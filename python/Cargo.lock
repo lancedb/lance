@@ -143,9 +143,9 @@ dependencies = [
 
 [[package]]
 name = "anstyle"
-version = "1.0.13"
+version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
+checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "anstyle-parse"
@@ -1332,9 +1332,9 @@ dependencies = [
 
 [[package]]
 name = "colorchoice"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "comfy-table"
@@ -2824,7 +2824,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -3911,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3978,7 +3978,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3998,7 +3998,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrayref",
  "paste",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4044,7 +4044,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4077,7 +4077,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4095,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4132,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4178,7 +4178,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4289,7 +4289,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4305,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4361,7 +4361,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5727,7 +5727,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "4.0.0-beta.10"
+version = "4.0.0-beta.12"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -7628,9 +7628,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.22"
+version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "matchers",
  "nu-ansi-term",

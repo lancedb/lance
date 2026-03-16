@@ -1935,13 +1935,17 @@ impl Transaction {
                 removed_indices,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
+                let removed_uuids = removed_indices
+                    .iter()
+                    .map(|old_index| old_index.uuid)
+                    .collect::<HashSet<_>>();
+                let new_uuids = new_indices
+                    .iter()
+                    .map(|new_index| new_index.uuid)
+                    .collect::<HashSet<_>>();
                 final_indices.retain(|existing_index| {
-                    !new_indices
-                        .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                    !removed_uuids.contains(&existing_index.uuid)
+                        && !new_uuids.contains(&existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }
@@ -3441,7 +3445,36 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use chrono::Utc;
+    use lance_core::datatypes::Schema as LanceSchema;
     use lance_io::utils::CachedFileSize;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sample_manifest() -> Manifest {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    fn sample_index_metadata(name: &str) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            name: name.to_string(),
+            dataset_version: 0,
+            fragment_bitmap: Some([0].into_iter().collect()),
+            index_details: None,
+            index_version: 1,
+            created_at: Some(Utc::now()),
+            base_id: None,
+        }
+    }
 
     #[test]
     fn test_rewrite_fragments() {
@@ -3496,11 +3529,6 @@ mod tests {
 
     #[test]
     fn test_merge_fragments_valid() {
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema as LanceSchema;
-        use lance_table::format::Manifest;
-        use std::sync::Arc;
-
         // Create a simple schema for testing
         let schema = ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
@@ -3575,6 +3603,82 @@ mod tests {
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
         let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_index_build_manifest_keeps_unremoved_same_name_indices() {
+        let manifest = sample_manifest();
+        let first_index = sample_index_metadata("vector_idx");
+        let second_index = sample_index_metadata("vector_idx");
+        let third_index = sample_index_metadata("vector_idx");
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![third_index.clone()],
+                removed_indices: vec![second_index.clone()],
+            },
+            None,
+        );
+
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![first_index.clone(), second_index.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(final_indices.len(), 2);
+        assert!(final_indices.iter().any(|idx| idx.uuid == first_index.uuid));
+        assert!(final_indices.iter().any(|idx| idx.uuid == third_index.uuid));
+        assert!(
+            !final_indices
+                .iter()
+                .any(|idx| idx.uuid == second_index.uuid)
+        );
+    }
+
+    #[test]
+    fn test_create_index_build_manifest_deduplicates_relisted_indices_by_uuid() {
+        let manifest = sample_manifest();
+        let first_index = sample_index_metadata("vector_idx");
+        let second_index = sample_index_metadata("vector_idx");
+        let third_index = sample_index_metadata("vector_idx");
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![first_index.clone(), third_index.clone()],
+                removed_indices: vec![second_index.clone()],
+            },
+            None,
+        );
+
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![first_index.clone(), second_index.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(final_indices.len(), 2);
+        assert_eq!(
+            final_indices
+                .iter()
+                .filter(|idx| idx.uuid == first_index.uuid)
+                .count(),
+            1
+        );
+        assert!(final_indices.iter().any(|idx| idx.uuid == third_index.uuid));
+        assert!(
+            !final_indices
+                .iter()
+                .any(|idx| idx.uuid == second_index.uuid)
+        );
     }
 
     #[test]

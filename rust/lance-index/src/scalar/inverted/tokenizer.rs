@@ -314,6 +314,27 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Serialize params for the build/training path, including build-only fields.
+    pub fn to_training_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        let object = value
+            .as_object_mut()
+            .expect("inverted index params should serialize to a JSON object");
+        if let Some(memory_limit_mb) = self.memory_limit_mb {
+            object.insert(
+                "memory_limit".to_string(),
+                serde_json::Value::from(memory_limit_mb),
+            );
+        }
+        if let Some(num_workers) = self.num_workers {
+            object.insert(
+                "num_workers".to_string(),
+                serde_json::Value::from(num_workers),
+            );
+        }
+        Ok(value)
+    }
+
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
@@ -457,5 +478,18 @@ mod tests {
         let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.memory_limit_mb, Some(4096));
         assert_eq!(params.num_workers, Some(3));
+    }
+
+    #[test]
+    fn test_training_json_serializes_build_only_fields() {
+        let params = InvertedIndexParams::default()
+            .memory_limit_mb(4096)
+            .num_workers(3);
+        let json = params.to_training_json().unwrap();
+        assert_eq!(
+            json.get("memory_limit"),
+            Some(&serde_json::Value::from(4096))
+        );
+        assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
     }
 }

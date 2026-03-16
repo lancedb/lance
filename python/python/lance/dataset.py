@@ -5342,12 +5342,12 @@ class DatasetOptimizer:
     def compact_files(
         self,
         *,
-        target_rows_per_fragment: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
         max_bytes_per_file: Optional[int] = None,
-        materialize_deletions: bool = True,
-        materialize_deletions_threshold: float = 0.1,
-        defer_index_remap: bool = False,
+        materialize_deletions: Optional[bool] = None,
+        materialize_deletions_threshold: Optional[float] = None,
+        defer_index_remap: Optional[bool] = None,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
         compaction_mode: Optional[
@@ -5369,14 +5369,33 @@ class DatasetOptimizer:
         not be compacted because the fragments it is adjacent to do not need
         compaction.
 
+        Default values for these options can be stored in the dataset manifest
+        config using keys prefixed with ``lance.compaction.``. For example,
+        setting the config key ``lance.compaction.target_rows_per_fragment`` to
+        ``"500000"`` will use 500,000 as the default target rows per fragment.
+        Explicitly provided parameters take precedence over manifest config
+        values, which in turn take precedence over hardcoded defaults.
+
+        Supported config keys: ``lance.compaction.target_rows_per_fragment``,
+        ``lance.compaction.max_rows_per_group``,
+        ``lance.compaction.max_bytes_per_file``,
+        ``lance.compaction.materialize_deletions``,
+        ``lance.compaction.materialize_deletions_threshold``,
+        ``lance.compaction.defer_index_remap``,
+        ``lance.compaction.batch_size``,
+        ``lance.compaction.compaction_mode``,
+        ``lance.compaction.binary_copy_read_batch_bytes``.
+
         Parameters
         ----------
-        target_rows_per_fragment: int, default 1024*1024
+        target_rows_per_fragment: int, optional
             The target number of rows per fragment. This is the number of rows
-            that will be in each fragment after compaction.
-        max_rows_per_group: int, default 1024
+            that will be in each fragment after compaction. If not specified,
+            uses the manifest config value, or 1024*1024.
+        max_rows_per_group: int, optional
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
+            If not specified, uses the manifest config value, or 1024.
 
             This setting only affects datasets using the legacy storage format.
             The newer format does not require row groups.
@@ -5387,14 +5406,17 @@ class DatasetOptimizer:
             that are smaller than `target_rows_per_fragment`.
 
             The default will use the default from ``write_dataset``.
-        materialize_deletions: bool, default True
+        materialize_deletions: bool, optional
             Whether to compact fragments with soft deleted rows so they are no
-            longer present in the file.
-        materialize_deletions_threshold: float, default 0.1
+            longer present in the file. If not specified, uses the manifest
+            config value, or True.
+        materialize_deletions_threshold: float, optional
             The fraction of original rows that are soft deleted in a fragment
-            before the fragment is a candidate for compaction.
-        defer_index_remap: bool, default False
-            Whether to defer index remapping during compaction.
+            before the fragment is a candidate for compaction. If not specified,
+            uses the manifest config value, or 0.1.
+        defer_index_remap: bool, optional
+            Whether to defer index remapping during compaction. If not specified,
+            uses the manifest config value, or False.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
@@ -5425,18 +5447,22 @@ class DatasetOptimizer:
         --------
         lance.optimize.Compaction
         """
-        opts = dict(
-            target_rows_per_fragment=target_rows_per_fragment,
-            max_rows_per_group=max_rows_per_group,
-            max_bytes_per_file=max_bytes_per_file,
-            materialize_deletions=materialize_deletions,
-            materialize_deletions_threshold=materialize_deletions_threshold,
-            defer_index_remap=defer_index_remap,
-            num_threads=num_threads,
-            batch_size=batch_size,
-            compaction_mode=compaction_mode,
-            binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
-        )
+        opts = {
+            k: v
+            for k, v in dict(
+                target_rows_per_fragment=target_rows_per_fragment,
+                max_rows_per_group=max_rows_per_group,
+                max_bytes_per_file=max_bytes_per_file,
+                materialize_deletions=materialize_deletions,
+                materialize_deletions_threshold=materialize_deletions_threshold,
+                defer_index_remap=defer_index_remap,
+                num_threads=num_threads,
+                batch_size=batch_size,
+                compaction_mode=compaction_mode,
+                binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+            ).items()
+            if v is not None
+        }
         return Compaction.execute(self._dataset, opts)
 
     def optimize_indices(self, **kwargs):
