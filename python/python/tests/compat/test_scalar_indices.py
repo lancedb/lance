@@ -294,7 +294,9 @@ class FtsIndex(UpgradeDowngradeTest):
     def check_read(self):
         """Verify FTS index can be queried."""
         ds = lance.dataset(self.path)
-        match_table = ds.to_table(full_text_query="words 7")
+        match_table = ds.to_table(
+            full_text_query={"query": "words 7", "columns": ["text"]}
+        )
         assert match_table.num_rows > 0
         assert 7 in match_table.column("idx").to_pylist()
 
