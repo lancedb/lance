@@ -1660,6 +1660,7 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
         m: 20,
         ef_construction: 100,
         prefetch_distance: None,
+        level_seed: None,
     };
 
     let Ok(stats) = source_index.statistics() else {
@@ -1693,6 +1694,7 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
             m,
             ef_construction,
             prefetch_distance: None,
+            level_seed: None,
         };
     }
 
@@ -2852,6 +2854,7 @@ mod tests {
             m: 24,
             ef_construction: 120,
             prefetch_distance: None,
+            level_seed: None,
         };
         let pq_params = PQBuildParams {
             num_sub_vectors: 8,
@@ -3111,6 +3114,7 @@ mod tests {
             m: 16,
             ef_construction: 80,
             prefetch_distance: None,
+            level_seed: None,
         };
         let sq_params = SQBuildParams {
             num_bits: 8,

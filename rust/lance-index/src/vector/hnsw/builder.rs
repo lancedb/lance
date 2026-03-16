@@ -598,11 +598,11 @@ impl HnswBuilder {
 // This is used to iterate over neighbors in a specific level.
 pub(crate) struct HnswLevelView<'a> {
     level: u16,
-    nodes: &'a Vec<RwLock<GraphBuilderNode>>,
+    nodes: &'a [RwLock<GraphBuilderNode>],
 }
 
 impl<'a> HnswLevelView<'a> {
-    pub fn new(level: u16, nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
+    pub fn new(level: u16, nodes: &'a [RwLock<GraphBuilderNode>]) -> Self {
         Self { level, nodes }
     }
 }
@@ -620,11 +620,11 @@ impl Graph for HnswLevelView<'_> {
 
 pub(crate) struct ImmutableHnswLevelView<'a> {
     level: u16,
-    nodes: &'a Vec<GraphBuilderNode>,
+    nodes: &'a [GraphBuilderNode],
 }
 
 impl<'a> ImmutableHnswLevelView<'a> {
-    pub fn new(level: u16, nodes: &'a Vec<GraphBuilderNode>) -> Self {
+    pub fn new(level: u16, nodes: &'a [GraphBuilderNode]) -> Self {
         Self { level, nodes }
     }
 }
@@ -650,11 +650,11 @@ impl BorrowingGraph for ImmutableHnswLevelView<'_> {
 }
 
 pub(crate) struct ImmutableHnswBottomView<'a> {
-    nodes: &'a Vec<GraphBuilderNode>,
+    nodes: &'a [GraphBuilderNode],
 }
 
 impl<'a> ImmutableHnswBottomView<'a> {
-    pub fn new(nodes: &'a Vec<GraphBuilderNode>) -> Self {
+    pub fn new(nodes: &'a [GraphBuilderNode]) -> Self {
         Self { nodes }
     }
 }

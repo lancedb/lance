@@ -27,9 +27,9 @@ use crate::{
     },
 };
 
+use super::DISTANCE_TYPE_KEY;
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
-use super::DISTANCE_TYPE_KEY;
 use super::quantizer::{Quantizer, QuantizerMetadata};
 
 /// <section class="warning">

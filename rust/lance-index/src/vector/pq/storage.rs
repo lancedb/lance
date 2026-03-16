@@ -827,9 +827,9 @@ impl VectorStore for ProductQuantizationStorage {
     }
 
     fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
-        selected.iter().all(|other| {
-            candidate.dist < OrderedFloat(self.dist_between(candidate.id, other.id))
-        })
+        selected
+            .iter()
+            .all(|other| candidate.dist < OrderedFloat(self.dist_between(candidate.id, other.id)))
     }
 }
 
