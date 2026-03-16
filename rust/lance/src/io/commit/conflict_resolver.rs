@@ -516,12 +516,7 @@ impl<'a> TransactionRebase<'a> {
                     let other_has_mem_wal = created_indices
                         .iter()
                         .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
-
-                    if (self_has_frag_reuse && other_has_frag_reuse)
-                        || (self_has_mem_wal && other_has_mem_wal)
-                    {
-                        Err(self.retryable_conflict_err(other_transaction, other_version))
-                    } else if new_indices
+                    let has_regular_name_conflict = new_indices
                         .iter()
                         .filter(|idx| {
                             idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
@@ -532,7 +527,11 @@ impl<'a> TransactionRebase<'a> {
                                     && created_index.name != MEM_WAL_INDEX_NAME
                                     && created_index.name == new_index.name
                             })
-                        })
+                        });
+
+                    if (self_has_frag_reuse && other_has_frag_reuse)
+                        || (self_has_mem_wal && other_has_mem_wal)
+                        || has_regular_name_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
