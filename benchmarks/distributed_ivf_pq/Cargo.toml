@@ -1,0 +1,20 @@
+[package]
+name = "distributed-ivf-pq-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+arrow = { version = "57.0.0", features = ["prettyprint"] }
+clap = { version = "4", features = ["derive"] }
+lance = { path = "../../rust/lance", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface", "tencent"] }
+lance-index = { path = "../../rust/lance-index" }
+lance-linalg = { path = "../../rust/lance-linalg" }
+rand = { version = "0.9.1", features = ["small_rng"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.23", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+uuid = { version = "1.2", features = ["v4", "serde"] }
