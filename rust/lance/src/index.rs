@@ -768,12 +768,7 @@ impl DatasetIndexExt for Dataset {
         // TODO: We will need some way to determine the index details here.  Perhaps
         // we can load the index itself and get the details that way.
 
-        let segment = IndexSegment {
-            uuid: index_id,
-            fragment_bitmap: self.fragment_bitmap.as_ref().clone(),
-            index_details: None,
-            index_version: 0,
-        };
+        let segment = IndexSegment::new(index_id, self.fragment_bitmap.as_ref().clone());
 
         self.commit_existing_index_segments(index_name, column, vec![segment])
             .await
@@ -799,26 +794,30 @@ impl DatasetIndexExt for Dataset {
 
         let mut seen_segment_ids = HashSet::with_capacity(segments.len());
         for segment in &segments {
-            if !seen_segment_ids.insert(segment.uuid) {
+            if !seen_segment_ids.insert(segment.uuid()) {
                 return Err(Error::invalid_input(format!(
                     "CreateIndex: duplicate segment uuid {} for index '{}'",
-                    segment.uuid, index_name
+                    segment.uuid(),
+                    index_name
                 )));
             }
         }
 
         let new_indices = segments
             .into_iter()
-            .map(|segment| IndexMetadata {
-                uuid: segment.uuid,
-                name: index_name.to_string(),
-                fields: vec![field.id],
-                dataset_version: self.manifest.version,
-                fragment_bitmap: Some(segment.fragment_bitmap),
-                index_details: segment.index_details,
-                index_version: segment.index_version,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None,
+            .map(|segment| {
+                let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+                IndexMetadata {
+                    uuid,
+                    name: index_name.to_string(),
+                    fields: vec![field.id],
+                    dataset_version: self.manifest.version,
+                    fragment_bitmap: Some(fragment_bitmap),
+                    index_details,
+                    index_version,
+                    created_at: Some(chrono::Utc::now()),
+                    base_id: None,
+                }
             })
             .collect();
 
@@ -5184,18 +5183,8 @@ mod tests {
         .await
         .unwrap();
 
-        let seg0 = IndexSegment {
-            uuid: Uuid::new_v4(),
-            fragment_bitmap: std::iter::once(0_u32).collect(),
-            index_details: None,
-            index_version: 0,
-        };
-        let seg1 = IndexSegment {
-            uuid: Uuid::new_v4(),
-            fragment_bitmap: std::iter::once(1_u32).collect(),
-            index_details: None,
-            index_version: 0,
-        };
+        let seg0 = IndexSegment::new(Uuid::new_v4(), std::iter::once(0_u32));
+        let seg1 = IndexSegment::new(Uuid::new_v4(), std::iter::once(1_u32));
 
         dataset
             .commit_existing_index_segments(
@@ -5211,7 +5200,7 @@ mod tests {
         let committed_uuids = committed.iter().map(|idx| idx.uuid).collect::<HashSet<_>>();
         assert_eq!(
             committed_uuids,
-            HashSet::from([seg0.uuid, seg1.uuid]),
+            HashSet::from([seg0.uuid(), seg1.uuid()]),
             "all committed segment uuids should be preserved"
         );
         assert_eq!(
@@ -5246,12 +5235,7 @@ mod tests {
 
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let base = IndexSegment {
-            uuid: Uuid::new_v4(),
-            fragment_bitmap: std::iter::once(0_u32).collect(),
-            index_details: None,
-            index_version: 0,
-        };
+        let base = IndexSegment::new(Uuid::new_v4(), std::iter::once(0_u32));
 
         let err = dataset
             .commit_existing_index_segments(
@@ -5259,10 +5243,7 @@ mod tests {
                 "vector",
                 vec![
                     base.clone(),
-                    IndexSegment {
-                        fragment_bitmap: std::iter::once(1_u32).collect(),
-                        ..base
-                    },
+                    IndexSegment::new(base.uuid(), std::iter::once(1_u32)),
                 ],
             )
             .await

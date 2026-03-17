@@ -36,7 +36,7 @@ use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::{DatasetIndexExt, IndexDescription};
+use lance_index::{DatasetIndexExt, IndexDescription, IndexSegment};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
@@ -415,7 +415,14 @@ async fn do_load_shuffled_vectors(
     .infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    ds.commit_existing_index(index_name, column, index_id)
+    ds.commit_existing_index_segments(
+        index_name,
+        column,
+        vec![IndexSegment::new(
+            index_id,
+            ds.iter_fragments().map(|f| f.id as u32),
+        )],
+    )
         .await
         .infer_error()?;
 

@@ -1463,12 +1463,10 @@ mod tests {
             .commit_existing_index_segments(
                 index_name,
                 "vector",
-                vec![IndexSegment {
-                    uuid: shared_uuid,
-                    fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
-                    index_details: None,
-                    index_version: 0,
-                }],
+                vec![IndexSegment::new(
+                    shared_uuid,
+                    dataset.fragment_bitmap.as_ref().clone(),
+                )],
             )
             .await
             .unwrap();
