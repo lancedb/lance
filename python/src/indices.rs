@@ -423,8 +423,8 @@ async fn do_load_shuffled_vectors(
             ds.iter_fragments().map(|f| f.id as u32),
         )],
     )
-        .await
-        .infer_error()?;
+    .await
+    .infer_error()?;
 
     Ok(())
 }
