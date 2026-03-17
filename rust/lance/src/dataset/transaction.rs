@@ -2265,6 +2265,11 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        // Merge transaction properties into manifest config if present
+        if let Some(tx_props) = &self.transaction_properties {
+            manifest.config_mut().extend(tx_props.as_ref().clone());
+        }
+
         Ok((manifest, final_indices))
     }
 

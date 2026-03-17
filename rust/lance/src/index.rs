@@ -78,7 +78,7 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -950,14 +950,15 @@ impl DatasetIndexExt for Dataset {
             return Ok(());
         }
 
-        let transaction = Transaction::new(
+        let transaction = TransactionBuilder::new(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
             },
-            None,
-        );
+        )
+        .transaction_properties(options.transaction_properties.clone())
+        .build();
 
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
