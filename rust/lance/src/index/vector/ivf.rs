@@ -2274,6 +2274,7 @@ mod tests {
     use crate::index::vector::IndexFileVersion;
     use crate::index::vector_index_details;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+    use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
 
@@ -3857,6 +3858,80 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_legacy_multiple_deltas() {
+        use lance_io::assert_io_eq;
+
+        let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
+
+        // Trigger migration to repair legacy corrupt fragment bitmaps.
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.index_statistics("vector_idx").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Reopen dataset to avoid carrying index state in-memory from migration.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2, "expected two index deltas for vector_idx");
+        let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
+        assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
+
+        let sample_batch = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .project(&["vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = sample_batch["vector"]
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap()
+            .value(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .clone();
+
+        // Reset IO stats after migration and sampling.
+        dataset.object_store().io_stats_incremental();
+
+        // Prewarm should perform IO to load all index deltas into cache.
+        dataset.prewarm_index("vector_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert!(
+            stats.read_iops > 0,
+            "prewarm should have read from disk, but read_iops was 0"
+        );
+
+        // Query should not perform index IO after prewarm of all deltas.
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "query should not perform IO after prewarm"
+        );
+
+        // Second prewarm should not need IO (already cached).
+        dataset.prewarm_index("vector_idx").await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }

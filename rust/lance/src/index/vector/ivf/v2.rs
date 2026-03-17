@@ -3511,4 +3511,119 @@ mod tests {
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_pq_multiple_deltas() {
+        use lance_io::assert_io_eq;
+
+        const INDEX_NAME: &str = "my_idx";
+        const BASE_ROWS_PER_PARTITION: usize = 3_000;
+        const SMALL_APPEND_ROWS: usize = 64;
+        let offsets = [-50.0, 50.0];
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (batch, schema) = generate_clustered_batch(BASE_ROWS_PER_PARTITION, offsets);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let centroids = build_centroids_for_offsets(&offsets);
+        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let template_batch = dataset
+            .take_rows(&[0], dataset.schema().clone())
+            .await
+            .unwrap();
+        let template_values = template_batch["vector"]
+            .as_fixed_size_list()
+            .value(0)
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let mut append_params = WriteParams {
+            max_rows_per_file: 32,
+            max_rows_per_group: 32,
+            ..Default::default()
+        };
+        append_params.mode = WriteMode::Append;
+        append_constant_vector_with_params(
+            &mut dataset,
+            SMALL_APPEND_ROWS,
+            &template_values,
+            Some(append_params),
+        )
+        .await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        // Reopen dataset to avoid carrying index state in-memory from index creation.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(indices.len(), 2, "expected two index deltas for my_idx");
+        let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
+        assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
+
+        // Reset IO stats after index creation
+        dataset.object_store().io_stats_incremental();
+
+        // Prewarm should perform IO to load all index deltas into cache
+        dataset.prewarm_index(INDEX_NAME).await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert!(
+            stats.read_iops > 0,
+            "prewarm should have read from disk, but read_iops was 0"
+        );
+
+        // Query should not perform IO after prewarm of all deltas
+        let q = Float32Array::from(template_values.clone());
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "query should not perform IO after prewarm"
+        );
+
+        // Second prewarm should not need IO (already cached)
+        dataset.prewarm_index(INDEX_NAME).await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
 }

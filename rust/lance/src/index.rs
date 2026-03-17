@@ -654,10 +654,12 @@ impl DatasetIndexExt for Dataset {
             return Err(Error::index_not_found(format!("name={}", name)));
         }
 
-        let index = self
-            .open_generic_index(name, &indices[0].uuid.to_string(), &NoOpMetricsCollector)
-            .await?;
-        index.prewarm().await?;
+        for index_meta in indices {
+            let index = self
+                .open_generic_index(name, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+                .await?;
+            index.prewarm().await?;
+        }
 
         Ok(())
     }

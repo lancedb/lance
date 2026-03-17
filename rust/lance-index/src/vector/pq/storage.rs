@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::ProductQuantizer;
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use crate::frag_reuse::FragReuseIndex;
+use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
     vector::{
@@ -823,6 +824,12 @@ impl VectorStore for ProductQuantizationStorage {
             }
             _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
         }
+    }
+
+    fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
+        selected
+            .iter()
+            .all(|other| candidate.dist < OrderedFloat(self.dist_between(candidate.id, other.id)))
     }
 }
 
