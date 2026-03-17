@@ -3,6 +3,7 @@
 
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     cmp::{Reverse, min},
@@ -41,8 +42,20 @@ use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use roaring::RoaringBitmap;
 use std::sync::LazyLock;
+
+/// Dedicated rayon pool for BM25 search, sized to match Lance's CPU budget.
+/// This avoids using the global rayon pool which doesn't respect
+/// LANCE_CPU_THREADS / LANCE_IO_CORE_RESERVATION.
+static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(get_num_compute_intensive_cpus())
+        .thread_name(|i| format!("lance-search-{}", i))
+        .build()
+        .expect("Failed to create search thread pool")
+});
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
@@ -112,15 +125,6 @@ static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
 struct PartitionCandidates {
     tokens_by_position: Vec<String>,
     candidates: Vec<DocCandidate>,
-}
-
-impl PartitionCandidates {
-    fn empty() -> Self {
-        Self {
-            tokens_by_position: Vec::new(),
-            candidates: Vec::new(),
-        }
-    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
@@ -258,52 +262,95 @@ impl InvertedIndex {
         }
         let mask = prefilter.mask();
 
-        let mut candidates = BinaryHeap::new();
-        let parts = self
+        // Phase 1: Load all posting lists in parallel on tokio (async I/O)
+        let load_futs = self
             .partitions
             .iter()
             .map(|part| {
                 let part = part.clone();
                 let tokens = tokens.clone();
                 let params = params.clone();
-                let mask = mask.clone();
                 let metrics = metrics.clone();
                 async move {
                     let postings = part
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
                         .await?;
                     if postings.is_empty() {
-                        return Result::Ok(PartitionCandidates::empty());
+                        return Result::Ok(None);
                     }
                     let mut tokens_by_position = vec![String::new(); postings.len()];
                     for posting in &postings {
                         let idx = posting.term_index() as usize;
                         tokens_by_position[idx] = posting.token().to_owned();
                     }
-                    let params = params.clone();
-                    let mask = mask.clone();
-                    let metrics = metrics.clone();
-                    spawn_cpu(move || {
-                        let candidates = part.bm25_search(
-                            params.as_ref(),
-                            operator,
-                            mask,
-                            postings,
-                            metrics.as_ref(),
-                        )?;
-                        Ok(PartitionCandidates {
-                            tokens_by_position,
-                            candidates,
-                        })
-                    })
-                    .await
+                    Ok(Some((part, postings, tokens_by_position)))
                 }
             })
             .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let loaded: Vec<_> = stream::iter(load_futs)
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .try_filter_map(|opt| async move { Ok(opt) })
+            .try_collect()
+            .await?;
+
+        if loaded.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Phase 2: Run all bm25_search calls in a single spawn_cpu.
+        // For multiple partitions, use rayon work-stealing for CPU parallelism
+        // (single cross-runtime hop instead of per-partition spawn_cpu).
+        // For a single partition, skip rayon overhead entirely.
+        let all_results: Vec<PartitionCandidates> = if loaded.len() == 1 {
+            let (part, postings, tokens_by_position) = loaded.into_iter().next().unwrap();
+            let params_cpu = params.clone();
+            let metrics_cpu = metrics.clone();
+            spawn_cpu(move || -> Result<Vec<PartitionCandidates>> {
+                let candidates = part.bm25_search(
+                    params_cpu.as_ref(),
+                    operator,
+                    mask,
+                    postings,
+                    metrics_cpu.as_ref(),
+                )?;
+                Ok(vec![PartitionCandidates {
+                    tokens_by_position,
+                    candidates,
+                }])
+            })
+            .await?
+        } else {
+            let params_cpu = params.clone();
+            let mask_cpu = mask.clone();
+            let metrics_cpu = metrics.clone();
+            spawn_cpu(move || {
+                SEARCH_THREAD_POOL.install(|| {
+                    loaded
+                        .into_par_iter()
+                        .map(|(part, postings, tokens_by_position)| {
+                            let candidates = part.bm25_search(
+                                params_cpu.as_ref(),
+                                operator,
+                                mask_cpu.clone(),
+                                postings,
+                                metrics_cpu.as_ref(),
+                            )?;
+                            Ok(PartitionCandidates {
+                                tokens_by_position,
+                                candidates,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .await?
+        };
+
+        // Phase 3: Cross-partition rescoring
+        let mut candidates = BinaryHeap::new();
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()), &[]);
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
+        for res in all_results {
             if res.candidates.is_empty() {
                 continue;
             }
@@ -405,6 +452,10 @@ impl InvertedIndex {
                 inverted_list,
                 docs,
                 token_set_format: TokenSetFormat::Arrow,
+                stats: OnceLock::new(),
+                token_doc_freq_cache: std::sync::Mutex::new(HashMap::new()),
+                doc_freq_cache_hits: AtomicU64::new(0),
+                doc_freq_cache_misses: AtomicU64::new(0),
             })],
         }))
     }
@@ -672,7 +723,6 @@ impl ScalarIndex for InvertedIndex {
     }
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
     // 0 for legacy format
     id: u64,
@@ -681,6 +731,76 @@ pub struct InvertedPartition {
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
     token_set_format: TokenSetFormat,
+
+    /// Cached partition-level statistics for BM25 scoring.
+    /// Computed once on first access via OnceLock.
+    stats: OnceLock<PartitionStatsInner>,
+
+    /// Lazy per-token document frequency cache.
+    /// Avoids repeated FST lookups for the same token across queries.
+    /// Key: token string, Value: posting_len (number of documents containing the token).
+    token_doc_freq_cache: std::sync::Mutex<HashMap<String, usize>>,
+
+    /// Cache hit/miss counters for token_doc_freq lookups.
+    pub(crate) doc_freq_cache_hits: AtomicU64,
+    pub(crate) doc_freq_cache_misses: AtomicU64,
+}
+
+impl Debug for InvertedPartition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvertedPartition")
+            .field("id", &self.id)
+            .field("tokens", &self.tokens)
+            .field("docs", &self.docs)
+            .field("token_set_format", &self.token_set_format)
+            .field(
+                "doc_freq_cache_size",
+                &self.token_doc_freq_cache.lock().unwrap().len(),
+            )
+            .field(
+                "doc_freq_cache_hits",
+                &self.doc_freq_cache_hits.load(Ordering::Relaxed),
+            )
+            .field(
+                "doc_freq_cache_misses",
+                &self.doc_freq_cache_misses.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl Clone for InvertedPartition {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            store: self.store.clone(),
+            tokens: self.tokens.clone(),
+            inverted_list: self.inverted_list.clone(),
+            docs: self.docs.clone(),
+            token_set_format: self.token_set_format,
+            stats: OnceLock::new(),
+            token_doc_freq_cache: std::sync::Mutex::new(HashMap::new()),
+            doc_freq_cache_hits: AtomicU64::new(0),
+            doc_freq_cache_misses: AtomicU64::new(0),
+        }
+    }
+}
+
+impl DeepSizeOf for InvertedPartition {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.tokens.deep_size_of_children(context)
+            + self.inverted_list.deep_size_of_children(context)
+            + self.docs.deep_size_of_children(context)
+            + self.token_doc_freq_cache.lock().unwrap().len()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<usize>())
+    }
+}
+
+/// Immutable partition-level statistics, computed once from DocSet.
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionStatsInner {
+    pub num_docs: usize,
+    pub total_tokens: u64,
 }
 
 impl InvertedPartition {
@@ -731,11 +851,52 @@ impl InvertedPartition {
             inverted_list: Arc::new(inverted_list),
             docs,
             token_set_format,
+            stats: OnceLock::new(),
+            token_doc_freq_cache: std::sync::Mutex::new(HashMap::new()),
+            doc_freq_cache_hits: AtomicU64::new(0),
+            doc_freq_cache_misses: AtomicU64::new(0),
         })
     }
 
     fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
+    }
+
+    /// Returns cached partition-level stats, computing on first call.
+    pub(crate) fn stats(&self) -> &PartitionStatsInner {
+        self.stats.get_or_init(|| {
+            let num_docs = self.docs.len();
+            let total_tokens = self.docs.total_tokens_num();
+            PartitionStatsInner {
+                num_docs,
+                total_tokens,
+            }
+        })
+    }
+
+    /// Returns the document frequency (posting_len) for a token, using a
+    /// lazy cache to avoid repeated FST lookups across queries.
+    pub(crate) fn doc_freq(&self, token: &str) -> usize {
+        // Fast path: check cache
+        {
+            let cache = self.token_doc_freq_cache.lock().unwrap();
+            if let Some(&freq) = cache.get(token) {
+                self.doc_freq_cache_hits.fetch_add(1, Ordering::Relaxed);
+                return freq;
+            }
+        }
+
+        // Slow path: FST lookup + cache insert
+        self.doc_freq_cache_misses.fetch_add(1, Ordering::Relaxed);
+        let freq = if let Some(token_id) = self.tokens.get(token) {
+            self.inverted_list.posting_len(token_id)
+        } else {
+            0
+        };
+
+        let mut cache = self.token_doc_freq_cache.lock().unwrap();
+        cache.insert(token.to_owned(), freq);
+        freq
     }
 
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
@@ -842,7 +1003,8 @@ impl InvertedPartition {
         }
 
         // let local_metrics = LocalMetricsCollector::default();
-        let scorer = IndexBM25Scorer::new(std::iter::once(self));
+        let query_tokens: Vec<&str> = postings.iter().map(|p| p.token()).collect();
+        let scorer = IndexBM25Scorer::new(std::iter::once(self), &query_tokens);
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
         let hits = wand.search(params, mask, metrics)?;
         // local_metrics.dump_into(metrics);
@@ -1842,6 +2004,9 @@ pub struct CompressedPostingList {
     // that contains `BLOCK_SIZE` doc ids and then `BLOCK_SIZE` frequencies
     pub blocks: LargeBinaryArray,
     pub positions: Option<ListArray>,
+    // Pre-extracted block metadata to avoid Arrow array accessor overhead per call
+    block_least_doc_ids: Vec<u32>,
+    block_max_scores: Vec<f32>,
 }
 
 impl DeepSizeOf for CompressedPostingList {
@@ -1852,6 +2017,8 @@ impl DeepSizeOf for CompressedPostingList {
                 .as_ref()
                 .map(Array::get_buffer_memory_size)
                 .unwrap_or(0)
+            + self.block_least_doc_ids.capacity() * std::mem::size_of::<u32>()
+            + self.block_max_scores.capacity() * std::mem::size_of::<f32>()
     }
 }
 
@@ -1862,11 +2029,21 @@ impl CompressedPostingList {
         length: u32,
         positions: Option<ListArray>,
     ) -> Self {
+        let num_blocks = blocks.len();
+        let mut block_least_doc_ids = Vec::with_capacity(num_blocks);
+        let mut block_max_scores = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            let block = blocks.value(i);
+            block_max_scores.push(f32::from_le_bytes(block[0..4].try_into().unwrap()));
+            block_least_doc_ids.push(u32::from_le_bytes(block[4..8].try_into().unwrap()));
+        }
         Self {
             max_score,
             length,
             blocks,
             positions,
+            block_least_doc_ids,
+            block_max_scores,
         }
     }
 
@@ -1881,12 +2058,7 @@ impl CompressedPostingList {
             .column_by_name(POSITION_COL)
             .map(|col| col.as_list::<i32>().value(0).as_list::<i32>().clone());
 
-        Self {
-            max_score,
-            length,
-            blocks,
-            positions,
-        }
+        Self::new(blocks, max_score, length, positions)
     }
 
     pub fn iter(&self) -> CompressedPostingListIterator {
@@ -1897,14 +2069,14 @@ impl CompressedPostingList {
         )
     }
 
+    #[inline]
     pub fn block_max_score(&self, block_idx: usize) -> f32 {
-        let block = self.blocks.value(block_idx);
-        block[0..4].try_into().map(f32::from_le_bytes).unwrap()
+        self.block_max_scores[block_idx]
     }
 
+    #[inline]
     pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
-        let block = self.blocks.value(block_idx);
-        block[4..8].try_into().map(u32::from_le_bytes).unwrap()
+        self.block_least_doc_ids[block_idx]
     }
 }
 
@@ -3073,7 +3245,10 @@ fn initialize_scorer(
     let mut all_token_counts = vec![0; query_tokens.len()];
 
     if let Some(index) = index {
-        let index_bm25_scorer = IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
+        // Pass &[] — this scorer is only used for num_docs_containing_token(),
+        // total_tokens(), and num_docs(). IDF cache is not needed here.
+        let index_bm25_scorer =
+            IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()), &[]);
         for (token_index, token) in query_tokens.into_iter().enumerate() {
             let token_nq = index_bm25_scorer.num_docs_containing_token(token);
             all_token_counts[token_index] = token_nq as u64;

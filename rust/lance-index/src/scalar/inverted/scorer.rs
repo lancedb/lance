@@ -79,22 +79,41 @@ pub struct IndexBM25Scorer<'a> {
     num_docs: usize,
     total_tokens: u64,
     avg_doc_length: f32,
+    idf_cache: HashMap<String, f32>,
 }
 
 impl<'a> IndexBM25Scorer<'a> {
-    pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
+    pub fn new(
+        partitions: impl Iterator<Item = &'a InvertedPartition>,
+        query_tokens: &[&str],
+    ) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
-        let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens = partitions
-            .iter()
-            .map(|part| part.docs.total_tokens_num())
-            .sum::<u64>();
-        let avgdl = total_tokens as f32 / num_docs as f32;
+
+        // Use cached partition stats — O(n_partitions) addition, no DocSet access
+        let num_docs: usize = partitions.iter().map(|p| p.stats().num_docs).sum();
+        let total_tokens: u64 = partitions.iter().map(|p| p.stats().total_tokens).sum();
+        let avgdl = if num_docs > 0 {
+            total_tokens as f32 / num_docs as f32
+        } else {
+            0.0
+        };
+
+        // Build IDF cache using partition doc_freq cache (avoids FST lookups on
+        // repeated tokens across queries)
+        let mut idf_cache = HashMap::with_capacity(query_tokens.len());
+        for &token in query_tokens {
+            let n: usize = partitions.iter().map(|p| p.doc_freq(token)).sum();
+            if n > 0 {
+                idf_cache.insert(token.to_owned(), idf(n, num_docs));
+            }
+        }
+
         Self {
             partitions,
             num_docs,
             total_tokens,
             avg_doc_length: avgdl,
+            idf_cache,
         }
     }
 
@@ -107,21 +126,17 @@ impl<'a> IndexBM25Scorer<'a> {
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {
-        self.partitions
-            .iter()
-            .map(|part| {
-                if let Some(token_id) = part.tokens.get(token) {
-                    part.inverted_list.posting_len(token_id)
-                } else {
-                    0
-                }
-            })
-            .sum()
+        self.partitions.iter().map(|p| p.doc_freq(token)).sum()
     }
 }
 
 impl Scorer for IndexBM25Scorer<'_> {
     fn query_weight(&self, token: &str) -> f32 {
+        // Fast path: use precomputed IDF from cache (O(1) HashMap lookup)
+        if let Some(&cached) = self.idf_cache.get(token) {
+            return cached;
+        }
+        // Fallback for tokens not in the cache (should not happen if constructed correctly)
         let token_docs = self.num_docs_containing_token(token);
         if token_docs == 0 {
             return 0.0;
