@@ -2698,7 +2698,7 @@ impl Scanner {
         let row_addrs = RowAddrTreeMap::from_iter(u64s);
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
         let index_result = IndexExprResult::Exact(row_addr_mask);
-        let fragments_covered = RoaringBitmap::from_iter(self.dataset.iter_fragment_ids());
+        let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let batch = index_result.serialize_to_arrow(&fragments_covered)?;
         let stream = futures::stream::once(async move { Ok(batch) });
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -4165,7 +4165,7 @@ impl Scanner {
         if let Some(fragments) = &self.fragments {
             RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
         } else {
-            RoaringBitmap::from_iter(self.dataset.iter_fragment_ids())
+            self.dataset.fragment_bitmap.as_ref().clone()
         }
     }
 

@@ -247,11 +247,8 @@ impl MemTableFlusher {
                     index_meta.fields = vec![field_idx];
                     index_meta.dataset_version = dataset.version().version;
                     // Calculate fragment_bitmap from dataset fragments
-                    let fragment_ids: roaring::RoaringBitmap = dataset
-                        .get_fragments()
-                        .iter()
-                        .map(|f| f.id() as u32)
-                        .collect();
+                    let fragment_ids: roaring::RoaringBitmap =
+                        dataset.fragment_bitmap.as_ref().clone();
                     index_meta.fragment_bitmap = Some(fragment_ids);
 
                     // Commit the index to the dataset
@@ -467,11 +464,7 @@ impl MemTableFlusher {
             let schema = dataset.schema();
             let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
 
-            let fragment_ids: roaring::RoaringBitmap = dataset
-                .get_fragments()
-                .iter()
-                .map(|f| f.id() as u32)
-                .collect();
+            let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,

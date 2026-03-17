@@ -1466,13 +1466,7 @@ mod tests {
                 "vector",
                 vec![IndexSegment {
                     uuid: shared_uuid,
-                    fragment_bitmap: Some(
-                        dataset
-                            .get_fragments()
-                            .iter()
-                            .map(|f| f.id() as u32)
-                            .collect(),
-                    ),
+                    fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
                     index_details: None,
                     index_version: 0,
                     created_at: Some(chrono::Utc::now()),

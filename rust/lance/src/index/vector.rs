@@ -1581,17 +1581,7 @@ pub async fn initialize_vector_index(
         ))
     })?;
 
-    let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
-        Some(roaring::RoaringBitmap::new())
-    } else {
-        Some(
-            target_dataset
-                .get_fragments()
-                .iter()
-                .map(|f| f.id() as u32)
-                .collect(),
-        )
-    };
+    let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,

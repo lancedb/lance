@@ -770,7 +770,7 @@ impl DatasetIndexExt for Dataset {
 
         let segment = IndexSegment {
             uuid: index_id,
-            fragment_bitmap: Some(self.iter_fragment_ids().collect()),
+            fragment_bitmap: Some(self.fragment_bitmap.as_ref().clone()),
             index_details: None,
             index_version: 0,
             created_at: Some(chrono::Utc::now()),

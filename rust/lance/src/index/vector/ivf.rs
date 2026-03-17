@@ -2655,13 +2655,7 @@ mod tests {
             dataset_version: dataset.version().version,
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(
-                dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -2758,13 +2752,7 @@ mod tests {
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(
-                dataset_mut
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),

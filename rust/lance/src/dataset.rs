@@ -1822,11 +1822,6 @@ impl Dataset {
         self.manifest.fragments.iter()
     }
 
-    /// Iterate over fragment ids in manifest order.
-    pub fn iter_fragment_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.iter_fragments().map(|f| f.id as u32)
-    }
-
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
         let dataset = Arc::new(self.clone());
         let fragment = self
