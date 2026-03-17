@@ -89,7 +89,7 @@ use std::sync::Arc;
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder};
 use super::utils::make_rowid_capture_stream;
 use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
@@ -207,6 +207,13 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Transaction properties to store in the commit manifest.
+    ///
+    /// These key-value pairs are stored in the transaction's manifest config
+    /// and can be read later to identify the source of the commit
+    /// (e.g., job_id for tracking completed compaction jobs).
+    #[serde(skip)]
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[allow(deprecated)]
@@ -227,6 +234,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            transaction_properties: None,
         }
     }
 }
@@ -377,6 +385,15 @@ impl CompactionOptions {
             (true, false) => CompactionMode::TryBinaryCopy,
             _ => CompactionMode::Reencode,
         }
+    }
+
+    /// Set transaction properties to store in the commit manifest.
+    pub fn transaction_properties(
+        mut self,
+        properties: Arc<HashMap<String, String>>,
+    ) -> Self {
+        self.transaction_properties = Some(properties);
+        self
     }
 }
 
@@ -1569,15 +1586,16 @@ pub async fn commit_compaction(
         None
     };
 
-    let transaction = Transaction::new(
+    let transaction = TransactionBuilder::new(
         dataset.manifest.version,
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
         },
-        None,
-    );
+    )
+    .transaction_properties(options.transaction_properties.clone())
+    .build();
 
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())

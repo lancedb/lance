@@ -5,7 +5,7 @@ use crate::{
     Error, Result,
     dataset::{
         Dataset,
-        transaction::{Operation, Transaction},
+        transaction::{Operation, TransactionBuilder},
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt,
@@ -26,7 +26,7 @@ use lance_index::{
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
-use std::{future::IntoFuture, sync::Arc};
+use std::{collections::HashMap, future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -56,6 +56,8 @@ pub struct CreateIndexBuilder<'a> {
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
+    /// Transaction properties to store in the commit manifest.
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -77,6 +79,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_uuid: None,
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
+            transaction_properties: None,
         }
     }
 
@@ -115,6 +118,19 @@ impl<'a> CreateIndexBuilder<'a> {
 
     pub fn progress(mut self, p: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = p;
+        self
+    }
+
+    /// Set transaction properties to store in the commit manifest.
+    ///
+    /// These key-value pairs are stored in the transaction's manifest config
+    /// and can be read later to identify the source of the commit
+    /// (e.g., job_id for tracking completed index jobs).
+    pub fn transaction_properties(
+        mut self,
+        properties: Arc<HashMap<String, String>>,
+    ) -> Self {
+        self.transaction_properties = Some(properties);
         self
     }
 
@@ -456,14 +472,15 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = Transaction::new(
+        let transaction = TransactionBuilder::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
                 removed_indices,
             },
-            None,
-        );
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
 
         self.dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
