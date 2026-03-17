@@ -4192,6 +4192,7 @@ dependencies = [
  "bitpacking",
  "bitvec",
  "bytes",
+ "chrono",
  "crossbeam-queue",
  "datafusion",
  "datafusion-common",
