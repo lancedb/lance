@@ -3,6 +3,7 @@
 
 //! Index merging mechanisms for distributed vector index building
 
+use crate::progress::IndexBuildProgress;
 use crate::vector::shared::partition_merger::{
     SupportedIvfIndexType, write_unified_ivf_and_index_metadata,
 };
@@ -699,6 +700,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
     target_dir: &object_store::path::Path,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     if aux_paths.is_empty() {
         return Err(Error::index(
@@ -737,8 +739,16 @@ pub async fn merge_partial_vector_auxiliary_files(
     // This avoids reopening each shard file for every partition during merge.
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
 
+    progress
+        .stage_start(
+            "read_shard_metadata",
+            Some(aux_paths.len() as u64),
+            "shards",
+        )
+        .await?;
+
     // Iterate over each shard auxiliary file and merge its metadata and collect lengths
-    for aux in aux_paths {
+    for (idx, aux) in aux_paths.iter().enumerate() {
         let fh = sched.open_file(aux, &CachedFileSize::unknown()).await?;
         let reader = V2Reader::try_open(
             fh,
@@ -1363,7 +1373,11 @@ pub async fn merge_partial_vector_auxiliary_files(
             partition_offsets,
             total_rows: running_offset,
         });
+        progress
+            .stage_progress("read_shard_metadata", idx as u64 + 1)
+            .await?;
     }
+    progress.stage_complete("read_shard_metadata").await?;
 
     // Write rows grouped by partition across all shards to ensure contiguous ranges per partition
 
@@ -1375,6 +1389,15 @@ pub async fn merge_partial_vector_auxiliary_files(
     let nlist = nlist_opt.ok_or_else(|| Error::index("Missing IVF partition count".to_string()))?;
     let idx_type_final = detected_index_type
         .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
+
+    let total_rows = accumulated_lengths
+        .iter()
+        .map(|length| *length as u64)
+        .sum::<u64>();
+    progress
+        .stage_start("merge_partitions", Some(total_rows), "rows")
+        .await?;
+    let mut merged_rows = 0u64;
 
     match idx_type_final {
         SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
@@ -1405,6 +1428,10 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_pq_transposed(w, partition_batch).await?;
                 }
+                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                progress
+                    .stage_progress("merge_partitions", merged_rows)
+                    .await?;
             }
         }
         SupportedIvfIndexType::IvfRq => {
@@ -1433,10 +1460,15 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_rq_packed(w, partition_batch).await?;
                 }
+                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                progress
+                    .stage_progress("merge_partitions", merged_rows)
+                    .await?;
             }
         }
         _ => {
-            for pid in 0..nlist {
+            for (pid, total_part_len) in accumulated_lengths.iter().copied().enumerate().take(nlist)
+            {
                 for shard in shard_infos.iter() {
                     let part_len = shard.lengths[pid] as usize;
                     if part_len == 0 {
@@ -1448,12 +1480,23 @@ pub async fn merge_partial_vector_auxiliary_files(
                             .await?;
                     }
                 }
+                if total_part_len == 0 {
+                    continue;
+                }
+                merged_rows = merged_rows.saturating_add(total_part_len as u64);
+                progress
+                    .stage_progress("merge_partitions", merged_rows)
+                    .await?;
             }
         }
     }
+    progress.stage_complete("merge_partitions").await?;
 
     // Write unified IVF metadata into global buffer & set schema metadata
     if let Some(w) = v2w_opt.as_mut() {
+        progress
+            .stage_start("write_auxiliary_index", Some(1), "files")
+            .await?;
         let mut ivf_model = if let Some(c) = first_centroids {
             IvfStorageModel::new(c, None)
         } else {
@@ -1465,6 +1508,8 @@ pub async fn merge_partial_vector_auxiliary_files(
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
         w.finish().await?;
+        progress.stage_progress("write_auxiliary_index", 1).await?;
+        progress.stage_complete("write_auxiliary_index").await?;
     } else {
         return Err(Error::index(
             "Failed to initialize unified writer".to_string(),
@@ -1493,6 +1538,11 @@ mod tests {
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
+    lance_testing::define_stage_event_progress!(
+        RecordingProgress,
+        IndexBuildProgress,
+        lance_core::Result<()>
+    );
 
     async fn write_flat_partial_aux(
         store: &ObjectStore,
@@ -1585,13 +1635,85 @@ mod tests {
             .await
             .unwrap();
 
+        let progress = Arc::new(RecordingProgress::default());
         merge_partial_vector_auxiliary_files(
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            progress.clone(),
         )
         .await
         .unwrap();
+
+        let events = progress.recorded_events();
+        let tags = events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let merge_total = events
+            .iter()
+            .find_map(|(kind, stage, value)| {
+                if kind == "start" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .expect("missing merge_partitions start total");
+        let merged_rows = events
+            .iter()
+            .filter_map(|(kind, stage, value)| {
+                if kind == "progress" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .next_back()
+            .unwrap_or_default();
+        let read_start = tags
+            .iter()
+            .position(|e| e == "start:read_shard_metadata")
+            .expect("missing read_shard_metadata start");
+        let read_complete = tags
+            .iter()
+            .position(|e| e == "complete:read_shard_metadata")
+            .expect("missing read_shard_metadata complete");
+        let merge_start = tags
+            .iter()
+            .position(|e| e == "start:merge_partitions")
+            .expect("missing merge_partitions start");
+        let merge_complete = tags
+            .iter()
+            .position(|e| e == "complete:merge_partitions")
+            .expect("missing merge_partitions complete");
+        let write_start = tags
+            .iter()
+            .position(|e| e == "start:write_auxiliary_index")
+            .expect("missing write_auxiliary_index start");
+        let write_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_auxiliary_index")
+            .expect("missing write_auxiliary_index complete");
+        assert!(read_start < read_complete);
+        assert!(read_complete < merge_start);
+        assert!(merge_start < merge_complete);
+        assert!(merge_complete < write_start);
+        assert!(write_start < write_complete);
+        assert!(
+            tags.iter().any(|e| e == "progress:read_shard_metadata"),
+            "expected read_shard_metadata progress callbacks"
+        );
+        assert!(
+            tags.iter().any(|e| e == "progress:merge_partitions"),
+            "expected merge_partitions progress callbacks"
+        );
+        assert_eq!(merge_total, 6, "expected merge_partitions total rows");
+        assert_eq!(merged_rows, 6, "expected merge_partitions completed rows");
+        assert!(
+            tags.iter().any(|e| e == "progress:write_auxiliary_index"),
+            "expected write_auxiliary_index progress callbacks"
+        );
 
         let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
@@ -1691,6 +1813,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await;
         match res {
@@ -1953,6 +2076,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await
         .unwrap();
@@ -2071,6 +2195,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await
         .unwrap();
@@ -2206,6 +2331,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await;
         match res {
@@ -2286,6 +2412,7 @@ mod tests {
             &object_store,
             &[aux_a.clone(), aux_b.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await
         .unwrap();

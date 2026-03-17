@@ -18,6 +18,7 @@ use super::{
 use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,
+    progress::{IndexBuildProgress, noop_progress},
     scalar::{
         CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
@@ -1659,7 +1660,14 @@ impl ScalarIndex for BTreeIndex {
             let lookup_files = (0..num_parts)
                 .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
                 .collect::<Vec<_>>();
-            merge_metadata_files(dest_store, &page_files, &lookup_files, None).await?;
+            merge_metadata_files(
+                dest_store,
+                &page_files,
+                &lookup_files,
+                None,
+                noop_progress(),
+            )
+            .await?;
         }
 
         Ok(CreatedIndex {
@@ -1925,6 +1933,7 @@ pub async fn merge_index_files(
     index_dir: &Path,
     store: Arc<dyn IndexStore>,
     batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     // List all partition page / lookup files in the index directory
     let (part_page_files, part_lookup_files) =
@@ -1934,6 +1943,7 @@ pub async fn merge_index_files(
         &part_page_files,
         &part_lookup_files,
         batch_readhead,
+        progress,
     )
     .await
 }
@@ -1989,6 +1999,7 @@ async fn merge_metadata_files(
     part_page_files: &[String],
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::internal(
@@ -2062,6 +2073,7 @@ async fn merge_metadata_files(
             metadata,
             batch_size,
             batch_readhead,
+            progress,
         )
         .await
     } else {
@@ -2074,6 +2086,7 @@ async fn merge_metadata_files(
             metadata,
             batch_size,
             batch_readhead,
+            progress,
         )
         .await
     }
@@ -2115,6 +2128,7 @@ async fn merge_range_partitioned_lookups(
     mut metadata: HashMap<String, String>,
     batch_size: u64,
     batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?;
     let mut lookup_file = store
@@ -2125,7 +2139,15 @@ async fn merge_range_partitioned_lookups(
     let mut pages_per_file: Vec<(u64, u32)> = Vec::with_capacity(sorted_part_lookup_files.len());
     let mut num_pages_written = 0u32;
 
-    for (part_id, part_lookup_file) in sorted_part_lookup_files {
+    progress
+        .stage_start(
+            "merge_lookups",
+            Some(sorted_part_lookup_files.len() as u64),
+            "files",
+        )
+        .await?;
+
+    for (idx, (part_id, part_lookup_file)) in sorted_part_lookup_files.into_iter().enumerate() {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
         let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
         let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
@@ -2136,6 +2158,9 @@ async fn merge_range_partitioned_lookups(
         }
         pages_per_file.push((part_id, lookup_reader.num_rows() as u32));
         num_pages_written += lookup_reader.num_rows() as u32;
+        progress
+            .stage_progress("merge_lookups", idx as u64 + 1)
+            .await?;
     }
 
     metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
@@ -2145,6 +2170,7 @@ async fn merge_range_partitioned_lookups(
     );
 
     lookup_file.finish_with_metadata(metadata).await?;
+    progress.stage_complete("merge_lookups").await?;
 
     // In this mode, we only clean up lookup files, and page files are untouched.
     cleanup_partition_files(store, part_lookup_files, &[]).await;
@@ -2166,6 +2192,7 @@ async fn merge_pages_and_lookups(
     metadata: HashMap<String, String>,
     batch_size: u64,
     batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     // Create a new global page file
     let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
@@ -2177,7 +2204,7 @@ async fn merge_pages_and_lookups(
     let mut page_file = store
         .new_index_file(BTREE_PAGES_NAME, arrow_schema.clone())
         .await?;
-
+    progress.stage_start("merge_pages", None, "pages").await?;
     let lookup_entries = merge_pages(
         part_lookup_files,
         page_files_map,
@@ -2186,9 +2213,11 @@ async fn merge_pages_and_lookups(
         &mut page_file,
         arrow_schema.clone(),
         batch_readhead,
+        progress.clone(),
     )
     .await?;
     page_file.finish().await?;
+    progress.stage_complete("merge_pages").await?;
 
     let lookup_batch = RecordBatch::try_new(
         lookup_schema.clone(),
@@ -2208,8 +2237,13 @@ async fn merge_pages_and_lookups(
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
         .await?;
+    progress
+        .stage_start("write_lookup_file", Some(1), "files")
+        .await?;
     lookup_file.write_record_batch(lookup_batch).await?;
     lookup_file.finish_with_metadata(metadata).await?;
+    progress.stage_progress("write_lookup_file", 1).await?;
+    progress.stage_complete("write_lookup_file").await?;
 
     // After successfully writing the merged files, delete all partition files
     // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
@@ -2240,6 +2274,7 @@ fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatc
 
 /// Merge pages using Datafusion's SortPreservingMergeExec
 /// which implements a K-way merge algorithm with fixed-size output batches
+#[allow(clippy::too_many_arguments)]
 async fn merge_pages(
     part_lookup_files: &[String],
     page_files_map: &HashMap<u64, &String>,
@@ -2248,6 +2283,7 @@ async fn merge_pages(
     page_file: &mut Box<dyn IndexWriter>,
     arrow_schema: Arc<Schema>,
     batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
     let mut lookup_entries = Vec::new();
     let mut page_idx = 0u32;
@@ -2331,6 +2367,9 @@ async fn merge_pages(
 
         lookup_entries.push((min_val, max_val, null_count, page_idx));
         page_idx += 1;
+        progress
+            .stage_progress("merge_pages", page_idx as u64)
+            .await?;
     }
 
     Ok(lookup_entries)
@@ -2666,6 +2705,7 @@ mod tests {
     use object_store::path::Path;
 
     use crate::metrics::LocalMetricsCollector;
+    use crate::progress::{IndexBuildProgress, noop_progress};
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
@@ -2679,6 +2719,12 @@ mod tests {
         DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, part_lookup_file_path,
         part_page_data_file_path, train_btree_index,
     };
+
+    lance_testing::define_stage_event_progress!(
+        RecordingProgress,
+        IndexBuildProgress,
+        lance_core::Result<()>
+    );
     #[test]
     fn test_scalar_value_size() {
         let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
@@ -3144,14 +3190,49 @@ mod tests {
             part_lookup_file_path(2 << 32),
         ];
 
+        let progress = Arc::new(RecordingProgress::default());
         super::merge_metadata_files(
             fragment_store.as_ref(),
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
+            progress.clone(),
         )
         .await
         .unwrap();
+
+        let tags = progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let merge_start = tags
+            .iter()
+            .position(|e| e == "start:merge_pages")
+            .expect("missing merge_pages start");
+        let merge_complete = tags
+            .iter()
+            .position(|e| e == "complete:merge_pages")
+            .expect("missing merge_pages complete");
+        let lookup_start = tags
+            .iter()
+            .position(|e| e == "start:write_lookup_file")
+            .expect("missing write_lookup_file start");
+        let lookup_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_lookup_file")
+            .expect("missing write_lookup_file complete");
+        assert!(merge_start < merge_complete);
+        assert!(merge_complete < lookup_start);
+        assert!(lookup_start < lookup_complete);
+        assert!(
+            tags.iter().any(|e| e == "progress:merge_pages"),
+            "expected merge_pages progress callbacks"
+        );
+        assert!(
+            tags.iter().any(|e| e == "progress:write_lookup_file"),
+            "expected write_lookup_file progress callbacks"
+        );
 
         // Load both indexes
         let full_index = BTreeIndex::load(full_store.clone(), None, &LanceCache::no_cache())
@@ -3358,6 +3439,7 @@ mod tests {
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
+            noop_progress(),
         )
         .await
         .unwrap();
@@ -3925,6 +4007,7 @@ mod tests {
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
+            noop_progress(),
         )
         .await
         .unwrap();
@@ -4242,6 +4325,7 @@ mod tests {
             &part_page_files,
             &part_lookup_files,
             Option::from(1usize),
+            noop_progress(),
         )
         .await
         .unwrap();

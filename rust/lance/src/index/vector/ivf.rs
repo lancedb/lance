@@ -1909,6 +1909,23 @@ pub(crate) async fn merge_segments(
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
+    merge_segments_with_progress(
+        object_store,
+        indices_dir,
+        segments,
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
+
+/// Merge one caller-defined group of source segments into a single segment and
+/// report progress through the provided callback.
+pub(crate) async fn merge_segments_with_progress(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
@@ -1931,7 +1948,7 @@ pub(crate) async fn merge_segments(
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
     let final_dir = indices_dir.child(segment_uuid.to_string());
-    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments).await?;
+    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments, progress).await?;
     let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
     merged_segment = TableIndexMetadata {
@@ -1957,6 +1974,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
 
@@ -1986,10 +2004,17 @@ async fn merge_segments_to_dir(
         object_store,
         &aux_paths,
         final_dir,
+        progress.clone(),
     )
     .await?;
-    write_root_vector_index_from_auxiliary(object_store, final_dir, None, &source_index_paths)
-        .await?;
+    write_root_vector_index_from_auxiliary(
+        object_store,
+        final_dir,
+        None,
+        &source_index_paths,
+        progress.clone(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -2020,6 +2045,7 @@ async fn write_root_vector_index_from_auxiliary(
     index_dir: &Path,
     requested_index_type: Option<IndexType>,
     centroid_source_index_paths: &[Path],
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
@@ -2114,6 +2140,9 @@ async fn write_root_vector_index_from_auxiliary(
     // Write root index.idx via V2 writer so downstream opens through v2 path.
     let index_path = index_dir.child(INDEX_FILE_NAME);
     let obj_writer = object_store.create(&index_path).await?;
+    progress
+        .stage_start("write_root_index", Some(1), "files")
+        .await?;
 
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
@@ -2159,6 +2188,9 @@ async fn write_root_vector_index_from_auxiliary(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
+    progress.stage_progress("write_root_index", 1).await?;
+    progress.stage_complete("write_root_index").await?;
+
     Ok(())
 }
 

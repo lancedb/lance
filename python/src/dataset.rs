@@ -70,6 +70,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::{
     IndexParams, IndexType,
     optimize::OptimizeOptions,
+    progress::NoopIndexBuildProgress,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
@@ -2097,7 +2098,12 @@ impl Dataset {
     ) -> PyResult<()> {
         rt().block_on(None, async {
             self.ds
-                .merge_index_metadata(index_uuid, IndexType::try_from(index_type)?, batch_readhead)
+                .merge_index_metadata(
+                    index_uuid,
+                    IndexType::try_from(index_type)?,
+                    batch_readhead,
+                    Arc::new(NoopIndexBuildProgress),
+                )
                 .await
         })?
         .map_err(|err| PyValueError::new_err(err.to_string()))

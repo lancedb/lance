@@ -31,7 +31,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::IndexType;
+use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -2759,12 +2759,14 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
-    /// Merge a distributed scalar index into a single root artifact.
+    /// Merge a distributed scalar index into a single root artifact and report
+    /// progress via the supplied callback.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: IndexType,
         batch_readhead: Option<usize>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
         let index_dir = self.indices_dir().child(index_uuid);
@@ -2775,6 +2777,7 @@ impl Dataset {
                     self.object_store(),
                     &index_dir,
                     Arc::new(store),
+                    progress,
                 )
                 .await
             }
@@ -2785,6 +2788,7 @@ impl Dataset {
                     &index_dir,
                     Arc::new(store),
                     batch_readhead,
+                    progress,
                 )
                 .await
             }

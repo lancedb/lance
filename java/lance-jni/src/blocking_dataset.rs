@@ -47,6 +47,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::progress::noop_progress;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
@@ -1062,7 +1063,7 @@ fn inner_merge_index_metadata(
     RT.block_on(async {
         dataset_guard
             .inner
-            .merge_index_metadata(&index_uuid, index_type, batch_readhead)
+            .merge_index_metadata(&index_uuid, index_type, batch_readhead, noop_progress())
             .await
     })?;
     Ok(())
