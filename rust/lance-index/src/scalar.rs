@@ -836,10 +836,13 @@ pub struct UpdateCriteria {
 /// - stable row IDs: use exact row-id membership instead
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
-    /// Keep old rows whose row-address fragment is in this bitmap.
+    /// Keeps track of which fragments are still valid and which are no longer valid.
     ///
     /// This is valid for address-style row IDs.
-    Fragments(RoaringBitmap),
+    Fragments {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+    },
     /// Keep old rows whose row IDs are in this exact allow-list.
     ///
     /// This is required for stable row IDs, where row IDs are opaque and
@@ -851,9 +854,9 @@ impl OldIndexDataFilter {
     /// Build a boolean mask that keeps only row IDs selected by this filter.
     pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
         match self {
-            Self::Fragments(valid_fragments) => row_ids
+            Self::Fragments { to_keep, .. } => row_ids
                 .iter()
-                .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+                .map(|id| id.map(|id| to_keep.contains((id >> 32) as u32)))
                 .collect(),
             Self::RowIds(valid_row_ids) => row_ids
                 .iter()
