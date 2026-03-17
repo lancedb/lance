@@ -1216,9 +1216,16 @@ mod tests {
             .collect();
 
         let results = join_all(futures).await;
-        for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-        }
+        let success_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Ok(_))))
+            .count();
+        let retryable_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Err(Error::RetryableCommitConflict { .. }))))
+            .count();
+        assert_eq!(success_count, 2, "{results:?}");
+        assert_eq!(retryable_count, 1, "{results:?}");
 
         // Validate that each version has the anticipated number of indexes
         let dataset = dataset.checkout_version(1).await.unwrap();
@@ -1241,12 +1248,7 @@ mod tests {
             assert_eq!(indices[0].fields, vec![0]);
         }
 
-        let dataset = dataset.checkout_version(4).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 2);
-        let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
-        fields.sort();
-        assert_eq!(fields, vec![0, 1]);
+        assert!(dataset.checkout_version(4).await.is_err());
     }
 
     #[tokio::test]

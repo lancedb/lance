@@ -625,7 +625,7 @@ impl BooleanQuery {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct BooleanMatchPlan {
     pub column: String,
     pub should: Vec<MatchQuery>,
@@ -633,7 +633,7 @@ pub(crate) struct BooleanMatchPlan {
     pub must_not: Vec<MatchQuery>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl BooleanMatchPlan {
     pub(crate) fn try_build(query: &FtsQuery) -> Option<Self> {
         match query {

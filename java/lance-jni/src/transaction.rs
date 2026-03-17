@@ -1107,6 +1107,9 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
+            // Pass None for dataset so that the new schema is not validated
+            // against the old schema. Overwrite replaces the entire dataset,
+            // so fields with the same name but different types are allowed.
             let schema = convert_schema_from_operation(
                 env,
                 java_operation,
@@ -1115,7 +1118,7 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Overwrite operations".to_string(),
                     )
                 })?,
-                dataset,
+                None,
                 read_version,
             )?;
             Operation::Overwrite {

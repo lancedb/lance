@@ -456,6 +456,8 @@ The following operations are retryable conflicts with DataReplacement:
 - DataReplacement (only if same field and overlapping fragments)
 - CreateIndex (only if the field being replaced is being indexed)
 - Rewrite (only if overlapping fragments)
+- Update (only if overlapping fragments)
+- Merge (always)
 
 ### UpdateMemWalState
 

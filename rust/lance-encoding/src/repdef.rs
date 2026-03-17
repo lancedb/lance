@@ -1225,7 +1225,7 @@ impl RepDefUnraveler {
     }
 
     pub fn is_all_valid(&self) -> bool {
-        self.def_meaning[self.current_layer].is_all_valid()
+        self.def_levels.is_none() || self.def_meaning[self.current_layer].is_all_valid()
     }
 
     /// If the current level is a repetition layer then this returns the number of lists
@@ -1400,15 +1400,14 @@ impl RepDefUnraveler {
     }
 
     pub fn skip_validity(&mut self) {
-        debug_assert!(
-            self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValidItem
-        );
+        debug_assert!(self.is_all_valid());
         self.current_layer += 1;
     }
 
     /// Unravels a layer of validity from the definition levels
     pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
-        if self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValidItem {
+        let meaning = self.def_meaning[self.current_layer];
+        if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
             self.current_layer += 1;
             validity.append_n(self.num_items as usize, true);
             return;
@@ -3182,6 +3181,33 @@ mod tests {
                 offsets_32(&[0, 2, 2, 2, 4]),
                 Some(validity(&[true, true, false, true]))
             )
+        );
+    }
+
+    #[test]
+    fn test_mixed_unraveler_nullable_without_def_levels() {
+        // A page can keep nullable layer metadata even when all definition levels are 0
+        // and no definition buffer needs to be materialized. This should decode as all-valid.
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![
+            RepDefUnraveler::new(
+                None,
+                Some(vec![0, 1, 0, 1]),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                4,
+            ),
+            RepDefUnraveler::new(
+                None,
+                None,
+                vec![DefinitionInterpretation::NullableItem].into(),
+                4,
+            ),
+        ]);
+
+        assert_eq!(
+            unraveler.unravel_validity(8),
+            Some(validity(&[
+                true, false, true, false, true, true, true, true
+            ]))
         );
     }
 }

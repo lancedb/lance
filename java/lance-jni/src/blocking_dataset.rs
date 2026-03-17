@@ -2541,7 +2541,12 @@ fn inner_compact(
     java_dataset: JObject,
     compaction_options: JObject, // CompactionOptions
 ) -> Result<()> {
-    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options)?;
+    let config = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.manifest.config.clone()
+    };
+    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options, &config)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.compact(rust_options)?;
@@ -2551,6 +2556,7 @@ fn inner_compact(
 fn convert_java_compaction_options_to_rust(
     env: &mut JNIEnv,
     java_options: JObject,
+    config: &std::collections::HashMap<String, String>,
 ) -> Result<RustCompactionOptions> {
     let target_rows_per_fragment = env
         .call_method(
@@ -2640,6 +2646,7 @@ fn convert_java_compaction_options_to_rust(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        config,
     )
 }
 

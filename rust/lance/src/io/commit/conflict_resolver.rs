@@ -14,6 +14,7 @@ use lance_core::{
     Error, Result,
     utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
 };
+use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_table::format::IndexMetadata;
@@ -501,8 +502,6 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                // unless it is the same frag reuse index or MemWAL index
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
@@ -518,9 +517,20 @@ impl<'a> TransactionRebase<'a> {
                     let other_has_mem_wal = created_indices
                         .iter()
                         .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+                    let has_regular_name_conflict = new_indices
+                        .iter()
+                        .filter(|idx| {
+                            idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
+                        })
+                        .any(|new_index| {
+                            created_indices
+                                .iter()
+                                .any(|created_index| created_index.name == new_index.name)
+                        });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
+                        || has_regular_name_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -1440,7 +1450,11 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
-        if let Operation::CreateIndex { new_indices, .. } = &mut self.transaction.operation {
+        if let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &mut self.transaction.operation
+        {
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -1520,6 +1534,25 @@ impl<'a> TransactionRebase<'a> {
 
                 let new_meta = new_mem_wal_index_meta(dataset.manifest.version, details)?;
                 new_indices.push(new_meta);
+            }
+
+            for singleton_name in [FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
+                if new_indices.iter().any(|idx| idx.name == singleton_name) {
+                    for existing_idx in dataset
+                        .load_indices()
+                        .await?
+                        .iter()
+                        .filter(|idx| idx.name == singleton_name)
+                        .cloned()
+                    {
+                        if !removed_indices
+                            .iter()
+                            .any(|removed_idx| removed_idx.uuid == existing_idx.uuid)
+                        {
+                            removed_indices.push(existing_idx);
+                        }
+                    }
+                }
             }
 
             Ok(self.transaction)
@@ -2296,10 +2329,10 @@ mod tests {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0],
                 },
-                // Will only conflict with operations that modify row ids.
+                // Conflicts with row-id-changing operations and same-name CreateIndex.
                 [
                     Compatible,    // append
-                    Compatible,    // create index
+                    Retryable,     // create index
                     Compatible,    // delete
                     Compatible,    // merge
                     NotCompatible, // overwrite
@@ -2627,6 +2660,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_create_index_conflicts_only_on_same_name() {
+        let index0 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+        };
+        let index1 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "other".to_string(),
+            ..index0.clone()
+        };
+
+        let txn = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![index0.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut rebase = TransactionRebase {
+            transaction: txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let same_name = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![IndexMetadata {
+                    uuid: uuid::Uuid::new_v4(),
+                    ..index0
+                }],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let different_name = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![index1],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let same_name_result = rebase.check_txn(&same_name, 1);
+        assert!(
+            matches!(same_name_result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict for same-name CreateIndex, got {:?}",
+            same_name_result
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: "test".to_string(),
+                        fields: vec![0],
+                        dataset_version: 1,
+                        fragment_bitmap: None,
+                        index_details: None,
+                        index_version: 0,
+                        created_at: None,
+                        base_id: None,
+                    }],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+        let different_name_result = rebase.check_txn(&different_name, 1);
+        assert!(
+            different_name_result.is_ok(),
+            "Expected compatibility for different-name CreateIndex, got {:?}",
+            different_name_result
+        );
     }
 
     #[tokio::test]

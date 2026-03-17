@@ -26,8 +26,10 @@ use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
 };
 use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_index::scalar::FullTextSearchQuery;
@@ -36,6 +38,8 @@ use lance_index::scalar::inverted::{
     tokenizer::InvertedIndexParams,
 };
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 
 use datafusion::common::{assert_contains, assert_not_contains};
@@ -2509,4 +2513,191 @@ async fn test_auto_infer_lance_tokenizer() {
         .await
         .unwrap();
     assert_eq!(1, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_index_inherits_dataset_file_version() {
+    // Test that index files use the same format version as the dataset
+    let test_uri = TempStrDir::default();
+
+    let dimension = 16;
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "embeddings",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dimension,
+        ),
+        false,
+    )]));
+
+    let float_arr = generate_random_array(512 * dimension as usize);
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            float_arr, dimension,
+        )
+        .unwrap(),
+    );
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+    // Create dataset with V2_1 file version
+    let dataset_version = LanceFileVersion::V2_1;
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(dataset_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Create a vector index
+    let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+    let index_meta = dataset
+        .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    // Get the index directory
+    let index_dir = dataset.indices_dir().child(index_meta.uuid.to_string());
+
+    // Open the index file and check its version
+    let index_path = index_dir.child("index.idx");
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+
+    let file_handle = scheduler
+        .open_file(&index_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+
+    let index_reader = FileReader::try_open(
+        file_handle,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Verify that the index file uses the same version as the dataset
+    assert_eq!(
+        index_reader.metadata().version(),
+        dataset_version,
+        "Index file should use the same format version as the dataset"
+    );
+
+    // Also check the auxiliary file if it exists
+    let aux_path = index_dir.child("auxiliary.idx");
+    if dataset
+        .object_store
+        .exists(&aux_path)
+        .await
+        .unwrap_or(false)
+    {
+        let aux_handle = scheduler
+            .open_file(&aux_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let aux_reader = FileReader::try_open(
+            aux_handle,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            aux_reader.metadata().version(),
+            dataset_version,
+            "Auxiliary index file should use the same format version as the dataset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_legacy_dataset_uses_v2_0_for_indexes() {
+    // Test that datasets with legacy format still use V2_0 for indexes (not legacy)
+    let test_uri = TempStrDir::default();
+
+    let dimension = 16;
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "embeddings",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dimension,
+        ),
+        false,
+    )]));
+
+    let float_arr = generate_random_array(512 * dimension as usize);
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            float_arr, dimension,
+        )
+        .unwrap(),
+    );
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+    // Create dataset with legacy file version
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Create a vector index
+    let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+    let index_meta = dataset
+        .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    // Get the index directory
+    let index_dir = dataset.indices_dir().child(index_meta.uuid.to_string());
+
+    // Open the index file and check its version
+    let index_path = index_dir.child("index.idx");
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+
+    let file_handle = scheduler
+        .open_file(&index_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+
+    let index_reader = FileReader::try_open(
+        file_handle,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Verify that the index file uses V2_0 (not legacy)
+    assert_eq!(
+        index_reader.metadata().version(),
+        LanceFileVersion::V2_0,
+        "Index files should never use legacy format, even for legacy datasets"
+    );
 }
