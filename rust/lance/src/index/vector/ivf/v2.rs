@@ -657,6 +657,7 @@ mod tests {
     };
     use lance_linalg::distance::{DistanceType, multivec_distance};
     use lance_linalg::kernels::normalize_fsl;
+    use lance_table::format::IndexSegment;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
@@ -1460,7 +1461,24 @@ mod tests {
             .unwrap();
 
         dataset
-            .commit_existing_index(index_name, "vector", shared_uuid)
+            .commit_existing_index_segments(
+                index_name,
+                "vector",
+                vec![IndexSegment {
+                    uuid: shared_uuid,
+                    fragment_bitmap: Some(
+                        dataset
+                            .get_fragments()
+                            .iter()
+                            .map(|f| f.id() as u32)
+                            .collect(),
+                    ),
+                    index_details: None,
+                    index_version: 0,
+                    created_at: Some(chrono::Utc::now()),
+                    base_id: None,
+                }],
+            )
             .await
             .unwrap();
     }

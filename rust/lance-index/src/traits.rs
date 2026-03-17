@@ -8,7 +8,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 
 use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, IndexSegment};
 use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
@@ -269,6 +269,20 @@ pub trait DatasetIndexExt {
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
+    /// Commit one or more existing physical index segments as a logical index.
+    async fn commit_existing_index_segments(
+        &mut self,
+        _index_name: &str,
+        _column: &str,
+        _segments: Vec<IndexSegment>,
+    ) -> Result<()> {
+        Err(Error::not_supported(format!(
+            "{} does not support commit_existing_index_segments",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    #[deprecated(since = "4.0.0", note = "Use commit_existing_index_segments instead")]
     async fn commit_existing_index(
         &mut self,
         index_name: &str,
