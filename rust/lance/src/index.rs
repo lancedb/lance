@@ -42,7 +42,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription};
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -55,7 +55,7 @@ use lance_io::utils::{
     read_version,
 };
 use lance_table::format::IndexMetadata;
-use lance_table::format::{Fragment, IndexSegment, SelfDescribingFileReader};
+use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -770,11 +770,9 @@ impl DatasetIndexExt for Dataset {
 
         let segment = IndexSegment {
             uuid: index_id,
-            fragment_bitmap: Some(self.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: self.fragment_bitmap.as_ref().clone(),
             index_details: None,
             index_version: 0,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None, // New indices don't have base_id (they're not from shallow clone)
         };
 
         self.commit_existing_index_segments(index_name, column, vec![segment])
@@ -816,11 +814,11 @@ impl DatasetIndexExt for Dataset {
                 name: index_name.to_string(),
                 fields: vec![field.id],
                 dataset_version: self.manifest.version,
-                fragment_bitmap: segment.fragment_bitmap,
+                fragment_bitmap: Some(segment.fragment_bitmap),
                 index_details: segment.index_details,
                 index_version: segment.index_version,
-                created_at: segment.created_at,
-                base_id: segment.base_id,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
             })
             .collect();
 
@@ -5188,19 +5186,15 @@ mod tests {
 
         let seg0 = IndexSegment {
             uuid: Uuid::new_v4(),
-            fragment_bitmap: Some(std::iter::once(0_u32).collect()),
+            fragment_bitmap: std::iter::once(0_u32).collect(),
             index_details: None,
             index_version: 0,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
         };
         let seg1 = IndexSegment {
             uuid: Uuid::new_v4(),
-            fragment_bitmap: Some(std::iter::once(1_u32).collect()),
+            fragment_bitmap: std::iter::once(1_u32).collect(),
             index_details: None,
             index_version: 0,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
         };
 
         dataset
@@ -5254,11 +5248,9 @@ mod tests {
 
         let base = IndexSegment {
             uuid: Uuid::new_v4(),
-            fragment_bitmap: Some(std::iter::once(0_u32).collect()),
+            fragment_bitmap: std::iter::once(0_u32).collect(),
             index_details: None,
             index_version: 0,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
         };
 
         let err = dataset
@@ -5268,7 +5260,7 @@ mod tests {
                 vec![
                     base.clone(),
                     IndexSegment {
-                        fragment_bitmap: Some(std::iter::once(1_u32).collect()),
+                        fragment_bitmap: std::iter::once(1_u32).collect(),
                         ..base
                     },
                 ],

@@ -141,24 +141,3 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
         }
     }
 }
-
-/// A single physical segment of a logical index.
-///
-/// Each segment is stored independently and will become one manifest entry when committed.
-/// The logical index identity (name / target column / dataset version) is provided separately
-/// by the commit API.
-#[derive(Debug, Clone, PartialEq)]
-pub struct IndexSegment {
-    /// Unique ID of the physical segment.
-    pub uuid: Uuid,
-    /// The fragments covered by this segment.
-    pub fragment_bitmap: Option<RoaringBitmap>,
-    /// Metadata specific to the index type.
-    pub index_details: Option<Arc<prost_types::Any>>,
-    /// The on-disk index version for this segment.
-    pub index_version: i32,
-    /// Timestamp when the segment was created.
-    pub created_at: Option<DateTime<Utc>>,
-    /// Base path identifier when the segment is imported from another dataset.
-    pub base_id: Option<u32>,
-}

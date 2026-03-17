@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 
-use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
-use lance_table::format::{IndexMetadata, IndexSegment};
+use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
+use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query

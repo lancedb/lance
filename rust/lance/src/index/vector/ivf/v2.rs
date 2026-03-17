@@ -646,7 +646,7 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -657,7 +657,6 @@ mod tests {
     };
     use lance_linalg::distance::{DistanceType, multivec_distance};
     use lance_linalg::kernels::normalize_fsl;
-    use lance_table::format::IndexSegment;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
@@ -1466,11 +1465,9 @@ mod tests {
                 "vector",
                 vec![IndexSegment {
                     uuid: shared_uuid,
-                    fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+                    fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                     index_details: None,
                     index_version: 0,
-                    created_at: Some(chrono::Utc::now()),
-                    base_id: None,
                 }],
             )
             .await
