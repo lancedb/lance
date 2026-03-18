@@ -261,9 +261,14 @@ async fn current_manifest_path(
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
-        if let Some(scheme) = ManifestNamingScheme::detect_scheme(res.location.filename().unwrap())
-        {
-            future::ready(Ok(Some((scheme, res))))
+        let filename = res.location.filename().unwrap();
+        if let Some(scheme) = ManifestNamingScheme::detect_scheme(filename) {
+            // Only include if we can parse a version (skip detached versions)
+            if scheme.parse_version(filename).is_some() {
+                future::ready(Ok(Some((scheme, res))))
+            } else {
+                future::ready(Ok(None))
+            }
         } else {
             future::ready(Ok(None))
         }
