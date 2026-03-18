@@ -277,15 +277,10 @@ pub trait DatasetIndexExt {
     /// Commit one or more existing physical index segments as a logical index.
     async fn commit_existing_index_segments(
         &mut self,
-        _index_name: &str,
-        _column: &str,
-        _segments: Vec<IndexSegment>,
-    ) -> Result<()> {
-        Err(Error::not_supported(format!(
-            "{} does not support commit_existing_index_segments",
-            std::any::type_name::<Self>()
-        )))
-    }
+        index_name: &str,
+        column: &str,
+        segments: Vec<IndexSegment>,
+    ) -> Result<()>;
 
     async fn read_index_partition(
         &self,
