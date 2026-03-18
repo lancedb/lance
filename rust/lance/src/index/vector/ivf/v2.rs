@@ -611,6 +611,7 @@ mod tests {
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use futures::StreamExt;
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
@@ -621,7 +622,9 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::vector::ivf::{PartialShard, merge_staging_segment, plan_staging_segments};
+    use crate::index::vector::ivf::{
+        PartialShard, collapse_segment_plans, merge_staging_segment, plan_staging_segments,
+    };
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -1507,7 +1510,20 @@ mod tests {
                 .collect::<Vec<_>>();
             new_shards.sort();
             assert_eq!(new_shards.len(), 1);
-            partial_shards.push(PartialShard::new(new_shards[0], fragment_bitmap));
+            let partial_dir = dataset
+                .indices_dir()
+                .child(shared_uuid.to_string())
+                .child(format!("partial_{}", new_shards[0]));
+            let mut estimated_bytes = 0_u64;
+            let mut files = dataset.object_store().list(Some(partial_dir));
+            while let Some(item) = files.next().await {
+                estimated_bytes += item.unwrap().size;
+            }
+            partial_shards.push(PartialShard::new(
+                new_shards[0],
+                fragment_bitmap,
+                estimated_bytes,
+            ));
         }
 
         (shared_uuid, partial_shards)
@@ -1534,13 +1550,24 @@ mod tests {
     ) -> Vec<PartialShard> {
         let shard_uuids = load_staging_shard_uuids(dataset, shared_uuid).await;
         assert_eq!(shard_uuids.len(), fragment_groups.len());
-        shard_uuids
-            .into_iter()
-            .zip(fragment_groups.iter())
-            .map(|(shard_uuid, fragment_group)| {
-                PartialShard::new(shard_uuid, fragment_group.iter().copied())
-            })
-            .collect()
+        let mut partial_shards = Vec::with_capacity(shard_uuids.len());
+        for (shard_uuid, fragment_group) in shard_uuids.into_iter().zip(fragment_groups.iter()) {
+            let partial_dir = dataset
+                .indices_dir()
+                .child(shared_uuid.to_string())
+                .child(format!("partial_{}", shard_uuid));
+            let mut estimated_bytes = 0_u64;
+            let mut files = dataset.object_store().list(Some(partial_dir));
+            while let Some(item) = files.next().await {
+                estimated_bytes += item.unwrap().size;
+            }
+            partial_shards.push(PartialShard::new(
+                shard_uuid,
+                fragment_group.iter().copied(),
+                estimated_bytes,
+            ));
+        }
+        partial_shards
     }
 
     async fn materialize_distributed_plan(
@@ -1551,15 +1578,10 @@ mod tests {
         index_name: &str,
     ) -> Vec<IndexSegment> {
         let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let segment_plans = plan_staging_segments(
-            dataset.object_store(),
-            &index_dir,
-            partial_shards,
-            None,
-            target_segment_bytes,
-        )
-        .await
-        .unwrap();
+        let segment_plans =
+            plan_staging_segments(&index_dir, partial_shards, None, target_segment_bytes)
+                .await
+                .unwrap();
         let mut segments = Vec::with_capacity(segment_plans.len());
         for plan in &segment_plans {
             segments.push(
@@ -1803,21 +1825,14 @@ mod tests {
         .await;
 
         let index_dir = ds_split.indices_dir().child(shared_uuid.to_string());
-        let shard_plan = plan_staging_segments(
-            ds_split.object_store(),
-            &index_dir,
-            &partial_shards,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let shard_plan = plan_staging_segments(&index_dir, &partial_shards, None, None)
+            .await
+            .unwrap();
         let shard_count = shard_plan.len();
         assert!(shard_count >= 4);
         let target_segment_bytes = shard_plan[0].estimated_bytes().saturating_mul(2);
 
         let grouped_plan = plan_staging_segments(
-            ds_split.object_store(),
             &index_dir,
             &partial_shards,
             None,
@@ -1927,15 +1942,14 @@ mod tests {
             build_partial_shards(&dataset, shared_uuid, &[shard0.clone(), shard1.clone()]).await;
 
         let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let err = plan_staging_segments(
-            dataset.object_store(),
-            &index_dir,
-            &partial_shards,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let plans = plan_staging_segments(&index_dir, &partial_shards, None, None)
+            .await
+            .unwrap();
+        let merged_plan = collapse_segment_plans(&plans).unwrap();
+        let err =
+            merge_staging_segment(dataset.object_store(), &dataset.indices_dir(), &merged_plan)
+                .await
+                .unwrap_err();
         assert!(
             err.to_string()
                 .contains("mismatched index subtype metadata")
@@ -1971,15 +1985,9 @@ mod tests {
         let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
         let partial_shards =
             build_partial_shards(&dataset, shared_uuid, &[vec![fragment], vec![fragment]]).await;
-        let err = plan_staging_segments(
-            dataset.object_store(),
-            &index_dir,
-            &partial_shards,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = plan_staging_segments(&index_dir, &partial_shards, None, None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
@@ -2039,15 +2047,14 @@ mod tests {
         let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
         let partial_shards =
             build_partial_shards(&dataset, shared_uuid, &[shard0.clone(), shard1.clone()]).await;
-        let err = plan_staging_segments(
-            dataset.object_store(),
-            &index_dir,
-            &partial_shards,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let plans = plan_staging_segments(&index_dir, &partial_shards, None, None)
+            .await
+            .unwrap();
+        let merged_plan = collapse_segment_plans(&plans).unwrap();
+        let err =
+            merge_staging_segment(dataset.object_store(), &dataset.indices_dir(), &merged_plan)
+                .await
+                .unwrap_err();
         assert!(err.to_string().contains("mismatched IVF centroids"));
     }
 
@@ -2086,15 +2093,9 @@ mod tests {
             .map(|fragment| vec![fragment.id() as u32])
             .collect::<Vec<_>>();
         let partial_shards = build_partial_shards(&dataset, shared_uuid, &fragment_groups).await;
-        let plans = plan_staging_segments(
-            dataset.object_store(),
-            &index_dir,
-            &partial_shards,
-            None,
-            Some(1),
-        )
-        .await
-        .unwrap();
+        let plans = plan_staging_segments(&index_dir, &partial_shards, None, Some(1))
+            .await
+            .unwrap();
         assert_eq!(plans.len(), fragments.iter().take(2).count());
 
         let mut segments = Vec::with_capacity(plans.len());

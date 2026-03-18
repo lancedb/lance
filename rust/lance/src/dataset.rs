@@ -2719,13 +2719,13 @@ impl Dataset {
                                 crate::index::vector::ivf::PartialShard::new(
                                     shard_uuid,
                                     std::iter::empty::<u32>(),
+                                    0,
                                 )
                             })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 partial_shards.sort_by_key(|shard| shard.uuid());
                 let segment_plans = crate::index::vector::ivf::plan_staging_segments(
-                    self.object_store(),
                     &index_dir,
                     &partial_shards,
                     Some(index_type),
