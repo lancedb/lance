@@ -1845,6 +1845,11 @@ mod tests {
         let test_cases = vec![
             ("s3://multi-path-test/test1/subBucket2", "test1/subBucket2"),
             ("gs://my-bucket/path/to/data", "path/to/data"),
+            ("az://container/path/to/data", "path/to/data"),
+            (
+                "abfss://filesystem@account.dfs.core.windows.net/path/to/data",
+                "path/to/data",
+            ),
             ("file:///tmp/test/bucket", "tmp/test/bucket"),
         ];
 
@@ -1871,6 +1876,18 @@ mod tests {
                     id: 2,
                     name: Some("bucket2".to_string()),
                     path: "s3://bucket2/path2".to_string(),
+                    is_dataset_root: true,
+                },
+                BasePath {
+                    id: 3,
+                    name: Some("azure-az-base".to_string()),
+                    path: "az://container/path1".to_string(),
+                    is_dataset_root: true,
+                },
+                BasePath {
+                    id: 4,
+                    name: Some("azure-abfss-base".to_string()),
+                    path: "abfss://filesystem@account.dfs.core.windows.net/path1".to_string(),
                     is_dataset_root: true,
                 },
             ]),
