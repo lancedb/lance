@@ -8,11 +8,10 @@ use std::{
 
 use arrow::array::AsArray;
 use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
     RecordBatch,
+    types::{Float16Type, Float32Type, Float64Type},
 };
 use arrow_schema::{DataType, Field};
-use snafu::location;
 use tracing::instrument;
 
 use crate::vector::transform::Transformer;
@@ -53,26 +52,22 @@ impl Transformer for SQTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input = batch
             .column_by_name(&self.input_column)
-            .ok_or(Error::Index {
-                message: format!(
-                    "SQ Transform: column {} not found in batch",
-                    self.input_column
-                ),
-                location: location!(),
-            })?;
-        let fsl = input.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: "input column is not vector type".to_string(),
-            location: location!(),
-        })?;
+            .ok_or(Error::index(format!(
+                "SQ Transform: column {} not found in batch",
+                self.input_column
+            )))?;
+        let fsl = input
+            .as_fixed_size_list_opt()
+            .ok_or(Error::index("input column is not vector type".to_string()))?;
         let sq_code = match fsl.value_type() {
             DataType::Float16 => self.quantizer.transform::<Float16Type>(input)?,
             DataType::Float32 => self.quantizer.transform::<Float32Type>(input)?,
             DataType::Float64 => self.quantizer.transform::<Float64Type>(input)?,
             _ => {
-                return Err(Error::Index {
-                    message: format!("unsupported data type: {}", fsl.value_type()),
-                    location: location!(),
-                })
+                return Err(Error::index(format!(
+                    "unsupported data type: {}",
+                    fsl.value_type()
+                )));
             }
         };
 

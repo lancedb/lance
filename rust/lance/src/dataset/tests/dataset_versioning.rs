@@ -4,24 +4,25 @@
 use std::sync::Arc;
 use std::vec;
 
+use crate::Dataset;
+use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::UpdateBuilder;
 use crate::datatypes::Schema;
-use crate::Dataset;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
-use arrow_array::{types::Int32Type, RecordBatchIterator, UInt32Array};
+use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 
 use crate::dataset::refs::branch_contents_path;
 use futures::TryStreamExt;
+use lance_core::Error;
 use object_store::path::Path;
 use rstest::rstest;
 use std::cmp::Ordering;
@@ -730,8 +731,10 @@ async fn test_branch() {
 
     let mut dataset = main_dataset;
     // Finally delete all branches
-    dataset.delete_branch("branch1").await.unwrap();
-    dataset.delete_branch("dev/branch2").await.unwrap();
+    assert!(matches!(
+        dataset.delete_branch("branch1").await,
+        Err(Error::RefConflict { message: _ })
+    ));
     // Test deleting zombie branch
     let root_location = dataset.refs.root().unwrap();
     let branch_file = branch_contents_path(&root_location.path, "feature/nathan/branch3");
@@ -744,6 +747,9 @@ async fn test_branch() {
         .unwrap();
     let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
+
+    dataset.delete_branch("dev/branch2").await.unwrap();
+    dataset.delete_branch("branch1").await.unwrap();
 
     // Verify list_branches is empty
     let branches_after_delete = dataset.list_branches().await.unwrap();

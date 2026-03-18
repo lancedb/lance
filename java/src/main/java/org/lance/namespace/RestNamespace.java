@@ -228,14 +228,6 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-    ensureInitialized();
-    String requestJson = toJson(request);
-    String responseJson = createEmptyTableNative(nativeRestNamespaceHandle, requestJson);
-    return fromJson(responseJson, CreateEmptyTableResponse.class);
-  }
-
-  @Override
   public DeclareTableResponse declareTable(DeclareTableRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
@@ -336,11 +328,53 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = listTableVersionsNative(nativeRestNamespaceHandle, requestJson);
+    return fromJson(responseJson, ListTableVersionsResponse.class);
+  }
+
+  @Override
+  public CreateTableVersionResponse createTableVersion(CreateTableVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createTableVersionNative(nativeRestNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateTableVersionResponse.class);
+  }
+
+  @Override
+  public DescribeTableVersionResponse describeTableVersion(DescribeTableVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = describeTableVersionNative(nativeRestNamespaceHandle, requestJson);
+    return fromJson(responseJson, DescribeTableVersionResponse.class);
+  }
+
+  @Override
+  public BatchDeleteTableVersionsResponse batchDeleteTableVersions(
+      BatchDeleteTableVersionsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = batchDeleteTableVersionsNative(nativeRestNamespaceHandle, requestJson);
+    return fromJson(responseJson, BatchDeleteTableVersionsResponse.class);
+  }
+
+  @Override
   public void close() {
     if (nativeRestNamespaceHandle != 0) {
       releaseNative(nativeRestNamespaceHandle);
       nativeRestNamespaceHandle = 0;
     }
+  }
+
+  /**
+   * Returns the native handle for this namespace. Used internally for passing to Dataset.open() for
+   * namespace commit handler support.
+   */
+  public long getNativeHandle() {
+    ensureInitialized();
+    return nativeRestNamespaceHandle;
   }
 
   private void ensureInitialized() {
@@ -401,8 +435,6 @@ public class RestNamespace implements LanceNamespace, Closeable {
 
   private native String createTableNative(long handle, String requestJson, byte[] requestData);
 
-  private native String createEmptyTableNative(long handle, String requestJson);
-
   private native String declareTableNative(long handle, String requestJson);
 
   private native String renameTableNative(long handle, String requestJson);
@@ -427,6 +459,14 @@ public class RestNamespace implements LanceNamespace, Closeable {
   private native String describeTransactionNative(long handle, String requestJson);
 
   private native String alterTransactionNative(long handle, String requestJson);
+
+  private native String listTableVersionsNative(long handle, String requestJson);
+
+  private native String createTableVersionNative(long handle, String requestJson);
+
+  private native String describeTableVersionNative(long handle, String requestJson);
+
+  private native String batchDeleteTableVersionsNative(long handle, String requestJson);
 
   // ==========================================================================
   // Provider loading helpers

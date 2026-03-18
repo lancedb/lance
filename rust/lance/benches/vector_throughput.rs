@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{StreamExt, TryStreamExt};
 use lance_file::version::LanceFileVersion;
 use log::info;
@@ -22,8 +22,8 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::{
-    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexType,
+    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;
@@ -215,20 +215,20 @@ fn drop_dataset_from_cache(dataset_dir: &str) -> std::io::Result<()> {
     let entries = fs::read_dir(format!("{}/data", dataset_dir)).unwrap();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
-            if let Ok(file) = fs::File::open(&path) {
-                let fd = file.as_raw_fd();
-                // POSIX_FADV_DONTNEED = 4
-                let result = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
-                if result != 0 {
-                    panic!(
-                        "Warning: Failed to drop {:?} from cache: {}",
-                        path,
-                        std::io::Error::from_raw_os_error(result)
-                    );
-                }
-                num_dropped += 1;
+        if path.is_file()
+            && let Ok(file) = fs::File::open(&path)
+        {
+            let fd = file.as_raw_fd();
+            // POSIX_FADV_DONTNEED = 4
+            let result = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if result != 0 {
+                panic!(
+                    "Warning: Failed to drop {:?} from cache: {}",
+                    path,
+                    std::io::Error::from_raw_os_error(result)
+                );
             }
+            num_dropped += 1;
         }
     }
     if num_dropped == 0 {
@@ -287,7 +287,11 @@ fn bench_ivf_pq_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("ivf_pq_throughput");
     group.throughput(Throughput::Elements(NUM_QUERIES as u64));
 
-    for &version in &[LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
+    for &version in &[
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+    ] {
         // Get or create cached dataset
         let cached_dataset = get_or_create_dataset(&rt, version);
 

@@ -10,7 +10,6 @@ use deepsize::DeepSizeOf;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::traits::ProtoStruct;
-use snafu::location;
 
 /// Data File Metadata
 #[derive(Debug, Default, DeepSizeOf, PartialEq)]
@@ -169,14 +168,11 @@ impl Metadata {
     // TODO: pub(crate)
     pub fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
-            return Err(Error::invalid_input(
-                format!(
-                    "Range {:?} is out of bounds {}",
-                    range,
-                    self.batch_offsets.last().unwrap()
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Range {:?} is out of bounds {}",
+                range,
+                self.batch_offsets.last().unwrap()
+            )));
         }
         let offsets = self.batch_offsets.as_slice();
         let mut batch_id = offsets

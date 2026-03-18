@@ -21,6 +21,7 @@ import pytest
 from lance import LanceDataset, LanceFragment
 from lance.dataset import Index, VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
+from lance.query import MatchQuery, PhraseQuery
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -181,6 +182,28 @@ def test_flat(dataset):
 
 def test_ann(indexed_dataset):
     run(indexed_dataset)
+
+
+def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):
+    # Keep this before other distributed vector merge tests so the process-level
+    # lazy window size initialization reads this override.
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE", "4")
+    monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT", "2")
+
+    data = create_table(nvec=3000, ndim=128)
+    q = np.random.randn(128).astype(np.float32)
+    assert_distributed_vector_consistency(
+        data,
+        "vector",
+        index_type="IVF_PQ",
+        index_params={"num_partitions": 10, "num_sub_vectors": 16},
+        queries=[q],
+        topk=10,
+        world=2,
+        tmp_path=tmp_path,
+        similarity_metric="recall",
+        similarity_threshold=0.80,
+    )
 
 
 @pytest.mark.parametrize(
@@ -496,9 +519,8 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
             accelerator="cuda",
         )
 
-    indices = dataset.list_indices()
-    assert len(indices) == 1
-    assert indices[0]["type"] == "IVF_HNSW_SQ"
+    stats = dataset.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_SQ"
     assert any(
         "does not support GPU acceleration; falling back to CPU" in record.message
         for record in caplog.records
@@ -560,7 +582,7 @@ def test_has_index(dataset, tmp_path):
     )
     assert ann_ds.has_index
 
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_index_type(dataset, tmp_path):
@@ -573,7 +595,8 @@ def test_index_type(dataset, tmp_path):
         num_sub_vectors=16,
         replace=True,
     )
-    assert ann_ds.list_indices()[0]["type"] == "IVF_PQ"
+    stats = ann_ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_PQ"
 
     ann_ds = ann_ds.create_index(
         "vector",
@@ -582,7 +605,8 @@ def test_index_type(dataset, tmp_path):
         num_sub_vectors=16,
         replace=True,
     )
-    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_SQ"
+    stats = ann_ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_SQ"
 
     ann_ds = ann_ds.create_index(
         "vector",
@@ -591,7 +615,8 @@ def test_index_type(dataset, tmp_path):
         num_sub_vectors=16,
         replace=True,
     )
-    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_PQ"
+    stats = ann_ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_PQ"
 
 
 def test_create_dot_index(dataset, tmp_path):
@@ -790,7 +815,7 @@ def test_create_ivf_sq_index(dataset, tmp_path):
         index_type="IVF_SQ",
         num_partitions=4,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_create_ivf_rq_index():
@@ -801,7 +826,9 @@ def test_create_ivf_rq_index():
         num_partitions=4,
         num_bits=1,
     )
-    assert ds.list_indices()[0]["fields"] == ["vector"]
+    assert ds.describe_indices()[0].field_names == ["vector"]
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["packed"] is True
 
     with pytest.raises(
         NotImplementedError,
@@ -840,6 +867,64 @@ def test_create_ivf_rq_index():
     assert res["_distance"].to_numpy().max() == 0.0
 
 
+def test_create_ivf_rq_skip_transpose():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+        skip_transpose=True,
+    )
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["packed"] is False
+
+
+def test_create_ivf_rq_requires_dim_divisible_by_8():
+    vectors = np.zeros((1000, 30), dtype=np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(vectors, type=pa.list_(pa.float32(), 30))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+
+    with pytest.raises(
+        ValueError, match="vector dimension must be divisible by 8 for IVF_RQ"
+    ):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=1,
+        )
+
+
+def test_create_ivf_rq_mostly_null():
+    ndim = 128
+    nvec = 100
+    nnull = 9900
+    vectors = np.random.randn(nvec, ndim).astype(np.float32).tolist()
+    vectors += [None] * nnull
+    tbl = pa.table(
+        {
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), ndim)),
+            "id": pa.array(range(nvec + nnull), type=pa.int32()),
+        }
+    )
+    ds = lance.write_dataset(tbl, "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    q = np.random.randn(ndim).astype(np.float32)
+    result = ds.to_table(
+        nearest={"column": "vector", "q": q, "k": 10},
+    )
+    assert result.num_rows == 10
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
@@ -849,7 +934,7 @@ def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
@@ -861,7 +946,7 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
@@ -873,7 +958,7 @@ def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
         num_partitions=4,
         num_sub_vectors=16,
     )
-    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+    assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
@@ -939,10 +1024,10 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     )["id"].to_numpy()
     assert len(actual) == 10
 
-    index_meta = dataset_with_index.list_indices()[0]
-    index_uuid = index_meta["uuid"]
+    index_meta = dataset_with_index.describe_indices()[0]
+    index_uuid = index_meta.segments[0].uuid
     assert len(index_uuid) == 36
-    assert index_meta["fragment_ids"] == {0}
+    assert index_meta.segments[0].fragment_ids == {0}
 
     expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
     if platform.system() == "Windows":
@@ -986,6 +1071,22 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert len(partitions) == 5
     partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
+
+
+def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
+    ds = lance.write_dataset(
+        dataset.to_table(), tmp_path / "indexed_skip_transpose.lance"
+    )
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        skip_transpose=True,
+    )
+
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["transposed"] is False
 
 
 def test_optimize_index(dataset, tmp_path):
@@ -1425,7 +1526,7 @@ def test_index_cast_centroids(tmp_path):
     )
 
     # Get the centroids
-    index_name = dataset.list_indices()[0]["name"]
+    index_name = dataset.describe_indices()[0].name
     index_stats = dataset.stats.index_stats(index_name)
     centroids = index_stats["indices"][0]["centroids"]
     values = pa.array([x for arr in centroids for x in arr], pa.float32())
@@ -1507,13 +1608,13 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
 
 
 def test_load_indices(dataset):
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 0
 
     dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
 
 
@@ -1522,8 +1623,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
 
     assert info.name == "vector_idx"
     assert info.type_url == "/lance.table.VectorIndexDetails"
-    # This is currently Unknown because vector indices are not yet handled by plugins
-    assert info.index_type == "Unknown"
+    assert info.index_type == "IVF_PQ"
     assert info.num_rows_indexed == 1000
     assert info.fields == [0]
     assert info.field_names == ["vector"]
@@ -1537,23 +1637,23 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
 def test_optimize_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 1
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 1
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 2
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 2
 
 
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 1
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 1
 
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 2
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 2
 
     stats = indexed_dataset.stats.index_stats("vector_idx")
     centroids = stats["indices"][0]["centroids"]
@@ -1564,8 +1664,8 @@ def test_retrain_indices(indexed_dataset):
     new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
         "centroids"
     ]
-    indices = indexed_dataset.list_indices()
-    assert len(indices) == 1
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_indices"] == 1
     assert centroids != new_centroids
 
 
@@ -1583,10 +1683,10 @@ def test_no_include_deleted_rows(indexed_dataset):
 
 
 def test_drop_indices(indexed_dataset):
-    idx_name = indexed_dataset.list_indices()[0]["name"]
+    idx_name = indexed_dataset.describe_indices()[0].name
 
     indexed_dataset.drop_index(idx_name)
-    indices = indexed_dataset.list_indices()
+    indices = indexed_dataset.describe_indices()
     assert len(indices) == 0
 
     test_vec = (
@@ -1607,7 +1707,7 @@ def test_drop_indices(indexed_dataset):
 
 
 def test_read_partition(indexed_dataset):
-    idx_name = indexed_dataset.list_indices()[0]["name"]
+    idx_name = indexed_dataset.describe_indices()[0].name
     reader = VectorIndexReader(indexed_dataset, idx_name)
 
     num_rows = indexed_dataset.count_rows()
@@ -1789,9 +1889,9 @@ def test_nested_field_vector_index(tmp_path):
     )
 
     # Verify index was created
-    indices = dataset.list_indices()
+    indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0]["fields"] == ["data.embedding"]
+    assert indices[0].field_names == ["embedding"]
 
     # Test querying with the index
     query_vec = vectors[0]
@@ -2747,3 +2847,126 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     assert ids_12 == ids_21
     for a, b in zip(dists_12, dists_21):
         assert np.allclose(a, b, atol=1e-6)
+
+
+def test_fts_filter_vector_search(tmp_path):
+    # Create dataset with vector and text columns
+    ids = list(range(1, 301))
+    vectors = [[float(i)] * 4 for i in ids]
+
+    # Create text data:
+    #   "text <i>" for ids 1-255, 299, 300,
+    #   "noop <i>" for 256-298,
+    texts = []
+    for i in ids:
+        if i <= 255:
+            texts.append(f"text {i}")
+        elif i <= 298:
+            texts.append(f"noop {i}")
+        else:
+            texts.append(f"text {i}")
+
+    categories = []
+    for i in ids:
+        if i % 3 == 1:
+            categories.append("literature")
+        elif i % 3 == 2:
+            categories.append("science")
+        else:
+            categories.append("geography")
+
+    table = pa.table(
+        {
+            "id": ids,
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 4)),
+            "text": texts,
+            "category": categories,
+        }
+    )
+
+    # Write dataset and create indices
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=4,
+    )
+    dataset.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    query_vector = [300.0, 300.0, 300.0, 300.0]
+
+    # Case 1: search with prefilter=true, query_filter=match("text")
+    scanner = dataset.scanner(
+        filter=MatchQuery("text", "text"),
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=True,
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300, 299, 255, 254, 253] == ids_result
+
+    # Case 2: search with prefilter=true, search_filter=match("text"),
+    #         filter="category='geography'"
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=True,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300, 255, 252, 249, 246] == ids_result
+
+    # Case 3: search with prefilter=false, search_filter=match("text")
+    scanner = dataset.scanner(
+        filter=MatchQuery("text", "text"),
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300, 299] == ids_result
+
+    # Case 4: search with prefilter=false, search_filter=match("text"),
+    #         filter="category='geography'"
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": MatchQuery("text", "text"),
+        },
+    )
+
+    result = scanner.to_table()
+    ids_result = result["id"].to_pylist()
+    assert [300] == ids_result
+
+    # Case 5: search with prefilter=false, search_filter=phrase("text")
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+        filter=PhraseQuery("text", "text"),
+    )
+
+    with pytest.raises(ValueError):
+        scanner.to_table()
+
+    # Case 6: search with prefilter=false, search_filter=phrase("text")
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 5},
+        prefilter=False,
+        filter={
+            "expr_filter": "category='geography'",
+            "search_filter": PhraseQuery("text", "text"),
+        },
+    )
+
+    with pytest.raises(ValueError):
+        scanner.to_table()

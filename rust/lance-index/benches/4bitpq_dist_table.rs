@@ -7,13 +7,13 @@ use std::iter::repeat_n;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{FixedSizeListArray, UInt8Array};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_index::vector::pq::distance::{build_distance_table_dot, build_distance_table_l2};
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pq::distance::{build_distance_table_dot, build_distance_table_l2};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
-use rand::{prelude::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, prelude::StdRng};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

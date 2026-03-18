@@ -12,16 +12,16 @@ use std::{
 };
 
 use arrow_array::{
-    types::{Float16Type, Float32Type, Float64Type},
     Array, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array,
+    types::{Float16Type, Float32Type, Float64Type},
 };
 use arrow_schema::{DataType, Field};
 use half::{bf16, f16};
 use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
-use crate::bfloat16::is_bfloat16_field;
 use crate::Result;
+use crate::bfloat16::is_bfloat16_field;
 
 /// Float data type.
 ///

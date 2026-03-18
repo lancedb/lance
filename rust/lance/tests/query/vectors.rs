@@ -6,7 +6,7 @@ use crate::utils::DatasetTestCases;
 use arrow::datatypes::{Date32Type, Float32Type, Int32Type};
 use arrow_array::RecordBatch;
 use lance::Dataset;
-use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
+use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
 use lance_index::IndexType;
 
 fn date_as_i32(date: &str) -> i32 {

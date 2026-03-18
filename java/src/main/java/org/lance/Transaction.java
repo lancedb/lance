@@ -18,39 +18,58 @@ import org.lance.operation.Operation;
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Align with the Transaction struct in rust. The transaction won't commit the status to original
- * dataset. It will return a new dataset after committed.
+ * A pure data container representing a Lance transaction.
+ *
+ * <p>A Transaction holds the read version, a unique identifier, the operation to perform, and
+ * optional transaction properties. It does not contain commit configuration or execution logic.
+ *
+ * <p>To commit a transaction, use {@link CommitBuilder} or {@link SourcedTransaction}.
  */
-public class Transaction {
+public class Transaction implements AutoCloseable {
 
   private final long readVersion;
   private final String uuid;
-  private final Map<String, String> writeParams;
-  private final Optional<Map<String, String>> transactionProperties;
-  // Mainly for JNI usage
-  private final Dataset dataset;
   private final Operation operation;
+  private final Optional<String> tag;
+  private final Optional<Map<String, String>> transactionProperties;
 
+  /**
+   * Constructor used by JNI when reading transactions from native code.
+   *
+   * @param readVersion the version that was read when creating this transaction
+   * @param uuid the unique identifier for this transaction
+   * @param operation the operation to perform
+   * @param tag optional tag for the transaction
+   * @param transactionProperties optional transaction properties
+   */
   private Transaction(
-      Dataset dataset,
       long readVersion,
       String uuid,
       Operation operation,
-      Map<String, String> writeParams,
+      String tag,
       Map<String, String> transactionProperties) {
-    this.dataset = dataset;
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
-    this.writeParams = writeParams != null ? writeParams : new HashMap<>();
+    this.tag = Optional.ofNullable(tag);
     this.transactionProperties = Optional.ofNullable(transactionProperties);
+  }
+
+  /**
+   * Create a transaction with the given read version and operation. A random UUID is generated
+   * automatically.
+   *
+   * @param readVersion the version that was read when creating this transaction
+   * @param operation the operation to perform
+   */
+  public Transaction(long readVersion, Operation operation) {
+    this(readVersion, UUID.randomUUID().toString(), operation, null, null);
   }
 
   public long readVersion() {
@@ -65,22 +84,18 @@ public class Transaction {
     return operation;
   }
 
-  public Map<String, String> writeParams() {
-    return writeParams;
+  /** Returns the optional tag for this transaction. */
+  public Optional<String> tag() {
+    return tag;
   }
 
   public Optional<Map<String, String>> transactionProperties() {
     return transactionProperties;
   }
 
-  public Dataset commit() {
-    if (dataset == null) {
-      throw new UnsupportedOperationException("Transaction doesn't support create new dataset yet");
-    }
-    return dataset.commitTransaction(this);
-  }
-
-  public void release() {
+  /** Release native resources held by the operation (e.g. Arrow C schemas). */
+  @Override
+  public void close() {
     operation.release();
   }
 
@@ -90,7 +105,7 @@ public class Transaction {
         .add("readVersion", readVersion)
         .add("uuid", uuid)
         .add("operation", operation)
-        .add("writeParams", writeParams)
+        .add("tag", tag)
         .add("transactionProperties", transactionProperties)
         .toString();
   }
@@ -107,20 +122,24 @@ public class Transaction {
     return readVersion == that.readVersion
         && uuid.equals(that.uuid)
         && Objects.equals(operation, that.operation)
-        && Objects.equals(writeParams, that.writeParams)
+        && Objects.equals(tag, that.tag)
         && Objects.equals(transactionProperties, that.transactionProperties);
   }
 
+  @Override
+  public int hashCode() {
+    return Objects.hash(readVersion, uuid, operation, tag, transactionProperties);
+  }
+
+  /** Builder for constructing {@link Transaction} instances. */
   public static class Builder {
-    private final String uuid;
-    private final Dataset dataset;
+    private String uuid;
     private long readVersion;
     private Operation operation;
-    private Map<String, String> writeParams;
+    private String tag;
     private Map<String, String> transactionProperties;
 
-    public Builder(Dataset dataset) {
-      this.dataset = dataset;
+    public Builder() {
       this.uuid = UUID.randomUUID().toString();
     }
 
@@ -129,34 +148,39 @@ public class Transaction {
       return this;
     }
 
+    public Builder uuid(String uuid) {
+      this.uuid = uuid;
+      return this;
+    }
+
+    public Builder operation(Operation operation) {
+      if (this.operation != null) {
+        throw new IllegalStateException(
+            String.format("Operation %s has been set", this.operation.name()));
+      }
+      this.operation = operation;
+      return this;
+    }
+
+    /**
+     * Set an optional tag for the transaction.
+     *
+     * @param tag the tag string
+     * @return this builder instance
+     */
+    public Builder tag(String tag) {
+      this.tag = tag;
+      return this;
+    }
+
     public Builder transactionProperties(Map<String, String> properties) {
       this.transactionProperties = properties;
       return this;
     }
 
-    public Builder writeParams(Map<String, String> writeParams) {
-      this.writeParams = writeParams;
-      return this;
-    }
-
-    public Builder operation(Operation operation) {
-      validateState();
-      this.operation = operation;
-      return this;
-    }
-
-    private void validateState() {
-      if (operation != null) {
-        throw new IllegalStateException(
-            String.format("Operation %s has been set", operation.name()));
-      }
-    }
-
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-
-      return new Transaction(
-          dataset, readVersion, uuid, operation, writeParams, transactionProperties);
+      return new Transaction(readVersion, uuid, operation, tag, transactionProperties);
     }
   }
 }

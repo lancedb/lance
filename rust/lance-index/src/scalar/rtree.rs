@@ -10,14 +10,14 @@ use crate::scalar::registry::{
 };
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexReader, IndexReaderStream, IndexStore,
-    IndexWriter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexReader, IndexStore, IndexWriter,
+    ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::vector::VectorIndex;
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType, pb};
+use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::UInt32Array;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -25,8 +25,9 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
-use futures::{stream, StreamExt, TryFutureExt, TryStreamExt};
-use geoarrow_array::array::{from_arrow_array, RectArray};
+use futures::future::BoxFuture;
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
+use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
@@ -35,13 +36,12 @@ use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::utils::tempfile::TempDir;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
-pub use lance_geo::bbox::{bounding_box, total_bounds, BoundingBox};
+pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use sort::hilbert_sort::HilbertSorter;
 use std::any::Any;
 use std::collections::HashMap;
@@ -78,6 +78,56 @@ static RTREE_NULLS_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
         false,
     )]))
 });
+
+/// A stream that reads the original training data back out of the index
+struct IndexReaderStream {
+    reader: Arc<dyn IndexReader>,
+    batch_size: u64,
+    offset: u64,
+    limit: u64,
+}
+
+impl IndexReaderStream {
+    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
+        let limit = reader.num_rows() as u64;
+        Self::new_with_limit(reader, batch_size, limit).await
+    }
+
+    async fn new_with_limit(reader: Arc<dyn IndexReader>, batch_size: u64, limit: u64) -> Self {
+        Self {
+            reader,
+            batch_size,
+            offset: 0,
+            limit,
+        }
+    }
+}
+
+impl Stream for IndexReaderStream {
+    type Item = BoxFuture<'static, Result<RecordBatch>>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.offset >= this.limit {
+            return std::task::Poll::Ready(None);
+        }
+        let read_start = this.offset;
+        let read_end = this.limit.min(this.offset + this.batch_size);
+        this.offset = read_end;
+        let reader_copy = this.reader.clone();
+
+        let read_task = async move {
+            reader_copy
+                .read_range(read_start as usize..read_end as usize, None)
+                .await
+        }
+        .boxed();
+        std::task::Poll::Ready(Some(read_task))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RTreeMetadata {
@@ -157,9 +207,11 @@ pub fn extract_bounding_boxes(
     geometry_array: &dyn Array,
     geometry_field: &ArrowField,
 ) -> Result<RectArray> {
-    let geo_array = from_arrow_array(geometry_array, geometry_field).map_err(|e| Error::Index {
-        message: format!("Construct GeoArrowArray from an Arrow Array failed: {}", e),
-        location: location!(),
+    let geo_array = from_arrow_array(geometry_array, geometry_field).map_err(|e| {
+        Error::index(format!(
+            "Construct GeoArrowArray from an Arrow Array failed: {}",
+            e
+        ))
     })?;
     let rect_array = bounding_box(geo_array.as_ref())?;
 
@@ -394,17 +446,14 @@ impl Index for RTreeIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "RTreeIndex is not vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "RTreeIndex is not vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(self.metadata.clone()).map_err(|e| Error::Internal {
-            message: format!("Error serializing statistics: {}", e),
-            location: location!(),
-        })
+        serde_json::to_value(self.metadata.clone())
+            .map_err(|e| Error::internal(format!("Error serializing statistics: {}", e)))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -501,16 +550,16 @@ impl ScalarIndex for RTreeIndex {
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::InvalidInput {
-            source: "RTree does not support remap".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "RTree does not support remap".into(),
+        ))
     }
 
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
         let tmpdir = Arc::new(TempDir::default());
@@ -611,18 +660,16 @@ pub struct RTreeIndexPlugin;
 impl RTreeIndexPlugin {
     fn validate_schema(schema: &ArrowSchema) -> Result<()> {
         if schema.fields().len() != 2 {
-            return Err(Error::InvalidInput {
-                source: "RTree index schema must have exactly two fields".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "RTree index schema must have exactly two fields".into(),
+            ));
         }
 
         let row_id_field = schema.field_with_name(ROW_ID)?;
         if *row_id_field.data_type() != DataType::UInt64 {
-            return Err(Error::InvalidInput {
-                source: "Second field in RTree index schema must be of type UInt64".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Second field in RTree index schema must be of type UInt64".into(),
+            ));
         }
         Ok(())
     }
@@ -882,12 +929,12 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "RTree index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "RTree index does not support fragment training".into(),
+            ));
         }
 
         Self::validate_schema(&data.schema())?;
@@ -959,7 +1006,7 @@ mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use arrow_array::ArrayRef;
     use arrow_schema::Schema;
-    use geo_types::{coord, Rect};
+    use geo_types::{Rect, coord};
     use geoarrow_array::builder::{PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, PointType, RectType};
     use lance_core::utils::tempfile::TempObjDir;
@@ -1021,6 +1068,7 @@ mod tests {
                     page_size: Some(page_size),
                 })),
                 None,
+                crate::progress::noop_progress(),
             )
             .await
             .unwrap();
@@ -1172,7 +1220,7 @@ mod tests {
             Arc::new(UInt64Array::from(new_rowaddr_arr.clone())),
         );
         rtree_index
-            .update(stream, new_store.as_ref())
+            .update(stream, new_store.as_ref(), None)
             .await
             .unwrap();
 
@@ -1247,17 +1295,21 @@ mod tests {
         rtree_index.prewarm().await.unwrap();
 
         for page_id in 0..rtree_index.metadata.num_pages {
-            assert!(rtree_index
-                .index_cache
-                .get_with_key(&RTreeCacheKey::Page(page_id))
-                .await
-                .is_some())
+            assert!(
+                rtree_index
+                    .index_cache
+                    .get_with_key(&RTreeCacheKey::Page(page_id))
+                    .await
+                    .is_some()
+            )
         }
 
-        assert!(rtree_index
-            .index_cache
-            .get_with_key(&RTreeCacheKey::Nulls)
-            .await
-            .is_some())
+        assert!(
+            rtree_index
+                .index_cache
+                .get_with_key(&RTreeCacheKey::Nulls)
+                .await
+                .is_some()
+        )
     }
 }

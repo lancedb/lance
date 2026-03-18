@@ -4,17 +4,16 @@
 use std::sync::Arc;
 
 use arrow_array::types::{
-    Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
-use arrow_array::{cast::AsArray, Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
-use arrow_buffer::bit_util::ceil;
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, cast::AsArray};
 use arrow_buffer::ArrowNativeType;
+use arrow_buffer::bit_util::ceil;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
 use num_traits::{AsPrimitive, PrimInt};
-use snafu::location;
 
 use lance_arrow::DataTypeExt;
 use lance_bitpacking::BitPacking;
@@ -188,7 +187,9 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
             }
         }
         _ => {
-            panic!("BitpackedForNonNegArrayEncoder only supports data types of UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64");
+            panic!(
+                "BitpackedForNonNegArrayEncoder only supports data types of UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64"
+            );
         }
     };
     res
@@ -327,10 +328,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                         }
                     }
                     _ => {
-                        return Err(Error::InvalidInput {
-                            source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source("Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into()));
                     }
                 }
                 let encoding =
@@ -346,10 +344,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 })
             }
             _ => {
-                Err(Error::InvalidInput {
-                    source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
-                    location: location!(),
-                })
+                Err(Error::invalid_input_source("Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into()))
             }
         }
     }
@@ -467,10 +462,7 @@ struct BitpackedForNonNegPageDecoder {
 impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         if ![8, 16, 32, 64].contains(&self.uncompressed_bits_per_value) {
-            return Err(Error::InvalidInput {
-                source: "BitpackedForNonNegPageDecoder should only has uncompressed_bits_per_value of 8, 16, 32, or 64".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("BitpackedForNonNegPageDecoder should only has uncompressed_bits_per_value of 8, 16, 32, or 64".into()));
         }
 
         let elem_size_in_bytes = self.uncompressed_bits_per_value / 8;
@@ -712,10 +704,9 @@ impl ArrayEncoder for BitpackedArrayEncoder {
         let mut dst_offset = 0;
 
         let DataBlock::FixedWidth(unpacked) = data else {
-            return Err(Error::InvalidInput {
-                source: "Bitpacking only supports fixed width data blocks".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Bitpacking only supports fixed width data blocks".into(),
+            ));
         };
 
         pack_bits(
@@ -1047,10 +1038,11 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
 
                 // If we've reached the last byte, there may be some extra bits from the
                 // next value outside the range. We don't want to be taking those.
-                if let Some(buffer_bit_end_offset) = self.buffer_bit_end_offsets[i] {
-                    if src_idx == src.len() - 1 && src_offset >= buffer_bit_end_offset as u64 {
-                        break;
-                    }
+                if let Some(buffer_bit_end_offset) = self.buffer_bit_end_offsets[i]
+                    && src_idx == src.len() - 1
+                    && src_offset >= buffer_bit_end_offset as u64
+                {
+                    break;
                 }
             }
         }
@@ -1153,7 +1145,7 @@ fn rows_in_buffer(
 pub mod test {
     use crate::{
         format::pb,
-        testing::{check_round_trip_encoding_generated, ArrayGeneratorProvider, TestCases},
+        testing::{ArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
         version::LanceFileVersion,
     };
 
@@ -1161,29 +1153,28 @@ pub mod test {
     use std::{marker::PhantomData, sync::Arc};
 
     use arrow_array::{
-        types::{UInt16Type, UInt8Type},
-        ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        types::{UInt8Type, UInt16Type},
     };
 
     use arrow_schema::Field;
     use lance_datagen::{
+        ArrayGenerator, ArrayGeneratorExt, RowCount,
         array::{fill, rand_with_distribution},
-        gen_batch, ArrayGenerator, ArrayGeneratorExt, RowCount,
+        gen_batch,
     };
     use rand::distr::Uniform;
 
     #[test]
     fn test_bitpack_params() {
         fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
-            let arr = gen_batch()
+            gen_batch()
                 .anon_col(generator)
                 .into_batch_rows(RowCount::from(10000))
                 .unwrap()
                 .column(0)
-                .clone();
-
-            arr
+                .clone()
         }
 
         macro_rules! do_test {

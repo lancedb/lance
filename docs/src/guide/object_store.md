@@ -190,3 +190,31 @@ These keys can be used as both environment variables or keys in the `storage_opt
 | `azure_federated_token_file` / `federated_token_file` | File containing token for Azure AD workload identity federation. |
 | `azure_use_azure_cli` / `use_azure_cli` | Use azure cli for acquiring access token. |
 | `azure_disable_tagging` / `disable_tagging` | Disables tagging objects. This can be desirable if not supported by the backing store. | 
+
+## AliCloud Object Storage Service Configuration
+
+OSS credentials can be set in the environment variables `OSS_ACCESS_KEY_ID`,
+`OSS_ACCESS_KEY_SECRET`, `OSS_REGION`, and `OSS_SECURITY_TOKEN`. Alternatively, they can be
+passed as parameters to the `storage_options` parameter:
+
+```python
+import lance
+ds = lance.dataset(
+    "oss://bucket/path",
+    storage_options={
+        "oss_region": "oss-region",
+        "oss_endpoint": "oss-endpoint",
+        "oss_access_key_id": "my-access-key",
+        "oss_secret_access_key": "my-secret-key",
+        "oss_security_token": "my-session-token",
+    }
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `oss_endpoint` | OSS endpoint. Required (for example, `https://oss-cn-hangzhou.aliyuncs.com`). |
+| `oss_access_key_id` | Access key ID used for OSS authentication. Optional if credentials are provided by environment. |
+| `oss_secret_access_key` | Access key secret used for OSS authentication. Optional if credentials are provided by environment. |
+| `oss_region` | OSS region (for example, `cn-hangzhou`). Optional. |
+| `oss_security_token` | Security token for temporary credentials (STS). Optional. |

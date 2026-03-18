@@ -18,9 +18,9 @@ use std::vec;
 use std::{collections::HashMap, ops::MulAssign};
 
 use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, PrimitiveArray, UInt32Array,
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt8Type},
-    Array, ArrayRef, FixedSizeListArray, Float32Array, PrimitiveArray, UInt32Array,
 };
 use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
@@ -29,18 +29,17 @@ use bitvec::prelude::*;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
-use lance_linalg::distance::{dot_distance_batch, DistanceType, Normalize};
+use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
 use log::{info, warn};
 use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
-use snafu::location;
 use {
     lance_linalg::distance::{
-        l2::{l2_distance_batch, L2},
         Dot,
+        l2::{L2, l2_distance_batch},
     },
     lance_linalg::kernels::argmin_value,
 };
@@ -56,7 +55,6 @@ pub enum KMeanInit {
 }
 
 /// KMean Training Parameters
-#[derive(Debug)]
 pub struct KMeansParams {
     /// Max number of iterations.
     pub max_iters: u32,
@@ -87,6 +85,24 @@ pub struct KMeansParams {
     /// Higher would split the clusters more aggressively, which would be more accurate but slower.
     /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
+
+    /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
+    pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for KMeansParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KMeansParams")
+            .field("max_iters", &self.max_iters)
+            .field("tolerance", &self.tolerance)
+            .field("redos", &self.redos)
+            .field("init", &self.init)
+            .field("distance_type", &self.distance_type)
+            .field("balance_factor", &self.balance_factor)
+            .field("hierarchical_k", &self.hierarchical_k)
+            .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Default for KMeansParams {
@@ -99,6 +115,7 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            on_progress: None,
         }
     }
 }
@@ -130,6 +147,11 @@ impl KMeansParams {
     /// which is the same as normal kmeans clustering.
     pub fn with_balance_factor(mut self, balance_factor: f32) -> Self {
         self.balance_factor = balance_factor;
+        self
+    }
+
+    pub fn with_on_progress(mut self, cb: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Self {
+        self.on_progress = Some(cb);
         self
     }
 
@@ -420,13 +442,20 @@ where
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             if data.len() / dimension < k * 256 {
-                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                warn!(
+                    "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
                 is too small to have a meaningful index ({} < {}) or has many duplicate vectors.",
-                empty_clusters, k, data.len() / dimension, k * 256);
+                    empty_clusters,
+                    k,
+                    data.len() / dimension,
+                    k * 256
+                );
             } else {
-                warn!("KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                warn!(
+                    "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
                 has many duplicate vectors.",
-                empty_clusters, k);
+                    empty_clusters, k
+                );
             }
         }
 
@@ -663,6 +692,9 @@ impl KMeans {
 
             let mut loss = f64::MAX;
             for i in 1..=params.max_iters {
+                if let Some(cb) = &params.on_progress {
+                    cb(i, params.max_iters);
+                }
                 if i % 10 == 0 {
                     info!(
                         "KMeans training: iteration {} / {}, redo={}",
@@ -704,7 +736,12 @@ impl KMeans {
                 if (loss - last_loss).abs() < params.tolerance * last_loss {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
-                        i, params.max_iters, redo, loss, last_loss, (loss - last_loss).abs() / last_loss
+                        i,
+                        params.max_iters,
+                        redo,
+                        loss,
+                        last_loss,
+                        (loss - last_loss).abs() / last_loss
                     );
                     break;
                 }
@@ -830,10 +867,10 @@ impl KMeans {
         for i in 0..initial_k {
             let mut cluster_indices = Vec::new();
             for (idx, &cluster_id) in membership.iter().enumerate() {
-                if let Some(cid) = cluster_id {
-                    if cid as usize == i {
-                        cluster_indices.push(idx);
-                    }
+                if let Some(cid) = cluster_id
+                    && cid as usize == i
+                {
+                    cluster_indices.push(idx);
                 }
             }
 
@@ -861,14 +898,22 @@ impl KMeans {
 
             // If this cluster is already finalized, no further split is possible; stop splitting
             if largest_cluster.finalized {
-                log::warn!("Cluster {} is already finalized, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
+                log::warn!(
+                    "Cluster {} is already finalized, no further split is possible, finish with {} clusters",
+                    largest_cluster.id,
+                    heap.len() + 1
+                );
                 heap.push(largest_cluster);
                 break;
             }
 
             // Because the clusters are sorted by size, if the cluster has only 1 point, no further split is possible; stop splitting
             if largest_cluster.indices.len() <= 1 {
-                log::warn!("Cluster {} has only 1 point, no further split is possible, finish with {} clusters", largest_cluster.id, heap.len()+ 1);
+                log::warn!(
+                    "Cluster {} has only 1 point, no further split is possible, finish with {} clusters",
+                    largest_cluster.id,
+                    heap.len() + 1
+                );
                 heap.push(largest_cluster);
                 break;
             }
@@ -1012,12 +1057,10 @@ impl KMeans {
     ) -> arrow::error::Result<Self> {
         let n = data.len();
         if n < k {
-            return Err(ArrowError::InvalidArgumentError(
-                format!(
-                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
-                    n, k
-                )
-            ));
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
+                n, k
+            )));
         }
 
         // use hierarchical clustering if k > 256 and hierarchical_k > 1
@@ -1319,12 +1362,9 @@ where
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(Error::Unprocessable {
-            message: format!(
-                "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
-            ),
-            location: location!(),
-        });
+        return Err(Error::unprocessable(format!(
+            "KMeans cannot train {k} centroids with {num_rows} vectors; choose a smaller K (< {num_rows})"
+        )));
     }
 
     // Only sample sample_rate * num_clusters. See Faiss
@@ -1375,8 +1415,8 @@ pub fn compute_partition<T: Float + L2 + Dot>(
 mod tests {
     use std::iter::repeat_n;
 
-    use arrow_array::types::Float16Type;
     use arrow_array::Float16Array;
+    use arrow_array::types::Float16Type;
     use half::f16;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;

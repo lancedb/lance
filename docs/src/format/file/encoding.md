@@ -184,9 +184,9 @@ must be loaded at initialization time and placed in the search cache.
 | 12               | Number of 8-byte words in block N   |
 | 4                | Log2 of number of values in block N |
 
-The last 4 bits are special and we just store 0 today. This is because the protobuf contains the number of
-values (not required to be a power of 2) in the entire disk page. We can subtract the values in the other blocks
-to get the number of values in the last block.
+For all chunks except the last, the lower 4 bits store `log2(num_values)` and `num_values` must be a power of two.
+For the last chunk, these bits are set to `0`. The protobuf stores the total number of values in the page, so readers
+can derive the final chunk size by subtracting the values from earlier chunks.
 
 #### Buffer 2 (Dictionary, optional)
 
@@ -198,9 +198,8 @@ dictionary in the buffer at index 2. We require the dictionary to be full loaded
 This means we don't have to load the dictionary during random access but it does require the dictionary be placed
 in the search cache.
 
-Dictionary encoding is one of the few spots today where we have no rules on how it is encoded and compressed. We
-treat the entire dictionary as a single opaque buffer. As a result we rely on the block compression trait to handle
-dictionary compression.
+Dictionary values are stored as a single buffer and compressed through the block compression path. The compression
+scheme for dictionary values can be configured separately (see `lance-encoding:dict-values-compression` below).
 
 #### Buffer 2 (or 3) (Repetition Index, optional)
 
@@ -402,7 +401,8 @@ are always accessed together.
 
 Packed struct is always opt-in (see section on configuration below).
 
-Currently packed struct is limited to fixed-width data.
+In Lance 2.1, packed struct is limited to fixed-width children (`PackedStruct`).
+Starting with Lance 2.2, variable-width children are also supported via `VariablePackedStruct`.
 
 ### Fixed Size List
 
@@ -445,9 +445,9 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
-| Rle             | ❓                    | ❌                       | ✅ (2.1)                   |
+| Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
-| General         | ❓                    | ☑️ (2.1)                 | ✅ (2.1)                   |
+| General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
 in various contexts.
@@ -544,6 +544,9 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:rle-threshold`       | `0.0-1.0`                            | `0.5`            | See below                                                                               |
 | `lance-encoding:bss`                 | `off`, `on`, `auto`                  | `auto`           | See below                                                                               |
 | `lance-encoding:dict-divisor`        | Integers greater than 1              | `2`              | See below                                                                               |
+| `lance-encoding:dict-size-ratio`     | `0.0-1.0`                            | `0.8`            | See below                                                                               |
+| `lance-encoding:dict-values-compression` | `lz4`, `zstd`, `none`             | `lz4`            | Select general compression scheme for dictionary values                                 |
+| `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
 | `lance-encoding:structural-encoding` | `miniblock`, `fullzip`               | Not set          | Force a particular structural encoding to be applied (only useful for testing purposes) |
@@ -619,18 +622,46 @@ BSS is particularly effective for:
 - Time-series data with consistent precision
 - Scientific data with correlated mantissa patterns
 
-#### Dictionary Divisor
+#### Dictionary Encoding Controls
 
-Currently this is used to determine whether or not we apply dictionary encoding. First, we use HLL to estimate
-the number of unique values in the column. Then we divide the number of total values by the divisor to get a
-threshold. If the number of unique values is less than the threshold then we apply dictionary encoding. The
-configuration variable defines the divisor that we apply and it defaults to 2 which means we apply dictionary
-encoding if we estimate that less than half the values are unique.
+Dictionary encoding is gated by a few heuristics.
+The decision is made on the leaf value page, so nested types can still benefit.
+For example, `List<u32>` can use dictionary encoding for its `u32` values.
 
-Dictionary encoding is effective for columns with low cardinality where the same values repeat many times.
-The dictionary is stored once per page and indices are stored in place of the actual values.
+Two field-level metadata keys control when dictionary encoding is attempted:
 
-This is likely to change in future versions.
+- `lance-encoding:dict-divisor` (default `2`): the encoder computes a unique-value budget as `num_values / divisor`
+- `lance-encoding:dict-size-ratio` (default `0.8`): the estimated dictionary-encoded representation must stay below this ratio of the raw page size
+
+There are additional global guards available as environment variables:
+
+- `LANCE_ENCODING_DICT_TOO_SMALL` (minimum page size before trying dictionary encoding, default `100` values)
+- `LANCE_ENCODING_DICT_DIVISOR` (fallback divisor when field metadata is not set, default `2`)
+- `LANCE_ENCODING_DICT_MAX_CARDINALITY` (upper cap for dictionary entries, default `100000`)
+- `LANCE_ENCODING_DICT_SIZE_RATIO` (fallback ratio when field metadata is not set, default `0.8`)
+
+Dictionary encoding is effective when values repeat frequently and the number of distinct values stays low.
+
+#### Dictionary Values Compression
+
+Dictionary values are compressed through the block-compression path and have their own configuration:
+
+- `lance-encoding:dict-values-compression`: `lz4`, `zstd`, `none`
+- `lance-encoding:dict-values-compression-level`: optional scheme-specific level
+
+Environment-variable fallbacks:
+
+- `LANCE_ENCODING_DICT_VALUES_COMPRESSION`
+- `LANCE_ENCODING_DICT_VALUES_COMPRESSION_LEVEL`
+
+Priority order is:
+
+1. Field metadata (`dict-values-*`)
+2. Environment variables (`LANCE_ENCODING_DICT_VALUES_*`)
+3. Default (`lz4`)
+
+`none` disables general (opaque) compression for dictionary values. For fixed-width dictionary values, structural
+encodings such as RLE or bitpacking may still be selected when beneficial.
 
 #### Packed Struct Encoding
 

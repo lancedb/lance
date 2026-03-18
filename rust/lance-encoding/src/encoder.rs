@@ -23,7 +23,6 @@ use lance_core::datatypes::{Field, Schema};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
@@ -306,7 +305,6 @@ pub fn default_encoding_strategy_with_params(
     match version.resolve() {
         LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
             "Compression parameters are only supported in Lance file version 2.1 and later",
-            location!(),
         )),
         _ => {
             let compression_strategy =
@@ -412,20 +410,18 @@ impl StructuralEncodingStrategy {
                     )?));
                 }
                 DataType::Struct(_) => {
-                    return Err(Error::InvalidInput {
-                        source: "Blob v2 struct input requires file version >= 2.2".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "Blob v2 struct input requires file version >= 2.2".into(),
+                    ));
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!(
+                    return Err(Error::invalid_input_source(
+                        format!(
                             "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
                             data_type
                         )
                         .into(),
-                        location: location!(),
-                    });
+                    ));
                 }
             }
         }
@@ -458,14 +454,11 @@ impl StructuralEncodingStrategy {
                     if matches!(inner.data_type(), DataType::Struct(_)) =>
                 {
                     if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::NotSupported {
-                            source: format!(
-                                "FixedSizeList<Struct> is only supported in Lance file format 2.2+, current version: {}",
-                                self.version
-                            )
-                            .into(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_supported_source(format!(
+                            "FixedSizeList<Struct> is only supported in Lance file format 2.2+, current version: {}",
+                            self.version
+                        )
+                        .into()));
                     }
                     // Complex FixedSizeList needs structural encoding
                     let child = field.children.first().expect_ok()?;
@@ -486,47 +479,34 @@ impl StructuralEncodingStrategy {
                     //  because converting a rust arrow map field to the python arrow field will
                     //  lose the keys_sorted property.
                     if keys_sorted {
-                        return Err(Error::NotSupported {
-                            source: format!("Map data type is not supported with keys_sorted=true now, current value is {}", keys_sorted).into(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", keys_sorted).into()));
                     }
                     if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::NotSupported {
-                            source: format!(
-                                "Map data type is only supported in Lance file format 2.2+, current version: {}",
-                                self.version
-                            )
-                            .into(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_supported_source(format!(
+                            "Map data type is only supported in Lance file format 2.2+, current version: {}",
+                            self.version
+                        )
+                        .into()));
                     }
-                    let entries_child = field.children.first().ok_or_else(|| Error::Schema {
-                        message: "Map should have an entries child".to_string(),
-                        location: location!(),
+                    let entries_child = field.children.first().ok_or_else(|| {
+                        Error::schema("Map should have an entries child".to_string())
                     })?;
                     let DataType::Struct(struct_fields) = entries_child.data_type() else {
-                        return Err(Error::Schema {
-                            message: "Map entries field must be a Struct<key, value>".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(
+                            "Map entries field must be a Struct<key, value>".to_string(),
+                        ));
                     };
                     if struct_fields.len() < 2 {
-                        return Err(Error::Schema {
-                            message: "Map entries struct must contain both key and value fields"
-                                .to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(
+                            "Map entries struct must contain both key and value fields".to_string(),
+                        ));
                     }
                     let key_field = &struct_fields[0];
                     if key_field.is_nullable() {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Map key field '{}' must be non-nullable according to Arrow Map specification",
-                                key_field.name()
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(format!(
+                            "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                            key_field.name()
+                        )));
                     }
                     let child_encoder = self.do_create_field_encoder(
                         _encoding_strategy_root,
@@ -586,7 +566,7 @@ impl StructuralEncodingStrategy {
                         // but would be a significant amount of work
                         //
                         // An easier fallback implementation would be to decode-on-write and encode-on-read
-                        Err(Error::NotSupported { source: format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into(), location: location!() })
+                        Err(Error::not_supported_source(format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into()))
                     }
                 }
                 _ => todo!("Implement encoding for field {}", field),
@@ -698,14 +678,13 @@ pub async fn encode_batch(
 ) -> Result<EncodedBatch> {
     if !is_pwr_two(options.buffer_alignment) || options.buffer_alignment < MIN_PAGE_BUFFER_ALIGNMENT
     {
-        return Err(Error::InvalidInput {
-            source: format!(
+        return Err(Error::invalid_input_source(
+            format!(
                 "buffer_alignment must be a power of two and at least {}",
                 MIN_PAGE_BUFFER_ALIGNMENT
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
 
     let mut data_buffer = BytesMut::new();
@@ -790,6 +769,7 @@ pub async fn encode_batch(
 mod tests {
     use super::*;
     use crate::compression_config::{CompressionFieldParams, CompressionParams};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields};
 
     #[test]
     fn test_configured_encoding_strategy() {
@@ -818,15 +798,52 @@ mod tests {
         // Test with V2.0 - should fail
         let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
             .expect_err("Should fail for V2.0");
-        assert!(err
-            .to_string()
-            .contains("only supported in Lance file version 2.1"));
+        assert!(
+            err.to_string()
+                .contains("only supported in Lance file version 2.1")
+        );
 
         // Test with Legacy - should fail
         let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
             .expect_err("Should fail for Legacy");
-        assert!(err
-            .to_string()
-            .contains("only supported in Lance file version 2.1"));
+        assert!(
+            err.to_string()
+                .contains("only supported in Lance file version 2.1")
+        );
+    }
+
+    #[test]
+    fn test_fixed_size_list_struct_requires_v2_2() {
+        let list_item = ArrowField::new(
+            "item",
+            ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "x",
+                ArrowDataType::Int32,
+                true,
+            )])),
+            true,
+        );
+        let arrow_field = ArrowField::new(
+            "list_struct",
+            ArrowDataType::FixedSizeList(Arc::new(list_item), 2),
+            true,
+        );
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        let strategy = StructuralEncodingStrategy::with_version(LanceFileVersion::V2_1);
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions::default();
+
+        let result = strategy.create_field_encoder(&strategy, &field, &mut column_index, &options);
+        assert!(
+            result.is_err(),
+            "FixedSizeList<Struct> should be rejected for file version 2.1"
+        );
+        let err = result.err().unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("FixedSizeList<Struct> is only supported in Lance file format 2.2+")
+        );
     }
 }

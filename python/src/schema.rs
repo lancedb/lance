@@ -10,11 +10,11 @@ use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
 use pyo3::{
+    IntoPyObjectExt,
     basic::CompareOp,
     exceptions::{PyNotImplementedError, PyValueError},
     prelude::*,
     types::PyTuple,
-    IntoPyObjectExt,
 };
 
 #[pyclass(name = "LanceField", module = "lance.schema")]

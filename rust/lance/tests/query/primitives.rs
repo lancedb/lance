@@ -10,9 +10,11 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use lance::Dataset;
+use lance::dataset::WriteParams;
+use lance::dataset::optimize::{CompactionOptions, compact_files};
 
-use lance_datagen::{array, gen_batch, ArrayGeneratorExt, RowCount};
-use lance_index::IndexType;
+use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
+use lance_index::{DatasetIndexExt, IndexType};
 
 use super::{test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;
@@ -79,8 +81,58 @@ async fn test_query_integer(#[case] data_type: DataType) {
             test_filter(&original, &ds, "NOT (value > 20)").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
+            test_filter(&original, &ds, "(value != 0) OR (value < 20)").await;
+            test_filter(&original, &ds, "NOT ((value != 0) OR (value < 20))").await;
+            test_filter(
+                &original,
+                &ds,
+                "(value != 5) OR ((value != 52) OR (value IS NULL))",
+            )
+            .await;
+            test_filter(
+                &original,
+                &ds,
+                "NOT ((value != 5) OR ((value != 52) OR (value IS NULL)))",
+            )
+            .await;
         })
         .await
+}
+
+/// Regression test: BTree OR on nullable column with value not in index.
+///
+/// When all non-null values are far from the equality value (e.g. all > 100,
+/// query `!= 0`), the BTree's page lookup finds no pages containing that value.
+/// Previously, null pages were not consulted for non-IsNull queries, so the
+/// null set was empty and `NOT(x = 0)` would incorrectly pass all rows
+/// (including NULLs). See also test_search_tracks_nulls_for_absent_value in
+/// lance-index for a direct unit test of the BTree fix.
+#[tokio::test]
+async fn test_btree_nullable_or_with_absent_value() {
+    // All non-null values are in [100..160], so value 0 never appears in the index.
+    // ~33% of rows are NULL (every 3rd row).
+    let value_array: Int32Array = (0..60)
+        .map(|i| if i % 3 == 0 { None } else { Some(100 + i) })
+        .collect();
+    let id_array = Int32Array::from((0..60).collect::<Vec<i32>>());
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(id_array) as ArrayRef),
+        ("value", Arc::new(value_array) as ArrayRef),
+    ])
+    .unwrap();
+
+    DatasetTestCases::from_data(batch)
+        .with_index_types("value", [Some(IndexType::BTree)])
+        .run(|ds: Dataset, original: RecordBatch| async move {
+            test_filter(&original, &ds, "(value != 0) OR (value < 5)").await;
+            test_filter(&original, &ds, "NOT ((value != 0) OR (value < 5))").await;
+            test_filter(&original, &ds, "value != 0").await;
+            test_filter(&original, &ds, "NOT (value = 0)").await;
+            test_filter(&original, &ds, "value is null").await;
+            test_filter(&original, &ds, "value is not null").await;
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -388,4 +440,75 @@ async fn test_query_decimal(#[case] data_type: DataType) {
             test_filter(&original, &ds, "value is not null").await;
         })
         .await
+}
+
+/// Regression test: filtered scan panics after compaction with SRID when a
+/// RangeWithBitmap segment appears after a Range segment in a fragment's
+/// RowIdSequence. The bitmap iterator was advanced using a global offset
+/// instead of a range-local position, exhausting the iterator.
+///
+/// Sequence: Write(2 frags) → Delete(from frag1) → Compact → CreateIndex → FilteredScan
+#[tokio::test]
+async fn test_filtered_scan_after_compact_with_srid() {
+    use arrow::record_batch::RecordBatchIterator;
+
+    // Write 100 rows across 2 fragments (50 each) with stable row IDs.
+    let batch = RecordBatch::try_from_iter(vec![(
+        "int_col",
+        Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef,
+    )])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let write_params = WriteParams {
+        enable_stable_row_ids: true,
+        max_rows_per_file: 50,
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, "memory://compact_srid_test", Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(ds.get_fragments().len(), 2);
+    assert_eq!(ds.count_rows(None).await.unwrap(), 100);
+
+    // Delete some rows from the second fragment to create holes.
+    // After compaction, this fragment's row_ids become a RangeWithBitmap segment.
+    ds.delete("int_col >= 60 AND int_col < 70").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 90);
+
+    // Compact: merges both fragments into one. The output RowIdSequence has
+    // multiple segments: Range(0..50) followed by RangeWithBitmap(50..100).
+    // The RangeWithBitmap segment has offset_start=50 from the preceding Range.
+    compact_files(&mut ds, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    // Create a BTree index so filtered scans use mask_to_offset_ranges.
+    ds.create_index(
+        &["int_col"],
+        IndexType::BTree,
+        None,
+        &lance_index::scalar::ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // Filtered scan: the index produces a RowAddrMask, which is passed to
+    // mask_to_offset_ranges on the multi-segment RowIdSequence. Before the
+    // fix, this panicked with "called Option::unwrap() on a None value".
+    let results = ds
+        .scan()
+        .filter("int_col < 200")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.num_rows(),
+        90,
+        "Expected 90 rows (100 written - 10 deleted) but got {}",
+        results.num_rows()
+    );
 }

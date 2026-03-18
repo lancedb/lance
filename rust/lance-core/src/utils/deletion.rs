@@ -403,9 +403,11 @@ mod test {
     #[test]
     fn test_build_predicate() {
         let addrs = [0u64, 1, 2, 3, 4];
-        assert!(DeletionVector::NoDeletions
-            .build_predicate(addrs.iter())
-            .is_none());
+        assert!(
+            DeletionVector::NoDeletions
+                .build_predicate(addrs.iter())
+                .is_none()
+        );
 
         let pred = set_dv([1, 3]).build_predicate(addrs.iter()).unwrap();
         assert_eq!(

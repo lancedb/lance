@@ -53,6 +53,7 @@ mod merge_insert;
 mod namespace;
 mod optimize;
 mod schema;
+mod session;
 mod sql;
 mod storage_options;
 pub mod traits;
@@ -111,14 +112,14 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
         let path = Path::new(&log_file_path);
 
         // Create parent directories if they don't exist
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                println!(
-                    "Failed to create parent directories for log file '{}': {}, using stderr",
-                    log_file_path, e
-                );
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            println!(
+                "Failed to create parent directories for log file '{}': {}, using stderr",
+                log_file_path, e
+            );
+            return;
         }
 
         // Try to open/create the log file
@@ -136,7 +137,7 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_JniLoader_initLanceLogger() {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")

@@ -5,16 +5,16 @@ use std::sync::Arc;
 
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     format::ProtobufUtils,
     previous::encoder::{ArrayEncoder, EncodedArray},
-    EncodingsIo,
 };
 
 /// A scheduler for fixed size binary data
@@ -166,8 +166,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        builder::LargeStringBuilder, Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray,
-        StringArray,
+        Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray, StringArray,
+        builder::LargeStringBuilder,
     };
     use arrow_buffer::Buffer;
     use arrow_data::ArrayData;
@@ -176,7 +176,7 @@ mod tests {
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
     use crate::previous::encodings::physical::fixed_size_binary::FixedSizeBinaryDecoder;
-    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_utf8_binary() {

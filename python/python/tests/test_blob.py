@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import io
+import subprocess
+import sys
 import tarfile
+import textwrap
 
 import lance
 import pyarrow as pa
 import pytest
-from lance import Blob, BlobColumn
+from lance import Blob, BlobColumn, DatasetBasePath
 
 
 def test_blob_read_from_binary():
@@ -141,6 +144,43 @@ def test_blob_files(dataset_with_blobs):
     for expected in [b"foo", b"bar", b"baz"]:
         with blobs.pop(0) as f:
             assert f.read() == expected
+
+
+def test_blob_files_close_no_shutdown_panic(tmp_path):
+    script = textwrap.dedent(
+        f"""
+        import pyarrow as pa
+        import lance
+
+        table = pa.table(
+            [pa.array([b"foo", b"bar"], pa.large_binary())],
+            schema=pa.schema(
+                [
+                    pa.field(
+                        "blob",
+                        pa.large_binary(),
+                        metadata={{"lance-encoding:blob": "true"}},
+                    )
+                ]
+            ),
+        )
+        ds = lance.write_dataset(table, {str(tmp_path / "ds")!r})
+        row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+        blobs = ds.take_blobs("blob", ids=row_ids)
+        for blob in blobs:
+            blob.close()
+        print("done")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "interpreter_lifecycle.rs" not in result.stderr
+    assert "The Python interpreter is not initialized" not in result.stderr
 
 
 def test_blob_files_by_address(dataset_with_blobs):
@@ -329,6 +369,7 @@ def test_blob_extension_write_external(tmp_path):
         table,
         tmp_path / "test_ds_v2_external",
         data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
     )
 
     blob = ds.take_blobs("blob", indices=[0])[0]
@@ -370,6 +411,7 @@ def test_blob_extension_write_external_slice(tmp_path):
         table,
         tmp_path / "ds",
         data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
     )
 
     blobs = ds.take_blobs("blob", indices=[0, 1, 2])
@@ -379,3 +421,42 @@ def test_blob_extension_write_external_slice(tmp_path):
         assert blob_file.size() == len(expected)
         with blob_file as f:
             assert f.read() == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "is_dataset_root"),
+    [
+        (b"inline", True),
+        (b"p" * (64 * 1024 + 1024), True),
+        (b"d" * (4 * 1024 * 1024 + 1024), True),
+        (b"x" * (64 * 1024 + 1024), False),
+    ],
+    ids=["inline", "packed", "dedicated", "packed_data_only_base"],
+)
+def test_blob_extension_take_blobs_multi_base(payload, is_dataset_root, tmp_path):
+    base_path = tmp_path / "blob_base"
+    base_path.mkdir(parents=True, exist_ok=True)
+    table = pa.table({"blob": lance.blob_array([payload])})
+
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "primary_ds",
+        mode="create",
+        data_storage_version="2.2",
+        initial_bases=[
+            DatasetBasePath(
+                str(base_path), name="blob_base", is_dataset_root=is_dataset_root
+            )
+        ],
+        target_bases=["blob_base"],
+    )
+
+    fragments = list(ds.get_fragments())
+    assert len(fragments) == 1
+    data_file = fragments[0].data_files()[0]
+    assert data_file.base_id is not None
+
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+    with blobs[0] as f:
+        assert f.read() == payload

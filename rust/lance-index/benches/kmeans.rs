@@ -4,7 +4,7 @@
 use arrow::array::AsArray;
 use arrow::datatypes::Float32Type;
 use arrow_array::FixedSizeListArray;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::flat::storage::FlatFloatStorage;
@@ -13,7 +13,7 @@ use lance_index::vector::utils::SimpleIndex;
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::kmeans::{
-    compute_partitions_arrow_array, KMeans, KMeansAlgo, KMeansAlgoFloat, KMeansParams,
+    KMeans, KMeansAlgo, KMeansAlgoFloat, KMeansParams, compute_partitions_arrow_array,
 };
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array;

@@ -310,23 +310,6 @@ public class RestNamespaceTest {
   }
 
   @Test
-  void testCreateEmptyTable() {
-    // Create parent namespace
-    CreateNamespaceRequest createNsReq =
-        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
-
-    // Create empty table (metadata-only operation)
-    CreateEmptyTableRequest createReq =
-        new CreateEmptyTableRequest().id(Arrays.asList("workspace", "empty_table"));
-
-    CreateEmptyTableResponse createResp = namespace.createEmptyTable(createReq);
-
-    assertNotNull(createResp);
-    assertNotNull(createResp.getLocation());
-  }
-
-  @Test
   void testRenameTable() throws Exception {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =

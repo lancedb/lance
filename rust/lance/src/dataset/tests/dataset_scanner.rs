@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::index::vector::VectorIndexParams;
-use lance_arrow::json::{is_arrow_json_field, json_field, JsonArray};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::json::{JsonArray, is_arrow_json_field, json_field};
 
 use arrow::compute::concat_batches;
 use arrow_array::UInt64Array;
@@ -18,25 +18,25 @@ use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::reader::{describe_encoding, FileReader, FileReaderOptions};
+use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
-use lance_index::scalar::inverted::{
-    query::PhraseQuery, tokenizer::InvertedIndexParams, SCORE_FIELD,
-};
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+use lance_index::scalar::inverted::{
+    SCORE_FIELD, query::PhraseQuery, tokenizer::InvertedIndexParams,
+};
+use lance_index::{DatasetIndexExt, IndexType, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
+use crate::Dataset;
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
-use crate::Dataset;
 use lance_index::scalar::inverted::query::FtsQuery;
+use lance_index::vector::Query;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_index::vector::Query;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -298,17 +298,8 @@ async fn test_fts_filter_vector_search() {
         )))
         .unwrap()
         .try_into_stream()
-        .await
-        .unwrap();
-    check_results(
-        stream,
-        schema
-            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
-            .unwrap()
-            .into(),
-        &[299, 300],
-    )
-    .await;
+        .await;
+    assert!(stream.is_err());
 
     // Case 6: search with prefilter=false, query_filter=phrase("text")
     let mut scanner = dataset.scan();
@@ -325,17 +316,8 @@ async fn test_fts_filter_vector_search() {
         )))
         .unwrap()
         .try_into_stream()
-        .await
-        .unwrap();
-    check_results(
-        stream,
-        schema
-            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
-            .unwrap()
-            .into(),
-        &[300],
-    )
-    .await;
+        .await;
+    assert!(stream.is_err());
 }
 
 #[tokio::test]
@@ -392,12 +374,9 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
         "0.99".to_string(),
     );
 
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "d",
-        DataType::UInt64,
-        false,
-    )
-    .with_metadata(field_meta)]));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("d", DataType::UInt64, false).with_metadata(field_meta),
+    ]));
 
     let values = (0..rows)
         .map(|i| (i % unique_values) as u64)

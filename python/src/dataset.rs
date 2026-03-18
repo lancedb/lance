@@ -10,7 +10,7 @@ use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
-use arrow_array::{make_array, RecordBatch, RecordBatchReader};
+use arrow_array::{RecordBatch, RecordBatchReader, make_array};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -22,44 +22,44 @@ use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{
+    PyResult,
     exceptions::{PyIOError, PyKeyError, PyValueError},
     intern,
     pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
-    PyResult,
 };
-use pyo3::{prelude::*, IntoPyObjectExt};
-use snafu::location;
 
+use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
-    ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    MaterializationStyle, QueryFilter,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
-use lance::dataset::AutoCleanupParams;
-use lance::dataset::{
-    fragment::FileFragment as LanceFileFragment,
-    progress::WriteFragmentProgress,
-    scanner::Scanner as LanceScanner,
-    transaction::{Operation, Transaction},
-    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
-    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, WriteMode, WriteParams,
-};
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
     WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::dataset::{
+    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
+    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
+    fragment::FileFragment as LanceFileFragment,
+    progress::WriteFragmentProgress,
+    scanner::Scanner as LanceScanner,
+    transaction::{Operation, Transaction},
+};
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
+use lance::index::{DatasetIndexInternalExt, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::datatypes::BlobHandling;
 use lance_core::Error;
+use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
@@ -67,33 +67,36 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
-};
-use lance_index::{
+    DatasetIndexExt, IndexParams, IndexType,
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
-        sq::builder::SQBuildParams,
+        Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
+        pq::PQBuildParams, sq::builder::SQBuildParams,
     },
-    DatasetIndexExt, IndexParams, IndexType,
+};
+use lance_index::{
+    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
+use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
-use crate::schema::{logical_schema_from_lance, LanceSchema};
+use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -359,14 +362,11 @@ pub fn transforms_from_python(
                 let result = udf_obj
                     .call_method1(py, "_call", (py_batch,))
                     .map_err(|err| {
-                        lance::Error::invalid_input(
-                            format_python_error(err, py).unwrap(),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format_python_error(err, py).unwrap())
                     })?;
                 let result_batch: PyArrowType<RecordBatch> = result
                     .extract(py)
-                    .map_err(|err| lance::Error::invalid_input(err.to_string(), location!()))?;
+                    .map_err(|err| lance::Error::invalid_input(err.to_string()))?;
                 Ok(result_batch.0)
             })
         };
@@ -482,7 +482,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, namespace=None, table_id=None))]
     fn new(
         py: Python,
         uri: String,
@@ -498,6 +498,8 @@ impl Dataset {
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
         storage_options_provider: Option<&Bound<'_, PyAny>>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -527,22 +529,24 @@ impl Dataset {
 
         // Handle read_params dict
         if let Some(read_params_dict) = read_params {
-            let cache_repetition_index = read_params_dict
+            let mut decoder_config = DecoderConfig::default();
+
+            if let Some(cache_repetition_index) = read_params_dict
                 .get_item("cache_repetition_index")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.cache_repetition_index = cache_repetition_index;
+            }
 
-            let validate_on_decode = read_params_dict
+            if let Some(validate_on_decode) = read_params_dict
                 .get_item("validate_on_decode")
                 .unwrap_or(None)
                 .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false);
+            {
+                decoder_config.validate_on_decode = validate_on_decode;
+            }
 
-            let decoder_config = DecoderConfig {
-                cache_repetition_index,
-                validate_on_decode,
-            };
             let file_reader_options = FileReaderOptions {
                 decoder_config,
                 ..Default::default()
@@ -590,6 +594,16 @@ impl Dataset {
             use crate::storage_options::py_object_to_storage_options_provider;
             let provider = py_object_to_storage_options_provider(provider_obj)?;
             builder = builder.with_storage_options_provider(provider);
+        }
+
+        // Set up namespace commit handler if namespace and table_id are provided
+        if let (Some(ns), Some(tid)) = (namespace, table_id) {
+            let ns_arc = extract_namespace_arc(py, ns)?;
+            let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder = builder.with_commit_handler(commit_handler);
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
@@ -764,12 +778,13 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
         filter: Option<String>,
+        search_filter: Option<PySearchFilter>,
         prefilter: Option<bool>,
         limit: Option<i64>,
         offset: Option<i64>,
@@ -794,6 +809,7 @@ impl Dataset {
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         disable_scoring_autoprojection: Option<bool>,
+        substrait_aggregate: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -813,7 +829,7 @@ impl Dataset {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "Cannot specify both columns and columns_with_transform",
-                ))
+                ));
             }
             (Some(c), None) => {
                 scanner
@@ -835,6 +851,11 @@ impl Dataset {
             }
             scanner
                 .filter(f.as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(qf) = search_filter {
+            scanner
+                .filter_query(qf.inner)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
@@ -982,7 +1003,7 @@ impl Dataset {
                     other => {
                         return Err(PyValueError::new_err(format!(
                             "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
-                        )))
+                        )));
                     }
                 }
             } else {
@@ -1001,111 +1022,18 @@ impl Dataset {
         }
 
         if let Some(nearest) = nearest {
-            let column = nearest
-                .get_item("column")?
-                .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
-                .to_string();
-
-            let qval = nearest
-                .get_item("q")?
-                .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
-            let data = ArrayData::from_pyarrow_bound(&qval)?;
-            let q = make_array(data);
-
-            let k: usize = if let Some(k) = nearest.get_item("k")? {
-                if k.is_none() {
-                    // Use limit if k is not specified, default to 10.
-                    limit.unwrap_or(10) as usize
-                } else {
-                    k.extract()?
-                }
-            } else {
-                10
-            };
-
-            let mut minimum_nprobes = DEFAULT_NPROBES;
-            let mut maximum_nprobes = None;
-
-            if let Some(nprobes) = nearest.get_item("nprobes")? {
-                if !nprobes.is_none() {
-                    let extracted: usize = nprobes.extract()?;
-                    minimum_nprobes = extracted;
-                    maximum_nprobes = Some(extracted);
-                }
-            }
-
-            if let Some(min_nprobes) = nearest.get_item("minimum_nprobes")? {
-                if !min_nprobes.is_none() {
-                    minimum_nprobes = min_nprobes.extract()?;
-                }
-            }
-
-            if let Some(max_nprobes) = nearest.get_item("maximum_nprobes")? {
-                if !max_nprobes.is_none() {
-                    maximum_nprobes = Some(max_nprobes.extract()?);
-                }
-            }
-
-            if let Some(maximum_nprobes) = maximum_nprobes {
-                if minimum_nprobes > maximum_nprobes {
-                    return Err(PyValueError::new_err(
-                        "minimum_nprobes must be <= maximum_nprobes",
-                    ));
-                }
-            }
-
-            if minimum_nprobes < 1 {
-                return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
-            }
-
-            if let Some(maximum_nprobes) = maximum_nprobes {
-                if maximum_nprobes < 1 {
-                    return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
-                }
-            }
-
-            let metric_type: Option<MetricType> =
-                if let Some(metric) = nearest.get_item("metric")? {
-                    if metric.is_none() {
-                        None
-                    } else {
-                        Some(
-                            MetricType::try_from(metric.to_string().to_lowercase().as_str())
-                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                        )
-                    }
-                } else {
-                    None
-                };
-
-            // When refine factor is specified, a final Refine stage will be added to the I/O plan,
-            // and use Flat index over the raw vectors to refine the results.
-            // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
-            let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor")? {
-                if rf.is_none() {
-                    None
-                } else {
-                    rf.extract()?
-                }
-            } else {
-                None
-            };
-
-            let use_index: bool = if let Some(idx) = nearest.get_item("use_index")? {
-                idx.extract()?
-            } else {
-                true
-            };
-
-            let ef: Option<usize> = if let Some(ef) = nearest.get_item("ef")? {
-                if ef.is_none() {
-                    None
-                } else {
-                    ef.extract()?
-                }
-            } else {
-                None
-            };
+            let default_k: usize = limit.unwrap_or(10) as usize;
+            let (
+                column,
+                q,
+                k,
+                minimum_nprobes,
+                maximum_nprobes,
+                metric_type,
+                refine_factor,
+                use_index,
+                ef,
+            ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -1178,6 +1106,11 @@ impl Dataset {
                 .order_by(Some(orderings.into_iter().map(|o| o.0).collect()))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
+        if let Some(aggregate_bytes) = substrait_aggregate {
+            scanner
+                .aggregate(AggregateExpr::substrait(aggregate_bytes))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
         let scan = Arc::new(scanner);
         Ok(Scanner::new(scan))
     }
@@ -1199,7 +1132,7 @@ impl Dataset {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "Cannot specify both columns and columns_with_transform",
-                ))
+                ));
             }
             (Some(columns), None) => {
                 Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
@@ -1226,7 +1159,7 @@ impl Dataset {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "Cannot specify both columns and columns_with_transform",
-                ))
+                ));
             }
             (Some(columns), None) => {
                 Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
@@ -1316,10 +1249,7 @@ impl Dataset {
                 {
                     Ok((start, end)) => Some(Ok(start..end)),
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
-                    Err(err) => Some(Err(lance::Error::InvalidInput {
-                        source: Box::new(err),
-                        location: location!(),
-                    })),
+                    Err(err) => Some(Err(lance::Error::invalid_input_source(Box::new(err)))),
                 }
             })
         });
@@ -1411,10 +1341,11 @@ impl Dataset {
     #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
     fn delete(
         &mut self,
+        py: Python<'_>,
         predicate: String,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<PyAny>> {
         let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
 
         if let Some(retries) = conflict_retries {
@@ -1425,11 +1356,13 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        let new_dataset = rt()
+        let result = rt()
             .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = new_dataset;
-        Ok(())
+        self.ds = result.new_dataset;
+        let dict = PyDict::new(py);
+        dict.set_item("num_deleted_rows", result.num_deleted_rows)?;
+        Ok(dict.into())
     }
 
     #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
@@ -1625,13 +1558,14 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
         let cleanup_stats = rt()
             .block_on(None, async {
@@ -1649,6 +1583,9 @@ impl Dataset {
                 if let Some(v) = error_if_tagged_old_versions {
                     builder = builder.error_if_tagged_old_versions(v);
                 }
+                if let Some(v) = delete_rate_limit {
+                    builder = builder.delete_rate_limit(v)?;
+                }
 
                 self.ds.cleanup_with_policy(builder.build()).await
             })?
@@ -1656,6 +1593,10 @@ impl Dataset {
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
             old_versions: cleanup_stats.old_versions,
+            data_files_removed: cleanup_stats.data_files_removed,
+            transaction_files_removed: cleanup_stats.transaction_files_removed,
+            index_files_removed: cleanup_stats.index_files_removed,
+            deletion_files_removed: cleanup_stats.deletion_files_removed,
         })
     }
 
@@ -1903,7 +1844,7 @@ impl Dataset {
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
-                )))
+                )));
             }
         };
 
@@ -2000,8 +1941,11 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
-                    if let Some(skip_merge) = kwargs.get_item("skip_merge")? {
-                        params = params.skip_merge(skip_merge.extract()?);
+                    if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
+                        params = params.memory_limit_mb(memory_limit.extract()?);
+                    }
+                    if let Some(num_workers) = kwargs.get_item("num_workers")? {
+                        params = params.num_workers(num_workers.extract()?);
                     }
                 }
                 Box::new(params)
@@ -2010,7 +1954,7 @@ impl Dataset {
                 let column_type = match self.ds.schema().field(columns[0]) {
                     Some(f) => f.data_type().clone(),
                     None => {
-                        return Err(PyValueError::new_err("Column not found in dataset schema."))
+                        return Err(PyValueError::new_err("Column not found in dataset schema."));
                     }
                 };
                 prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
@@ -2062,11 +2006,9 @@ impl Dataset {
         // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
         let index_metadata = if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
-            let index_metadata = rt()
-                .block_on(None, builder.execute_uncommitted())?
-                .infer_error()?;
             // Note: We don't update self.ds here as the index is not committed
-            index_metadata
+            rt().block_on(None, builder.execute_uncommitted())?
+                .infer_error()?
         } else {
             // For regular indexing, use the standard execute path
             let index_metadata = rt().block_on(None, builder.into_future())?.infer_error()?;
@@ -2196,7 +2138,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2208,6 +2150,9 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
         commit_message: Option<String>,
+        enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2227,13 +2172,16 @@ impl Dataset {
             enable_v2_manifest_paths,
             detached,
             max_retries,
+            enable_stable_row_ids,
+            namespace,
+            table_id,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2243,6 +2191,9 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        enable_stable_row_ids: Option<bool>,
+        namespace: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let accessor = crate::storage_options::create_accessor_from_python(
             storage_options.clone(),
@@ -2258,19 +2209,34 @@ impl Dataset {
             None
         };
 
-        let commit_handler = commit_lock
-            .as_ref()
-            .map(|commit_lock| {
-                commit_lock
-                    .into_py_any(commit_lock.py())
-                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
-            })
-            .transpose()?;
+        // Create commit_handler: prefer user-provided commit_lock, then namespace-based handler
+        let commit_handler: Option<Arc<dyn CommitHandler>> =
+            if let Some(commit_lock) = commit_lock.as_ref() {
+                // User provided a commit_lock
+                Some(
+                    commit_lock
+                        .into_py_any(commit_lock.py())
+                        .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
+                )
+            } else if let (Some(ns), Some(tid)) = (namespace, table_id) {
+                // Create ExternalManifestCommitHandler from namespace and table_id
+                let ns_arc = extract_namespace_arc(ns.py(), ns)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+                Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }) as Arc<dyn CommitHandler>)
+            } else {
+                None
+            };
 
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20));
+
+        if let Some(enable) = enable_stable_row_ids {
+            builder = builder.use_stable_row_ids(enable);
+        }
 
         if let Some(store_params) = object_store_params {
             builder = builder.with_store_params(store_params);
@@ -3184,10 +3150,16 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         // Handle target_bases parameter (list of strings - base names or paths)
-        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")? {
-            if !target_bases_list.is_empty() {
-                p = p.with_target_base_names_or_paths(target_bases_list);
-            }
+        if let Some(target_bases_list) = get_dict_opt::<Vec<String>>(options, "target_bases")?
+            && !target_bases_list.is_empty()
+        {
+            p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        if let Some(allow_external) =
+            get_dict_opt::<bool>(options, "allow_external_blob_outside_bases")?
+        {
+            p = p.with_allow_external_blob_outside_bases(allow_external);
         }
 
         // Handle properties
@@ -3203,6 +3175,23 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 new_props.insert(key, value);
             }
             p.transaction_properties = Some(Arc::new(new_props));
+        }
+
+        // Handle namespace and table_id for managed versioning (external manifest store)
+        // Only set if commit_handler is not already set by user
+        if p.commit_handler.is_none() {
+            let namespace_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace")?;
+            let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+
+            if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
+                let ns_arc = extract_namespace_arc(options.py(), &ns)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
+                let commit_handler: Arc<dyn CommitHandler> =
+                    Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: Arc::new(external_store),
+                    });
+                p.commit_handler = Some(commit_handler);
+            }
         }
 
         Some(p)
@@ -3223,6 +3212,7 @@ fn prepare_vector_index_params(
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
+    let mut skip_transpose = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -3287,29 +3277,30 @@ fn prepare_vector_index_params(
         }
 
         match (
-                kwargs.get_item("precomputed_shuffle_buffers")?,
-                kwargs.get_item("precomputed_shuffle_buffers_path")?
-            ) {
-                (Some(l), Some(p)) => {
-                    let path = Path::parse(p.to_string()).map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to parse precomputed_shuffle_buffers_path: {}",
-                            e
-                        ))
-                    })?;
-                    let list = l.downcast::<PyList>()?
-                        .iter()
-                        .map(|f| f.to_string())
-                        .collect();
-                    ivf_params.precomputed_shuffle_buffers = Some((path, list));
-                },
-                (None, None) => {},
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+            kwargs.get_item("precomputed_shuffle_buffers")?,
+            kwargs.get_item("precomputed_shuffle_buffers_path")?,
+        ) {
+            (Some(l), Some(p)) => {
+                let path = Path::parse(p.to_string()).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "Failed to parse precomputed_shuffle_buffers_path: {}",
+                        e
                     ))
-                }
+                })?;
+                let list = l
+                    .downcast::<PyList>()?
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect();
+                ivf_params.precomputed_shuffle_buffers = Some((path, list));
             }
+            (None, None) => {}
+            _ => {
+                return Err(PyValueError::new_err(
+                    "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together.",
+                ));
+            }
+        }
 
         // Parse HNSW params
         if let Some(max_level) = kwargs.get_item("max_level")? {
@@ -3350,6 +3341,10 @@ fn prepare_vector_index_params(
             let version: String = version.extract()?;
             index_file_version = IndexFileVersion::try_from(&version)
                 .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
+        }
+
+        if let Some(value) = kwargs.get_item("skip_transpose")? {
+            skip_transpose = value.extract()?;
         }
     }
 
@@ -3395,6 +3390,7 @@ fn prepare_vector_index_params(
         ))),
     }?;
     params.version(index_file_version);
+    params.skip_transpose(skip_transpose);
     Ok(params)
 }
 
@@ -3422,10 +3418,10 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::invalid_input(
-                format!("Failed to call begin() on WriteFragmentProgress: {}", e),
-                location!(),
-            )
+            lance::Error::invalid_input(format!(
+                "Failed to call begin() on WriteFragmentProgress: {}",
+                e
+            ))
         })?;
         Ok(())
     }
@@ -3439,10 +3435,10 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::invalid_input(
-                format!("Failed to call complete() on WriteFragmentProgress: {}", e),
-                location!(),
-            )
+            lance::Error::invalid_input(format!(
+                "Failed to call complete() on WriteFragmentProgress: {}",
+                e
+            ))
         })?;
         Ok(())
     }
@@ -3483,10 +3479,10 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(batch.map(|b| b.0))
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call get_batch() on UDFCheckpointer: {}",
+                err
+            ))
         })
     }
 
@@ -3499,18 +3495,18 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(fragment)
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call get_fragment() on UDFCheckpointer: {}",
+                err
+            ))
         })?;
         fragment_data
             .map(|data| {
                 serde_json::from_str(&data).map_err(|err| {
-                    lance_core::Error::invalid_input(
-                        format!("Failed to deserialize fragment data: {}", err),
-                        location!(),
-                    )
+                    lance_core::Error::invalid_input(format!(
+                        "Failed to deserialize fragment data: {}",
+                        err
+                    ))
                 })
             })
             .transpose()
@@ -3524,19 +3520,16 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call insert_batch() on UDFCheckpointer: {}",
+                err
+            ))
         })
     }
 
     fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
         let data = serde_json::to_string(&fragment).map_err(|err| {
-            lance_core::Error::io(
-                format!("Failed to serialize fragment data: {}", err),
-                location!(),
-            )
+            lance_core::Error::io(format!("Failed to serialize fragment data: {}", err))
         })?;
         Python::attach(|py| {
             self.inner
@@ -3544,13 +3537,10 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::invalid_input(
-                format!(
-                    "Failed to call insert_fragment() on UDFCheckpointer: {}",
-                    err
-                ),
-                location!(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "Failed to call insert_fragment() on UDFCheckpointer: {}",
+                err
+            ))
         })
     }
 }
@@ -3645,6 +3635,193 @@ impl PyFullTextQuery {
 
         Ok(Self {
             inner: BooleanQuery::new(sub_queries).into(),
+        })
+    }
+}
+
+type VectorQueryParams = (
+    String,
+    arrow_array::ArrayRef,
+    usize,
+    usize,
+    Option<usize>,
+    Option<MetricType>,
+    Option<u32>,
+    bool,
+    Option<usize>,
+);
+
+fn vector_query_params_from_dict(
+    dict: &Bound<'_, PyDict>,
+    default_k: usize,
+) -> PyResult<VectorQueryParams> {
+    let column = dict
+        .get_item("column")?
+        .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
+        .to_string();
+
+    let qval = dict
+        .get_item("q")?
+        .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
+    let data = ArrayData::from_pyarrow_bound(&qval)?;
+    let key = make_array(data);
+
+    let k: usize = if let Some(k) = dict.get_item("k")? {
+        if k.is_none() {
+            // Use limit if k is not specified, default to 10.
+            default_k
+        } else {
+            k.extract()?
+        }
+    } else {
+        default_k
+    };
+
+    let mut minimum_nprobes = DEFAULT_NPROBES;
+    let mut maximum_nprobes: Option<usize> = None;
+
+    if let Some(nprobes) = dict.get_item("nprobes")?
+        && !nprobes.is_none()
+    {
+        let extracted: usize = nprobes.extract()?;
+        minimum_nprobes = extracted;
+        maximum_nprobes = Some(extracted);
+    }
+
+    if let Some(min_nprobes) = dict.get_item("minimum_nprobes")?
+        && !min_nprobes.is_none()
+    {
+        minimum_nprobes = min_nprobes.extract()?;
+    }
+
+    if let Some(max_nprobes) = dict.get_item("maximum_nprobes")?
+        && !max_nprobes.is_none()
+    {
+        maximum_nprobes = Some(max_nprobes.extract()?);
+    }
+
+    if let Some(maximum_nprobes_val) = maximum_nprobes
+        && minimum_nprobes > maximum_nprobes_val
+    {
+        return Err(PyValueError::new_err(
+            "minimum_nprobes must be <= maximum_nprobes",
+        ));
+    }
+
+    if minimum_nprobes < 1 {
+        return Err(PyValueError::new_err("minimum_nprobes must be >= 1"));
+    }
+
+    if let Some(maximum_nprobes_val) = maximum_nprobes
+        && maximum_nprobes_val < 1
+    {
+        return Err(PyValueError::new_err("maximum_nprobes must be >= 1"));
+    }
+
+    let metric_type: Option<MetricType> = if let Some(metric) = dict.get_item("metric")? {
+        if metric.is_none() {
+            None
+        } else {
+            Some(
+                MetricType::try_from(metric.to_string().to_lowercase().as_str())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    // When refine factor is specified, a final Refine stage will be added to the I/O plan,
+    // and use Flat index over the raw vectors to refine the results.
+    // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
+    let refine_factor: Option<u32> = if let Some(rf) = dict.get_item("refine_factor")? {
+        if rf.is_none() { None } else { rf.extract()? }
+    } else {
+        None
+    };
+
+    let use_index: bool = if let Some(idx) = dict.get_item("use_index")? {
+        idx.extract()?
+    } else {
+        true
+    };
+
+    let ef: Option<usize> = if let Some(ef_obj) = dict.get_item("ef")? {
+        if ef_obj.is_none() {
+            None
+        } else {
+            ef_obj.extract()?
+        }
+    } else {
+        None
+    };
+
+    Ok((
+        column,
+        key,
+        k,
+        minimum_nprobes,
+        maximum_nprobes,
+        metric_type,
+        refine_factor,
+        use_index,
+        ef,
+    ))
+}
+
+#[pyclass(name = "PySearchFilter")]
+#[derive(Debug, Clone)]
+pub struct PySearchFilter {
+    pub(crate) inner: QueryFilter,
+}
+
+#[pymethods]
+impl PySearchFilter {
+    /// Create a search filter from a full text query.
+    #[staticmethod]
+    #[pyo3(signature = (query))]
+    fn from_full_text_query(query: PyFullTextQuery) -> PyResult<Self> {
+        Ok(Self {
+            inner: QueryFilter::Fts(FullTextSearchQuery::new_query(query.inner.clone())),
+        })
+    }
+
+    /// Create a query filter from a vector search query dict.
+    #[staticmethod]
+    #[pyo3(signature = (query))]
+    fn from_vector_search_query(query: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let default_k = 10;
+        let (
+            column,
+            key,
+            k,
+            minimum_nprobes,
+            maximum_nprobes,
+            metric_type_opt,
+            refine_factor,
+            use_index,
+            ef,
+        ) = vector_query_params_from_dict(query, default_k)?;
+
+        let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
+
+        let vector_query = VectorQuery {
+            column,
+            key,
+            k,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes,
+            maximum_nprobes,
+            ef,
+            refine_factor,
+            metric_type,
+            use_index,
+            dist_q_c: 0.0,
+        };
+
+        Ok(Self {
+            inner: QueryFilter::Vector(vector_query),
         })
     }
 }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
@@ -10,20 +11,21 @@ use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
-use lance_index::vector::ivf::shuffler::{shuffle_vectors, IvfShuffler};
+use lance_index::progress::NoopIndexBuildProgress;
+use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
 use lance_index::vector::{
-    ivf::{storage::IvfModel, IvfBuildParams},
+    ivf::{IvfBuildParams, storage::IvfModel},
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
+use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModuleMethods;
-use pyo3::Bound;
 use pyo3::{
-    pyfunction,
+    PyResult, Python, pyfunction,
     types::{PyList, PyModule},
-    wrap_pyfunction, PyResult, Python,
+    wrap_pyfunction,
 };
 
 use lance::index::DatasetIndexInternalExt;
@@ -141,6 +143,7 @@ async fn do_train_ivf_model(
         dimension,
         distance_type,
         &params,
+        Arc::new(NoopIndexBuildProgress),
     )
     .await
     .infer_error()?;
@@ -485,7 +488,14 @@ pub struct PyIndexSegmentDescription {
 
 impl PyIndexSegmentDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version_at_last_update, self.fragment_ids, self.index_version, self.created_at)
+        format!(
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})",
+            self.uuid,
+            self.dataset_version_at_last_update,
+            self.fragment_ids,
+            self.index_version,
+            self.created_at
+        )
     }
 }
 
@@ -560,7 +570,15 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.segments.len())
+        format!(
+            "IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})",
+            self.name,
+            self.type_url,
+            self.num_rows_indexed,
+            self.fields,
+            self.field_names,
+            self.segments.len()
+        )
     }
 }
 

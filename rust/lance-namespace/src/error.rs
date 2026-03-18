@@ -25,7 +25,6 @@
 //! let lance_err: lance_core::Error = err.into();
 //! ```
 
-use lance_core::error::ToSnafuLocation;
 use snafu::Snafu;
 
 /// Lance Namespace error codes.
@@ -77,6 +76,8 @@ pub enum ErrorCode {
     InvalidTableState = 19,
     /// Table schema validation failed
     TableSchemaValidationError = 20,
+    /// Request was throttled due to rate limiting or too many concurrent operations
+    Throttled = 21,
 }
 
 impl ErrorCode {
@@ -111,6 +112,7 @@ impl ErrorCode {
             18 => Some(Self::Internal),
             19 => Some(Self::InvalidTableState),
             20 => Some(Self::TableSchemaValidationError),
+            21 => Some(Self::Throttled),
             _ => None,
         }
     }
@@ -140,6 +142,7 @@ impl std::fmt::Display for ErrorCode {
             Self::Internal => "Internal",
             Self::InvalidTableState => "InvalidTableState",
             Self::TableSchemaValidationError => "TableSchemaValidationError",
+            Self::Throttled => "Throttled",
         };
         write!(f, "{}", name)
     }
@@ -253,6 +256,10 @@ pub enum NamespaceError {
     /// Table schema validation failed.
     #[snafu(display("Table schema validation error: {message}"))]
     TableSchemaValidationError { message: String },
+
+    /// Request was throttled due to rate limiting or too many concurrent operations.
+    #[snafu(display("Throttled: {message}"))]
+    Throttled { message: String },
 }
 
 impl NamespaceError {
@@ -282,6 +289,7 @@ impl NamespaceError {
             Self::Internal { .. } => ErrorCode::Internal,
             Self::InvalidTableState { .. } => ErrorCode::InvalidTableState,
             Self::TableSchemaValidationError { .. } => ErrorCode::TableSchemaValidationError,
+            Self::Throttled { .. } => ErrorCode::Throttled,
         }
     }
 
@@ -314,6 +322,7 @@ impl NamespaceError {
             Some(ErrorCode::TableSchemaValidationError) => {
                 Self::TableSchemaValidationError { message }
             }
+            Some(ErrorCode::Throttled) => Self::Throttled { message },
             None => Self::Internal { message },
         }
     }
@@ -326,10 +335,7 @@ impl NamespaceError {
 impl From<NamespaceError> for lance_core::Error {
     #[track_caller]
     fn from(err: NamespaceError) -> Self {
-        Self::Namespace {
-            source: Box::new(err),
-            location: std::panic::Location::caller().to_snafu_location(),
-        }
+        Self::namespace_source(Box::new(err))
     }
 }
 
@@ -342,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_error_code_roundtrip() {
-        for code in 0..=20 {
+        for code in 0..=21 {
             let error_code = ErrorCode::from_u32(code).unwrap();
             assert_eq!(error_code.as_u32(), code);
         }

@@ -9,10 +9,10 @@ use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
 use datafusion::error::Result;
 
-use crate::namespace_level::NamespaceLevel;
-use crate::schema::LanceSchemaProvider;
 #[allow(unused_imports)]
 use crate::SessionBuilder;
+use crate::namespace_level::NamespaceLevel;
+use crate::schema::LanceSchemaProvider;
 
 /// A dynamic [`CatalogProviderList`] that maps Lance namespaces to catalogs.
 ///

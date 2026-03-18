@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -12,36 +12,38 @@ use std::{
 
 use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
+use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
-        CreatedIndex, UpdateCriteria,
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
-use crate::{Index, IndexType};
 use arrow_arith::numeric::add;
-use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
+    union::UnionExec,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
+use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use deepsize::DeepSizeOf;
 use futures::{
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
+    Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
@@ -49,11 +51,10 @@ use lance_core::{
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
-    Error, Result, ROW_ID,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
 use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
@@ -61,7 +62,6 @@ use object_store::path::Path;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
-use snafu::location;
 use tracing::{info, instrument};
 
 mod flat;
@@ -271,7 +271,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (Int64(_), _) => panic!("Attempt to compare Int16 with non-Int64"),
+            (Int64(_), _) => panic!("Attempt to compare Int64 with non-Int64"),
             (UInt8(v1), UInt8(v2)) => v1.cmp(v2),
             (UInt8(v1), Null) => {
                 if v1.is_none() {
@@ -307,7 +307,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
+            (UInt64(_), _) => panic!("Attempt to compare UInt64 with non-UInt64"),
             (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
                 v1.cmp(v2)
             }
@@ -902,13 +902,12 @@ impl LazyRangedIndexReader {
         &self,
         page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
-        let (page_file_name, offset) =
-            self.ranges_to_files
-                .get(&page_idx)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Unexpected page index, index {} is out of range.", page_idx),
-                    location: location!(),
-                })?;
+        let (page_file_name, offset) = self.ranges_to_files.get(&page_idx).ok_or_else(|| {
+            Error::internal(format!(
+                "Unexpected page index, index {} is out of range.",
+                page_idx
+            ))
+        })?;
         let reader = self.get_reader(page_file_name).await?;
         Ok((reader.clone(), page_idx - *offset))
     }
@@ -1295,20 +1294,21 @@ impl BTreeIndex {
         )))
     }
 
-    async fn into_old_data(self) -> Result<Arc<dyn ExecutionPlan>> {
-        let stream = self.into_data_stream().await?;
-        Ok(Arc::new(OneShotExec::new(stream)))
-    }
-
     async fn combine_old_new(
         self,
         new_data: SendableRecordBatchStream,
         chunk_size: u64,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<SendableRecordBatchStream> {
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
         let new_input = Arc::new(OneShotExec::new(new_data));
-        let old_input = self.into_old_data().await?;
+        let old_stream = self.into_data_stream().await?;
+        let old_stream = match old_data_filter {
+            Some(filter) => filter_row_ids(old_stream, filter),
+            None => old_stream,
+        };
+        let old_input = Arc::new(OneShotExec::new(old_stream));
         debug_assert_eq!(
             old_input.schema().flattened_fields().len(),
             new_input.schema().flattened_fields().len()
@@ -1335,6 +1335,25 @@ impl BTreeIndex {
         )?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
+}
+
+/// Filter a stream of record batches using the selection semantics encapsulated
+/// by `old_data_filter`.
+fn filter_row_ids(
+    stream: SendableRecordBatchStream,
+    old_data_filter: OldIndexDataFilter,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        let row_ids = batch[ROW_ID]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| Error::internal("expected UInt64Array for row_id column"))?;
+        let mask = old_data_filter.filter_row_ids(row_ids);
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
@@ -1376,10 +1395,9 @@ impl Index for BTreeIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "BTreeIndex is not vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "BTreeIndex is not vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1410,10 +1428,9 @@ impl Index for BTreeIndex {
                 .await;
 
             if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Failed to prewarm index: cache is no longer available".to_string(),
+                ));
             }
         }
 
@@ -1468,7 +1485,7 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let pages = match query {
+        let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
                 .pages_eq(&OrderableScalarValue(val.clone())),
@@ -1478,12 +1495,36 @@ impl ScalarIndex for BTreeIndex {
             SargableQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for BTree index, build a inverted index for it",
-                location!(),
-            )),
+            SargableQuery::FullTextSearch(_) => {
+                return Err(Error::invalid_input(
+                    "full text search is not supported for BTree index, build a inverted index for it",
+                ));
+            }
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
+
+        // For non-IsNull queries, also include null pages so that null row IDs
+        // are tracked in the result. Any comparison with NULL yields NULL, and
+        // we need this information for correct three-valued logic (e.g. NOT,
+        // OR). Without this, a query like `NOT(x = 0)` on data where 0 doesn't
+        // exist would incorrectly include NULL rows.
+        //
+        // We add them as Matches::Some (not Matches::All) so that
+        // FlatIndex::search() evaluates the predicate and correctly marks
+        // the rows as NULL rather than TRUE.
+        if !matches!(query, SargableQuery::IsNull()) {
+            let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
+            for &page_id in self
+                .page_lookup
+                .null_pages
+                .iter()
+                .chain(self.page_lookup.all_null_pages.iter())
+            {
+                if !existing.contains(&page_id) {
+                    pages.push(Matches::Some(page_id));
+                }
+            }
+        }
 
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
@@ -1594,11 +1635,12 @@ impl ScalarIndex for BTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, self.batch_size)
+            .combine_old_new(new_data, self.batch_size, old_data_filter)
             .await?;
         train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
 
@@ -1631,20 +1673,14 @@ struct BatchStats {
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
     if values.is_empty() {
-        return Err(Error::Internal {
-            message: "received an empty batch in btree training".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "received an empty batch in btree training".to_string(),
+        ));
     }
-    let min = ScalarValue::try_from_array(&values, 0).map_err(|e| Error::Internal {
-        message: format!("failed to get min value from batch: {}", e),
-        location: location!(),
-    })?;
-    let max =
-        ScalarValue::try_from_array(&values, values.len() - 1).map_err(|e| Error::Internal {
-            message: format!("failed to get max value from batch: {}", e),
-            location: location!(),
-        })?;
+    let min = ScalarValue::try_from_array(&values, 0)
+        .map_err(|e| Error::internal(format!("failed to get min value from batch: {}", e)))?;
+    let max = ScalarValue::try_from_array(&values, values.len() - 1)
+        .map_err(|e| Error::internal(format!("failed to get max value from batch: {}", e)))?;
 
     Ok(BatchStats {
         min,
@@ -1891,13 +1927,12 @@ async fn list_page_lookup_files(
     }
 
     if part_page_files.is_empty() || part_lookup_files.is_empty() {
-        return Err(Error::Internal {
-            message: format!(
-                "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-                index_dir, part_page_files.len(), part_lookup_files.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
+            index_dir,
+            part_page_files.len(),
+            part_lookup_files.len()
+        )));
     }
 
     Ok((part_page_files, part_lookup_files))
@@ -1916,22 +1951,18 @@ async fn merge_metadata_files(
     batch_readhead: Option<usize>,
 ) -> Result<()> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
-        return Err(Error::Internal {
-            message: "No partition files provided for merging".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "No partition files provided for merging".to_string(),
+        ));
     }
 
     // Step 1: Create lookup map for page files by partition ID
     if part_lookup_files.len() != part_page_files.len() {
-        return Err(Error::Internal {
-            message: format!(
-                "Number of partition lookup files ({}) does not match number of partition page files ({})",
-                part_lookup_files.len(),
-                part_page_files.len()
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Number of partition lookup files ({}) does not match number of partition page files ({})",
+            part_lookup_files.len(),
+            part_page_files.len()
+        )));
     }
     let mut page_files_map = HashMap::new();
     for page_file in part_page_files {
@@ -1943,13 +1974,10 @@ async fn merge_metadata_files(
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
         if !page_files_map.contains_key(&partition_id) {
-            return Err(Error::Internal {
-                message: format!(
-                    "No corresponding page file found for lookup file: {} (partition_id: {})",
-                    lookup_file, partition_id
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "No corresponding page file found for lookup file: {} (partition_id: {})",
+                lookup_file, partition_id
+            )));
         }
     }
 
@@ -2152,21 +2180,15 @@ async fn merge_pages_and_lookups(
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
 fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatch> {
-    let (page_idx_pos, _) =
-        batch
-            .schema()
-            .column_with_name("page_idx")
-            .ok_or_else(|| Error::Internal {
-                message: "Column 'page_idx' not found in RecordBatch schema".to_string(),
-                location: location!(),
-            })?;
+    let (page_idx_pos, _) = batch.schema().column_with_name("page_idx").ok_or_else(|| {
+        Error::internal("Column 'page_idx' not found in RecordBatch schema".to_string())
+    })?;
     let page_idx_array = batch
         .column(page_idx_pos)
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal {
-            message: "Failed to downcast 'page_idx' column to UInt32Array".to_string(),
-            location: location!(),
+        .ok_or_else(|| {
+            Error::internal("Failed to downcast 'page_idx' column to UInt32Array".to_string())
         })?;
     let offset_array = UInt32Array::from(vec![offset; page_idx_array.len()]);
     let new_page_idx_array_ref = add(page_idx_array, &offset_array)?;
@@ -2203,14 +2225,13 @@ async fn merge_pages(
     let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
-        let page_file_name =
-            (*page_files_map
-                .get(&partition_id)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Page file not found for partition ID: {}", partition_id),
-                    location: location!(),
-                })?)
-            .clone();
+        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
+            Error::internal(format!(
+                "Page file not found for partition ID: {}",
+                partition_id
+            ))
+        })?)
+        .clone();
 
         let reader = store.open_index_file(&page_file_name).await?;
 
@@ -2296,23 +2317,25 @@ fn sort_files_by_partition_id(part_files: &[String]) -> Result<Vec<(u64, String)
 /// Expected format: "part_{partition_id}_{suffix}.lance"
 fn extract_partition_id(filename: &str) -> Result<u64> {
     if !filename.starts_with("part_") {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Invalid partition file name format: {}",
+            filename
+        )));
     }
 
     let parts: Vec<&str> = filename.split('_').collect();
     if parts.len() < 3 {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Invalid partition file name format: {}",
+            filename
+        )));
     }
 
-    parts[1].parse::<u64>().map_err(|_| Error::Internal {
-        message: format!("Failed to parse partition ID from filename: {}", filename),
-        location: location!(),
+    parts[1].parse::<u64>().map_err(|_| {
+        Error::internal(format!(
+            "Failed to parse partition ID from filename: {}",
+            filename
+        ))
     })
 }
 
@@ -2511,10 +2534,9 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A btree index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A btree index can only be created on a non-nested field.".into(),
+            ));
         }
 
         let params = serde_json::from_str::<BTreeParameters>(params)?;
@@ -2543,6 +2565,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
@@ -2583,21 +2606,21 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::{record_batch, FixedSizeListArray};
+    use arrow_array::{FixedSizeListArray, record_batch};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
-        physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
+        physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
     };
     use datafusion_common::{DataFusionError, ScalarValue};
-    use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
+    use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
     use deepsize::DeepSizeOf;
-    use futures::stream;
     use futures::TryStreamExt;
+    use futures::stream;
     use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
@@ -2605,15 +2628,15 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME},
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
-            IndexStore, SargableQuery, ScalarIndex, SearchResult,
         },
     };
 
     use super::{
-        part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
-        DEFAULT_BTREE_BATCH_SIZE,
+        DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, part_lookup_file_path,
+        part_page_data_file_path, train_btree_index,
     };
     #[test]
     fn test_scalar_value_size() {
@@ -4010,7 +4033,7 @@ mod tests {
 
         // update the ranged index
         ranged_index
-            .update(update_data_source, new_store.as_ref())
+            .update(update_data_source, new_store.as_ref(), None)
             .await
             .expect("Error in updating ranged index");
 
@@ -4045,6 +4068,86 @@ mod tests {
                 panic!("Btree search result should always be Exact.");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_with_exact_row_id_filter() {
+        let old_tmpdir = TempObjDir::default();
+        let old_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            old_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let new_tmpdir = TempObjDir::default();
+        let new_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let old_data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(512), BatchCount::from(2));
+        let old_data_source = Box::pin(RecordBatchStreamAdapter::new(old_data.schema(), old_data));
+        train_btree_index(
+            old_data_source,
+            old_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(old_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let new_data = gen_batch()
+            .col("value", array::step_custom::<Int32Type>(2000, 1))
+            .col("_rowid", array::step_custom::<UInt64Type>(2000, 1))
+            .into_df_stream(RowCount::from(100), BatchCount::from(1));
+        let new_data_source = Box::pin(RecordBatchStreamAdapter::new(new_data.schema(), new_data));
+
+        let mut retained_old_rows = RowAddrTreeMap::new();
+        retained_old_rows.insert_range(0..64);
+        retained_old_rows.insert_range(300..364);
+
+        index
+            .update(
+                new_data_source,
+                new_store.as_ref(),
+                Some(OldIndexDataFilter::RowIds(retained_old_rows)),
+            )
+            .await
+            .unwrap();
+
+        let updated_index = BTreeIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let present = |value: i32| {
+            let updated_index = updated_index.clone();
+            async move {
+                let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
+                match updated_index
+                    .search(&query, &NoOpMetricsCollector)
+                    .await
+                    .unwrap()
+                {
+                    SearchResult::Exact(row_id_map) => row_id_map.selected(value as u64),
+                    _ => unreachable!("Btree search result should always be Exact"),
+                }
+            }
+        };
+
+        assert!(present(12).await);
+        assert!(present(320).await);
+        assert!(!present(120).await);
+        assert!(!present(420).await);
+        assert!(present(2005).await);
     }
 
     /// Rust equivalent of Python test `test_btree_remap_big_deletions`
@@ -4162,6 +4265,111 @@ mod tests {
                     panic!("Btree search result should always be Exact.");
                 }
             }
+        }
+    }
+
+    /// Regression test: BTree search must track null row IDs for non-IsNull
+    /// queries, even when no pages match the queried value.
+    ///
+    /// Without this, `NOT(x = val)` when `val` is absent from the data would
+    /// produce an empty null set, causing NULL rows to incorrectly pass.
+    #[tokio::test]
+    async fn test_search_tracks_nulls_for_absent_value() {
+        use arrow_array::{Int32Array, UInt64Array};
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create data with 80% nulls so that training produces separate
+        // all-null pages (which are not in the BTree map). Non-null values
+        // are all in [100, 5099], so value 0 never appears.
+        let num_rows = 5000u64;
+        let values: Int32Array = (0..num_rows)
+            .map(|i| {
+                if i % 5 != 0 {
+                    None // 80% null
+                } else {
+                    Some(100 + i as i32) // non-null values in [100, 5099]
+                }
+            })
+            .collect();
+        let row_ids = UInt64Array::from_iter_values(0..num_rows);
+        let data = arrow_array::RecordBatch::try_from_iter(vec![
+            ("value", Arc::new(values) as arrow_array::ArrayRef),
+            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+
+        let schema = data.schema();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(data)]),
+        ));
+        train_btree_index(stream, test_store.as_ref(), num_rows, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Verify we have all-null pages (the bug depends on this)
+        assert!(
+            !index.page_lookup.all_null_pages.is_empty(),
+            "Test setup requires all-null pages; got null_pages={}, all_null_pages={}",
+            index.page_lookup.null_pages.len(),
+            index.page_lookup.all_null_pages.len(),
+        );
+
+        let metrics = NoOpMetricsCollector;
+
+        // Search for Equals(0) — value 0 doesn't exist in any page
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
+                &metrics,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            SearchResult::Exact(set) => {
+                // No rows should be TRUE (value 0 doesn't exist)
+                assert!(set.true_rows().is_empty(), "No rows should match Equals(0)");
+                // NULL rows MUST be tracked as null
+                assert!(
+                    !set.null_rows().is_empty(),
+                    "Null rows must be tracked even when no pages match the value"
+                );
+            }
+            _ => panic!("BTree search should return Exact"),
+        }
+
+        // Also verify Range query tracks nulls when no values match
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Excluded(ScalarValue::Int32(Some(50))),
+                ),
+                &metrics,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            SearchResult::Exact(set) => {
+                assert!(set.true_rows().is_empty(), "No rows should be < 50");
+                assert!(
+                    !set.null_rows().is_empty(),
+                    "Null rows must be tracked for range queries too"
+                );
+            }
+            _ => panic!("BTree search should return Exact"),
         }
     }
 }

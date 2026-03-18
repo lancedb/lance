@@ -9,8 +9,8 @@ use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use futures::FutureExt;
 use lance::index::vector::VectorIndexParams;
 use lance::{
-    dataset::{InsertBuilder, WriteParams},
     Dataset,
+    dataset::{InsertBuilder, WriteParams},
 };
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::hnsw::builder::HnswBuildParams;

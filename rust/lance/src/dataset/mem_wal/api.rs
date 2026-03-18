@@ -10,24 +10,23 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MemWalIndexDetails, RegionSpec, MEM_WAL_INDEX_NAME};
+use lance_index::DatasetIndexExt;
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, RegionSpec};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::DatasetIndexExt;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::DistanceType;
-use snafu::location;
 use uuid::Uuid;
 
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::CommitBuilder;
-use crate::index::mem_wal::new_mem_wal_index_meta;
-use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
+use crate::dataset::CommitBuilder;
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::DatasetIndexInternalExt;
+use crate::index::mem_wal::new_mem_wal_index_meta;
 
+use super::RegionWriterConfig;
 use super::write::MemIndexConfig;
 use super::write::RegionWriter;
-use super::RegionWriterConfig;
 
 /// Configuration for initializing MemWAL on a Dataset.
 #[derive(Debug, Clone, Default)]
@@ -96,8 +95,7 @@ impl DatasetMemWalExt for Dataset {
         if pk_fields.is_empty() {
             return Err(Error::invalid_input(
                 "MemWAL requires a primary key on the dataset. \
-                 Define a primary key using the 'lance-schema:unenforced-primary-key' Arrow field metadata.",
-                location!(),
+             Define a primary key using the 'lance-schema:unenforced-primary-key' Arrow field metadata.",
             ));
         }
 
@@ -105,13 +103,10 @@ impl DatasetMemWalExt for Dataset {
         let indices = self.load_indices().await?;
         for index_name in &config.maintained_indexes {
             if !indices.iter().any(|idx| &idx.name == index_name) {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Index '{}' not found on dataset. maintained_indexes must reference existing indexes.",
-                        index_name
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Index '{}' not found on dataset. maintained_indexes must reference existing indexes.",
+                    index_name
+                )));
             }
         }
 
@@ -119,7 +114,6 @@ impl DatasetMemWalExt for Dataset {
         if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
             return Err(Error::invalid_input(
                 "MemWAL is already initialized on this dataset. Use update methods instead.",
-                location!(),
             ));
         }
 
@@ -167,7 +161,6 @@ impl DatasetMemWalExt for Dataset {
             .ok_or_else(|| {
                 Error::invalid_input(
                     "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                    location!(),
                 )
             })?;
 
@@ -178,13 +171,10 @@ impl DatasetMemWalExt for Dataset {
         let mut index_configs = Vec::new();
         for index_name in maintained_indexes {
             let index_meta = self.load_index_by_name(index_name).await?.ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Index '{}' from maintained_indexes not found on dataset",
-                        index_name
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Index '{}' from maintained_indexes not found on dataset",
+                    index_name
+                ))
             })?;
 
             // Detect index type and create appropriate config
@@ -216,10 +206,10 @@ impl DatasetMemWalExt for Dataset {
                     index_configs.push(vector_config);
                 }
                 _ => {
-                    return Err(Error::invalid_input(
-                        format!("Unknown index type: {}", index_type),
-                        location!(),
-                    ))
+                    return Err(Error::invalid_input(format!(
+                        "Unknown index type: {}",
+                        index_type
+                    )));
                 }
             };
         }
@@ -257,17 +247,11 @@ async fn load_vector_index_config(
 
     // Get the column name for this index
     let field_id = index_meta.fields.first().ok_or_else(|| {
-        Error::invalid_input(
-            format!("Vector index '{}' has no fields", index_name),
-            location!(),
-        )
+        Error::invalid_input(format!("Vector index '{}' has no fields", index_name))
     })?;
 
     let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
-        Error::invalid_input(
-            format!("Field not found for vector index '{}'", index_name),
-            location!(),
-        )
+        Error::invalid_input(format!("Field not found for vector index '{}'", index_name))
     })?;
 
     let column = field.name.clone();
@@ -312,13 +296,10 @@ async fn load_ivf_pq_components(
     // Try to downcast to IvfPq (IVFIndex<FlatIndex, ProductQuantizer>)
     // This covers IVF-PQ indexes which are the most common
     let ivf_index = index.as_any().downcast_ref::<IvfPq>().ok_or_else(|| {
-        Error::invalid_input(
-            format!(
-                "Vector index '{}' is not an IVF-PQ index. Only IVF-PQ indexes are supported for MemWAL.",
-                index_name
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "Vector index '{}' is not an IVF-PQ index. Only IVF-PQ indexes are supported for MemWAL.",
+            index_name
+        ))
     })?;
 
     // Extract IVF model and distance type from the index

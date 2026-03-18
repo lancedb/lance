@@ -153,7 +153,8 @@ def dataset(
     read_params : optional, dict
         Dictionary of read parameters. Currently supports:
         - cache_repetition_index (bool): Whether to cache repetition indices for
-          large string/binary columns
+          large string/binary columns. This is enabled by default. You can disable
+          it globally by setting LANCE_READ_CACHE_REPETITION_INDEX=false.
         - validate_on_decode (bool): Whether to validate data during decoding
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
@@ -197,6 +198,7 @@ def dataset(
         )
 
     # Handle namespace resolution in Python
+    managed_versioning = False
     if namespace is not None:
         if table_id is None:
             raise ValueError(
@@ -209,6 +211,9 @@ def dataset(
         uri = response.location
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
+
+        # Check if namespace manages versioning (commits go through namespace API)
+        managed_versioning = getattr(response, "managed_versioning", None) is True
 
         namespace_storage_options = response.storage_options
 
@@ -239,6 +244,8 @@ def dataset(
         read_params=read_params,
         session=session,
         storage_options_provider=storage_options_provider,
+        namespace=namespace if managed_versioning else None,
+        table_id=table_id if managed_versioning else None,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)

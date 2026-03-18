@@ -8,7 +8,6 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
 
 use super::pb;
@@ -97,10 +96,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
-                Error::invalid_input(
-                    "uuid field does not exist in Index metadata".to_string(),
-                    location!(),
-                )
+                Error::invalid_input("uuid field does not exist in Index metadata".to_string())
             })??,
             name: proto.name,
             fields: proto.fields,
@@ -120,13 +116,13 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap {
-            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
-                // In theory, this should never error. But if we do, just
-                // recover gracefully.
-                log::error!("Failed to serialize fragment bitmap: {}", e);
-                fragment_bitmap.clear();
-            }
+        if let Some(bitmap) = &idx.fragment_bitmap
+            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
+        {
+            // In theory, this should never error. But if we do, just
+            // recover gracefully.
+            log::error!("Failed to serialize fragment bitmap: {}", e);
+            fragment_bitmap.clear();
         }
 
         Self {

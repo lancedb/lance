@@ -6,33 +6,32 @@ use std::ops::Range;
 use arrow::datatypes::Float64Type;
 use arrow::{compute::concat_batches, datatypes::Float16Type};
 use arrow_array::{
+    ArrayRef, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
-    types::{Float32Type, UInt64Type, UInt8Type},
-    ArrayRef, RecordBatch, UInt64Array, UInt8Array,
+    types::{Float32Type, UInt8Type, UInt64Type},
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
+use lance_linalg::distance::{DistanceType, dot_distance, l2_distance_uint_scalar};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::sync::Arc;
 
-use super::{scale_to_u8, ScalarQuantizer};
+use super::{ScalarQuantizer, scale_to_u8};
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
+    INDEX_METADATA_SCHEMA_KEY, IndexMetadata,
     vector::{
+        SQ_CODE_COLUMN,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
         transform::Transformer,
-        SQ_CODE_COLUMN,
     },
-    IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
@@ -57,17 +56,12 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
             .schema()
             .metadata
             .get(SQ_METADATA_KEY)
-            .ok_or(Error::Index {
-                message: format!(
-                    "Reading SQ metadata: metadata key {} not found",
-                    SQ_METADATA_KEY
-                ),
-                location: location!(),
-            })?;
-        serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-            message: format!("Failed to parse index metadata: {}", metadata_str),
-            location: location!(),
-        })
+            .ok_or(Error::index(format!(
+                "Reading SQ metadata: metadata key {} not found",
+                SQ_METADATA_KEY
+            )))?;
+        serde_json::from_str(metadata_str)
+            .map_err(|_| Error::index(format!("Failed to parse index metadata: {}", metadata_str)))
     }
 }
 
@@ -90,27 +84,24 @@ impl SQStorageChunk {
     fn new(batch: RecordBatch) -> Result<Self> {
         let row_ids = batch
             .column_by_name(ROW_ID)
-            .ok_or(Error::Index {
-                message: "Row ID column not found in the batch".to_owned(),
-                location: location!(),
-            })?
+            .ok_or(Error::index(
+                "Row ID column not found in the batch".to_owned(),
+            ))?
             .as_primitive::<UInt64Type>()
             .clone();
         let fsl = batch
             .column_by_name(SQ_CODE_COLUMN)
-            .ok_or(Error::Index {
-                message: "SQ code column not found in the batch".to_owned(),
-                location: location!(),
-            })?
+            .ok_or(Error::index(
+                "SQ code column not found in the batch".to_owned(),
+            ))?
             .as_fixed_size_list();
         let dim = fsl.value_length() as usize;
         let sq_codes = fsl
             .values()
             .as_primitive_opt::<UInt8Type>()
-            .ok_or(Error::Index {
-                message: "SQ code column is not FixedSizeList<u8>".to_owned(),
-                location: location!(),
-            })?
+            .ok_or(Error::index(
+                "SQ code column is not FixedSizeList<u8>".to_owned(),
+            ))?
             .clone();
         Ok(Self {
             batch,
@@ -228,18 +219,13 @@ impl ScalarQuantizationStorage {
         let metadata_str = schema
             .metadata
             .get(INDEX_METADATA_SCHEMA_KEY)
-            .ok_or(Error::Index {
-                message: format!(
-                    "Reading SQ storage: index key {} not found",
-                    INDEX_METADATA_SCHEMA_KEY
-                ),
-                location: location!(),
-            })?;
-        let index_metadata: IndexMetadata =
-            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
-                message: format!("Failed to parse index metadata: {}", metadata_str),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "Reading SQ storage: index key {} not found",
+                INDEX_METADATA_SCHEMA_KEY
+            )))?;
+        let index_metadata: IndexMetadata = serde_json::from_str(metadata_str).map_err(|_| {
+            Error::index(format!("Failed to parse index metadata: {}", metadata_str))
+        })?;
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
         let metadata = ScalarQuantizationMetadata::load(&reader).await?;
 
@@ -494,7 +480,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                 // Loop over the sq_code to prefetch each cache line
                 for offset in (0..dim).step_by(CACHE_LINE_SIZE) {
                     {
-                        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
                         _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
                     }
                 }

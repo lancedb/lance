@@ -6,7 +6,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use lance_namespace::LanceNamespace as LanceNamespaceTrait;
+use lance_namespace::models::{
+    CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, ListTableVersionsRequest, ListTableVersionsResponse,
+};
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
@@ -98,7 +104,7 @@ fn dict_to_hashmap(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, String>
 /// Python wrapper for DirectoryNamespace
 #[pyclass(name = "PyDirectoryNamespace", module = "lance.lance")]
 pub struct PyDirectoryNamespace {
-    inner: Arc<dyn lance_namespace::LanceNamespace>,
+    pub(crate) inner: Arc<dyn lance_namespace::LanceNamespace>,
 }
 
 #[pymethods]
@@ -298,19 +304,6 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    #[allow(deprecated)]
-    fn create_empty_table<'py>(
-        &self,
-        py: Python<'py>,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let request = depythonize(request)?;
-        let response = crate::rt()
-            .block_on(Some(py), self.inner.create_empty_table(request))?
-            .infer_error()?;
-        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    }
-
     fn declare_table<'py>(
         &self,
         py: Python<'py>,
@@ -322,12 +315,62 @@ impl PyDirectoryNamespace {
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }
+
+    // Table version operations
+
+    fn list_table_versions<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_versions(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_table_version<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_version(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn describe_table_version<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.describe_table_version(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn batch_delete_table_versions<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.batch_delete_table_versions(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
 }
 
 /// Python wrapper for RestNamespace
 #[pyclass(name = "PyRestNamespace", module = "lance.lance")]
 pub struct PyRestNamespace {
-    inner: Arc<dyn lance_namespace::LanceNamespace>,
+    pub(crate) inner: Arc<dyn lance_namespace::LanceNamespace>,
 }
 
 #[pymethods]
@@ -524,19 +567,6 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    #[allow(deprecated)]
-    fn create_empty_table<'py>(
-        &self,
-        py: Python<'py>,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let request = depythonize(request)?;
-        let response = crate::rt()
-            .block_on(Some(py), self.inner.create_empty_table(request))?
-            .infer_error()?;
-        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    }
-
     fn declare_table<'py>(
         &self,
         py: Python<'py>,
@@ -560,6 +590,311 @@ impl PyRestNamespace {
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }
+
+    // Table version operations
+
+    fn list_table_versions<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_versions(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_table_version<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_version(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn describe_table_version<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.describe_table_version(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn batch_delete_table_versions<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.batch_delete_table_versions(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+/// Wrapper that allows any Python object implementing LanceNamespace protocol
+/// to be used as a Rust LanceNamespace.
+///
+/// This is similar to JavaLanceNamespace in the Java bindings - it wraps a Python
+/// object and calls back into Python when namespace methods are invoked.
+///
+/// We use `Arc<Py<PyAny>>` instead of `Py<PyAny>` directly because cloning `Py`
+/// requires the GIL, but cloning `Arc` does not. This allows us to pass the
+/// namespace reference to `spawn_blocking` without holding the GIL.
+pub struct PyLanceNamespace {
+    py_namespace: Arc<Py<PyAny>>,
+    namespace_id: String,
+}
+
+impl PyLanceNamespace {
+    /// Create a new PyLanceNamespace wrapper around a Python namespace object.
+    pub fn new(_py: Python<'_>, py_namespace: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // Get the namespace_id by calling the Python method
+        let namespace_id = py_namespace
+            .call_method0("namespace_id")?
+            .extract::<String>()?;
+
+        Ok(Self {
+            py_namespace: Arc::new(py_namespace.clone().unbind()),
+            namespace_id,
+        })
+    }
+
+    /// Create an Arc<dyn LanceNamespace> from a Python namespace object.
+    pub fn create_arc(
+        py: Python<'_>,
+        py_namespace: &Bound<'_, PyAny>,
+    ) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
+        let wrapper = Self::new(py, py_namespace)?;
+        Ok(Arc::new(wrapper))
+    }
+}
+
+impl std::fmt::Debug for PyLanceNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PyLanceNamespace {{ id: {} }}", self.namespace_id)
+    }
+}
+
+#[async_trait]
+impl LanceNamespaceTrait for PyLanceNamespace {
+    fn namespace_id(&self) -> String {
+        self.namespace_id.clone()
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> lance_core::Result<DescribeTableVersionResponse> {
+        // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
+        let py_namespace = self.py_namespace.clone();
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to serialize request: {}",
+                e
+            ))))
+        })?;
+
+        let response_json = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let result =
+                    py_namespace.call_method1(py, "describe_table_version_json", (request_json,));
+
+                match result {
+                    Ok(response_py) => {
+                        let response_str: String = response_py.extract(py).map_err(|e| {
+                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                                "Failed to extract response string: {}",
+                                e
+                            ))))
+                        })?;
+                        Ok(response_str)
+                    }
+                    Err(e) => Err(lance_core::Error::io_source(Box::new(
+                        std::io::Error::other(format!(
+                            "Failed to call describe_table_version_json: {}",
+                            e
+                        )),
+                    ))),
+                }
+            })
+        })
+        .await
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Task join error: {}",
+                e
+            ))))
+        })??;
+
+        serde_json::from_str(&response_json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to deserialize response: {}",
+                e
+            ))))
+        })
+    }
+
+    async fn create_table_version(
+        &self,
+        request: CreateTableVersionRequest,
+    ) -> lance_core::Result<CreateTableVersionResponse> {
+        // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
+        let py_namespace = self.py_namespace.clone();
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to serialize request: {}",
+                e
+            ))))
+        })?;
+
+        let response_json = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let result =
+                    py_namespace.call_method1(py, "create_table_version_json", (request_json,));
+
+                match result {
+                    Ok(response_py) => {
+                        let response_str: String = response_py.extract(py).map_err(|e| {
+                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                                "Failed to extract response string: {}",
+                                e
+                            ))))
+                        })?;
+                        Ok(response_str)
+                    }
+                    Err(e) => Err(lance_core::Error::io_source(Box::new(
+                        std::io::Error::other(format!(
+                            "Failed to call create_table_version_json: {}",
+                            e
+                        )),
+                    ))),
+                }
+            })
+        })
+        .await
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Task join error: {}",
+                e
+            ))))
+        })??;
+
+        serde_json::from_str(&response_json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to deserialize response: {}",
+                e
+            ))))
+        })
+    }
+
+    async fn list_table_versions(
+        &self,
+        request: ListTableVersionsRequest,
+    ) -> lance_core::Result<ListTableVersionsResponse> {
+        // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
+        let py_namespace = self.py_namespace.clone();
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to serialize request: {}",
+                e
+            ))))
+        })?;
+
+        let response_json = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let result =
+                    py_namespace.call_method1(py, "list_table_versions_json", (request_json,));
+
+                match result {
+                    Ok(response_py) => {
+                        let response_str: String = response_py.extract(py).map_err(|e| {
+                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                                "Failed to extract response string: {}",
+                                e
+                            ))))
+                        })?;
+                        Ok(response_str)
+                    }
+                    Err(e) => Err(lance_core::Error::io_source(Box::new(
+                        std::io::Error::other(format!(
+                            "Failed to call list_table_versions_json: {}",
+                            e
+                        )),
+                    ))),
+                }
+            })
+        })
+        .await
+        .map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Task join error: {}",
+                e
+            ))))
+        })??;
+
+        serde_json::from_str(&response_json).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to deserialize response: {}",
+                e
+            ))))
+        })
+    }
+}
+
+/// Extract an `Arc<dyn LanceNamespace>` from a Python namespace object.
+///
+/// This function handles the different ways a Python namespace can be provided:
+/// 1. Direct PyO3 class (PyDirectoryNamespace or PyRestNamespace)
+/// 2. Python wrapper class with `_inner` attribute that holds the PyO3 class
+/// 3. Custom Python implementation (wrapped with PyLanceNamespace)
+///
+/// For Python wrapper classes (DirectoryNamespace, RestNamespace in namespace.py),
+/// we check if it's the exact wrapper class by comparing type names. Subclasses
+/// are wrapped with PyLanceNamespace to call through Python.
+pub fn extract_namespace_arc(
+    py: Python<'_>,
+    ns: &Bound<'_, PyAny>,
+) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
+    // Direct PyO3 class
+    if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
+        return Ok(dir_ns.borrow().inner.clone());
+    }
+    if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
+        return Ok(rest_ns.borrow().inner.clone());
+    }
+
+    // Python wrapper class - check if it's the exact wrapper class
+    if let Ok(inner) = ns.getattr("_inner") {
+        let type_name = ns
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+
+        if type_name == "DirectoryNamespace" {
+            if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
+                return Ok(dir_ns.borrow().inner.clone());
+            }
+        } else if type_name == "RestNamespace"
+            && let Ok(rest_ns) = inner.downcast::<PyRestNamespace>()
+        {
+            return Ok(rest_ns.borrow().inner.clone());
+        }
+    }
+
+    // Custom Python implementation or subclass - wrap with PyLanceNamespace
+    PyLanceNamespace::create_arc(py, ns)
 }
 
 /// Python wrapper for REST adapter server

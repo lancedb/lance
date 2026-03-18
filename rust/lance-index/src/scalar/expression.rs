@@ -13,22 +13,23 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
-    expr::{InList, ScalarFunction},
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
+    expr::{InList, ScalarFunction},
 };
 use tokio::try_join;
 
 use super::{
-    AnyQuery, BloomFilterQuery, GeoQuery, LabelListQuery, MetricsCollector, RelationQuery,
-    SargableQuery, ScalarIndex, SearchResult, TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
+    SearchResult, TextQuery, TokenQuery,
 };
+#[cfg(feature = "geo")]
+use super::{GeoQuery, RelationQuery};
 use lance_core::{
-    utils::mask::{NullableRowAddrMask, RowAddrMask},
     Error, Result,
+    utils::mask::{NullableRowAddrMask, RowAddrMask},
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -256,15 +257,15 @@ impl ScalarQueryParser for SargableQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        if let Bound::Included(val) | Bound::Excluded(val) = low {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = low
+            && val.is_null()
+        {
+            return None;
         }
-        if let Bound::Included(val) | Bound::Excluded(val) = high {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = high
+            && val.is_null()
+        {
+            return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
         Some(IndexedExpression::index_query_with_recheck(
@@ -513,6 +514,9 @@ impl ScalarQueryParser for LabelListQueryParser {
         let label_list = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
+            if list_values.is_empty() {
+                return None;
+            }
             let mut scalars = Vec::with_capacity(list_values.len());
             for idx in 0..list_values.len() {
                 scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
@@ -674,32 +678,35 @@ impl ScalarQueryParser for FtsQueryParser {
             return None;
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            if func.name() == "contains_tokens" {
-                let query = TokenQuery::TokensContains(scalar_str);
-                return Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ));
-            }
+        if let ScalarValue::Utf8(Some(scalar_str)) = scalar
+            && func.name() == "contains_tokens"
+        {
+            let query = TokenQuery::TokensContains(scalar_str);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
         }
         None
     }
 }
 
 /// A parser for geo indices that handles spatial queries
+#[cfg(feature = "geo")]
 #[derive(Debug, Clone)]
 pub struct GeoQueryParser {
     index_name: String,
 }
 
+#[cfg(feature = "geo")]
 impl GeoQueryParser {
     pub fn new(index_name: String) -> Self {
         Self { index_name }
     }
 }
 
+#[cfg(feature = "geo")]
 impl ScalarQueryParser for GeoQueryParser {
     fn visit_between(
         &self,
@@ -1143,10 +1150,9 @@ impl IndexExprResult {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
             2 => Ok(Self::AtLeast(mask)),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+            )),
         }
     }
 
@@ -1326,12 +1332,11 @@ fn maybe_indexed_column<'b>(
     index_info: &'b dyn IndexInformationProvider,
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
-    if let Some(nested_path) = extract_nested_column_path(expr) {
-        if let Some((data_type, parser)) = index_info.get_index(&nested_path) {
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                return Some((nested_path, data_type, parser));
-            }
-        }
+    if let Some(nested_path) = extract_nested_column_path(expr)
+        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
+        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+    {
+        return Some((nested_path, data_type, parser));
     }
 
     match expr {
@@ -1661,13 +1666,10 @@ fn visit_node(
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     if depth >= MAX_DEPTH {
-        return Err(Error::invalid_input(
-            format!(
-                "the filter expression is too long, lance limit the max number of conditions to {}",
-                MAX_DEPTH
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "the filter expression is too long, lance limit the max number of conditions to {}",
+            MAX_DEPTH
+        )));
     }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),
@@ -1827,7 +1829,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
-    use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+    use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 

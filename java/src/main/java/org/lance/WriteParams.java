@@ -30,32 +30,12 @@ public class WriteParams {
     OVERWRITE
   }
 
-  public enum LanceFileVersion {
-    LEGACY("legacy"),
-    V0_1("0.1"),
-    V2_0("2.0"),
-    STABLE("stable"),
-    V2_1("2.1"),
-    NEXT("next"),
-    V2_2("2.2");
-
-    private final String versionString;
-
-    LanceFileVersion(String versionString) {
-      this.versionString = versionString;
-    }
-
-    public String getVersionString() {
-      return versionString;
-    }
-  }
-
   private final Optional<Integer> maxRowsPerFile;
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
   private final Optional<Boolean> enableStableRowIds;
-  private final Optional<LanceFileVersion> dataStorageVersion;
+  private final Optional<String> dataStorageVersion;
   private final Optional<Boolean> enableV2ManifestPaths;
   private Map<String, String> storageOptions = new HashMap<>();
   private final Optional<List<BasePath>> initialBases;
@@ -67,7 +47,7 @@ public class WriteParams {
       Optional<Long> maxBytesPerFile,
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
-      Optional<LanceFileVersion> dataStorageVersion,
+      Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<List<BasePath>> initialBases,
@@ -110,7 +90,7 @@ public class WriteParams {
   }
 
   public Optional<String> getDataStorageVersion() {
-    return dataStorageVersion.map(LanceFileVersion::getVersionString);
+    return dataStorageVersion;
   }
 
   public Optional<Boolean> getEnableV2ManifestPaths() {
@@ -147,7 +127,7 @@ public class WriteParams {
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
     private Optional<Boolean> enableStableRowIds = Optional.empty();
-    private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
+    private Optional<String> dataStorageVersion = Optional.empty();
     private Optional<Boolean> enableV2ManifestPaths;
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<List<BasePath>> initialBases = Optional.empty();
@@ -173,7 +153,7 @@ public class WriteParams {
       return this;
     }
 
-    public Builder withDataStorageVersion(LanceFileVersion dataStorageVersion) {
+    public Builder withDataStorageVersion(String dataStorageVersion) {
       this.dataStorageVersion = Optional.of(dataStorageVersion);
       return this;
     }

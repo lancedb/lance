@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{cast::AsArray, types::Int32Type, UInt32Array};
+use arrow_array::{UInt32Array, cast::AsArray, types::Int32Type};
 use arrow_schema::DataType;
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use futures::{FutureExt, StreamExt};
 use lance_core::utils::{tempfile::TempDir, tokio::get_num_compute_intensive_cpus};
 use lance_datagen::ArrayGeneratorExt;
@@ -25,7 +25,11 @@ use std::collections::HashMap;
 use tokio::runtime::Runtime;
 
 fn bench_reader(c: &mut Criterion) {
-    for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
+    for version in [
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+    ] {
         let mut group = c.benchmark_group(format!("reader_{}", version));
         let data = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
@@ -357,7 +361,11 @@ fn bench_random_access(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("take");
 
-    let versions = [LanceFileVersion::V2_0, LanceFileVersion::V2_1];
+    let versions = [
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+    ];
 
     for filesystem in filesystems {
         for version in versions {

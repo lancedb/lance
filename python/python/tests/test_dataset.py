@@ -1168,19 +1168,12 @@ def test_count_rows_via_scanner(tmp_path: Path):
     ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
 
     assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
-
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
-
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(with_row_id=True).count_rows()
-
-    with pytest.raises(ValueError, match="with_row_id is false"):
-        ds.scanner(columns=[]).count_rows()
+    assert (
+        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows() == 50
+    )
+    assert ds.scanner(with_row_id=True).count_rows() == 100
+    assert ds.scanner(columns=[]).count_rows() == 100
+    assert ds.scanner().count_rows() == 100
 
 
 def test_select_none(tmp_path: Path):
@@ -1395,6 +1388,10 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert len(ds.versions()) == 4
     stats = ds.cleanup_old_versions(retain_versions=3)
     assert stats.old_versions == 1
+    assert stats.data_files_removed == 1
+    assert stats.transaction_files_removed == 1
+    assert stats.index_files_removed == 0
+    assert stats.deletion_files_removed == 0
     assert len(ds.versions()) == 3
     assert ds.count_rows() == len(ds.to_table())
 
@@ -1530,6 +1527,36 @@ def test_enable_disable_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
 
     assert len(ds.versions()) == 7
+
+
+def test_cleanup_with_rate_limit(tmp_path):
+    """Test that cleanup_old_versions works with delete_rate_limit parameter."""
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir, mode="create")
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    latest_version_timestamp = dataset.versions()[-1]["timestamp"]
+    now = (
+        datetime.now(latest_version_timestamp.tzinfo)
+        if latest_version_timestamp.tzinfo is not None
+        else datetime.now()
+    )
+
+    start = time.time_ns()
+    # Cleanup with a rate limit should still remove old versions correctly
+    stats = dataset.cleanup_old_versions(
+        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+    )
+    finished = time.time_ns()
+
+    assert stats.old_versions == 3
+    assert stats.bytes_removed > 0
+    assert (finished - start) >= 2_000_000_000  # 2s
 
 
 def test_create_from_commit(tmp_path: Path):
@@ -4695,6 +4722,36 @@ def test_commit_message_and_get_properties(tmp_path):
         transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
         == "Use Dataset.commit"
     )
+
+
+def test_commit_with_stable_row_ids(tmp_path: Path):
+    """Test that commit() with enable_stable_row_ids creates stable row IDs."""
+    base_uri = str(tmp_path)
+    table = pa.table({"a": range(10)})
+
+    # Create dataset via commit with Overwrite and enable_stable_row_ids
+    fragments = lance.fragment.write_fragments(table, base_uri)
+    operation = lance.LanceOperation.Overwrite(table.schema, fragments)
+    ds = lance.LanceDataset.commit(
+        base_uri,
+        operation,
+        enable_stable_row_ids=True,
+    )
+
+    # Append more data
+    table2 = pa.table({"a": range(10, 20)})
+    fragments2 = lance.fragment.write_fragments(table2, base_uri)
+    ds = lance.LanceDataset.commit(
+        base_uri,
+        lance.LanceOperation.Append(fragments2),
+        read_version=ds.version,
+    )
+
+    # Verify row IDs are sequential (stable row IDs assign monotonic IDs)
+    result = ds.scanner(with_row_id=True).to_table()
+    assert len(result) == 20
+    row_ids = [result["_rowid"][i].as_py() for i in range(20)]
+    assert row_ids == list(range(20))
 
 
 def test_table_metadata_updates(tmp_path: Path):

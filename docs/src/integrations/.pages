@@ -4,4 +4,3 @@ nav:
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md
   - Tensorflow: tensorflow.md
-  - Trino: https://github.com/lancedb/lance-trino

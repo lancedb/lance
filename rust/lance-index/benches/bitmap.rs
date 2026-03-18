@@ -18,14 +18,14 @@ use std::{
 };
 
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
-use lance_index::scalar::{bitmap::BitmapIndexPlugin, SargableQuery, ScalarIndex};
+use lance_index::scalar::{SargableQuery, ScalarIndex, bitmap::BitmapIndexPlugin};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -78,12 +78,11 @@ async fn create_int_unique_index(
         .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
-    let index = BitmapIndexPlugin
+
+    (BitmapIndexPlugin
         .load_index(store, &details, None, &get_cache(use_cache, "int_unique"))
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Create and train a Bitmap index for int64 data with low cardinality
@@ -98,12 +97,11 @@ async fn create_int_low_card_index(
         .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
-    let index = BitmapIndexPlugin
+
+    (BitmapIndexPlugin
         .load_index(store, &details, None, &get_cache(use_cache, "int_low_card"))
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Create and train a Bitmap index for string data with unique values
@@ -118,7 +116,8 @@ async fn create_string_unique_index(
         .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
-    let index = BitmapIndexPlugin
+
+    (BitmapIndexPlugin
         .load_index(
             store,
             &details,
@@ -126,9 +125,7 @@ async fn create_string_unique_index(
             &get_cache(use_cache, "string_unique"),
         )
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Create and train a Bitmap index for string data with low cardinality
@@ -143,7 +140,8 @@ async fn create_string_low_card_index(
         .unwrap();
 
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
-    let index = BitmapIndexPlugin
+
+    (BitmapIndexPlugin
         .load_index(
             store,
             &details,
@@ -151,9 +149,7 @@ async fn create_string_low_card_index(
             &get_cache(use_cache, "string_low_card"),
         )
         .await
-        .unwrap();
-
-    index
+        .unwrap()) as _
 }
 
 /// Set up all benchmark indices

@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
-    cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
-    GenericListArray, LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StructArray, UInt32Array, UInt8Array,
+    Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
+    LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
+    UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
-    new_null_array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
@@ -35,6 +35,7 @@ pub mod json;
 pub mod list;
 pub mod memory;
 pub mod scalar;
+pub mod stream;
 pub mod r#struct;
 
 /// Arrow extension metadata key for extension name
@@ -320,7 +321,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int16Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int16Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f32)),
@@ -339,7 +340,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int32Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int32Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f32)),
@@ -358,7 +359,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int64Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int64Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -377,7 +378,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<UInt8Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to UInt8Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -396,7 +397,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<UInt32Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to UInt32Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -1153,6 +1154,12 @@ fn adjust_child_validity(
         Some(p) => p,
     };
 
+    // Fast path: DataType::Null arrays are always entirely null by definition and cannot
+    // carry an explicit null bitmap (Arrow rejects it). No adjustment is needed.
+    if child.data_type() == &DataType::Null {
+        return child.clone();
+    }
+
     let child_validity = child.nulls();
 
     // Compute the new validity: child_validity AND parent_validity
@@ -1558,8 +1565,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, new_null_array, ListArray, StringArray};
-    use arrow_array::{Float32Array, Int32Array, StructArray};
+    use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
+    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -1983,6 +1990,31 @@ mod tests {
         assert_eq!(width_values.value(0), 300);
         assert_eq!(width_values.value(1), 200);
         assert!(width_values.is_null(2)); // width is null when right struct was null
+    }
+
+    #[test]
+    fn test_merge_null_typed_column_with_parent_validity() {
+        // Reproduces ENT-990: panic in adjust_child_validity when a Null-typed column
+        // exists on one side and the parent struct has null rows.
+        // Arrow's Null type has no null bitmap, so passing one to ArrayData::try_new panics.
+        let left_struct = StructArray::new(
+            Fields::from(vec![Field::new("a", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let right_struct = StructArray::new(
+            Fields::from(vec![Field::new("b", DataType::Null, true)]),
+            vec![Arc::new(NullArray::new(2)) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+
+        // Previously panicked: "Arrays of type Null cannot contain a null bitmask"
+        let merged = merge(&left_struct, &right_struct);
+        assert_eq!(merged.len(), 2);
+        let b_col = merged.column_by_name("b").unwrap();
+        // DataType::Null implies all-null by definition; no null bitmap is stored.
+        assert_eq!(b_col.data_type(), &DataType::Null);
+        assert_eq!(b_col.len(), 2);
     }
 
     #[test]

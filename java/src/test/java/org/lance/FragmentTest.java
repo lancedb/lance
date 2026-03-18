@@ -210,7 +210,11 @@ public class FragmentTest {
 
         Update update =
             Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
-        Dataset dataset3 = dataset2.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset3;
+        try (Transaction txn =
+            new Transaction.Builder().readVersion(dataset2.version()).operation(update).build()) {
+          dataset3 = new CommitBuilder(dataset2).execute(txn);
+        }
 
         assertEquals(totalRows - deleteCount, dataset3.countRows());
 
@@ -226,7 +230,11 @@ public class FragmentTest {
 
         update =
             Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
-        Dataset dataset4 = dataset3.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset4;
+        try (Transaction txn =
+            new Transaction.Builder().readVersion(dataset3.version()).operation(update).build()) {
+          dataset4 = new CommitBuilder(dataset3).execute(txn);
+        }
         assertEquals(totalRows - deleteCount - deleteCount2, dataset4.countRows());
 
         // Case 3. Test delete all rows
@@ -242,7 +250,11 @@ public class FragmentTest {
             Update.builder()
                 .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
                 .build();
-        Dataset dataset5 = dataset4.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset5;
+        try (Transaction txn =
+            new Transaction.Builder().readVersion(dataset4.version()).operation(update).build()) {
+          dataset5 = new CommitBuilder(dataset4).execute(txn);
+        }
 
         assertEquals(0, dataset5.countRows());
       }
@@ -279,7 +291,6 @@ public class FragmentTest {
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
-      Transaction transaction;
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
@@ -293,43 +304,40 @@ public class FragmentTest {
 
         FragmentMergeResult mergeResult = testDataset.mergeColumn(fragment, 10);
 
-        Transaction.Builder builder = new Transaction.Builder(dataset);
-        transaction =
-            builder
+        try (Transaction transaction =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
                 .operation(
                     Merge.builder()
                         .fragments(Collections.singletonList(mergeResult.getFragmentMetadata()))
                         .schema(mergeResult.getSchema().asArrowSchema())
                         .build())
-                .readVersion(dataset.version())
-                .build();
+                .build()) {
+          try (Dataset newDs = new CommitBuilder(dataset).execute(transaction)) {
+            assertEquals(3, newDs.version());
+            assertEquals(3, newDs.latestVersion());
+            Fragment newFrag = newDs.getFragments().get(0);
+            try (LanceScanner scanner = newFrag.newScan()) {
+              Schema schemaRes = scanner.schema();
+              assertTrue(
+                  schemaRes.getFields().stream()
+                      .anyMatch(field -> field.getName().equals("new_col1")));
+              assertTrue(
+                  schemaRes.getFields().stream()
+                      .anyMatch(field -> field.getName().equals("new_col2")));
 
-        assertNotNull(transaction);
+              try (ArrowReader reader = scanner.scanBatches()) {
+                assertTrue(reader.loadNextBatch());
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                VarCharVector newCol1Vec = (VarCharVector) root.getVector("new_col1");
+                VarCharVector newCol2Vec = (VarCharVector) root.getVector("new_col2");
+                assertEquals(21, newCol2Vec.getValueCount());
 
-        try (Dataset newDs = transaction.commit()) {
-          assertEquals(3, newDs.version());
-          assertEquals(3, newDs.latestVersion());
-          Fragment newFrag = newDs.getFragments().get(0);
-          try (LanceScanner scanner = newFrag.newScan()) {
-            Schema schemaRes = scanner.schema();
-            assertTrue(
-                schemaRes.getFields().stream()
-                    .anyMatch(field -> field.getName().equals("new_col1")));
-            assertTrue(
-                schemaRes.getFields().stream()
-                    .anyMatch(field -> field.getName().equals("new_col2")));
-
-            try (ArrowReader reader = scanner.scanBatches()) {
-              assertTrue(reader.loadNextBatch());
-              VectorSchemaRoot root = reader.getVectorSchemaRoot();
-              VarCharVector newCol1Vec = (VarCharVector) root.getVector("new_col1");
-              VarCharVector newCol2Vec = (VarCharVector) root.getVector("new_col2");
-              assertEquals(21, newCol2Vec.getValueCount());
-
-              // The first 10 rows are not null
-              assertNotNull(newCol1Vec.get(9));
-              // Remaining rows are null
-              assertNull(newCol1Vec.get(10));
+                // The first 10 rows are not null
+                assertNotNull(newCol1Vec.get(9));
+                // Remaining rows are null
+                assertNull(newCol1Vec.get(10));
+              }
             }
           }
         }

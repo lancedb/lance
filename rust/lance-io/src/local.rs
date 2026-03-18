@@ -20,12 +20,12 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::location;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
+use crate::object_writer::WriteResult;
 use crate::traits::{Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
 
@@ -42,10 +42,7 @@ pub fn to_local_path(path: &Path) -> String {
 pub fn remove_dir_all(path: &Path) -> Result<()> {
     let local_path = to_local_path(path);
     std::fs::remove_dir_all(local_path).map_err(|err| match err.kind() {
-        ErrorKind::NotFound => Error::NotFound {
-            uri: path.to_string(),
-            location: location!(),
-        },
+        ErrorKind::NotFound => Error::not_found(path.to_string()),
         _ => Error::from(err),
     })?;
     Ok(())
@@ -64,10 +61,7 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
     }
 
     std::fs::copy(&from_path, &to_path).map_err(|err| match err.kind() {
-        ErrorKind::NotFound => Error::NotFound {
-            uri: from.to_string(),
-            location: location!(),
-        },
+        ErrorKind::NotFound => Error::not_found(from.to_string()),
         _ => Error::from(err),
     })?;
     Ok(())
@@ -135,10 +129,7 @@ impl LocalObjectReader {
         let local_path = to_local_path(&path);
         tokio::task::spawn_blocking(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
-                ErrorKind::NotFound => Error::NotFound {
-                    uri: path.to_string(),
-                    location: location!(),
-                },
+                ErrorKind::NotFound => Error::not_found(path.to_string()),
                 _ => e.into(),
             })?;
             let size = OnceCell::new_with(known_size);
@@ -283,5 +274,11 @@ fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::i
 impl Writer for tokio::fs::File {
     async fn tell(&mut self) -> Result<usize> {
         Ok(self.seek(SeekFrom::Current(0)).await? as usize)
+    }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        let size = self.seek(SeekFrom::Current(0)).await? as usize;
+        tokio::io::AsyncWriteExt::shutdown(self).await?;
+        Ok(WriteResult { size, e_tag: None })
     }
 }

@@ -16,25 +16,33 @@ package org.lance;
 import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
-import org.lance.namespace.model.CreateEmptyTableRequest;
-import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.CreateNamespaceRequest;
+import org.lance.namespace.model.CreateTableRequest;
+import org.lance.namespace.model.CreateTableResponse;
 import org.lance.namespace.model.DeclareTableRequest;
 import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
+import org.lance.namespace.model.DropTableRequest;
+import org.lance.namespace.model.DropTableResponse;
+import org.lance.namespace.model.TableExistsRequest;
 import org.lance.operation.Append;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -47,6 +55,7 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
+import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -55,9 +64,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Integration tests for Lance with S3 and credential refresh using StorageOptionsProvider.
@@ -79,6 +95,21 @@ public class NamespaceIntegrationTest {
   private static final String BUCKET_NAME = "lance-namespace-integtest-java";
 
   private static S3Client s3Client;
+  private BufferAllocator testAllocator;
+  private String testPrefix;
+
+  @BeforeEach
+  void setUpTest() {
+    testAllocator = new RootAllocator(Long.MAX_VALUE);
+    testPrefix = "test-" + UUID.randomUUID().toString().substring(0, 8);
+  }
+
+  @AfterEach
+  void tearDownTest() {
+    if (testAllocator != null) {
+      testAllocator.close();
+    }
+  }
 
   @BeforeAll
   static void setup() {
@@ -186,37 +217,27 @@ public class NamespaceIntegrationTest {
     }
 
     /**
-     * Modifies storage options to add incrementing credentials with expiration timestamp.
+     * Simulates a credential vendor returning only vended credentials.
      *
-     * @param storageOptions Original storage options
+     * <p>Returns only credential keys with expiration metadata. Clients are expected to provide
+     * their own connection config (endpoint, region, allow_http) via storageOptions.
+     *
      * @param count Call count to use for credential generation
-     * @return Modified storage options with new credentials
+     * @return Storage options with vended credentials
      */
-    private Map<String, String> modifyStorageOptions(
-        Map<String, String> storageOptions, int count) {
-      Map<String, String> modified =
-          storageOptions != null ? new HashMap<>(storageOptions) : new HashMap<>();
+    private Map<String, String> vendStorageOptions(int count) {
+      Map<String, String> options = new HashMap<>();
 
-      modified.put("aws_access_key_id", "AKID_" + count);
-      modified.put("aws_secret_access_key", "SECRET_" + count);
-      modified.put("aws_session_token", "TOKEN_" + count);
+      options.put("aws_access_key_id", "AKID_" + count);
+      options.put("aws_secret_access_key", "SECRET_" + count);
+      options.put("aws_session_token", "TOKEN_" + count);
 
       long expiresAtMillis = System.currentTimeMillis() + (credentialExpiresInSeconds * 1000L);
-      modified.put("expires_at_millis", String.valueOf(expiresAtMillis));
+      options.put("expires_at_millis", String.valueOf(expiresAtMillis));
       // Set refresh offset to 1 second (1000ms) for short-lived credential tests
-      modified.put("refresh_offset_millis", "1000");
+      options.put("refresh_offset_millis", "1000");
 
-      return modified;
-    }
-
-    @Override
-    public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-      int count = createCallCount.incrementAndGet();
-
-      CreateEmptyTableResponse response = inner.createEmptyTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
-
-      return response;
+      return options;
     }
 
     @Override
@@ -224,7 +245,7 @@ public class NamespaceIntegrationTest {
       int count = createCallCount.incrementAndGet();
 
       DeclareTableResponse response = inner.declareTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+      response.setStorageOptions(vendStorageOptions(count));
 
       return response;
     }
@@ -234,7 +255,7 @@ public class NamespaceIntegrationTest {
       int count = describeCallCount.incrementAndGet();
 
       DescribeTableResponse response = inner.describeTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+      response.setStorageOptions(vendStorageOptions(count));
 
       return response;
     }
@@ -319,16 +340,17 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
       }
 
-      // Verify createEmptyTable was called
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      // Verify declareTable was called
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       // Open dataset through namespace WITH refresh enabled
-      ReadOptions readOptions = new ReadOptions.Builder().build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -449,16 +471,17 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
       }
 
-      // Verify createEmptyTable was called
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      // Verify declareTable was called
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       // Open dataset through namespace with refresh enabled
-      ReadOptions readOptions = new ReadOptions.Builder().build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -592,12 +615,12 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
 
-          // Verify createEmptyTable was called
+          // Verify declareTable was called
           int callCountAfter = namespace.getCreateCallCount();
-          assertEquals(
-              1, callCountAfter - callCountBefore, "createEmptyTable should be called once");
+          assertEquals(1, callCountAfter - callCountBefore, "declareTable should be called once");
 
           // Verify dataset was created successfully
           assertEquals(2, dataset.countRows());
@@ -625,7 +648,7 @@ public class NamespaceIntegrationTest {
       String tableName = UUID.randomUUID().toString();
 
       // Verify initial call counts
-      assertEquals(0, namespace.getCreateCallCount(), "createEmptyTable should not be called yet");
+      assertEquals(0, namespace.getCreateCallCount(), "declareTable should not be called yet");
       assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
 
       // Create schema and data
@@ -693,20 +716,21 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
 
-          // Verify createEmptyTable was called exactly ONCE
+          // Verify declareTable was called exactly ONCE
           assertEquals(
-              1, namespace.getCreateCallCount(), "createEmptyTable should be called exactly once");
+              1, namespace.getCreateCallCount(), "declareTable should be called exactly once");
 
           // Verify describeTable was NOT called during CREATE
-          // Initial credentials come from createEmptyTable response, and since credentials
+          // Initial credentials come from declareTable response, and since credentials
           // don't expire during the fast write, NO refresh (describeTable) is needed
           assertEquals(
               0,
               namespace.getDescribeCallCount(),
               "describeTable should NOT be called during CREATE - "
-                  + "initial credentials come from createEmptyTable response and don't expire");
+                  + "initial credentials come from declareTable response and don't expire");
 
           // Verify dataset was created successfully
           assertEquals(2, dataset.countRows());
@@ -715,15 +739,14 @@ public class NamespaceIntegrationTest {
       }
 
       // Verify counts after dataset is closed
-      assertEquals(
-          1, namespace.getCreateCallCount(), "createEmptyTable should still be 1 after close");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1 after close");
       assertEquals(
           0,
           namespace.getDescribeCallCount(),
           "describeTable should still be 0 after close (no refresh needed)");
 
       // Now open the dataset through namespace with long-lived credentials (60s expiration)
-      ReadOptions readOptions = new ReadOptions.Builder().build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       try (Dataset dsFromNamespace =
           Dataset.open()
@@ -733,11 +756,11 @@ public class NamespaceIntegrationTest {
               .readOptions(readOptions)
               .build()) {
 
-        // createEmptyTable should NOT be called during open (only during CREATE)
+        // declareTable should NOT be called during open (only during CREATE)
         assertEquals(
             1,
             namespace.getCreateCallCount(),
-            "createEmptyTable should still be 1 (not called during open)");
+            "declareTable should still be 1 (not called during open)");
 
         // describeTable is called exactly ONCE during open to get table location
         assertEquals(
@@ -759,7 +782,7 @@ public class NamespaceIntegrationTest {
       }
 
       // Final verification
-      assertEquals(1, namespace.getCreateCallCount(), "Final: createEmptyTable = 1");
+      assertEquals(1, namespace.getCreateCallCount(), "Final: declareTable = 1");
       assertEquals(1, namespace.getDescribeCallCount(), "Final: describeTable = 1");
     }
   }
@@ -842,11 +865,12 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
 
-        assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+        assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
         int initialDescribeCount = namespace.getDescribeCallCount();
 
         // Now append data using the write builder with namespace
@@ -890,6 +914,7 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.APPEND)
+                .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify describeTable was called
@@ -981,11 +1006,12 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(1, dataset.countRows());
         }
 
-        assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+        assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
         assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
 
         // Now overwrite with 2 rows
@@ -1040,10 +1066,11 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.OVERWRITE)
+                .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify describeTable was called for overwrite
-          assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should still be 1");
+          assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1");
           int describeCountAfterOverwrite = namespace.getDescribeCallCount();
           assertEquals(
               1, describeCountAfterOverwrite, "describeTable should be called once for overwrite");
@@ -1060,6 +1087,7 @@ public class NamespaceIntegrationTest {
                 .allocator(allocator)
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
+                .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
                 .build()) {
           assertEquals(2, ds.countRows(), "Should have 2 rows after overwrite");
           assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
@@ -1089,12 +1117,12 @@ public class NamespaceIntegrationTest {
                   new Field("a", FieldType.nullable(new ArrowType.Int(32, true)), null),
                   new Field("b", FieldType.nullable(new ArrowType.Int(32, true)), null)));
 
-      // Step 1: Create empty table via namespace
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
+      // Step 1: Declare table via namespace
+      DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      DeclareTableResponse response = namespace.declareTable(request);
 
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
       assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
 
       String tableUri = response.getLocation();
@@ -1189,6 +1217,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(5, dsFromNamespace.countRows(), "Should read 5 rows through namespace");
       }
@@ -1216,12 +1245,12 @@ public class NamespaceIntegrationTest {
                   new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                   new Field("value", FieldType.nullable(new ArrowType.Int(32, true)), null)));
 
-      // Create empty table via namespace
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
+      // Declare table via namespace
+      DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      DeclareTableResponse response = namespace.declareTable(request);
 
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1302,6 +1331,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(6, ds.countRows(), "Should have 6 rows total");
         assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
@@ -1330,10 +1360,10 @@ public class NamespaceIntegrationTest {
                   new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                   new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
 
-      // Create empty table via namespace
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
+      // Declare table via namespace
+      DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      DeclareTableResponse response = namespace.declareTable(request);
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1414,15 +1444,16 @@ public class NamespaceIntegrationTest {
 
         // Create and commit transaction
         Append appendOp = Append.builder().fragments(newFragments).build();
-        Transaction transaction =
-            new Transaction.Builder(datasetWithProvider)
+        try (Transaction transaction =
+            new Transaction.Builder()
                 .readVersion(datasetWithProvider.version())
                 .operation(appendOp)
-                .build();
-
-        try (Dataset committedDataset = transaction.commit()) {
-          assertEquals(2, committedDataset.version());
-          assertEquals(4, committedDataset.countRows());
+                .build()) {
+          try (Dataset committedDataset =
+              new CommitBuilder(datasetWithProvider).execute(transaction)) {
+            assertEquals(2, committedDataset.version());
+            assertEquals(4, committedDataset.countRows());
+          }
         }
       }
 
@@ -1432,10 +1463,346 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(4, ds.countRows(), "Should have 4 rows total");
         assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
       }
     }
+  }
+
+  private Map<String, String> createDirectoryNamespaceS3Config() {
+    Map<String, String> config = new HashMap<>();
+    config.put("root", "s3://" + BUCKET_NAME + "/" + testPrefix);
+    config.put("storage.access_key_id", ACCESS_KEY);
+    config.put("storage.secret_access_key", SECRET_KEY);
+    config.put("storage.endpoint", ENDPOINT_URL);
+    config.put("storage.region", REGION);
+    config.put("storage.allow_http", "true");
+    config.put("storage.virtual_hosted_style_request", "false");
+    config.put("inline_optimization_enabled", "false");
+    // Very high retry count to guarantee all concurrent operations succeed
+    config.put("commit_retries", "2147483647");
+    return config;
+  }
+
+  private byte[] createTestTableData() throws Exception {
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("name", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("age", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, testAllocator)) {
+      IntVector idVector = (IntVector) root.getVector("id");
+      VarCharVector nameVector = (VarCharVector) root.getVector("name");
+      IntVector ageVector = (IntVector) root.getVector("age");
+
+      idVector.allocateNew(3);
+      nameVector.allocateNew(3);
+      ageVector.allocateNew(3);
+
+      idVector.set(0, 1);
+      nameVector.set(0, "Alice".getBytes());
+      ageVector.set(0, 30);
+
+      idVector.set(1, 2);
+      nameVector.set(1, "Bob".getBytes());
+      ageVector.set(1, 25);
+
+      idVector.set(2, 3);
+      nameVector.set(2, "Charlie".getBytes());
+      ageVector.set(2, 35);
+
+      idVector.setValueCount(3);
+      nameVector.setValueCount(3);
+      ageVector.setValueCount(3);
+      root.setRowCount(3);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.writeBatch();
+      }
+      return out.toByteArray();
+    }
+  }
+
+  @Test
+  void testBasicCreateAndDropOnS3() throws Exception {
+    DirectoryNamespace namespace = new DirectoryNamespace();
+    namespace.initialize(createDirectoryNamespaceS3Config(), testAllocator);
+
+    try {
+      String tableName = "basic_test_table";
+      List<String> tableId = Arrays.asList("test_ns", tableName);
+      byte[] tableData = createTestTableData();
+
+      CreateTableRequest createReq = new CreateTableRequest().id(tableId);
+      CreateTableResponse createResp = namespace.createTable(createReq, tableData);
+      assertNotNull(createResp);
+      assertNotNull(createResp.getLocation());
+
+      DropTableRequest dropReq = new DropTableRequest().id(tableId);
+      DropTableResponse dropResp = namespace.dropTable(dropReq);
+      assertNotNull(dropResp);
+
+      TableExistsRequest existsReq = new TableExistsRequest().id(tableId);
+      assertThrows(RuntimeException.class, () -> namespace.tableExists(existsReq));
+    } finally {
+      namespace.close();
+    }
+  }
+
+  @Test
+  void testConcurrentCreateAndDropWithSingleInstanceOnS3() throws Exception {
+    DirectoryNamespace namespace = new DirectoryNamespace();
+    namespace.initialize(createDirectoryNamespaceS3Config(), testAllocator);
+
+    try {
+      // Initialize namespace first - create parent namespace to ensure __manifest table
+      // is created before concurrent operations
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+      namespace.createNamespace(createNsReq);
+
+      int numTables = 10;
+      ExecutorService executor = Executors.newFixedThreadPool(numTables);
+      CountDownLatch startLatch = new CountDownLatch(1);
+      CountDownLatch doneLatch = new CountDownLatch(numTables);
+      AtomicInteger successCount = new AtomicInteger(0);
+      AtomicInteger failCount = new AtomicInteger(0);
+
+      for (int i = 0; i < numTables; i++) {
+        final int tableIndex = i;
+        executor.submit(
+            () -> {
+              try {
+                startLatch.await();
+
+                String tableName = "s3_concurrent_table_" + tableIndex;
+                List<String> tableId = Arrays.asList("test_ns", tableName);
+                byte[] tableData = createTestTableData();
+
+                CreateTableRequest createReq = new CreateTableRequest().id(tableId);
+                namespace.createTable(createReq, tableData);
+
+                DropTableRequest dropReq = new DropTableRequest().id(tableId);
+                namespace.dropTable(dropReq);
+
+                successCount.incrementAndGet();
+              } catch (Exception e) {
+                failCount.incrementAndGet();
+              } finally {
+                doneLatch.countDown();
+              }
+            });
+      }
+
+      startLatch.countDown();
+      assertTrue(doneLatch.await(120, TimeUnit.SECONDS), "Timed out waiting for tasks to complete");
+
+      executor.shutdown();
+      assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
+
+      assertEquals(numTables, successCount.get(), "All tasks should succeed");
+      assertEquals(0, failCount.get(), "No tasks should fail");
+    } finally {
+      namespace.close();
+    }
+  }
+
+  @Test
+  void testConcurrentCreateAndDropWithMultipleInstancesOnS3() throws Exception {
+    Map<String, String> baseConfig = createDirectoryNamespaceS3Config();
+
+    // Initialize namespace first with a single instance to ensure __manifest
+    // table is created and parent namespace exists before concurrent operations
+    DirectoryNamespace initNs = new DirectoryNamespace();
+    initNs.initialize(new HashMap<>(baseConfig), testAllocator);
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    initNs.createNamespace(createNsReq);
+    initNs.close();
+
+    int numTables = 10;
+    ExecutorService executor = Executors.newFixedThreadPool(numTables);
+    CountDownLatch startLatch = new CountDownLatch(1);
+    CountDownLatch doneLatch = new CountDownLatch(numTables);
+    AtomicInteger successCount = new AtomicInteger(0);
+    AtomicInteger failCount = new AtomicInteger(0);
+    List<DirectoryNamespace> namespaces = new ArrayList<>();
+
+    for (int i = 0; i < numTables; i++) {
+      final int tableIndex = i;
+      executor.submit(
+          () -> {
+            DirectoryNamespace localNs = null;
+            try {
+              startLatch.await();
+
+              localNs = new DirectoryNamespace();
+              localNs.initialize(new HashMap<>(baseConfig), testAllocator);
+
+              synchronized (namespaces) {
+                namespaces.add(localNs);
+              }
+
+              String tableName = "s3_multi_ns_table_" + tableIndex;
+              List<String> tableId = Arrays.asList("test_ns", tableName);
+              byte[] tableData = createTestTableData();
+
+              CreateTableRequest createReq = new CreateTableRequest().id(tableId);
+              localNs.createTable(createReq, tableData);
+
+              DropTableRequest dropReq = new DropTableRequest().id(tableId);
+              localNs.dropTable(dropReq);
+
+              successCount.incrementAndGet();
+            } catch (Exception e) {
+              failCount.incrementAndGet();
+            } finally {
+              doneLatch.countDown();
+            }
+          });
+    }
+
+    startLatch.countDown();
+    assertTrue(doneLatch.await(120, TimeUnit.SECONDS), "Timed out waiting for tasks to complete");
+
+    executor.shutdown();
+    assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
+
+    for (DirectoryNamespace ns : namespaces) {
+      try {
+        ns.close();
+      } catch (Exception e) {
+        // Ignore
+      }
+    }
+
+    assertEquals(numTables, successCount.get(), "All tasks should succeed");
+    assertEquals(0, failCount.get(), "No tasks should fail");
+  }
+
+  @Test
+  void testConcurrentCreateThenDropFromDifferentInstanceOnS3() throws Exception {
+    Map<String, String> baseConfig = createDirectoryNamespaceS3Config();
+
+    // Initialize namespace first with a single instance to ensure __manifest
+    // table is created and parent namespace exists before concurrent operations
+    DirectoryNamespace initNs = new DirectoryNamespace();
+    initNs.initialize(new HashMap<>(baseConfig), testAllocator);
+    CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+    initNs.createNamespace(createNsReq);
+    initNs.close();
+
+    int numTables = 10;
+
+    // First, create all tables using separate namespace instances
+    ExecutorService createExecutor = Executors.newFixedThreadPool(numTables);
+    CountDownLatch createStartLatch = new CountDownLatch(1);
+    CountDownLatch createDoneLatch = new CountDownLatch(numTables);
+    AtomicInteger createSuccessCount = new AtomicInteger(0);
+    List<DirectoryNamespace> createNamespaces = new ArrayList<>();
+
+    for (int i = 0; i < numTables; i++) {
+      final int tableIndex = i;
+      createExecutor.submit(
+          () -> {
+            DirectoryNamespace localNs = null;
+            try {
+              createStartLatch.await();
+
+              localNs = new DirectoryNamespace();
+              localNs.initialize(new HashMap<>(baseConfig), testAllocator);
+
+              synchronized (createNamespaces) {
+                createNamespaces.add(localNs);
+              }
+
+              String tableName = "s3_cross_instance_table_" + tableIndex;
+              List<String> tableId = Arrays.asList("test_ns", tableName);
+              byte[] tableData = createTestTableData();
+
+              CreateTableRequest createReq = new CreateTableRequest().id(tableId);
+              localNs.createTable(createReq, tableData);
+
+              createSuccessCount.incrementAndGet();
+            } catch (Exception e) {
+              // Ignore
+            } finally {
+              createDoneLatch.countDown();
+            }
+          });
+    }
+
+    createStartLatch.countDown();
+    assertTrue(createDoneLatch.await(120, TimeUnit.SECONDS), "Timed out waiting for creates");
+    createExecutor.shutdown();
+
+    assertEquals(numTables, createSuccessCount.get(), "All creates should succeed");
+
+    // Close create namespaces
+    for (DirectoryNamespace ns : createNamespaces) {
+      try {
+        ns.close();
+      } catch (Exception e) {
+        // Ignore
+      }
+    }
+
+    // Now drop all tables using NEW namespace instances
+    ExecutorService dropExecutor = Executors.newFixedThreadPool(numTables);
+    CountDownLatch dropStartLatch = new CountDownLatch(1);
+    CountDownLatch dropDoneLatch = new CountDownLatch(numTables);
+    AtomicInteger dropSuccessCount = new AtomicInteger(0);
+    AtomicInteger dropFailCount = new AtomicInteger(0);
+    List<DirectoryNamespace> dropNamespaces = new ArrayList<>();
+
+    for (int i = 0; i < numTables; i++) {
+      final int tableIndex = i;
+      dropExecutor.submit(
+          () -> {
+            DirectoryNamespace localNs = null;
+            try {
+              dropStartLatch.await();
+
+              localNs = new DirectoryNamespace();
+              localNs.initialize(new HashMap<>(baseConfig), testAllocator);
+
+              synchronized (dropNamespaces) {
+                dropNamespaces.add(localNs);
+              }
+
+              String tableName = "s3_cross_instance_table_" + tableIndex;
+              List<String> tableId = Arrays.asList("test_ns", tableName);
+
+              DropTableRequest dropReq = new DropTableRequest().id(tableId);
+              localNs.dropTable(dropReq);
+
+              dropSuccessCount.incrementAndGet();
+            } catch (Exception e) {
+              dropFailCount.incrementAndGet();
+            } finally {
+              dropDoneLatch.countDown();
+            }
+          });
+    }
+
+    dropStartLatch.countDown();
+    assertTrue(dropDoneLatch.await(120, TimeUnit.SECONDS), "Timed out waiting for drops");
+    dropExecutor.shutdown();
+
+    // Close drop namespaces
+    for (DirectoryNamespace ns : dropNamespaces) {
+      try {
+        ns.close();
+      } catch (Exception e) {
+        // Ignore
+      }
+    }
+
+    assertEquals(numTables, dropSuccessCount.get(), "All drops should succeed");
+    assertEquals(0, dropFailCount.get(), "No drops should fail");
   }
 }

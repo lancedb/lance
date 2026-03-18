@@ -4,20 +4,19 @@
 //! Utilities for remapping row ids. Necessary before stable row ids.
 //!
 
+use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
-use crate::Result;
-use crate::{index, Dataset};
+use crate::{Dataset, index};
 use async_trait::async_trait;
-use lance_core::utils::address::RowAddress;
 use lance_core::Error;
-use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
+use lance_core::utils::address::RowAddress;
 use lance_index::DatasetIndexExt;
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -201,10 +200,9 @@ pub fn transpose_row_ids_from_digest(
 async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let indices = dataset.load_indices().await.unwrap();
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-        None => Err(Error::NotSupported {
-            source: "Fragment reuse index not found, cannot remap an index post compaction".into(),
-            location: location!(),
-        }),
+        None => Err(Error::not_supported_source(
+            "Fragment reuse index not found, cannot remap an index post compaction".into(),
+        )),
         Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
     }?;
 
@@ -253,9 +251,10 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                             // and we always reindex either the entire group or nothing.
                             // We use invalid input to be consistent with
                             // dataset::transaction::recalculate_fragment_bitmap
-                            return Err(Error::invalid_input(
-                                format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}", group.old_frags),
-                                location!()));
+                            return Err(Error::invalid_input(format!(
+                                "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                                group.old_frags
+                            )));
                         }
                         index_frag_bitmap
                             .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));
@@ -326,38 +325,33 @@ pub async fn remap_column_index(
     name: Option<String>,
 ) -> Result<()> {
     if columns.len() != 1 {
-        return Err(Error::Index {
-            message: "Only support remapping index on 1 column at the moment".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Only support remapping index on 1 column at the moment".to_string(),
+        ));
     }
 
     let column = columns[0];
     let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::Index {
-            message: format!("RemapIndex: column '{column}' does not exist"),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "RemapIndex: column '{column}' does not exist"
+        )));
     };
 
     let indices = dataset.load_indices().await?;
     let index_name = name.unwrap_or(format!("{column}_idx"));
     let index = match indices.iter().find(|i| i.name == index_name) {
         None => {
-            return Err(Error::Index {
-                message: format!("Index with name {} not found", index_name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index with name {} not found",
+                index_name
+            )));
         }
         Some(index) => {
             if index.fields != [field.id] {
-                Err(Error::Index {
-                    message: format!(
-                        "Index name {} already exists with different fields",
-                        index_name
-                    ),
-                    location: location!(),
-                })
+                Err(Error::index(format!(
+                    "Index name {} already exists with different fields",
+                    index_name
+                )))
             } else {
                 Ok(index)
             }

@@ -5,32 +5,32 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
+use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
-use crate::{io::exec::Planner, Dataset};
+use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::error::{box_error, InvalidInputSnafu};
+use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
-use snafu::{location, ResultExt};
+use snafu::ResultExt;
 
 /// Build an update operation.
 ///
@@ -84,14 +84,13 @@ impl UpdateBuilder {
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
-        self.condition = Some(planner.optimize_expr(expr).map_err(box_error).context(
-            InvalidInputSnafu {
-                location: location!(),
-            },
-        )?);
+            .context(InvalidInputSnafu {})?;
+        self.condition = Some(
+            planner
+                .optimize_expr(expr)
+                .map_err(box_error)
+                .context(InvalidInputSnafu {})?,
+        );
         Ok(self)
     }
 
@@ -101,27 +100,23 @@ impl UpdateBuilder {
             .schema()
             .field(column.as_ref())
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Column '{}' does not exist in dataset schema: {:?}",
-                        column.as_ref(),
-                        self.dataset.schema()
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Column '{}' does not exist in dataset schema: {:?}",
+                    column.as_ref(),
+                    self.dataset.schema()
+                ))
             })?;
 
         // TODO: support nested column references. This is mostly blocked on the
         // ability to insert them into the RecordBatch properly.
         if column.as_ref().contains('.') {
-            return Err(Error::NotSupported {
-                source: format!(
+            return Err(Error::not_supported_source(
+                format!(
                     "Nested column references are not yet supported. Referenced: {}",
                     column.as_ref(),
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
 
         let schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
@@ -129,9 +124,7 @@ impl UpdateBuilder {
         let mut expr = planner
             .parse_expr(value)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
 
         // Cast expression to the column's data type if necessary.
         let dest_type = field.data_type();
@@ -139,9 +132,7 @@ impl UpdateBuilder {
         let src_type = expr
             .get_type(&df_schema)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
         if dest_type != src_type {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
@@ -163,9 +154,7 @@ impl UpdateBuilder {
                 _ => expr
                     .cast_to(&dest_type, &df_schema)
                     .map_err(box_error)
-                    .context(InvalidInputSnafu {
-                        location: location!(),
-                    })?,
+                    .context(InvalidInputSnafu {})?,
             };
         }
 
@@ -175,9 +164,7 @@ impl UpdateBuilder {
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu {
-                location: location!(),
-            })?;
+            .context(InvalidInputSnafu {})?;
 
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
@@ -213,7 +200,7 @@ impl UpdateBuilder {
         }
 
         if updates.is_empty() {
-            return Err(Error::invalid_input("No updates provided", location!()));
+            return Err(Error::invalid_input("No updates provided"));
         }
 
         let updates = Arc::new(updates);
@@ -284,10 +271,10 @@ impl UpdateJob {
 
         let expected_schema = self.dataset.schema().into();
         if schema.as_ref() != &expected_schema {
-            return Err(Error::Internal {
-                message: format!("Expected schema {:?} but got {:?}", expected_schema, schema),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Expected schema {:?} but got {:?}",
+                expected_schema, schema
+            )));
         }
 
         let updates_ref = self.updates.clone();
@@ -320,10 +307,9 @@ impl UpdateJob {
         )
         .await?;
 
-        let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-            location: location!(),
-        })?;
+        let removed_row_ids = row_id_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
 
         if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
             let fragment_sizes = new_fragments
@@ -334,12 +320,11 @@ impl UpdateJob {
                 fragment_sizes,
                 false,
             )
-            .map_err(|e| Error::Internal {
-                message: format!(
+            .map_err(|e| {
+                Error::internal(format!(
                     "Captured row ids not equal to number of rows written: {}",
                     e
-                ),
-                location: location!(),
+                ))
             })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);
@@ -490,7 +475,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteParams},
+        dataset::{InsertBuilder, ReadParams, WriteParams, builder::DatasetBuilder},
         session::Session,
         utils::test::ThrottledStoreWrapper,
     };
@@ -505,14 +490,14 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
-    use futures::{future::try_join_all, TryStreamExt};
-    use lance_core::utils::tempfile::TempStrDir;
+    use futures::{TryStreamExt, future::try_join_all};
     use lance_core::ROW_ID;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_index::scalar::ScalarIndexParams;
     use lance_index::DatasetIndexExt;
     use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
@@ -1162,11 +1147,13 @@ mod tests {
         assert!(fragments.len() > 2);
 
         let second_fragment = &fragments[1];
-        assert!(second_fragment
-            .get_deletion_vector()
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            second_fragment
+                .get_deletion_vector()
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1286,11 +1273,13 @@ mod tests {
                 .len(),
             2
         );
-        assert!(!str_index_after_insert
-            .fragment_bitmap
-            .as_ref()
-            .unwrap()
-            .contains(2));
+        assert!(
+            !str_index_after_insert
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(2)
+        );
         assert_eq!(
             vec_index_after_insert
                 .fragment_bitmap
@@ -1299,11 +1288,13 @@ mod tests {
                 .len(),
             2
         );
-        assert!(!vec_index_after_insert
-            .fragment_bitmap
-            .as_ref()
-            .unwrap()
-            .contains(2));
+        assert!(
+            !vec_index_after_insert
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(2)
+        );
 
         let updated_dataset = UpdateBuilder::new(Arc::new(dataset))
             // 'a' in fragment 0，'g' in fragment 2, and frag 2 not in frag bitmap
@@ -1338,16 +1329,20 @@ mod tests {
 
         // frag 3 not in the index's frag bitmap
         for &fragment_id in str_bitmap.iter().collect::<Vec<_>>().iter() {
-            assert!(fragment_id < 2,
-                    "str index bitmap should not contain fragments with unindexed data, found fragment {}",
-                    fragment_id);
+            assert!(
+                fragment_id < 2,
+                "str index bitmap should not contain fragments with unindexed data, found fragment {}",
+                fragment_id
+            );
         }
 
         // frag 3 not in the index's frag bitmap
         for &fragment_id in vec_bitmap.iter().collect::<Vec<_>>().iter() {
-            assert!(fragment_id < 2,
-                    "vec index bitmap should not contain fragments with unindexed data, found fragment {}",
-                    fragment_id);
+            assert!(
+                fragment_id < 2,
+                "vec index bitmap should not contain fragments with unindexed data, found fragment {}",
+                fragment_id
+            );
         }
     }
 }

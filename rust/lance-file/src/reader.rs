@@ -14,38 +14,37 @@ use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use deepsize::{Context, DeepSizeOf};
-use futures::{stream::BoxStream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use lance_encoding::{
+    EncodingsIo,
     decoder::{
-        schedule_and_decode, schedule_and_decode_blocking, ColumnInfo, DecoderConfig,
-        DecoderPlugins, FilterExpression, PageEncoding, PageInfo, ReadBatchTask, RequestedRows,
-        SchedulerDecoderConfig,
+        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
+        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
+        schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
-    EncodingsIo,
 };
 use log::debug;
 use object_store::path::Path;
 use prost::{Message, Name};
-use snafu::location;
 
 use lance_core::{
+    Error, Result,
     cache::LanceCache,
     datatypes::{Field, Schema},
-    Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
 use lance_io::{
+    ReadBatchParams,
     scheduler::FileScheduler,
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
-    ReadBatchParams,
 };
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
-    format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION},
+    format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
     writer::PAGE_BUFFER_ALIGNMENT,
 };
@@ -125,6 +124,7 @@ impl CachedFileMetadata {
             (2, 0) => LanceFileVersion::V2_0,
             (2, 1) => LanceFileVersion::V2_1,
             (2, 2) => LanceFileVersion::V2_2,
+            (2, 3) => LanceFileVersion::V2_3,
             _ => panic!(
                 "Unsupported version: {}.{}",
                 self.major_version, self.minor_version
@@ -212,15 +212,13 @@ impl ReaderProjection {
             let is_structural = file_version >= LanceFileVersion::V2_1;
             // In the 2.0 system we needed ids for intermediate fields.  In 2.1+
             // we only need ids for leaf fields.
-            if !is_structural
+            if (!is_structural
                 || field.children.is_empty()
                 || field.is_blob()
-                || field.is_packed_struct()
+                || field.is_packed_struct())
+                && let Some(column_idx) = field_id_to_column_index.get(&(field.id as u32)).copied()
             {
-                if let Some(column_idx) = field_id_to_column_index.get(&(field.id as u32)).copied()
-                {
-                    column_indices.push(column_idx);
-                }
+                column_indices.push(column_idx);
             }
             // Don't recurse into children if the field is a blob or packed struct in 2.1
             if !is_structural || (!field.is_blob() && !field.is_packed_struct()) {
@@ -420,7 +418,7 @@ impl FileReader {
     }
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
-        let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len()), location!()))?;
+        let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len())))?;
         self.scheduler
             .submit_single(
                 buffer_desc.position..buffer_desc.position + buffer_desc.size,
@@ -445,13 +443,10 @@ impl FileReader {
     fn decode_footer(footer_bytes: &Bytes) -> Result<Footer> {
         let len = footer_bytes.len();
         if len < FOOTER_LEN {
-            return Err(Error::invalid_input(
-                format!(
-                    "does not have sufficient data, len: {}, bytes: {:?}",
-                    len, footer_bytes
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "does not have sufficient data, len: {}, bytes: {:?}",
+                len, footer_bytes
+            )));
         }
         let mut cursor = Cursor::new(footer_bytes.slice(len - FOOTER_LEN..));
 
@@ -468,19 +463,15 @@ impl FileReader {
                 "Attempt to use the lance v2 reader to read a legacy file".to_string(),
                 major_version,
                 minor_version,
-                location!(),
             ));
         }
 
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
-            return Err(Error::invalid_input(
-                format!(
-                    "file does not appear to be a Lance file (invalid magic: {:?})",
-                    MAGIC
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "file does not appear to be a Lance file (invalid magic: {:?})",
+                MAGIC
+            )));
         }
         Ok(Footer {
             column_meta_start,
@@ -619,10 +610,9 @@ impl FileReader {
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
         if gbo_table.is_empty() {
-            return Err(Error::Internal {
-                message: "File did not contain any global buffers, schema expected".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "File did not contain any global buffers, schema expected".to_string(),
+            ));
         }
         let schema_start = gbo_table[0].position;
         let schema_size = gbo_table[0].size;
@@ -752,22 +742,22 @@ impl FileReader {
             return Err(Error::invalid_input(
                 "Attempt to read zero columns from the file, at least one column must be specified"
                     .to_string(),
-                location!(),
             ));
         }
         let mut column_indices_seen = BTreeSet::new();
         for column_index in &projection.column_indices {
             if !column_indices_seen.insert(*column_index) {
-                return Err(Error::invalid_input(
-                    format!(
-                        "The projection specified the column index {} more than once",
-                        column_index
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "The projection specified the column index {} more than once",
+                    column_index
+                )));
             }
             if *column_index >= metadata.column_infos.len() as u32 {
-                return Err(Error::invalid_input(format!("The projection specified the column index {} but there are only {} columns in the file", column_index, metadata.column_infos.len()), location!()));
+                return Err(Error::invalid_input(format!(
+                    "The projection specified the column index {} but there are only {} columns in the file",
+                    column_index,
+                    metadata.column_infos.len()
+                )));
             }
         }
         Ok(())
@@ -1068,13 +1058,10 @@ impl FileReader {
         Self::validate_projection(&projection, &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
-                Err(Error::invalid_input(
-                    format!(
-                        "cannot read {:?} from file with {} rows",
-                        params, self.num_rows
-                    ),
-                    location!(),
-                ))
+                Err(Error::invalid_input(format!(
+                    "cannot read {:?} from file with {} rows",
+                    params, self.num_rows
+                )))
             } else {
                 Ok(())
             }
@@ -1084,10 +1071,7 @@ impl FileReader {
                 for idx in indices {
                     match idx {
                         None => {
-                            return Err(Error::invalid_input(
-                                "Null value in indices array",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Null value in indices array"));
                         }
                         Some(idx) => {
                             verify_bound(&params, idx as u64, true)?;
@@ -1311,13 +1295,10 @@ impl FileReader {
         Self::validate_projection(&projection, &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
-                Err(Error::invalid_input(
-                    format!(
-                        "cannot read {:?} from file with {} rows",
-                        params, self.num_rows
-                    ),
-                    location!(),
-                ))
+                Err(Error::invalid_input(format!(
+                    "cannot read {:?} from file with {} rows",
+                    params, self.num_rows
+                )))
             } else {
                 Ok(())
             }
@@ -1327,10 +1308,7 @@ impl FileReader {
                 for idx in indices {
                     match idx {
                         None => {
-                            return Err(Error::invalid_input(
-                                "Null value in indices array",
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input("Null value in indices array"));
                         }
                         Some(idx) => {
                             verify_bound(&params, idx as u64, true)?;
@@ -1519,10 +1497,9 @@ impl EncodedBatchReaderExt for EncodedBatch {
             file_version,
         )?;
         if gbo_table.is_empty() {
-            return Err(Error::Internal {
-                message: "File did not contain any global buffers, schema expected".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "File did not contain any global buffers, schema expected".to_string(),
+            ));
         }
         let schema_start = gbo_table[0].position as usize;
         let schema_size = gbo_table[0].size as usize;
@@ -1559,18 +1536,18 @@ pub mod tests {
     use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
     use arrow_array::{
-        types::{Float64Type, Int32Type},
         RecordBatch, UInt32Array,
+        types::{Float64Type, Int32Type},
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
-    use futures::{prelude::stream::TryStreamExt, StreamExt};
+    use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::RecordBatchExt;
-    use lance_core::{datatypes::Schema, ArrowResult};
-    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, RowCount};
+    use lance_core::{ArrowResult, datatypes::Schema};
+    use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::{
-        decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
-        encoder::{default_encoding_strategy, encode_batch, EncodedBatch, EncodingOptions},
+        decoder::{DecodeBatchScheduler, DecoderPlugins, FilterExpression, decode_batch},
+        encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
         version::LanceFileVersion,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
@@ -1579,7 +1556,7 @@ pub mod tests {
     use tokio::sync::mpsc;
 
     use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection};
-    use crate::testing::{test_cache, write_lance_file, FsFixture, WrittenFile};
+    use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
 
@@ -1774,7 +1751,8 @@ pub mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_projection(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
     ) {
         let fs = FsFixture::default();
 
@@ -1888,27 +1866,31 @@ pub mod tests {
                 )
                 .await;
 
-                assert!(file_reader
-                    .read_stream_projected(
-                        lance_io::ReadBatchParams::RangeFull,
-                        1024,
-                        16,
-                        empty_projection.clone(),
-                        FilterExpression::no_filter(),
-                    )
-                    .is_err());
+                assert!(
+                    file_reader
+                        .read_stream_projected(
+                            lance_io::ReadBatchParams::RangeFull,
+                            1024,
+                            16,
+                            empty_projection.clone(),
+                            FilterExpression::no_filter(),
+                        )
+                        .is_err()
+                );
             }
         }
 
-        assert!(FileReader::try_open(
-            file_scheduler.clone(),
-            Some(empty_projection),
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .is_err());
+        assert!(
+            FileReader::try_open(
+                file_scheduler.clone(),
+                Some(empty_projection),
+                Arc::<DecoderPlugins>::default(),
+                &test_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .is_err()
+        );
 
         let arrow_schema = ArrowSchema::new(vec![
             Field::new("x", DataType::Int32, true),
@@ -1921,15 +1903,17 @@ pub mod tests {
             schema: Arc::new(schema),
         };
 
-        assert!(FileReader::try_open(
-            file_scheduler.clone(),
-            Some(projection_with_dupes),
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .is_err());
+        assert!(
+            FileReader::try_open(
+                file_scheduler.clone(),
+                Some(projection_with_dupes),
+                Arc::<DecoderPlugins>::default(),
+                &test_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test_log::test(tokio::test)]
@@ -2026,7 +2010,8 @@ pub mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_blocking_take(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
     ) {
         let fs = FsFixture::default();
         let WrittenFile { data, schema, .. } = create_some_file(&fs, version).await;

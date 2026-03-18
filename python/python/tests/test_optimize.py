@@ -296,12 +296,29 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     fragments = list(ds.get_fragments())
     assert len(fragments) == 2
 
-    index = ds.list_indices()[0]
-    index_frag_ids = list(index["fragment_ids"])
+    index = ds.describe_indices()[0]
+    index_frag_ids = list(index.segments[0].fragment_ids)
     frag_ids = [frag.fragment_id for frag in fragments]
 
     assert len(index_frag_ids) == 1
     assert index_frag_ids[0] in frag_ids
+
+
+def test_defer_index_remap(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    options = dict(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
+
+    dataset.delete("i < 500")
+    dataset.optimize.compact_files(**options)
+
+    dataset = lance.dataset(base_dir)
+    indices = dataset.describe_indices()
+    assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):

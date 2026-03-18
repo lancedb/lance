@@ -15,10 +15,10 @@ use arrow_array::*;
 use arrow_schema::{DataType, Field};
 use proptest::prelude::*;
 
-use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+use crate::testing::{TestCases, check_round_trip_encoding_of_data};
 use crate::version::LanceFileVersion;
 use lance_core::Result;
-use lance_datagen::{array, gen_batch, ArrayGenerator, ByteCount, Dimension, RowCount, Seed};
+use lance_datagen::{ArrayGenerator, ByteCount, Dimension, RowCount, Seed, array, gen_batch};
 
 /// Test configuration representing one of the 16 permutations
 #[derive(Debug, Clone)]

@@ -31,10 +31,13 @@ public class ScanOptions {
   private final Optional<Long> offset;
   private final Optional<Query> nearest;
   private final Optional<FullTextQuery> fullTextQuery;
+  private final boolean prefilter;
   private final boolean withRowId;
   private final boolean withRowAddress;
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
+  private final boolean useScalarIndex;
+  private final Optional<ByteBuffer> substraitAggregate;
 
   /**
    * Constructor for LanceScanOptions.
@@ -46,12 +49,16 @@ public class ScanOptions {
    *     Otherwise, only columns present in the List will be scanned.
    * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param substraitFilter (Optional) Substrait filter expression.
+   * @param filter (Optional) Filter expression. Optional.empty() for no filter.
    * @param limit (Optional) Maximum number of rows to return.
    * @param offset (Optional) Number of rows to skip before returning results.
    * @param withRowId Whether to include the row ID in the results.
    * @param withRowAddress Whether to include the row address in the results.
    * @param nearest (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
+   * @param columnOrderings (Optional) Column orderings for result sorting.
+   * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
+   * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
    */
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -63,10 +70,13 @@ public class ScanOptions {
       Optional<Long> offset,
       Optional<Query> nearest,
       Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
-      Optional<List<ColumnOrdering>> columnOrderings) {
+      Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
+      Optional<ByteBuffer> substraitAggregate) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -79,10 +89,13 @@ public class ScanOptions {
     this.offset = offset;
     this.nearest = nearest;
     this.fullTextQuery = fullTextQuery;
+    this.prefilter = prefilter;
     this.withRowId = withRowId;
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
+    this.useScalarIndex = useScalarIndex;
+    this.substraitAggregate = substraitAggregate;
   }
 
   /**
@@ -167,6 +180,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to prefilter before nearest neighbor search.
+   *
+   * @return true if prefilter should be applied, false otherwise.
+   */
+  public boolean isPrefilter() {
+    return prefilter;
+  }
+
+  /**
    * Get whether to include the row ID.
    *
    * @return true if row ID should be included, false otherwise.
@@ -197,6 +219,24 @@ public class ScanOptions {
     return columnOrderings;
   }
 
+  /**
+   * Get whether to use scalar indices for the scan.
+   *
+   * @return true if scalar indices should be used, false otherwise.
+   */
+  public boolean isUseScalarIndex() {
+    return useScalarIndex;
+  }
+
+  /**
+   * Get the substrait aggregate expression.
+   *
+   * @return Optional containing the substrait aggregate if specified, otherwise empty.
+   */
+  public Optional<ByteBuffer> getSubstraitAggregate() {
+    return substraitAggregate;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -211,10 +251,15 @@ public class ScanOptions {
         .add("offset", offset.orElse(null))
         .add("nearest", nearest.orElse(null))
         .add("fullTextQuery", fullTextQuery.orElse(null))
+        .add("prefilter", prefilter)
         .add("withRowId", withRowId)
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
         .add("columnOrdering", columnOrderings)
+        .add("useScalarIndex", useScalarIndex)
+        .add(
+            "substraitAggregate",
+            substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
         .toString();
   }
 
@@ -229,10 +274,13 @@ public class ScanOptions {
     private Optional<Long> offset = Optional.empty();
     private Optional<Query> nearest = Optional.empty();
     private Optional<FullTextQuery> fullTextQuery = Optional.empty();
+    private boolean prefilter = false;
     private boolean withRowId = false;
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
+    private boolean useScalarIndex = true;
+    private Optional<ByteBuffer> substraitAggregate = Optional.empty();
 
     public Builder() {}
 
@@ -251,10 +299,13 @@ public class ScanOptions {
       this.offset = options.getOffset();
       this.nearest = options.getNearest();
       this.fullTextQuery = options.getFullTextQuery();
+      this.prefilter = options.isPrefilter();
       this.withRowId = options.isWithRowId();
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
+      this.useScalarIndex = options.isUseScalarIndex();
+      this.substraitAggregate = options.getSubstraitAggregate();
     }
 
     /**
@@ -357,6 +408,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to prefilter during nearest neighbor search.
+     *
+     * @param prefilter true to apply prefilter, false otherwise.
+     * @return Builder instance for method chaining.
+     */
+    public Builder prefilter(boolean prefilter) {
+      this.prefilter = prefilter;
+      return this;
+    }
+
+    /**
      * Set whether to include the row ID.
      *
      * @param withRowId true to include row ID, false otherwise.
@@ -395,6 +457,32 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to use scalar indices for the scan.
+     *
+     * <p>Scans will use scalar indices, when available, to optimize queries with filters. However,
+     * in some corner cases, scalar indices may make performance worse. This parameter allows users
+     * to disable scalar indices in these cases.
+     *
+     * @param useScalarIndex true to use scalar indices, false otherwise. Default is true.
+     * @return Builder instance for method chaining.
+     */
+    public Builder useScalarIndex(boolean useScalarIndex) {
+      this.useScalarIndex = useScalarIndex;
+      return this;
+    }
+
+    /**
+     * Set the substrait aggregate expression.
+     *
+     * @param substraitAggregate Substrait aggregate expression.
+     * @return Builder instance for method chaining.
+     */
+    public Builder substraitAggregate(ByteBuffer substraitAggregate) {
+      this.substraitAggregate = Optional.of(substraitAggregate);
+      return this;
+    }
+
+    /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
@@ -410,10 +498,13 @@ public class ScanOptions {
           offset,
           nearest,
           fullTextQuery,
+          prefilter,
           withRowId,
           withRowAddress,
           batchReadahead,
-          columnOrderings);
+          columnOrderings,
+          useScalarIndex,
+          substraitAggregate);
     }
   }
 }

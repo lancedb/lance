@@ -61,6 +61,7 @@ from .fragment import (
     RowIdMeta as RowIdMeta,
 )
 from .indices import IndexDescription as IndexDescription
+from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
 )
@@ -85,6 +86,10 @@ from .trace import trace_to_chrome as trace_to_chrome
 class CleanupStats:
     bytes_removed: int
     old_versions: int
+    data_files_removed: int
+    transaction_files_removed: int
+    index_files_removed: int
+    deletion_files_removed: int
 
 class LanceFileWriter:
     def __init__(
@@ -223,6 +228,7 @@ class _Dataset:
         columns: Optional[List[str]] = None,
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
         filter: Optional[str] = None,
+        search_filter: Optional[PySearchFilter] = None,
         prefilter: Optional[bool] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -243,6 +249,11 @@ class _Dataset:
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[Any], None]] = None,
+        strict_batch_size: Optional[bool] = None,
+        order_by: Optional[List[Any]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
+        substrait_aggregate: Optional[bytes] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -306,6 +317,7 @@ class _Dataset:
         older_than_micros: int,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
@@ -372,6 +384,7 @@ class _Dataset:
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        enable_stable_row_ids: Optional[bool] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod

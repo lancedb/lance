@@ -4,6 +4,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import traceback
 from io import BytesIO
@@ -11,6 +12,26 @@ from io import BytesIO
 from .lance import language_model_home
 
 LANGUAGE_MODEL_HOME = language_model_home()
+
+
+def _safe_tar_extractall(tar, dest_dir):
+    """Extract tar safely, blocking path traversal attacks (CVE-2007-4559).
+
+    On Python >= 3.12 uses the built-in ``filter="data"`` safeguard.
+    On older versions, manually validates every member path.
+    """
+    if sys.version_info >= (3, 12):
+        tar.extractall(path=dest_dir, filter="data")
+    else:
+        abs_dest = os.path.realpath(dest_dir)
+        for member in tar.getmembers():
+            member_path = os.path.join(dest_dir, member.name)
+            abs_member = os.path.realpath(member_path)
+            if not abs_member.startswith(abs_dest + os.sep) and abs_member != abs_dest:
+                raise Exception(
+                    f"Tar member '{member.name}' would extract outside target directory"
+                )
+        tar.extractall(path=dest_dir)
 
 
 def check_lindera():
@@ -69,7 +90,7 @@ def download_lindera(lm: str):
     try:
         os.chdir(src_dirname)
         with tarfile.open(fileobj=BytesIO(data)) as tar:
-            tar.extractall()
+            _safe_tar_extractall(tar, src_dirname)
             name = tar.getnames()[0]
         cmd = [
             "lindera",

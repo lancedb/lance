@@ -34,22 +34,21 @@ use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_file::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
-use snafu::location;
 
+use crate::Error;
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
-use crate::Error;
 use crate::{
+    Dataset,
     dataset::{
-        fragment::{FileFragment, FragmentReader},
         ROW_ID,
+        fragment::{FileFragment, FragmentReader},
     },
     datatypes::Schema,
-    Dataset,
 };
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
 use super::Planner;
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
@@ -118,7 +117,7 @@ impl LancePushdownScanExec {
             .collect();
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
-            .map_err(|err| Error::invalid_input(format!("Filter predicate '{:?}' references columns {:?}, but some of them were not found in the dataset schema: {}\nInner error: {:?}", predicate, columns, dataset_schema, err), location!()))?);
+            .map_err(|err| Error::invalid_input(format!("Filter predicate '{:?}' references columns {:?}, but some of them were not found in the dataset schema: {}\nInner error: {:?}", predicate, columns, dataset_schema, err)))?);
 
         if config.make_deletions_null && !config.with_row_id {
             return Err(DataFusionError::Configuration(
@@ -268,7 +267,9 @@ impl DisplayAs for LancePushdownScanExec {
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "LancePushdownScan\nuri={}\nprojection=[{}]\npredicate={}\nrow_id={}\nrow_addr={}\nordered={}",
+                write!(
+                    f,
+                    "LancePushdownScan\nuri={}\nprojection=[{}]\npredicate={}\nrow_id={}\nrow_addr={}\nordered={}",
                     self.dataset.data_dir(),
                     columns,
                     self.predicate,
@@ -473,7 +474,7 @@ impl FragmentScanner {
                         return Err(DataFusionError::Internal(format!(
                             "Unexpected result from predicate evaluation: {:?}",
                             result
-                        )))
+                        )));
                     }
                 };
 
@@ -539,14 +540,13 @@ impl FragmentScanner {
 
         let mut batch = batch
             .project_by_schema(&self.projection.as_ref().into())
-            .map_err(|err| Error::Internal {
-                message: format!(
+            .map_err(|err| {
+                Error::internal(format!(
                     "Failed to select schema {} from batch with schema {}\nInner error: {}",
                     self.projection,
                     batch.schema(),
                     err
-                ),
-                location: location!(),
+                ))
             })?;
 
         // Row id nor row address weren't part of the projection, so we need to
@@ -708,14 +708,14 @@ impl FragmentScanner {
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
         RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
+        types::{Float32Type, Int32Type},
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{Field, TimeUnit};
     use arrow_select::concat::concat_batches;
-    use datafusion::prelude::{lit, Column, SessionContext};
+    use datafusion::prelude::{Column, SessionContext, lit};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
@@ -741,11 +741,13 @@ mod test {
             false,
         )]));
         let num_rows: usize = 10;
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+            )
+            .unwrap(),
+        ];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
         let dataset = Dataset::write(
@@ -795,13 +797,15 @@ mod test {
         )]));
         let num_rows: usize = 10;
         // Create a batch where every row is null
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from_iter(
-                (0..num_rows).map(|_| Option::<String>::None),
-            ))],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter(
+                    (0..num_rows).map(|_| Option::<String>::None),
+                ))],
+            )
+            .unwrap(),
+        ];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
         let dataset = Dataset::write(

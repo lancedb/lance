@@ -13,13 +13,13 @@ use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNod
 use lance_core::{ROW_ADDR, ROW_ID};
 use std::{cmp::Ordering, sync::Arc};
 
+use crate::Dataset;
 use crate::dataset::write::merge_insert::exec::{
     DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec,
 };
 use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
-use crate::Dataset;
 
-use super::{MergeInsertParams, MERGE_ACTION_COLUMN};
+use super::{MERGE_ACTION_COLUMN, MergeInsertParams};
 
 /// Logical plan node for merge insert write.
 ///
@@ -119,10 +119,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
         write!(
             f,
             "MergeInsertWrite: on=[{}], when_matched={}, when_not_matched={}, when_not_matched_by_source={}",
-            on_keys,
-            when_matched,
-            when_not_matched,
-            when_not_matched_by_source
+            on_keys, when_matched, when_not_matched, when_not_matched_by_source
         )
     }
 

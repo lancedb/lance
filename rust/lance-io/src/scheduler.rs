@@ -5,7 +5,6 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
-use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -227,7 +226,9 @@ impl IoQueueState {
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
             tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
-            log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            log::debug!(
+                "Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind"
+            );
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
         }
@@ -391,10 +392,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
-            Err(Error::Wrapped {
-                error: self.err.take().unwrap(),
-                location: location!(),
-            })
+            Err(Error::wrapped(self.err.take().unwrap()))
         } else {
             let mut data = Vec::new();
             std::mem::swap(&mut data, &mut self.data_buffers);
@@ -471,10 +469,9 @@ impl IoTask {
         self.to_read.end - self.to_read.start
     }
     fn cancel(self) {
-        (self.when_done)(Err(Error::Internal {
-            message: "Scheduler closed before I/O was completed".to_string(),
-            location: location!(),
-        }));
+        (self.when_done)(Err(Error::internal(
+            "Scheduler closed before I/O was completed".to_string(),
+        )));
     }
 
     async fn run(self) {
@@ -790,7 +787,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
 
         self.do_submit_request(reader, request, tx, priority, io_queue);
@@ -812,7 +809,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
         io_queue: &Arc<lite::IoQueue>,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // It's important that we submit all requests _before_ we await anything
         let maybe_tasks = request
             .into_iter()
@@ -846,7 +843,7 @@ impl ScanScheduler {
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => futures::future::Either::Left(
                 self.submit_request_standard(reader, request, priority, io_queue),
@@ -918,7 +915,7 @@ impl FileScheduler {
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
@@ -1057,7 +1054,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
 
-    use object_store::{memory::InMemory, GetRange, ObjectStore as OSObjectStore};
+    use object_store::{GetRange, ObjectStore as OSObjectStore, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 

@@ -2,10 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::Ordering;
-use std::sync::{atomic, LazyLock};
+use std::sync::{LazyLock, atomic};
 use std::time::Duration;
-
-use crate::Result;
 
 use futures::{Future, FutureExt};
 use tokio::runtime::{Builder, Runtime};
@@ -110,9 +108,13 @@ fn install_atfork() {}
 ///
 /// This can also be used to convert a big chunk of synchronous work into a future
 /// so that it can be run in parallel with something like StreamExt::buffered()
-pub fn spawn_cpu<F: FnOnce() -> Result<R> + Send + 'static, R: Send + 'static>(
+pub fn spawn_cpu<
+    E: std::error::Error + Send + 'static,
+    F: FnOnce() -> std::result::Result<R, E> + Send + 'static,
+    R: Send + 'static,
+>(
     func: F,
-) -> impl Future<Output = Result<R>> {
+) -> impl Future<Output = std::result::Result<R, E>> {
     let (send, recv) = tokio::sync::oneshot::channel();
     // Propagate the current span into the task
     let span = Span::current();
