@@ -862,9 +862,12 @@ impl ManifestNamespace {
 
         merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
         merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-        // conflict_retries=0: no outer loop retry on semantic conflicts (handled by caller)
-        // commit_retries: inner retry for manifest version conflicts (uses lance default if not set)
-        merge_builder.conflict_retries(0);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
         // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
         // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
         // results in (Some, None) filter mismatch when rebasing against V2 operations.
@@ -2916,6 +2919,85 @@ mod tests {
         assert_eq!(
             trailing_slash_result, "s3://bucket/path/subdir/table.lance",
             "URL with existing trailing slash should still work"
+        );
+    }
+
+    /// Test that concurrent create_table calls for the same table name don't
+    /// create duplicate entries in the manifest. Uses two independent
+    /// ManifestNamespace instances pointing at the same directory to simulate
+    /// two separate OS processes racing on table creation. The conflict_retries
+    /// setting on the MergeInsert ensures the second operation properly detects
+    /// the duplicate via WhenMatched::Fail after retrying against the latest data.
+    #[tokio::test]
+    async fn test_concurrent_create_table_no_duplicates() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Two independent namespace instances = two separate "processes"
+        // sharing the same underlying filesystem directory.
+        let ns1 = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let ns2 = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let buffer = create_test_ipc_data();
+
+        let mut req1 = CreateTableRequest::new();
+        req1.id = Some(vec!["race_table".to_string()]);
+        let mut req2 = CreateTableRequest::new();
+        req2.id = Some(vec!["race_table".to_string()]);
+
+        // Launch both create_table calls concurrently
+        let (result1, result2) = tokio::join!(
+            ns1.create_table(req1, Bytes::from(buffer.clone())),
+            ns2.create_table(req2, Bytes::from(buffer.clone())),
+        );
+
+        // Exactly one should succeed and one should fail
+        let success_count = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+        let failure_count = [&result1, &result2].iter().filter(|r| r.is_err()).count();
+        assert_eq!(
+            success_count, 1,
+            "Exactly one create should succeed, got: result1={:?}, result2={:?}",
+            result1, result2
+        );
+        assert_eq!(
+            failure_count, 1,
+            "Exactly one create should fail, got: result1={:?}, result2={:?}",
+            result1, result2
+        );
+
+        // Verify only one table entry exists in the manifest
+        let ns_check = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let response = ns_check.list_tables(list_request).await.unwrap();
+        assert_eq!(
+            response.tables.len(),
+            1,
+            "Should have exactly 1 table, found: {:?}",
+            response.tables
+        );
+        assert_eq!(response.tables[0], "race_table");
+
+        // Also verify describe_table works (no "found 2" error)
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec!["race_table".to_string()]);
+        let describe_result = ns_check.describe_table(describe_request).await;
+        assert!(
+            describe_result.is_ok(),
+            "describe_table should not fail with duplicate entries: {:?}",
+            describe_result
         );
     }
 }
