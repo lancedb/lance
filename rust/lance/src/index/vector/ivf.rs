@@ -2167,8 +2167,8 @@ pub(crate) async fn merge_staging_segment(
 /// Write one planned segment into `final_dir`.
 ///
 /// For a single-shard plan this is just a file copy. For a multi-shard plan we
-/// restage the selected partial shards under `final_dir/partial_*`, invoke the
-/// existing auxiliary merge kernel, and then write a fresh root `index.idx`.
+/// read the selected `partial_*` shards directly from the staging root and
+/// materialize the merged auxiliary/index files into `final_dir`.
 async fn merge_staging_segment_to_dir(
     object_store: &ObjectStore,
     indices_dir: &Path,
@@ -2190,21 +2190,32 @@ async fn merge_staging_segment_to_dir(
         return Ok(());
     }
 
-    for shard_uuid in partial_shards {
-        let source_dir = indices_dir
-            .child(segment_plan.staging_index_uuid().to_string())
-            .child(format!("partial_{}", shard_uuid));
-        let staged_dir = final_dir.child(format!("partial_{}", shard_uuid));
-        copy_partial_segment_contents(object_store, &source_dir, &staged_dir).await?;
-    }
+    let staging_root = indices_dir.child(segment_plan.staging_index_uuid().to_string());
+    let aux_paths = partial_shards
+        .iter()
+        .map(|shard_uuid| {
+            staging_root
+                .child(format!("partial_{}", shard_uuid))
+                .child(INDEX_AUXILIARY_FILE_NAME)
+        })
+        .collect::<Vec<_>>();
+    let partial_index_paths = partial_shards
+        .iter()
+        .map(|shard_uuid| {
+            staging_root
+                .child(format!("partial_{}", shard_uuid))
+                .child(INDEX_FILE_NAME)
+        })
+        .collect::<Vec<_>>();
 
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
         object_store,
-        &final_dir,
+        &aux_paths,
+        final_dir,
     )
     .await?;
-    write_root_vector_index_from_auxiliary(object_store, &final_dir, None).await?;
-    cleanup_partial_vector_dirs(object_store, &final_dir).await?;
+    write_root_vector_index_from_auxiliary(object_store, &final_dir, None, &partial_index_paths)
+        .await?;
     if cleanup_source_shards {
         cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
     }
@@ -2554,6 +2565,7 @@ async fn write_root_vector_index_from_auxiliary(
     object_store: &ObjectStore,
     index_dir: &Path,
     requested_index_type: Option<IndexType>,
+    centroid_source_index_paths: &[Path],
 ) -> Result<()> {
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
@@ -2587,30 +2599,14 @@ async fn write_root_vector_index_from_auxiliary(
     let mut pb_ivf: lance_index::pb::Ivf = Message::decode(raw_ivf_bytes.clone())?;
 
     // If the unified IVF metadata does not contain centroids, try to source them
-    // from any partial_* index.idx under this index directory.
+    // from one of the shard index files that fed this merge.
     if pb_ivf.centroids_tensor.is_none() {
-        let mut stream = object_store.list(Some(index_dir.clone()));
-        let mut partial_index_path = None;
-
-        while let Some(item) = stream.next().await {
-            let meta = item?;
-            if let Some(fname) = meta.location.filename()
-                && fname == INDEX_FILE_NAME
-            {
-                let parts: Vec<_> = meta.location.parts().collect();
-                if parts.len() >= 2 {
-                    let parent = parts[parts.len() - 2].as_ref();
-                    if parent.starts_with("partial_") {
-                        partial_index_path = Some(meta.location.clone());
-                        break;
-                    }
-                }
+        for partial_index_path in centroid_source_index_paths {
+            if !object_store.exists(partial_index_path).await? {
+                continue;
             }
-        }
-
-        if let Some(partial_index_path) = partial_index_path {
             let fh = scheduler
-                .open_file(&partial_index_path, &CachedFileSize::unknown())
+                .open_file(partial_index_path, &CachedFileSize::unknown())
                 .await?;
             let partial_reader = V2Reader::try_open(
                 fh,
@@ -2628,6 +2624,7 @@ async fn write_root_vector_index_from_auxiliary(
                 let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
                 if partial_pb_ivf.centroids_tensor.is_some() {
                     pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
+                    break;
                 }
             }
         }
@@ -2708,60 +2705,6 @@ async fn write_root_vector_index_from_auxiliary(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
-    Ok(())
-}
-
-/// Cleanup for distributed partial vector index directories after
-/// a distributed merge.
-///
-/// This helper scans `index_dir` for direct child directories whose names
-/// start with `partial_` (e.g. `<index_dir>/partial_0`, `<index_dir>/partial_1`)
-/// and attempts to recursively delete them via [`ObjectStore::remove_dir_all`].
-///
-/// Listing and deletion failures are logged with [`warn!`] and ignored so that
-/// index finalization is never blocked by cleanup. The function always returns
-/// `Ok(())`.
-async fn cleanup_partial_vector_dirs(
-    object_store: &ObjectStore,
-    index_dir: &object_store::path::Path,
-) -> Result<()> {
-    let mut partial_dirs: HashSet<Path> = HashSet::new();
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
-
-    while let Some(item) = list_stream.next().await {
-        match item {
-            Ok(meta) => {
-                if let Some(relative_parts) = meta.location.prefix_match(index_dir) {
-                    let rel_parts: Vec<_> = relative_parts.collect();
-                    // Expect paths like: <index_dir>/partial_*/<file>
-                    if rel_parts.len() >= 2 {
-                        let parent_name = rel_parts[0].as_ref();
-                        if parent_name.starts_with("partial_") {
-                            partial_dirs.insert(index_dir.child(parent_name));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to list index directory '{}' while collecting partial_* dirs: {}",
-                    index_dir.as_ref(),
-                    e
-                );
-            }
-        }
-    }
-
-    for dir in partial_dirs {
-        if let Err(e) = object_store.remove_dir_all(dir.clone()).await {
-            warn!(
-                "Failed to remove partial_* directory '{}' after distributed merge: {}",
-                dir.as_ref(),
-                e
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -4307,50 +4250,6 @@ mod tests {
         assert!(correct_times >= 9, "correct: {}", correct_times);
     }
 
-    #[tokio::test]
-    async fn test_cleanup_removes_only_partial_dirs() {
-        let object_store = ObjectStore::memory();
-        let index_dir = Path::from("index/uuid_test_cleanup");
-
-        // partial_* directories that should be removed
-        let partial0_file = index_dir.child("partial_0").child("file.bin");
-        let partial_abc_file = index_dir.child("partial_abc").child("file.bin");
-
-        // Non-partial paths that must be preserved
-        let partialx_file = index_dir.child("partialX").child("file.bin");
-        let shard_file = index_dir.child("shard_0").child("file.bin");
-        let keep_root_file = index_dir.child("keep_root.txt");
-
-        object_store.put(&partial0_file, b"partial0").await.unwrap();
-        object_store
-            .put(&partial_abc_file, b"partial_abc")
-            .await
-            .unwrap();
-        object_store.put(&partialx_file, b"partialx").await.unwrap();
-        object_store.put(&shard_file, b"shard").await.unwrap();
-        object_store.put(&keep_root_file, b"root").await.unwrap();
-
-        // Sanity: all files exist before cleanup
-        assert!(object_store.exists(&partial0_file).await.unwrap());
-        assert!(object_store.exists(&partial_abc_file).await.unwrap());
-        assert!(object_store.exists(&partialx_file).await.unwrap());
-        assert!(object_store.exists(&shard_file).await.unwrap());
-        assert!(object_store.exists(&keep_root_file).await.unwrap());
-
-        cleanup_partial_vector_dirs(&object_store, &index_dir)
-            .await
-            .unwrap();
-
-        // partial_* directories should be removed
-        assert!(!object_store.exists(&partial0_file).await.unwrap());
-        assert!(!object_store.exists(&partial_abc_file).await.unwrap());
-
-        // Non-partial directories and root files must be preserved
-        assert!(object_store.exists(&partialx_file).await.unwrap());
-        assert!(object_store.exists(&shard_file).await.unwrap());
-        assert!(object_store.exists(&keep_root_file).await.unwrap());
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_ivf_model_progress_callback() {
         use lance_index::progress::IndexBuildProgress;
@@ -4419,27 +4318,6 @@ mod tests {
                 window[0].1,
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_idempotent() {
-        let object_store = ObjectStore::memory();
-        let index_dir = Path::from("index/uuid_test_cleanup_idempotent");
-
-        let partial_file = index_dir.child("partial_0").child("file.bin");
-        object_store.put(&partial_file, b"partial").await.unwrap();
-
-        assert!(object_store.exists(&partial_file).await.unwrap());
-
-        cleanup_partial_vector_dirs(&object_store, &index_dir)
-            .await
-            .unwrap();
-        assert!(!object_store.exists(&partial_file).await.unwrap());
-
-        // Second call should succeed even when there are no partial_* directories left.
-        cleanup_partial_vector_dirs(&object_store, &index_dir)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
