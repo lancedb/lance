@@ -25,8 +25,6 @@ pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance
 
 > Note: Preview releases receive the same level of testing as regular releases.
 
-> Note: For versions prior to 1.0.0-beta.4, you can find them at https://pypi.fury.io/lancedb/pylance
-
 ## Set Up Your Environment
 
 First, let's import the necessary libraries:
