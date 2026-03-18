@@ -420,7 +420,7 @@ async fn do_load_shuffled_vectors(
         column,
         vec![IndexSegment::new(
             index_id,
-            ds.iter_fragments().map(|f| f.id as u32),
+            ds.fragments().iter().map(|f| f.id as u32),
         )],
     )
     .await

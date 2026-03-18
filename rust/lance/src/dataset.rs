@@ -1817,11 +1817,6 @@ impl Dataset {
             .collect()
     }
 
-    /// Iterate over manifest fragments without allocating [`FileFragment`] wrappers.
-    pub fn iter_fragments(&self) -> impl Iterator<Item = &Fragment> {
-        self.manifest.fragments.iter()
-    }
-
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
         let dataset = Arc::new(self.clone());
         let fragment = self

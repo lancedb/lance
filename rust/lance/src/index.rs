@@ -761,12 +761,6 @@ impl DatasetIndexExt for Dataset {
         column: &str,
         index_id: Uuid,
     ) -> Result<()> {
-        let Some(_field) = self.schema().field(column) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column}' does not exist"
-            )));
-        };
-
         // TODO: We will need some way to determine the index details here.  Perhaps
         // we can load the index itself and get the details that way.
 
