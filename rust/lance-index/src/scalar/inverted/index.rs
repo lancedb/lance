@@ -1768,7 +1768,9 @@ impl PostingListReader {
                             Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                             e => e,
                         })?;
-                    CompressedPositionStorage::LegacyPerDoc(batch[POSITION_COL].as_list::<i32>().clone())
+                    CompressedPositionStorage::LegacyPerDoc(
+                        batch[POSITION_COL].as_list::<i32>().value(0).as_list::<i32>().clone(),
+                    )
                 }
                 PositionsLayout::SharedStream(codec) => {
                     let batch = self
@@ -4870,5 +4872,87 @@ mod tests {
                 expected_idf
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_phrase_query_reads_legacy_per_doc_positions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V1,
+        );
+        builder.tokens.add("hello".to_owned());
+        builder.tokens.add("world".to_owned());
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                PostingTailCodec::Fixed32,
+            ));
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                PostingTailCodec::Fixed32,
+            ));
+        builder.posting_lists[0].add(0, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(0, PositionRecorder::Position(vec![1].into()));
+        builder.posting_lists[0].add(1, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(1, PositionRecorder::Position(vec![2].into()));
+        builder.docs.append(100, 2);
+        builder.docs.append(101, 2);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(
+            vec!["hello".to_owned(), "world".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_phrase_slop(Some(0)),
+        );
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, _scores) = index
+            .bm25_search(tokens, params, Operator::And, prefilter, metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![100]);
     }
 }
