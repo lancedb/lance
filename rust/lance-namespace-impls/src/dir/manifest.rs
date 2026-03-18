@@ -942,8 +942,8 @@ impl ManifestNamespace {
                     ))))
                 },
             )?;
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+        merge_builder.when_matched(WhenMatched::Fail);
+        merge_builder.when_not_matched(WhenNotMatched::InsertAll);
         // Use conflict_retries to handle cross-process races on manifest mutations.
         // When two processes concurrently insert the same object_id, the second one
         // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
