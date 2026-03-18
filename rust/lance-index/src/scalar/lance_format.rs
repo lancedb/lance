@@ -9,8 +9,9 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{cache::LanceCache, Error, Result};
+use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
     writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
@@ -19,7 +20,7 @@ use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjec
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use std::cmp::min;
@@ -37,6 +38,7 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
+    format_version: LanceFileVersion,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -54,6 +56,21 @@ impl LanceIndexStore {
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
     ) -> Self {
+        Self::with_format_version(
+            object_store,
+            index_dir,
+            metadata_cache,
+            LanceFileVersion::V2_0,
+        )
+    }
+
+    /// Create a new index store at the given directory with a specific format version
+    pub fn with_format_version(
+        object_store: Arc<ObjectStore>,
+        index_dir: Path,
+        metadata_cache: Arc<LanceCache>,
+        format_version: LanceFileVersion,
+    ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -63,6 +80,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
+            format_version,
         }
     }
 }
@@ -216,7 +234,10 @@ impl IndexStore for LanceIndexStore {
         let writer = current_writer::FileWriter::try_new(
             writer,
             schema,
-            current_writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions {
+                format_version: Some(self.format_version),
+                ..Default::default()
+            },
         )?;
         Ok(Box::new(writer))
     }
@@ -310,27 +331,27 @@ pub mod tests {
     use crate::scalar::label_list::LabelListIndexPlugin;
     use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
-        bitmap::BitmapIndex,
-        btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
+        bitmap::BitmapIndex,
+        btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
     };
 
     use super::*;
     use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
+        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
         cast::AsArray,
         types::{Int32Type, UInt64Type},
-        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
+    use lance_core::ROW_ID;
     use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     use lance_core::utils::tempfile::TempDir;
-    use lance_core::ROW_ID;
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
@@ -1362,35 +1383,41 @@ pub mod tests {
             .unwrap();
 
         // Remapped to new value
-        assert!(remapped_index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
-                &NoOpMetricsCollector
-            )
-            .await
-            .unwrap()
-            .row_addrs()
-            .selected(65));
+        assert!(
+            remapped_index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+                    &NoOpMetricsCollector
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .selected(65)
+        );
         // Deleted
-        assert!(remapped_index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
-                &NoOpMetricsCollector
-            )
-            .await
-            .unwrap()
-            .row_addrs()
-            .is_empty());
+        assert!(
+            remapped_index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                    &NoOpMetricsCollector
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .is_empty()
+        );
         // Not remapped
-        assert!(remapped_index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(3))),
-                &NoOpMetricsCollector
-            )
-            .await
-            .unwrap()
-            .row_addrs()
-            .selected(3));
+        assert!(
+            remapped_index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(3))),
+                    &NoOpMetricsCollector
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .selected(3)
+        );
     }
 
     async fn train_tag(

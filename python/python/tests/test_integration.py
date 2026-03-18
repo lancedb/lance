@@ -16,7 +16,7 @@ def test_duckdb_filter_on_rowid(tmp_path):
     expected = tab.slice(1, 1)
     actual = duckdb.query(
         f"SELECT * FROM ds WHERE _rowid = {row_ids[1]}"
-    ).fetch_arrow_table()
+    ).to_arrow_table()
 
     assert actual.to_pydict() == expected.to_pydict()
 
@@ -37,11 +37,11 @@ def test_duckdb_pushdown_extension_types(tmp_path):
     )
     ds = lance.write_dataset(tab, str(tmp_path))  # noqa: F841
     expected = tab.slice(1, 1)
-    actual = duckdb.query("SELECT * FROM ds WHERE filterme = 2").fetch_arrow_table()
+    actual = duckdb.query("SELECT * FROM ds WHERE filterme = 2").to_arrow_table()
     assert actual.to_pydict() == expected.to_pydict()
 
     expected = tab.slice(0, 1)
-    actual = duckdb.query("SELECT * FROM ds WHERE othercol = 4").fetch_arrow_table()
+    actual = duckdb.query("SELECT * FROM ds WHERE othercol = 4").to_arrow_table()
     assert actual.to_pydict() == expected.to_pydict()
 
     # Not the best error message but hopefully this is short lived until datafusion
@@ -64,6 +64,6 @@ def test_duckdb_pushdown_extension_types(tmp_path):
         "filterme IS NOT NULL",
         "filterme < 2",
     ]:
-        expected = duckdb.query(f"SELECT * FROM tab WHERE {filt}").fetch_arrow_table()
-        actual = duckdb.query(f"SELECT * FROM ds WHERE {filt}").fetch_arrow_table()
+        expected = duckdb.query(f"SELECT * FROM tab WHERE {filt}").to_arrow_table()
+        actual = duckdb.query(f"SELECT * FROM ds WHERE {filt}").to_arrow_table()
         assert actual == expected

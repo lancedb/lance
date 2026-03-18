@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
-use arrow_array::{cast::AsArray, Array, ArrayRef, FixedSizeListArray, RecordBatch};
+use arrow_array::new_empty_array;
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
 use futures::StreamExt;
 use lance_arrow::DataTypeExt;
@@ -15,7 +16,6 @@ use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
-use snafu::location;
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
@@ -35,27 +35,24 @@ fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> 
 
     // Parse the field path using Lance's field path parsing logic
     // This properly handles backtick-escaped field names
-    let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| Error::Index {
-        message: format!("Failed to parse field path '{}': {}", column, e),
-        location: location!(),
-    })?;
+    let parts = lance_core::datatypes::parse_field_path(column)
+        .map_err(|e| Error::index(format!("Failed to parse field path '{}': {}", column, e)))?;
 
     if parts.is_empty() {
-        return Err(Error::Index {
-            message: format!("Invalid empty field path: {}", column),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Invalid empty field path: {}",
+            column
+        )));
     }
 
     // Get the root column
     let mut current_array: ArrayRef = batch
         .column_by_name(&parts[0])
-        .ok_or_else(|| Error::Index {
-            message: format!(
+        .ok_or_else(|| {
+            Error::index(format!(
                 "Column '{}' does not exist in batch (looking for root field '{}')",
                 column, parts[0]
-            ),
-            location: location!(),
+            ))
         })?
         .clone();
 
@@ -64,22 +61,20 @@ fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> 
         let struct_array = current_array
             .as_any()
             .downcast_ref::<arrow_array::StructArray>()
-            .ok_or_else(|| Error::Index {
-                message: format!(
+            .ok_or_else(|| {
+                Error::index(format!(
                     "Cannot access nested field '{}' in column '{}': parent is not a struct",
                     part, column
-                ),
-                location: location!(),
+                ))
             })?;
 
         current_array = struct_array
             .column_by_name(part)
-            .ok_or_else(|| Error::Index {
-                message: format!(
+            .ok_or_else(|| {
+                Error::index(format!(
                     "Nested field '{}' does not exist in column '{}'",
                     part, column
-                ),
-                location: location!(),
+                ))
             })?
             .clone();
     }
@@ -141,10 +136,10 @@ async fn estimate_multivector_vectors_per_row(
 
 /// Get the vector dimension of the given column in the schema.
 pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
-    let field = schema.field(column).ok_or(Error::Index {
-        message: format!("Column {} does not exist in schema {}", column, schema),
-        location: location!(),
-    })?;
+    let field = schema.field(column).ok_or(Error::index(format!(
+        "Column {} does not exist in schema {}",
+        column, schema
+    )))?;
     infer_vector_dim(&field.data_type())
 }
 
@@ -154,10 +149,15 @@ pub fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize>
 }
 
 fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) -> Result<usize> {
-    match (data_type,in_list) {
-        (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
-        (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
-        _ => Err(Error::invalid_input(format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type), location!()))
+    match (data_type, in_list) {
+        (arrow::datatypes::DataType::FixedSizeList(_, dim), _) => Ok(*dim as usize),
+        (arrow::datatypes::DataType::List(inner), false) => {
+            infer_vector_dim_impl(inner.data_type(), true)
+        }
+        _ => Err(Error::invalid_input(format!(
+            "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
+            data_type
+        ))),
     }
 }
 
@@ -168,10 +168,10 @@ pub fn get_vector_type(
     schema: &Schema,
     column: &str,
 ) -> Result<(arrow_schema::DataType, arrow_schema::DataType)> {
-    let field = schema.field(column).ok_or(Error::Index {
-        message: format!("column {} does not exist in schema {}", column, schema),
-        location: location!(),
-    })?;
+    let field = schema.field(column).ok_or(Error::index(format!(
+        "column {} does not exist in schema {}",
+        column, schema
+    )))?;
     Ok((
         field.data_type(),
         infer_vector_element_type(&field.data_type())?,
@@ -208,13 +208,10 @@ pub fn validate_distance_type_for(
     if supported {
         Ok(())
     } else {
-        Err(Error::invalid_input(
-            format!(
-                "Distance type {} does not support {} vectors",
-                distance_type, element_type
-            ),
-            location!(),
-        ))
+        Err(Error::invalid_input(format!(
+            "Distance type {} does not support {} vectors",
+            distance_type, element_type
+        )))
     }
 }
 
@@ -240,25 +237,19 @@ fn infer_vector_element_type_impl(
                 | arrow::datatypes::DataType::Float64
                 | arrow::datatypes::DataType::UInt8
                 | arrow::datatypes::DataType::Int8 => Ok(element_field.data_type().clone()),
-                _ => Err(Error::Index {
-                    message: format!(
-                        "vector element is not expected type (Float16/Float32/Float64 or UInt8): {:?}",
-                        element_field.data_type()
-                    ),
-                    location: location!(),
-                }),
+                _ => Err(Error::index(format!(
+                    "vector element is not expected type (Float16/Float32/Float64 or UInt8): {:?}",
+                    element_field.data_type()
+                ))),
             }
         }
         (arrow::datatypes::DataType::List(inner), false) => {
             infer_vector_element_type_impl(inner.data_type(), true)
         }
-        _ => Err(Error::invalid_input(
-            format!(
+        _ => Err(Error::invalid_input(format!(
             "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
             data_type
-        ),
-            location!(),
-        )),
+        ))),
     }
 }
 
@@ -273,13 +264,23 @@ pub async fn maybe_sample_training_data(
 ) -> Result<FixedSizeListArray> {
     let num_rows = dataset.count_rows(None).await?;
 
-    let vector_field = dataset.schema().field(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in schema",
-            column
-        ),
-        location: location!(),
-    })?;
+    let vector_field = dataset.schema().field(column).ok_or(Error::index(format!(
+        "Sample training data: column {} does not exist in schema",
+        column
+    )))?;
+
+    if sample_size_hint == 0 {
+        info!("No sampling required, skipping sampling and returning empty array");
+        let data_type = vector_field.data_type();
+        let dimension = infer_vector_dim(&data_type)?;
+        let element_type = infer_vector_element_type(&data_type)?;
+        let fsl_type = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", element_type, false)),
+            dimension as i32,
+        );
+        return Ok(new_empty_array(&fsl_type).as_fixed_size_list().clone());
+    }
+
     let is_nullable = vector_field.nullable;
 
     let sample_size_hint = match vector_field.data_type() {
@@ -363,13 +364,10 @@ fn vector_column_to_fsl(batch: &RecordBatch, column: &str) -> Result<FixedSizeLi
             let vectors = list_array.values().as_fixed_size_list();
             Ok(vectors.clone())
         }
-        _ => Err(Error::Index {
-            message: format!(
-                "Sample training data: column {} is not a vector column",
-                column
-            ),
-            location: location!(),
-        }),
+        _ => Err(Error::index(format!(
+            "Sample training data: column {} is not a vector column",
+            column
+        ))),
     }
 }
 
@@ -465,23 +463,19 @@ fn fsl_values_to_array(
     let (inner_field, dim) = match field.data_type() {
         DataType::FixedSizeList(f, d) => (f, d as usize),
         other => {
-            return Err(Error::Index {
-                message: format!("Expected FixedSizeList, got {:?}", other),
-                location: location!(),
-            })
+            return Err(Error::index(format!(
+                "Expected FixedSizeList, got {:?}",
+                other
+            )));
         }
     };
 
-    let elem_size = inner_field
-        .data_type()
-        .primitive_width()
-        .ok_or_else(|| Error::Index {
-            message: format!(
-                "FixedSizeList inner type {:?} has no fixed width",
-                inner_field.data_type()
-            ),
-            location: location!(),
-        })?;
+    let elem_size = inner_field.data_type().primitive_width().ok_or_else(|| {
+        Error::index(format!(
+            "FixedSizeList inner type {:?} has no fixed width",
+            inner_field.data_type()
+        ))
+    })?;
 
     let expected_bytes = num_rows * dim * elem_size;
     debug_assert_eq!(values_buf.len(), expected_bytes);
@@ -650,10 +644,7 @@ async fn sample_nullable_fallback(
     }
 
     let Some(schema) = schema else {
-        return Err(Error::Index {
-            message: "No non-null training data found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index("No non-null training data found".to_string()));
     };
     let batch = arrow::compute::concat_batches(&schema, &filtered)?;
     let num_rows_out = batch.num_rows().min(sample_size_hint);
@@ -748,16 +739,18 @@ fn random_ranges(
             .cloned()
             .collect::<std::collections::HashSet<_>>();
 
-        let additional = std::iter::from_fn(move || loop {
-            if seen.len() >= num_bins {
-                break None;
-            }
-            let next = (0..num_bins).choose(&mut rng).unwrap();
-            if seen.contains(&next) {
-                continue;
-            } else {
-                seen.insert(next);
-                return Some(next);
+        let additional = std::iter::from_fn(move || {
+            loop {
+                if seen.len() >= num_bins {
+                    break None;
+                }
+                let next = (0..num_bins).choose(&mut rng).unwrap();
+                if seen.contains(&next) {
+                    continue;
+                } else {
+                    seen.insert(next);
+                    return Some(next);
+                }
             }
         });
 
@@ -776,10 +769,10 @@ fn random_ranges(
 mod tests {
     use super::*;
 
-    use arrow_array::{types::Float32Type, Float32Array};
+    use arrow_array::{Float32Array, types::Float32Type};
     use arrow_schema::{DataType, Field};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
 
     use crate::dataset::InsertBuilder;
 

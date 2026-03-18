@@ -5,20 +5,20 @@ use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
-    dataset::transaction::{Operation, Transaction},
     Dataset,
+    dataset::transaction::{Operation, Transaction},
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
-    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
     Error, Result,
+    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
 };
+use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::mem_wal::{MergedGeneration, MEM_WAL_INDEX_NAME};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
-use snafu::{location, Location};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -157,35 +157,31 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn retryable_conflict_err(
-        &self,
-        other_transaction: &Transaction,
-        other_version: u64,
-        location: Location,
-    ) -> Error {
-        Error::RetryableCommitConflict {
-            version: other_version,
-            source: format!(
+    #[track_caller]
+    fn retryable_conflict_err(&self, other_transaction: &Transaction, other_version: u64) -> Error {
+        Error::retryable_commit_conflict_source(
+            other_version,
+            format!(
                 "This {} transaction was preempted by concurrent transaction {} at version {}. Please retry.",
-                self.transaction.operation, other_transaction.operation, other_version).into(),
-            location,
-        }
+                self.transaction.operation, other_transaction.operation, other_version
+            )
+            .into(),
+        )
     }
 
+    #[track_caller]
     fn incompatible_conflict_err(
         &self,
         other_transaction: &Transaction,
         other_version: u64,
-        location: Location,
     ) -> Error {
-        Error::IncompatibleTransaction {
-            source: format!(
+        Error::incompatible_transaction_source(
+            format!(
                 "This {} transaction is incompatible with concurrent transaction {} at version {}.",
                 self.transaction.operation, other_transaction.operation, other_version
             )
             .into(),
-            location,
-        }
+        )
     }
 
     /// Check whether the transaction conflicts with another transaction.
@@ -249,11 +245,7 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -264,11 +256,7 @@ impl<'a> TransactionRebase<'a> {
                         .map(|r| r.0)
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -295,11 +283,7 @@ impl<'a> TransactionRebase<'a> {
                     if self.affected_rows.is_none() {
                         // We don't have any affected rows, so we can't
                         // do the rebase anyways.
-                        return Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ));
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     for updated in updated_fragments {
                         if let Some((fragment, needs_rewrite)) =
@@ -308,11 +292,9 @@ impl<'a> TransactionRebase<'a> {
                             // If data files, not just deletion files, are modified,
                             // then we can't rebase.
                             if fragment.files != updated.files {
-                                return Err(self.retryable_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
                             }
 
                             // Mark any modified fragments as needing a rewrite.
@@ -322,25 +304,21 @@ impl<'a> TransactionRebase<'a> {
 
                     for removed_fragment_id in removed_fragment_ids {
                         if self.initial_fragments.contains_key(removed_fragment_id) {
-                            return Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
                         }
                     }
                     Ok(())
                 }
                 Operation::Merge { .. } => {
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
-                | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                )),
+                | Operation::UpdateMemWalState { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -369,11 +347,9 @@ impl<'a> TransactionRebase<'a> {
                     (Some(self_keys), Some(other_keys)) => {
                         if self_keys.field_ids != other_keys.field_ids {
                             // Different key columns - can't verify conflicts
-                            return Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
                         }
                         // Check for intersection. If the bloom filter configs don't match
                         // (e.g., different number_of_items or probability), intersects() returns
@@ -382,18 +358,14 @@ impl<'a> TransactionRebase<'a> {
                             self_keys.intersects(other_keys)
                         else {
                             // Bloom filter configs don't match - treat as conflict
-                            return Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
                         };
                         if has_intersection {
-                            return Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
                         }
                     }
                     (Some(_), None) | (None, Some(_)) => {
@@ -430,11 +402,7 @@ impl<'a> TransactionRebase<'a> {
                     // we can't safely commit against an Append because we don't
                     // know if the appended rows conflict with inserted rows.
                     if self_inserted_rows_filter.is_some() {
-                        return Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ));
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     Ok(())
                 }
@@ -444,11 +412,7 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -459,11 +423,7 @@ impl<'a> TransactionRebase<'a> {
                         .map(|r| r.0)
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -490,11 +450,7 @@ impl<'a> TransactionRebase<'a> {
                     if self.affected_rows.is_none() {
                         // We don't have any affected rows, so we can't
                         // do the rebase anyways.
-                        return Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ));
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     for updated in updated_fragments {
                         if let Some((fragment, needs_rewrite)) =
@@ -503,11 +459,9 @@ impl<'a> TransactionRebase<'a> {
                             // If data files, not just deletion files, are modified,
                             // then we can't rebase.
                             if fragment.files != updated.files {
-                                return Err(self.retryable_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
                             }
 
                             // Mark any modified fragments as needing a rewrite.
@@ -517,21 +471,19 @@ impl<'a> TransactionRebase<'a> {
 
                     for removed_fragment_id in removed_fragment_ids {
                         if self.initial_fragments.contains_key(removed_fragment_id) {
-                            return Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
                         }
                     }
                     Ok(())
                 }
                 Operation::Merge { .. } => {
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
-                    self.incompatible_conflict_err(other_transaction, other_version, location!())
-                ),
+                Operation::Overwrite { .. } | Operation::Restore { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
                 Operation::UpdateMemWalState {
                     merged_generations: other_merged_generations,
                 } => self.check_merged_generations_conflict(
@@ -561,8 +513,6 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                // unless it is the same frag reuse index or MemWAL index
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
@@ -578,15 +528,22 @@ impl<'a> TransactionRebase<'a> {
                     let other_has_mem_wal = created_indices
                         .iter()
                         .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+                    let has_regular_name_conflict = new_indices
+                        .iter()
+                        .filter(|idx| {
+                            idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
+                        })
+                        .any(|new_index| {
+                            created_indices
+                                .iter()
+                                .any(|created_index| created_index.name == new_index.name)
+                        });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
+                        || has_regular_name_conflict
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -619,11 +576,8 @@ impl<'a> TransactionRebase<'a> {
                             // this should not happen today since we don't support committing
                             // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
-                                return Err(self.incompatible_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version));
                             }
 
                             self.conflicting_frag_reuse_indices
@@ -638,11 +592,9 @@ impl<'a> TransactionRebase<'a> {
                             if let Some(frag_bitmap) = &index.fragment_bitmap {
                                 affected_ids.extend(frag_bitmap.iter());
                             } else {
-                                return Err(self.retryable_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
                             }
                         }
 
@@ -651,11 +603,7 @@ impl<'a> TransactionRebase<'a> {
                             .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                             .any(|id| affected_ids.contains(&(id as u32)))
                         {
-                            Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ))
+                            Err(self.retryable_conflict_err(other_transaction, other_version))
                         } else {
                             Ok(())
                         }
@@ -672,11 +620,9 @@ impl<'a> TransactionRebase<'a> {
                     for replacement in replacements {
                         for field in &replacement.1.fields {
                             if newly_indexed_fields.contains(&field) {
-                                return Err(self.retryable_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
                             }
                         }
                     }
@@ -693,16 +639,12 @@ impl<'a> TransactionRebase<'a> {
                             .extend(other_merged_gens.iter().cloned());
                         Ok(())
                     } else {
-                        Err(self.incompatible_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
                     }
                 }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
-                    self.incompatible_conflict_err(other_transaction, other_version, location!())
-                ),
+                Operation::Overwrite { .. } | Operation::Restore { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -746,11 +688,7 @@ impl<'a> TransactionRebase<'a> {
                         .chain(deleted_fragment_ids.iter().copied())
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -765,21 +703,13 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else if committed_fri.is_some() && frag_reuse_index.is_some() {
                         // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexes.
                         // The other rewrite must retry.
                         // TODO: could potentially rebase to combine both frag_reuse_indexes,
                         //   but today it is already rare to run concurrent rewrites.
-                        Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -790,11 +720,8 @@ impl<'a> TransactionRebase<'a> {
                         for group in groups {
                             for old_fragment in &group.old_fragments {
                                 if replacement.0 == old_fragment.id {
-                                    return Err(self.retryable_conflict_err(
-                                        other_transaction,
-                                        other_version,
-                                        location!(),
-                                    ));
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
                                 }
                             }
                         }
@@ -802,7 +729,7 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::Merge { .. } => {
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
                 Operation::CreateIndex {
                     new_indices,
@@ -822,11 +749,8 @@ impl<'a> TransactionRebase<'a> {
                             // this should not happen today since we don't support committing
                             // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
-                                return Err(self.incompatible_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version));
                             }
 
                             self.conflicting_frag_reuse_indices
@@ -841,11 +765,8 @@ impl<'a> TransactionRebase<'a> {
                             // this should not happen today since we don't support committing
                             // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
-                                Err(self.incompatible_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ))
+                                Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version))
                             } else {
                                 Ok(())
                             }
@@ -858,11 +779,8 @@ impl<'a> TransactionRebase<'a> {
                                 if let Some(frag_bitmap) = &index.fragment_bitmap {
                                     affected_ids.extend(frag_bitmap.iter());
                                 } else {
-                                    return Err(self.retryable_conflict_err(
-                                        other_transaction,
-                                        other_version,
-                                        location!(),
-                                    ));
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
                                 }
                             }
                             if groups
@@ -870,20 +788,16 @@ impl<'a> TransactionRebase<'a> {
                                 .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                                 .any(|id| affected_ids.contains(&(id as u32)))
                             {
-                                Err(self.retryable_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ))
+                                Err(self.retryable_conflict_err(other_transaction, other_version))
                             } else {
                                 Ok(())
                             }
                         }
                     }
                 }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
-                    self.incompatible_conflict_err(other_transaction, other_version, location!())
-                ),
+                Operation::Overwrite { .. } | Operation::Restore { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -902,15 +816,11 @@ impl<'a> TransactionRebase<'a> {
                     .operation
                     .upsert_key_conflict(&other_transaction.operation)
                 {
-                    Err(self.incompatible_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ))
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
                 } else {
                     // Concurrent overwrites are retryable so user can decide
                     // if their overwrite should still proceed
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
             }
             Operation::UpdateConfig { .. } => {
@@ -919,17 +829,13 @@ impl<'a> TransactionRebase<'a> {
                     .operation
                     .upsert_key_conflict(&other_transaction.operation)
                 {
-                    Err(self.incompatible_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ))
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
                 } else {
                     Ok(())
                 }
             }
             Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             Operation::Append { .. }
             | Operation::Clone { .. }
@@ -957,7 +863,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             Operation::Append { .. }
             | Operation::Rewrite { .. }
@@ -1005,11 +911,9 @@ impl<'a> TransactionRebase<'a> {
                     for replacement in replacements {
                         for field in &replacement.1.fields {
                             if newly_indexed_fields.contains(&field) {
-                                return Err(self.retryable_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
                             }
                         }
                     }
@@ -1021,11 +925,8 @@ impl<'a> TransactionRebase<'a> {
                         for group in groups {
                             for old_fragment in &group.old_fragments {
                                 if replacement.0 == old_fragment.id {
-                                    return Err(self.retryable_conflict_err(
-                                        other_transaction,
-                                        other_version,
-                                        location!(),
-                                    ));
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
                                 }
                             }
                         }
@@ -1045,11 +946,8 @@ impl<'a> TransactionRebase<'a> {
 
                             for field in &replacement.1.fields {
                                 if other_replacement.1.fields.contains(field) {
-                                    return Err(self.retryable_conflict_err(
-                                        other_transaction,
-                                        other_version,
-                                        location!(),
-                                    ));
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
                                 }
                             }
                         }
@@ -1058,11 +956,9 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
-                | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                )),
+                | Operation::UpdateMemWalState { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1087,13 +983,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::Merge { .. }
             | Operation::DataReplacement { .. } => {
-                Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
             | Operation::Project { .. }
             | Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
     }
@@ -1119,7 +1015,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
             Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
     }
@@ -1131,7 +1027,7 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Overwrite { .. } | Operation::Restore { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             Operation::Append { .. }
             | Operation::Delete { .. }
@@ -1168,12 +1064,12 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
-                Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
     }
@@ -1200,11 +1096,7 @@ impl<'a> TransactionRebase<'a> {
                             .operation
                             .upsert_key_conflict(&other_transaction.operation)
                     {
-                        Err(self.incompatible_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -1219,11 +1111,7 @@ impl<'a> TransactionRebase<'a> {
                             .operation
                             .modifies_same_metadata(&other_transaction.operation)
                     {
-                        Err(self.incompatible_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ))
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -1309,11 +1197,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
-                | Operation::Project { .. } => Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                )),
+                | Operation::Project { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1338,27 +1224,18 @@ impl<'a> TransactionRebase<'a> {
                                 && committed_base.id != 0
                                 && new_base.id == committed_base.id
                             {
-                                return Err(self.incompatible_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version));
                             }
                             // Check for name conflicts
                             if new_base.name == committed_base.name && new_base.name.is_some() {
-                                return Err(self.incompatible_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version));
                             }
                             // Check for path conflicts
                             if new_base.path == committed_base.path {
-                                return Err(self.incompatible_conflict_err(
-                                    other_transaction,
-                                    other_version,
-                                    location!(),
-                                ));
+                                return Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version));
                             }
                         }
                     }
@@ -1387,17 +1264,11 @@ impl<'a> TransactionRebase<'a> {
                     // If committed >= to_commit, data already merged or superseded - abort without retry
                     // If committed < to_commit, can retry with new state
                     if committed_mg.generation >= to_commit_mg.generation {
-                        return Err(self.incompatible_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ));
+                        return Err(
+                            self.incompatible_conflict_err(other_transaction, other_version)
+                        );
                     } else {
-                        return Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ));
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                 }
             }
@@ -1492,17 +1363,13 @@ impl<'a> TransactionRebase<'a> {
                         .unwrap()
                         .take(5)
                         .collect::<Vec<_>>();
-                    return Err(crate::Error::RetryableCommitConflict {
-                        version: dataset.manifest.version,
-                        source: format!(
-                            "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
-                            self.transaction.uuid,
-                            dataset.manifest.version,
-                            sample_addressed.as_slice()
-                        )
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(crate::Error::retryable_commit_conflict_source(dataset.manifest.version, format!(
+                        "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
+                        self.transaction.uuid,
+                        dataset.manifest.version,
+                        sample_addressed.as_slice()
+                    )
+                        .into()));
                 }
 
                 let merged = existing_deletions.clone() | affected_rows.clone();
@@ -1524,11 +1391,10 @@ impl<'a> TransactionRebase<'a> {
                         .initial_fragments
                         .get(fragment_id)
                         .and_then(|(fragment, _)| fragment.physical_rows)
+                        && dv.len() == physical_rows
                     {
-                        if dv.len() == physical_rows {
-                            new_deleted_frag_ids.push(*fragment_id);
-                            continue;
-                        }
+                        new_deleted_frag_ids.push(*fragment_id);
+                        continue;
                     }
 
                     let new_deletion_file = write_deletion_file(
@@ -1582,10 +1448,9 @@ impl<'a> TransactionRebase<'a> {
                 })
             } else {
                 // We shouldn't hit this.
-                Err(crate::Error::Internal {
-                    message: "We have a transaction that needs to be rebased, but we don't have any affected rows.".into(),
-                    location: location!(),
-                })
+                Err(crate::Error::internal(
+                    "We have a transaction that needs to be rebased, but we don't have any affected rows.",
+                ))
             }
         } else {
             Ok(Transaction {
@@ -1596,7 +1461,11 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
-        if let Operation::CreateIndex { new_indices, .. } = &mut self.transaction.operation {
+        if let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &mut self.transaction.operation
+        {
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -1676,6 +1545,25 @@ impl<'a> TransactionRebase<'a> {
 
                 let new_meta = new_mem_wal_index_meta(dataset.manifest.version, details)?;
                 new_indices.push(new_meta);
+            }
+
+            for singleton_name in [FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
+                if new_indices.iter().any(|idx| idx.name == singleton_name) {
+                    for existing_idx in dataset
+                        .load_indices()
+                        .await?
+                        .iter()
+                        .filter(|idx| idx.name == singleton_name)
+                        .cloned()
+                    {
+                        if !removed_indices
+                            .iter()
+                            .any(|removed_idx| removed_idx.uuid == existing_idx.uuid)
+                        {
+                            removed_indices.push(existing_idx);
+                        }
+                    }
+                }
             }
 
             Ok(self.transaction)
@@ -1797,10 +1685,7 @@ async fn initial_fragments_for_rebase(
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {
-    Error::Internal {
-        message: format!("function called against a wrong operation: {}", op),
-        location: location!(),
-    }
+    Error::internal(format!("function called against a wrong operation: {}", op))
 }
 
 #[cfg(test)]
@@ -1845,12 +1730,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+
+        InsertBuilder::new("memory://")
             .with_params(&write_params)
             .execute(vec![data])
             .await
-            .unwrap();
-        dataset
+            .unwrap()
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters
@@ -2289,7 +2174,7 @@ mod tests {
 
     #[test]
     fn test_conflicts() {
-        use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
+        use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
 
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2455,10 +2340,10 @@ mod tests {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0],
                 },
-                // Will only conflict with operations that modify row ids.
+                // Conflicts with row-id-changing operations and same-name CreateIndex.
                 [
                     Compatible,    // append
-                    Compatible,    // create index
+                    Retryable,     // create index
                     Compatible,    // delete
                     Compatible,    // merge
                     NotCompatible, // overwrite
@@ -2786,6 +2671,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_create_index_conflicts_only_on_same_name() {
+        let index0 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+        };
+        let index1 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "other".to_string(),
+            ..index0.clone()
+        };
+
+        let txn = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![index0.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut rebase = TransactionRebase {
+            transaction: txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+
+        let same_name = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![IndexMetadata {
+                    uuid: uuid::Uuid::new_v4(),
+                    ..index0
+                }],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let different_name = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![index1],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let same_name_result = rebase.check_txn(&same_name, 1);
+        assert!(
+            matches!(same_name_result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict for same-name CreateIndex, got {:?}",
+            same_name_result
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: "test".to_string(),
+                        fields: vec![0],
+                        dataset_version: 1,
+                        fragment_bitmap: None,
+                        index_details: None,
+                        index_version: 0,
+                        created_at: None,
+                        base_id: None,
+                    }],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+        let different_name_result = rebase.check_txn(&different_name, 1);
+        assert!(
+            different_name_result.is_ok(),
+            "Expected compatibility for different-name CreateIndex, got {:?}",
+            different_name_result
+        );
     }
 
     #[tokio::test]
@@ -3168,7 +3149,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conflicts_data_replacement() {
-        use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
+        use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
 
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);

@@ -16,8 +16,6 @@ package org.lance;
 import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
-import org.lance.namespace.model.CreateEmptyTableRequest;
-import org.lance.namespace.model.CreateEmptyTableResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateTableRequest;
 import org.lance.namespace.model.CreateTableResponse;
@@ -219,37 +217,27 @@ public class NamespaceIntegrationTest {
     }
 
     /**
-     * Modifies storage options to add incrementing credentials with expiration timestamp.
+     * Simulates a credential vendor returning only vended credentials.
      *
-     * @param storageOptions Original storage options
+     * <p>Returns only credential keys with expiration metadata. Clients are expected to provide
+     * their own connection config (endpoint, region, allow_http) via storageOptions.
+     *
      * @param count Call count to use for credential generation
-     * @return Modified storage options with new credentials
+     * @return Storage options with vended credentials
      */
-    private Map<String, String> modifyStorageOptions(
-        Map<String, String> storageOptions, int count) {
-      Map<String, String> modified =
-          storageOptions != null ? new HashMap<>(storageOptions) : new HashMap<>();
+    private Map<String, String> vendStorageOptions(int count) {
+      Map<String, String> options = new HashMap<>();
 
-      modified.put("aws_access_key_id", "AKID_" + count);
-      modified.put("aws_secret_access_key", "SECRET_" + count);
-      modified.put("aws_session_token", "TOKEN_" + count);
+      options.put("aws_access_key_id", "AKID_" + count);
+      options.put("aws_secret_access_key", "SECRET_" + count);
+      options.put("aws_session_token", "TOKEN_" + count);
 
       long expiresAtMillis = System.currentTimeMillis() + (credentialExpiresInSeconds * 1000L);
-      modified.put("expires_at_millis", String.valueOf(expiresAtMillis));
+      options.put("expires_at_millis", String.valueOf(expiresAtMillis));
       // Set refresh offset to 1 second (1000ms) for short-lived credential tests
-      modified.put("refresh_offset_millis", "1000");
+      options.put("refresh_offset_millis", "1000");
 
-      return modified;
-    }
-
-    @Override
-    public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-      int count = createCallCount.incrementAndGet();
-
-      CreateEmptyTableResponse response = inner.createEmptyTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
-
-      return response;
+      return options;
     }
 
     @Override
@@ -257,7 +245,7 @@ public class NamespaceIntegrationTest {
       int count = createCallCount.incrementAndGet();
 
       DeclareTableResponse response = inner.declareTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+      response.setStorageOptions(vendStorageOptions(count));
 
       return response;
     }
@@ -267,7 +255,7 @@ public class NamespaceIntegrationTest {
       int count = describeCallCount.incrementAndGet();
 
       DescribeTableResponse response = inner.describeTable(request);
-      response.setStorageOptions(modifyStorageOptions(response.getStorageOptions(), count));
+      response.setStorageOptions(vendStorageOptions(count));
 
       return response;
     }
@@ -352,16 +340,17 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
       }
 
-      // Verify createEmptyTable was called
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      // Verify declareTable was called
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       // Open dataset through namespace WITH refresh enabled
-      ReadOptions readOptions = new ReadOptions.Builder().build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -482,16 +471,17 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
       }
 
-      // Verify createEmptyTable was called
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      // Verify declareTable was called
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       // Open dataset through namespace with refresh enabled
-      ReadOptions readOptions = new ReadOptions.Builder().build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       int callCountBeforeOpen = namespace.getDescribeCallCount();
       try (Dataset dsFromNamespace =
@@ -625,12 +615,12 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
 
-          // Verify createEmptyTable was called
+          // Verify declareTable was called
           int callCountAfter = namespace.getCreateCallCount();
-          assertEquals(
-              1, callCountAfter - callCountBefore, "createEmptyTable should be called once");
+          assertEquals(1, callCountAfter - callCountBefore, "declareTable should be called once");
 
           // Verify dataset was created successfully
           assertEquals(2, dataset.countRows());
@@ -658,7 +648,7 @@ public class NamespaceIntegrationTest {
       String tableName = UUID.randomUUID().toString();
 
       // Verify initial call counts
-      assertEquals(0, namespace.getCreateCallCount(), "createEmptyTable should not be called yet");
+      assertEquals(0, namespace.getCreateCallCount(), "declareTable should not be called yet");
       assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
 
       // Create schema and data
@@ -726,20 +716,21 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
 
-          // Verify createEmptyTable was called exactly ONCE
+          // Verify declareTable was called exactly ONCE
           assertEquals(
-              1, namespace.getCreateCallCount(), "createEmptyTable should be called exactly once");
+              1, namespace.getCreateCallCount(), "declareTable should be called exactly once");
 
           // Verify describeTable was NOT called during CREATE
-          // Initial credentials come from createEmptyTable response, and since credentials
+          // Initial credentials come from declareTable response, and since credentials
           // don't expire during the fast write, NO refresh (describeTable) is needed
           assertEquals(
               0,
               namespace.getDescribeCallCount(),
               "describeTable should NOT be called during CREATE - "
-                  + "initial credentials come from createEmptyTable response and don't expire");
+                  + "initial credentials come from declareTable response and don't expire");
 
           // Verify dataset was created successfully
           assertEquals(2, dataset.countRows());
@@ -748,15 +739,14 @@ public class NamespaceIntegrationTest {
       }
 
       // Verify counts after dataset is closed
-      assertEquals(
-          1, namespace.getCreateCallCount(), "createEmptyTable should still be 1 after close");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1 after close");
       assertEquals(
           0,
           namespace.getDescribeCallCount(),
           "describeTable should still be 0 after close (no refresh needed)");
 
       // Now open the dataset through namespace with long-lived credentials (60s expiration)
-      ReadOptions readOptions = new ReadOptions.Builder().build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       try (Dataset dsFromNamespace =
           Dataset.open()
@@ -766,11 +756,11 @@ public class NamespaceIntegrationTest {
               .readOptions(readOptions)
               .build()) {
 
-        // createEmptyTable should NOT be called during open (only during CREATE)
+        // declareTable should NOT be called during open (only during CREATE)
         assertEquals(
             1,
             namespace.getCreateCallCount(),
-            "createEmptyTable should still be 1 (not called during open)");
+            "declareTable should still be 1 (not called during open)");
 
         // describeTable is called exactly ONCE during open to get table location
         assertEquals(
@@ -792,7 +782,7 @@ public class NamespaceIntegrationTest {
       }
 
       // Final verification
-      assertEquals(1, namespace.getCreateCallCount(), "Final: createEmptyTable = 1");
+      assertEquals(1, namespace.getCreateCallCount(), "Final: declareTable = 1");
       assertEquals(1, namespace.getDescribeCallCount(), "Final: describeTable = 1");
     }
   }
@@ -875,11 +865,12 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(2, dataset.countRows());
         }
 
-        assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+        assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
         int initialDescribeCount = namespace.getDescribeCallCount();
 
         // Now append data using the write builder with namespace
@@ -923,6 +914,7 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.APPEND)
+                .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify describeTable was called
@@ -1014,11 +1006,12 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
+                .storageOptions(storageOptions)
                 .execute()) {
           assertEquals(1, dataset.countRows());
         }
 
-        assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+        assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
         assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
 
         // Now overwrite with 2 rows
@@ -1073,10 +1066,11 @@ public class NamespaceIntegrationTest {
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.OVERWRITE)
+                .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify describeTable was called for overwrite
-          assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should still be 1");
+          assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1");
           int describeCountAfterOverwrite = namespace.getDescribeCallCount();
           assertEquals(
               1, describeCountAfterOverwrite, "describeTable should be called once for overwrite");
@@ -1093,6 +1087,7 @@ public class NamespaceIntegrationTest {
                 .allocator(allocator)
                 .namespace(namespace)
                 .tableId(Arrays.asList(tableName))
+                .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
                 .build()) {
           assertEquals(2, ds.countRows(), "Should have 2 rows after overwrite");
           assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
@@ -1122,12 +1117,12 @@ public class NamespaceIntegrationTest {
                   new Field("a", FieldType.nullable(new ArrowType.Int(32, true)), null),
                   new Field("b", FieldType.nullable(new ArrowType.Int(32, true)), null)));
 
-      // Step 1: Create empty table via namespace
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
+      // Step 1: Declare table via namespace
+      DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      DeclareTableResponse response = namespace.declareTable(request);
 
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
       assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
 
       String tableUri = response.getLocation();
@@ -1222,6 +1217,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(5, dsFromNamespace.countRows(), "Should read 5 rows through namespace");
       }
@@ -1249,12 +1245,12 @@ public class NamespaceIntegrationTest {
                   new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                   new Field("value", FieldType.nullable(new ArrowType.Int(32, true)), null)));
 
-      // Create empty table via namespace
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
+      // Declare table via namespace
+      DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      DeclareTableResponse response = namespace.declareTable(request);
 
-      assertEquals(1, namespace.getCreateCallCount(), "createEmptyTable should be called once");
+      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1335,6 +1331,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(6, ds.countRows(), "Should have 6 rows total");
         assertEquals(2, ds.listVersions().size(), "Should have 2 versions");
@@ -1363,10 +1360,10 @@ public class NamespaceIntegrationTest {
                   new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                   new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
 
-      // Create empty table via namespace
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
+      // Declare table via namespace
+      DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      DeclareTableResponse response = namespace.declareTable(request);
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1466,6 +1463,7 @@ public class NamespaceIntegrationTest {
               .allocator(allocator)
               .namespace(namespace)
               .tableId(Arrays.asList(tableName))
+              .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
         assertEquals(4, ds.countRows(), "Should have 4 rows total");
         assertEquals(2, ds.listVersions().size(), "Should have 2 versions");

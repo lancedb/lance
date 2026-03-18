@@ -53,7 +53,7 @@ use std::time::Duration;
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;

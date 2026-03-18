@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use criterion::{criterion_group, criterion_main, Criterion};
-use lance_index::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
+use criterion::{Criterion, criterion_group, criterion_main};
+use lance_index::vector::kmeans::{KMeansAlgoFloat, compute_partitions};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array_with_seed;
 #[cfg(target_os = "linux")]

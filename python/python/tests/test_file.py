@@ -61,7 +61,7 @@ def test_schema_only(tmp_path):
 def test_write_with_max_page_bytes(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
-    for version in ["2.0", "2.1", "2.2"]:
+    for version in ["2.0", "2.1", "2.2", "2.3"]:
         with LanceFileWriter(
             str(path), schema, max_page_bytes=1, version=version
         ) as writer:
@@ -96,6 +96,7 @@ def test_version(tmp_path):
         ("foo.lance", "2.0", (0, 3)),
         ("foo2.lance", "2.1", (2, 1)),
         ("foo3.lance", "2.2", (2, 2)),
+        ("foo4.lance", "2.3", (2, 3)),
     ]
 
     for file_name, version, (major, minor) in cases:

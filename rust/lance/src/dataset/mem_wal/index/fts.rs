@@ -25,16 +25,15 @@
 //! but is skipped during MemTable flush.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
 use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::InvertedIndexParams;
-use snafu::location;
+use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use tantivy::tokenizer::TokenStream;
 
 use super::RowPosition;
@@ -97,11 +96,11 @@ pub enum FtsQueryExpr {
     /// Boolean combination of queries.
     Boolean {
         /// All MUST clauses must match for a document to be included.
-        must: Vec<FtsQueryExpr>,
+        must: Vec<Self>,
         /// At least one SHOULD clause should match (adds to score).
-        should: Vec<FtsQueryExpr>,
+        should: Vec<Self>,
         /// No MUST_NOT clause may match (excludes documents).
-        must_not: Vec<FtsQueryExpr>,
+        must_not: Vec<Self>,
     },
     /// Boosting query with positive and optional negative components.
     ///
@@ -110,9 +109,9 @@ pub enum FtsQueryExpr {
     /// and negative have their scores reduced by `negative_boost`.
     Boost {
         /// The primary query (documents must match this).
-        positive: Box<FtsQueryExpr>,
+        positive: Box<Self>,
         /// Optional query to demote matching documents.
-        negative: Option<Box<FtsQueryExpr>>,
+        negative: Option<Box<Self>>,
         /// Boost factor for documents matching negative query (typically < 1.0).
         /// Score becomes: original_score * negative_boost for docs matching negative.
         negative_boost: f32,
@@ -1289,13 +1288,10 @@ impl FtsMemIndex {
             let original_pos = entry.key().row_position;
             let reversed_pos = total_rows_u64 - original_pos - 1;
             let doc_id = *reversed_pos_to_doc_id.get(&reversed_pos).ok_or_else(|| {
-                Error::io(
-                    format!(
-                        "FTS index internal error: doc_id not found for reversed position {} (original: {}, total_rows: {})",
-                        reversed_pos, original_pos, total_rows
-                    ),
-                    location!(),
-                )
+                Error::io(format!(
+                    "FTS index internal error: doc_id not found for reversed position {} (original: {}, total_rows: {})",
+                    reversed_pos, original_pos, total_rows
+                ))
             })?;
 
             token_postings
@@ -1318,13 +1314,10 @@ impl FtsMemIndex {
 
         for (token, mut postings) in token_postings {
             let token_id = tokens.get(&token).ok_or_else(|| {
-                Error::io(
-                    format!(
-                        "FTS index internal error: token '{}' not found in TokenSet",
-                        token
-                    ),
-                    location!(),
-                )
+                Error::io(format!(
+                    "FTS index internal error: token '{}' not found in TokenSet",
+                    token
+                ))
             })? as usize;
 
             // Sort postings by doc_id for proper ordering

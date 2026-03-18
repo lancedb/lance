@@ -10,11 +10,11 @@ use lance_io::{
     utils::CachedFileSize,
 };
 use object_store::path::Path;
-use rand::{seq::SliceRandom, RngCore};
+use rand::{RngCore, seq::SliceRandom};
 use std::{fmt::Display, process::Command, sync::Arc};
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
@@ -98,7 +98,9 @@ fn bench_full_read(c: &mut Criterion) {
                                     .output()
                                     .unwrap();
                             }
-                            std::env::set_var("IO_THREADS", io_parallelism.to_string());
+                            unsafe {
+                                std::env::set_var("IO_THREADS", io_parallelism.to_string());
+                            }
                             let mut config = SchedulerConfig::default_for_testing();
                             if use_lite_scheduler {
                                 config = config.with_lite_scheduler();
@@ -221,7 +223,12 @@ fn bench_random_read(c: &mut Criterion) {
                                         .output()
                                         .unwrap();
                                 }
-                                std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
+                                unsafe {
+                                    std::env::set_var(
+                                        "IO_THREADS",
+                                        params.io_parallelism.to_string(),
+                                    );
+                                }
                                 runtime.block_on(async {
                                     // Spawn background CPU tasks if noisy_runtime is enabled
                                     let mut noise_tasks: Vec<JoinHandle<()>> = Vec::new();

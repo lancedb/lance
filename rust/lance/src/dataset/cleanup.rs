@@ -35,18 +35,19 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
-use crate::{utils::temporal::utc_now, Dataset};
+use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
 use futures::future::try_join_all;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
+    Error, Result,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
     },
-    Error, Result,
 };
 use lance_table::{
     format::{IndexMetadata, Manifest},
@@ -63,8 +64,11 @@ use std::{
     collections::{HashMap, HashSet},
     future,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
-use tracing::{debug, info, instrument, Span};
+use tokio::time::{MissedTickBehavior, interval};
+use tokio_stream::wrappers::IntervalStream;
+use tracing::{Span, debug, info, instrument};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -78,6 +82,18 @@ struct ReferencedFiles {
 pub struct RemovalStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
+    pub data_files_removed: u64,
+    pub transaction_files_removed: u64,
+    pub index_files_removed: u64,
+    pub deletion_files_removed: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RemovedFileType {
+    Data,
+    Transaction,
+    Index,
+    Deletion,
 }
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
@@ -113,6 +129,8 @@ struct CleanupInspection {
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
+const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
+const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
@@ -169,6 +187,10 @@ impl<'a> CleanupTask<'a> {
         let stats = self.delete_unreferenced_files(inspection).await?;
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
+        final_stats.data_files_removed += stats.data_files_removed;
+        final_stats.transaction_files_removed += stats.transaction_files_removed;
+        final_stats.index_files_removed += stats.index_files_removed;
+        final_stats.deletion_files_removed += stats.deletion_files_removed;
         Ok(final_stats)
     }
 
@@ -282,7 +304,18 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_removed = tracing::field::Empty))]
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            old_versions = inspection.old_manifests.len(),
+            bytes_removed = tracing::field::Empty,
+            data_files_removed = tracing::field::Empty,
+            transaction_files_removed = tracing::field::Empty,
+            index_files_removed = tracing::field::Empty,
+            deletion_files_removed = tracing::field::Empty
+        )
+    )]
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
@@ -302,7 +335,9 @@ impl<'a> CleanupTask<'a> {
             )
         };
         // Build stream for a managed subtree
-        let build_listing_stream = |dir: Path| {
+        let build_listing_stream = |dir: Path, file_type: Option<RemovedFileType>| {
+            let inspection_ref = &inspection;
+            let removal_stats_ref = &removal_stats;
             self.dataset
                 .object_store
                 .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
@@ -316,7 +351,7 @@ impl<'a> CleanupTask<'a> {
                     }
                 })
                 .try_flatten()
-                .try_filter_map(|obj_meta| {
+                .try_filter_map(move |obj_meta| {
                     // If a file is new-ish then it might be part of an ongoing operation and so we only
                     // delete it if we can verify it is part of an old version.
                     let maybe_in_progress = !self.policy.delete_unverified
@@ -324,10 +359,21 @@ impl<'a> CleanupTask<'a> {
                     let path_to_remove = self.path_if_not_referenced(
                         obj_meta.location,
                         maybe_in_progress,
-                        &inspection,
+                        inspection_ref,
                     );
                     if matches!(path_to_remove, Ok(Some(..))) {
-                        removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
+                        let mut stats = removal_stats_ref.lock().unwrap();
+                        stats.bytes_removed += obj_meta.size;
+                        if let Some(file_type) = file_type {
+                            match file_type {
+                                RemovedFileType::Data => stats.data_files_removed += 1,
+                                RemovedFileType::Transaction => {
+                                    stats.transaction_files_removed += 1
+                                }
+                                RemovedFileType::Index => stats.index_files_removed += 1,
+                                RemovedFileType::Deletion => stats.deletion_files_removed += 1,
+                            }
+                        }
                     }
                     future::ready(path_to_remove)
                 })
@@ -336,11 +382,17 @@ impl<'a> CleanupTask<'a> {
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir()),
-            build_listing_stream(self.dataset.transactions_dir()),
-            build_listing_stream(self.dataset.data_dir()),
-            build_listing_stream(self.dataset.indices_dir()),
-            build_listing_stream(self.dataset.deletions_dir()),
+            build_listing_stream(self.dataset.versions_dir(), None),
+            build_listing_stream(
+                self.dataset.transactions_dir(),
+                Some(RemovedFileType::Transaction),
+            ),
+            build_listing_stream(self.dataset.data_dir(), Some(RemovedFileType::Data)),
+            build_listing_stream(self.dataset.indices_dir(), Some(RemovedFileType::Index)),
+            build_listing_stream(
+                self.dataset.deletions_dir(),
+                Some(RemovedFileType::Deletion),
+            ),
         ];
         let unreferenced_paths = stream::iter(streams).flatten().boxed();
 
@@ -367,10 +419,24 @@ impl<'a> CleanupTask<'a> {
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
+        let paths_to_delete: BoxStream<Result<Path>> = if let Some(rate) =
+            self.policy.delete_rate_limit
+        {
+            let duration = calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
+            let mut ticker = interval(duration);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            IntervalStream::new(ticker)
+                .zip(all_paths_to_remove)
+                .map(|(_, path)| path)
+                .boxed()
+        } else {
+            all_paths_to_remove.boxed()
+        };
+
         let delete_fut = self
             .dataset
             .object_store
-            .remove_stream(all_paths_to_remove.boxed())
+            .remove_stream(paths_to_delete)
             .try_for_each(|_| future::ready(Ok(())));
 
         delete_fut.await?;
@@ -381,6 +447,16 @@ impl<'a> CleanupTask<'a> {
 
         let span = Span::current();
         span.record("bytes_removed", removal_stats.bytes_removed);
+        span.record("data_files_removed", removal_stats.data_files_removed);
+        span.record(
+            "transaction_files_removed",
+            removal_stats.transaction_files_removed,
+        );
+        span.record("index_files_removed", removal_stats.index_files_removed);
+        span.record(
+            "deletion_files_removed",
+            removal_stats.deletion_files_removed,
+        );
 
         Ok(removal_stats)
     }
@@ -457,7 +533,7 @@ impl<'a> CleanupTask<'a> {
             }
             Some("blob") => {
                 // Blob v2 sidecar files are keyed by the data file stem:
-                //   data/{data_file_key}/{blob_id:08x}.blob
+                //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //
                 // These files are not referenced directly by the manifest.  Instead, treat them
                 // as referenced if their parent data file is referenced.
@@ -474,7 +550,10 @@ impl<'a> CleanupTask<'a> {
                 let data_file_key = parts.next();
                 let blob_file = parts.next();
                 // Be conservative: only handle the expected 3-part layout.
-                if data_dir.is_none() || data_file_key.is_none() || blob_file.is_none() {
+                if !matches!(data_dir, Some(dir) if dir.as_ref() == "data")
+                    || data_file_key.is_none()
+                    || blob_file.is_none()
+                {
                     debug!(
                         path = relative_path.as_ref(),
                         "Will not garbage collect blob file because it does not follow convention"
@@ -605,10 +684,10 @@ impl<'a> CleanupTask<'a> {
                     )
                     .await;
 
-                    if let Ok(manifest) = manifest {
-                        if policy.should_clean(&manifest) {
-                            referenced_branches.insert(branch_name.clone());
-                        }
+                    if let Ok(manifest) = manifest
+                        && policy.should_clean(&manifest)
+                    {
+                        referenced_branches.insert(branch_name.clone());
                     }
                     Ok::<(), Error>(())
                 }
@@ -662,6 +741,11 @@ impl<'a> CleanupTask<'a> {
                             let mut stats_guard = final_stats.lock().unwrap();
                             stats_guard.bytes_removed += stats.bytes_removed;
                             stats_guard.old_versions += stats.old_versions;
+                            stats_guard.data_files_removed += stats.data_files_removed;
+                            stats_guard.transaction_files_removed +=
+                                stats.transaction_files_removed;
+                            stats_guard.index_files_removed += stats.index_files_removed;
+                            stats_guard.deletion_files_removed += stats.deletion_files_removed;
                         }
                     }
                     Ok::<(), Error>(())
@@ -717,46 +801,45 @@ impl<'a> CleanupTask<'a> {
             for file in fragment.files.iter() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
-                    if let Some(base_path) = base_path {
-                        if base_path.path == self.dataset.uri {
-                            let full_data_path = self.dataset.data_dir().child(file.path.as_str());
-                            let relative_data_path =
-                                remove_prefix(&full_data_path, &self.dataset.base);
-                            inspection
-                                .verified_files
-                                .data_paths
-                                .remove(&relative_data_path);
-                            inspection
-                                .referenced_files
-                                .data_paths
-                                .insert(relative_data_path);
-                            is_referenced = true;
-                        }
+                    if let Some(base_path) = base_path
+                        && base_path.path == self.dataset.uri
+                    {
+                        let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                        let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                        inspection
+                            .verified_files
+                            .data_paths
+                            .remove(&relative_data_path);
+                        inspection
+                            .referenced_files
+                            .data_paths
+                            .insert(relative_data_path);
+                        is_referenced = true;
                     }
                 }
             }
-            if let Some(del_file) = fragment.deletion_file.as_ref() {
-                if let Some(base_id) = del_file.base_id {
-                    let base_path = manifest.base_paths.get(&base_id);
-                    if let Some(base_path) = base_path {
-                        let deletion_path = fragment.deletion_file.as_ref().map(|deletion_file| {
-                            deletion_file_path(&self.dataset.base, fragment.id, deletion_file)
-                        });
-                        if base_path.path == self.dataset.uri {
-                            if let Some(deletion_path) = deletion_path {
-                                let relative_del_path =
-                                    remove_prefix(&deletion_path, &self.dataset.base);
-                                inspection
-                                    .verified_files
-                                    .delete_paths
-                                    .remove(&relative_del_path);
-                                inspection
-                                    .referenced_files
-                                    .delete_paths
-                                    .insert(relative_del_path);
-                            }
-                            is_referenced = true;
+            if let Some(del_file) = fragment.deletion_file.as_ref()
+                && let Some(base_id) = del_file.base_id
+            {
+                let base_path = manifest.base_paths.get(&base_id);
+                if let Some(base_path) = base_path {
+                    let deletion_path = fragment.deletion_file.as_ref().map(|deletion_file| {
+                        deletion_file_path(&self.dataset.base, fragment.id, deletion_file)
+                    });
+                    if base_path.path == self.dataset.uri {
+                        if let Some(deletion_path) = deletion_path {
+                            let relative_del_path =
+                                remove_prefix(&deletion_path, &self.dataset.base);
+                            inspection
+                                .verified_files
+                                .delete_paths
+                                .remove(&relative_del_path);
+                            inspection
+                                .referenced_files
+                                .delete_paths
+                                .insert(relative_del_path);
                         }
+                        is_referenced = true;
                     }
                 }
             }
@@ -764,13 +847,13 @@ impl<'a> CleanupTask<'a> {
         for index in indexes {
             if let Some(base_id) = index.base_id {
                 let base_path = manifest.base_paths.get(&base_id);
-                if let Some(base_path) = base_path {
-                    if base_path.path == self.dataset.uri {
-                        let uuid_str = index.uuid.to_string();
-                        inspection.verified_files.index_uuids.remove(&uuid_str);
-                        inspection.referenced_files.index_uuids.insert(uuid_str);
-                        is_referenced = true;
-                    }
+                if let Some(base_path) = base_path
+                    && base_path.path == self.dataset.uri
+                {
+                    let uuid_str = index.uuid.to_string();
+                    inspection.verified_files.index_uuids.remove(&uuid_str);
+                    inspection.referenced_files.index_uuids.insert(uuid_str);
+                    is_referenced = true;
                 }
             }
         }
@@ -782,6 +865,25 @@ impl<'a> CleanupTask<'a> {
 
         Ok(())
     }
+}
+
+fn calculate_duration(scheme: String, rate: u64) -> Duration {
+    let batch_size = if scheme.to_lowercase().contains("s3") {
+        S3_DELETE_STREAM_BATCH_SIZE
+    } else if scheme.to_lowercase().contains("az") {
+        AZURE_DELETE_STREAM_BATCH_SIZE
+    } else {
+        1
+    };
+    let effective_rate = rate.max(1);
+    let path_rate = effective_rate * batch_size;
+    info!(
+        "delete_rate_limit enabled: limit {} delete requests/sec",
+        effective_rate
+    );
+    // convert user given op/s to the rate of issuing paths
+    let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
+    Duration::from_nanos(duration_ns)
 }
 
 #[derive(Clone, Debug)]
@@ -796,6 +898,12 @@ pub struct CleanupPolicy {
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,
+    /// Maximum number of delete requests per second. If None, no rate limiting is applied.
+    ///
+    /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
+    /// On stores with bulk delete, each request can include multiple paths.
+    /// For example, `Some(100)` limits deletions to 100 delete requests per second.
+    pub delete_rate_limit: Option<u64>,
 }
 
 impl CleanupPolicy {
@@ -819,6 +927,7 @@ impl Default for CleanupPolicy {
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
+            delete_rate_limit: None,
         }
     }
 }
@@ -870,6 +979,25 @@ impl CleanupPolicyBuilder {
     pub fn error_if_tagged_old_versions(mut self, error: bool) -> Self {
         self.policy.error_if_tagged_old_versions = error;
         self
+    }
+
+    /// Limit the number of delete requests per second during cleanup.
+    ///
+    /// By default (None), deletions run at full speed. Set this to a positive value to
+    /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
+    /// On backends with bulk delete APIs, effective path throughput scales with batch size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rate` is zero.
+    pub fn delete_rate_limit(mut self, rate: u64) -> Result<Self> {
+        if rate == 0 {
+            return Err(Error::Cleanup {
+                message: format!("delete_rate_limit must be greater than 0, got {}", rate),
+            });
+        }
+        self.policy.delete_rate_limit = Some(rate);
+        Ok(self)
     }
 
     pub fn build(self) -> CleanupPolicy {
@@ -998,6 +1126,23 @@ pub async fn build_cleanup_policy(
         // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
     }
+    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+        let rate: u64 = match delete_rate_limit.parse() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
+                        e
+                    ),
+                });
+            }
+        };
+        builder = match builder.delete_rate_limit(rate) {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+    }
 
     Ok(Some(builder.build()))
 }
@@ -1034,9 +1179,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::blob::{blob_field, BlobArrayBuilder};
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
+        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1054,9 +1199,8 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
-    use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
-    use snafu::location;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -1235,10 +1379,7 @@ mod tests {
                 "block_commit",
                 Arc::new(|op, _| -> Result<()> {
                     if op.contains("copy") {
-                        return Err(Error::Internal {
-                            message: "Copy blocked".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::internal("Copy blocked".to_string()));
                     }
                     Ok(())
                 }),
@@ -1251,10 +1392,7 @@ mod tests {
                 "block_delete_manifest",
                 Arc::new(|op, path| -> Result<()> {
                     if op.contains("delete") && path.extension() == Some("manifest") {
-                        Err(Error::Internal {
-                            message: "Delete manifest blocked".to_string(),
-                            location: location!(),
-                        })
+                        Err(Error::internal("Delete manifest blocked".to_string()))
                     } else {
                         Ok(())
                     }
@@ -1432,6 +1570,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
         assert_eq!(
             removed.bytes_removed,
             before_count.num_bytes - after_count.num_bytes
@@ -1970,6 +2109,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_collects_removed_file_metrics() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let row_count = 512;
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                IncrementingInt32::new().named("filter_me".to_owned()),
+            ))
+            .col(Box::new(RandomVector::new().named("indexable".to_owned())));
+
+        fixture
+            .create_with_data(data_gen.batch(row_count))
+            .await
+            .unwrap();
+        fixture
+            .append_data(data_gen.batch(row_count))
+            .await
+            .unwrap();
+        fixture.create_some_index().await.unwrap();
+        fixture.delete_data("filter_me < 20").await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        fixture
+            .overwrite_data(data_gen.batch(row_count))
+            .await
+            .unwrap();
+        fixture.delete_data("filter_me >= 40").await.unwrap();
+
+        let before_count = fixture.count_files().await.unwrap();
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        let after_count = fixture.count_files().await.unwrap();
+
+        let data_files_removed = (before_count.num_data_files - after_count.num_data_files) as u64;
+        let transaction_files_removed =
+            (before_count.num_tx_files - after_count.num_tx_files) as u64;
+        let index_files_removed =
+            (before_count.num_index_files - after_count.num_index_files) as u64;
+        let deletion_files_removed =
+            (before_count.num_delete_files - after_count.num_delete_files) as u64;
+
+        assert_eq!(removed.data_files_removed, data_files_removed);
+        assert_eq!(removed.transaction_files_removed, transaction_files_removed);
+        assert_eq!(removed.index_files_removed, index_files_removed);
+        assert_eq!(removed.deletion_files_removed, deletion_files_removed);
+        assert_gt!(removed.data_files_removed, 0);
+        assert_gt!(removed.transaction_files_removed, 0);
+        assert_gt!(removed.index_files_removed, 0);
+        assert_gt!(removed.deletion_files_removed, 0);
+    }
+
+    #[tokio::test]
     async fn dont_clean_index_data_files() {
         // Indexes have .lance files in them that are not referenced
         // by any fragment.  We need to make sure the cleanup routine
@@ -2017,6 +2208,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 1);
         assert_eq!(
             removed.bytes_removed,
             before_count.num_bytes - after_count.num_bytes
@@ -2050,6 +2242,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.bytes_removed, 0);
+        assert_eq!(removed.data_files_removed, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count, after_count);
@@ -2073,10 +2266,12 @@ mod tests {
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 2);
 
-        assert!(fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
-            .await
-            .is_err());
+        assert!(
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+                .await
+                .is_err()
+        );
 
         // This test currently relies on us sending in manifest files after
         // data files.  Also, the delete process is run in parallel.  However,
@@ -2530,10 +2725,10 @@ mod tests {
                 while let Some(meta) = s.try_next().await? {
                     match exts {
                         Some(exts) => {
-                            if let Some(e) = meta.location.extension() {
-                                if exts.contains(&e) {
-                                    count += 1;
-                                }
+                            if let Some(e) = meta.location.extension()
+                                && exts.contains(&e)
+                            {
+                                count += 1;
                             }
                         }
                         None => count += 1,
@@ -2620,7 +2815,7 @@ mod tests {
 
         // Compact files for a given branch and optimize indices to stabilize index files.
         async fn compact(&mut self) -> Result<()> {
-            use crate::dataset::optimize::{compact_files, CompactionOptions};
+            use crate::dataset::optimize::{CompactionOptions, compact_files};
             compact_files(&mut self.dataset, CompactionOptions::default(), None).await?;
             self.refresh().await
         }
@@ -2672,7 +2867,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 2);
-        assert_eq!(setup.branch1.counts.num_index_files, 8);
+        assert_eq!(setup.branch1.counts.num_index_files, 23);
         setup.assert_all_unchanged().await;
 
         setup.branch1.compact().await.unwrap();
@@ -2687,7 +2882,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 8);
+        assert_eq!(setup.branch1.counts.num_index_files, 23);
         setup.assert_all_unchanged().await;
 
         // Now we clean the referenced files of branch1 by branch2 and branch3
@@ -2701,14 +2896,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 16);
         setup.branch1.run_cleanup().await.unwrap();
 
         // Only the latest manifest is retained.
@@ -2717,7 +2912,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
         setup.assert_all_unchanged().await;
     }
 
@@ -2734,7 +2929,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 19);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -2750,7 +2945,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
 
         setup.branch3.compact().await.unwrap();
         setup.branch3.run_cleanup().await.unwrap();
@@ -2760,7 +2955,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 19);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -2773,7 +2968,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
     }
 
     #[tokio::test]
@@ -2790,7 +2985,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 2);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 2);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 16);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -2810,7 +3005,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 17);
 
         setup.branch4.compact().await.unwrap();
         setup.branch4.run_cleanup().await.unwrap();
@@ -2820,7 +3015,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 16);
         setup.assert_all_unchanged().await;
 
         setup.main.run_cleanup().await.unwrap();
@@ -2834,7 +3029,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 17);
     }
 
     #[tokio::test]
@@ -2859,7 +3054,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 12);
+        assert_eq!(setup.main.counts.num_index_files, 30);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -2870,7 +3065,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 12);
+        assert_eq!(setup.main.counts.num_index_files, 30);
         setup.assert_all_unchanged().await;
 
         setup.branch1.write_data().await.unwrap();
@@ -2891,14 +3086,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 8);
+        assert_eq!(setup.branch2.counts.num_index_files, 29);
         setup.branch1.run_cleanup().await.unwrap();
         // Cleanup 4 index files referenced from branch2
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch3 holds references from main:
@@ -2914,7 +3109,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 23);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -2924,7 +3119,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 19);
 
         setup.main.run_cleanup().await.unwrap();
         // Cleanup doesn't take effects if we don't clean branch2 and branch1 first
@@ -2932,7 +3127,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 23);
 
         // Cleanup doesn't take effect if we don't clean branch2 first
         setup.branch1.run_cleanup().await.unwrap();
@@ -2940,7 +3135,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
 
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -2949,7 +3144,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 16);
 
         setup.branch1.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -2958,7 +3153,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch4 holds references from main:
@@ -2970,7 +3165,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 23);
 
         setup.branch4.write_data().await.unwrap();
         setup.branch4.compact().await.unwrap();
@@ -2981,7 +3176,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 16);
 
         setup.main.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -2990,7 +3185,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
     }
 
     #[tokio::test]
@@ -3014,7 +3209,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
         // After auto-clean: branch3
         // 2 appends produced 2 data files
         // 2 deletes produced 2 deletion files
@@ -3022,7 +3217,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 19);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3044,14 +3239,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 16);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 19);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3081,7 +3276,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
 
         setup.main.compact().await.unwrap();
         setup
@@ -3101,7 +3296,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
 
         setup.branch4.compact().await.unwrap();
         setup
@@ -3118,13 +3313,13 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 13);
 
         setup.branch1.write_data().await.unwrap();
         setup.branch1.compact().await.unwrap();
@@ -3142,7 +3337,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
         // Branch3 and branch2 still hold references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3151,7 +3346,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
 
         setup.branch2.write_data().await.unwrap();
         setup.branch2.compact().await.unwrap();
@@ -3169,7 +3364,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
         // Branch3 still holds references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3178,7 +3373,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
         // Branch3 still holds references from branch2:
         // - 1 manifest file
         // - 1 data files
@@ -3187,7 +3382,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 16);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3205,22 +3400,22 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 13);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 13);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 16);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 19);
         setup.assert_unchanged(&["branch4"]).await;
     }
 
@@ -3264,24 +3459,24 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 20);
         // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
         // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 13);
 
         setup
             .branch3
@@ -3304,27 +3499,27 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 8);
+        assert_eq!(setup.main.counts.num_index_files, 20);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 4);
+        assert_eq!(setup.branch1.counts.num_index_files, 10);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 16);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 13);
 
         setup.main.dataset.tags().delete("main-tag").await.unwrap();
         setup
@@ -3340,21 +3535,82 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 4);
+        assert_eq!(setup.main.counts.num_index_files, 10);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 4);
+        assert_eq!(setup.branch2.counts.num_index_files, 13);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 4);
+        assert_eq!(setup.branch3.counts.num_index_files, 16);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 4);
+        assert_eq!(setup.branch4.counts.num_index_files, 13);
+    }
+
+    #[test]
+    fn test_calculate_duration_s3() {
+        // Normal case: duration is computed from S3 batch size and configured rate.
+        let normal_rate = 100;
+        let expected_duration_ns =
+            1_000_000_000u64.div_ceil(normal_rate * S3_DELETE_STREAM_BATCH_SIZE);
+        assert_eq!(
+            calculate_duration("s3".to_string(), normal_rate),
+            Duration::from_nanos(expected_duration_ns)
+        );
+
+        // Edge case: rate too small should be clamped to 1.
+        let min_rate_duration = calculate_duration("s3".to_string(), 1);
+        assert_eq!(calculate_duration("s3".to_string(), 0), min_rate_duration);
+
+        // Edge case: computed duration_ns too small should be clamped to at least 1ns.
+        let very_large_rate = 2_000_000;
+        assert_eq!(
+            calculate_duration("s3".to_string(), very_large_rate),
+            Duration::from_nanos(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_with_rate_limit() {
+        // Create multiple versions with data files that will be deleted.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        // Create several old versions
+        for _ in 0..4 {
+            fixture.overwrite_some_data().await.unwrap();
+        }
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        // Set rate limit to 1 ops/second so cleanup of several files must take at least ~1s
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+            .delete_rate_limit(1)
+            .unwrap()
+            .build();
+
+        let start = std::time::Instant::now();
+        let db = fixture.open().await.unwrap();
+        let stats = cleanup_old_versions(&db, policy).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // We deleted old versions, so there should be removed files
+        assert!(
+            stats.old_versions > 0,
+            "expected some old versions to be removed"
+        );
+        // With rate=1 and multiple files, it must take at least 2s
+        // (even just 2 deletions at 1/s means ≥2s)
+        assert!(
+            elapsed.as_millis() >= 2000,
+            "expected cleanup to be rate-limited (elapsed: {:?})",
+            elapsed
+        );
     }
 }

@@ -1388,6 +1388,10 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert len(ds.versions()) == 4
     stats = ds.cleanup_old_versions(retain_versions=3)
     assert stats.old_versions == 1
+    assert stats.data_files_removed == 1
+    assert stats.transaction_files_removed == 1
+    assert stats.index_files_removed == 0
+    assert stats.deletion_files_removed == 0
     assert len(ds.versions()) == 3
     assert ds.count_rows() == len(ds.to_table())
 
@@ -1523,6 +1527,36 @@ def test_enable_disable_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
 
     assert len(ds.versions()) == 7
+
+
+def test_cleanup_with_rate_limit(tmp_path):
+    """Test that cleanup_old_versions works with delete_rate_limit parameter."""
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir, mode="create")
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    latest_version_timestamp = dataset.versions()[-1]["timestamp"]
+    now = (
+        datetime.now(latest_version_timestamp.tzinfo)
+        if latest_version_timestamp.tzinfo is not None
+        else datetime.now()
+    )
+
+    start = time.time_ns()
+    # Cleanup with a rate limit should still remove old versions correctly
+    stats = dataset.cleanup_old_versions(
+        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+    )
+    finished = time.time_ns()
+
+    assert stats.old_versions == 3
+    assert stats.bytes_removed > 0
+    assert (finished - start) >= 2_000_000_000  # 2s
 
 
 def test_create_from_commit(tmp_path: Path):

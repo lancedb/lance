@@ -8,7 +8,9 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "protoc")]
     // Use vendored protobuf compiler if requested.
-    std::env::set_var("PROTOC", protobuf_src::protoc());
+    unsafe {
+        std::env::set_var("PROTOC", protobuf_src::protoc());
+    }
 
     let mut prost_build = prost_build::Config::new();
     prost_build.extern_path(".lance.file", "::lance_file::format::pb");

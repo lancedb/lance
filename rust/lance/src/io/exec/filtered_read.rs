@@ -3,8 +3,8 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
@@ -18,25 +18,25 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    execution_plan::{Boundedness, EmissionType},
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
-use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
-use futures::{future, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::mask::{
-    bitmap_to_ranges, ranges_to_bitmap, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
+    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Projection, Error, Result};
+use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
@@ -48,16 +48,15 @@ use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
 use roaring::RoaringBitmap;
-use snafu::location;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
-use tracing::{instrument, Instrument};
+use tracing::{Instrument, instrument};
 
+use crate::Dataset;
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
-    get_default_batch_size, BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD,
+    BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
 };
-use crate::Dataset;
 
 use super::utils::IoMetrics;
 
@@ -81,24 +80,22 @@ impl EvaluatedIndex {
 
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
         if batch.num_rows() != 2 {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Expected a batch with exactly 2 rows but there are {} rows",
                     batch.num_rows()
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         if batch.num_columns() != 3 {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(Error::invalid_input_source(
+                format!(
                     "Expected a batch with exactly two columns but there are {} columns",
                     batch.num_columns()
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
         let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
@@ -537,10 +534,10 @@ impl FilteredReadStream {
             deletion_vector,
         } in fragments.iter()
         {
-            if let Some(range_before_filter) = &options.scan_range_before_filter {
-                if range_offset >= range_before_filter.end {
-                    break;
-                }
+            if let Some(range_before_filter) = &options.scan_range_before_filter
+                && range_offset >= range_before_filter.end
+            {
+                break;
             }
 
             let mut to_read: Vec<Range<u64>> =
@@ -1150,9 +1147,10 @@ impl FilteredReadStream {
                 .map(move |batch| {
                     let batch = batch?;
                     let batch = datafusion_physical_plan::filter::batch_filter(&batch, &filter)
-                        .map_err(|e| Error::Execution {
-                            message: format!("Error applying filter expression to batch: {e}"),
-                            location: location!(),
+                        .map_err(|e| {
+                            Error::execution(format!(
+                                "Error applying filter expression to batch: {e}"
+                            ))
                         })?;
                     // Drop any fields loaded purely for the purpose of applying the filter
                     Ok(batch.project_by_schema(output_schema.as_ref())?)
@@ -1307,10 +1305,9 @@ impl FilteredReadOptions {
     /// entire fragment was deleted, it will not be read by this function.
     pub fn with_deleted_rows(mut self) -> Result<Self> {
         if self.scan_range_before_filter.is_some() || self.scan_range_after_filter.is_some() {
-            return Err(Error::InvalidInput {
-                source: "with_deleted_rows is not supported when there is a scan range".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
         }
         self.with_deleted_rows = true;
         Ok(self)
@@ -1326,10 +1323,9 @@ impl FilteredReadOptions {
     /// and the range is 100..300, then scan will read rows 100..300 and return rows 200..300
     pub fn with_scan_range_before_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
         if self.with_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "with_deleted_rows is not supported when there is a scan range".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
         }
         self.scan_range_before_filter = Some(scan_range);
         Ok(self)
@@ -1345,10 +1341,9 @@ impl FilteredReadOptions {
     /// We currently do not support setting this when there is more than one partition.
     pub fn with_scan_range_after_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
         if self.with_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "with_deleted_rows is not supported when there is a scan range".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
         }
         self.scan_range_after_filter = Some(scan_range);
         Ok(self)
@@ -1405,10 +1400,9 @@ impl FilteredReadOptions {
         full_filter: Option<Expr>,
     ) -> Result<Self> {
         if refine_filter.is_some() && full_filter.is_none() {
-            return Err(Error::InvalidInput {
-                source: "refine_filter is set but full_filter is not".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "refine_filter is set but full_filter is not".into(),
+            ));
         }
         self.refine_filter = refine_filter;
         self.full_filter = full_filter;
@@ -1526,12 +1520,8 @@ impl FilteredReadExec {
         }
 
         if options.projection.is_empty() {
-            return Err(Error::InvalidInput {
-                source:
-                    "no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
-                        .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source("no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
+                .into()));
         }
 
         if options.scan_range_after_filter.is_some() {
@@ -1540,11 +1530,8 @@ impl FilteredReadExec {
                 && options.refine_filter.is_none()
                 && index_input.is_none()
             {
-                return Err(Error::InvalidInput {
-                    source: "scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
-                        .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source("scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
+                    .into()));
             }
 
             // TODO: support multi partition
@@ -1552,12 +1539,11 @@ impl FilteredReadExec {
                 options.threading_mode,
                 FilteredReadThreadingMode::MultiplePartitions(_)
             ) {
-                return Err(Error::NotSupported {
-                    source: "scan_range_after_filter not yet supported with multiple partitions"
+                return Err(Error::not_supported_source(
+                    "scan_range_after_filter not yet supported with multiple partitions"
                         .to_string()
                         .into(),
-                    location: location!(),
-                });
+                ));
             }
         }
         let output_schema = Arc::new(options.projection.to_arrow_schema());
@@ -1596,9 +1582,10 @@ impl FilteredReadExec {
                     let fragment = self
                         .dataset
                         .get_fragment(*fragment_id as usize)
-                        .ok_or_else(|| Error::InvalidInput {
-                            source: format!("Fragment {} not found", fragment_id).into(),
-                            location: location!(),
+                        .ok_or_else(|| {
+                            Error::invalid_input_source(
+                                format!("Fragment {} not found", fragment_id).into(),
+                            )
                         })?;
                     let num_rows = fragment.physical_rows().await?;
                     vec![0..num_rows as u64]
@@ -1636,11 +1623,9 @@ impl FilteredReadExec {
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
                     let mut index_search = index_input.execute(partition, ctx)?;
-                    let index_search_result =
-                        index_search.next().await.ok_or_else(|| Error::Internal {
-                            message: "Index search did not yield any results".to_string(),
-                            location: location!(),
-                        })??;
+                    let index_search_result = index_search.next().await.ok_or_else(|| {
+                        Error::internal("Index search did not yield any results".to_string())
+                    })??;
                     evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
                         &index_search_result,
                     )?));
@@ -1774,27 +1759,53 @@ impl DisplayAs for FilteredReadExec {
                     "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, full_filter={}, refine_filter={}",
                     self.dataset.data_dir(),
                     columns,
-                    self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
+                    self.options
+                        .fragments
+                        .as_ref()
+                        .map(|f| f.len())
+                        .unwrap_or(self.dataset.fragments().len()),
                     self.options.scan_range_before_filter,
                     self.options.scan_range_after_filter,
                     self.options.projection.with_row_id,
                     self.options.projection.with_row_addr,
-                    self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("--".to_string()),
-                    self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("--".to_string()),
+                    self.options
+                        .full_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("--".to_string()),
+                    self.options
+                        .refine_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("--".to_string()),
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
-                self.dataset.data_dir(),
-                columns,
-                self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
-                self.options.scan_range_before_filter,
-                self.options.scan_range_after_filter,
-                self.options.projection.with_row_id,
-                self.options.projection.with_row_addr,
-                self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
-                self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
-            )
+                write!(
+                    f,
+                    "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.options
+                        .fragments
+                        .as_ref()
+                        .map(|f| f.len())
+                        .unwrap_or(self.dataset.fragments().len()),
+                    self.options.scan_range_before_filter,
+                    self.options.scan_range_after_filter,
+                    self.options.projection.with_row_id,
+                    self.options.projection.with_row_addr,
+                    self.options
+                        .full_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("true".to_string()),
+                    self.options
+                        .refine_filter
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or("true".to_string()),
+                )
             }
         }
     }
@@ -1843,7 +1854,7 @@ impl ExecutionPlan for FilteredReadExec {
 
         let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
 
-        if self.options.full_filter.is_none() {
+        let Some(filter) = self.options.full_filter.as_ref() else {
             // If there is no filter, we just return the total number of rows (sans any before-filter range)
             // divided by the number of partitions.
             let total_rows =
@@ -1865,83 +1876,81 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
-            Ok(Statistics {
+            return Ok(Statistics {
                 num_rows: Precision::Exact(total_rows as usize),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
-            })
-        } else {
-            // We could evaluate the indexed filter here but this is still during the planning
-            // phase so we want to avoid that.
-            //
-            // Instead, we create a mock input which is the filtered read (without the filter)
-            // and then use DF's FilterExec logic to calculate the statistics (which uses column
-            // stats and basic filter shape)
-            let filter = self.options.full_filter.as_ref().unwrap();
+            });
+        };
 
-            // Need to add in filter columns even though they aren't part of the projection
-            let filter_columns = Planner::column_names_in_expr(filter);
-            let read_projection = self
-                .options
-                .projection
-                .clone()
-                .union_columns(filter_columns, OnMissing::Error)?;
+        // We could evaluate the indexed filter here but this is still during the planning
+        // phase so we want to avoid that.
+        //
+        // Instead, we create a mock input which is the filtered read (without the filter)
+        // and then use DF's FilterExec logic to calculate the statistics (which uses column
+        // stats and basic filter shape)
 
-            let read_schema = Arc::new(read_projection.to_arrow_schema());
+        // Need to add in filter columns even though they aren't part of the projection
+        let filter_columns = Planner::column_names_in_expr(filter);
+        let read_projection = self
+            .options
+            .projection
+            .clone()
+            .union_columns(filter_columns, OnMissing::Error)?;
 
-            let planner = Arc::new(Planner::new(read_schema.clone()));
-            let physical_filter = planner.create_physical_expr(filter)?;
+        let read_schema = Arc::new(read_projection.to_arrow_schema());
 
-            let mock_input = Arc::new(Self::try_new(
-                self.dataset.clone(),
-                FilteredReadOptions {
-                    scan_range_after_filter: None,
-                    refine_filter: None,
-                    full_filter: None,
-                    projection: read_projection,
-                    ..self.options.clone()
-                },
-                None,
-            )?);
-            let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-            let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+        let planner = Arc::new(Planner::new(read_schema.clone()));
+        let physical_filter = planner.create_physical_expr(filter)?;
 
-            // If we have an after-filter range, we should apply it to the stats (the before-filter range
-            // is applied in the mock input)
-            let total_rows = if let Some(scan_range_after_filter) =
-                &self.options.scan_range_after_filter
-            {
+        let mock_input = Arc::new(Self::try_new(
+            self.dataset.clone(),
+            FilteredReadOptions {
+                scan_range_after_filter: None,
+                refine_filter: None,
+                full_filter: None,
+                projection: read_projection,
+                ..self.options.clone()
+            },
+            None,
+        )?);
+        let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
+        let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+
+        // If we have an after-filter range, we should apply it to the stats (the before-filter range
+        // is applied in the mock input)
+        let total_rows =
+            if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
                 df_stats.num_rows.min(&Precision::Exact(
                     scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
                 ))
             } else {
                 df_stats.num_rows
             };
-            df_stats.num_rows = total_rows;
+        df_stats.num_rows = total_rows;
 
-            let schema = self.schema();
+        let schema = self.schema();
 
-            // We might have added some columns to the schema so the filter compiles but we drop this
-            // columns during the filtered read and they aren't part of the output.  So we need to make
-            // sure and drop them from the column stats as well.
-            assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
-            let mut proj_iter = schema.fields.iter().peekable();
-            let mut stats_iter = read_schema.fields.iter();
-            df_stats.column_statistics.retain(|_| {
-                let stats_field = stats_iter.next().unwrap();
-                if let Some(proj_field) = proj_iter.peek() {
-                    if proj_field.name() == stats_field.name() {
-                        proj_iter.next();
-                        true
-                    } else {
-                        false
-                    }
+        // We might have added some columns to the schema so the filter compiles but we drop this
+        // columns during the filtered read and they aren't part of the output.  So we need to make
+        // sure and drop them from the column stats as well.
+        assert_eq!(read_schema.fields.len(), df_stats.column_statistics.len());
+        let mut proj_iter = schema.fields.iter().peekable();
+        let mut stats_iter = read_schema.fields.iter();
+        df_stats.column_statistics.retain(|_| {
+            let stats_field = stats_iter.next().unwrap();
+            if let Some(proj_field) = proj_iter.peek() {
+                if proj_field.name() == stats_field.name() {
+                    proj_iter.next();
+                    true
                 } else {
                     false
                 }
-            });
+            } else {
+                false
+            }
+        });
 
-            Ok(df_stats)
-        }
+        Ok(df_stats)
     }
 
     fn with_new_children(
@@ -1950,11 +1959,7 @@ impl ExecutionPlan for FilteredReadExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() > 1 {
             Err(DataFusionError::External(
-                Error::Internal {
-                    message: "A FilteredReadExec cannot have two children".to_string(),
-                    location: location!(),
-                }
-                .into(),
+                Error::internal("A FilteredReadExec cannot have two children".to_string()).into(),
             ))
         } else {
             let index_input = children.into_iter().next();
@@ -2052,16 +2057,16 @@ mod tests {
         datatypes::{Float32Type, UInt32Type, UInt64Type},
     };
     use arrow_array::{
-        cast::AsArray, Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array,
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray,
     };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::{
-        optimize::OptimizeOptions,
-        scalar::{expression::PlannerIndexExt, ScalarIndexParams},
         DatasetIndexExt, IndexType,
+        optimize::OptimizeOptions,
+        scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
 
     use crate::{

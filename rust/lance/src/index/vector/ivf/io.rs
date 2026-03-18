@@ -8,42 +8,41 @@ use std::{cmp::Reverse, pin::Pin};
 
 use super::IVFIndex;
 use crate::dataset::ROW_ID;
-use crate::index::vector::pq::{build_pq_storage, PQIndex};
+use crate::index::vector::pq::{PQIndex, build_pq_storage};
 use arrow::compute::concat;
 use arrow_array::UInt64Array;
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    Array, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type,
 };
 use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
+use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::Error;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
+use lance_index::vector::hnsw::{HnswMetadata, builder::HnswBuildParams};
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_io::ReadBatchParams;
 use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
-use lance_io::ReadBatchParams;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::location;
 use tokio::sync::Semaphore;
 
 use crate::Result;
@@ -71,15 +70,11 @@ async fn merge_streams(
         let batch = match stream.next().await {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => {
-                return Err(Error::io(
-                    format!("failed to read batch: {}", e),
-                    location!(),
-                ));
+                return Err(Error::io(format!("failed to read batch: {}", e)));
             }
             None => {
                 return Err(Error::io(
                     "failed to read batch: unexpected end of stream".to_string(),
-                    location!(),
                 ));
             }
         };
@@ -97,10 +92,7 @@ async fn merge_streams(
             let codes = Arc::new(
                 batch
                     .column_by_name(column)
-                    .ok_or_else(|| Error::Index {
-                        message: format!("code column {} not found", column),
-                        location: location!(),
-                    })?
+                    .ok_or_else(|| Error::index(format!("code column {} not found", column)))?
                     .as_fixed_size_list()
                     .clone(),
             );
@@ -118,10 +110,10 @@ async fn merge_streams(
                 }
             }
             Some(Err(e)) => {
-                return Err(Error::io(
-                    format!("IVF Shuffler::failed to read batch: {}", e),
-                    location!(),
-                ));
+                return Err(Error::io(format!(
+                    "IVF Shuffler::failed to read batch: {}",
+                    e
+                )));
             }
             None => {}
         }
@@ -167,16 +159,10 @@ pub(super) async fn write_pq_partitions(
                     new_streams.push(stream);
                 }
                 Some(Err(e)) => {
-                    return Err(Error::io(
-                        format!("failed to read batch: {}", e),
-                        location!(),
-                    ));
+                    return Err(Error::io(format!("failed to read batch: {}", e)));
                 }
                 None => {
-                    return Err(Error::io(
-                        "failed to read batch: end of stream".to_string(),
-                        location!(),
-                    ));
+                    return Err(Error::io("failed to read batch: end of stream".to_string()));
                 }
             }
         }
@@ -192,14 +178,10 @@ pub(super) async fn write_pq_partitions(
                 let sub_index = idx
                     .load_partition(part_id as usize, true, &NoOpMetricsCollector)
                     .await?;
-                let pq_index =
-                    sub_index
-                        .as_any()
-                        .downcast_ref::<PQIndex>()
-                        .ok_or(Error::Index {
-                            message: "Invalid sub index".to_string(),
-                            location: location!(),
-                        })?;
+                let pq_index = sub_index
+                    .as_any()
+                    .downcast_ref::<PQIndex>()
+                    .ok_or(Error::index("Invalid sub index".to_string()))?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
                     let row_ids = pq_index.row_ids.as_ref().unwrap();
                     let num_vectors = row_ids.len();
@@ -286,16 +268,10 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     new_streams.push(stream);
                 }
                 Some(Err(e)) => {
-                    return Err(Error::io(
-                        format!("failed to read batch: {}", e),
-                        location!(),
-                    ));
+                    return Err(Error::io(format!("failed to read batch: {}", e)));
                 }
                 None => {
-                    return Err(Error::io(
-                        "failed to read batch: end of stream".to_string(),
-                        location!(),
-                    ));
+                    return Err(Error::io("failed to read batch: end of stream".to_string()));
                 }
             }
         }
@@ -486,8 +462,7 @@ async fn build_hnsw_quantization_partition(
     let mut metric_type = metric_type;
     if metric_type == MetricType::Cosine {
         // Normalize vectors for cosine similarity
-        vectors =
-            Arc::new(spawn_cpu(move || Ok(normalize_fsl(vectors.as_fixed_size_list())?)).await?);
+        vectors = Arc::new(spawn_cpu(move || normalize_fsl(vectors.as_fixed_size_list())).await?);
         metric_type = MetricType::L2;
     }
 
@@ -496,10 +471,9 @@ async fn build_hnsw_quantization_partition(
 
     let build_store = match quantizer {
         Quantizer::Flat(_) => {
-            return Err(Error::Index {
-                message: "Flat quantizer is not supported for IVF_HNSW".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Flat quantizer is not supported for IVF_HNSW".to_string(),
+            ));
         }
         Quantizer::Product(pq) => tokio::spawn(build_and_write_pq_storage(
             metric_type,
@@ -541,11 +515,7 @@ async fn build_and_write_pq_storage(
     pq: ProductQuantizer,
     mut writer: PreviousFileWriter<ManifestDescribing>,
 ) -> Result<()> {
-    let storage = spawn_cpu(move || {
-        let storage = build_pq_storage(metric_type, row_ids, code_array, pq)?;
-        Ok(storage)
-    })
-    .await?;
+    let storage = spawn_cpu(move || build_pq_storage(metric_type, row_ids, code_array, pq)).await?;
 
     writer.write_record_batch(storage.batch().clone()).await?;
     writer.finish().await?;
@@ -556,14 +526,14 @@ async fn build_and_write_pq_storage(
 mod tests {
     use super::*;
 
-    use crate::index::vector::ivf::v2;
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
     use crate::Dataset;
+    use crate::index::vector::ivf::v2;
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::IndexType;
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_testing::datagen::generate_random_array;
 
     #[tokio::test]

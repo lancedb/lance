@@ -90,7 +90,13 @@ impl ScanStatistics {
     fn __repr__(&self) -> String {
         format!(
             "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, all_counts={:?})",
-            self.iops, self.requests, self.bytes_read, self.indices_loaded, self.parts_loaded, self.index_comparisons, self.all_counts
+            self.iops,
+            self.requests,
+            self.bytes_read,
+            self.indices_loaded,
+            self.parts_loaded,
+            self.index_comparisons,
+            self.all_counts
         )
     }
 }

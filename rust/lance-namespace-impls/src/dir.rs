@@ -26,23 +26,23 @@ use std::sync::Arc;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateEmptyTableRequest,
-    CreateEmptyTableResponse, CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
-    DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
-    NamespaceExistsRequest, TableExistsRequest, TableVersion,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
+    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse, Identity,
+    ListNamespacesRequest, ListNamespacesResponse, ListTableVersionsRequest,
+    ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
+    TableExistsRequest, TableVersion,
 };
 
-use lance_core::{box_error, Error, Result};
-use lance_namespace::schema::arrow_schema_to_json;
+use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
+use lance_namespace::schema::arrow_schema_to_json;
 
 use crate::credentials::{
-    create_credential_vendor_for_location, has_credential_vendor_config, CredentialVendor,
+    CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
 
 /// Result of checking table status atomically.
@@ -259,13 +259,11 @@ impl DirectoryNamespaceBuilder {
         session: Option<Arc<Session>>,
     ) -> Result<Self> {
         // Extract root from properties (required)
-        let root = properties
-            .get("root")
-            .cloned()
-            .ok_or_else(|| Error::Namespace {
-                source: "Missing required property 'root' for directory namespace".into(),
-                location: snafu::location!(),
-            })?;
+        let root = properties.get("root").cloned().ok_or_else(|| {
+            Error::namespace_source(
+                "Missing required property 'root' for directory namespace".into(),
+            )
+        })?;
 
         // Extract storage options (properties prefixed with "storage.")
         let storage_options: HashMap<String, String> = properties
@@ -536,9 +534,8 @@ impl DirectoryNamespaceBuilder {
         // Use Lance's object store factory to create from URI
         let (object_store, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!("Failed to create object store: {}", e).into(),
-                location: snafu::location!(),
+            .map_err(|e| {
+                Error::namespace_source(format!("Failed to create object store: {}", e).into())
             })?;
 
         Ok((object_store, base_path))
@@ -627,10 +624,10 @@ impl DirectoryNamespace {
         }
 
         // Apply limit
-        if let Some(limit) = limit {
-            if limit >= 0 {
-                names.truncate(limit as usize);
-            }
+        if let Some(limit) = limit
+            && limit >= 0
+        {
+            names.truncate(limit as usize);
         }
     }
 
@@ -641,12 +638,11 @@ impl DirectoryNamespace {
             .object_store
             .read_dir(self.base_path.clone())
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
+            .map_err(|e| {
+                Error::io_source(box_error(std::io::Error::other(format!(
                     "Failed to list directory: {}",
                     e
-                ))),
-                location: snafu::location!(),
+                ))))
             })?;
 
         for entry in entries {
@@ -671,36 +667,29 @@ impl DirectoryNamespace {
 
     /// Validate that the namespace ID represents the root namespace
     fn validate_root_namespace_id(id: &Option<Vec<String>>) -> Result<()> {
-        if let Some(id) = id {
-            if !id.is_empty() {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
-                        id
-                    ).into(),
-                    location: snafu::location!(),
-                });
-            }
+        if let Some(id) = id
+            && !id.is_empty()
+        {
+            return Err(Error::namespace_source(format!(
+                "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
+                id
+            ).into()));
         }
         Ok(())
     }
 
     /// Extract table name from table ID
     fn table_name_from_id(id: &Option<Vec<String>>) -> Result<String> {
-        let id = id.as_ref().ok_or_else(|| Error::Namespace {
-            source: "Directory namespace table ID cannot be empty".into(),
-            location: snafu::location!(),
+        let id = id.as_ref().ok_or_else(|| {
+            Error::namespace_source("Directory namespace table ID cannot be empty".into())
         })?;
 
         if id.len() != 1 {
-            return Err(Error::Namespace {
-                source: format!(
-                    "Multi-level table IDs are only supported when manifest mode is enabled, but got: {:?}",
-                    id
-                )
-                .into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(format!(
+                "Multi-level table IDs are only supported when manifest mode is enabled, but got: {:?}",
+                id
+            )
+            .into()));
         }
 
         Ok(id[0].clone())
@@ -713,9 +702,8 @@ impl DirectoryNamespace {
 
         let describe_resp = self.describe_table(describe_req).await?;
 
-        describe_resp.location.ok_or_else(|| Error::Namespace {
-            source: format!("Table location not found for: {:?}", id).into(),
-            location: snafu::location!(),
+        describe_resp.location.ok_or_else(|| {
+            Error::namespace_source(format!("Table location not found for: {:?}", id).into())
         })
     }
 
@@ -831,13 +819,16 @@ impl DirectoryNamespace {
     async fn get_storage_options_for_table(
         &self,
         table_uri: &str,
+        vend_credentials: bool,
         identity: Option<&Identity>,
     ) -> Result<Option<HashMap<String, String>>> {
-        if let Some(ref vendor) = self.credential_vendor {
+        if vend_credentials && let Some(ref vendor) = self.credential_vendor {
             let vended = vendor.vend_credentials(table_uri, identity).await?;
             return Ok(Some(vended.storage_options));
         }
-        Ok(self.storage_options.clone())
+        // When no credential vendor is configured, return None to avoid
+        // leaking the namespace's own static credentials to clients.
+        Ok(None)
     }
 
     /// Migrate directory-based tables to the manifest.
@@ -961,16 +952,14 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Err(Error::Namespace {
-                source: "Root namespace already exists and cannot be created".into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                "Root namespace already exists and cannot be created".into(),
+            ));
         }
 
-        Err(Error::NotSupported {
-            source: "Child namespaces are only supported when manifest mode is enabled".into(),
-            location: snafu::location!(),
-        })
+        Err(Error::not_supported_source(
+            "Child namespaces are only supported when manifest mode is enabled".into(),
+        ))
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
@@ -979,16 +968,14 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Err(Error::Namespace {
-                source: "Root namespace cannot be dropped".into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                "Root namespace cannot be dropped".into(),
+            ));
         }
 
-        Err(Error::NotSupported {
-            source: "Child namespaces are only supported when manifest mode is enabled".into(),
-            location: snafu::location!(),
-        })
+        Err(Error::not_supported_source(
+            "Child namespaces are only supported when manifest mode is enabled".into(),
+        ))
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
@@ -1000,35 +987,33 @@ impl LanceNamespace for DirectoryNamespace {
             return Ok(());
         }
 
-        Err(Error::Namespace {
-            source: "Child namespaces are only supported when manifest mode is enabled".into(),
-            location: snafu::location!(),
-        })
+        Err(Error::namespace_source(
+            "Child namespaces are only supported when manifest mode is enabled".into(),
+        ))
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
         // Validate that namespace ID is provided
-        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: snafu::location!(),
-        })?;
+        let namespace_id = request
+            .id
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input_source("Namespace ID is required".into()))?;
 
         // For child namespaces, always delegate to manifest (if enabled)
         if !namespace_id.is_empty() {
             if let Some(ref manifest_ns) = self.manifest_ns {
                 return manifest_ns.list_tables(request).await;
             }
-            return Err(Error::NotSupported {
-                source: "Child namespaces are only supported when manifest mode is enabled".into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::not_supported_source(
+                "Child namespaces are only supported when manifest mode is enabled".into(),
+            ));
         }
 
         // When only manifest is enabled (no directory listing), delegate directly to manifest
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            if !self.dir_listing_enabled {
-                return manifest_ns.list_tables(request).await;
-            }
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !self.dir_listing_enabled
+        {
+            return manifest_ns.list_tables(request).await;
         }
 
         // When both manifest and directory listing are enabled, we need to merge and deduplicate
@@ -1082,16 +1067,13 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
-                    // Only apply identity-based credential vending when explicitly requested
-                    if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
-                        if let Some(ref table_uri) = response.table_uri {
-                            let identity = request.identity.as_deref();
-                            response.storage_options = self
-                                .get_storage_options_for_table(table_uri, identity)
-                                .await?;
-                        }
-                    } else if request.vend_credentials == Some(false) {
-                        response.storage_options = None;
+                    if let Some(ref table_uri) = response.table_uri {
+                        // For backwards compatibility, only skip vending credentials when explicitly set to false
+                        let vend = request.vend_credentials.unwrap_or(true);
+                        let identity = request.identity.as_deref();
+                        response.storage_options = self
+                            .get_storage_options_for_table(table_uri, vend, identity)
+                            .await?;
                     }
                     // Set managed_versioning flag when table_version_tracking_enabled
                     if self.table_version_tracking_enabled {
@@ -1116,17 +1098,15 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::Namespace {
-                source: format!("Table does not exist: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table does not exist: {}", table_name).into(),
+            ));
         }
 
         if status.is_deregistered {
-            return Err(Error::Namespace {
-                source: format!("Table is deregistered: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table is deregistered: {}", table_name).into(),
+            ));
         }
 
         let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
@@ -1136,12 +1116,9 @@ impl LanceNamespace for DirectoryNamespace {
 
         // If not loading detailed metadata, return minimal response with just location
         if !load_detailed_metadata {
-            let storage_options = if vend_credentials {
-                self.get_storage_options_for_table(&table_uri, identity)
-                    .await?
-            } else {
-                None
-            };
+            let storage_options = self
+                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                .await?;
             return Ok(DescribeTableResponse {
                 table: Some(table_name),
                 namespace: request.id.as_ref().map(|id| {
@@ -1183,12 +1160,9 @@ impl LanceNamespace for DirectoryNamespace {
                 let lance_schema = dataset.schema();
                 let arrow_schema: arrow_schema::Schema = lance_schema.into();
                 let json_schema = arrow_schema_to_json(&arrow_schema)?;
-                let storage_options = if vend_credentials {
-                    self.get_storage_options_for_table(&table_uri, identity)
-                        .await?
-                } else {
-                    None
-                };
+                let storage_options = self
+                    .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                    .await?;
 
                 // Convert BTreeMap to HashMap for the response
                 let metadata: std::collections::HashMap<String, String> =
@@ -1220,12 +1194,9 @@ impl LanceNamespace for DirectoryNamespace {
             Err(err) => {
                 // Use the reserved file status from the atomic check
                 if status.has_reserved_file {
-                    let storage_options = if vend_credentials {
-                        self.get_storage_options_for_table(&table_uri, identity)
-                            .await?
-                    } else {
-                        None
-                    };
+                    let storage_options = self
+                        .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                        .await?;
                     Ok(DescribeTableResponse {
                         table: Some(table_name),
                         namespace: request.id.as_ref().map(|id| {
@@ -1246,14 +1217,13 @@ impl LanceNamespace for DirectoryNamespace {
                         ..Default::default()
                     })
                 } else {
-                    Err(Error::Namespace {
-                        source: format!(
+                    Err(Error::namespace_source(
+                        format!(
                             "Table directory exists but cannot load dataset {}: {:?}",
                             table_name, err
                         )
                         .into(),
-                        location: snafu::location!(),
-                    })
+                    ))
                 }
             }
         }
@@ -1276,17 +1246,15 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::Namespace {
-                source: format!("Table does not exist: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table does not exist: {}", table_name).into(),
+            ));
         }
 
         if status.is_deregistered {
-            return Err(Error::Namespace {
-                source: format!("Table is deregistered: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table is deregistered: {}", table_name).into(),
+            ));
         }
 
         Ok(())
@@ -1304,9 +1272,10 @@ impl LanceNamespace for DirectoryNamespace {
         self.object_store
             .remove_dir_all(table_path)
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!("Failed to drop table {}: {}", table_name, e).into(),
-                location: snafu::location!(),
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!("Failed to drop table {}: {}", table_name, e).into(),
+                )
             })?;
 
         Ok(DropTableResponse {
@@ -1328,26 +1297,25 @@ impl LanceNamespace for DirectoryNamespace {
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
         if request_data.is_empty() {
-            return Err(Error::Namespace {
-                source: "Request data (Arrow IPC stream) is required for create_table".into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                "Request data (Arrow IPC stream) is required for create_table".into(),
+            ));
         }
 
         // Parse the Arrow IPC stream from request_data
         let cursor = Cursor::new(request_data.to_vec());
-        let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| Error::Namespace {
-            source: format!("Invalid Arrow IPC stream: {}", e).into(),
-            location: snafu::location!(),
+        let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
+            Error::namespace_source(format!("Invalid Arrow IPC stream: {}", e).into())
         })?;
         let arrow_schema = stream_reader.schema();
 
         // Collect all batches from the stream
         let mut batches = Vec::new();
         for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| Error::Namespace {
-                source: format!("Failed to read batch from IPC stream: {}", e).into(),
-                location: snafu::location!(),
+            batches.push(batch_result.map_err(|e| {
+                Error::namespace_source(
+                    format!("Failed to read batch from IPC stream: {}", e).into(),
+                )
             })?);
         }
 
@@ -1377,9 +1345,8 @@ impl LanceNamespace for DirectoryNamespace {
         // Create the Lance dataset using the actual Lance API
         Dataset::write(reader, &table_uri, Some(write_params))
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!("Failed to create Lance dataset: {}", e).into(),
-                location: snafu::location!(),
+            .map_err(|e| {
+                Error::namespace_source(format!("Failed to create Lance dataset: {}", e).into())
             })?;
 
         Ok(CreateTableResponse {
@@ -1390,86 +1357,16 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            #[allow(deprecated)]
-            let mut response = manifest_ns.create_empty_table(request.clone()).await?;
-            // Only apply identity-based credential vending when explicitly requested
-            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
-                if let Some(ref location) = response.location {
-                    let identity = request.identity.as_deref();
-                    response.storage_options = self
-                        .get_storage_options_for_table(location, identity)
-                        .await?;
-                }
-            } else if request.vend_credentials == Some(false) {
-                response.storage_options = None;
-            }
-            return Ok(response);
-        }
-
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
-
-        // Validate location if provided
-        if let Some(location) = &request.location {
-            let location = location.trim_end_matches('/');
-            if location != table_uri {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_uri
-                    )
-                    .into(),
-                    location: snafu::location!(),
-                });
-            }
-        }
-
-        // Atomically create the .lance-reserved file to mark the table as existing.
-        // This uses put_if_not_exists semantics to avoid race conditions.
-        let reserved_file_path = self.table_reserved_file_path(&table_name);
-
-        self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
-            .await
-            .map_err(|e| Error::Namespace {
-                source: e.into(),
-                location: snafu::location!(),
-            })?;
-
-        // For backwards compatibility, only skip vending credentials when explicitly set to false
-        let vend_credentials = request.vend_credentials.unwrap_or(true);
-        let identity = request.identity.as_deref();
-        let storage_options = if vend_credentials {
-            self.get_storage_options_for_table(&table_uri, identity)
-                .await?
-        } else {
-            None
-        };
-
-        Ok(CreateEmptyTableResponse {
-            location: Some(table_uri),
-            storage_options,
-            ..Default::default()
-        })
-    }
-
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         if let Some(ref manifest_ns) = self.manifest_ns {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
-            // Only apply identity-based credential vending when explicitly requested
-            if request.vend_credentials == Some(true) && self.credential_vendor.is_some() {
-                if let Some(ref location) = response.location {
-                    let identity = request.identity.as_deref();
-                    response.storage_options = self
-                        .get_storage_options_for_table(location, identity)
-                        .await?;
-                }
-            } else if request.vend_credentials == Some(false) {
-                response.storage_options = None;
+            if let Some(ref location) = response.location {
+                // For backwards compatibility, only skip vending credentials when explicitly set to false
+                let vend = request.vend_credentials.unwrap_or(true);
+                let identity = request.identity.as_deref();
+                response.storage_options = self
+                    .get_storage_options_for_table(location, vend, identity)
+                    .await?;
             }
             // Set managed_versioning when table_version_tracking_enabled
             if self.table_version_tracking_enabled {
@@ -1485,14 +1382,13 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
             if location != table_uri {
-                return Err(Error::Namespace {
-                    source: format!(
+                return Err(Error::namespace_source(
+                    format!(
                         "Cannot declare table {} at location {}, must be at location {}",
                         table_name, location, table_uri
                     )
                     .into(),
-                    location: snafu::location!(),
-                });
+                ));
             }
         }
 
@@ -1502,10 +1398,9 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
         if status.exists && !status.has_reserved_file {
             // Table has data but no reserved file - it was created with data
-            return Err(Error::Namespace {
-                source: format!("Table already exists: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table already exists: {}", table_name).into(),
+            ));
         }
 
         // Atomically create the .lance-reserved file to mark the table as declared.
@@ -1515,20 +1410,14 @@ impl LanceNamespace for DirectoryNamespace {
 
         self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
             .await
-            .map_err(|e| Error::Namespace {
-                source: e.into(),
-                location: snafu::location!(),
-            })?;
+            .map_err(|e| Error::namespace_source(e.into()))?;
 
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
         let identity = request.identity.as_deref();
-        let storage_options = if vend_credentials {
-            self.get_storage_options_for_table(&table_uri, identity)
-                .await?
-        } else {
-            None
-        };
+        let storage_options = self
+            .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+            .await?;
 
         Ok(DeclareTableResponse {
             location: Some(table_uri),
@@ -1552,10 +1441,9 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Without manifest, register_table is not supported
-        Err(Error::NotSupported {
-            source: "register_table is only supported when manifest mode is enabled".into(),
-            location: snafu::location!(),
-        })
+        Err(Error::not_supported_source(
+            "register_table is only supported when manifest mode is enabled".into(),
+        ))
     }
 
     async fn deregister_table(
@@ -1576,17 +1464,15 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::Namespace {
-                source: format!("Table does not exist: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table does not exist: {}", table_name).into(),
+            ));
         }
 
         if status.is_deregistered {
-            return Err(Error::Namespace {
-                source: format!("Table is already deregistered: {}", table_name).into(),
-                location: snafu::location!(),
-            });
+            return Err(Error::namespace_source(
+                format!("Table is already deregistered: {}", table_name).into(),
+            ));
         }
 
         // Atomically create the .lance-deregistered marker file.
@@ -1607,10 +1493,7 @@ impl LanceNamespace for DirectoryNamespace {
             } else {
                 e
             };
-            Error::Namespace {
-                source: message.into(),
-                location: snafu::location!(),
-            }
+            Error::namespace_source(message.into())
         })?;
 
         Ok(lance_namespace::models::DeregisterTableResponse {
@@ -1633,13 +1516,14 @@ impl LanceNamespace for DirectoryNamespace {
             .read_dir_all(&versions_dir, None)
             .try_collect()
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!(
-                    "Failed to list manifest files for table at '{}': {}",
-                    table_uri, e
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to list manifest files for table at '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
                 )
-                .into(),
-                location: snafu::location!(),
             })?;
 
         let is_v2_naming = manifest_metas
@@ -1731,23 +1615,25 @@ impl LanceNamespace for DirectoryNamespace {
             .inner
             .get(&staging_path)
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!(
-                    "Failed to read staging manifest at '{}': {}",
-                    staging_manifest_path, e
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read staging manifest at '{}': {}",
+                        staging_manifest_path, e
+                    )
+                    .into(),
                 )
-                .into(),
-                location: snafu::location!(),
             })?
             .bytes()
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!(
-                    "Failed to read staging manifest bytes at '{}': {}",
-                    staging_manifest_path, e
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read staging manifest bytes at '{}': {}",
+                        staging_manifest_path, e
+                    )
+                    .into(),
                 )
-                .into(),
-                location: snafu::location!(),
             })?;
 
         let manifest_size = manifest_data.len() as i64;
@@ -1766,22 +1652,20 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| match e {
                 object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => Error::Namespace {
-                    source: format!(
+                | object_store::Error::Precondition { .. } => Error::namespace_source(
+                    format!(
                         "Version {} already exists for table at '{}'",
                         version, table_uri
                     )
                     .into(),
-                    location: snafu::location!(),
-                },
-                _ => Error::Namespace {
-                    source: format!(
+                ),
+                _ => Error::namespace_source(
+                    format!(
                         "Failed to create version {} for table at '{}': {}",
                         version, table_uri, e
                     )
                     .into(),
-                    location: snafu::location!(),
-                },
+                ),
             })?;
 
         // Delete the staging manifest after successful copy
@@ -1820,22 +1704,24 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(sess) = &self.session {
             builder = builder.with_session(sess.clone());
         }
-        let mut dataset = builder.load().await.map_err(|e| Error::Namespace {
-            source: format!("Failed to open table at '{}': {}", table_uri, e).into(),
-            location: snafu::location!(),
+        let mut dataset = builder.load().await.map_err(|e| {
+            Error::namespace_source(
+                format!("Failed to open table at '{}': {}", table_uri, e).into(),
+            )
         })?;
 
         if let Some(version) = request.version {
             dataset = dataset
                 .checkout_version(version as u64)
                 .await
-                .map_err(|e| Error::Namespace {
-                    source: format!(
-                        "Failed to checkout version {} for table at '{}': {}",
-                        version, table_uri, e
+                .map_err(|e| {
+                    Error::namespace_source(
+                        format!(
+                            "Failed to checkout version {} for table at '{}': {}",
+                            version, table_uri, e
+                        )
+                        .into(),
                     )
-                    .into(),
-                    location: snafu::location!(),
                 })?;
         }
 
@@ -1890,14 +1776,13 @@ impl LanceNamespace for DirectoryNamespace {
                     }
                     Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
-                        return Err(Error::Namespace {
-                            source: format!(
+                        return Err(Error::namespace_source(
+                            format!(
                                 "Failed to delete version {} for table at '{}': {}",
                                 version, table_uri, e
                             )
                             .into(),
-                            location: snafu::location!(),
-                        });
+                        ));
                     }
                 }
             }
@@ -2009,10 +1894,12 @@ mod tests {
 
         let result = namespace.create_table(request, bytes::Bytes::new()).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Arrow IPC stream) is required"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Arrow IPC stream) is required")
+        );
     }
 
     #[tokio::test]
@@ -2152,10 +2039,12 @@ mod tests {
 
         let result = namespace.describe_table(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Table does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Table does not exist")
+        );
     }
 
     #[tokio::test]
@@ -2184,10 +2073,12 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.table_exists(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Table does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Table does not exist")
+        );
     }
 
     #[tokio::test]
@@ -2269,10 +2160,12 @@ mod tests {
         request.id = Some(vec![]);
         let result = namespace.drop_namespace(request).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be dropped"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be dropped")
+        );
     }
 
     #[tokio::test]
@@ -2371,6 +2264,79 @@ mod tests {
         let storage_options = response.storage_options.unwrap();
         assert_eq!(storage_options.get("option1"), Some(&"value1".to_string()));
         assert_eq!(storage_options.get("option2"), Some(&"value2".to_string()));
+    }
+
+    /// When no credential vendor is configured, `describe_table` and
+    /// `declare_table` must strip credential keys from storage options
+    /// while preserving non-credential config (region, endpoint, etc.).
+    #[tokio::test]
+    async fn test_no_storage_options_without_vendor() {
+        use lance_namespace::models::DeclareTableRequest;
+
+        let temp_dir = TempStdDir::default();
+
+        // No manifest, no credential vendor, but storage options with credentials
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .storage_option("aws_access_key_id", "AKID")
+            .storage_option("aws_secret_access_key", "SECRET")
+            .storage_option("region", "us-east-1")
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        // create_table
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["t1".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // describe_table should not return storage options without a vendor
+        let mut desc_req = DescribeTableRequest::new();
+        desc_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace.describe_table(desc_req).await.unwrap();
+        assert!(resp.storage_options.is_none());
+
+        // declare_table should not return storage options without a vendor
+        let mut decl_req = DeclareTableRequest::new();
+        decl_req.id = Some(vec!["t2".to_string()]);
+        let resp = namespace.declare_table(decl_req).await.unwrap();
+        assert!(resp.storage_options.is_none());
+    }
+
+    /// Same test with manifest mode enabled.
+    #[tokio::test]
+    async fn test_no_storage_options_without_vendor_manifest() {
+        let temp_dir = TempStdDir::default();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .storage_option("aws_access_key_id", "AKID")
+            .storage_option("aws_secret_access_key", "SECRET")
+            .storage_option("region", "us-east-1")
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["t1".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // describe_table through manifest should not return storage options without a vendor
+        let mut desc_req = DescribeTableRequest::new();
+        desc_req.id = Some(vec!["t1".to_string()]);
+        let resp = namespace.describe_table(desc_req).await.unwrap();
+        assert!(resp.storage_options.is_none());
     }
 
     #[tokio::test]
@@ -2581,112 +2547,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.version, Some(1));
-        assert!(response
-            .location
-            .unwrap()
-            .contains("test_table_with_data.lance"));
+        assert!(
+            response
+                .location
+                .unwrap()
+                .contains("test_table_with_data.lance")
+        );
 
         // Verify table exists
         let mut exists_request = TableExistsRequest::new();
         exists_request.id = Some(vec!["test_table_with_data".to_string()]);
         namespace.table_exists(exists_request).await.unwrap();
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_create_empty_table() {
-        let (namespace, temp_dir) = create_test_namespace().await;
-
-        let mut request = CreateEmptyTableRequest::new();
-        request.id = Some(vec!["empty_table".to_string()]);
-
-        let response = namespace.create_empty_table(request).await.unwrap();
-
-        assert!(response.location.is_some());
-        assert!(response.location.unwrap().ends_with("empty_table.lance"));
-
-        // Verify the .lance-reserved file was created in the correct location
-        let table_dir = temp_dir.join("empty_table.lance");
-        assert!(table_dir.exists());
-        assert!(table_dir.is_dir());
-
-        let reserved_file = table_dir.join(".lance-reserved");
-        assert!(reserved_file.exists());
-        assert!(reserved_file.is_file());
-
-        // Verify file is empty
-        let metadata = std::fs::metadata(&reserved_file).unwrap();
-        assert_eq!(metadata.len(), 0);
-
-        // Verify table exists by checking for .lance-reserved file
-        let mut exists_request = TableExistsRequest::new();
-        exists_request.id = Some(vec!["empty_table".to_string()]);
-        namespace.table_exists(exists_request).await.unwrap();
-
-        // List tables should include the empty table
-        let mut list_request = ListTablesRequest::new();
-        list_request.id = Some(vec![]);
-        let list_response = namespace.list_tables(list_request).await.unwrap();
-        assert!(list_response.tables.contains(&"empty_table".to_string()));
-
-        // Verify describe table works for empty table
-        let mut describe_request = DescribeTableRequest::new();
-        describe_request.id = Some(vec!["empty_table".to_string()]);
-        let describe_response = namespace.describe_table(describe_request).await.unwrap();
-        assert!(describe_response.location.is_some());
-        assert!(describe_response.location.unwrap().contains("empty_table"));
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_create_empty_table_with_wrong_location() {
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let mut request = CreateEmptyTableRequest::new();
-        request.id = Some(vec!["test_table".to_string()]);
-        request.location = Some("/wrong/path/table.lance".to_string());
-
-        let result = namespace.create_empty_table(request).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be at location"));
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_create_empty_table_then_drop() {
-        let (namespace, temp_dir) = create_test_namespace().await;
-
-        // Create an empty table
-        let mut create_request = CreateEmptyTableRequest::new();
-        create_request.id = Some(vec!["empty_table_to_drop".to_string()]);
-
-        let create_response = namespace.create_empty_table(create_request).await.unwrap();
-        assert!(create_response.location.is_some());
-
-        // Verify it exists
-        let table_dir = temp_dir.join("empty_table_to_drop.lance");
-        assert!(table_dir.exists());
-        let reserved_file = table_dir.join(".lance-reserved");
-        assert!(reserved_file.exists());
-
-        // Drop the table
-        let mut drop_request = DropTableRequest::new();
-        drop_request.id = Some(vec!["empty_table_to_drop".to_string()]);
-        let drop_response = namespace.drop_table(drop_request).await.unwrap();
-        assert!(drop_response.location.is_some());
-
-        // Verify table directory was removed
-        assert!(!table_dir.exists());
-        assert!(!reserved_file.exists());
-
-        // Verify table no longer exists
-        let mut exists_request = TableExistsRequest::new();
-        exists_request.id = Some(vec!["empty_table_to_drop".to_string()]);
-        let exists_result = namespace.table_exists(exists_request).await;
-        assert!(exists_result.is_err());
     }
 
     #[tokio::test]
@@ -2867,32 +2738,6 @@ mod tests {
         exists_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
         let result = namespace.table_exists(exists_req).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_empty_table_in_child_namespace() {
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        // Create child namespace
-        let mut create_ns_req = CreateNamespaceRequest::new();
-        create_ns_req.id = Some(vec!["test_ns".to_string()]);
-        namespace.create_namespace(create_ns_req).await.unwrap();
-
-        // Create empty table
-        let mut create_empty_req = CreateEmptyTableRequest::new();
-        create_empty_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
-        let result = namespace.create_empty_table(create_empty_req).await;
-        assert!(
-            result.is_ok(),
-            "Failed to create empty table in child namespace"
-        );
-
-        // Verify table exists
-        let mut exists_req = TableExistsRequest::new();
-        exists_req.id = Some(vec!["test_ns".to_string(), "empty_table".to_string()]);
-        let result = namespace.table_exists(exists_req).await;
-        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -3405,10 +3250,12 @@ mod tests {
         register_req.id = Some(vec!["test_table".to_string()]);
         let result = namespace.register_table(register_req).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("manifest mode is enabled"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("manifest mode is enabled")
+        );
 
         // Note: deregister_table now works in V1 mode via .lance-deregistered marker files
         // See test_deregister_table_v1_mode for that test case
@@ -3773,10 +3620,12 @@ mod tests {
         // Try to deregister again - should fail
         let result = namespace.deregister_table(deregister_req).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("already deregistered"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already deregistered")
+        );
     }
 
     // ============================================================
@@ -4706,14 +4555,6 @@ mod tests {
                 self.inner.create_table(request, request_data).await
             }
 
-            #[allow(deprecated)]
-            async fn create_empty_table(
-                &self,
-                request: CreateEmptyTableRequest,
-            ) -> Result<CreateEmptyTableResponse> {
-                self.inner.create_empty_table(request).await
-            }
-
             async fn declare_table(
                 &self,
                 request: DeclareTableRequest,
@@ -4808,9 +4649,9 @@ mod tests {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
             use arrow::record_batch::RecordBatch;
+            use lance::Dataset;
             use lance::dataset::builder::DatasetBuilder;
             use lance::dataset::{WriteMode, WriteParams};
-            use lance::Dataset;
             use lance_namespace::models::CreateNamespaceRequest;
 
             let temp_dir = TempStdDir::default();

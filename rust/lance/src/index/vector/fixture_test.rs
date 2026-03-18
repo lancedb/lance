@@ -22,12 +22,12 @@ mod test {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
+    use lance_index::{Index, IndexType, vector::Query};
     use lance_index::{metrics::MetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
         metrics::NoOpMetricsCollector,
         vector::quantizer::{QuantizationType, Quantizer},
     };
-    use lance_index::{vector::Query, Index, IndexType};
     use lance_io::{local::LocalObjectReader, traits::Reader};
     use lance_linalg::{distance::MetricType, kernels::normalize_arrow};
     use roaring::RoaringBitmap;
@@ -35,11 +35,11 @@ mod test {
 
     use super::super::VectorIndex;
     use crate::{
+        Result,
         index::{
             prefilter::{DatasetPreFilter, PreFilter},
             vector::ivf::IVFIndex,
         },
-        Result,
     };
 
     #[derive(Clone, Debug)]

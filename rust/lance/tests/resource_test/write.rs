@@ -5,7 +5,7 @@ use all_asserts::assert_le;
 use arrow_schema::DataType;
 use lance::dataset::InsertBuilder;
 use lance_datafusion::datagen::DatafusionDatagenExt;
-use lance_datagen::{array, gen_batch, BatchCount, ByteCount, RoundingBehavior};
+use lance_datagen::{BatchCount, ByteCount, RoundingBehavior, array, gen_batch};
 
 #[tokio::test]
 async fn test_insert_memory() {

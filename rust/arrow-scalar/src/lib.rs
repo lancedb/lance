@@ -16,7 +16,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_array::{make_array, new_null_array, ArrayRef};
+use arrow_array::{ArrayRef, make_array, new_null_array};
 use arrow_cast::display::ArrayFormatter;
 use arrow_data::transform::MutableArrayData;
 use arrow_row::{OwnedRow, RowConverter, SortField};
@@ -40,7 +40,7 @@ type Result<T> = std::result::Result<T, ArrowError>;
 /// # Examples
 ///
 /// ```
-/// use arrow_scalar::ArrowScalar;
+/// use lance_arrow_scalar::ArrowScalar;
 ///
 /// let a = ArrowScalar::from(1i32);
 /// let b = ArrowScalar::from(2i32);

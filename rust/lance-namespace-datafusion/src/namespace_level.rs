@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use lance::dataset::builder::DatasetBuilder;
 use lance::{Dataset, Result};
-use lance_namespace::models::{ListNamespacesRequest, ListTablesRequest};
 use lance_namespace::LanceNamespace;
+use lance_namespace::models::{ListNamespacesRequest, ListTablesRequest};
 
 const DEFAULT_NAMESPACE_NAME: &str = "lance";
 

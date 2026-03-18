@@ -303,23 +303,6 @@ public class DirectoryNamespaceTest {
   }
 
   @Test
-  void testCreateEmptyTable() {
-    // Create parent namespace
-    CreateNamespaceRequest createNsReq =
-        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
-
-    // Create empty table (metadata-only operation)
-    CreateEmptyTableRequest createReq =
-        new CreateEmptyTableRequest().id(Arrays.asList("workspace", "empty_table"));
-
-    CreateEmptyTableResponse createResp = namespace.createEmptyTable(createReq);
-
-    assertNotNull(createResp);
-    assertNotNull(createResp.getLocation());
-  }
-
-  @Test
   void testDescribeTableReturnsManagedVersioningWhenTrackingEnabled() throws Exception {
     // Create namespace with table_version_tracking_enabled and manifest_enabled
     DirectoryNamespace trackingNs = new DirectoryNamespace();
@@ -438,11 +421,6 @@ public class DirectoryNamespaceTest {
     @Override
     public String namespaceId() {
       return "TableVersionTrackingNamespace { inner: " + inner.namespaceId() + " }";
-    }
-
-    @Override
-    public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-      return inner.createEmptyTable(request);
     }
 
     @Override

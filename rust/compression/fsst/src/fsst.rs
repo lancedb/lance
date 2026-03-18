@@ -3,7 +3,7 @@
 
 // the first 32-bits of a FSST compressed file is the FSST magic number
 const FSST_MAGIC: u64 = 0x46535354 << 32; // "FSST"
-                                          // when the code is FSST_ESC, the next byte should be interpreted as is
+// when the code is FSST_ESC, the next byte should be interpreted as is
 const FSST_ESC: u8 = 255;
 // when building symbol table, we have a maximum of 512 symbols, so we can use 9 bits to represent the code
 const FSST_CODE_BITS: u16 = 9;

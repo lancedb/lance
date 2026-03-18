@@ -86,6 +86,10 @@ from .trace import trace_to_chrome as trace_to_chrome
 class CleanupStats:
     bytes_removed: int
     old_versions: int
+    data_files_removed: int
+    transaction_files_removed: int
+    index_files_removed: int
+    deletion_files_removed: int
 
 class LanceFileWriter:
     def __init__(
@@ -313,6 +317,7 @@ class _Dataset:
         older_than_micros: int,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations

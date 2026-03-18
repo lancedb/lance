@@ -24,24 +24,23 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
-use futures::future::Either;
 use futures::Stream;
+use futures::future::Either;
 use futures::{
+    StreamExt, TryStreamExt,
     future::{self, BoxFuture},
     stream::BoxStream,
-    StreamExt, TryStreamExt,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{get_etag, ObjectWriter, WriteResult};
+use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::PutOptions;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use snafu::location;
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
 use url::Url;
 
@@ -53,14 +52,14 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
 use lance_io::traits::{WriteExt, Writer};
 
-use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
+use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-    aws_credential_types::provider::error::CredentialsError,
     aws_credential_types::provider::ProvideCredentials,
-    lance_io::object_store::{providers::aws::build_aws_credential, StorageOptions},
+    aws_credential_types::provider::error::CredentialsError,
+    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -230,21 +229,14 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
     fn try_from(meta: object_store::ObjectMeta) -> Result<Self> {
-        let filename = meta.location.filename().ok_or_else(|| Error::Internal {
-            message: "ObjectMeta location does not have a filename".to_string(),
-            location: location!(),
+        let filename = meta.location.filename().ok_or_else(|| {
+            Error::internal("ObjectMeta location does not have a filename".to_string())
         })?;
-        let scheme =
-            ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+        let scheme = ManifestNamingScheme::detect_scheme(filename)
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         let version = scheme
             .parse_version(filename)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         Ok(Self {
             version,
             path: meta.location,
@@ -260,10 +252,10 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base) {
-            return Ok(location);
-        }
+    if object_store.is_local()
+        && let Ok(Some(location)) = current_manifest_local(base)
+    {
+        return Ok(location);
     }
 
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
@@ -329,14 +321,11 @@ async fn current_manifest_path(
 
             while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
                 if entry_scheme != scheme {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
-                             Use `migrate_manifest_paths_v2` to migrate the directory.",
-                            scheme, entry_scheme
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
+                         Use `migrate_manifest_paths_v2` to migrate the directory.",
+                        scheme, entry_scheme
+                    )));
                 }
                 let version = entry_scheme
                     .parse_version(meta.location.filename().unwrap())
@@ -354,10 +343,7 @@ async fn current_manifest_path(
                 e_tag: current_meta.e_tag,
             })
         }
-        (None, _) => Err(Error::NotFound {
-            uri: base.child(VERSIONS_DIR).to_string(),
-            location: location!(),
-        }),
+        (None, _) => Err(Error::not_found(base.child(VERSIONS_DIR).to_string())),
     }
 }
 
@@ -444,10 +430,7 @@ fn list_manifests<'a>(
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
-    Path::parse(format!("{base}-{id}")).map_err(|e| Error::IO {
-        source: Box::new(e),
-        location: location!(),
-    })
+    Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
 }
 
 #[cfg(feature = "dynamodb")]
@@ -652,8 +635,8 @@ async fn build_dynamodb_external_store(
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
     use aws_sdk_dynamodb::{
-        config::{retry::RetryConfig, IdentityCache, Region},
         Client,
+        config::{IdentityCache, Region, retry::RetryConfig},
     };
 
     let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
@@ -700,38 +683,31 @@ pub async fn commit_handler_from_url(
         "file" | "file-object-store" => Ok(local_handler),
         "s3" | "gs" | "az" | "memory" | "oss" | "cos" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
-        "s3+ddb" => Err(Error::InvalidInput {
-            source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
-            location: location!(),
-        }),
+        "s3+ddb" => Err(Error::invalid_input_source(
+            "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
+        )),
         #[cfg(feature = "dynamodb")]
         "s3+ddb" => {
             if url.query_pairs().count() != 1 {
-                return Err(Error::InvalidInput {
-                    source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                        .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                ));
             }
             let table_name = match url.query_pairs().next() {
                 Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
                     if key == DDB_URL_QUERY_KEY =>
                 {
                     if table_name.is_empty() {
-                        return Err(Error::InvalidInput {
-                            source: "`s3+ddb://` scheme requires non empty dynamodb table name"
-                                .into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            "`s3+ddb://` scheme requires non empty dynamodb table name".into(),
+                        ));
                     }
                     table_name
                 }
                 _ => {
-                    return Err(Error::InvalidInput {
-                        source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                            .into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                    ));
                 }
             };
             let options = options.clone().unwrap_or_default();
@@ -796,10 +772,7 @@ impl From<Error> for CommitError {
 impl From<CommitError> for Error {
     fn from(e: CommitError) -> Self {
         match e {
-            CommitError::CommitConflict => Self::Internal {
-                message: "Commit conflict".to_string(),
-                location: location!(),
-            },
+            CommitError::CommitConflict => Self::internal("Commit conflict".to_string()),
             CommitError::OtherError(e) => e,
         }
     }

@@ -6,15 +6,15 @@ use std::{ops::Range, sync::Arc};
 use arrow_buffer::BooleanBufferBuilder;
 use bytes::Bytes;
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-    EncodingsIo,
 };
 
 /// A physical scheduler for bitmap buffers encoded densely as 1 bit per value
@@ -134,7 +134,7 @@ mod tests {
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
     use crate::previous::encodings::physical::bitmap::BitmapData;
-    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     use super::BitmapDecoder;
 

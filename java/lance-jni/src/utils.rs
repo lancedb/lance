@@ -5,20 +5,20 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow_schema::{DataType, Field};
+use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use jni::JNIEnv;
-use lance::dataset::optimize::CompactionOptions;
+use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
+use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::IndexParams;
 use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
@@ -139,8 +139,11 @@ pub fn build_compaction_options(
     num_threads: &JObject,                     // Optional<Long>
     batch_size: &JObject,                      // Optional<Long>
     defer_index_remap: &JObject,               // Optional<Boolean>
+    compaction_mode: &JObject,                 // Optional<String>
+    binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
+    config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
-    let mut compaction_options = CompactionOptions::default();
+    let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
 
     if let Some(target_rows_per_fragment_val) = env.get_long_opt(target_rows_per_fragment)? {
         compaction_options.target_rows_per_fragment = target_rows_per_fragment_val as usize;
@@ -167,6 +170,16 @@ pub fn build_compaction_options(
     }
     if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
         compaction_options.defer_index_remap = defer_index_remap_val;
+    }
+    if let Some(compaction_mode_val) = env.get_string_opt(compaction_mode)? {
+        compaction_options.compaction_mode =
+            Some(CompactionMode::try_from(compaction_mode_val.as_str())?);
+    }
+    if let Some(binary_copy_read_batch_bytes_val) =
+        env.get_long_opt(binary_copy_read_batch_bytes)?
+    {
+        compaction_options.binary_copy_read_batch_bytes =
+            Some(binary_copy_read_batch_bytes_val as usize);
     }
 
     Ok(compaction_options)
@@ -418,6 +431,7 @@ pub fn get_vector_index_params(
                 metric_type: distance_type,
                 stages,
                 version: IndexFileVersion::V3,
+                skip_transpose: false,
             })
         },
     )?;

@@ -15,10 +15,10 @@
 use std::sync::Arc;
 
 use pyo3::{
+    Bound, PyResult, Python,
     exceptions::PyValueError,
     pyclass, pymethods,
     types::{PyByteArray, PyByteArrayMethods, PyBytes},
-    Bound, PyResult, Python,
 };
 
 use lance::dataset::BlobFile as InnerBlobFile;

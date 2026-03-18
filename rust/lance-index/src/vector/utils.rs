@@ -3,6 +3,7 @@
 
 use arrow::{
     array::AsArray,
+    compute::cast,
     datatypes::{Float16Type, Float32Type, Float64Type},
 };
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray};
@@ -12,15 +13,14 @@ use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
 use prost::bytes;
-use snafu::location;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
 use crate::vector::flat::storage::FlatFloatStorage;
-use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::hnsw::HNSW;
+use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::v3::subindex::IvfSubIndex;
 
 enum SimpleIndexStatus {
@@ -79,18 +79,19 @@ impl SimpleIndex {
             _ => {}
         }
 
-        match centroids.data_type() {
-            DataType::Float32 => {
-                let fsl =
-                    FixedSizeListArray::try_new_from_values(centroids.clone(), dimension as i32)?;
-                let store = FlatFloatStorage::new(fsl, distance_type);
-                Self::try_new(store).map(Some)
+        let f32_centroids = match centroids.data_type() {
+            DataType::Float16 | DataType::Float32 => {
+                cast(&centroids, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?
             }
-            _ => Ok(None),
-        }
+            _ => return Ok(None),
+        };
+        let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
+        let store = FlatFloatStorage::new(fsl, distance_type);
+        Self::try_new(store).map(Some)
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
+        let query = cast(&query, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?;
         let res = self.index.search_basic(
             query,
             1,
@@ -128,10 +129,10 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
             do_prefetch(array.values().as_ptr_range())
         }
         _ => {
-            return Err(Error::invalid_input(
-                format!("Unsupported data type for prefetch: {}", array.data_type()),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Unsupported data type for prefetch: {}",
+                array.data_type()
+            )));
         }
     }
 
@@ -149,7 +150,7 @@ pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
             const CACHE_LINE_SIZE: usize = 64;
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
-                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
                 _mm_prefetch(current_ptr, _MM_HINT_T0);
             }
             current_ptr = current_ptr.add(CACHE_LINE_SIZE);
@@ -184,10 +185,10 @@ impl TryFrom<&DataType> for pb::tensor::DataType {
             DataType::Float16 => Ok(Self::Float16),
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
-            _ => Err(Error::Index {
-                message: format!("pb tensor type not supported: {:?}", dt),
-                location: location!(),
-            }),
+            _ => Err(Error::index(format!(
+                "pb tensor type not supported: {:?}",
+                dt
+            ))),
         }
     }
 }
@@ -218,10 +219,10 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
 
     fn try_from(tensor: &Tensor) -> Result<Self> {
         if tensor.shape.len() != 2 {
-            return Err(Error::Index {
-                message: format!("only accept 2-D tensor shape, got: {:?}", tensor.shape),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "only accept 2-D tensor shape, got: {:?}",
+                tensor.shape
+            )));
         }
         let dim = tensor.shape[1] as usize;
         let num_rows = tensor.shape[0] as usize;
@@ -235,14 +236,11 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         )?;
 
         if flat_array.len() != dim * num_rows {
-            return Err(Error::Index {
-                message: format!(
-                    "Tensor shape {:?} does not match to data len: {}",
-                    tensor.shape,
-                    flat_array.len()
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Tensor shape {:?} does not match to data len: {}",
+                tensor.shape,
+                flat_array.len()
+            )));
         }
 
         let field = Field::new("item", flat_array.data_type().clone(), true);
@@ -293,6 +291,37 @@ mod tests {
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
+
+    use arrow::compute::cast;
+    use rstest::rstest;
+
+    fn build_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
+        let f32_centroids = cast(&centroids, &DataType::Float32).unwrap();
+        let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dim as i32).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        SimpleIndex::try_new(store).unwrap()
+    }
+
+    #[rstest]
+    #[case::f16(Arc::new(Float16Array::from(
+        (0..100).flat_map(|i| std::iter::repeat_n(f16::from_f32(i as f32), 16)).collect::<Vec<_>>(),
+    )) as ArrayRef)]
+    #[case::f32(Arc::new(Float32Array::from(
+        (0..100).flat_map(|i| std::iter::repeat_n(i as f32, 16)).collect::<Vec<_>>(),
+    )) as ArrayRef)]
+    fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef) {
+        let index = build_index(centroids, 16);
+        let query: ArrayRef = Arc::new(Float32Array::from(vec![42.1f32; 16]));
+        let (id, _) = index.search(query).unwrap();
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn test_simple_index_rejects_f64() {
+        let centroids: ArrayRef = Arc::new(Float64Array::from(vec![0.0; 1600]));
+        let result = SimpleIndex::may_train_index(centroids, 16, DistanceType::L2).unwrap();
+        assert!(result.is_none());
+    }
 
     #[test]
     fn test_fsl_to_tensor() {

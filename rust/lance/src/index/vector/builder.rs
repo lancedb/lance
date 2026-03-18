@@ -9,48 +9,50 @@ use std::{collections::HashMap, pin::Pin};
 use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::{self};
-use arrow::datatypes::{Float16Type, Float64Type, UInt64Type, UInt8Type};
+use arrow::datatypes::{Float16Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::types::Float32Type;
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, PrimitiveArray,
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
+use futures::{FutureExt, stream};
 use futures::{
-    prelude::stream::{StreamExt, TryStreamExt},
     Stream,
+    prelude::stream::{StreamExt, TryStreamExt},
 };
-use futures::{stream, FutureExt};
 use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::ROW_ID;
 use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::ROW_ID;
-use lance_core::{Error, Result, ROW_ID_FIELD};
-use lance_file::writer::FileWriter;
+use lance_core::{Error, ROW_ID_FIELD, Result};
+use lance_encoding::version::LanceFileVersion;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
+use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, pack_codes, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
-use lance_index::vector::shared::{write_unified_ivf_and_index_metadata, SupportedIvfIndexType};
+use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{ivf::storage::IvfModel, PART_ID_FIELD};
-use lance_index::vector::{VectorIndex, LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_index::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN, VectorIndex};
+use lance_index::vector::{PART_ID_FIELD, ivf::storage::IvfModel};
 use lance_index::{
-    pb,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, pb,
     vector::{
-        ivf::{storage::IVF_METADATA_KEY, IvfBuildParams},
+        DISTANCE_TYPE_KEY,
+        ivf::{IvfBuildParams, storage::IVF_METADATA_KEY},
         quantizer::Quantization,
         storage::{StorageBuilder, VectorStore},
         transform::Transformer,
@@ -58,29 +60,27 @@ use lance_index::{
             shuffler::{ShuffleReader, Shuffler},
             subindex::IvfSubIndex,
         },
-        DISTANCE_TYPE_KEY,
     },
-    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{
-    IndexMetadata, IndexType, INDEX_METADATA_SCHEMA_KEY, MAX_PARTITION_SIZE_FACTOR,
+    INDEX_METADATA_SCHEMA_KEY, IndexMetadata, IndexType, MAX_PARTITION_SIZE_FACTOR,
     MIN_PARTITION_SIZE_PERCENT,
 };
 use lance_io::local::to_local_path;
 use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
-use lance_linalg::distance::{DistanceType, Dot, Normalize, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
-use snafu::location;
-use tracing::{instrument, span, Level};
+use tracing::{Level, instrument, span};
 
+use crate::Dataset;
 use crate::dataset::ProjectionRequest;
+use crate::dataset::index::dataset_format_version;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::{infer_vector_dim, infer_vector_element_type};
-use crate::Dataset;
 
 use super::v2::IVFIndex;
 use super::{
@@ -151,6 +151,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // whether to transpose codes when building storage
     transpose_codes: bool,
 
+    // lance file version for writing index files
+    format_version: LanceFileVersion,
+
     progress: Arc<dyn IndexBuildProgress>,
 }
 
@@ -172,6 +175,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     ) -> Result<Self> {
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+        let format_version = dataset_format_version(&dataset);
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -194,6 +198,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -230,17 +235,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         index_dir: Path,
         index: Arc<dyn VectorIndex>,
     ) -> Result<Self> {
-        let ivf_index =
-            index
-                .as_any()
-                .downcast_ref::<IVFIndex<S, Q>>()
-                .ok_or(Error::invalid_input(
-                    "existing index is not IVF index",
-                    location!(),
-                ))?;
+        let ivf_index = index
+            .as_any()
+            .downcast_ref::<IVFIndex<S, Q>>()
+            .ok_or(Error::invalid_input("existing index is not IVF index"))?;
 
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+        let format_version = dataset_format_version(&dataset);
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -262,6 +264,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -285,21 +288,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
-            progress.stage_start("shuffle", None, "batches").await?;
+            let num_rows = self.num_rows_to_shuffle().await?;
+            progress.stage_start("shuffle", num_rows, "rows").await?;
             self.shuffle_dataset().await?;
             progress.stage_complete("shuffle").await?;
         }
 
-        // step 3. build partitions
+        // step 3. build and merge partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
         progress
-            .stage_start("build_partitions", num_partitions, "partitions")
+            .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
-
-        // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
-        progress.stage_complete("build_partitions").await?;
+        progress.stage_complete("merge_partitions").await?;
 
         Ok(self.merged_num)
     }
@@ -308,45 +310,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
-                location!(),
             ));
         }
         let Some(ivf) = self.ivf.as_ref() else {
-            return Err(Error::invalid_input(
-                "IVF model not set before remapping",
-                location!(),
-            ));
+            return Err(Error::invalid_input("IVF model not set before remapping"));
         };
 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].clone();
         let mapping = Arc::new(mapping.clone());
-        let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
-            let existing_index = existing_index.clone();
-            let mapping = mapping.clone();
-            async move {
-                let ivf_index = existing_index
-                    .as_any()
-                    .downcast_ref::<IVFIndex<S, Q>>()
-                    .ok_or(Error::invalid_input(
-                        "existing index is not IVF index",
-                        location!(),
-                    ))?;
-                let part = ivf_index
-                    .load_partition(part_id, false, &NoOpMetricsCollector)
-                    .await?;
-                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                    Error::Internal {
-                        message: "failed to downcast partition entry".to_string(),
-                        location: location!(),
-                    },
-                )?;
+        let build_iter =
+            (0..ivf.num_partitions()).map(move |part_id| {
+                let existing_index = existing_index.clone();
+                let mapping = mapping.clone();
+                async move {
+                    let ivf_index = existing_index
+                        .as_any()
+                        .downcast_ref::<IVFIndex<S, Q>>()
+                        .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+                    let part = ivf_index
+                        .load_partition(part_id, false, &NoOpMetricsCollector)
+                        .await?;
+                    let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
+                        Error::internal("failed to downcast partition entry".to_string()),
+                    )?;
 
-                let storage = part.storage.remap(&mapping)?;
-                let index = part.index.remap(&mapping, &storage)?;
-                Result::Ok(Some((storage, index, 0.0)))
-            }
-        });
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    Result::Ok(Some((storage, index, 0.0)))
+                }
+            });
 
         self.merge_partitions(
             stream::iter(build_iter)
@@ -399,14 +392,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let Some(dataset) = self.dataset.as_ref() else {
                     return Err(Error::invalid_input(
                         "dataset not set before loading or building IVF",
-                        location!(),
                     ));
                 };
                 let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
-                let ivf_params = self.ivf_params.as_ref().ok_or(Error::invalid_input(
-                    "IVF build params not set",
-                    location!(),
-                ))?;
+                let ivf_params = self
+                    .ivf_params
+                    .as_ref()
+                    .ok_or(Error::invalid_input("IVF build params not set"))?;
                 super::build_ivf_model(
                     dataset,
                     &self.column,
@@ -429,7 +421,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before loading or building quantizer",
-                location!(),
             ));
         };
         let sample_size_hint = match &self.quantizer_params {
@@ -478,9 +469,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let quantizer = match &self.quantizer {
             Some(q) => q.clone(),
             None => {
-                let quantizer_params = self.quantizer_params.as_ref().ok_or(
-                    Error::invalid_input("quantizer build params not set", location!()),
-                )?;
+                let quantizer_params = self
+                    .quantizer_params
+                    .as_ref()
+                    .ok_or(Error::invalid_input("quantizer build params not set"))?;
                 Q::build(&training_data, DistanceType::L2, quantizer_params)?
             }
         };
@@ -522,12 +514,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         )
     }
 
+    async fn num_rows_to_shuffle(&self) -> Result<Option<u64>> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Ok(None);
+        };
+        match &self.fragment_filter {
+            Some(fragment_ids) => {
+                let fragments: Vec<_> = dataset
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|f| fragment_ids.contains(&(f.id() as u32)))
+                    .collect();
+                let counts = futures::stream::iter(fragments)
+                    .map(|f| async move { f.count_rows(None).await })
+                    .buffer_unordered(16) // ref: Dataset::count_all_rows()
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok(Some(counts.iter().sum::<usize>() as u64))
+            }
+            None => Ok(Some(dataset.count_rows(None).await? as u64)),
+        }
+    }
+
     async fn shuffle_dataset(&mut self) -> Result<()> {
         let Some(dataset) = self.dataset.as_ref() else {
-            return Err(Error::invalid_input(
-                "dataset not set before shuffling",
-                location!(),
-            ));
+            return Err(Error::invalid_input("dataset not set before shuffling"));
         };
 
         let stream = match self
@@ -597,10 +608,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> Result<&mut Self> {
         let Some(ivf) = self.ivf.as_ref() else {
-            return Err(Error::invalid_input(
-                "IVF not set before shuffle data",
-                location!(),
-            ));
+            return Err(Error::invalid_input("IVF not set before shuffle data"));
         };
 
         let Some(data) = data else {
@@ -614,14 +622,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(quantizer) = self.quantizer.clone() else {
             return Err(Error::invalid_input(
                 "quantizer not set before shuffle data",
-                location!(),
             ));
         };
         let Some(shuffler) = self.shuffler.as_ref() else {
-            return Err(Error::invalid_input(
-                "shuffler not set before shuffle data",
-                location!(),
-            ));
+            return Err(Error::invalid_input("shuffler not set before shuffle data"));
         };
 
         let code_column = quantizer.column();
@@ -727,25 +731,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input(
                 "IVF not set before building partitions",
-                location!(),
             ));
         };
         let Some(quantizer) = self.quantizer.clone() else {
             return Err(Error::invalid_input(
                 "quantizer not set before building partition",
-                location!(),
             ));
         };
         let Some(sub_index_params) = self.sub_index_params.clone() else {
             return Err(Error::invalid_input(
                 "sub index params not set before building partition",
-                location!(),
             ));
         };
         let Some(reader) = self.shuffle_reader.as_ref() else {
             return Err(Error::invalid_input(
                 "shuffle reader not set before building partitions",
-                location!(),
             ));
         };
 
@@ -797,7 +797,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         let Some(ivf) = self.ivf.as_mut() else {
                             return Err(Error::invalid_input(
                                 "IVF not set before building partitions",
-                                location!(),
                             ));
                         };
                         ivf.centroids = Some(split_results.new_centroids);
@@ -813,7 +812,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         let Some(ivf) = self.ivf.as_mut() else {
                             return Err(Error::invalid_input(
                                 "IVF model not set before joining partition",
-                                location!(),
                             ));
                         };
                         ivf.centroids = Some(results.new_centroids);
@@ -947,10 +945,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let existing_index = existing_index
                 .as_any()
                 .downcast_ref::<IVFIndex<S, Q>>()
-                .ok_or(Error::invalid_input(
-                    "existing index is not IVF index",
-                    location!(),
-                ))?;
+                .ok_or(Error::invalid_input("existing index is not IVF index"))?;
 
             // Skip if this partition doesn't exist in the existing index
             // This can happen after a split creates a new partition
@@ -1013,26 +1008,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut loss = 0.0;
         // Skip if this partition doesn't exist in the reader
         // This can happen after a split creates a new partition
-        if let Some(reader) = reader {
-            if reader.partition_size(part_id)? > 0 {
-                let mut partition_data =
-                    reader
-                        .read_partition(part_id)
-                        .await?
-                        .ok_or(Error::invalid_input(
-                            format!("partition {} is empty", part_id),
-                            location!(),
-                        ))?;
-                while let Some(batch) = partition_data.try_next().await? {
-                    loss += batch
-                        .metadata()
-                        .get(LOSS_METADATA_KEY)
-                        .map(|s| s.parse::<f64>().unwrap_or(0.0))
-                        .unwrap_or(0.0);
-                    let batch = batch.drop_column(PART_ID_COLUMN)?;
-                    let batch = stable_sort_batch_by_row_id(&batch)?;
-                    batches.push(batch);
-                }
+        if let Some(reader) = reader
+            && reader.partition_size(part_id)? > 0
+        {
+            let mut partition_data =
+                reader
+                    .read_partition(part_id)
+                    .await?
+                    .ok_or(Error::invalid_input(format!(
+                        "partition {} is empty",
+                        part_id
+                    )))?;
+            while let Some(batch) = partition_data.try_next().await? {
+                loss += batch
+                    .metadata()
+                    .get(LOSS_METADATA_KEY)
+                    .map(|s| s.parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let batch = batch.drop_column(PART_ID_COLUMN)?;
+                let batch = stable_sort_batch_by_row_id(&batch)?;
+                batches.push(batch);
             }
         }
 
@@ -1042,19 +1037,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
     async fn merge_partitions(&mut self, mut build_stream: BuildStream<S, Q>) -> Result<()> {
         let Some(ivf) = self.ivf.as_ref() else {
-            return Err(Error::invalid_input(
-                "IVF not set before merge partitions",
-                location!(),
-            ));
+            return Err(Error::invalid_input("IVF not set before merge partitions"));
         };
         let Some(quantizer) = self.quantizer.clone() else {
             return Err(Error::invalid_input(
                 "quantizer not set before merge partitions",
-                location!(),
             ));
         };
 
         let is_pq = Q::quantization_type() == QuantizationType::Product;
+        let is_rq = Q::quantization_type() == QuantizationType::Rabit;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1063,15 +1055,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
         fields.extend(quantizer.extra_fields());
         let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
+        let writer_options = FileWriterOptions {
+            format_version: Some(self.format_version),
+            ..Default::default()
+        };
         let mut storage_writer = FileWriter::try_new(
             self.store.create(&storage_path).await?,
             storage_schema.clone(),
-            Default::default(),
+            writer_options.clone(),
         )?;
         let mut index_writer = FileWriter::try_new(
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
-            Default::default(),
+            writer_options,
         )?;
 
         // maintain the IVF partitions
@@ -1085,7 +1081,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
-            progress.stage_progress("build_partitions", part_id).await?;
+            progress.stage_progress("merge_partitions", part_id).await?;
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 
@@ -1123,6 +1119,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, original_fsl)?;
                 }
 
+                if is_rq && batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
+                    // RQ storage batches reaching merge_partitions always come
+                    // from RabitQuantizationStorage, which canonicalizes codes
+                    // into packed layout in try_from_batch/remap. Materialize
+                    // row-major bytes so row-wise sort operates on per-row codes.
+                    let codes_fsl = batch
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let unpacked = Arc::new(unpack_codes(codes_fsl));
+                    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
+                }
+
                 // Enforce a stable ROW_ID ordering for all auxiliary batches so that the
                 // PQ code column moves together with ROW_ID.
                 batch = stable_sort_batch_by_row_id(&batch)?;
@@ -1144,6 +1153,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         bytes_per_code as i32,
                     )?);
                     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
+                }
+
+                if is_rq
+                    && self.transpose_codes
+                    && batch.column_by_name(RABIT_CODE_COLUMN).is_some()
+                {
+                    let codes_fsl = batch
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let packed = Arc::new(pack_codes(codes_fsl));
+                    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, packed)?;
                 }
 
                 storage_writer.write_batch(&batch).await?;
@@ -1189,8 +1210,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         let quant_type = Q::quantization_type();
         let transposed = match quant_type {
-            QuantizationType::Product => self.transpose_codes,
-            QuantizationType::Rabit => true,
+            QuantizationType::Product | QuantizationType::Rabit => self.transpose_codes,
             _ => false,
         };
         // For now, each partition's metadata is just the quantizer,
@@ -1267,14 +1287,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))
                 .await?;
             if batch.num_rows() != chunk.len() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "batch.num_rows() != chunk.len() ({} != {})",
-                        batch.num_rows(),
-                        chunk.len()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "batch.num_rows() != chunk.len() ({} != {})",
+                    batch.num_rows(),
+                    chunk.len()
+                )));
             }
             let batch = batch.try_with_column(
                 ROW_ID_FIELD.clone(),
@@ -1293,7 +1310,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before split partition",
-                location!(),
             ));
         };
 
@@ -1315,14 +1331,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let vectors = batch
             .column_by_qualified_name(&self.column)
-            .ok_or(Error::invalid_input(
-                format!(
-                    "vector column {} not found in batch {}",
-                    self.column,
-                    batch.schema()
-                ),
-                location!(),
-            ))?
+            .ok_or(Error::invalid_input(format!(
+                "vector column {} not found in batch {}",
+                self.column,
+                batch.schema()
+            )))?
             .as_fixed_size_list()
             .clone();
         Ok(Some((row_ids, vectors)))
@@ -1402,13 +1415,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 self.split_partition_impl::<UInt8Type>(part_idx, ivf, &row_ids, &vectors)
                     .await
             }
-            dt => Err(Error::invalid_input(
-                format!(
-                    "vectors must be float16, float32, float64 or uint8, but got {:?}",
-                    dt
-                ),
-                location!(),
-            )),
+            dt => Err(Error::invalid_input(format!(
+                "vectors must be float16, float32, float64 or uint8, but got {:?}",
+                dt
+            ))),
         }
     }
 
@@ -1445,10 +1455,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             256,
         )?;
         // the original centroid
-        let c0 = ivf.centroid(part_idx).ok_or(Error::invalid_input(
-            "original centroid not found",
-            location!(),
-        ))?;
+        let c0 = ivf
+            .centroid(part_idx)
+            .ok_or(Error::invalid_input("original centroid not found"))?;
         // the 2 new centroids
         let c1 = kmeans.centroids.slice(0, dimension);
         let c2 = kmeans.centroids.slice(dimension, dimension);
@@ -1632,13 +1641,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 )
                 .await
             }
-            dt => Err(Error::invalid_input(
-                format!(
-                    "vectors must be float16, float32, float64 or uint8, but got {:?}",
-                    dt
-                ),
-                location!(),
-            )),
+            dt => Err(Error::invalid_input(format!(
+                "vectors must be float16, float32, float64 or uint8, but got {:?}",
+                dt
+            ))),
         }
     }
 
@@ -1657,10 +1663,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         assert_eq!(row_ids.len(), vectors.len());
 
         // the original centroid
-        let c0 = ivf.centroid(part_idx).ok_or(Error::invalid_input(
-            "original centroid not found",
-            location!(),
-        ))?;
+        let c0 = ivf
+            .centroid(part_idx)
+            .ok_or(Error::invalid_input("original centroid not found"))?;
 
         // get top REASSIGN_RANGE centroids from c0
         let (reassign_part_ids, reassign_part_centroids) =
@@ -1708,13 +1713,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before building assign batch",
-                location!(),
             ));
         };
         let Some(quantizer) = self.quantizer.clone() else {
             return Err(Error::invalid_input(
                 "quantizer not set before building assign batch",
-                location!(),
             ));
         };
 
@@ -1731,7 +1734,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         else {
             return Err(Error::invalid_input(
                 "vector field not found in dataset schema",
-                location!(),
             ));
         };
 

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{builder::LargeBinaryBuilder, builder::StringBuilder, ArrayRef, StructArray};
+use arrow_array::{ArrayRef, StructArray, builder::LargeBinaryBuilder, builder::StringBuilder};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
@@ -76,10 +76,7 @@ impl BlobArrayBuilder {
         self.ensure_capacity()?;
         let uri = uri.into();
         if uri.is_empty() {
-            return Err(Error::invalid_input(
-                "URI cannot be empty",
-                snafu::location!(),
-            ));
+            return Err(Error::invalid_input("URI cannot be empty"));
         }
         self.validity.append_non_null();
         self.data_builder.append_null();
@@ -111,13 +108,10 @@ impl BlobArrayBuilder {
     /// Finish building and return an Arrow struct array.
     pub fn finish(mut self) -> Result<ArrayRef> {
         if self.len != self.expected_len {
-            return Err(Error::invalid_input(
-                format!(
-                    "Expected {} rows but received {}",
-                    self.expected_len, self.len
-                ),
-                snafu::location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Expected {} rows but received {}",
+                self.expected_len, self.len
+            )));
         }
 
         let data = Arc::new(self.data_builder.finish());
@@ -139,10 +133,7 @@ impl BlobArrayBuilder {
 
     fn ensure_capacity(&self) -> Result<()> {
         if self.len >= self.expected_len {
-            Err(Error::invalid_input(
-                "BlobArrayBuilder capacity exceeded",
-                snafu::location!(),
-            ))
+            Err(Error::invalid_input("BlobArrayBuilder capacity exceeded"))
         } else {
             Ok(())
         }
@@ -152,8 +143,8 @@ impl BlobArrayBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::cast::AsArray;
     use arrow_array::Array;
+    use arrow_array::cast::AsArray;
 
     #[test]
     fn test_field_metadata() {

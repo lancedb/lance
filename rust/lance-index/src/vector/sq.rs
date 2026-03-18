@@ -15,11 +15,10 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use num_traits::*;
-use snafu::location;
-use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
+use storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata, ScalarQuantizationStorage};
 
-use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
 use super::SQ_CODE_COLUMN;
+use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
 
 pub mod builder;
 pub mod storage;
@@ -72,13 +71,10 @@ impl ScalarQuantizer {
             .values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a float vector array, got: {:?}",
-                    vectors.value_type()
-                ),
-                location: location!(),
-            })?
+            .ok_or(Error::index(format!(
+                "Expect to be a float vector array, got: {:?}",
+                vectors.value_type()
+            )))?
             .as_slice();
 
         self.metadata.bounds = data.iter().fold(self.metadata.bounds.clone(), |f, v| {
@@ -91,25 +87,19 @@ impl ScalarQuantizer {
     pub fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
-                    data.data_type()
-                ),
-                location: location!(),
-            })?
+            .ok_or(Error::index(format!(
+                "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
+                data.data_type()
+            )))?
             .clone();
         let data = fsl
             .values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a float vector array, got: {:?}",
-                    fsl.value_type()
-                ),
-                location: location!(),
-            })?
+            .ok_or(Error::index(format!(
+                "Expect to be a float vector array, got: {:?}",
+                fsl.value_type()
+            )))?
             .as_slice();
 
         // TODO: support SQ4
@@ -136,10 +126,7 @@ impl TryFrom<Quantizer> for ScalarQuantizer {
     fn try_from(value: Quantizer) -> Result<Self> {
         match value {
             Quantizer::Scalar(sq) => Ok(sq),
-            _ => Err(Error::Index {
-                message: "Expect to be a ScalarQuantizer".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::index("Expect to be a ScalarQuantizer".to_string())),
         }
     }
 }
@@ -150,13 +137,10 @@ impl Quantization for ScalarQuantizer {
     type Storage = ScalarQuantizationStorage;
 
     fn build(data: &dyn Array, _: DistanceType, params: &Self::BuildParams) -> Result<Self> {
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "SQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::index(format!(
+            "SQ builder: input is not a FixedSizeList: {}",
+            data.data_type()
+        )))?;
 
         let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
 
@@ -171,10 +155,10 @@ impl Quantization for ScalarQuantizer {
                 quantizer.update_bounds::<Float64Type>(fsl)?;
             }
             _ => {
-                return Err(Error::Index {
-                    message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
-                    location: location!(),
-                })
+                return Err(Error::index(format!(
+                    "SQ builder: unsupported data type: {}",
+                    fsl.value_type()
+                )));
             }
         }
 
@@ -182,13 +166,10 @@ impl Quantization for ScalarQuantizer {
     }
 
     fn retrain(&mut self, data: &dyn Array) -> Result<()> {
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "SQ retrain: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::index(format!(
+            "SQ retrain: input is not a FixedSizeList: {}",
+            data.data_type()
+        )))?;
 
         match fsl.value_type() {
             DataType::Float16 => {
@@ -201,10 +182,10 @@ impl Quantization for ScalarQuantizer {
                 self.update_bounds::<Float64Type>(fsl)?;
             }
             value_type => {
-                return Err(Error::invalid_input(
-                    format!("unsupported data type {} for scalar quantizer", value_type),
-                    location!(),
-                ))
+                return Err(Error::invalid_input(format!(
+                    "unsupported data type {} for scalar quantizer",
+                    value_type
+                )));
             }
         }
         Ok(())
@@ -223,10 +204,10 @@ impl Quantization for ScalarQuantizer {
             DataType::Float16 => self.transform::<Float16Type>(vectors),
             DataType::Float32 => self.transform::<Float32Type>(vectors),
             DataType::Float64 => self.transform::<Float64Type>(vectors),
-            value_type => Err(Error::invalid_input(
-                format!("unsupported data type {} for scalar quantizer", value_type),
-                location!(),
-            )),
+            value_type => Err(Error::invalid_input(format!(
+                "unsupported data type {} for scalar quantizer",
+                value_type
+            ))),
         }
     }
 

@@ -23,10 +23,9 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
-use snafu::location;
 
 use super::ProjectionRequest;
-use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
+use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 
 /// Convert a list of row offsets to a list of row addresses
 ///
@@ -215,13 +214,10 @@ async fn do_take_rows(
         let range = range_start..(range_end + 1);
 
         let fragment = builder.dataset.get_fragment(fragment_id).ok_or_else(|| {
-            Error::invalid_input(
-                format!(
-                    "rowaddr start: {} belongs to non-existent fragment: {}",
-                    start, fragment_id
-                ),
-                location!(),
-            )
+            Error::invalid_input(format!(
+                "rowaddr start: {} belongs to non-existent fragment: {}",
+                start, fragment_id
+            ))
         })?;
 
         let read_config = FragReadConfig::default()
@@ -260,13 +256,10 @@ async fn do_take_rows(
                 .dataset
                 .get_fragment(fragment_id as usize)
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "rowaddr {} belongs to non-existent fragment: {}",
-                            row_addrs[range.start], fragment_id
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "rowaddr {} belongs to non-existent fragment: {}",
+                        row_addrs[range.start], fragment_id
+                    ))
                 })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
@@ -337,10 +330,7 @@ async fn do_take_rows(
 
         let returned_row_addr = one_batch
             .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::Internal {
-                message: "_rowaddr column not found".into(),
-                location: location!(),
-            })?
+            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
             .as_primitive::<UInt64Type>()
             .values();
 
@@ -369,14 +359,11 @@ async fn do_take_rows(
     if builder.with_row_address || projection.must_add_row_offset {
         // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
-            return Err(Error::NotSupported  {
-            source: format!(
+            return Err(Error::not_supported_source(format!(
                 "Expected {} rows, got {}.  A take operation that includes row addresses must not target deleted rows.",
                 row_addrs.len(),
                 batch.num_rows()
-            ).into(),
-            location: location!(),
-            });
+            ).into()));
         }
 
         let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));
@@ -540,11 +527,10 @@ impl TakeBuilder {
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
             let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                let addresses = row_ids
+                row_ids
                     .iter()
                     .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                    .collect::<Vec<_>>();
-                addresses
+                    .collect::<Vec<_>>()
             } else {
                 row_ids.clone()
             };
@@ -600,7 +586,7 @@ mod test {
     use rstest::rstest;
     use std::collections::HashMap;
 
-    use crate::dataset::{scanner::test_dataset::TestVectorDataset, WriteParams};
+    use crate::dataset::{WriteParams, scanner::test_dataset::TestVectorDataset};
 
     use super::*;
 
@@ -781,12 +767,9 @@ mod test {
         let mut metadata = HashMap::new();
         metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "blob",
-            DataType::LargeBinary,
-            true,
-        )
-        .with_metadata(metadata)]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata),
+        ]));
 
         let batch = RecordBatch::try_new(
             schema.clone(),

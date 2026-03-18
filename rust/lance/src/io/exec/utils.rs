@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
@@ -27,12 +27,11 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
-use lance_core::{Result, ROW_ID};
+use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
-use snafu::location;
 
-use crate::index::prefilter::DatasetPreFilter;
 use crate::Dataset;
+use crate::index::prefilter::DatasetPreFilter;
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
@@ -78,10 +77,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         let mut allow_list = RowAddrTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
-                message: "input batch missing row id column even though it is in the schema for the stream".into(),
-                location: location!(),
-            })?;
+            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::internal("input batch missing row id column even though it is in the schema for the stream"))?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -102,19 +98,15 @@ impl FilterLoader for SelectionVectorToPrefilter {
             .0
             .try_next()
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: "Selection vector source for prefilter did not yield any batches".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal("Selection vector source for prefilter did not yield any batches")
             })
             .unwrap();
         RowAddrMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::Internal {
-                message: format!(
-                    "Expected selection vector input to yield binary arrays but got {}",
-                    batch["result"].data_type()
-                ),
-                location: location!(),
-            }
+            Error::internal(format!(
+                "Expected selection vector input to yield binary arrays but got {}",
+                batch["result"].data_type()
+            ))
         })?)
     }
 }
@@ -431,20 +423,20 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{types::UInt32Type, RecordBatchReader};
+    use arrow_array::{RecordBatchReader, types::UInt32Type};
     use arrow_schema::SortOptions;
     use datafusion::common::NullEquality;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
         physical_plan::{
-            joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter, ExecutionPlan,
+            ExecutionPlan, joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter,
         },
     };
     use futures::{StreamExt, TryStreamExt};
     use lance_core::utils::futures::Capacity;
     use lance_datafusion::exec::OneShotExec;
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
 
     use super::ReplayExec;
 

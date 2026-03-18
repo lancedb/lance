@@ -29,15 +29,15 @@ remapping after compaction.
 
 Lance indices are designed with the following design choices in mind:
 
-1. **Indexes are loaded on demand**: A dataset and be loaded and read without loading any indices.
+1. **Indices are loaded on demand**: A dataset can be loaded and read without loading any indices.
    Indices are only loaded when a query can benefit from them.
    This design minimizes memory usage and speeds up dataset opening time.
-2. **Indexes can be loaded progressively**: indexes are designed so that only the necessary parts
+2. **Indices can be loaded progressively**: indices are designed so that only the necessary parts
    are loaded into memory during query execution. For example, when querying a B-tree index,
    it loads a small page table to figure out which pages of the index to load for the given query,
    and then only loads those pages to perform the indexed search. This amortizes the cost of
    cold index queries, since each query only needs to load a small portion of the index.
-3. **Indexes can be coalesced to larger units than fragments.** Indexes are much smaller than
+3. **Indices can be coalesced to larger units than fragments.** Indices are much smaller than
    data files, so it is efficient to coalesce index segments to cover multiple fragments.
    This reduces the number of index files that need to be opened during query execution and
    then number of unique index data structures that need to be queried.

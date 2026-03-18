@@ -16,10 +16,9 @@ use crate::{
 };
 use arrow_array::{ArrayRef, StructArray};
 use arrow_schema::{DataType, Field, Fields};
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture, stream::FuturesUnordered};
 use lance_core::{Error, Result};
 use log::trace;
-use snafu::location;
 
 #[derive(Debug)]
 struct SchedulingJobWithStatus<'a> {
@@ -207,8 +206,7 @@ impl SchedulingJob for SimpleStructSchedulerJob<'_> {
             let child_scan = next_child.job.schedule_next(scoped.context, priority)?;
             trace!(
                 "Scheduled {} rows for child {}",
-                child_scan.rows_scheduled,
-                next_child.col_idx
+                child_scan.rows_scheduled, next_child.col_idx
             );
             next_child.rows_scheduled += child_scan.rows_scheduled;
             next_child.rows_remaining -= child_scan.rows_scheduled;
@@ -358,9 +356,7 @@ impl ChildState {
     async fn wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
         trace!(
             "Struct child {} waiting for more than {} rows to be loaded and {} are fully loaded already",
-            self.field_index,
-            loaded_need,
-            self.rows_loaded,
+            self.field_index, loaded_need, self.rows_loaded,
         );
         let mut fully_loaded = self.rows_popped;
         for (page_idx, next_decoder) in self.scheduled.iter_mut().enumerate() {
@@ -371,10 +367,7 @@ impl ChildState {
                 let need_for_page = (rows_in_page - 1).min(current_need);
                 trace!(
                     "Struct child {} page {} will wait until more than {} rows loaded from page with {} rows",
-                    self.field_index,
-                    page_idx,
-                    need_for_page,
-                    rows_in_page,
+                    self.field_index, page_idx, need_for_page, rows_in_page,
                 );
                 // We might only await part of a page.  This is important for things
                 // like the struct<struct<...>> case where we have one outer page, one
@@ -386,10 +379,7 @@ impl ChildState {
                 fully_loaded += now_loaded;
                 trace!(
                     "Struct child {} page {} await and now has {} loaded rows and we have {} fully loaded",
-                    self.field_index,
-                    page_idx,
-                    now_loaded,
-                    fully_loaded
+                    self.field_index, page_idx, now_loaded, fully_loaded
                 );
             } else {
                 fully_loaded += next_decoder.num_rows();
@@ -401,9 +391,7 @@ impl ChildState {
         self.rows_loaded = fully_loaded;
         trace!(
             "Struct child {} loaded {} new rows and now {} are loaded",
-            self.field_index,
-            fully_loaded,
-            self.rows_loaded
+            self.field_index, fully_loaded, self.rows_loaded
         );
         Ok(())
     }
@@ -413,8 +401,7 @@ impl ChildState {
 
         trace!(
             "Draining {} rows from struct page with {} rows already drained",
-            num_rows,
-            self.rows_drained
+            num_rows, self.rows_drained
         );
         let mut remaining = num_rows;
         let mut composite = CompositeDecodeTask {
@@ -531,7 +518,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
                 .push_back(child.decoder);
         } else {
             // This decoder is intended for one of our children
-            let intended = self.children[child_idx as usize].scheduled.back_mut().ok_or_else(|| Error::Internal { message: format!("Decoder scheduled for child at index {} but we don't have any child at that index yet", child_idx), location: location!() })?;
+            let intended = self.children[child_idx as usize].scheduled.back_mut().ok_or_else(|| Error::internal(format!("Decoder scheduled for child at index {} but we don't have any child at that index yet", child_idx)))?;
             intended.accept_child(child)?;
         }
         Ok(())
@@ -564,10 +551,11 @@ impl LogicalPageDecoder for SimpleStructDecoder {
 
     fn rows_drained(&self) -> u64 {
         // All children should have the same number of rows drained
-        debug_assert!(self
-            .children
-            .iter()
-            .all(|c| c.rows_drained == self.children[0].rows_drained));
+        debug_assert!(
+            self.children
+                .iter()
+                .all(|c| c.rows_drained == self.children[0].rows_drained)
+        );
         self.children[0].rows_drained
     }
 

@@ -6,11 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use either::Either;
-use futures::future::FutureExt;
 use futures::TryFutureExt;
+use futures::future::FutureExt;
 use lance_core::utils::backoff::SlotBackoff;
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::Dataset;
 
@@ -46,14 +45,11 @@ pub trait RetryExecutor: Clone {
 }
 
 fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
-    Error::TooMuchWriteContention {
-        message: format!(
-            "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
-            attempts,
-            retry_timeout.as_secs_f32()
-        ),
-        location: location!(),
-    }
+    Error::too_much_write_contention(format!(
+        "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
+        attempts,
+        retry_timeout.as_secs_f32()
+    ))
 }
 
 fn maybe_timeout<T>(
@@ -127,8 +123,8 @@ pub async fn execute_with_retry<E: RetryExecutor>(
         }
     }
 
-    Err(Error::TooMuchWriteContention {
-        message: format!("Attempted {} retries.", config.max_retries),
-        location: location!(),
-    })
+    Err(Error::too_much_write_contention(format!(
+        "Attempted {} retries.",
+        config.max_retries
+    )))
 }

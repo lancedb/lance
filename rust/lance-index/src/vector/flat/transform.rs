@@ -5,7 +5,6 @@ use arrow_array::RecordBatch;
 use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
 use lance_core::Error;
-use snafu::location;
 use tracing::instrument;
 
 use crate::vector::transform::Transformer;
@@ -30,13 +29,10 @@ impl Transformer for FlatTransformer {
     fn transform(&self, batch: &RecordBatch) -> crate::Result<RecordBatch> {
         let input_arr = batch
             .column_by_name(&self.input_column)
-            .ok_or(Error::Index {
-                message: format!(
-                    "FlatTransform: column {} not found in batch",
-                    self.input_column
-                ),
-                location: location!(),
-            })?;
+            .ok_or(Error::index(format!(
+                "FlatTransform: column {} not found in batch",
+                self.input_column
+            )))?;
         let field = Field::new(
             FLAT_COLUMN,
             input_arr.data_type().clone(),

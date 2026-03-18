@@ -9,34 +9,33 @@ use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, StructArray, UInt32Array,
     builder::PrimitiveBuilder,
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StructArray, UInt32Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::concat::{self, concat_batches};
 use async_recursion::async_recursion;
 use deepsize::DeepSizeOf;
-use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
+use futures::{Future, FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::*;
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
-use lance_io::encodings::dictionary::DictionaryDecoder;
 use lance_io::encodings::AsyncIndex;
+use lance_io::encodings::dictionary::DictionaryDecoder;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::traits::Reader;
 use lance_io::utils::{
     read_fixed_stride_array, read_metadata_offset, read_struct, read_struct_from_buf,
 };
-use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use std::borrow::Cow;
 
 use object_store::path::Path;
-use snafu::location;
 use tracing::instrument;
 
 use crate::previous::format::metadata::Metadata;
@@ -339,15 +338,13 @@ impl FileReader {
         let batches = stream::iter(indices_in_batches)
             .map(|batch| async move {
                 if batch.batch_id >= num_batches as i32 {
-                    Err(Error::InvalidInput {
-                        source: format!("batch_id: {} out of bounds", batch.batch_id).into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        format!("batch_id: {} out of bounds", batch.batch_id).into(),
+                    ))
                 } else if *batch.offsets.last().expect("got empty batch") > num_rows {
-                    Err(Error::InvalidInput {
-                        source: format!("indices: {:?} out of bounds", batch.offsets).into(),
-                        location: location!(),
-                    })
+                    Err(Error::invalid_input_source(
+                        format!("indices: {:?} out of bounds", batch.offsets).into(),
+                    ))
                 } else {
                     self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
                         .await
@@ -367,12 +364,12 @@ impl FileReader {
         self.metadata.stats_metadata.as_ref().map(|meta| {
             let mut stats_field_ids = vec![];
             for stats_field in &meta.schema.fields {
-                if let Ok(stats_field_id) = stats_field.name.parse::<i32>() {
-                    if field_ids.contains(&stats_field_id) {
-                        stats_field_ids.push(stats_field.id);
-                        for child in &stats_field.children {
-                            stats_field_ids.push(child.id);
-                        }
+                if let Ok(stats_field_id) = stats_field.name.parse::<i32>()
+                    && field_ids.contains(&stats_field_id)
+                {
+                    stats_field_ids.push(stats_field.id);
+                    for child in &stats_field.children {
+                        stats_field_ids.push(child.id);
                     }
                 }
             }
@@ -469,7 +466,7 @@ pub async fn read_batch(
         let arrs = arrs.await?;
         Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
     } else {
-        Err(Error::invalid_input("no fields requested", location!()))
+        Err(Error::invalid_input("no fields requested"))
     }
 }
 
@@ -516,13 +513,10 @@ fn get_page_info<'a>(
     batch_id: i32,
 ) -> Result<&'a PageInfo> {
     page_table.get(field.id, batch_id).ok_or_else(|| {
-        Error::invalid_input(
-            format!(
-                "No page info found for field: {}, field_id={} batch={}",
-                field.name, field.id, batch_id
-            ),
-            location!(),
-        )
+        Error::invalid_input(format!(
+            "No page info found for field: {}, field_id={} batch={}",
+            field.name, field.id, batch_id
+        ))
     })
 }
 
@@ -560,13 +554,10 @@ fn read_null_array(
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
                 if idx_max >= page_info.length as u64 {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "NullArray Reader: request([{}]) out of range: [0..{}]",
-                            idx_max, page_info.length
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "NullArray Reader: request([{}]) out of range: [0..{}]",
+                        idx_max, page_info.length
+                    )));
                 }
                 indices.len()
             }
@@ -580,16 +571,13 @@ fn read_null_array(
                 _ => unreachable!(),
             };
             if idx_end > page_info.length {
-                return Err(Error::invalid_input(
-                    format!(
-                        "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
-                        // and wrap it in here.
-                        idx_start,
-                        idx_end,
-                        page_info.length
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
+                    // and wrap it in here.
+                    idx_start,
+                    idx_end,
+                    page_info.length
+                )));
             }
             idx_end - idx_start
         }
@@ -752,10 +740,9 @@ where
             positions.value(0).as_usize()..positions.value(range.end - range.start).as_usize(),
         ),
         ReadBatchParams::Ranges(_) => {
-            return Err(Error::Internal {
-                message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
-                location: location!(),
-            })
+            return Err(Error::internal(
+                "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
+            ));
         }
         ReadBatchParams::RangeTo(RangeTo { end }) => {
             ReadBatchParams::from(..positions.value(*end).as_usize())
@@ -791,11 +778,11 @@ mod tests {
     use super::*;
 
     use arrow_array::{
+        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
+        UInt8Array,
         builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
         types::UInt8Type,
-        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
-        UInt8Array,
     };
     use arrow_array::{BooleanArray, Int32Array};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};

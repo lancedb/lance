@@ -16,7 +16,6 @@ use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
 use crate::pb::Ivf as PbIvf;
 
@@ -149,15 +148,15 @@ impl IvfModel {
 
     pub async fn load(reader: &PreviousFileReader) -> Result<Self> {
         let schema = reader.schema();
-        let meta_str = schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {
-            message: format!("{} not found during search", IVF_METADATA_KEY),
-            location: location!(),
-        })?;
-        let ivf_metadata: IvfMetadata =
-            serde_json::from_str(meta_str).map_err(|e| Error::Index {
-                message: format!("Failed to parse IVF metadata: {}", e),
-                location: location!(),
-            })?;
+        let meta_str = schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .ok_or(Error::index(format!(
+                "{} not found during search",
+                IVF_METADATA_KEY
+            )))?;
+        let ivf_metadata: IvfMetadata = serde_json::from_str(meta_str)
+            .map_err(|e| Error::index(format!("Failed to parse IVF metadata: {}", e)))?;
 
         let pb: PbIvf = read_message(
             reader.object_reader.as_ref(),

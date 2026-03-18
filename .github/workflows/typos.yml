@@ -11,7 +11,7 @@ jobs:
     runs-on: "ubuntu-24.04"
     steps:
     - name: Checkout Actions Repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Check spelling of the entire repository
-      uses: crate-ci/typos@v1.26.0
+      uses: crate-ci/typos@6802cc60d4e7f78b9d5454f6cf3935c042d5e1e3 # v1.26.0

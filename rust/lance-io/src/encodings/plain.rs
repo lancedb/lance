@@ -11,16 +11,16 @@ use std::slice::from_raw_parts;
 use std::sync::Arc;
 
 use crate::{
-    traits::{Reader, Writer},
     ReadBatchParams,
+    traits::{Reader, Writer},
 };
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array, Array, ArrayRef,
-    BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt8Array,
+    UInt32Array, builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array,
 };
-use arrow_buffer::{bit_util, Buffer};
-use arrow_data::{layout, ArrayDataBuilder, BufferSpec};
+use arrow_buffer::{Buffer, bit_util};
+use arrow_data::{ArrayDataBuilder, BufferSpec, layout};
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
@@ -29,7 +29,6 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::{AsyncIndex, Decoder};
@@ -132,9 +131,11 @@ impl<'a> PlainEncoder<'a> {
             let list_array = array
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| Error::Schema {
-                    message: format!("Needed a FixedSizeListArray but got {}", array.data_type()),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::schema(format!(
+                        "Needed a FixedSizeListArray but got {}",
+                        array.data_type()
+                    ))
                 })?;
             let offset = list_array.value_offset(0) as usize;
             let length = list_array.len();
@@ -183,13 +184,10 @@ pub fn bytes_to_array(
     let layout = layout(data_type);
 
     if layout.buffers.len() != 1 {
-        return Err(Error::Internal {
-            message: format!(
-                "Can only convert datatypes that require one buffer, found {:?}",
-                data_type
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Can only convert datatypes that require one buffer, found {:?}",
+            data_type
+        )));
     }
 
     let buf: Buffer = if let BufferSpec::FixedWidth {
@@ -241,13 +239,10 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::invalid_input(
-                format!(
-                    "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
-                    start, end, self.length
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
+                start, end, self.length
+            )));
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
@@ -274,13 +269,10 @@ impl<'a> PlainDecoder<'a> {
         end: usize,
     ) -> Result<ArrayRef> {
         if !items.data_type().is_fixed_stride() {
-            return Err(Error::Schema {
-                message: format!(
-                    "Items for fixed size list should be primitives but found {}",
-                    items.data_type()
-                ),
-                location: location!(),
-            });
+            return Err(Error::schema(format!(
+                "Items for fixed size list should be primitives but found {}",
+                items.data_type()
+            )));
         };
         let item_decoder = PlainDecoder::new(
             self.reader,
@@ -317,9 +309,8 @@ impl<'a> PlainDecoder<'a> {
         let values = bytes_array
             .as_any()
             .downcast_ref::<UInt8Array>()
-            .ok_or_else(|| Error::Schema {
-                message: "Could not cast to UInt8Array for FixedSizeBinary".to_string(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::schema("Could not cast to UInt8Array for FixedSizeBinary".to_string())
             })?;
         Ok(Arc::new(FixedSizeBinaryArray::try_new_from_values(values, stride)?) as ArrayRef)
     }

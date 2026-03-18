@@ -10,16 +10,16 @@ use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, UInt32Array,
     builder::{ArrayBuilder, PrimitiveBuilder},
-    cast::as_primitive_array,
     cast::AsArray,
+    cast::as_primitive_array,
     new_empty_array,
     types::{
         BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, UInt32Type, Utf8Type,
     },
-    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, UInt32Array,
 };
-use arrow_buffer::{bit_util, ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
+use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer, bit_util};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -27,11 +27,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::BufferExt;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use super::ReadBatchParams;
-use super::{plain::PlainDecoder, AsyncIndex, Decoder, Encoder};
+use super::{AsyncIndex, Decoder, Encoder, plain::PlainDecoder};
 use crate::traits::{Reader, Writer};
 use lance_core::Result;
 
@@ -99,10 +98,10 @@ impl Encoder for BinaryEncoder<'_> {
             DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
-                return Err(lance_core::Error::invalid_input(
-                    format!("Unsupported data type for binary encoding: {}", data_type),
-                    location!(),
-                ));
+                return Err(lance_core::Error::invalid_input(format!(
+                    "Unsupported data type for binary encoding: {}",
+                    data_type
+                )));
             }
         }
     }
@@ -470,7 +469,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        types::GenericStringType, BinaryArray, GenericStringArray, LargeStringArray, StringArray,
+        BinaryArray, GenericStringArray, LargeStringArray, StringArray, types::GenericStringType,
     };
     use arrow_select::concat::concat;
     use lance_core::utils::tempfile::TempStdFile;

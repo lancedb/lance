@@ -13,7 +13,7 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/stale@v10
+      - uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10
         with:
           close-pr-message: "Thank you for your contribution. This PR has been inactive for a while, so we're closing it to free up bandwidth. Feel free to reopen it if you still find it useful."
           days-before-issue-stale: 360

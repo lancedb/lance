@@ -3,8 +3,6 @@
 
 use std::{collections::VecDeque, ops::Range};
 
-use snafu::location;
-
 use crate::decoder::{
     FilterExpression, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
 };
@@ -106,13 +104,10 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
     /// The default implementation does not expect children and returns
     /// an error.
     fn accept_child(&mut self, _child: DecoderReady) -> Result<()> {
-        Err(Error::Internal {
-            message: format!(
-                "The decoder {:?} does not expect children but received a child",
-                self
-            ),
-            location: location!(),
-        })
+        Err(Error::internal(format!(
+            "The decoder {:?} does not expect children but received a child",
+            self
+        )))
     }
     /// Waits until at least `num_rows` have been loaded
     fn wait_for_loaded(&'_ mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>>;

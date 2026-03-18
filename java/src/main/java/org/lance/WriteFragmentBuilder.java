@@ -196,10 +196,10 @@ public class WriteFragmentBuilder {
   /**
    * Set the data storage version.
    *
-   * @param version the data storage version
+   * @param version the data storage version (e.g., "legacy", "stable", "2.0")
    * @return this builder
    */
-  public WriteFragmentBuilder dataStorageVersion(WriteParams.LanceFileVersion version) {
+  public WriteFragmentBuilder dataStorageVersion(String version) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withDataStorageVersion(version);
     return this;

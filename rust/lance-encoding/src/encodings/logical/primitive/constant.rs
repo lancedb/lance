@@ -3,27 +3,26 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{new_empty_array, Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, new_empty_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use futures::FutureExt;
-use snafu::location;
+use futures::future::BoxFuture;
 
 use lance_core::{
-    cache::{Context, DeepSizeOf},
     Error, Result,
+    cache::{Context, DeepSizeOf},
 };
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     decoder::PageEncoding,
     encoder::EncodedPage,
     encodings::logical::primitive::{CachedPageData, PageLoadTask},
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefUnraveler},
-    EncodingsIo,
 };
 
 pub(crate) fn encode_constant_page(
@@ -136,46 +135,37 @@ impl ConstantPageScheduler {
                 (None, 1) => (ScalarSource::ValueBuffer(0), None, None),
                 (None, 3) => (ScalarSource::ValueBuffer(0), Some(1), Some(2)),
                 (Some(_inline), 1) => {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Invalid constant layout: inline_value present with {} buffers",
-                            1
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Invalid constant layout: inline_value present with {} buffers",
+                        1
+                    )));
                 }
                 (Some(_inline), 3) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: inline_value present with 3 buffers",
-                        location!(),
                     ));
                 }
                 (None, 0) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: missing scalar source",
-                        location!(),
-                    ))
+                    ));
                 }
                 (None, 2) => {
                     return Err(Error::invalid_input(
                         "Invalid constant layout: ambiguous (2 buffers and no inline_value)",
-                        location!(),
-                    ))
+                    ));
                 }
                 (Some(_), n) => {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Invalid constant layout: inline_value present with {} buffers",
-                            n
-                        ),
-                        location!(),
-                    ))
+                    return Err(Error::invalid_input(format!(
+                        "Invalid constant layout: inline_value present with {} buffers",
+                        n
+                    )));
                 }
                 (None, n) => {
-                    return Err(Error::invalid_input(
-                        format!("Invalid constant layout: unexpected buffer count {}", n),
-                        location!(),
-                    ))
+                    return Err(Error::invalid_input(format!(
+                        "Invalid constant layout: unexpected buffer count {}",
+                        n
+                    )));
                 }
             };
 
@@ -233,7 +223,6 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
             let ScalarSource::Inline(inline) = &self.scalar_source else {
                 return std::future::ready(Err(Error::invalid_input(
                     "Invalid constant layout: missing scalar source",
-                    location!(),
                 )))
                 .boxed();
             };
@@ -362,16 +351,14 @@ impl ConstantPageDecoder {
         let start = self.cursor_level;
         let end = if let Some(rep) = &self.rep {
             if start >= rep.len() {
-                return Err(Error::Internal {
-                    message: "Invalid constant layout: repetition buffer too short".into(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Invalid constant layout: repetition buffer too short",
+                ));
             }
             if rep[start] != self.max_rep {
-                return Err(Error::Internal {
-                    message: "Invalid constant layout: row did not start at max_rep".into(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Invalid constant layout: row did not start at max_rep",
+                ));
             }
             let mut end = start + 1;
             while end < rep.len() && rep[end] != self.max_rep {
@@ -416,11 +403,11 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
             for _ in range.start..range.end {
                 let (level_range, visible) = self.take_row()?;
                 visible_items_total += visible;
-                if let Some(last) = level_slices.last_mut() {
-                    if last.end == level_range.start {
-                        last.end = level_range.end;
-                        continue;
-                    }
+                if let Some(last) = level_slices.last_mut()
+                    && last.end == level_range.start
+                {
+                    last.end = level_range.end;
+                    continue;
                 }
                 level_slices.push(level_range);
             }
@@ -473,13 +460,13 @@ impl DecodeConstantTask {
             return Ok(new_empty_array(self.scalar.data_type()));
         }
 
-        if let DataType::Struct(fields) = self.scalar.data_type() {
-            if fields.is_empty() {
-                return Ok(Arc::new(arrow_array::StructArray::new_empty_fields(
-                    num_values as usize,
-                    None,
-                )) as ArrayRef);
-            }
+        if let DataType::Struct(fields) = self.scalar.data_type()
+            && fields.is_empty()
+        {
+            return Ok(Arc::new(arrow_array::StructArray::new_empty_fields(
+                num_values as usize,
+                None,
+            )) as ArrayRef);
         }
 
         let indices = arrow_array::UInt64Array::from(vec![0u64; num_values as usize]);

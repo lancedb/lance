@@ -13,7 +13,6 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
-use crate::error::ToSnafuLocation;
 use crate::{Error, Result};
 
 use super::address::RowAddress;
@@ -327,11 +326,7 @@ impl RowAddrSelection {
                 .union(),
         );
 
-        if is_full {
-            Self::Full
-        } else {
-            res
-        }
+        if is_full { Self::Full } else { res }
     }
 }
 
@@ -418,12 +413,9 @@ impl RowSetOps for RowAddrTreeMap {
                 .peeking_take_while(|row_id| (row_id >> 32) as u32 == fragment_id)
                 .map(|row_id| row_id as u32);
             let Ok(bitmap) = RoaringBitmap::from_sorted_iter(next_bitmap_iter) else {
-                return Err(Error::Internal {
-                    message: "RowAddrTreeMap::from_sorted_iter called with non-sorted input"
-                        .to_string(),
-                    // Use the caller location since we aren't the one that got it out of order
-                    location: std::panic::Location::caller().to_snafu_location(),
-                });
+                return Err(Error::internal(
+                    "RowAddrTreeMap::from_sorted_iter called with non-sorted input",
+                ));
             };
             inner.insert(fragment_id, RowAddrSelection::Partial(bitmap));
         }
@@ -1034,15 +1026,12 @@ impl RowSetOps for RowIdSet {
         let mut inner = RoaringTreemap::new();
         let mut last: Option<u64> = None;
         for value in iter {
-            if let Some(prev) = last {
-                if value < prev {
-                    return Err(Error::Internal {
-                        message: "RowIdSet::from_sorted_iter called with non-sorted input"
-                            .to_string(),
-                        // Use the caller location since we aren't the one that got it out of order
-                        location: std::panic::Location::caller().to_snafu_location(),
-                    });
-                }
+            if let Some(prev) = last
+                && value < prev
+            {
+                return Err(Error::internal(
+                    "RowIdSet::from_sorted_iter called with non-sorted input",
+                ));
             }
             inner.insert(value);
             last = Some(value);

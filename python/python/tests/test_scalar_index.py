@@ -849,7 +849,12 @@ def test_fts_ngram_tokenizer(tmp_path):
 
 def test_fts_stats(dataset):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
+        "doc",
+        index_type="INVERTED",
+        with_position=False,
+        remove_stop_words=True,
+        memory_limit=4096,
+        num_workers=2,
     )
     stats = dataset.stats.index_stats("doc_idx")
     assert stats["index_type"] == "Inverted"
@@ -864,6 +869,8 @@ def test_fts_stats(dataset):
     assert params["stem"] is True
     assert params["remove_stop_words"] is True
     assert params["ascii_folding"] is True
+    assert "memory_limit" not in params
+    assert "num_workers" not in params
 
 
 def test_fts_score(tmp_path):
@@ -1270,6 +1277,23 @@ def test_fts_deleted_rows(tmp_path):
     ds.delete("text = 'lance is cool'")
     results = ds.to_table(full_text_query="cool")
     assert results.num_rows == 2
+
+
+def test_fts_deleted_rows_with_stable_row_ids(tmp_path):
+    # Regression test: stable-row-id prefiltering must not leak deleted rows.
+    data = pa.table(
+        {
+            "text": [f"dup_{i}" for i in range(200)],
+            "category": [["A", "B", "C", "D", "E"][i % 5] for i in range(200)],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, enable_stable_row_ids=True)
+    ds.create_scalar_index("text", "INVERTED")
+
+    assert ds.to_table(full_text_query="dup", prefilter=True).num_rows == 200
+
+    ds.delete("category = 'A'")
+    assert ds.to_table(full_text_query="dup", prefilter=True).num_rows == 160
 
 
 def test_index_after_merge_insert(tmp_path):
@@ -4461,8 +4485,8 @@ def test_vector_filter_fts_search(tmp_path):
         nearest=vector_query,
         filter=PhraseQuery("text", "text"),
     )
-    result = scanner.to_table()
-    assert [299, 300] == result["id"].to_pylist()
+    with pytest.raises(ValueError):
+        scanner.to_table()
 
     # Case 6: search with prefilter=false, search_filter=phrase("text")
     scanner = ds.scanner(
@@ -4473,5 +4497,5 @@ def test_vector_filter_fts_search(tmp_path):
             "search_filter": PhraseQuery("text", "text"),
         },
     )
-    result = scanner.to_table()
-    assert [300] == result["id"].to_pylist()
+    with pytest.raises(ValueError):
+        scanner.to_table()

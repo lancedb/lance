@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use lance::{
+    Dataset,
     dataset::{WriteMode, WriteParams},
     index::vector::VectorIndexParams,
-    Dataset,
 };
 use lance_arrow::*;
 use lance_index::{DatasetIndexExt, IndexType};
