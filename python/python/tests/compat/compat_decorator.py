@@ -329,7 +329,9 @@ def test_func({sig_params}):
     obj = cls(tmp_path / "data.lance", {init_params})
     obj.compat_version = version
     if obj.skip_downgrade(version):
-        pytest.skip("downgrade compatibility is intentionally unsupported for this test")
+        pytest.skip(
+            "downgrade compatibility is intentionally unsupported for this test"
+        )
     # Current version: create data
     with _temporary_env(obj.current_env("create")):
         obj.create()
