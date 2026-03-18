@@ -2175,6 +2175,7 @@ mod tests {
             index_version: 0,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            files: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -2674,6 +2675,7 @@ mod tests {
             index_version: 0,
             created_at: None,
             base_id: None,
+            files: None,
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2739,6 +2741,7 @@ mod tests {
                         index_version: 0,
                         created_at: None,
                         base_id: None,
+                        files: None,
                     }],
                     removed_indices: vec![],
                 },

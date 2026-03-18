@@ -114,6 +114,12 @@ pub trait IndexDescription: Send + Sync {
     /// plugin.  As a result, this method may fail if there is no plugin
     /// available for the index.
     fn details(&self) -> Result<String>;
+
+    /// Returns the total size in bytes of all files across all segments.
+    ///
+    /// Returns `None` if file size information is not available for any segment
+    /// (for backward compatibility with indices created before file tracking was added).
+    fn total_size_bytes(&self) -> Option<u64>;
 }
 
 // Extends Lance Dataset with secondary index.

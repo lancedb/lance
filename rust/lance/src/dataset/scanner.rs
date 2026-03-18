@@ -2724,9 +2724,15 @@ impl Scanner {
             }
         }?;
 
+        let mut filtered_read_options = FilteredReadOptions::new(projection);
+        if let Some(fragment) = self.fragments.as_ref() {
+            filtered_read_options =
+                filtered_read_options.with_fragments(Arc::new(fragment.clone()));
+        }
+
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
-            FilteredReadOptions::new(projection),
+            filtered_read_options,
             Some(input),
         )?))
     }

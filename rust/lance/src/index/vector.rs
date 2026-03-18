@@ -52,7 +52,7 @@ use lance_index::{
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use serde::Serialize;
 use tracing::instrument;
 use utils::get_vector_type;
@@ -1574,6 +1574,10 @@ pub async fn initialize_vector_index(
     )
     .await?;
 
+    // Capture file sizes for the new vector index
+    let index_dir = target_dataset.indices_dir().child(new_uuid.to_string());
+    let files = list_index_files_with_sizes(&target_dataset.object_store, &index_dir).await?;
+
     let field = target_dataset.schema().field(column_name).ok_or_else(|| {
         Error::index(format!(
             "Column '{}' not found in target dataset",
@@ -1593,6 +1597,7 @@ pub async fn initialize_vector_index(
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        files: Some(files),
     };
 
     let transaction = Transaction::new(

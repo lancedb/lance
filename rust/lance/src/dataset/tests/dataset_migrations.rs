@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::vec;
 
+use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
@@ -374,6 +375,107 @@ async fn test_max_fragment_id_migration() {
         assert_eq!(dataset.manifest.max_fragment_id, None);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
     }
+}
+
+#[tokio::test]
+async fn test_index_without_file_sizes() {
+    // Test that we can open indices created before the `files` field was added
+    // to IndexMetadata. The index should still work correctly, falling back to
+    // HEAD calls for file sizes.
+
+    let test_dir = copy_test_data_to_tmp("pre_file_sizes/index_without_file_sizes").unwrap();
+    let test_uri = test_dir.path_str();
+
+    // Open the dataset
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+
+    // Verify the index exists and has no file size info
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    let index = &indices[0];
+    assert_eq!(index.name, "values_idx");
+    assert!(
+        index.files.is_none() || index.files.as_ref().unwrap().is_empty(),
+        "Index should not have file size info (created with old version)"
+    );
+
+    // Verify the index still works - scan with a filter that uses the index
+    let batch = dataset
+        .scan()
+        .filter("values = 'value_42'")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+
+    // Verify describe_indices returns None for total_size_bytes for old indices
+    let descriptions = dataset.describe_indices(None).await.unwrap();
+    assert_eq!(descriptions.len(), 1);
+    assert!(
+        descriptions[0].total_size_bytes().is_none(),
+        "Old index without file sizes should return None for total_size_bytes"
+    );
+}
+
+#[tokio::test]
+async fn test_index_file_size_migration() {
+    // Test that file sizes are migrated when a write operation is performed
+    // on a dataset with an index missing file sizes.
+
+    let test_dir = copy_test_data_to_tmp("pre_file_sizes/index_without_file_sizes").unwrap();
+    let test_uri = test_dir.path_str();
+
+    // Open the dataset and verify the index has no file sizes
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert!(
+        indices[0].files.is_none() || indices[0].files.as_ref().unwrap().is_empty(),
+        "Index should not have file size info before migration"
+    );
+
+    // Perform a write operation (append) to trigger migration
+    let batch = arrow_array::record_batch!(
+        ("id", Int64, [100, 101]),
+        ("values", Utf8, ["value_100", "value_101"])
+    )
+    .unwrap();
+    let dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+
+    // Verify the index now has file sizes after migration
+    let indices = dataset.load_indices().await.unwrap();
+    let index = &indices[0];
+    assert!(
+        index.files.is_some() && !index.files.as_ref().unwrap().is_empty(),
+        "Index should have file size info after migration"
+    );
+
+    // Verify each file has a positive size
+    for file in index.files.as_ref().unwrap() {
+        assert!(
+            file.size_bytes > 0,
+            "File {} should have positive size after migration",
+            file.path
+        );
+    }
+
+    // Verify describe_indices now returns total_size_bytes
+    let descriptions = dataset.describe_indices(None).await.unwrap();
+    assert!(
+        descriptions[0].total_size_bytes().is_some(),
+        "Index should have total_size_bytes after migration"
+    );
+    assert!(
+        descriptions[0].total_size_bytes().unwrap() > 0,
+        "Total size should be positive after migration"
+    );
 }
 
 /// Regression test for issue #5702: project_by_schema should reorder fields inside List<Struct>.

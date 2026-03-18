@@ -27,7 +27,8 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
+        RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
@@ -1137,6 +1138,9 @@ pub struct RewrittenIndex {
     pub new_id: Uuid,
     pub new_index_details: prost_types::Any,
     pub new_index_version: u32,
+    /// Files in the new index with their sizes.
+    /// Empty list from older writers that didn't persist this field.
+    pub new_index_files: Option<Vec<IndexFile>>,
 }
 
 impl DeepSizeOf for RewrittenIndex {
@@ -2516,6 +2520,10 @@ impl Transaction {
                 groups,
             )?);
             index.uuid = rewritten_index.new_id;
+            // Update file sizes to match the new index files. When not available
+            // (e.g., from older writers), clear the old file sizes to avoid
+            // using stale sizes from the pre-remap index.
+            index.files = rewritten_index.new_index_files.clone();
         }
         Ok(())
     }
@@ -3031,6 +3039,20 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 })?
                 .clone(),
             new_index_version: message.new_index_version,
+            new_index_files: if message.new_index_files.is_empty() {
+                None
+            } else {
+                Some(
+                    message
+                        .new_index_files
+                        .iter()
+                        .map(|f| IndexFile {
+                            path: f.path.clone(),
+                            size_bytes: f.size_bytes,
+                        })
+                        .collect(),
+                )
+            },
         })
     }
 }
@@ -3264,6 +3286,19 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
             new_id: Some((&value.new_id).into()),
             new_index_details: Some(value.new_index_details.clone()),
             new_index_version: value.new_index_version,
+            new_index_files: value
+                .new_index_files
+                .as_ref()
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|f| pb::IndexFile {
+                            path: f.path.clone(),
+                            size_bytes: f.size_bytes,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -3473,6 +3508,7 @@ mod tests {
             index_version: 1,
             created_at: Some(Utc::now()),
             base_id: None,
+            files: None,
         }
     }
 
@@ -3979,6 +4015,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -4000,6 +4037,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -4411,6 +4449,7 @@ mod tests {
                 value: vec![],
             },
             new_index_version: 1,
+            new_index_files: None,
         }];
 
         // Should succeed (skip missing index) instead of error

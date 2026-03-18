@@ -57,6 +57,7 @@ class IndexSegmentDescription:
     fragment_ids: set[int]
     index_version: int
     created_at: Optional[datetime]
+    size_bytes: Optional[int]
 
     def __repr__(self) -> str: ...
 
@@ -69,5 +70,6 @@ class IndexDescription:
     field_names: list[str]
     segments: list[IndexSegmentDescription]
     details: dict
+    total_size_bytes: Optional[int]
 
     def __repr__(self) -> str: ...

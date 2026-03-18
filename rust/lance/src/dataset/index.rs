@@ -105,6 +105,7 @@ impl IndexRemapper for DatasetIndexRemapper {
                             new_id: id,
                             index_details,
                             index_version: index.index_version as u32,
+                            files: index.files.clone(),
                         });
                     }
                     RemapResult::Remapped(remapped_index) => {
@@ -162,11 +163,12 @@ impl LanceIndexStoreExt for LanceIndexStore {
             .child(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
-        Ok(Self::with_format_version(
+        let store = Self::with_format_version(
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
             format_version,
-        ))
+        );
+        Ok(store.with_file_sizes(index.file_size_map()))
     }
 }
