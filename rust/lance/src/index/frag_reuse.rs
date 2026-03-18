@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use crate::Dataset;
+use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use lance_core::Error;
-use lance_index::frag_reuse::{
-    FragReuseGroup, FragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
-    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME,
-};
 use lance_index::DatasetIndexExt;
+use lance_index::frag_reuse::{
+    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
+    FragReuseIndexDetails, FragReuseVersion,
+};
+use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
-use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
-use snafu::location;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -34,18 +33,14 @@ pub async fn load_frag_reuse_index_details(
             .type_url
             .ends_with("FragmentReuseIndexDetails")
     {
-        return Err(Error::Index {
-            message: "Index details is not for the fragment reuse index".into(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Index details is not for the fragment reuse index",
+        ));
     }
 
     let proto = details_any.unwrap().to_msg::<FragmentReuseIndexDetails>()?;
     match &proto.content {
-        None => Err(Error::Index {
-            message: "Index details content is not found".into(),
-            location: location!(),
-        }),
+        None => Err(Error::index("Index details content is not found")),
         Some(Content::Inline(content)) => {
             Ok(Arc::new(FragReuseIndexDetails::try_from(content.clone())?))
         }
@@ -118,7 +113,7 @@ pub(crate) async fn build_new_frag_reuse_index(
         None => FragReuseIndexDetails {
             versions: Vec::from([new_version]),
         },
-        Some(ref index_meta) => {
+        Some(index_meta) => {
             let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
             let mut versions = current_details.versions.clone();
             versions.push(new_version);

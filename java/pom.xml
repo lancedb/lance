@@ -4,14 +4,14 @@
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.lancedb</groupId>
+    <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>1.0.0-beta.7</version>
+    <version>4.0.0-beta.12</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
-    <url>http://lancedb.com/</url>
+    <url>https://lance.org/</url>
 
     <developers>
         <developer>
@@ -28,11 +28,11 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <arrow.version>15.0.0</arrow.version>
+        <arrow.version>18.3.0</arrow.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
-        <spotless.version>2.30.0</spotless.version>
-        <spotless.java.googlejavaformat.version>1.7</spotless.java.googlejavaformat.version>
+        <spotless.version>2.43.0</spotless.version>
+        <spotless.java.googlejavaformat.version>1.22.0</spotless.java.googlejavaformat.version>
         <scala.version>2.12.19</scala.version>
         <scala.binary.version>2.12</scala.binary.version>
         <!-- Please also update .scalafmt.conf when you change it here -->
@@ -40,7 +40,7 @@
         <spotless.delimiter>package</spotless.delimiter>
         <rust.release.build>false</rust.release.build>
         <skip.build.jni>false</skip.build.jni>
-        <shade.base>com.lancedb.lance.shaded</shade.base>
+        <shade.base>org.lance.shaded</shade.base>
         <spotless.license.header>
         /*
         * Licensed under the Apache License, Version 2.0 (the "License");
@@ -94,6 +94,7 @@
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>5.10.1</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.apache.commons</groupId>
@@ -106,9 +107,14 @@
             <version>33.3.1-jre</version>
         </dependency>
         <dependency>
-            <groupId>com.lancedb</groupId>
+            <groupId>org.lance</groupId>
             <artifactId>lance-namespace-core</artifactId>
-            <version>0.0.20</version>
+            <version>0.5.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-namespace-apache-client</artifactId>
+            <version>0.5.2</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
@@ -268,6 +274,19 @@
                 <groupId>com.diffplug.spotless</groupId>
                 <artifactId>spotless-maven-plugin</artifactId>
             </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>license-maven-plugin</artifactId>
+                <version>2.4.0</version>
+                <configuration>
+                    <outputDirectory>${project.basedir}</outputDirectory>
+                    <thirdPartyFilename>JAVA_THIRD_PARTY_LICENSES.md</thirdPartyFilename>
+                    <fileTemplate>/org/codehaus/mojo/license/third-party-file-groupByLicense.ftl</fileTemplate>
+                    <includedScopes>compile,runtime</includedScopes>
+                    <excludedScopes>test,provided</excludedScopes>
+                    <sortArtifactByName>true</sortArtifactByName>
+                </configuration>
+            </plugin>
         </plugins>
         <pluginManagement>
             <plugins>
@@ -317,7 +336,7 @@
                             </googleJavaFormat>
 
                             <importOrder>
-                                <order>com.lancedb.lance,,javax,java,\#</order>
+                                <order>org.lance,,javax,java,\#</order>
                             </importOrder>
 
                             <removeUnusedImports />
@@ -414,8 +433,8 @@
                 <jdk>[11,)</jdk>
             </activation>
             <properties>
-                <!-- Ping release target to JDK8 to link only against Java 8 APIs -->
-                <maven.compiler.release>8</maven.compiler.release>
+                <!-- Ping release target to JDK11 to link only against Java 11 APIs -->
+                <maven.compiler.release>11</maven.compiler.release>
             </properties>
             <build>
                 <plugins>

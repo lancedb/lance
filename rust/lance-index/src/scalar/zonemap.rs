@@ -12,6 +12,7 @@
 //! false positives that require rechecking.
 //!
 //!
+use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -20,17 +21,13 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
 };
-use crate::Any;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
-use futures::TryStreamExt;
 use lance_core::cache::{LanceCache, WeakLanceCache};
-use lance_core::ROW_ADDR;
-use lance_datafusion::chunker::chunk_concat_stream;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array};
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -42,29 +39,17 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::Error;
 use lance_core::Result;
-use lance_core::{utils::address::RowAddress, utils::mask::RowIdTreeMap, Error};
 use roaring::RoaringBitmap;
-use snafu::location;
+
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
-//
-// Example: Suppose we have two fragments, each with 4 rows.
-// Fragment 0: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 0
-// The row addresses for fragment 0 are: 0, 1, 2, 3
-// Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 1, 2, 3 in fragment 1
-// The row addresses for fragment 1 are: 32>>1, 32>>1 + 1, 32>>1 + 2, 32>>1 + 3
-//
-// Deletion is 0 index based. We delete the 0th and 1st row in fragment 0,
-// and the 1st and 2nd row in fragment 1,
-// Fragment 0: zone_start = 2, zone_length = 2 // covers rows 2, 3 in fragment 0
-// The row addresses for fragment 0 are: 2, 3
-// Fragment 1: zone_start = 0, zone_length = 4  // covers rows 0, 3 in fragment 1
-// The row addresses for fragment 1 are: 32>>1, 32>>1 + 3
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
 struct ZoneMapStatistics {
@@ -73,14 +58,9 @@ struct ZoneMapStatistics {
     null_count: u32,
     // only apply to float type
     nan_count: u32,
-    fragment_id: u64,
-    // zone_start is start row of the zone in the fragment, also known
-    // as the local offset. To get the actual first row address,
-    // you can do `fragment_id << 32 + zone_start`
-    zone_start: u64,
-    // zone_length is the `row offset span` between the first and the last row in the zone
-    // calculated as: (last_row_offset - first_row_offset + 1)
-    zone_length: usize,
+    // Bound of this zone within the fragment. Persisted as three separate columns
+    // (fragment_id, zone_start, zone_length) in the index file.
+    bound: ZoneBound,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -90,6 +70,12 @@ impl DeepSizeOf for ZoneMapStatistics {
         let max_size = self.max.size() - std::mem::size_of::<ScalarValue>();
 
         min_size + max_size
+    }
+}
+
+impl AsRef<ZoneBound> for ZoneMapStatistics {
+    fn as_ref(&self) -> &ZoneBound {
+        &self.bound
     }
 }
 
@@ -336,10 +322,9 @@ impl ZoneMapIndex {
                     }
                 }))
             }
-            SargableQuery::FullTextSearch(_) => Err(Error::NotSupported {
-                source: "full text search is not supported for zonemap indexes".into(),
-                location: location!(),
-            }),
+            SargableQuery::FullTextSearch(_) => Err(Error::not_supported_source(
+                "full text search is not supported for zonemap indexes".into(),
+            )),
         }
     }
 
@@ -380,78 +365,53 @@ impl ZoneMapIndex {
         rows_per_zone: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
-        let min_col = data.column_by_name("min").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'min' column", location!())
-        })?;
-        let max_col = data.column_by_name("max").ok_or_else(|| {
-            Error::invalid_input("ZoneMapIndex: missing 'max' column", location!())
-        })?;
+        let min_col = data
+            .column_by_name("min")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
+        let max_col = data
+            .column_by_name("max")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'max' column"))?;
         let null_count_col = data
             .column_by_name("null_count")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'null_count' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'null_count' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'null_count' column is not UInt32",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'null_count' column is not UInt32")
             })?;
         let nan_count_col = data
             .column_by_name("nan_count")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'nan_count' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'nan_count' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'nan_count' column is not UInt32",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'nan_count' column is not UInt32")
             })?;
         let zone_length = data
             .column_by_name("zone_length")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_length' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_length' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'zone_length' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64")
             })?;
 
         let fragment_id_col = data
             .column_by_name("fragment_id")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'fragment_id' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64")
             })?;
 
         let zone_start_col = data
             .column_by_name("zone_start")
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_start' column", location!())
-            })?
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "ZoneMapIndex: 'zone_start' column is not UInt64",
-                    location!(),
-                )
+                Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
         let data_type = min_col.data_type().clone();
@@ -475,15 +435,16 @@ impl ZoneMapIndex {
             let max = ScalarValue::try_from_array(max_col, i)?;
             let null_count = null_count_col.value(i);
             let nan_count = nan_count_col.value(i);
-
             zones.push(ZoneMapStatistics {
                 min,
                 max,
                 null_count,
                 nan_count,
-                fragment_id: fragment_id_col.value(i),
-                zone_start: zone_start_col.value(i),
-                zone_length: zone_length.value(i) as usize,
+                bound: ZoneBound {
+                    fragment_id: fragment_id_col.value(i),
+                    start: zone_start_col.value(i),
+                    length: zone_length.value(i) as usize,
+                },
             });
         }
 
@@ -509,10 +470,9 @@ impl Index for ZoneMapIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::InvalidInput {
-            source: "ZoneMapIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "ZoneMapIndex is not a vector index".into(),
+        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -536,7 +496,7 @@ impl Index for ZoneMapIndex {
 
         // Loop through zones and add unique fragment IDs to the bitmap
         for zone in &self.zones {
-            frag_ids.insert(zone.fragment_id as u32);
+            frag_ids.insert(zone.bound.fragment_id as u32);
         }
 
         Ok(frag_ids)
@@ -550,25 +510,10 @@ impl ScalarIndex for ZoneMapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-
-        let mut row_id_tree_map = RowIdTreeMap::new();
-
-        // Loop through zones and check each one
-        for zone in self.zones.iter() {
-            // Check if this zone matches the query
-            if self.evaluate_zone_against_query(zone, query)? {
-                // Calculate the range of row addresses for this zone
-                let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
-                let zone_end_addr = zone_start_addr + zone.zone_length as u64;
-
-                // Add all row addresses in this zone to the result
-                row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
-            }
-        }
-
-        Ok(SearchResult::AtMost(row_id_tree_map))
+        search_zones(&self.zones, metrics, |zone| {
+            self.evaluate_zone_against_query(zone, query)
+        })
     }
 
     fn can_remap(&self) -> bool {
@@ -581,10 +526,9 @@ impl ScalarIndex for ZoneMapIndex {
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::InvalidInput {
-            source: "ZoneMapIndex does not support remap".into(),
-            location: location!(),
-        })
+        Err(Error::invalid_input_source(
+            "ZoneMapIndex does not support remap".into(),
+        ))
     }
 
     /// Add the new data , creating an updated version of the index in `dest_store`
@@ -592,35 +536,22 @@ impl ScalarIndex for ZoneMapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Process the new data to create zones
-        let batches_source = new_data;
-        let value_type = batches_source.schema().field(0).data_type().clone();
+        // Train new zones for the incoming data stream
+        let schema = new_data.schema();
+        let value_type = schema.field(0).data_type().clone();
 
-        let mut builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderParams::new(self.rows_per_zone),
-            value_type,
-        )?;
+        let options = ZoneMapIndexBuilderParams::new(self.rows_per_zone);
+        let processor = ZoneMapProcessor::new(value_type.clone())?;
+        let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
+        let updated_zones = rebuild_zones(&self.zones, trainer, new_data).await?;
 
-        builder.train(batches_source).await?;
-
-        // Get the new zones from the builder
-        let new_zone_stats = builder.maps;
-
-        // Combine existing zones with new zones
-        let mut all_zones = self.zones.clone();
-        all_zones.extend(new_zone_stats);
-
-        // Create a new builder with all zones to write them out
-        let mut combined_builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderParams::new(self.rows_per_zone),
-            self.data_type.clone(),
-        )?;
-        combined_builder.maps = all_zones;
-        combined_builder.options.rows_per_zone = self.rows_per_zone;
-
-        // Write the updated index to dest_store
-        combined_builder.write_index(dest_store).await?;
+        // Serialize the combined zones back into the index file
+        let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
+        builder.options.rows_per_zone = self.rows_per_zone;
+        builder.maps = updated_zones;
+        builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
@@ -682,206 +613,24 @@ pub struct ZoneMapIndexBuilder {
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
-    // The local offset within the current zone
-    cur_zone_offset: usize,
-    cur_fragment_id: u32,
-    // Track the actual first and last row offsets in the current zone
-    // This handles non-contiguous offsets after deletions
-    cur_zone_first_row_offset: Option<u32>,
-    cur_zone_last_row_offset: Option<u32>,
-
-    min: MinAccumulator,
-    max: MaxAccumulator,
-    null_count: u32,
-    nan_count: u32,
 }
 
 impl ZoneMapIndexBuilder {
     pub fn try_new(options: ZoneMapIndexBuilderParams, items_type: DataType) -> Result<Self> {
-        let min = MinAccumulator::try_new(&items_type)?;
-        let max = MaxAccumulator::try_new(&items_type)?;
         Ok(Self {
             options,
             items_type,
             maps: Vec::new(),
-            cur_zone_offset: 0,
-            cur_fragment_id: 0,
-            cur_zone_first_row_offset: None,
-            cur_zone_last_row_offset: None,
-            min,
-            max,
-            null_count: 0,
-            nan_count: 0,
         })
     }
 
-    fn count_nans(array: &ArrayRef) -> u32 {
-        match array.data_type() {
-            DataType::Float16 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float16Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float32 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float32Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float64 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float64Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            _ => 0, // Non-float types don't have NaNs
-        }
-    }
-
-    fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
-        self.null_count += array.null_count() as u32;
-        self.nan_count += Self::count_nans(array);
-        self.min.update_batch(std::slice::from_ref(array))?;
-        self.max.update_batch(std::slice::from_ref(array))?;
-        Ok(())
-    }
-
-    fn new_map(&mut self, fragment_id: u32) -> Result<()> {
-        let zone_start = self.cur_zone_first_row_offset.unwrap_or(0) as u64;
-        let zone_length = self
-            .cur_zone_last_row_offset
-            .map(|last_row_offset| {
-                (last_row_offset - self.cur_zone_first_row_offset.unwrap_or(0) + 1) as usize
-            })
-            .unwrap_or(self.cur_zone_offset);
-
-        let new_map = ZoneMapStatistics {
-            min: self.min.evaluate()?,
-            max: self.max.evaluate()?,
-            null_count: self.null_count,
-            nan_count: self.nan_count,
-            fragment_id: fragment_id as u64,
-            zone_start,
-            zone_length,
-        };
-
-        self.maps.push(new_map);
-
-        self.cur_zone_offset = 0;
-        self.cur_zone_first_row_offset = None;
-        self.cur_zone_last_row_offset = None;
-        self.min = MinAccumulator::try_new(&self.items_type)?;
-        self.max = MaxAccumulator::try_new(&self.items_type)?;
-        self.null_count = 0;
-        self.nan_count = 0;
-        Ok(())
-    }
-
+    /// Train the builder using the shared zone trainer.  The input stream must contain
+    /// the value column followed by `_rowaddr`, matching the dataset scan order enforced
+    /// by the scalar index registry.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        assert!(batches_source.schema().field_with_name(ROW_ADDR).is_ok());
-
-        let mut batches_source =
-            chunk_concat_stream(batches_source, self.options.rows_per_zone as usize);
-
-        while let Some(batch) = batches_source.try_next().await? {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            let data_array: &arrow_array::ArrayRef = batch.column(0);
-            let row_addrs_array = batch
-                .column_by_name(ROW_ADDR)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .unwrap();
-
-            let mut remaining = batch.num_rows();
-            let mut array_offset: usize = 0;
-
-            // Initialize cur_fragment_id from the first row address if this is the first batch
-            if self.maps.is_empty() && self.cur_zone_offset == 0 {
-                let first_row_addr = row_addrs_array.value(0);
-                self.cur_fragment_id = (first_row_addr >> 32) as u32;
-            }
-
-            while remaining > 0 {
-                // Find the next fragment boundary in this batch
-                let next_fragment_index = (array_offset..row_addrs_array.len()).find(|&i| {
-                    let row_addr = row_addrs_array.value(i);
-                    let fragment_id = (row_addr >> 32) as u32;
-                    fragment_id == self.cur_fragment_id + 1
-                });
-                let empty_rows_left_in_cur_zone: usize =
-                    (self.options.rows_per_zone - self.cur_zone_offset as u64) as usize;
-
-                // Check if there is enough data from the current fragment to fill the current zone
-                let desired = if let Some(idx) = next_fragment_index {
-                    self.cur_fragment_id = (row_addrs_array.value(idx) >> 32) as u32;
-                    // Take the minimum between distance to boundary and space left in zone
-                    // to ensure we don't exceed the zone size limit
-                    std::cmp::min(idx - array_offset, empty_rows_left_in_cur_zone)
-                } else {
-                    empty_rows_left_in_cur_zone
-                };
-
-                if desired > remaining {
-                    // Not enough data to fill a map, just increment counts
-                    self.update_stats(&data_array.slice(array_offset, remaining))?;
-
-                    // Track first and last row offsets (local offsets within fragment)
-                    let first_row_offset =
-                        RowAddress::new_from_u64(row_addrs_array.value(array_offset)).row_offset();
-                    let last_row_offset = RowAddress::new_from_u64(
-                        row_addrs_array.value(array_offset + remaining - 1),
-                    )
-                    .row_offset();
-                    if self.cur_zone_first_row_offset.is_none() {
-                        self.cur_zone_first_row_offset = Some(first_row_offset);
-                    }
-                    self.cur_zone_last_row_offset = Some(last_row_offset);
-
-                    self.cur_zone_offset += remaining;
-                    break;
-                } else if desired > 0 {
-                    // There is enough data, create a new zone map
-                    self.update_stats(&data_array.slice(array_offset, desired))?;
-
-                    // Track first and last row offsets
-                    let first_row_offset =
-                        RowAddress::new_from_u64(row_addrs_array.value(array_offset)).row_offset();
-                    let last_row_offset =
-                        RowAddress::new_from_u64(row_addrs_array.value(array_offset + desired - 1))
-                            .row_offset();
-                    if self.cur_zone_first_row_offset.is_none() {
-                        self.cur_zone_first_row_offset = Some(first_row_offset);
-                    }
-                    self.cur_zone_last_row_offset = Some(last_row_offset);
-
-                    self.cur_zone_offset += desired;
-                    self.new_map((row_addrs_array.value(array_offset) >> 32) as u32)?;
-                } else if desired == 0 {
-                    // The new batch starts with a new fragment. Flush the current zone if it's not empty
-                    if self.cur_zone_offset > 0 {
-                        self.new_map(self.cur_fragment_id.wrapping_sub(1))?;
-                    }
-                    // Let the loop run again
-                    // to find the next fragment boundary
-                    continue;
-                }
-                array_offset += desired;
-                remaining = remaining.saturating_sub(desired);
-            }
-        }
-        // Create the final map
-        if self.cur_zone_offset > 0 {
-            self.new_map(self.cur_fragment_id)?;
-        }
-
+        let processor = ZoneMapProcessor::new(self.items_type.clone())?;
+        let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?;
+        self.maps = trainer.train(batches_source).await?;
         Ok(())
     }
 
@@ -903,13 +652,13 @@ impl ZoneMapIndexBuilder {
         let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
 
         let fragment_ids =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.fragment_id));
 
         let zone_lengths =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length as u64));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.length as u64));
 
         let zone_starts =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.start));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             // min and max can be null if the entire batch is null values
@@ -948,6 +697,87 @@ impl ZoneMapIndexBuilder {
             .await?;
         index_file.write_record_batch(record_batch).await?;
         index_file.finish().await?;
+        Ok(())
+    }
+}
+
+/// Index-specific processor that computes min/max statistics for each zone while the
+/// trainer takes care of chunking and fragment boundaries.
+struct ZoneMapProcessor {
+    data_type: DataType,
+    min: MinAccumulator,
+    max: MaxAccumulator,
+    null_count: u32,
+    nan_count: u32,
+}
+
+impl ZoneMapProcessor {
+    fn new(data_type: DataType) -> Result<Self> {
+        let min = MinAccumulator::try_new(&data_type)?;
+        let max = MaxAccumulator::try_new(&data_type)?;
+        Ok(Self {
+            data_type,
+            min,
+            max,
+            null_count: 0,
+            nan_count: 0,
+        })
+    }
+
+    fn count_nans(array: &ArrayRef) -> u32 {
+        match array.data_type() {
+            DataType::Float16 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            DataType::Float32 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            DataType::Float64 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            _ => 0,
+        }
+    }
+}
+
+impl ZoneProcessor for ZoneMapProcessor {
+    type ZoneStatistics = ZoneMapStatistics;
+
+    fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
+        self.null_count += array.null_count() as u32;
+        self.nan_count += Self::count_nans(array);
+        self.min.update_batch(std::slice::from_ref(array))?;
+        self.max.update_batch(std::slice::from_ref(array))?;
+        Ok(())
+    }
+
+    fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+        Ok(ZoneMapStatistics {
+            min: self.min.evaluate()?,
+            max: self.max.evaluate()?,
+            null_count: self.null_count,
+            nan_count: self.nan_count,
+            bound,
+        })
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.min = MinAccumulator::try_new(&self.data_type)?;
+        self.max = MaxAccumulator::try_new(&self.data_type)?;
+        self.null_count = 0;
+        self.nan_count = 0;
         Ok(())
     }
 }
@@ -1008,10 +838,9 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
-            return Err(Error::InvalidInput {
-                source: "A zone map index can only be created on a non-nested field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A zone map index can only be created on a non-nested field.".into(),
+            ));
         }
 
         let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
@@ -1041,19 +870,20 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
-            return Err(Error::InvalidInput {
-                source: "ZoneMap index does not support fragment training".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "ZoneMap index does not support fragment training".into(),
+            ));
         }
 
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
             })?;
         Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
@@ -1077,35 +907,37 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 #[cfg(test)]
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
-    use crate::scalar::{zonemap::ROWS_PER_ZONE_DEFAULT, IndexStore};
+    use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
     use std::sync::Arc;
 
+    use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
     use arrow::datatypes::Float32Type;
-    use arrow_array::{Array, RecordBatch, UInt64Array};
+    use arrow_array::{Array, RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::{StreamExt, TryStreamExt, stream};
+    use lance_core::utils::mask::NullableRowAddrSet;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
+    use lance_core::{ROW_ADDR, cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
 
     use crate::scalar::{
+        SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
-            ZoneMapIndex, ZoneMapIndexBuilderParams, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
+            ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
         },
-        SargableQuery, ScalarIndex, SearchResult,
     };
 
     // Add missing imports for the tests
-    use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
+    use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
     use std::collections::Bound;
 
@@ -1170,7 +1002,7 @@ mod tests {
         // Equals query: null (should match nothing, as there are no nulls)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1211,22 +1043,22 @@ mod tests {
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.null_count, 1000);
             assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
-            assert_eq!(zone.zone_length, 5000);
-            assert_eq!(zone.fragment_id, i as u64);
+            assert_eq!(zone.bound.length, 5000);
+            assert_eq!(zone.bound.fragment_id, i as u64);
         }
 
         // Equals query: null (should match all zones since they contain null values)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Create expected RowIdTreeMap with all zones since they contain null values
-        let mut expected = RowIdTreeMap::new();
+        // Create expected RowAddrTreeMap with all zones since they contain null values
+        let mut expected = RowAddrTreeMap::new();
         for fragment_id in 0..10 {
             let start = (fragment_id as u64) << 32;
             let end = start + 5000;
             expected.insert_range(start..end);
         }
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test update - add new data with Float32 values (matching the original data type)
         let new_data =
@@ -1251,7 +1083,7 @@ mod tests {
         // Directly pass the stream with proper row addresses instead of using MockTrainingSource
         // which would regenerate row addresses starting from 0
         index
-            .update(new_data_stream, test_store.as_ref())
+            .update(new_data_stream, test_store.as_ref(), None)
             .await
             .unwrap();
 
@@ -1265,8 +1097,8 @@ mod tests {
 
         // Verify the new zone was added
         let new_zone = &updated_index.zones[10]; // Last zone should be the new one
-        assert_eq!(new_zone.fragment_id, 10u64); // New fragment ID
-        assert_eq!(new_zone.zone_length, 5000);
+        assert_eq!(new_zone.bound.fragment_id, 10u64); // New fragment ID
+        assert_eq!(new_zone.bound.length, 5000);
         assert_eq!(new_zone.null_count, 0); // New data has no nulls
         assert_eq!(new_zone.nan_count, 0); // New data has no NaN values
 
@@ -1278,13 +1110,13 @@ mod tests {
             .unwrap();
 
         // Should match original 10 zones (with nulls) but not the new zone (no nulls)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         for fragment_id in 0..10 {
             let start = (fragment_id as u64) << 32;
             let end = start + 5000;
             expected.insert_range(start..end);
         }
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that should be in the new zone
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(2.5))); // Value 2500/1000 = 2.5
@@ -1294,11 +1126,94 @@ mod tests {
             .unwrap();
 
         // Should match the new zone (fragment 10)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         let start = 10u64 << 32;
         let end = start + 5000;
         expected.insert_range(start..end);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_null_handling_in_queries() {
+        // Test that zonemap index correctly returns null_list for queries
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data: [0, 5, null]
+        let batch = record_batch!(
+            (VALUE_COLUMN_NAME, Int64, [Some(0), Some(5), None]),
+            (ROW_ADDR, UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        // Train and write the zonemap index
+        ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = ZoneMapIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        // Test 1: Search for value 5 - zonemap should return at_most with all rows
+        // Since ZoneMap returns AtMost (superset), it's correct to include nulls in the result
+        let query = SargableQuery::Equals(ScalarValue::Int64(Some(5)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::AtMost(row_ids) => {
+                // Zonemap can't determine exact matches, so it returns all rows in the zone
+                // This includes nulls because ZoneMap can't prove they don't match
+                let all_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    all_rows,
+                    vec![0, 1, 2],
+                    "Should return all rows (including nulls) since ZoneMap is inexact"
+                );
+
+                // For AtMost results, nulls are included in the superset
+                // Downstream processing will handle null filtering
+            }
+            _ => panic!("Expected AtMost search result from zonemap"),
+        }
+
+        // Test 2: Range query - should also return all rows as AtMost
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int64(Some(0))),
+            std::ops::Bound::Included(ScalarValue::Int64(Some(3))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::AtMost(row_ids) => {
+                // Again, ZoneMap returns superset including nulls
+                let all_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(
+                    all_rows,
+                    vec![0, 1, 2],
+                    "Should return all rows in zone as possible matches"
+                );
+            }
+            _ => panic!("Expected AtMost search result from zonemap"),
+        }
     }
 
     #[tokio::test]
@@ -1360,12 +1275,12 @@ mod tests {
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.nan_count, 20, "Zone {} should have 20 NaN values", i);
             assert_eq!(
-                zone.zone_length, 100,
+                zone.bound.length, 100,
                 "Zone {} should have zone_length 100",
                 i
             );
             assert_eq!(
-                zone.fragment_id, 0u64,
+                zone.bound.fragment_id, 0u64,
                 "Zone {} should have fragment_id 0",
                 i
             );
@@ -1376,18 +1291,18 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every zone
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a specific finite value that exists in the data
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(5.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match only the first zone since 5.0 only exists in rows 0-99
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..100);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a value that doesn't exist
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(1000.0)));
@@ -1395,9 +1310,9 @@ mod tests {
 
         // Since zones contain NaN values, their max will be NaN, so they will be included
         // as potential matches for any finite target (false positive, but acceptable for zone maps)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test range query that should include finite values
         let query = SargableQuery::Range(
@@ -1407,9 +1322,9 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the first three zones since they contain values in the range [0, 250]
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..300);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsIn query with NaN and finite values
         let query = SargableQuery::IsIn(vec![
@@ -1420,9 +1335,9 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test range query that excludes all values
         let query = SargableQuery::Range(
@@ -1433,14 +1348,14 @@ mod tests {
 
         // Since zones contain NaN values, their max will be NaN, so they will be included
         // as potential matches for any range query (false positive, but acceptable for zone maps)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsNull query (should match nothing since there are no null values)
         let query = SargableQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(NullableRowAddrSet::empty()));
 
         // Test range queries with NaN bounds
         // Range with NaN as start bound (included)
@@ -1450,9 +1365,9 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Range with NaN as end bound (included)
         let query = SargableQuery::Range(
@@ -1461,9 +1376,9 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Range with NaN as end bound (excluded)
         let query = SargableQuery::Range(
@@ -1472,9 +1387,9 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since everything is less than NaN
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Range with NaN as start bound (excluded)
         let query = SargableQuery::Range(
@@ -1483,7 +1398,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match nothing since nothing is greater than NaN
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::AtMost(NullableRowAddrSet::empty()));
 
         // Test IsIn query with mixed float types (Float16, Float32, Float64)
         let query = SargableQuery::IsIn(vec![
@@ -1494,9 +1409,9 @@ mod tests {
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all zones since they all contain NaN values
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -1583,18 +1498,22 @@ mod tests {
                     max: ScalarValue::Int32(Some(99)),
                     null_count: 0,
                     nan_count: 0,
-                    fragment_id: 0,
-                    zone_start: 0,
-                    zone_length: 100,
+                    bound: ZoneBound {
+                        fragment_id: 0,
+                        start: 0,
+                        length: 100,
+                    },
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int32(Some(100)),
                     max: ScalarValue::Int32(Some(100)),
                     null_count: 0,
                     nan_count: 0,
-                    fragment_id: 0,
-                    zone_start: 100,
-                    zone_length: 1,
+                    bound: ZoneBound {
+                        fragment_id: 0,
+                        start: 100,
+                        length: 1,
+                    },
                 }
             ]
         );
@@ -1618,10 +1537,7 @@ mod tests {
             Bound::Unbounded,
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..=100))
-        );
+        assert_eq!(result, SearchResult::at_most(0..=100));
 
         // 2. Range query: [0, 50]
         let query = SargableQuery::Range(
@@ -1629,10 +1545,7 @@ mod tests {
             Bound::Included(ScalarValue::Int32(Some(50))),
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..=99))
-        );
+        assert_eq!(result, SearchResult::at_most(0..=99));
 
         // 3. Range query: [101, 200] (should only match the second zone, which is row 100)
         let query = SargableQuery::Range(
@@ -1641,7 +1554,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Only row 100 is in the second zone, but its value is 100, so this should be empty
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // 4. Range query: [100, 100] (should match only the last row)
         let query = SargableQuery::Range(
@@ -1649,37 +1562,27 @@ mod tests {
             Bound::Included(ScalarValue::Int32(Some(100))),
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(100..=100))
-        );
+        assert_eq!(result, SearchResult::at_most(100..=100));
 
         // 5. Equals query: 0 (should match first row)
         let query = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..100))
-        );
+        assert_eq!(result, SearchResult::at_most(0..=99));
 
         // 6. Equals query: 100 (should match only last row)
         let query = SargableQuery::Equals(ScalarValue::Int32(Some(100)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(100..=100))
-        );
+        assert_eq!(result, SearchResult::at_most(100..=100));
 
         // 7. Equals query: 101 (should match nothing)
         let query = SargableQuery::Equals(ScalarValue::Int32(Some(101)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // 8. IsNull query (no nulls in data, should match nothing)
         let query = SargableQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
-
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
         // 9. IsIn query: [0, 100, 101, 50]
         let query = SargableQuery::IsIn(vec![
             ScalarValue::Int32(Some(0)),
@@ -1689,10 +1592,7 @@ mod tests {
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // 0 and 50 are in the first zone, 100 in the second, 101 is not present
-        assert_eq!(
-            result,
-            SearchResult::AtMost(RowIdTreeMap::from_iter(0..=100))
-        );
+        assert_eq!(result, SearchResult::at_most(0..=100));
 
         // 10. IsIn query: [101, 102] (should match nothing)
         let query = SargableQuery::IsIn(vec![
@@ -1700,17 +1600,17 @@ mod tests {
             ScalarValue::Int32(Some(102)),
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // 11. IsIn query: [null] (should match nothing, as there are no nulls)
         let query = SargableQuery::IsIn(vec![ScalarValue::Int32(None)]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // 12. Equals query: null (should match nothing, as there are no nulls)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1761,27 +1661,33 @@ mod tests {
                     max: ScalarValue::Int64(Some(8191)),
                     null_count: 0,
                     nan_count: 0,
-                    fragment_id: 0,
-                    zone_start: 0,
-                    zone_length: 8192,
+                    bound: ZoneBound {
+                        fragment_id: 0,
+                        start: 0,
+                        length: 8192,
+                    },
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(8192)),
                     max: ScalarValue::Int64(Some(16383)),
                     null_count: 0,
                     nan_count: 0,
-                    fragment_id: 0,
-                    zone_start: 8192,
-                    zone_length: 8192,
+                    bound: ZoneBound {
+                        fragment_id: 0,
+                        start: 8192,
+                        length: 8192,
+                    },
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(16384)),
                     max: ScalarValue::Int64(Some(16425)),
                     null_count: 0,
                     nan_count: 0,
-                    fragment_id: 0,
-                    zone_start: 16384,
-                    zone_length: 42,
+                    bound: ZoneBound {
+                        fragment_id: 0,
+                        start: 16384,
+                        length: 42,
+                    },
                 }
             ]
         );
@@ -1804,22 +1710,22 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(1000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match row 1000 in fragment 0: row address = (0 << 32) + 1000 = 1000
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..=8191);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Search for a value in the second zone
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(9000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match row 9000 in fragment 0: row address = (0 << 32) + 9000 = 9000
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(8192..=16383);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Search for a value not present in any zone
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(20000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Search for a range that spans multiple zones
         let query = SargableQuery::Range(
@@ -1828,9 +1734,9 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match all rows from 8000 to 16400 (inclusive)
-        let mut expected = RowIdTreeMap::new();
+        let mut expected = RowAddrTreeMap::new();
         expected.insert_range(8192..=16425);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        assert_eq!(result, SearchResult::at_most(expected));
     }
 
     #[tokio::test]
@@ -1915,45 +1821,55 @@ mod tests {
                         max: ScalarValue::Int64(Some(4999)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 0,
-                        zone_start: 0,
-                        zone_length: 5000,
+                        bound: ZoneBound {
+                            fragment_id: 0,
+                            start: 0,
+                            length: 5000,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(5000)),
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 0,
-                        zone_start: 5000,
-                        zone_length: 3192,
+                        bound: ZoneBound {
+                            fragment_id: 0,
+                            start: 5000,
+                            length: 3192,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
                         max: ScalarValue::Int64(Some(13191)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 1,
-                        zone_start: 0,
-                        zone_length: 5000,
+                        bound: ZoneBound {
+                            fragment_id: 1,
+                            start: 0,
+                            length: 5000,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(13192)),
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 1,
-                        zone_start: 5000,
-                        zone_length: 3192,
+                        bound: ZoneBound {
+                            fragment_id: 1,
+                            start: 5000,
+                            length: 3192,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 2,
-                        zone_start: 0,
-                        zone_length: 42,
+                        bound: ZoneBound {
+                            fragment_id: 2,
+                            start: 0,
+                            length: 42,
+                        },
                     }
                 ]
             );
@@ -2037,48 +1953,48 @@ mod tests {
             );
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             // Should include zones from fragments 0 and 1 since they overlap with range 5000-12000
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             // zone 1
             expected.insert_range(5000..8192);
             // zone 2
             expected.insert_range((1u64 << 32)..((1u64 << 32) + 5000));
-            assert_eq!(result, SearchResult::AtMost(expected));
+            assert_eq!(result, SearchResult::at_most(expected));
 
             // Test exact match query from zone 2
             let query = SargableQuery::Equals(ScalarValue::Int64(Some(8192)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             // Should include zone 2 since it contains value 8192
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range((1u64 << 32)..((1u64 << 32) + 5000));
-            assert_eq!(result, SearchResult::AtMost(expected));
+            assert_eq!(result, SearchResult::at_most(expected));
 
             // Test exact match query from zone 4
             let query = SargableQuery::Equals(ScalarValue::Int64(Some(16385)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             // Should include zone 4 since it contains value 16385
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range(2u64 << 32..((2u64 << 32) + 42));
-            assert_eq!(result, SearchResult::AtMost(expected));
+            assert_eq!(result, SearchResult::at_most(expected));
 
             // Test query that matches nothing
             let query = SargableQuery::Equals(ScalarValue::Int64(Some(99999)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+            assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
             // Test is_in query
             let query = SargableQuery::IsIn(vec![ScalarValue::Int64(Some(16385))]);
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range(2u64 << 32..((2u64 << 32) + 42));
-            assert_eq!(result, SearchResult::AtMost(expected));
+            assert_eq!(result, SearchResult::at_most(expected));
 
             // Test equals query with null
             let query = SargableQuery::Equals(ScalarValue::Int64(None));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let mut expected = RowIdTreeMap::new();
+            let mut expected = RowAddrTreeMap::new();
             expected.insert_range(0..=16425);
             // expected = {:?}", expected
-            assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+            assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
         }
 
         //  Each fragment is its own batch
@@ -2113,27 +2029,33 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 0,
-                        zone_start: 0,
-                        zone_length: 8192,
+                        bound: ZoneBound {
+                            fragment_id: 0,
+                            start: 0,
+                            length: 8192,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 1,
-                        zone_start: 0,
-                        zone_length: 8192,
+                        bound: ZoneBound {
+                            fragment_id: 1,
+                            start: 0,
+                            length: 8192,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 2,
-                        zone_start: 0,
-                        zone_length: 42,
+                        bound: ZoneBound {
+                            fragment_id: 2,
+                            start: 0,
+                            length: 42,
+                        },
                     }
                 ]
             );
@@ -2182,27 +2104,33 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 0,
-                        zone_start: 0,
-                        zone_length: 8192,
+                        bound: ZoneBound {
+                            fragment_id: 0,
+                            start: 0,
+                            length: 8192,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 1,
-                        zone_start: 0,
-                        zone_length: 8192,
+                        bound: ZoneBound {
+                            fragment_id: 1,
+                            start: 0,
+                            length: 8192,
+                        },
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        fragment_id: 2,
-                        zone_start: 0,
-                        zone_length: 42,
+                        bound: ZoneBound {
+                            fragment_id: 2,
+                            start: 0,
+                            length: 42,
+                        },
                     }
                 ]
             );

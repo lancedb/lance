@@ -13,10 +13,13 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
-use snafu::location;
 
-use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
+use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
+use crate::{
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD, ROW_ID,
+    ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION_FIELD, ROW_OFFSET,
+    ROW_OFFSET_FIELD, Result, WILDCARD,
+};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -42,18 +45,16 @@ impl FieldRef<'_> {
         match self {
             FieldRef::ById(id) => {
                 if schema.field_by_id(id).is_none() {
-                    return Err(Error::InvalidInput {
-                        source: format!("Field ID {} not found in schema", id).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        format!("Field ID {} not found in schema", id).into(),
+                    ));
                 }
                 Ok(id)
             }
             FieldRef::ByPath(path) => {
-                let field = schema.field(path).ok_or_else(|| Error::InvalidInput {
-                    source: format!("Field '{}' not found in schema", path).into(),
-                    location: location!(),
-                })?;
+                let field = schema
+                    .field(path)
+                    .ok_or_else(|| Error::field_not_found(path, schema.field_paths()))?;
                 Ok(field.id)
             }
         }
@@ -111,11 +112,27 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    /// The unenforced primary key fields in the schema
+    /// The unenforced primary key fields in the schema, ordered by position.
+    ///
+    /// Fields with explicit positions (1, 2, 3, ...) are ordered by their position value.
+    /// Fields without explicit positions (using the legacy boolean flag) are ordered
+    /// by their schema field id and come after fields with explicit positions.
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
-        self.fields_pre_order()
-            .filter(|f| f.unenforced_primary_key)
-            .collect::<Vec<_>>()
+        let mut pk_fields: Vec<&Field> = self
+            .fields_pre_order()
+            .filter(|f| f.is_unenforced_primary_key())
+            .collect();
+
+        pk_fields.sort_by_key(|f| {
+            let pk_position = f.unenforced_primary_key_position.unwrap_or(0);
+            if pk_position > 0 {
+                (false, pk_position as i32, f.id)
+            } else {
+                (true, f.id, f.id)
+            }
+        });
+
+        pk_fields
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
@@ -131,12 +148,11 @@ impl Schema {
         let mut differences =
             explain_fields_difference(&self.fields, &expected.fields, options, None);
 
-        if options.compare_metadata {
-            if let Some(difference) =
+        if options.compare_metadata
+            && let Some(difference) =
                 explain_metadata_difference(&self.metadata, &expected.metadata)
-            {
-                differences.push(difference);
-            }
+        {
+            differences.push(difference);
         }
 
         if differences.is_empty() {
@@ -153,11 +169,10 @@ impl Schema {
     pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
         if !self.compare_with_options(expected, options) {
             let difference = self.explain_difference(expected, options);
-            Err(Error::SchemaMismatch {
-                // unknown reason is messy but this shouldn't happen.
-                difference: difference.unwrap_or("unknown reason".to_string()),
-                location: location!(),
-            })
+            // unknown reason is messy but this shouldn't happen.
+            Err(Error::schema_mismatch(
+                difference.unwrap_or("unknown reason".to_string()),
+            ))
         } else {
             Ok(())
         }
@@ -205,7 +220,12 @@ impl Schema {
         }
     }
 
-    fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
+    fn do_project<T: AsRef<str>>(
+        &self,
+        columns: &[T],
+        err_on_missing: bool,
+        preserve_system_columns: bool,
+    ) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
             let split = parse_field_path(col.as_ref())?;
@@ -218,11 +238,28 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
-                return Err(Error::Schema {
-                    message: format!("Column {} does not exist", col.as_ref()),
-                    location: location!(),
-                });
+            } else if crate::is_system_column(first) {
+                if preserve_system_columns {
+                    if first == ROW_ID {
+                        candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
+                    } else if first == ROW_ADDR {
+                        candidates.push(Field::try_from(ROW_ADDR_FIELD.clone())?);
+                    } else if first == ROW_OFFSET {
+                        candidates.push(Field::try_from(ROW_OFFSET_FIELD.clone())?);
+                    } else if first == ROW_CREATED_AT_VERSION {
+                        candidates.push(Field::try_from(ROW_CREATED_AT_VERSION_FIELD.clone())?);
+                    } else if first == ROW_LAST_UPDATED_AT_VERSION {
+                        candidates
+                            .push(Field::try_from(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?);
+                    } else {
+                        return Err(Error::schema(format!(
+                            "System column {} is currently not supported in projection",
+                            first
+                        )));
+                    }
+                }
+            } else if err_on_missing {
+                return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
             }
         }
 
@@ -239,12 +276,17 @@ impl Schema {
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
     pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true)
+        self.do_project(columns, true, false)
     }
 
     /// Project the columns over the schema, dropping unrecognized columns
     pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, false)
+        self.do_project(columns, false, false)
+    }
+
+    /// Project the columns over the schema, preserving system columns.
+    pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        self.do_project(columns, true, true)
     }
 
     /// Check that the top level fields don't contain `.` in their names
@@ -255,10 +297,10 @@ impl Schema {
 
         for field in self.fields.iter() {
             if field.name.contains('.') {
-                return Err(Error::Schema{message:format!(
+                return Err(Error::schema(format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
-                ), location: location!(),});
+                )));
             }
 
             let column_path = self
@@ -269,13 +311,10 @@ impl Schema {
                 .collect::<Vec<_>>()
                 .join(".");
             if !seen_names.insert(column_path.clone()) {
-                return Err(Error::Schema {
-                    message: format!(
-                        "Duplicate field name \"{}\" in schema:\n {:#?}",
-                        column_path, self
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Duplicate field name \"{}\" in schema:\n {:#?}",
+                    column_path, self
+                )));
             }
         }
 
@@ -283,16 +322,16 @@ impl Schema {
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
             if field.id < 0 {
-                return Err(Error::Schema {
-                    message: format!("Field {} has a negative id {}", field.name, field.id),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Field {} has a negative id {}",
+                    field.name, field.id
+                )));
             }
             if !seen_ids.insert(field.id) {
-                return Err(Error::Schema {
-                    message: format!("Duplicate field id {} in schema {:?}", field.id, self),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Duplicate field id {} in schema {:?}",
+                    field.id, self
+                )));
             }
         }
 
@@ -329,6 +368,27 @@ impl Schema {
     /// before its children
     pub fn fields_pre_order(&self) -> impl Iterator<Item = &Field> {
         SchemaFieldIterPreOrder::new(self)
+    }
+
+    /// Get all field paths in the schema as a list of strings.
+    ///
+    /// This returns all field paths in the schema, including nested fields.
+    /// For example, if there's a struct field "user" with a field "name",
+    /// this will return "user.name" as one of the paths.
+    pub fn field_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for field in self.fields_pre_order() {
+            let ancestry = self.field_ancestry_by_id(field.id);
+            if let Some(ancestry) = ancestry {
+                let path = ancestry
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                paths.push(path);
+            }
+        }
+        paths
     }
 
     /// Returns a new schema that only contains the fields in `column_ids`.
@@ -378,23 +438,17 @@ impl Schema {
         for field in projection.fields.iter() {
             // Ensure the field is a top-level field (no dots in the name)
             if field.name.contains('.') {
-                return Err(Error::Schema {
-                    message: format!(
-                        "Field '{}' contains dots. project_by_schema only accepts top-level fields. \
-                         Use project() method for nested field paths.",
-                        field.name
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!(
+                    "Field '{}' contains dots. project_by_schema only accepts top-level fields. \
+                     Use project() method for nested field paths.",
+                    field.name
+                )));
             }
 
             if let Some(self_field) = self.field(&field.name) {
                 new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
             } else if matches!(on_missing, OnMissing::Error) {
-                return Err(Error::Schema {
-                    message: format!("Field {} not found", field.name),
-                    location: location!(),
-                });
+                return Err(Error::schema(format!("Field {} not found", field.name)));
             }
         }
         Ok(Self {
@@ -405,17 +459,16 @@ impl Schema {
 
     /// Exclude the fields from `other` Schema, and returns a new Schema.
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
-        let other = schema.try_into().map_err(|_| Error::Schema {
-            message: "The other schema is not compatible with this schema".to_string(),
-            location: location!(),
+        let other = schema.try_into().map_err(|_| {
+            Error::schema("The other schema is not compatible with this schema".to_string())
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_struct() {
-                    if let Some(f) = field.exclude(other_field) {
-                        fields.push(f)
-                    }
+                if field.data_type().is_nested()
+                    && let Some(f) = field.exclude(other_field)
+                {
+                    fields.push(f)
                 }
             } else {
                 fields.push(field.clone());
@@ -433,14 +486,67 @@ impl Schema {
         self.resolve(name).and_then(|fields| fields.last().copied())
     }
 
+    /// Get a field by its path, with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual field from the schema (preserving original case).
+    /// Field names containing dots must be quoted: parent."child.with.dot"
+    pub fn field_case_insensitive(&self, name: &str) -> Option<&Field> {
+        self.resolve_case_insensitive(name)
+            .and_then(|fields| fields.last().copied())
+    }
+
+    /// Given a string column reference, resolve the path of fields with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual fields from the schema (preserving original case).
+    pub fn resolve_case_insensitive(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
+        let split = parse_field_path(column.as_ref()).ok()?;
+        if split.is_empty() {
+            return None;
+        }
+
+        if split.len() == 1 {
+            let field_name = &split[0];
+            // Try exact match first
+            if let Some(field) = self.fields.iter().find(|f| &f.name == field_name) {
+                return Some(vec![field]);
+            }
+            // Fall back to case-insensitive match
+            if let Some(field) = self
+                .fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(field_name))
+            {
+                return Some(vec![field]);
+            }
+            return None;
+        }
+
+        // Multiple segments - resolve as a nested field path
+        let mut fields = Vec::with_capacity(split.len());
+        let first = &split[0];
+
+        // Find the first field (try exact match, then case-insensitive)
+        let field = self.fields.iter().find(|f| &f.name == first).or_else(|| {
+            self.fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(first))
+        })?;
+
+        let mut split_refs: VecDeque<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+        if field.resolve_case_insensitive(&mut split_refs, &mut fields) {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
     pub fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
             .map(|f| f.id)
-            .ok_or_else(|| Error::Schema {
-                message: "Vector column not in schema".to_string(),
-                location: location!(),
-            })
+            .ok_or_else(|| Error::schema("Vector column not in schema".to_string()))
     }
 
     pub fn top_level_field_ids(&self) -> Vec<i32> {
@@ -513,7 +619,7 @@ impl Schema {
     // TODO: pub(crate)
     /// Get the maximum field id in the schema.
     ///
-    /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
+    /// Note: When working with Datasets, you should prefer `Manifest::max_field_id()`
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
@@ -524,12 +630,12 @@ impl Schema {
     // TODO: pub(crate)
     pub fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.fields.as_mut_slice() {
-            let column = batch
-                .column_by_name(&field.name)
-                .ok_or_else(|| Error::Schema {
-                    message: format!("column '{}' does not exist in the record batch", field.name),
-                    location: location!(),
-                })?;
+            let column = batch.column_by_name(&field.name).ok_or_else(|| {
+                Error::schema(format!(
+                    "column '{}' does not exist in the record batch",
+                    field.name
+                ))
+            })?;
             field.set_dictionary(column);
         }
         Ok(())
@@ -568,13 +674,10 @@ impl Schema {
         // Validate this addition does not create any duplicate field names
         let field_names = self.fields.iter().map(|f| &f.name).collect::<HashSet<_>>();
         if field_names.len() != self.fields.len() {
-            Err(Error::Internal {
-                message: format!(
-                    "Attempt to add fields [{:?}] would lead to duplicate field names",
-                    fields.iter().map(|f| f.name()).collect::<Vec<_>>()
-                ),
-                location: location!(),
-            })
+            Err(Error::internal(format!(
+                "Attempt to add fields [{:?}] would lead to duplicate field names",
+                fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+            )))
         } else {
             Ok(())
         }
@@ -629,10 +732,47 @@ impl Schema {
                 let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
                 format_field_path(&field_refs)
             })
-            .ok_or_else(|| Error::Index {
-                message: format!("Could not find field ancestry for id {}", field_id),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::index(format!("Could not find field ancestry for id {}", field_id))
             })
+    }
+
+    pub fn verify_primary_key(&self) -> Result<()> {
+        let pk = self.unenforced_primary_key();
+        for pk_col in pk.into_iter() {
+            if !pk_col.is_leaf() {
+                return Err(Error::schema(format!(
+                    "Primary key column must be a leaf: {}",
+                    pk_col
+                )));
+            }
+
+            if let Some(ancestors) = self.field_ancestry_by_id(pk_col.id) {
+                for ancestor in ancestors {
+                    if ancestor.nullable {
+                        return Err(Error::schema(format!(
+                            "Primary key column and all its ancestors must not be nullable: {}",
+                            ancestor
+                        )));
+                    }
+
+                    if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
+                        return Err(Error::schema(format!(
+                            "Primary key column must not be in a list type: {}",
+                            ancestor
+                        )));
+                    }
+
+                    if ancestor.logical_type.is_map() {
+                        return Err(Error::schema(format!(
+                            "Primary key column must not be in a map type: {}",
+                            ancestor
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -667,39 +807,7 @@ impl TryFrom<&ArrowSchema> for Schema {
         schema.set_field_id(None);
         schema.validate()?;
 
-        let pk = schema.unenforced_primary_key();
-        for pk_col in pk.into_iter() {
-            if !pk_col.is_leaf() {
-                return Err(Error::Schema {
-                    message: format!("Primary key column must be a leaf: {}", pk_col),
-                    location: location!(),
-                });
-            }
-
-            if let Some(ancestors) = schema.field_ancestry_by_id(pk_col.id) {
-                for ancestor in ancestors {
-                    if ancestor.nullable {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Primary key column and all its ancestors must not be nullable: {}",
-                                ancestor
-                            ),
-                            location: location!(),
-                        });
-                    }
-
-                    if ancestor.logical_type.is_list() || ancestor.logical_type.is_large_list() {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Primary key column must not be in a list type: {}",
-                                ancestor
-                            ),
-                            location: location!(),
-                        });
-                    }
-                }
-            }
-        }
+        schema.verify_primary_key()?;
 
         Ok(schema)
     }
@@ -905,7 +1013,7 @@ impl Projectable for Schema {
 }
 
 /// Specifies how to handle blob columns when projecting
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum BlobHandling {
     /// Read all blobs as binary
     AllBinary,
@@ -928,7 +1036,9 @@ pub enum BlobHandling {
 
 impl BlobHandling {
     fn should_unload(&self, field: &Field) -> bool {
-        if !field.data_type().is_binary_like() {
+        // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
+        // even if the physical data type is not binary-like.
+        if !(field.data_type().is_binary_like() || field.is_blob()) {
             return false;
         }
         match self {
@@ -940,12 +1050,11 @@ impl BlobHandling {
         }
     }
 
-    pub fn unload_if_needed(&self, field: Field, version: BlobVersion) -> Field {
+    pub fn unload_if_needed(&self, mut field: Field) -> Field {
         if self.should_unload(&field) {
-            field.into_unloaded_with_version(version)
-        } else {
-            field
+            field.unloaded_mut();
         }
+        field
     }
 }
 
@@ -962,7 +1071,6 @@ pub struct Projection {
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
-    pub blob_version: BlobVersion,
 }
 
 impl Debug for Projection {
@@ -980,7 +1088,6 @@ impl Debug for Projection {
                 &self.with_row_created_at_version,
             )
             .field("blob_handling", &self.blob_handling)
-            .field("blob_version", &self.blob_version)
             .finish()
     }
 }
@@ -996,7 +1103,6 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
-            blob_version: BlobVersion::V1,
         }
     }
 
@@ -1027,11 +1133,6 @@ impl Projection {
 
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
-        self
-    }
-
-    pub fn with_blob_version(mut self, blob_version: BlobVersion) -> Self {
-        self.blob_version = blob_version;
         self
     }
 
@@ -1070,10 +1171,9 @@ impl Projection {
                 Self::add_field_children(&mut self.field_ids, last_field);
             }
         } else if matches!(on_missing, OnMissing::Error) {
-            return Err(Error::InvalidInput {
-                source: format!("Column {} does not exist", column).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                format!("Column {} does not exist", column).into(),
+            ));
         }
         Ok(self)
     }
@@ -1350,10 +1450,7 @@ impl Projection {
 /// The result is guaranteed to contain at least one element.
 pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     if path.is_empty() {
-        return Err(Error::Schema {
-            message: "Field path cannot be empty".to_string(),
-            location: location!(),
-        });
+        return Err(Error::schema("Field path cannot be empty".to_string()));
     }
 
     let mut result = Vec::new();
@@ -1374,13 +1471,13 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
                         // End of quoted field
                         in_quotes = false;
                         // After closing quote, we should either see a dot or end of string
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch != '.' {
-                                return Err(Error::Schema {
-                                    message: format!("Invalid field path '{}': expected '.' or end of string after closing quote", path),
-                                    location: location!(),
-                                });
-                            }
+                        if let Some(&next_ch) = chars.peek()
+                            && next_ch != '.'
+                        {
+                            return Err(Error::schema(format!(
+                                "Invalid field path '{}': expected '.' or end of string after closing quote",
+                                path
+                            )));
                         }
                     }
                 } else if current.is_empty() {
@@ -1388,21 +1485,18 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
                     in_quotes = true;
                 } else {
                     // Quote in the middle of unquoted field name
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Invalid field path '{}': unexpected quote in the middle of field name",
-                            path
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': unexpected quote in the middle of field name",
+                        path
+                    )));
                 }
             }
             '.' if !in_quotes => {
                 if current.is_empty() {
-                    return Err(Error::Schema {
-                        message: format!("Invalid field path '{}': empty field name", path),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': empty field name",
+                        path
+                    )));
                 }
                 result.push(current);
                 current = String::new();
@@ -1414,44 +1508,47 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
     }
 
     if in_quotes {
-        return Err(Error::Schema {
-            message: format!("Invalid field path '{}': unclosed quote", path),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "Invalid field path '{}': unclosed quote",
+            path
+        )));
     }
 
     if !current.is_empty() {
         result.push(current);
     } else if !result.is_empty() {
-        return Err(Error::Schema {
-            message: format!("Invalid field path '{}': trailing dot", path),
-            location: location!(),
-        });
+        return Err(Error::schema(format!(
+            "Invalid field path '{}': trailing dot",
+            path
+        )));
     }
 
     // This check is now redundant since we check for empty input at the beginning,
     // but keeping it for extra safety
     if result.is_empty() {
-        return Err(Error::Schema {
-            message: format!("Invalid field path '{}'", path),
-            location: location!(),
-        });
+        return Err(Error::schema(format!("Invalid field path '{}'", path)));
     }
 
     Ok(result)
 }
 
-/// Format a field path, quoting field names that contain dots or backticks.
+/// Format a field path, quoting field names that require escaping.
 ///
-/// For example: ["parent", "child.with.dot"] formats to “parent.`child.with.dot`”
+/// Field names are quoted if they contain any character that is not alphanumeric
+/// or underscore, to ensure safe SQL parsing.
+///
+/// For example: ["parent", "child.with.dot"] formats to "parent.`child.with.dot`"
+/// For example: ["meta-data", "user-id"] formats to "`meta-data`.`user-id`"
 /// Backticks in field names are escaped by doubling them.
-/// For example: ["field`with`backticks"] formats to “`field``with``backticks`”
+/// For example: \["field`with`backticks"\] formats to "`field``with``backticks`"
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
         .map(|field| {
-            if field.contains('.') || field.contains('`') {
-                // Quote this field
+            // Quote if the field contains any non-identifier character
+            // (i.e., anything other than alphanumeric or underscore)
+            let needs_quoting = field.chars().any(|c| !c.is_alphanumeric() && c != '_');
+            if needs_quoting {
                 // Escape backticks by doubling them (PostgreSQL style)
                 let escaped = field.replace('`', "``");
                 format!("`{}`", escaped)
@@ -1492,19 +1589,6 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
-
-    #[test]
-    fn projection_from_schema_defaults_to_v1() {
-        let field = Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, true)).unwrap();
-        let schema = Schema {
-            fields: vec![field],
-            metadata: HashMap::new(),
-        };
-
-        let projection = Projection::empty(Arc::new(schema));
-
-        assert_eq!(projection.blob_version, BlobVersion::V1);
-    }
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -1665,9 +1749,10 @@ mod tests {
         let schema_result = Schema::try_from(&arrow_schema_with_dots);
         assert!(schema_result.is_err());
         let err = schema_result.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Top level field field.with.dots cannot contain `.`"));
+        assert!(
+            err.to_string()
+                .contains("Top level field field.with.dots cannot contain `.`")
+        );
 
         // Test that nested fields with dots are allowed
         let arrow_schema = ArrowSchema::new(vec![
@@ -1737,6 +1822,41 @@ mod tests {
                 ])),
                 true,
             ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+    }
+
+    #[test]
+    fn test_schema_projection_preserving_system_columns() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let projected = schema
+            .project_preserve_system_columns(&["b.f1", "b.f3", "_rowid", "c"])
+            .unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("_rowid", DataType::UInt64, true),
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
@@ -2337,44 +2457,50 @@ mod tests {
             ),
             (
                 // check nested schema, parent is nullable
-                vec![Field::new_arrow(
-                    "struct",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "a",
-                        DataType::Int32,
-                        false,
-                    )])),
-                    true,
-                )
-                .unwrap()],
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "a",
+                            DataType::Int32,
+                            false,
+                        )])),
+                        true,
+                    )
+                    .unwrap(),
+                ],
                 false,
             ),
             (
                 // check nested schema, child is nullable
-                vec![Field::new_arrow(
-                    "struct",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "a",
-                        DataType::Int32,
-                        true,
-                    )])),
-                    false,
-                )
-                .unwrap()],
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "a",
+                            DataType::Int32,
+                            true,
+                        )])),
+                        false,
+                    )
+                    .unwrap(),
+                ],
                 false,
             ),
             (
                 // check nested schema, all is nullable
-                vec![Field::new_arrow(
-                    "struct",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "a",
-                        DataType::Int32,
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "a",
+                            DataType::Int32,
+                            true,
+                        )])),
                         true,
-                    )])),
-                    true,
-                )
-                .unwrap()],
+                    )
+                    .unwrap(),
+                ],
                 true,
             ),
         ];
@@ -2392,15 +2518,16 @@ mod tests {
     fn test_schema_unenforced_primary_key() {
         let cases = vec![
             ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]),
-            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)
-                .with_metadata(
+            ArrowSchema::new(vec![
+                ArrowField::new("a", DataType::Int32, false).with_metadata(
                     vec![(
                         "lance-schema:unenforced-primary-key".to_owned(),
                         "true".to_owned(),
                     )]
                     .into_iter()
                     .collect::<HashMap<_, _>>(),
-                )]),
+                ),
+            ]),
             ArrowSchema::new(vec![
                 ArrowField::new("a", DataType::Int32, false).with_metadata(
                     vec![(
@@ -2412,19 +2539,16 @@ mod tests {
                 ),
                 ArrowField::new(
                     "b",
-                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                        "f1",
-                        DataType::Utf8,
-                        false,
-                    )
-                    .with_metadata(
-                        vec![(
-                            "lance-schema:unenforced-primary-key".to_owned(),
-                            "true".to_owned(),
-                        )]
-                        .into_iter()
-                        .collect::<HashMap<_, _>>(),
-                    )])),
+                    DataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("f1", DataType::Utf8, false).with_metadata(
+                            vec![(
+                                "lance-schema:unenforced-primary-key".to_owned(),
+                                "true".to_owned(),
+                            )]
+                            .into_iter()
+                            .collect::<HashMap<_, _>>(),
+                        ),
+                    ])),
                     false,
                 ),
             ]),
@@ -2451,37 +2575,24 @@ mod tests {
     #[test]
     fn test_schema_unenforced_primary_key_failures() {
         let cases = vec![
-            ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)
-                .with_metadata(
+            ArrowSchema::new(vec![
+                ArrowField::new("a", DataType::Int32, true).with_metadata(
                     vec![(
                         "lance-schema:unenforced-primary-key".to_owned(),
                         "true".to_owned(),
                     )]
                     .into_iter()
                     .collect::<HashMap<_, _>>(),
-                )]),
-            ArrowSchema::new(vec![ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                    "f1",
-                    DataType::Utf8,
-                    false,
-                )])),
-                false,
-            )
-            .with_metadata(
-                vec![(
-                    "lance-schema:unenforced-primary-key".to_owned(),
-                    "true".to_owned(),
-                )]
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-            )]),
-            ArrowSchema::new(vec![ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                    "f1",
-                    DataType::Utf8,
+                ),
+            ]),
+            ArrowSchema::new(vec![
+                ArrowField::new(
+                    "b",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "f1",
+                        DataType::Utf8,
+                        false,
+                    )])),
                     false,
                 )
                 .with_metadata(
@@ -2491,7 +2602,20 @@ mod tests {
                     )]
                     .into_iter()
                     .collect::<HashMap<_, _>>(),
-                )])),
+                ),
+            ]),
+            ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, false).with_metadata(
+                        vec![(
+                            "lance-schema:unenforced-primary-key".to_owned(),
+                            "true".to_owned(),
+                        )]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    ),
+                ])),
                 true,
             )]),
             ArrowSchema::new(vec![ArrowField::new(
@@ -2519,10 +2643,172 @@ mod tests {
         for (idx, case) in cases.into_iter().enumerate() {
             let result = Schema::try_from(&case);
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains(error_message_contains[idx]));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(error_message_contains[idx])
+            );
         }
+    }
+
+    #[test]
+    fn test_schema_unenforced_primary_key_ordering() {
+        use crate::datatypes::field::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+
+        // When positions are specified, fields are ordered by their position values
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "2".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "b");
+        assert_eq!(pk_fields[1].name, "a");
+
+        // When positions are not specified, fields are ordered by their schema field id
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("d", DataType::Int64, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 2);
+        assert_eq!(pk_fields[0].name, "c");
+        assert_eq!(pk_fields[1].name, "d");
+
+        // Fields with explicit positions are ordered before fields without
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("e", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("f", DataType::Int64, false).with_metadata(
+                vec![
+                    (
+                        "lance-schema:unenforced-primary-key".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("g", DataType::Utf8, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_owned(),
+                    "true".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let pk_fields = schema.unenforced_primary_key();
+        assert_eq!(pk_fields.len(), 3);
+        assert_eq!(pk_fields[0].name, "f");
+        assert_eq!(pk_fields[1].name, "e");
+        assert_eq!(pk_fields[2].name, "g");
+    }
+
+    #[test]
+    fn test_project_with_suggestion() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("vector", ArrowDataType::Float32, false),
+            ArrowField::new("label", ArrowDataType::Utf8, true),
+            ArrowField::new("score", ArrowDataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // Typo: "vectr" is close to "vector" → should get suggestion
+        let err = schema.project(&["vectr"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Did you mean 'vector'?"),
+            "Expected suggestion for 'vectr', got: {}",
+            msg
+        );
+        // Should also list available fields
+        assert!(
+            msg.contains("Available fields:"),
+            "Expected available fields list, got: {}",
+            msg
+        );
+
+        // Completely wrong name → no suggestion but still lists fields
+        let err = schema.project(&["nonexistent_column"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Did you mean"),
+            "Should not suggest for completely different name, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Available fields:"),
+            "Expected available fields list even without suggestion, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_field_paths() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("vector", ArrowDataType::Float32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let paths = schema.field_paths();
+        assert!(paths.contains(&"id".to_string()));
+        assert!(paths.contains(&"vector".to_string()));
+        assert!(paths.contains(&"name".to_string()));
     }
 }

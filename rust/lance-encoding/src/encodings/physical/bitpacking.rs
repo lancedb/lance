@@ -20,7 +20,6 @@ use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
 use byteorder::{ByteOrder, LittleEndian};
 use lance_bitpacking::BitPacking;
-use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -32,9 +31,9 @@ use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
-use crate::format::{pb21, ProtobufUtils21};
+use crate::format::{ProtobufUtils21, pb21};
 use crate::statistics::{GetStat, Stat};
-use bytemuck::{cast_slice, AnyBitPattern};
+use bytemuck::{AnyBitPattern, cast_slice};
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
 const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
@@ -120,13 +119,13 @@ impl InlineBitpacking {
                 );
             }
             chunks.push(MiniBlockChunk {
-                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u16],
+                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u32],
                 log_num_values: LOG_ELEMS_PER_CHUNK,
             });
         }
 
         // Handle the last chunk
-        let last_chunk_elem_num = if data.num_values % ELEMS_PER_CHUNK == 0 {
+        let last_chunk_elem_num = if data.num_values.is_multiple_of(ELEMS_PER_CHUNK) {
             ELEMS_PER_CHUNK
         } else {
             data.num_values % ELEMS_PER_CHUNK
@@ -149,7 +148,7 @@ impl InlineBitpacking {
         chunks.push(MiniBlockChunk {
             buffer_sizes: vec![
                 ((1 + packed_chunk_sizes[bit_widths_array.len() - 1]) * std::mem::size_of::<T>())
-                    as u16,
+                    as u32,
             ],
             log_num_values: 0,
         });
@@ -162,7 +161,7 @@ impl InlineBitpacking {
     }
 
     fn chunk_data(&self, data: FixedWidthDataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
-        assert!(data.bits_per_value % 8 == 0);
+        assert!(data.bits_per_value.is_multiple_of(8));
         assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
         let bits_per_value = data.bits_per_value;
         let compressed = match bits_per_value {
@@ -219,14 +218,13 @@ impl MiniBlockCompressor for InlineBitpacking {
     fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with BitpackMiniBlockEncoder",
                     chunk.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
@@ -528,14 +526,14 @@ impl BlockDecompressor for OutOfLineBitpacking {
 mod test {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, Int64Array, Int8Array};
+    use arrow_array::{Array, Int8Array, Int64Array};
     use arrow_schema::DataType;
 
-    use super::{bitpack_out_of_line, unpack_out_of_line, ELEMS_PER_CHUNK};
+    use super::{ELEMS_PER_CHUNK, bitpack_out_of_line, unpack_out_of_line};
     use crate::{
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

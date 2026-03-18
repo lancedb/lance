@@ -7,12 +7,12 @@ use std::{collections::VecDeque, task::Context};
 
 use arrow::compute::kernels;
 use arrow_array::RecordBatch;
-use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::DataFusionError;
-use futures::{ready, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, ready};
 
-use lance_core::error::DataFusionResult;
 use lance_core::Result;
+use lance_core::error::DataFusionResult;
 
 /// Wraps a [`SendableRecordBatchStream`] into a stream of RecordBatch chunks of
 /// a given size.  This slices but does not copy any buffers.
@@ -241,12 +241,12 @@ impl<S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin> StrictBatchSizeStr
 ///
 /// # Example
 /// With batch_size=5 and input sequence:
-/// - Fragment 1: 7 rows → splits into [5,2]
+/// - Fragment 1: 7 rows → splits into `[5,2]`
 ///   (queues 5, carries 2)
 /// - Fragment 2: 4 rows → combines carried 2 + 4 = 6
-///   splits into [5,1]
+///   splits into `[5,1]`
 ///
-/// - Output batches: [5], [5], [1]
+/// - Output batches: `[5]`, `[5]`, `[1]`
 impl<S> Stream for StrictBatchSizeStream<S>
 where
     S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin,
@@ -316,7 +316,7 @@ mod tests {
     use arrow::datatypes::{Int32Type, Int64Type};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt};
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
 
     use crate::datagen::DatafusionDatagenExt;
 

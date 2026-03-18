@@ -12,7 +12,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
-use super::graph::{OrderedFloat, OrderedNode};
+use super::graph::OrderedNode;
 use super::storage::VectorStore;
 
 pub mod builder;
@@ -32,7 +32,7 @@ use std::sync::LazyLock;
 pub static POINTER_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(POINTER_COL, DataType::UInt32, true));
 
-/// Id of the vector in the [VectorStorage].
+/// Id of the vector in the `VectorStorage`.
 pub static VECTOR_ID_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(VECTOR_ID_COL, DataType::UInt32, true));
 
@@ -68,7 +68,7 @@ fn select_neighbors_heuristic(
         return candidates.iter().cloned().collect_vec();
     }
     let mut candidates = candidates.to_vec();
-    candidates.sort_unstable_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+    candidates.sort_unstable();
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);
     for u in candidates.iter() {
@@ -76,11 +76,7 @@ fn select_neighbors_heuristic(
             break;
         }
 
-        if results.is_empty()
-            || results
-                .iter()
-                .all(|v| u.dist < OrderedFloat(storage.dist_between(u.id, v.id)))
-        {
+        if results.is_empty() || storage.prefers_candidate(u, &results) {
             results.push(u.clone());
         }
     }

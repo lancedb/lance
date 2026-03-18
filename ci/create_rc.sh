@@ -78,8 +78,21 @@ else
     echo "Warning: Previous tag not found"
 fi
 
+# Determine release type based on version components
+# - major: X.0.0 releases
+# - minor: X.Y.0 releases where Y > 0
+# - patch: X.Y.Z releases where Z > 0
+if [ "${PATCH}" -gt 0 ]; then
+    RELEASE_TYPE="patch"
+elif [ "${MINOR}" -eq 0 ]; then
+    RELEASE_TYPE="major"
+else
+    RELEASE_TYPE="minor"
+fi
+echo "Release type: ${RELEASE_TYPE}"
+
 echo "Successfully created RC tag: ${RC_TAG}"
 echo "RC_TAG=${RC_TAG}" >> $GITHUB_OUTPUT 2>/dev/null || true
 echo "RC_VERSION=${RC_VERSION}" >> $GITHUB_OUTPUT 2>/dev/null || true
 echo "PREVIOUS_TAG=${PREVIOUS_TAG}" >> $GITHUB_OUTPUT 2>/dev/null || true
-echo "RELEASE_TYPE=patch" >> $GITHUB_OUTPUT 2>/dev/null || true
+echo "RELEASE_TYPE=${RELEASE_TYPE}" >> $GITHUB_OUTPUT 2>/dev/null || true

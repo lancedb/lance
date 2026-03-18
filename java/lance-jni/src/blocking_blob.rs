@@ -5,14 +5,14 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{FromJString, IntoJava};
 use crate::{JNIEnvExt, RT};
+use jni::JNIEnv;
 use jni::objects::{JByteArray, JObject, JString, JValueGen};
 use jni::sys::{jbyteArray, jint, jlong};
-use jni::JNIEnv;
 use lance::dataset::BlobFile;
 use std::mem::transmute;
 use std::sync::Arc;
 
-const BLOB_FILE_CLASS: &str = "com/lancedb/lance/BlobFile";
+const BLOB_FILE_CLASS: &str = "org/lance/BlobFile";
 const BLOB_FILE_CTOR_SIG: &str = "()V";
 const NATIVE_BLOB: &str = "nativeBlobHandle";
 
@@ -34,8 +34,8 @@ impl From<BlobFile> for BlockingBlobFile {
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTakeBlobs<'local>(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeTakeBlobs<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     row_ids_obj: JObject, // List<Long>
@@ -86,8 +86,8 @@ fn transform_vec<'local>(
     Ok(array_list)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTakeBlobsByIndices<'local>(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeTakeBlobsByIndices<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     row_indices_obj: JObject, // List<Long>
@@ -122,8 +122,8 @@ fn inner_take_blobs_by_indices<'local>(
     transform_vec(env, j_blobs)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_BlobFile_nativeRead(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeRead(
     mut env: JNIEnv,
     jblob: JObject,
 ) -> jbyteArray {
@@ -147,8 +147,8 @@ fn inner_blob_read<'local>(env: &mut JNIEnv<'local>, jblob: JObject) -> Result<J
     Ok(arr)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_BlobFile_nativeReadUpTo<'local>(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeReadUpTo<'local>(
     mut env: JNIEnv<'local>,
     jblob: JObject,
     len: jint,
@@ -177,8 +177,8 @@ fn inner_blob_read_up_to<'local>(
     Ok(arr)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_BlobFile_nativeSeek(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeSeek(
     mut env: JNIEnv,
     jblob: JObject,
     new_cursor: jlong,
@@ -192,8 +192,8 @@ fn inner_blob_seek(env: &mut JNIEnv, jblob: JObject, new_cursor: jlong) -> Resul
     Ok(())
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_BlobFile_nativeTell(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeTell(
     mut env: JNIEnv,
     jblob: JObject,
 ) -> jlong {
@@ -205,8 +205,8 @@ fn inner_blob_tell(env: &mut JNIEnv, jblob: JObject) -> Result<u64> {
     Ok(RT.block_on(blob.inner.tell())?)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_BlobFile_nativeSize(
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeSize(
     mut env: JNIEnv,
     jblob: JObject,
 ) -> jlong {
@@ -218,11 +218,8 @@ fn inner_blob_size(env: &mut JNIEnv, jblob: JObject) -> Result<u64> {
     Ok(blob.inner.size())
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_BlobFile_nativeClose(
-    mut env: JNIEnv,
-    jblob: JObject,
-) {
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeClose(mut env: JNIEnv, jblob: JObject) {
     ok_or_throw_without_return!(env, inner_blob_close(&mut env, jblob));
 }
 

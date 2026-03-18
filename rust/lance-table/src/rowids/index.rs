@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use super::{RowIdSequence, U64Segment};
 use deepsize::DeepSizeOf;
+use lance_core::Result;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::Result;
 use rangemap::RangeInclusiveMap;
 
 /// An index of row ids

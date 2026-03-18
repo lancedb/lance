@@ -11,23 +11,23 @@ use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
     physical_plan::{
+        SendableRecordBatchStream,
         metrics::{
             Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet, Time,
         },
         stream::RecordBatchStreamAdapter,
-        SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::Result;
+use lance_core::datatypes::Schema;
 use tokio::task::spawn;
 
 pub mod background_iterator;
 
-/// A trait for [BatchRecord] iterators, readers and streams
-/// that can be converted to a concrete stream type [SendableRecordBatchStream].
+/// A trait for [`RecordBatch`] iterators, readers and streams
+/// that can be converted to a concrete stream type [`SendableRecordBatchStream`].
 ///
 /// This also cam read the schema from the first batch
 /// and then update the schema to reflect the dictionary columns.

@@ -180,12 +180,12 @@ mod tests {
     use std::sync::Arc;
 
     use lance_core::Error;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use rstest::rstest;
 
     use super::*;
     use arrow_array::{
-        types::Int32Type, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array,
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, types::Int32Type,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 
@@ -529,10 +529,13 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err
-            .to_string()
-            .contains("Field 'non_existent_field' not found in schema"));
+        assert!(matches!(err, Error::FieldNotFound { .. }));
+        assert!(
+            err.to_string()
+                .contains("Field 'non_existent_field' not found"),
+            "Expected error message to contain field name, got: {}",
+            err
+        );
     }
 
     #[tokio::test]

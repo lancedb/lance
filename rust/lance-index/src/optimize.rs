@@ -12,7 +12,7 @@ pub struct OptimizeOptions {
     /// will be merged into one single index.
     ///
     /// It is up to the caller to decide how many indices to merge / keep. Callers can
-    /// find out how many indices are there by calling [`Dataset::index_statistics`].
+    /// find out how many indices are there by calling `Dataset::index_statistics`.
     ///
     /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
     /// and accumulate a few delta indices, then merge them into the snapshot.

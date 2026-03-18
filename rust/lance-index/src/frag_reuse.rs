@@ -8,13 +8,12 @@ use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use async_trait::async_trait;
 use deepsize::{Context, DeepSizeOf};
 use itertools::Itertools;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::format::{pb, ExternalFile, Fragment};
+use lance_table::format::{ExternalFile, Fragment, pb};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
@@ -245,8 +244,8 @@ impl FragReuseIndex {
         mapped_value
     }
 
-    pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
-        RowIdTreeMap::from_iter(row_ids.row_ids().unwrap().filter_map(|addr| {
+    pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(row_addrs.row_addrs().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
             self.remap_row_id(addr_as_u64)
         }))
@@ -256,7 +255,7 @@ impl FragReuseIndex {
         RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
-    /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
+    /// Remap a record batch that contains a row_id column at index `row_id_idx`
     /// Currently this assumes there are only 2 columns in the schema,
     /// which is the case for all indexes.
     /// For example, for btree, the schema is (value, row_id).
@@ -328,10 +327,10 @@ impl FragReuseIndex {
                         // and we always reindex either the entire group or nothing.
                         // We use invalid input to be consistent with
                         // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(
-                            format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                    group.old_frags),
-                            location!()));
+                        return Err(Error::invalid_input(format!(
+                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
+                            group.old_frags
+                        )));
                     }
 
                     for new_frag in group.new_frags.iter() {
@@ -360,19 +359,20 @@ impl Index for FragReuseIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::NotSupported {
-            source: "FragReuseIndex is not a vector index".into(),
-            location: location!(),
-        })
+        Err(Error::not_supported_source(
+            "FragReuseIndex is not a vector index".into(),
+        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
         let stats = FragReuseStatistics {
             num_versions: self.details.versions.len(),
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize fragment reuse index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize fragment reuse index statistics: {}",
+                e
+            ))
         })
     }
 

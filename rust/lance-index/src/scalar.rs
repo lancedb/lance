@@ -4,25 +4,25 @@
 //! Scalar indices for metadata search & filtering
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_array::{ListArray, RecordBatch};
+use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion_common::{scalar::ScalarValue, Column};
+use datafusion_common::{Column, scalar::ScalarValue};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
+use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowIdTreeMap;
+use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
@@ -32,13 +32,15 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
-pub mod flat;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 pub mod registry;
+#[cfg(feature = "geo")]
+pub mod rtree;
+pub mod zoned;
 pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -60,6 +62,7 @@ pub enum BuiltinIndexType {
     NGram,
     ZoneMap,
     BloomFilter,
+    RTree,
     Inverted,
 }
 
@@ -73,6 +76,7 @@ impl BuiltinIndexType {
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
+            Self::RTree => "rtree",
         }
     }
 }
@@ -89,10 +93,8 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
-            _ => Err(Error::Index {
-                message: "Invalid index type".to_string(),
-                location: location!(),
-            }),
+            IndexType::RTree => Ok(Self::RTree),
+            _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
 }
@@ -212,7 +214,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
-        -> Result<Box<dyn IndexWriter>>;
+    -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
@@ -494,7 +496,7 @@ impl AnyQuery for LabelListQuery {
                 let offsets_buffer =
                     OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
                 let labels_list = ListArray::try_new(
-                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), true)),
                     offsets_buffer,
                     labels_arr,
                     None,
@@ -514,7 +516,7 @@ impl AnyQuery for LabelListQuery {
                 let offsets_buffer =
                     OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
                 let labels_list = ListArray::try_new(
-                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), true)),
                     offsets_buffer,
                     labels_arr,
                     None,
@@ -680,28 +682,92 @@ impl AnyQuery for TokenQuery {
     }
 }
 
+#[cfg(feature = "geo")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationQuery {
+    pub value: ScalarValue,
+    pub field: Field,
+}
+
+/// A query that a Geo index can satisfy
+#[cfg(feature = "geo")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeoQuery {
+    IntersectQuery(RelationQuery),
+    IsNull,
+}
+
+#[cfg(feature = "geo")]
+impl AnyQuery for GeoQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::IntersectQuery(query) => {
+                format!("Intersect({} {})", col, query.value)
+            }
+            Self::IsNull => {
+                format!("{} IS NULL", col)
+            }
+        }
+    }
+
+    fn to_expr(&self, _col: String) -> Expr {
+        todo!()
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
 /// The result of a search operation against a scalar index
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
-    Exact(RowIdTreeMap),
+    Exact(NullableRowAddrSet),
     /// Any row id satisfying the query will be in this set but not every
     /// row id in this set will satisfy the query, a further recheck step
     /// is needed
-    AtMost(RowIdTreeMap),
+    AtMost(NullableRowAddrSet),
     /// All of the given row ids satisfy the query but there may be more
     ///
     /// No scalar index actually returns this today but it can arise from
     /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
-    AtLeast(RowIdTreeMap),
+    AtLeast(NullableRowAddrSet),
 }
 
 impl SearchResult {
-    pub fn row_ids(&self) -> &RowIdTreeMap {
+    pub fn exact(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::Exact(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn at_most(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::AtMost(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn at_least(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::AtLeast(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn with_nulls(self, nulls: impl Into<RowAddrTreeMap>) -> Self {
         match self {
-            Self::Exact(row_ids) => row_ids,
-            Self::AtMost(row_ids) => row_ids,
-            Self::AtLeast(row_ids) => row_ids,
+            Self::Exact(row_ids) => Self::Exact(row_ids.with_nulls(nulls.into())),
+            Self::AtMost(row_ids) => Self::AtMost(row_ids.with_nulls(nulls.into())),
+            Self::AtLeast(row_ids) => Self::AtLeast(row_ids.with_nulls(nulls.into())),
+        }
+    }
+
+    pub fn row_addrs(&self) -> &NullableRowAddrSet {
+        match self {
+            Self::Exact(row_addrs) => row_addrs,
+            Self::AtMost(row_addrs) => row_addrs,
+            Self::AtLeast(row_addrs) => row_addrs,
         }
     }
 
@@ -731,6 +797,41 @@ pub struct UpdateCriteria {
     pub requires_old_data: bool,
     /// The criteria required for data (both old and new)
     pub data_criteria: TrainingCriteria,
+}
+
+/// Filter used when merging existing scalar-index rows during update.
+///
+/// The caller must pick a filter mode that matches the row-id semantics of the
+/// dataset:
+/// - address-style row IDs: fragment filtering is valid
+/// - stable row IDs: use exact row-id membership instead
+#[derive(Debug, Clone)]
+pub enum OldIndexDataFilter {
+    /// Keep old rows whose row-address fragment is in this bitmap.
+    ///
+    /// This is valid for address-style row IDs.
+    Fragments(RoaringBitmap),
+    /// Keep old rows whose row IDs are in this exact allow-list.
+    ///
+    /// This is required for stable row IDs, where row IDs are opaque and
+    /// should not be interpreted as encoded row addresses.
+    RowIds(RowAddrTreeMap),
+}
+
+impl OldIndexDataFilter {
+    /// Build a boolean mask that keeps only row IDs selected by this filter.
+    pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
+        match self {
+            Self::Fragments(valid_fragments) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+                .collect(),
+            Self::RowIds(valid_row_ids) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_row_ids.contains(id)))
+                .collect(),
+        }
+    }
 }
 
 impl UpdateCriteria {
@@ -772,10 +873,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<CreatedIndex>;
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    ///
+    /// If `old_data_filter` is provided, old index data will be filtered before
+    /// merge according to the chosen filter mode.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index

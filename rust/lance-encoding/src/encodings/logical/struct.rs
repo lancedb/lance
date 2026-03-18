@@ -7,6 +7,10 @@ use std::{
     sync::Arc,
 };
 
+use super::{
+    fixed_size_list::StructuralFixedSizeListDecoder, list::StructuralListDecoder,
+    map::StructuralMapDecoder, primitive::StructuralPrimitiveFieldDecoder,
+};
 use crate::{
     decoder::{
         DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
@@ -17,20 +21,18 @@ use crate::{
     format::pb,
     repdef::{CompositeRepDefUnraveler, RepDefBuilder},
 };
-use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray, cast::AsArray};
 use arrow_schema::{DataType, Fields};
 use futures::{
+    FutureExt, StreamExt, TryStreamExt,
     future::BoxFuture,
     stream::{FuturesOrdered, FuturesUnordered},
-    FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use log::trace;
-
-use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
 #[derive(Debug)]
 struct StructuralSchedulingJobWithStatus<'a> {
@@ -143,8 +145,7 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
             let child_scan = next_child.ready_scan_lines.pop_front().unwrap();
             trace!(
                 "Scheduled {} rows for child {}",
-                child_scan.rows_scheduled,
-                next_child.col_idx
+                child_scan.rows_scheduled, next_child.col_idx
             );
             next_child.rows_scheduled += child_scan.rows_scheduled;
             next_child.rows_remaining -= child_scan.rows_scheduled;
@@ -237,46 +238,72 @@ pub struct StructuralStructDecoder {
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Self {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Result<Self> {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let data_type = DataType::Struct(fields.clone());
-        Self {
+        Ok(Self {
             data_type,
             children,
             child_fields: fields,
             is_root,
-        }
+        })
     }
 
     fn field_to_decoder(
         field: &Arc<arrow_schema::Field>,
         should_validate: bool,
-    ) -> Box<dyn StructuralFieldDecoder> {
+    ) -> Result<Box<dyn StructuralFieldDecoder>> {
         match field.data_type() {
             DataType::Struct(fields) => {
                 if field.is_packed_struct() || field.is_blob() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
-                    Box::new(decoder)
+                    Ok(Box::new(decoder))
                 } else {
-                    Box::new(Self::new(fields.clone(), should_validate, false))
+                    Ok(Box::new(Self::new(fields.clone(), should_validate, false)?))
                 }
             }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
-                let child_decoder = Self::field_to_decoder(child_field, should_validate);
-                Box::new(StructuralListDecoder::new(
+                let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
+                Ok(Box::new(StructuralListDecoder::new(
                     child_decoder,
                     field.data_type().clone(),
-                ))
+                )))
+            }
+            DataType::FixedSizeList(child_field, _)
+                if matches!(child_field.data_type(), DataType::Struct(_)) =>
+            {
+                // FixedSizeList containing Struct needs structural decoding
+                let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
+                Ok(Box::new(StructuralFixedSizeListDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                )))
+            }
+            DataType::Map(entries_field, keys_sorted) => {
+                if *keys_sorted {
+                    return Err(Error::not_supported_source(
+                        "Map data type with keys_sorted=true is not supported yet"
+                            .to_string()
+                            .into(),
+                    ));
+                }
+                let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
+                Ok(Box::new(StructuralMapDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                )))
             }
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
-            DataType::Map(_, _) => todo!(),
             DataType::Union(_, _) => todo!(),
-            _ => Box::new(StructuralPrimitiveFieldDecoder::new(field, should_validate)),
+            _ => Ok(Box::new(StructuralPrimitiveFieldDecoder::new(
+                field,
+                should_validate,
+            ))),
         }
     }
 
@@ -359,7 +386,8 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::new(self.child_fields, children, validity);
+        let array = StructArray::try_new(self.child_fields, children, validity)
+            .map_err(|e| Error::invalid_input_source(e.to_string().into()))?;
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,
@@ -563,14 +591,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
         Array, ArrayRef, Int32Array, ListArray, StructArray,
+        builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
     use crate::{
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 
@@ -741,6 +769,40 @@ mod tests {
         ]));
         let field = Field::new("row", data_type, false);
         check_basic_random(field).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_of_struct_with_null_struct_element() {
+        // Regression: a list containing structs where most struct elements are null
+        // causes a length mismatch during decoding with V2_2 encoding.
+        use arrow_array::StringArray;
+
+        let tag_array = StringArray::from(vec![
+            Some("valid"),
+            Some("null_struct"),
+            Some("valid"),
+            Some("valid"),
+        ]);
+        let struct_fields = Fields::from(vec![Field::new("tag", DataType::Utf8, true)]);
+        // 3 out of 4 struct elements are null
+        let struct_validity = NullBuffer::from(vec![false, true, false, false]);
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(tag_array)],
+            Some(struct_validity),
+        );
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 4]));
+        let list_field = Field::new("item", DataType::Struct(struct_fields), true);
+        let list_array =
+            ListArray::new(Arc::new(list_field), offsets, Arc::new(struct_array), None);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array)],
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]

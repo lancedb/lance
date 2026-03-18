@@ -4,11 +4,10 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, cast::AsArray};
 use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use snafu::location;
 use tracing::instrument;
 
 use super::ProductQuantizer;
@@ -52,21 +51,17 @@ impl Transformer for PQTransformer {
         }
         let input_arr = batch
             .column_by_name(&self.input_column)
-            .ok_or(Error::Index {
-                message: format!(
-                    "PQ Transform: column {} not found in batch",
-                    self.input_column
-                ),
-                location: location!(),
-            })?;
-        let data = input_arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
+            .ok_or(Error::index(format!(
+                "PQ Transform: column {} not found in batch",
+                self.input_column
+            )))?;
+        let data = input_arr
+            .as_fixed_size_list_opt()
+            .ok_or(Error::index(format!(
                 "PQ Transform: column {} is not a fixed size list, got {}",
                 self.input_column,
                 input_arr.data_type(),
-            ),
-            location: location!(),
-        })?;
+            )))?;
         let pq_code = self.quantizer.quantize(&data)?;
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;

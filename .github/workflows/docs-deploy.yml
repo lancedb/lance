@@ -24,32 +24,47 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Checkout lance-spark
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: lancedb/lance-spark
           path: lance-spark
       - name: Checkout lance-namespace
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: lancedb/lance-namespace
           path: lance-namespace
       - name: Checkout lance-ray
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: lancedb/lance-ray
           path: lance-ray
+      - name: Checkout lance-huggingface
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-huggingface
+          path: lance-huggingface
+      - name: Checkout lance-namespace-impls
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-namespace-impls
+          path: lance-namespace-impls
+      - name: Checkout lance-trino
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-trino
+          path: lance-trino
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
       - name: "Set up Python"
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version-file: "docs/pyproject.toml"
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
       - name: Copy lance-namespace docs
@@ -59,6 +74,20 @@ jobs:
             - Namespace Spec: namespace
           EOF
           cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
+      - name: Copy lance-namespace-impls docs
+        run: |
+          # Copy implementation specs to the integrations folder
+          cp lance-namespace-impls/docs/src/*.md docs/src/format/namespace/integrations/
+
+          # Copy .pages from lance-namespace-impls and append template entry
+          cp lance-namespace-impls/docs/src/.pages docs/src/format/namespace/integrations/.pages
+          echo "  - Template for New Integrations: template.md" >> docs/src/format/namespace/integrations/.pages
+      - name: Copy lance-huggingface docs
+        run: |
+          cp -r lance-huggingface/docs/src docs/src/integrations/huggingface
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Huggingface: huggingface
+          EOF
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark
@@ -70,6 +99,51 @@ jobs:
           cp -r lance-ray/docs/src docs/src/integrations/ray
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
+          EOF
+      - name: Copy lance-trino docs
+        run: |
+          cp -r lance-trino/docs/src docs/src/integrations/trino
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Trino: trino
+          EOF
+      - name: Copy contributing docs
+        run: |
+          mkdir -p docs/src/community/project-specific/lance
+
+          # Lance project files
+          cp CONTRIBUTING.md docs/src/community/project-specific/lance/general.md
+          cp release_process.md docs/src/community/project-specific/lance/release.md
+          cp rust/CONTRIBUTING.md docs/src/community/project-specific/lance/rust.md
+          cp python/CONTRIBUTING.md docs/src/community/project-specific/lance/python.md
+          cp docs/CONTRIBUTING.md docs/src/community/project-specific/lance/docs.md
+
+          # External project files
+          cp lance-ray/CONTRIBUTING.md docs/src/community/project-specific/ray.md
+          cp lance-spark/CONTRIBUTING.md docs/src/community/project-specific/spark.md
+          cp lance-namespace/CONTRIBUTING.md docs/src/community/project-specific/namespace.md
+          cp lance-namespace-impls/CONTRIBUTING.md docs/src/community/project-specific/namespace-impls.md || true
+          cp lance-trino/CONTRIBUTING.md docs/src/community/project-specific/trino.md
+
+          # Create .pages for project-specific
+          cat > docs/src/community/project-specific/.pages << 'EOF'
+          nav:
+            - index.md
+            - Lance: lance
+            - Lance Namespace: namespace.md
+            - Lance Namespace Impls: namespace-impls.md
+            - Lance Ray: ray.md
+            - Lance Spark: spark.md
+            - Lance Trino: trino.md
+          EOF
+
+          # Create .pages for lance subfolder
+          cat > docs/src/community/project-specific/lance/.pages << 'EOF'
+          nav:
+            - General: general.md
+            - Release: release.md
+            - Rust: rust.md
+            - Python: python.md
+            - Docs: docs.md
           EOF
       - name: Deploy
         working-directory: docs

@@ -10,20 +10,20 @@ use std::sync::{Arc, LazyLock};
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use deepsize::DeepSizeOf;
-use lance_arrow::bfloat16::{is_bfloat16_field, BFLOAT16_EXT_NAME};
+use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
-use snafu::location;
 
 mod field;
 mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
+    BlobVersion, Encoding, Field, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
+    OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,
-    OnMissing, Projectable, Projection, Schema,
+    BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
+    escape_field_path_for_project, format_field_path, parse_field_path,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -49,10 +49,10 @@ pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
 pub static BLOB_V2_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
         ArrowField::new("kind", DataType::UInt8, false),
-        ArrowField::new("position", DataType::UInt64, true),
-        ArrowField::new("size", DataType::UInt64, true),
-        ArrowField::new("blob_id", DataType::UInt32, true),
-        ArrowField::new("blob_uri", DataType::Utf8, true),
+        ArrowField::new("position", DataType::UInt64, false),
+        ArrowField::new("size", DataType::UInt64, false),
+        ArrowField::new("blob_id", DataType::UInt32, false),
+        ArrowField::new("blob_uri", DataType::Utf8, false),
     ])
 });
 
@@ -60,8 +60,9 @@ pub static BLOB_V2_DESC_TYPE: LazyLock<DataType> =
     LazyLock::new(|| DataType::Struct(BLOB_V2_DESC_FIELDS.clone()));
 
 pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
-    ArrowField::new("description", BLOB_V2_DESC_TYPE.clone(), true).with_metadata(HashMap::from([
+    ArrowField::new("description", BLOB_V2_DESC_TYPE.clone(), false).with_metadata(HashMap::from([
         (lance_arrow::BLOB_META_KEY.to_string(), "true".to_string()),
+        ("lance-encoding:packed".to_string(), "true".to_string()),
     ]))
 });
 
@@ -90,12 +91,20 @@ impl LogicalType {
         self.0 == "large_list" || self.0 == "large_list.struct"
     }
 
+    fn is_fixed_size_list_struct(&self) -> bool {
+        self.0.starts_with("fixed_size_list:struct:")
+    }
+
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
 
     fn is_blob(&self) -> bool {
         self.0 == BLOB_LOGICAL_TYPE
+    }
+
+    fn is_map(&self) -> bool {
+        self.0 == "map"
     }
 }
 
@@ -120,10 +129,7 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
         "ms" => Ok(TimeUnit::Millisecond),
         "us" => Ok(TimeUnit::Microsecond),
         "ns" => Ok(TimeUnit::Nanosecond),
-        _ => Err(Error::Arrow {
-            message: format!("Unsupported TimeUnit: {unit}"),
-            location: location!(),
-        }),
+        _ => Err(Error::arrow(format!("Unsupported TimeUnit: {unit}"))),
     }
 }
 
@@ -195,11 +201,20 @@ impl TryFrom<&DataType> for LogicalType {
                 }
             }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
+            DataType::Map(_, keys_sorted) => {
+                // TODO: We only support keys_sorted=false for now,
+                //  because converting a rust arrow map field to the python arrow field will
+                //  lose the keys_sorted property.
+                if *keys_sorted {
+                    return Err(Error::schema(format!(
+                        "Unsupported map data type with keys_sorted=true: {:?}",
+                        dt
+                    )));
+                }
+                "map".to_string()
+            }
             _ => {
-                return Err(Error::Schema {
-                    message: format!("Unsupported data type: {:?}", dt),
-                    location: location!(),
-                })
+                return Err(Error::schema(format!("Unsupported data type: {:?}", dt)));
             }
         };
 
@@ -250,21 +265,14 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() < 3 {
-                        return Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(format!("Unsupported logical type: {}", lt)));
                     }
 
-                    let size: i32 =
-                        splits
-                            .last()
-                            .unwrap()
-                            .parse::<i32>()
-                            .map_err(|e: _| Error::Schema {
-                                message: e.to_string(),
-                                location: location!(),
-                            })?;
+                    let size: i32 = splits
+                        .last()
+                        .unwrap()
+                        .parse::<i32>()
+                        .map_err(|e: _| Error::schema(e.to_string()))?;
 
                     let inner_type = splits[1..splits.len() - 1].join(":");
 
@@ -292,24 +300,20 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
-                            location: location!(),
-                        })
+                        Err(Error::schema(format!("Unsupported logical type: {}", lt)))
                     } else {
-                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| Error::Schema {
-                            message: e.to_string(),
-                            location: location!(),
-                        })?;
+                        let size: i32 = splits[1]
+                            .parse::<i32>()
+                            .map_err(|e: _| Error::schema(e.to_string()))?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
                 "dict" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported dictionary type: {}", lt),
-                            location: location!(),
-                        })
+                        Err(Error::schema(format!(
+                            "Unsupported dictionary type: {}",
+                            lt
+                        )))
                     } else {
                         let value_type: Self = (&LogicalType::from(splits[1])).try_into()?;
                         let index_type: Self = (&LogicalType::from(splits[2])).try_into()?;
@@ -318,45 +322,32 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "decimal" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported decimal type: {}", lt),
-                            location: location!(),
-                        })
+                        Err(Error::schema(format!("Unsupported decimal type: {}", lt)))
                     } else {
-                        let bits: i16 = splits[1].parse::<i16>().map_err(|err| Error::Schema {
-                            message: err.to_string(),
-                            location: location!(),
-                        })?;
-                        let precision: u8 =
-                            splits[2].parse::<u8>().map_err(|err| Error::Schema {
-                                message: err.to_string(),
-                                location: location!(),
-                            })?;
-                        let scale: i8 = splits[3].parse::<i8>().map_err(|err| Error::Schema {
-                            message: err.to_string(),
-                            location: location!(),
-                        })?;
+                        let bits: i16 = splits[1]
+                            .parse::<i16>()
+                            .map_err(|err| Error::schema(err.to_string()))?;
+                        let precision: u8 = splits[2]
+                            .parse::<u8>()
+                            .map_err(|err| Error::schema(err.to_string()))?;
+                        let scale: i8 = splits[3]
+                            .parse::<i8>()
+                            .map_err(|err| Error::schema(err.to_string()))?;
 
                         if bits == 128 {
                             Ok(Decimal128(precision, scale))
                         } else if bits == 256 {
                             Ok(Decimal256(precision, scale))
                         } else {
-                            Err(Error::Schema {
-                                message: format!(
-                                    "Only Decimal128 and Decimal256 is supported. Found {bits}"
-                                ),
-                                location: location!(),
-                            })
+                            Err(Error::schema(format!(
+                                "Only Decimal128 and Decimal256 is supported. Found {bits}"
+                            )))
                         }
                     }
                 }
                 "timestamp" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported timestamp type: {}", lt),
-                            location: location!(),
-                        })
+                        Err(Error::schema(format!("Unsupported timestamp type: {}", lt)))
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
                         let tz: Option<Arc<str>> = if splits[2] == "-" {
@@ -367,10 +358,7 @@ impl TryFrom<&LogicalType> for DataType {
                         Ok(Timestamp(timeunit, tz))
                     }
                 }
-                _ => Err(Error::Schema {
-                    message: format!("Unsupported logical type: {}", lt),
-                    location: location!(),
-                }),
+                _ => Err(Error::schema(format!("Unsupported logical type: {}", lt))),
             }
         }
     }
@@ -403,15 +391,39 @@ impl PartialEq for Dictionary {
     }
 }
 
-/// Returns true if Lance supports writing this datatype with nulls.
-pub fn lance_supports_nulls(datatype: &DataType) -> bool {
-    matches!(
-        datatype,
-        DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::List(_)
-            | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _)
-    )
+/// Physical storage mode for blob v2 descriptors (one byte, stored in the packed struct column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlobKind {
+    /// Stored in the main data file’s out-of-line buffer; `position`/`size` point into that file.
+    Inline = 0,
+    /// Stored in a shared packed blob file; `position`/`size` locate the slice, `blob_id` selects the file.
+    Packed = 1,
+    /// Stored in a dedicated raw blob file; `blob_id` identifies the file, `size` is the full file length.
+    Dedicated = 2,
+    /// Not stored by Lance data files.
+    ///
+    /// For external blobs:
+    /// - `blob_id == 0` means `blob_uri` is an absolute external URI.
+    /// - `blob_id > 0` means `blob_uri` is a path relative to `manifest.base_paths[blob_id]`.
+    ///
+    /// External blobs can have a position and a size. If the position is not set,
+    /// it defaults to 0, which points to the beginning of the blob.
+    External = 3,
+}
+
+impl TryFrom<u8> for BlobKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Inline),
+            1 => Ok(Self::Packed),
+            2 => Ok(Self::Dedicated),
+            3 => Ok(Self::External),
+            other => Err(Error::invalid_input_source(
+                format!("Unknown blob kind {other:?}").into(),
+            )),
+        }
+    }
 }

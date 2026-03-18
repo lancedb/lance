@@ -11,21 +11,25 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, stream};
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
+use lance_core::datatypes::Field;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
     TRACE_IO_EVENTS,
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
-use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
-use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
+pub use lance_index::IndexParams;
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
+pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::expression::{
     IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
 };
@@ -38,21 +42,17 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-pub use lance_index::IndexParams;
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription};
+use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
-    is_system_index,
+    IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
-    IndexCriteria,
-};
-use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
-use lance_index::{
-    DatasetIndexExt, IndexDescription, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
-    read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
-    CachedFileSize,
+    CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
+    read_version,
 };
 use lance_table::format::IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
@@ -60,7 +60,6 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
 use serde_json::json;
-use snafu::location;
 use tracing::{info, instrument};
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
@@ -77,15 +76,15 @@ pub mod vector;
 use self::append::merge_indices;
 use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::optimize::RemappedIndex;
+use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
-use crate::index::scalar::{fetch_index_details, load_training_data, IndexDetails};
+use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
-use crate::{dataset::Dataset, Error, Result};
+use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 
 // Cache keys for different index types
@@ -188,12 +187,46 @@ impl CacheKey for MemWalCacheKey<'_> {
 // Whether to auto-migrate a dataset when we encounter corruption.
 fn auto_migrate_corruption() -> bool {
     static LANCE_AUTO_MIGRATION: OnceLock<bool> = OnceLock::new();
-    *LANCE_AUTO_MIGRATION.get_or_init(|| {
-        std::env::var("LANCE_AUTO_MIGRATION")
-            .ok()
-            .map(|s| str_is_truthy(&s))
-            .unwrap_or(true)
-    })
+    *LANCE_AUTO_MIGRATION.get_or_init(|| parse_env_as_bool("LANCE_AUTO_MIGRATION", true))
+}
+
+/// Derive a friendly (but not necessarily unique) type name from a type URL.
+/// Extract a human-friendly type name from a type URL.
+///
+/// Strips prefixes like `type.googleapis.com/` and package names, then removes
+/// trailing `IndexDetails` / `Index` so callers get a concise display name.
+fn type_name_from_uri(index_uri: &str) -> String {
+    let type_name = index_uri.rsplit('/').next().unwrap_or(index_uri);
+    let type_name = type_name.rsplit('.').next().unwrap_or(type_name);
+    type_name.trim_end_matches("IndexDetails").to_string()
+}
+
+/// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
+/// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
+///
+/// If `index_type_hint` is provided (e.g. parsed from the index statistics of a concrete
+/// index instance), it takes precedence so callers can surface the exact index type even
+/// when the type URL alone is too generic (such as VectorIndexDetails).
+fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
+    if let Some(hint) = index_type_hint {
+        return hint.to_string();
+    }
+
+    let base = type_name_from_uri(index_uri);
+
+    match base.as_str() {
+        "BTree" => IndexType::BTree.to_string(),
+        "Bitmap" => IndexType::Bitmap.to_string(),
+        "LabelList" => IndexType::LabelList.to_string(),
+        "NGram" => IndexType::NGram.to_string(),
+        "ZoneMap" => IndexType::ZoneMap.to_string(),
+        "BloomFilter" => IndexType::BloomFilter.to_string(),
+        "Inverted" => IndexType::Inverted.to_string(),
+        "Json" => IndexType::Scalar.to_string(),
+        "Flat" | "Vector" => IndexType::Vector.to_string(),
+        other if other.contains("Vector") => IndexType::Vector.to_string(),
+        _ => "N/A".to_string(),
+    }
 }
 
 /// Builds index.
@@ -214,16 +247,12 @@ pub(crate) async fn remap_index(
     let matched = indices
         .iter()
         .find(|i| i.uuid == *index_id)
-        .ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", index_id),
-            location: location!(),
-        })?;
+        .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
 
     if matched.fields.len() > 1 {
-        return Err(Error::Index {
-            message: "Remapping indices with multiple fields is not supported".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Remapping indices with multiple fields is not supported".to_string(),
+        ));
     }
 
     if row_id_map.values().all(|v| v.is_none()) {
@@ -250,9 +279,22 @@ pub(crate) async fn remap_index(
 
     let new_id = Uuid::new_v4();
 
-    let generic = dataset
+    let generic = match dataset
         .open_generic_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
-        .await?;
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!(
+                "Cannot open index '{}' on '{}': {}. \
+                 Index will be dropped during compaction.",
+                index_id,
+                field_path,
+                e
+            );
+            return Ok(RemapResult::Drop);
+        }
+    };
 
     let created_index = match generic.index_type() {
         it if it.is_scalar() => {
@@ -270,12 +312,10 @@ pub(crate) async fn remap_index(
                     let inverted_index = scalar_index
                         .as_any()
                         .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
-                        .ok_or(Error::Index {
-                            message: "expected inverted index".to_string(),
-                            location: location!(),
-                        })?;
+                        .ok_or(Error::index("expected inverted index".to_string()))?;
                     if inverted_index.is_legacy() {
-                        log::warn!("reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
+                        log::warn!(
+                            "reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
                             scalar_index.index_type(),
                             index_id,
                             field_path
@@ -294,6 +334,7 @@ pub(crate) async fn remap_index(
                             &new_store,
                             inverted_index.params().clone(),
                             None,
+                            Arc::new(NoopIndexBuildProgress),
                         )
                         .await?
                     } else {
@@ -304,6 +345,12 @@ pub(crate) async fn remap_index(
             }
         }
         it if it.is_vector() => {
+            let index_version = u32::try_from(matched.index_version).map_err(|_| {
+                Error::index(format!(
+                    "Invalid vector index version {} on index {}",
+                    matched.index_version, matched.name
+                ))
+            })?;
             remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field_path,
@@ -318,14 +365,14 @@ pub(crate) async fn remap_index(
                     &lance_table::format::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
-                index_version: VECTOR_INDEX_VERSION,
+                index_version,
             }
         }
         _ => {
-            return Err(Error::Index {
-                message: format!("Index type {} is not supported", generic.index_type()),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index type {} is not supported",
+                generic.index_type()
+            )));
         }
     };
 
@@ -379,12 +426,9 @@ struct IndexDescriptionImpl {
 }
 
 impl IndexDescriptionImpl {
-    fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
+    async fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
         if segments.is_empty() {
-            return Err(Error::Index {
-                message: "Index metadata is empty".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index("Index metadata is empty".to_string()));
         }
 
         // We assume the type URL and details are the same for all segments
@@ -392,28 +436,22 @@ impl IndexDescriptionImpl {
 
         let name = example_metadata.name.clone();
         if !segments.iter().all(|shard| shard.name == name) {
-            return Err(Error::Index {
-                message: "Index name should be identical across all segments".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Index name should be identical across all segments".to_string(),
+            ));
         }
 
         let field_ids = &example_metadata.fields;
         if !segments.iter().all(|shard| shard.fields == *field_ids) {
-            return Err(Error::Index {
-                message: "Index fields should be identical across all segments".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Index fields should be identical across all segments".to_string(),
+            ));
         }
-        let field_ids = field_ids.iter().map(|id| *id as u32).collect();
+        let field_ids_vec: Vec<u32> = field_ids.iter().map(|id| *id as u32).collect();
 
         // This should not fail as we have already filtered out indexes without index details.
-        let index_details = example_metadata.index_details.as_ref().ok_or(Error::Index {
-            message:
-                "Index details are required for index description.  This index must be retrained to support this method."
-                    .to_string(),
-            location: location!(),
-        })?;
+        let index_details = example_metadata.index_details.as_ref().ok_or(Error::index("Index details are required for index description.  This index must be retrained to support this method."
+            .to_string()))?;
         let type_url = &index_details.type_url;
         if !segments.iter().all(|shard| {
             shard
@@ -422,29 +460,54 @@ impl IndexDescriptionImpl {
                 .map(|d| d.type_url == *type_url)
                 .unwrap_or(false)
         }) {
-            return Err(Error::Index {
-                message: "Index type URL should be present and identical across all segments"
-                    .to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "Index type URL should be present and identical across all segments".to_string(),
+            ));
         }
 
         let details = IndexDetails(index_details.clone());
         let mut rows_indexed = 0;
 
-        let index_type = details
-            .get_plugin()
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
+        // Vector indices need to be opened to get the correct type
+        let index_type = if details.is_vector() {
+            let column = field_ids
+                .first()
+                .and_then(|id| dataset.schema().field_by_id(*id))
+                .map(|f| f.name.clone())
+                .ok_or_else(|| {
+                    Error::index("Cannot determine column name for vector index".to_string())
+                })?;
+
+            match dataset
+                .open_generic_index(
+                    &column,
+                    &example_metadata.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await
+            {
+                Ok(idx) => idx.index_type().to_string(),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to open vector index {} to determine type: {}",
+                        name,
+                        e
+                    );
+                    "Unknown".to_string()
+                }
+            }
+        } else {
+            details
+                .get_plugin()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|_| "Unknown".to_string())
+        };
 
         for shard in &segments {
             let fragment_bitmap = shard
             .fragment_bitmap
             .as_ref()
-            .ok_or_else(|| Error::Index {
-                message: "Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string(),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()))?;
 
             for fragment in dataset.get_fragments() {
                 if fragment_bitmap.contains(fragment.id() as u32) {
@@ -455,7 +518,7 @@ impl IndexDescriptionImpl {
 
         Ok(Self {
             name,
-            field_ids,
+            field_ids: field_ids_vec,
             index_type,
             segments,
             details,
@@ -553,7 +616,7 @@ impl DatasetIndexExt for Dataset {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<()> {
+    ) -> Result<IndexMetadata> {
         // Use the builder pattern with default train=true for backward compatibility
         let mut builder = self.create_index_builder(columns, index_type, params);
 
@@ -567,10 +630,7 @@ impl DatasetIndexExt for Dataset {
     async fn drop_index(&mut self, name: &str) -> Result<()> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", name)));
         }
 
         let transaction = Transaction::new(
@@ -591,16 +651,15 @@ impl DatasetIndexExt for Dataset {
     async fn prewarm_index(&self, name: &str) -> Result<()> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", name)));
         }
 
-        let index = self
-            .open_generic_index(name, &indices[0].uuid.to_string(), &NoOpMetricsCollector)
-            .await?;
-        index.prewarm().await?;
+        for index_meta in indices {
+            let index = self
+                .open_generic_index(name, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+                .await?;
+            index.prewarm().await?;
+        }
 
         Ok(())
     }
@@ -634,16 +693,19 @@ impl DatasetIndexExt for Dataset {
         };
         indices.sort_by_key(|idx| &idx.name);
 
-        indices
+        let grouped: Vec<Vec<IndexMetadata>> = indices
             .into_iter()
-            .chunk_by(|idx| &idx.name)
+            .chunk_by(|idx| idx.name.clone())
             .into_iter()
-            .map(|(_, segments)| {
-                let segments = segments.cloned().collect::<Vec<_>>();
-                let desc = IndexDescriptionImpl::try_new(segments, self)?;
-                Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
-            })
-            .collect::<Result<Vec<_>>>()
+            .map(|(_, segments)| segments.cloned().collect::<Vec<_>>())
+            .collect();
+
+        let mut results = Vec::with_capacity(grouped.len());
+        for segments in grouped {
+            let desc = IndexDescriptionImpl::try_new(segments, self).await?;
+            results.push(Arc::new(desc) as Arc<dyn IndexDescription>);
+        }
+        Ok(results)
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
@@ -700,10 +762,9 @@ impl DatasetIndexExt for Dataset {
         index_id: Uuid,
     ) -> Result<()> {
         let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column}' does not exist"
+            )));
         };
 
         // TODO: We will need some way to determine the index details here.  Perhaps
@@ -770,29 +831,29 @@ impl DatasetIndexExt for Dataset {
             let has_multiple = indices.len() > 1;
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
-                if let Some(field) = field {
-                    if index_matches_criteria(
+                if let Some(field) = field
+                    && index_matches_criteria(
                         idx,
                         &criteria,
                         &[field],
                         has_multiple,
                         self.schema(),
-                    )? {
-                        let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                            bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
-                        });
-                        let is_fts_index = if let Some(details) = &idx.index_details {
-                            IndexDetails(details.clone()).supports_fts()
-                        } else {
-                            false
-                        };
-                        // FTS indices must always be returned even if empty, because FTS queries
-                        // require an index to exist. The query execution will handle the empty
-                        // bitmap appropriately and fall back to scanning unindexed data.
-                        // Other index types can be skipped if empty since they're optional optimizations.
-                        if non_empty || is_fts_index {
-                            return Ok(Some(idx.clone()));
-                        }
+                    )?
+                {
+                    let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                        bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                    });
+                    let is_fts_index = if let Some(details) = &idx.index_details {
+                        IndexDetails(details.clone()).supports_fts()
+                    } else {
+                        false
+                    };
+                    // FTS indices must always be returned even if empty, because FTS queries
+                    // require an index to exist. The query execution will handle the empty
+                    // bitmap appropriately and fall back to scanning unindexed data.
+                    // Other index types can be skipped if empty since they're optional optimizations.
+                    if non_empty || is_fts_index {
+                        return Ok(Some(idx.clone()));
                     }
                 }
             }
@@ -841,13 +902,6 @@ impl DatasetIndexExt for Dataset {
                 base_id: None, // Mew merged index file locates in the cloned dataset.
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            if deltas.len() > res.removed_indices.len() {
-                new_indices.extend(
-                    deltas[0..(deltas.len() - res.removed_indices.len())]
-                        .iter()
-                        .map(|&idx| idx.clone()),
-                );
-            }
             new_indices.push(new_idx);
         }
 
@@ -873,149 +927,20 @@ impl DatasetIndexExt for Dataset {
     async fn index_statistics(&self, index_name: &str) -> Result<String> {
         let metadatas = self.load_indices_by_name(index_name).await?;
         if metadatas.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", index_name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", index_name)));
         }
 
         if index_name == FRAG_REUSE_INDEX_NAME {
-            let index = self
-                .open_frag_reuse_index(&NoOpMetricsCollector)
-                .await?
-                .expect("FragmentReuse index does not exist");
-            return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
-                message: format!("Failed to serialize index statistics: {}", e),
-                location: location!(),
-            });
+            return index_statistics_frag_reuse(self).boxed().await;
         }
 
         if index_name == MEM_WAL_INDEX_NAME {
-            let index = self
-                .open_mem_wal_index(&NoOpMetricsCollector)
-                .await?
-                .expect("MemWal index does not exist");
-            return serde_json::to_string(&index.statistics()?).map_err(|e| Error::Index {
-                message: format!("Failed to serialize index statistics: {}", e),
-                location: location!(),
-            });
+            return index_statistics_mem_wal(self).boxed().await;
         }
 
-        let field_id = metadatas[0].fields[0];
-        let field_path = self.schema().field_path(field_id)?;
-
-        // Open all delta indices
-        let indices = stream::iter(metadatas.iter())
-            .then(|m| {
-                let field_path = field_path.clone();
-                async move {
-                    self.open_generic_index(&field_path, &m.uuid.to_string(), &NoOpMetricsCollector)
-                        .await
-                }
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        // Stastistics for each delta index.
-        let indices_stats = indices
-            .iter()
-            .map(|idx| idx.statistics())
-            .collect::<Result<Vec<_>>>()?;
-
-        let index_type = indices[0].index_type().to_string();
-
-        let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
-
-        let res = indexed_fragments_per_delta
-            .iter()
-            .map(|frags| {
-                let mut sum = 0;
-                for frag in frags.iter() {
-                    sum += frag.num_rows().ok_or_else(|| Error::Internal {
-                        message: "Fragment should have row counts, please upgrade lance and \
-                                      trigger a single write to fix this"
-                            .to_string(),
-                        location: location!(),
-                    })?;
-                }
-                Ok(sum)
-            })
-            .collect::<Result<Vec<_>>>();
-
-        async fn migrate_and_recompute(ds: &Dataset, index_name: &str) -> Result<String> {
-            let mut ds = ds.clone();
-            log::warn!(
-                "Detecting out-dated fragment metadata, migrating dataset. \
-                        To disable migration, set LANCE_AUTO_MIGRATION=false"
-            );
-            ds.delete("false").await.map_err(|err| {
-                Error::Execution {
-                    message: format!("Failed to migrate dataset while calculating index statistics. \
-                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}", err),
-                    location: location!(),
-                }
-            })?;
-            ds.index_statistics(index_name).await
-        }
-
-        let num_indexed_rows_per_delta = match res {
-            Ok(rows) => rows,
-            Err(Error::Internal { message, .. })
-                if auto_migrate_corruption() && message.contains("trigger a single write") =>
-            {
-                return migrate_and_recompute(self, index_name).await;
-            }
-            Err(e) => return Err(e),
-        };
-
-        let mut fragment_ids = HashSet::new();
-        for frags in indexed_fragments_per_delta.iter() {
-            for frag in frags.iter() {
-                if !fragment_ids.insert(frag.id) {
-                    if auto_migrate_corruption() {
-                        return migrate_and_recompute(self, index_name).await;
-                    } else {
-                        return Err(Error::Internal {
-                            message:
-                                "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
-                                  and trigger a single write to fix this"
-                                    .to_string(),
-                            location: location!(),
-                        });
-                    }
-                }
-            }
-        }
-        let num_indexed_fragments = fragment_ids.len();
-
-        let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
-        let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().cloned().sum();
-        let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
-
-        // Calculate updated_at as max(created_at) from all index metadata
-        let updated_at = metadatas
-            .iter()
-            .filter_map(|m| m.created_at)
-            .max()
-            .map(|dt| dt.timestamp_millis() as u64);
-
-        let stats = json!({
-            "index_type": index_type,
-            "name": index_name,
-            "num_indices": metadatas.len(),
-            "indices": indices_stats,
-            "num_indexed_fragments": num_indexed_fragments,
-            "num_indexed_rows": num_indexed_rows,
-            "num_unindexed_fragments": num_unindexed_fragments,
-            "num_unindexed_rows": num_unindexed_rows,
-            "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
-            "updated_at_timestamp_ms": updated_at,
-        });
-
-        serde_json::to_string(&stats).map_err(|e| Error::Index {
-            message: format!("Failed to serialize index statistics: {}", e),
-            location: location!(),
-        })
+        index_statistics_scalar(self, index_name, metadatas)
+            .boxed()
+            .await
     }
 
     async fn read_index_partition(
@@ -1026,10 +951,7 @@ impl DatasetIndexExt for Dataset {
     ) -> Result<SendableRecordBatchStream> {
         let indices = self.load_indices_by_name(index_name).await?;
         if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!("name={}", index_name),
-                location: location!(),
-            });
+            return Err(Error::index_not_found(format!("name={}", index_name)));
         }
         let column = self.schema().field_by_id(indices[0].fields[0]).unwrap();
 
@@ -1061,6 +983,209 @@ impl DatasetIndexExt for Dataset {
             ))),
         }
     }
+}
+
+fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Result<Vec<usize>> {
+    let mut rows_per_delta = Vec::with_capacity(indexed_fragments_per_delta.len());
+    for frags in indexed_fragments_per_delta {
+        let mut sum = 0usize;
+        for frag in frags {
+            sum += frag.num_rows().ok_or_else(|| {
+                Error::internal(
+                    "Fragment should have row counts, please upgrade lance and \
+                                  trigger a single write to fix this"
+                        .to_string(),
+                )
+            })?;
+        }
+        rows_per_delta.push(sum);
+    }
+    Ok(rows_per_delta)
+}
+
+fn unique_indexed_fragment_count(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Option<usize> {
+    let mut fragment_ids = HashSet::new();
+    for frags in indexed_fragments_per_delta {
+        for frag in frags {
+            if !fragment_ids.insert(frag.id) {
+                return None;
+            }
+        }
+    }
+    Some(fragment_ids.len())
+}
+
+fn serialize_index_statistics(stats: &serde_json::Value) -> Result<String> {
+    serde_json::to_string(stats)
+        .map_err(|e| Error::index(format!("Failed to serialize index statistics: {}", e)))
+}
+
+async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) -> Result<String> {
+    let mut ds = ds.clone();
+    log::warn!(
+        "Detecting out-dated fragment metadata, migrating dataset. \
+                        To disable migration, set LANCE_AUTO_MIGRATION=false"
+    );
+    ds.delete("false").await.map(|_| ()).map_err(|err| {
+        Error::execution(format!(
+            "Failed to migrate dataset while calculating index statistics. \
+                        To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}",
+            err
+        ))
+    })?;
+    ds.index_statistics(index_name).await
+}
+
+async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
+    let index = ds
+        .open_frag_reuse_index(&NoOpMetricsCollector)
+        .await?
+        .expect("FragmentReuse index does not exist");
+    serialize_index_statistics(&index.statistics()?)
+}
+
+async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
+    let index = ds
+        .open_mem_wal_index(&NoOpMetricsCollector)
+        .await?
+        .expect("MemWal index does not exist");
+    serialize_index_statistics(&index.statistics()?)
+}
+
+async fn index_statistics_scalar(
+    ds: &Dataset,
+    index_name: &str,
+    metadatas: Vec<IndexMetadata>,
+) -> Result<String> {
+    let field_id = metadatas[0].fields[0];
+    let field_path = ds.schema().field_path(field_id)?;
+
+    let (indices_stats, index_uri, num_indices, updated_at) =
+        collect_regular_indices_statistics(ds, metadatas, &field_path).await?;
+
+    let index_type_hint = indices_stats
+        .first()
+        .and_then(|stats| stats.get("index_type"))
+        .and_then(|v| v.as_str());
+    let index_type = legacy_type_name(&index_uri, index_type_hint);
+
+    let Some((
+        num_indexed_rows_per_delta,
+        num_indexed_fragments,
+        num_unindexed_fragments,
+        num_indexed_rows,
+        num_unindexed_rows,
+    )) = gather_fragment_statistics(ds, index_name).await?
+    else {
+        return migrate_and_recompute_index_statistics(ds, index_name).await;
+    };
+
+    let stats = json!({
+        "index_type": index_type,
+        "name": index_name,
+        "num_indices": num_indices,
+        "indices": indices_stats,
+        "num_indexed_fragments": num_indexed_fragments,
+        "num_indexed_rows": num_indexed_rows,
+        "num_unindexed_fragments": num_unindexed_fragments,
+        "num_unindexed_rows": num_unindexed_rows,
+        "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
+        "updated_at_timestamp_ms": updated_at,
+    });
+
+    serialize_index_statistics(&stats)
+}
+
+async fn collect_regular_indices_statistics(
+    ds: &Dataset,
+    metadatas: Vec<IndexMetadata>,
+    field_path: &str,
+) -> Result<(Vec<serde_json::Value>, String, usize, Option<u64>)> {
+    let num_indices = metadatas.len();
+    let updated_at = metadatas
+        .iter()
+        .filter_map(|m| m.created_at)
+        .max()
+        .map(|dt| dt.timestamp_millis() as u64);
+
+    let mut indices_stats = Vec::with_capacity(num_indices);
+    let mut index_uri: Option<String> = None;
+
+    for meta in metadatas.iter() {
+        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta)?);
+        let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
+        if index_uri.is_none() {
+            index_uri = Some(index_details.type_url.clone());
+        }
+
+        let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+        if let Ok(plugin) = index_details_wrapper.get_plugin()
+            && let Some(stats) = plugin
+                .load_statistics(index_store.clone(), index_details.as_ref())
+                .await?
+        {
+            indices_stats.push(stats);
+            continue;
+        }
+
+        let index = ds
+            .open_generic_index(field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
+            .await?;
+
+        indices_stats.push(index.statistics()?);
+    }
+
+    Ok((
+        indices_stats,
+        index_uri.unwrap_or_else(|| "unknown".to_string()),
+        num_indices,
+        updated_at,
+    ))
+}
+
+async fn gather_fragment_statistics(
+    ds: &Dataset,
+    index_name: &str,
+) -> Result<Option<(Vec<usize>, usize, usize, usize, usize)>> {
+    let indexed_fragments_per_delta = ds.indexed_fragments(index_name).await?;
+
+    let num_indexed_rows_per_delta = match sum_indexed_rows_per_delta(&indexed_fragments_per_delta)
+    {
+        Ok(rows) => rows,
+        Err(Error::Internal { message, .. })
+            if auto_migrate_corruption() && message.contains("trigger a single write") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let Some(num_indexed_fragments) = unique_indexed_fragment_count(&indexed_fragments_per_delta)
+    else {
+        if auto_migrate_corruption() {
+            return Ok(None);
+        }
+        return Err(Error::internal(
+            "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                              and trigger a single write to fix this"
+                .to_string(),
+        ));
+    };
+
+    let num_unindexed_fragments = ds.fragments().len() - num_indexed_fragments;
+    let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().sum();
+
+    drop(indexed_fragments_per_delta);
+    let total_rows = ds.count_rows(None).await?;
+    let num_unindexed_rows = total_rows - num_indexed_rows;
+
+    Ok(Some((
+        num_indexed_rows_per_delta,
+        num_indexed_fragments,
+        num_unindexed_fragments,
+        num_indexed_rows,
+        num_unindexed_rows,
+    )))
 }
 
 pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
@@ -1184,10 +1309,10 @@ impl DatasetIndexInternalExt for Dataset {
         // scalar indices, we may start having this file with scalar indices too.  Once that happens
         // we can just read this file and look at the `implementation` or `index_type` fields to
         // determine what kind of index it is.
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         if self.object_store.exists(&index_file).await? {
@@ -1199,6 +1324,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn open_scalar_index(
         &self,
         column: &str,
@@ -1211,10 +1337,10 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index);
         }
 
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
         let index = scalar::open_scalar_index(self, column, &index_meta, metrics).await?;
 
@@ -1242,10 +1368,10 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
@@ -1274,10 +1400,9 @@ impl DatasetIndexInternalExt for Dataset {
                         )
                         .await
                     }
-                    None => Err(Error::Internal {
-                        message: "Index proto was missing implementation field".into(),
-                        location: location!(),
-                    }),
+                    None => Err(Error::internal(
+                        "Index proto was missing implementation field",
+                    )),
                 }
             }
 
@@ -1318,18 +1443,14 @@ impl DatasetIndexInternalExt for Dataset {
                     .schema()
                     .metadata
                     .get(INDEX_METADATA_SCHEMA_KEY)
-                    .ok_or(Error::Index {
-                        message: "Index Metadata not found".to_owned(),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
                 let index_metadata: lance_index::IndexMetadata =
                     serde_json::from_str(index_metadata)?;
-                let field = self.schema().field(column).ok_or_else(|| Error::Index {
-                    message: format!("Column {} does not exist in the schema", column),
-                    location: location!(),
-                })?;
 
-                let (_, element_type) = get_vector_type(self.schema(), column)?;
+                // Resolve the column name and field
+                let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
+
+                let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
@@ -1359,13 +1480,10 @@ impl DatasetIndexInternalExt for Dataset {
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                         }
-                        _ => Err(Error::Index {
-                            message: format!(
-                                "the field type {} is not supported for FLAT index",
-                                field.data_type()
-                            ),
-                            location: location!(),
-                        }),
+                        _ => Err(Error::index(format!(
+                            "the field type {} is not supported for FLAT index",
+                            field.data_type()
+                        ))),
                     },
 
                     "IVF_PQ" => {
@@ -1449,18 +1567,16 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
-                    _ => Err(Error::Index {
-                        message: format!("Unsupported index type: {}", index_metadata.index_type),
-                        location: location!(),
-                    }),
+                    _ => Err(Error::index(format!(
+                        "Unsupported index type: {}",
+                        index_metadata.index_type
+                    ))),
                 }
             }
 
-            _ => Err(Error::Index {
-                message: "unsupported index version (maybe need to upgrade your lance version)"
-                    .to_owned(),
-                location: location!(),
-            }),
+            _ => Err(Error::index(
+                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
+            )),
         };
         let index = index?;
         metrics.record_index_load();
@@ -1482,10 +1598,7 @@ impl DatasetIndexInternalExt for Dataset {
             let index = self
                 .index_cache
                 .get_or_insert_with_key(frag_reuse_key, || async move {
-                    let index_meta = self.load_index(&uuid_clone).await?.ok_or_else(|| Error::Index {
-                        message: format!("Index with id {} does not exist", uuid_clone),
-                        location: location!(),
-                    })?;
+                    let index_meta = self.load_index(&uuid_clone).await?.ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid_clone)))?;
                     let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
                     let index =
                         open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await?;
@@ -1520,10 +1633,10 @@ impl DatasetIndexInternalExt for Dataset {
 
         let uuid = mem_wal_meta.uuid.to_string();
 
-        let index_meta = self.load_index(&uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(&uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index = open_mem_wal_index(index_meta)?;
 
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
@@ -1574,11 +1687,10 @@ impl DatasetIndexInternalExt for Dataset {
             idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
         }) {
             let field = index.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
-                message: format!(
+            let field = schema.field_by_id(field).ok_or_else(|| {
+                Error::internal(format!(
                     "Index referenced a field with id {field} which did not exist in the schema"
-                ),
-                location: location!(),
+                ))
             })?;
 
             // Build the full field path for nested fields
@@ -1594,7 +1706,19 @@ impl DatasetIndexInternalExt for Dataset {
                 continue;
             }
 
-            let plugin = index_details.get_plugin()?;
+            let plugin = match index_details.get_plugin() {
+                Ok(plugin) => plugin,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping index '{}' on column '{}': {}. \
+                         Queries on this column will fall back to a full scan.",
+                        index.name,
+                        field_path,
+                        e
+                    );
+                    continue;
+                }
+            };
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
             if let Some(query_parser) = query_parser {
@@ -1605,19 +1729,19 @@ impl DatasetIndexInternalExt for Dataset {
         for indexed_field in indexed_fields {
             // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
             // but the rust compiler does not.
-            let mut parser = Some(indexed_field.1 .1);
+            let mut parser = Some(indexed_field.1.1);
             let parser = &mut parser;
             index_info_map
                 .entry(indexed_field.0)
                 .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
                     // If there are two indices on the same column, they must have the same type
-                    debug_assert_eq!(existing.0, indexed_field.1 .0);
+                    debug_assert_eq!(existing.0, indexed_field.1.0);
 
                     existing.1.add(parser.take().unwrap());
                 })
                 .or_insert_with(|| {
                     (
-                        indexed_field.1 .0,
+                        indexed_field.1.0,
                         Box::new(MultiQueryParser::single(parser.take().unwrap())),
                     )
                 });
@@ -1631,10 +1755,9 @@ impl DatasetIndexInternalExt for Dataset {
         let indices = self.load_indices_by_name(name).await?;
         let mut total_fragment_bitmap = RoaringBitmap::new();
         for idx in indices.iter() {
-            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
-                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                location: location!(),
-            })?;
+            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::index(
+                "Please upgrade lance to 0.8+ to use this function".to_string(),
+            ))?;
         }
         Ok(self
             .fragments()
@@ -1649,10 +1772,9 @@ impl DatasetIndexInternalExt for Dataset {
         indices
             .iter()
             .map(|index| {
-                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::Index {
-                    message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                    location: location!(),
-                })?;
+                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::index(
+                    "Please upgrade lance to 0.8+ to use this function".to_string(),
+                ))?;
                 let mut indexed_frags = Vec::with_capacity(fragment_bitmap.len() as usize);
                 for frag in self.fragments().iter() {
                     if fragment_bitmap.contains(frag.id as u32) {
@@ -1668,18 +1790,20 @@ impl DatasetIndexInternalExt for Dataset {
         let source_indices = source_dataset.load_indices_by_name(index_name).await?;
 
         if source_indices.is_empty() {
-            return Err(Error::Index {
-                message: format!("Index '{}' not found in source dataset", index_name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index '{}' not found in source dataset",
+                index_name
+            )));
         }
 
         let source_index = source_indices
             .iter()
             .min_by_key(|idx| idx.created_at)
-            .ok_or_else(|| Error::Index {
-                message: format!("Could not determine oldest index for '{}'", index_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "Could not determine oldest index for '{}'",
+                    index_name
+                ))
             })?;
 
         let mut field_names = Vec::new();
@@ -1687,42 +1811,37 @@ impl DatasetIndexInternalExt for Dataset {
             let source_field = source_dataset
                 .schema()
                 .field_by_id(*field_id)
-                .ok_or_else(|| Error::Index {
-                    message: format!("Field with id {} not found in source dataset", field_id),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Field with id {} not found in source dataset",
+                        field_id
+                    ))
                 })?;
 
-            let target_field =
-                self.schema()
-                    .field(&source_field.name)
-                    .ok_or_else(|| Error::Index {
-                        message: format!(
-                            "Field '{}' required by index '{}' not found in target dataset",
-                            source_field.name, index_name
-                        ),
-                        location: location!(),
-                    })?;
+            let target_field = self.schema().field(&source_field.name).ok_or_else(|| {
+                Error::index(format!(
+                    "Field '{}' required by index '{}' not found in target dataset",
+                    source_field.name, index_name
+                ))
+            })?;
 
             if source_field.data_type() != target_field.data_type() {
-                return Err(Error::Index {
-                    message: format!(
-                        "Field '{}' has different types in source ({:?}) and target ({:?}) datasets",
-                        source_field.name,
-                        source_field.data_type(),
-                        target_field.data_type()
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::index(format!(
+                    "Field '{}' has different types in source ({:?}) and target ({:?}) datasets",
+                    source_field.name,
+                    source_field.data_type(),
+                    target_field.data_type()
+                )));
             }
 
             field_names.push(source_field.name.as_str());
         }
 
         if field_names.is_empty() {
-            return Err(Error::Index {
-                message: format!("Index '{}' has no fields", index_name),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Index '{}' has no fields",
+                index_name
+            )));
         }
 
         if let Some(index_details) = &source_index.index_details {
@@ -1769,6 +1888,48 @@ impl DatasetIndexInternalExt for Dataset {
     }
 }
 
+/// Resolves the column name and field for an index operation.
+///
+/// This function handles the case where the caller passes an index name instead of a column name.
+/// It returns the full field path and the field reference.
+fn resolve_index_column(
+    schema: &LanceSchema,
+    index_meta: &IndexMetadata,
+    column_arg: &str,
+) -> Result<(String, Arc<Field>)> {
+    // First, try to find the column directly in the schema
+    if let Some(field) = schema.field(column_arg) {
+        // Column exists in schema, use it
+        return Ok((column_arg.to_string(), Arc::new(field.clone())));
+    }
+
+    // Column doesn't exist in schema, check if it's the index name
+    if column_arg == index_meta.name {
+        // Get the actual column from index metadata
+        if let Some(field_id) = index_meta.fields.first() {
+            let field = schema.field_by_id(*field_id).ok_or_else(|| {
+                Error::index(format!(
+                    "Index '{}' references field with id {} which does not exist in schema",
+                    index_meta.name, field_id
+                ))
+            })?;
+            let field_path = schema.field_path(*field_id)?;
+            return Ok((field_path, Arc::new(field.clone())));
+        } else {
+            return Err(Error::index(format!(
+                "Index '{}' has no fields",
+                index_meta.name
+            )));
+        }
+    }
+
+    // Column doesn't exist and is not the index name
+    Err(Error::index(format!(
+        "Column '{}' does not exist in the schema",
+        column_arg
+    )))
+}
+
 fn is_vector_field(data_type: DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => true,
@@ -1782,33 +1943,33 @@ fn is_vector_field(data_type: DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::dataset::builder::DatasetBuilder;
-    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
-    use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
-    use arrow_array::Int32Array;
-
-    use lance_io::{assert_io_eq, assert_io_lt};
-
-    use super::*;
-
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow_array::Int32Array;
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::stream::TryStreamExt;
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
-    use lance_datagen::{array, BatchCount, Dimension, RowCount};
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array};
+    use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
+    use lance_index::scalar::{
+        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+    };
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
-
+    use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
@@ -1830,14 +1991,16 @@ mod tests {
             ),
         ]));
         let data = generate_random_array(2048 * DIM as usize);
-        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(FixedSizeListArray::try_new_from_values(data.clone(), DIM).unwrap()),
-                Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
-            ],
-        )
-        .unwrap()];
+        let batches: Vec<RecordBatch> = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(FixedSizeListArray::try_new_from_values(data.clone(), DIM).unwrap()),
+                    Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
+                ],
+            )
+            .unwrap(),
+        ];
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -1861,16 +2024,92 @@ mod tests {
             .unwrap();
 
         // Can not overwrite an index on different columns.
-        assert!(dataset
+        assert!(
+            dataset
+                .create_index(
+                    &["v"],
+                    IndexType::Vector,
+                    Some("o_idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
+        const NUM_ROWS: usize = 500_000;
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Int32,
+            false,
+        )]));
+        let values: Vec<i32> = (0..NUM_ROWS as i32).collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+        let io_tracker = dataset.object_store().io_tracker().clone();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
             .create_index(
-                &["v"],
-                IndexType::Vector,
-                Some("o_idx".to_string()),
+                &["status"],
+                IndexType::Bitmap,
+                Some("status_idx".to_string()),
                 &params,
                 true,
             )
             .await
-            .is_err());
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index_meta = indices
+            .iter()
+            .find(|idx| idx.name == "status_idx")
+            .expect("status_idx should exist");
+        let lookup_path = dataset
+            .indice_files_dir(index_meta)
+            .unwrap()
+            .child(index_meta.uuid.to_string())
+            .child(BITMAP_LOOKUP_NAME);
+        let meta = dataset.object_store.inner.head(&lookup_path).await.unwrap();
+        assert!(
+            meta.size >= 1_000_000,
+            "bitmap index should be large enough to fail without metadata path, size={} bytes",
+            meta.size
+        );
+
+        // Reset stats collected during index creation
+        io_tracker.incremental_stats();
+
+        dataset.index_statistics("status_idx").await.unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        assert_io_eq!(
+            stats,
+            read_bytes,
+            4096,
+            "index_statistics should only read the index footer; got {} bytes",
+            stats.read_bytes
+        );
+        assert_io_lt!(
+            stats,
+            read_iops,
+            3,
+            "index_statistics should only require a head plus one range read; got {} ops",
+            stats.read_iops
+        );
+        assert_io_eq!(
+            stats,
+            written_bytes,
+            0,
+            "index_statistics should not perform writes"
+        );
     }
 
     fn sample_vector_field() -> Field {
@@ -2491,8 +2730,8 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await;
 
-        assert!(matches!(result, Err(Error::Index { .. })));
-        if let Error::Index { message, .. } = result.unwrap_err() {
+        assert!(matches!(result, Err(Error::Unprocessable { .. })));
+        if let Error::Unprocessable { message, .. } = result.unwrap_err() {
             assert_eq!(
                 message,
                 "Not enough rows to train PQ. Requires 256 rows but only 100 available",
@@ -2941,7 +3180,7 @@ mod tests {
         #[case] index_type: IndexType,
         #[case] params: Box<dyn IndexParams>,
     ) {
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
 
         // Create dataset with scalar and text columns (no vector column needed)
         let reader = lance_datagen::gen_batch()
@@ -3053,7 +3292,7 @@ mod tests {
         #[case] index_type: IndexType,
         #[case] params: Box<dyn IndexParams>,
     ) {
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
 
         // Create dataset with initial data
         let reader = lance_datagen::gen_batch()
@@ -3256,7 +3495,7 @@ mod tests {
         #[case] params: Box<dyn IndexParams>,
     ) {
         use crate::dataset::UpdateBuilder;
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
 
         // Create dataset with initial data
         let reader = lance_datagen::gen_batch()
@@ -3670,12 +3909,14 @@ mod tests {
             assert!(
                 vector_index_dir.exists(),
                 "Round {}: New vector index directory should exist in cloned dataset location: {:?}",
-                round, vector_index_dir
+                round,
+                vector_index_dir
             );
             assert!(
                 category_index_dir.exists(),
                 "Round {}: New category index directory should exist in cloned dataset location: {:?}",
-                round, category_index_dir
+                round,
+                category_index_dir
             );
 
             // Verify base id
@@ -3844,7 +4085,7 @@ mod tests {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use std::collections::HashSet;
@@ -3994,7 +4235,7 @@ mod tests {
         use crate::dataset::Dataset;
         use arrow_array::types::Int32Type;
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::scalar::ScalarIndexParams;
 
         // Test that initialize_indices handles missing fields gracefully
@@ -4036,10 +4277,12 @@ mod tests {
 
         // Should fail when field is missing
         assert!(result.is_err(), "Should error when field is missing");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in target dataset"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in target dataset")
+        );
     }
 
     #[tokio::test]
@@ -4048,7 +4291,7 @@ mod tests {
         use crate::index::vector::VectorIndexParams;
         use arrow_array::types::{Float32Type, Int32Type};
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::scalar::ScalarIndexParams;
         use lance_linalg::distance::MetricType;
 
@@ -4141,10 +4384,12 @@ mod tests {
             .initialize_index(&source_dataset, "non_existent")
             .await;
         assert!(result.is_err(), "Should error for non-existent index");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in source dataset"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in source dataset")
+        );
     }
 
     #[tokio::test]
@@ -4807,5 +5052,272 @@ mod tests {
             "Should find at least some documents with 'machine learning'"
         );
         assert!(found_count < num_rows, "Should not match all documents");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_index_column() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        // Create a test dataset with a vector column
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(32.into()),
+            )
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an index with a custom name
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            4,
+            lance_linalg::distance::MetricType::L2,
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("my_vector_index".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset to get the index metadata
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index_meta = &indices[0];
+
+        // Test 1: Pass the actual column name
+        let (field_path, field) =
+            resolve_index_column(dataset.schema(), index_meta, "vector").unwrap();
+        assert_eq!(field_path, "vector");
+        assert_eq!(field.name, "vector");
+
+        // Test 2: Pass the index name (should resolve to the actual column)
+        let (field_path2, field2) =
+            resolve_index_column(dataset.schema(), index_meta, "my_vector_index").unwrap();
+        assert_eq!(field_path2, "vector");
+        assert_eq!(field2.name, "vector");
+
+        // Test 3: Pass a non-existent column name (should fail)
+        let result = resolve_index_column(dataset.schema(), index_meta, "nonexistent");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist in the schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_index_column_error_cases() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        // Create a test dataset
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(32.into()),
+            )
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an index
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            4,
+            lance_linalg::distance::MetricType::L2,
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("my_index".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index_meta = &indices[0];
+
+        // Test: Pass a column that doesn't exist and is not the index name
+        let result = resolve_index_column(dataset.schema(), index_meta, "nonexistent_column");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist in the schema"),
+            "Error message should mention column doesn't exist, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_index_column_nested_field() {
+        use arrow_array::{RecordBatch, StructArray};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        // Create a test dataset with nested struct manually
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create schema with nested structure: data.vector
+        let vector_field = ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                8,
+            ),
+            false,
+        );
+        let struct_field = ArrowField::new(
+            "data",
+            DataType::Struct(vec![vector_field.clone()].into()),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            struct_field,
+        ]));
+
+        // Create data
+        let id_array = arrow_array::Int32Array::from(vec![1, 2, 3, 4, 5]);
+
+        // Create nested vector data
+        let mut vector_values = Vec::new();
+        for _ in 0..5 {
+            for _ in 0..8 {
+                vector_values.push(rand::random::<f32>());
+            }
+        }
+        let vector_array = arrow_array::FixedSizeListArray::try_new_from_values(
+            arrow_array::Float32Array::from(vector_values),
+            8,
+        )
+        .unwrap();
+
+        let struct_array = StructArray::from(vec![(
+            Arc::new(vector_field),
+            Arc::new(vector_array) as arrow_array::ArrayRef,
+        )]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(struct_array)],
+        )
+        .unwrap();
+
+        let reader = Box::new(arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch)],
+            schema,
+        ));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an index on the nested field
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            2,
+            lance_linalg::distance::MetricType::L2,
+        );
+        dataset
+            .create_index(
+                &["data.vector"],
+                IndexType::Vector,
+                Some("nested_vector_index".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset to get the index metadata
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index_meta = &indices[0];
+
+        // Test 1: Pass the nested field path directly
+        let (field_path, field) =
+            resolve_index_column(dataset.schema(), index_meta, "data.vector").unwrap();
+        assert_eq!(field_path, "data.vector");
+        assert_eq!(field.name, "vector");
+
+        // Test 2: Pass the index name, should resolve to the nested field path
+        let (field_path2, field2) =
+            resolve_index_column(dataset.schema(), index_meta, "nested_vector_index").unwrap();
+        assert_eq!(field_path2, "data.vector");
+        assert_eq!(field2.name, "vector");
+
+        // Verify the field path is correct for nested access
+        assert!(
+            field_path2.contains('.'),
+            "Field path should contain '.' for nested field"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_returns_correct_vector_index_type() {
+        const DIM: i32 = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                true,
+            ),
+        ]));
+
+        let data = generate_random_array(256 * DIM as usize);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..256)),
+                Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+
+        // Create IVF_FLAT index
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset and call describe_indices
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+
+        assert_eq!(descriptions.len(), 1);
+        let desc = &descriptions[0];
+        assert_eq!(desc.name(), "vector_idx");
+        // This should be "IVF_FLAT", not "Unknown"
+        assert_eq!(desc.index_type(), "IVF_FLAT");
+        assert!(!desc.field_ids().is_empty());
     }
 }

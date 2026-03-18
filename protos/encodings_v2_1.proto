@@ -102,7 +102,7 @@ message MiniBlockLayout {
   // If there is repetition then the depth must be at least 1.  If there are many layers
   // of repetition then deeper repetition indices will support deeper nested random access.  For
   // example, given 5 layers of repetition then the repetition index depth must be at least
-  // 3 to support access like rows[50][17][3].
+  // 3 to support access like `rows[50][17][3]`.
   //
   // We require `repetition_index_depth + 1` u64 values per mini-block to store the repetition
   // index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store
@@ -112,6 +112,9 @@ message MiniBlockLayout {
   // The page already records how many rows are in the page.  For mini-block we also need to know how
   // many "items" are in the page.  A row and an item are the same thing unless the page has lists.
   uint64 num_items = 9;
+
+  // Since Lance 2.2, miniblocks have larger chunk sizes (>= 64KB)
+  bool has_large_chunk = 10;
 }
 
 // A layout used for pages where the data is large
@@ -144,13 +147,36 @@ message FullZipLayout {
   repeated RepDefLayer layers = 8;
 }
 
-// A layout used for pages where all values are null
+// A layout used for pages where all (visible) values are the same scalar value.
 //
-// There may be buffers of repetition and definition information
-// if required in order to interpret what kind of nulls are present
-message AllNullLayout {
+// This generalizes the prior AllNullLayout semantics for file_version >= 2.2.
+//
+// There may be buffers of repetition and definition information if required in order
+// to interpret what kind of nulls are present / which items are visible.
+message ConstantLayout {
   // The meaning of each repdef layer, used to interpret repdef buffers correctly
   repeated RepDefLayer layers = 5;
+
+  // Inline fixed-width scalar value bytes.
+  //
+  // This MUST only be used for types where a single non-null element is represented by a single
+  // fixed-width Arrow value buffer (i.e. no offsets buffer, no child data).
+  //
+  // Constraints:
+  // - MUST be absent for an all-null page
+  // - MUST be <= 32 bytes if present
+  optional bytes inline_value = 6;
+
+  // Optional compression algorithm used for the repetition buffer.
+  // If absent, repetition levels are stored as raw u16 values.
+  CompressiveEncoding rep_compression = 7;
+  // Optional compression algorithm used for the definition buffer.
+  // If absent, definition levels are stored as raw u16 values.
+  CompressiveEncoding def_compression = 8;
+  // Number of values in repetition buffer after decompression.
+  uint64 num_rep_values = 9;
+  // Number of values in definition buffer after decompression.
+  uint64 num_def_values = 10;
 }
 
 // A layout where large binary data is encoded externally and only
@@ -173,8 +199,8 @@ message PageLayout {
   oneof layout {
     // A layout used for pages where the data is small
     MiniBlockLayout mini_block_layout = 1;
-    // A layout used for pages where all values are null
-    AllNullLayout all_null_layout = 2;
+    // A layout used for pages where all (visible) values are the same scalar value or null.
+    ConstantLayout constant_layout = 2;
     // A layout used for pages where the data is large
     FullZipLayout full_zip_layout = 3;
     // A layout where large binary data is encoded externally

@@ -16,7 +16,6 @@
 //! FSST encoding is transparent.
 
 use lance_core::{Error, Result};
-use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
@@ -27,8 +26,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     },
     format::{
-        pb21::{self, CompressiveEncoding},
         ProtobufUtils21,
+        pb21::{self, CompressiveEncoding},
     },
 };
 
@@ -116,20 +115,27 @@ impl FsstCompressed {
                     ),
                 }
             }
-            _ => Err(Error::InvalidInput {
-                source: format!(
+            _ => Err(Error::invalid_input_source(
+                format!(
                     "Cannot compress a data block of type {} with FsstEncoder",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
 
 #[derive(Debug, Default)]
-pub struct FsstMiniBlockEncoder {}
+pub struct FsstMiniBlockEncoder {
+    minichunk_size: Option<i64>,
+}
+
+impl FsstMiniBlockEncoder {
+    pub fn new(minichunk_size: Option<i64>) -> Self {
+        Self { minichunk_size }
+    }
+}
 
 impl MiniBlockCompressor for FsstMiniBlockEncoder {
     fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
@@ -138,8 +144,8 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
         let data_block = DataBlock::VariableWidth(compressed.data);
 
         // compress the fsst compressed data using `BinaryMiniBlockEncoder`
-        let binary_compressor =
-            Box::new(BinaryMiniBlockEncoder::default()) as Box<dyn MiniBlockCompressor>;
+        let binary_compressor = Box::new(BinaryMiniBlockEncoder::new(self.minichunk_size))
+            as Box<dyn MiniBlockCompressor>;
 
         let (binary_miniblock_compressed, binary_array_encoding) =
             binary_compressor.compress(data_block)?;
@@ -367,13 +373,12 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
 
 #[cfg(test)]
 mod tests {
-
     use std::collections::HashMap;
 
     use lance_datagen::{ByteCount, RowCount};
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, TestCases},
+        testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
 

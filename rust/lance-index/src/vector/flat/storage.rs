@@ -13,16 +13,15 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::UInt8Type;
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::{
-    types::{Float32Type, UInt64Type},
     Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
+    types::{Float32Type, UInt64Type},
 };
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
-use snafu::location;
+use lance_linalg::distance::hamming::hamming;
 
 pub const FLAT_COLUMN: &str = "flat";
 
@@ -63,20 +62,14 @@ impl QuantizerStorage for FlatFloatStorage {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
-                .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
-                    location: location!(),
-                })?
+                .ok_or(Error::schema(format!("column {} not found", ROW_ID)))?
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
         let vectors = Arc::new(
             batch
                 .column_by_name(FLAT_COLUMN)
-                .ok_or(Error::Schema {
-                    message: "column flat not found".to_string(),
-                    location: location!(),
-                })?
+                .ok_or(Error::schema("column flat not found".to_string()))?
                 .as_fixed_size_list()
                 .clone(),
         );
@@ -221,20 +214,14 @@ impl QuantizerStorage for FlatBinStorage {
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
-                .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
-                    location: location!(),
-                })?
+                .ok_or(Error::schema(format!("column {} not found", ROW_ID)))?
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
         let vectors = Arc::new(
             batch
                 .column_by_name(FLAT_COLUMN)
-                .ok_or(Error::Schema {
-                    message: "column flat not found".to_string(),
-                    location: location!(),
-                })?
+                .ok_or(Error::schema("column flat not found".to_string()))?
                 .as_fixed_size_list()
                 .clone(),
         );

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
@@ -10,20 +11,21 @@ use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
-use lance_index::vector::ivf::shuffler::{shuffle_vectors, IvfShuffler};
+use lance_index::progress::NoopIndexBuildProgress;
+use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
 use lance_index::vector::{
-    ivf::{storage::IvfModel, IvfBuildParams},
+    ivf::{IvfBuildParams, storage::IvfModel},
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
+use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModuleMethods;
-use pyo3::Bound;
 use pyo3::{
-    pyfunction,
+    PyResult, Python, pyfunction,
     types::{PyList, PyModule},
-    wrap_pyfunction, PyObject, PyResult, Python,
+    wrap_pyfunction,
 };
 
 use lance::index::DatasetIndexInternalExt;
@@ -64,7 +66,7 @@ pub struct PyIvfModel {
 #[pymethods]
 impl PyIvfModel {
     #[getter]
-    fn centroids(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         if let Some(centroids) = &self.inner.centroids {
             let data = centroids.clone().into_data();
             Ok(Some(data.to_pyarrow(py)?))
@@ -141,6 +143,7 @@ async fn do_train_ivf_model(
         dimension,
         distance_type,
         &params,
+        Arc::new(NoopIndexBuildProgress),
     )
     .await
     .infer_error()?;
@@ -150,8 +153,8 @@ async fn do_train_ivf_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn train_ivf_model(
-    py: Python<'_>,
+fn train_ivf_model<'py>(
+    py: Python<'py>,
     dataset: &Dataset,
     column: &str,
     dimension: usize,
@@ -159,7 +162,7 @@ fn train_ivf_model(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let centroids = rt().block_on(
         Some(py),
         do_train_ivf_model(
@@ -210,8 +213,8 @@ async fn do_train_pq_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn train_pq_model(
-    py: Python<'_>,
+fn train_pq_model<'py>(
+    py: Python<'py>,
     dataset: &Dataset,
     column: &str,
     dimension: usize,
@@ -220,7 +223,7 @@ fn train_pq_model(
     sample_rate: u32,
     max_iters: u32,
     ivf_centroids: PyArrowType<ArrayData>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
     let ivf_model = IvfModel {
@@ -363,7 +366,7 @@ pub fn shuffle_transformed_vectors(
     dir_path: &str,
     ivf_centroids: PyArrowType<ArrayData>,
     shuffle_output_root_filename: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
 
@@ -485,7 +488,14 @@ pub struct PyIndexSegmentDescription {
 
 impl PyIndexSegmentDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version_at_last_update, self.fragment_ids, self.index_version, self.created_at)
+        format!(
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})",
+            self.uuid,
+            self.dataset_version_at_last_update,
+            self.fragment_ids,
+            self.index_version,
+            self.created_at
+        )
     }
 }
 
@@ -560,7 +570,15 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.segments.len())
+        format!(
+            "IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})",
+            self.name,
+            self.type_url,
+            self.num_rows_indexed,
+            self.fields,
+            self.field_names,
+            self.segments.len()
+        )
     }
 }
 

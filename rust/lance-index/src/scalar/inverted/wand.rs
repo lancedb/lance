@@ -11,23 +11,23 @@ use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
 use itertools::Itertools;
-use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::RowAddrMask;
 
 use crate::metrics::MetricsCollector;
 
 use super::{
+    CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
     query::FtsSearchParams,
     scorer::Scorer,
-    DocSet, PostingList, RawDocInfo,
 };
-use super::{builder::BLOCK_SIZE, DocInfo};
+use super::{DocInfo, builder::BLOCK_SIZE};
 use super::{
     query::Operator,
-    scorer::{idf, K1},
+    scorer::{K1, idf},
 };
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
@@ -140,6 +140,28 @@ impl Ord for PostingIterator {
 }
 
 impl PostingIterator {
+    #[inline]
+    fn compressed_state_ptr(&self) -> *mut CompressedState {
+        debug_assert!(self.compressed.is_some());
+        // this method is called very frequently, so we prefer to use `UnsafeCell` instead of
+        // `RefCell` to avoid the overhead of runtime borrow checking
+        self.compressed.as_ref().unwrap().get()
+    }
+
+    #[inline]
+    fn ensure_compressed_block_ptr(
+        &self,
+        list: &CompressedPostingList,
+        block_idx: usize,
+    ) -> *mut CompressedState {
+        let compressed = unsafe { &mut *self.compressed_state_ptr() };
+        if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
+            let block = list.blocks.value(block_idx);
+            compressed.decompress(block, block_idx, list.blocks.len(), list.length);
+        }
+        compressed as *mut CompressedState
+    }
+
     pub(crate) fn new(
         token: String,
         token_id: u32,
@@ -148,7 +170,7 @@ impl PostingIterator {
         num_doc: usize,
     ) -> Self {
         let approximate_upper_bound = match list.max_score() {
-            Some(max_score) => max_score, // the index doesn't include the full BM25 upper bound at indexing time, so we need to multiply it here
+            Some(max_score) => max_score,
             None => idf(list.len(), num_doc) * (K1 + 1.0),
         };
 
@@ -164,6 +186,16 @@ impl PostingIterator {
             approximate_upper_bound,
             compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
         }
+    }
+
+    #[inline]
+    pub(crate) fn term_index(&self) -> u32 {
+        self.position
+    }
+
+    #[inline]
+    pub(crate) fn token(&self) -> &str {
+        &self.token
     }
 
     #[inline]
@@ -184,19 +216,9 @@ impl PostingIterator {
 
         match self.list {
             PostingList::Compressed(ref list) => {
-                debug_assert!(self.compressed.is_some());
-                // this method is called very frequently, so we prefer to use `UnsafeCell` instead of `RefCell`
-                // to avoid the overhead of runtime borrow checking
-                let compressed = unsafe {
-                    let compressed = self.compressed.as_ref().unwrap();
-                    &mut *compressed.get()
-                };
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
-                if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
-                    let block = list.blocks.value(block_idx);
-                    compressed.decompress(block, block_idx, list.blocks.len(), list.length);
-                }
+                let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
                 let doc_id = compressed.doc_ids[block_offset];
@@ -222,7 +244,7 @@ impl PostingIterator {
     // move to the next doc id that is greater than or equal to least_id
     fn next(&mut self, least_id: u64) {
         match self.list {
-            PostingList::Compressed(ref mut list) => {
+            PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let mut block_idx = self.index / BLOCK_SIZE;
@@ -232,9 +254,24 @@ impl PostingIterator {
                     block_idx += 1;
                 }
                 self.index = self.index.max(block_idx * BLOCK_SIZE);
-                let length = self.list.len();
-                while self.index < length && (self.doc().unwrap().doc_id() as u32) < least_id {
-                    self.index += 1;
+                let length = list.length as usize;
+                while self.index < length {
+                    let block_idx = self.index / BLOCK_SIZE;
+                    let block_offset = self.index % BLOCK_SIZE;
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                    let in_block = &compressed.doc_ids[block_offset..];
+                    let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
+                    let new_offset = block_offset + offset_in_block;
+                    if new_offset < compressed.doc_ids.len() {
+                        self.index = block_idx * BLOCK_SIZE + new_offset;
+                        break;
+                    }
+                    if block_idx + 1 >= list.blocks.len() {
+                        self.index = length;
+                        break;
+                    }
+                    self.index = (block_idx + 1) * BLOCK_SIZE;
                 }
                 self.block_idx = self.index / BLOCK_SIZE;
             }
@@ -246,7 +283,7 @@ impl PostingIterator {
 
     fn shallow_next(&mut self, least_id: u64) {
         match self.list {
-            PostingList::Compressed(ref mut list) => {
+            PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 while self.block_idx + 1 < list.blocks.len()
@@ -265,7 +302,7 @@ impl PostingIterator {
     #[inline]
     fn block_max_score(&self) -> f32 {
         match self.list {
-            PostingList::Compressed(ref list) => list.block_max_score(self.block_idx) * (K1 + 1.0),
+            PostingList::Compressed(ref list) => list.block_max_score(self.block_idx),
             PostingList::Plain(_) => self.approximate_upper_bound,
         }
     }
@@ -293,9 +330,11 @@ impl PostingIterator {
     }
 }
 
+#[derive(Debug)]
 pub struct DocCandidate {
     pub row_id: u64,
-    pub freqs: Vec<(String, u32)>,
+    /// (term_index, freq)
+    pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
 }
 
@@ -341,7 +380,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn search(
         &mut self,
         params: &FtsSearchParams,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate>> {
         let limit = params.limit.unwrap_or(usize::MAX);
@@ -349,7 +388,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        match (mask.max_len(), mask.iter_ids()) {
+        match (mask.max_len(), mask.iter_addrs()) {
             (Some(num_rows_matched), Some(row_ids))
                 if num_rows_matched * 100
                     <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
@@ -359,13 +398,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
-        let mut candidates = BinaryHeap::new();
+        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
-            if let Some(cur_doc) = self.cur_doc {
-                if cur_doc.doc_id() >= doc.doc_id() {
-                    continue;
-                }
+            if let Some(cur_doc) = self.cur_doc
+                && cur_doc.doc_id() >= doc.doc_id()
+            {
+                continue;
             }
             self.cur_doc = Some(doc);
             num_comparisons += 1;
@@ -394,19 +433,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             let score = self.score(pivot, doc_length);
-            let freqs = self
-                .iter_token_freqs(pivot)
-                .map(|(token, freq)| (token.to_owned(), freq))
-                .collect();
+            let freqs = self.iter_term_freqs(pivot).collect();
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
         }
@@ -463,11 +499,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 pivot += 1;
             }
 
-            if let Some(least_id) = self.postings[0].block_first_doc() {
-                if least_id > doc_id {
-                    current_doc = least_id;
-                    continue;
-                }
+            if let Some(least_id) = self.postings[0].block_first_doc()
+                && least_id > doc_id
+            {
+                current_doc = least_id;
+                continue;
             }
             let mut max_pivot = 0;
             while max_pivot + 1 < self.postings.len() {
@@ -522,20 +558,17 @@ impl<'a, S: Scorer> Wand<'a, S> {
             };
 
             let score = self.score(max_pivot, doc_length);
-            let freqs = self
-                .iter_token_freqs(max_pivot)
-                .map(|(token, freq)| (token.to_owned(), freq))
-                .collect();
+            let freqs = self.iter_term_freqs(max_pivot).collect();
 
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
         }
         metrics.record_comparisons(num_comparisons);
@@ -565,6 +598,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
             posting
                 .doc()
                 .map(|doc| (posting.token.as_str(), doc.frequency()))
+        })
+    }
+
+    // iterate over all the preceding terms and collect the term index and frequency
+    fn iter_term_freqs(&self, pivot: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.postings[..=pivot].iter().filter_map(|posting| {
+            posting
+                .doc()
+                .map(|doc| (posting.term_index(), doc.frequency()))
         })
     }
 
@@ -857,7 +899,7 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, CompressedPostingList, PlainPostingList,
+            CompressedPostingList, PlainPostingList, encoding::compress_posting_list,
         },
     };
 
@@ -930,11 +972,34 @@ mod tests {
         let result = wand
             .search(
                 &FtsSearchParams::default(),
-                Arc::new(RowIdMask::default()),
+                Arc::new(RowAddrMask::default()),
                 &NoOpMetricsCollector,
             )
             .unwrap();
         assert_eq!(result.len(), 0); // Should not panic
+    }
+
+    #[test]
+    fn test_posting_iterator_next_compressed_partition_point() {
+        let mut docs = DocSet::default();
+        let num_docs = (BLOCK_SIZE * 2 + 5) as u32;
+        for i in 0..num_docs {
+            docs.append(i as u64, 1);
+        }
+
+        let doc_ids = (0..num_docs).collect::<Vec<_>>();
+        let posting = generate_posting_list(doc_ids, 1.0, None, true);
+        let mut iter = PostingIterator::new(String::from("term"), 0, 0, posting, docs.len());
+
+        iter.next(10);
+        assert_eq!(iter.doc().unwrap().doc_id(), 10);
+
+        let target = BLOCK_SIZE as u64 + 3;
+        iter.next(target);
+        assert_eq!(iter.doc().unwrap().doc_id(), target);
+
+        iter.next(num_docs as u64 + 10);
+        assert!(iter.doc().is_none());
     }
 
     #[test]
@@ -972,10 +1037,29 @@ mod tests {
 
         let result = wand.search(
             &FtsSearchParams::default(),
-            Arc::new(RowIdMask::default()),
+            Arc::new(RowAddrMask::default()),
             &NoOpMetricsCollector,
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_max_score_matches_stored_value() {
+        let doc_ids = vec![0_u32];
+        let block_max_scores = vec![0.7_f32];
+        let posting_list = generate_posting_list(doc_ids, 0.7, Some(block_max_scores), true);
+        let expected = match &posting_list {
+            PostingList::Compressed(list) => list.block_max_score(0),
+            PostingList::Plain(_) => unreachable!("expected compressed posting list"),
+        };
+
+        let posting = PostingIterator::new(String::from("test"), 0, 0, posting_list, 1);
+
+        let actual = posting.block_max_score();
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "block max score should match stored value"
+        );
     }
 }

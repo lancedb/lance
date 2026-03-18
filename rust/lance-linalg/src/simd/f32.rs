@@ -218,7 +218,7 @@ impl SIMD<f32, 8> for f32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let sum = vaddq_f32(self.0 .0, self.0 .1);
+            let sum = vaddq_f32(self.0.0, self.0.1);
             vaddvq_f32(sum)
         }
         #[cfg(target_arch = "loongarch64")]
@@ -246,7 +246,7 @@ impl SIMD<f32, 8> for f32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let m = vminq_f32(self.0 .0, self.0 .1);
+            let m = vminq_f32(self.0.0, self.0.1);
             vminvq_f32(m)
         }
         #[cfg(target_arch = "loongarch64")]
@@ -269,8 +269,8 @@ impl SIMD<f32, 8> for f32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x2_t(
-                vminq_f32(self.0 .0, rhs.0 .0),
-                vminq_f32(self.0 .1, rhs.0 .1),
+                vminq_f32(self.0.0, rhs.0.0),
+                vminq_f32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -292,8 +292,8 @@ impl SIMD<f32, 8> for f32x8 {
         unsafe {
             let tgt = vdupq_n_f32(val);
             let mut arr = [0; 8];
-            let mask1 = vceqq_f32(self.0 .0, tgt);
-            let mask2 = vceqq_f32(self.0 .1, tgt);
+            let mask1 = vceqq_f32(self.0.0, tgt);
+            let mask2 = vceqq_f32(self.0.1, tgt);
             vst1q_u32(arr.as_mut_ptr(), mask1);
             vst1q_u32(arr.as_mut_ptr().add(4), mask2);
             for i in 0..8 {
@@ -322,8 +322,8 @@ impl FloatSimd<f32, 8> for f32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
-            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
+            self.0.0 = vfmaq_f32(self.0.0, a.0.0, b.0.0);
+            self.0.1 = vfmaq_f32(self.0.1, a.0.1, b.0.1);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -344,8 +344,8 @@ impl Add for f32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x2_t(
-                vaddq_f32(self.0 .0, rhs.0 .0),
-                vaddq_f32(self.0 .1, rhs.0 .1),
+                vaddq_f32(self.0.0, rhs.0.0),
+                vaddq_f32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -364,8 +364,8 @@ impl AddAssign for f32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vaddq_f32(self.0 .0, rhs.0 .0);
-            self.0 .1 = vaddq_f32(self.0 .1, rhs.0 .1);
+            self.0.0 = vaddq_f32(self.0.0, rhs.0.0);
+            self.0.1 = vaddq_f32(self.0.1, rhs.0.1);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -386,8 +386,8 @@ impl Sub for f32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x2_t(
-                vsubq_f32(self.0 .0, rhs.0 .0),
-                vsubq_f32(self.0 .1, rhs.0 .1),
+                vsubq_f32(self.0.0, rhs.0.0),
+                vsubq_f32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -406,8 +406,8 @@ impl SubAssign for f32x8 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vsubq_f32(self.0 .0, rhs.0 .0);
-            self.0 .1 = vsubq_f32(self.0 .1, rhs.0 .1);
+            self.0.0 = vsubq_f32(self.0.0, rhs.0.0);
+            self.0.1 = vsubq_f32(self.0.1, rhs.0.1);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -428,8 +428,8 @@ impl Mul for f32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x2_t(
-                vmulq_f32(self.0 .0, rhs.0 .0),
-                vmulq_f32(self.0 .1, rhs.0 .1),
+                vmulq_f32(self.0.0, rhs.0.0),
+                vmulq_f32(self.0.1, rhs.0.1),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -644,8 +644,8 @@ impl SIMD<f32, 16> for f32x16 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let mut sum1 = vaddq_f32(self.0 .0, self.0 .1);
-            let sum2 = vaddq_f32(self.0 .2, self.0 .3);
+            let mut sum1 = vaddq_f32(self.0.0, self.0.1);
+            let sum2 = vaddq_f32(self.0.2, self.0.3);
             sum1 = vaddq_f32(sum1, sum2);
             vaddvq_f32(sum1)
         }
@@ -675,8 +675,8 @@ impl SIMD<f32, 16> for f32x16 {
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let m1 = vminq_f32(self.0 .0, self.0 .1);
-            let m2 = vminq_f32(self.0 .2, self.0 .3);
+            let m1 = vminq_f32(self.0.0, self.0.1);
+            let m2 = vminq_f32(self.0.2, self.0.3);
             let m = vminq_f32(m1, m2);
             vminvq_f32(m)
         }
@@ -706,10 +706,10 @@ impl SIMD<f32, 16> for f32x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x4_t(
-                vminq_f32(self.0 .0, rhs.0 .0),
-                vminq_f32(self.0 .1, rhs.0 .1),
-                vminq_f32(self.0 .2, rhs.0 .2),
-                vminq_f32(self.0 .3, rhs.0 .3),
+                vminq_f32(self.0.0, rhs.0.0),
+                vminq_f32(self.0.1, rhs.0.1),
+                vminq_f32(self.0.2, rhs.0.2),
+                vminq_f32(self.0.3, rhs.0.3),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -742,10 +742,10 @@ impl SIMD<f32, 16> for f32x16 {
         unsafe {
             let tgt = vdupq_n_f32(val);
             let mut arr = [0; 16];
-            let mask1 = vceqq_f32(self.0 .0, tgt);
-            let mask2 = vceqq_f32(self.0 .1, tgt);
-            let mask3 = vceqq_f32(self.0 .2, tgt);
-            let mask4 = vceqq_f32(self.0 .3, tgt);
+            let mask1 = vceqq_f32(self.0.0, tgt);
+            let mask2 = vceqq_f32(self.0.1, tgt);
+            let mask3 = vceqq_f32(self.0.2, tgt);
+            let mask4 = vceqq_f32(self.0.3, tgt);
 
             vst1q_u32(arr.as_mut_ptr(), mask1);
             vst1q_u32(arr.as_mut_ptr().add(4), mask2);
@@ -785,10 +785,10 @@ impl FloatSimd<f32, 16> for f32x16 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
-            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
-            self.0 .2 = vfmaq_f32(self.0 .2, a.0 .2, b.0 .2);
-            self.0 .3 = vfmaq_f32(self.0 .3, a.0 .3, b.0 .3);
+            self.0.0 = vfmaq_f32(self.0.0, a.0.0, b.0.0);
+            self.0.1 = vfmaq_f32(self.0.1, a.0.1, b.0.1);
+            self.0.2 = vfmaq_f32(self.0.2, a.0.2, b.0.2);
+            self.0.3 = vfmaq_f32(self.0.3, a.0.3, b.0.3);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -814,10 +814,10 @@ impl Add for f32x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x4_t(
-                vaddq_f32(self.0 .0, rhs.0 .0),
-                vaddq_f32(self.0 .1, rhs.0 .1),
-                vaddq_f32(self.0 .2, rhs.0 .2),
-                vaddq_f32(self.0 .3, rhs.0 .3),
+                vaddq_f32(self.0.0, rhs.0.0),
+                vaddq_f32(self.0.1, rhs.0.1),
+                vaddq_f32(self.0.2, rhs.0.2),
+                vaddq_f32(self.0.3, rhs.0.3),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -841,10 +841,10 @@ impl AddAssign for f32x16 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vaddq_f32(self.0 .0, rhs.0 .0);
-            self.0 .1 = vaddq_f32(self.0 .1, rhs.0 .1);
-            self.0 .2 = vaddq_f32(self.0 .2, rhs.0 .2);
-            self.0 .3 = vaddq_f32(self.0 .3, rhs.0 .3);
+            self.0.0 = vaddq_f32(self.0.0, rhs.0.0);
+            self.0.1 = vaddq_f32(self.0.1, rhs.0.1);
+            self.0.2 = vaddq_f32(self.0.2, rhs.0.2);
+            self.0.3 = vaddq_f32(self.0.3, rhs.0.3);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -870,10 +870,10 @@ impl Mul for f32x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x4_t(
-                vmulq_f32(self.0 .0, rhs.0 .0),
-                vmulq_f32(self.0 .1, rhs.0 .1),
-                vmulq_f32(self.0 .2, rhs.0 .2),
-                vmulq_f32(self.0 .3, rhs.0 .3),
+                vmulq_f32(self.0.0, rhs.0.0),
+                vmulq_f32(self.0.1, rhs.0.1),
+                vmulq_f32(self.0.2, rhs.0.2),
+                vmulq_f32(self.0.3, rhs.0.3),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -899,10 +899,10 @@ impl Sub for f32x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x4_t(
-                vsubq_f32(self.0 .0, rhs.0 .0),
-                vsubq_f32(self.0 .1, rhs.0 .1),
-                vsubq_f32(self.0 .2, rhs.0 .2),
-                vsubq_f32(self.0 .3, rhs.0 .3),
+                vsubq_f32(self.0.0, rhs.0.0),
+                vsubq_f32(self.0.1, rhs.0.1),
+                vsubq_f32(self.0.2, rhs.0.2),
+                vsubq_f32(self.0.3, rhs.0.3),
             ))
         }
         #[cfg(target_arch = "loongarch64")]
@@ -926,10 +926,10 @@ impl SubAssign for f32x16 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            self.0 .0 = vsubq_f32(self.0 .0, rhs.0 .0);
-            self.0 .1 = vsubq_f32(self.0 .1, rhs.0 .1);
-            self.0 .2 = vsubq_f32(self.0 .2, rhs.0 .2);
-            self.0 .3 = vsubq_f32(self.0 .3, rhs.0 .3);
+            self.0.0 = vsubq_f32(self.0.0, rhs.0.0);
+            self.0.1 = vsubq_f32(self.0.1, rhs.0.1);
+            self.0.2 = vsubq_f32(self.0.2, rhs.0.2);
+            self.0.3 = vsubq_f32(self.0.3, rhs.0.3);
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {
@@ -953,14 +953,18 @@ mod tests {
         let simd_b = unsafe { f32x8::load_unaligned(b.as_ptr()) };
 
         let simd_add = simd_a + simd_b;
-        assert!((0..8)
-            .zip(simd_add.as_array().iter())
-            .all(|(x, &y)| (x + x + 10) as f32 == y));
+        assert!(
+            (0..8)
+                .zip(simd_add.as_array().iter())
+                .all(|(x, &y)| (x + x + 10) as f32 == y)
+        );
 
         let simd_mul = simd_a * simd_b;
-        assert!((0..8)
-            .zip(simd_mul.as_array().iter())
-            .all(|(x, &y)| (x * (x + 10)) as f32 == y));
+        assert!(
+            (0..8)
+                .zip(simd_mul.as_array().iter())
+                .all(|(x, &y)| (x * (x + 10)) as f32 == y)
+        );
 
         let simd_sub = simd_b - simd_a;
         assert!(simd_sub.as_array().iter().all(|&v| v == 10.0));
@@ -1010,14 +1014,18 @@ mod tests {
         let simd_b = unsafe { f32x16::load_unaligned(b.as_ptr()) };
 
         let simd_add = simd_a + simd_b;
-        assert!((0..16)
-            .zip(simd_add.as_array().iter())
-            .all(|(x, &y)| (x + x + 10) as f32 == y));
+        assert!(
+            (0..16)
+                .zip(simd_add.as_array().iter())
+                .all(|(x, &y)| (x + x + 10) as f32 == y)
+        );
 
         let simd_mul = simd_a * simd_b;
-        assert!((0..16)
-            .zip(simd_mul.as_array().iter())
-            .all(|(x, &y)| (x * (x + 10)) as f32 == y));
+        assert!(
+            (0..16)
+                .zip(simd_mul.as_array().iter())
+                .all(|(x, &y)| (x * (x + 10)) as f32 == y)
+        );
 
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -160.0);
@@ -1049,7 +1057,9 @@ mod tests {
         let min_simd = simd_a.min(&simd_b);
         assert_eq!(
             min_simd.as_array(),
-            [1.0, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0, -0.5, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 1.0]
+            [
+                1.0, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0, -0.5, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 1.0
+            ]
         );
         let min_val = min_simd.reduce_min();
         assert_eq!(min_val, -0.5);

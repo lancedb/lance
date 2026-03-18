@@ -90,7 +90,13 @@ impl ScanStatistics {
     fn __repr__(&self) -> String {
         format!(
             "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, all_counts={:?})",
-            self.iops, self.requests, self.bytes_read, self.indices_loaded, self.parts_loaded, self.index_comparisons, self.all_counts
+            self.iops,
+            self.requests,
+            self.bytes_read,
+            self.indices_loaded,
+            self.parts_loaded,
+            self.index_comparisons,
+            self.all_counts
         )
     }
 }
@@ -98,7 +104,7 @@ impl ScanStatistics {
 #[pymethods]
 impl Scanner {
     #[getter(schema)]
-    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let scanner = self_.scanner.clone();
         let schema = rt()
             .spawn(Some(self_.py()), async move { scanner.schema().await })?

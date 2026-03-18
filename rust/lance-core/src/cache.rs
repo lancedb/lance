@@ -6,13 +6,12 @@
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use futures::{Future, FutureExt};
 use moka::future::Cache;
-use snafu::location;
 
 use crate::Result;
 
@@ -251,10 +250,9 @@ impl LanceCache {
                 // The loader returned an error, retrieve it from the channel
                 match error_rx.await {
                     Ok(err) => Err(err),
-                    Err(_) => Err(crate::Error::Internal {
-                        message: "Failed to retrieve error from cache loader".into(),
-                        location: location!(),
-                    }),
+                    Err(_) => Err(crate::Error::internal(
+                        "Failed to retrieve error from cache loader",
+                    )),
                 }
             }
         }
@@ -449,10 +447,9 @@ impl WeakLanceCache {
                     // Init returned None, which means there was an error
                     match error_rx.await {
                         Ok(e) => Err(e),
-                        Err(_) => Err(crate::Error::Internal {
-                            message: "Failed to receive error from cache init function".to_string(),
-                            location: location!(),
-                        }),
+                        Err(_) => Err(crate::Error::internal(
+                            "Failed to receive error from cache init function".to_string(),
+                        )),
                     }
                 }
             }

@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
-use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::json::JSON_EXT_NAME;
 use serde_json::Value;
-use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 /// Document type for full text search.
@@ -37,15 +36,13 @@ impl TryFrom<&Field> for DocType {
             }
             DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
                 Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
-                _ => Err(lance_core::Error::InvalidInput {
-                    source: format!("field {} is not json", field.name()).into(),
-                    location: location!(),
-                }),
+                _ => Err(lance_core::Error::invalid_input_source(
+                    format!("field {} is not json", field.name()).into(),
+                )),
             },
-            _ => Err(lance_core::Error::InvalidInput {
-                source: format!("field {} is not json", field.name()).into(),
-                location: location!(),
-            }),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("field {} is not json", field.name()).into(),
+            )),
         }
     }
 }
@@ -57,10 +54,10 @@ impl DocType {
     pub fn prefix_len(&self, token: &str) -> usize {
         match self {
             Self::Json => {
-                if let Some(pos) = token.find(',') {
-                    if let Some(second_pos) = token[pos + 1..].find(',') {
-                        return pos + second_pos + 2;
-                    }
+                if let Some(pos) = token.find(',')
+                    && let Some(second_pos) = token[pos + 1..].find(',')
+                {
+                    return pos + second_pos + 2;
                 }
                 panic!("json token must be in format of <path>,<type>,<value>")
             }
@@ -76,7 +73,7 @@ impl DocType {
 /// 1. Query text is a triplet <path,type,value>, something like `a.b,str,123`. We shouldn't use
 ///    json in search, because it would be too complicated.
 /// 2. Document text is a json string.
-pub trait LanceTokenizer: Send + Sync {
+pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     /// Tokenize query text for search.
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a>;
     /// Tokenize document text for index.
@@ -96,6 +93,12 @@ impl Clone for Box<dyn LanceTokenizer> {
 #[derive(Clone)]
 pub struct TextTokenizer {
     tokenizer: tantivy::tokenizer::TextAnalyzer,
+}
+
+impl std::fmt::Debug for TextTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TextTokenizer")
+    }
 }
 
 impl TextTokenizer {
@@ -130,6 +133,12 @@ pub struct JsonTokenizer {
 impl JsonTokenizer {
     pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
         Self { tokenizer }
+    }
+}
+
+impl std::fmt::Debug for JsonTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JsonTokenizer")
     }
 }
 
@@ -171,10 +180,9 @@ fn flatten_triplet(
     for triple in text.split(';') {
         let parts: Vec<&str> = triple.splitn(3, ',').collect();
         if parts.len() != 3 {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!("Invalid triple format: {}", triple).into(),
-                location: location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                format!("Invalid triple format: {}", triple).into(),
+            ));
         }
         let field = parts[0];
         let v_type = parts[1];
@@ -206,10 +214,9 @@ fn flatten_triplet(
                 }
             }
             _ => {
-                return Err(lance_core::Error::InvalidInput {
-                    source: format!("Invalid triple type: {}", v_type).into(),
-                    location: location!(),
-                })
+                return Err(lance_core::Error::invalid_input_source(
+                    format!("Invalid triple type: {}", v_type).into(),
+                ));
             }
         }
     }
@@ -300,7 +307,7 @@ impl TokenStream for TTStream {
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::tokenizer::lance_tokenizer::{
-        flatten_json, flatten_triplet, JsonTokenizer, LanceTokenizer,
+        JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
     use serde_json::Value;
     use tantivy::tokenizer::{SimpleTokenizer, Token};

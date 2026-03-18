@@ -149,7 +149,22 @@
   line-height: 1.8;
   margin-bottom: 32px;
   opacity: 0.9;
-  text-align: center;
+  text-align: left;
+}
+
+.lance-paper-link {
+  color: var(--md-primary-fg-color);
+  text-decoration: none;
+}
+
+.lance-paper-link:hover {
+  color: var(--md-primary-fg-color);
+  text-decoration: none;
+}
+
+.lance-intro-content a:hover {
+  color: #757575;
+  text-decoration: none;
 }
 
 .lance-intro-content .md-button {

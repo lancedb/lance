@@ -6,6 +6,13 @@ stable and breaking changes should generally be communicated (via warnings) for 
 give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
 migrate.
 
+## 1.0.0
+
+* The `SearchResult` returned by scalar indices must now output information about null values.
+  Instead of containing a `RowIdTreeMap`, it now contains a `NullableRowIdSet`. Expressions that
+  resolve to null values must be included in search results in the null set. This ensures that
+  `NOT` can be applied to index search results correctly.
+
 ## 0.39
 
 * The `lance` crate no longer re-exports utilities from `lance-arrow` such as `RecordBatchExt` or `SchemaExt`.  In the

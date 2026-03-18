@@ -3,13 +3,12 @@
 
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use lance_arrow::DataTypeExt;
 use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 use lance_io::utils::{read_binary_array, read_fixed_stride_array};
-use snafu::location;
 use std::collections::HashMap;
 
 use crate::format::pb;
@@ -45,7 +44,13 @@ impl From<&pb::Field> for Field {
             nullable: field.nullable,
             children: vec![],
             dictionary: field.dictionary.as_ref().map(Dictionary::from),
-            unenforced_primary_key: field.unenforced_primary_key,
+            unenforced_primary_key_position: if field.unenforced_primary_key_position > 0 {
+                Some(field.unenforced_primary_key_position)
+            } else if field.unenforced_primary_key {
+                Some(0)
+            } else {
+                None
+            },
         }
     }
 }
@@ -77,7 +82,8 @@ impl From<&Field> for pb::Field {
                 .map(|name| name.to_owned())
                 .unwrap_or_default(),
             r#type: 0,
-            unenforced_primary_key: field.unenforced_primary_key,
+            unenforced_primary_key: field.unenforced_primary_key_position.is_some(),
+            unenforced_primary_key_position: field.unenforced_primary_key_position.unwrap_or(0),
         }
     }
 }
@@ -226,13 +232,10 @@ async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Re
                     );
                 }
                 _ => {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Does not support {} as dictionary value type",
-                            value_type
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Does not support {} as dictionary value type",
+                        value_type
+                    )));
                 }
             }
         } else {

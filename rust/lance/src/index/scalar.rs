@@ -9,36 +9,36 @@ use std::sync::{Arc, LazyLock};
 use crate::index::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
-    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
+    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
 };
 use arrow_schema::DataType;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
-use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
 };
+use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
+use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::IndexStore;
-use lance_index::scalar::{
-    bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
-    ScalarIndex, ScalarIndexParams,
-};
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
-use lance_index::{DatasetIndexExt, IndexCriteria, IndexType, VECTOR_INDEX_VERSION};
+use lance_index::scalar::{
+    ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
+    lance_format::LanceIndexStore,
+};
+use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
-use snafu::location;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -64,10 +64,12 @@ impl TrainingRequest {
         column: &str,
         criteria: &TrainingCriteria,
     ) -> Result<SendableRecordBatchStream> {
-        let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-            source: format!("No column with name {}", column).into(),
-            location: location!(),
-        })?;
+        let column_field = dataset
+            .schema()
+            .field(column)
+            .ok_or(Error::invalid_input_source(
+                format!("No column with name {}", column).into(),
+            ))?;
 
         let mut fields = Vec::with_capacity(3);
         fields.push(arrow_schema::Field::new(
@@ -199,10 +201,9 @@ pub(crate) async fn load_training_data(
                 .zip(frags)
                 .map(|(id, frag)| {
                     let Some(frag) = frag else {
-                        return Err(Error::InvalidInput {
-                            source: format!("No fragment with id {}", id).into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            format!("No fragment with id {}", id).into(),
+                        ));
                     };
                     Ok(frag.metadata().clone())
                 })
@@ -242,7 +243,12 @@ impl IndexDetails {
     /// Returns the index version
     pub fn index_version(&self) -> Result<u32> {
         if self.is_vector() {
-            Ok(VECTOR_INDEX_VERSION)
+            // VectorIndexDetails currently does not include the concrete vector
+            // subtype (IVF_PQ / IVF_RQ / ...), so compatibility filtering cannot
+            // do per-subtype version checks here. Use the highest supported
+            // vector index version as a safe upper bound; older binaries still
+            // ignore newer indices based on their own lower bound.
+            Ok(IndexType::max_vector_version())
         } else {
             self.get_plugin().map(|p| p.version())
         }
@@ -250,6 +256,7 @@ impl IndexDetails {
 }
 
 /// Build a Scalar Index (returns details to store in the manifest)
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 pub(super) async fn build_scalar_index(
     dataset: &Dataset,
@@ -258,11 +265,15 @@ pub(super) async fn build_scalar_index(
     params: &ScalarIndexParams,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    preprocessed_data: Option<SendableRecordBatchStream>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
-    let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-        source: format!("No column with name {}", column).into(),
-        location: location!(),
-    })?;
+    let field = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ))?;
     let field: arrow_schema::Field = field.into();
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
@@ -271,18 +282,31 @@ pub(super) async fn build_scalar_index(
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
-    let training_data = load_training_data(
-        dataset,
-        column,
-        training_request.criteria(),
-        None,
-        train,
-        fragment_ids.clone(),
-    )
-    .await?;
+    progress.stage_start("load_data", None, "rows").await?;
+    let training_data = match preprocessed_data {
+        Some(preprocessed_data) => preprocessed_data,
+        None => {
+            load_training_data(
+                dataset,
+                column,
+                training_request.criteria(),
+                None,
+                train,
+                fragment_ids.clone(),
+            )
+            .await?
+        }
+    };
+    progress.stage_complete("load_data").await?;
 
     plugin
-        .train_index(training_data, &index_store, training_request, fragment_ids)
+        .train_index(
+            training_data,
+            &index_store,
+            training_request,
+            fragment_ids,
+            progress,
+        )
         .await
 }
 
@@ -340,13 +364,13 @@ pub(crate) async fn infer_scalar_index_details(
     }
 
     let index_dir = dataset.indice_files_dir(index)?.child(uuid.clone());
-    let col = dataset.schema().field(column).ok_or(Error::Internal {
-        message: format!(
+    let col = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::internal(format!(
             "Index refers to column {} which does not exist in dataset schema",
             column
-        ),
-        location: location!(),
-    })?;
+        )))?;
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
@@ -395,10 +419,10 @@ pub fn index_matches_criteria(
     has_multiple_indices: bool,
     schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
-    if let Some(name) = &criteria.has_name {
-        if &index.name != name {
-            return Ok(false);
-        }
+    if let Some(name) = &criteria.has_name
+        && &index.name != name
+    {
+        return Ok(false);
     }
 
     if let Some(for_column) = criteria.for_column {
@@ -426,35 +450,30 @@ pub fn index_matches_criteria(
     let index_details = index.index_details.clone().map(IndexDetails);
     let Some(index_details) = index_details else {
         if has_multiple_indices {
-            return Err(Error::InvalidInput {
-                                source: format!(
-                                    "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
-                                    index.name,
-                                    index.fields.first().unwrap_or(&0),
-                                ).into(),
-                                location: location!(),
-                            });
+            return Err(Error::invalid_input_source(format!(
+                "An index {} on the field with id {} co-exists with other indices on the same column but was written with an older Lance version, and this is not supported.  Please retrain this index.",
+                index.name,
+                index.fields.first().unwrap_or(&0),
+            ).into()));
         }
 
         // If we don't have details then allow it for backwards compatibility
         return Ok(true);
     };
 
-    if index_details.is_vector() {
-        // This method is only for finding matching scalar indexes today so reject any vector indexes
-        return Ok(false);
-    }
-
-    if criteria.must_support_fts && !index_details.supports_fts() {
-        return Ok(false);
-    }
-
-    // We should not use FTS / NGram indices for exact equality queries
-    // (i.e. merge insert with a join on the indexed column)
-    if criteria.must_support_exact_equality {
-        let plugin = index_details.get_plugin()?;
-        if !plugin.provides_exact_answer() {
+    // Only apply scalar-specific checks to scalar indices
+    if !index_details.is_vector() {
+        if criteria.must_support_fts && !index_details.supports_fts() {
             return Ok(false);
+        }
+
+        // We should not use FTS / NGram indices for exact equality queries
+        // (i.e. merge insert with a join on the indexed column)
+        if criteria.must_support_exact_equality {
+            let plugin = index_details.get_plugin()?;
+            if !plugin.provides_exact_answer() {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -468,10 +487,10 @@ pub async fn initialize_scalar_index(
     field_names: &[&str],
 ) -> Result<()> {
     if field_names.is_empty() || field_names.len() > 1 {
-        return Err(Error::Index {
-            message: format!("Unsupported fields for scalar index: {:?}", field_names),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Unsupported fields for scalar index: {:?}",
+            field_names
+        )));
     }
 
     // Scalar indices currently support only single fields, use the first one
@@ -491,10 +510,10 @@ pub async fn initialize_scalar_index(
     // For Inverted index, we need to parse the params JSON and create InvertedIndexParams
     if index_type == IndexType::Inverted {
         // Extract the JSON string from ScalarIndexParams
-        let params_json = params.params.as_ref().ok_or_else(|| Error::Index {
-            message: "Inverted index params missing".to_string(),
-            location: location!(),
-        })?;
+        let params_json = params
+            .params
+            .as_ref()
+            .ok_or_else(|| Error::index("Inverted index params missing".to_string()))?;
 
         // Parse the JSON into InvertedIndexParams
         let inverted_params: InvertedIndexParams = serde_json::from_str(params_json)?;
@@ -537,7 +556,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::IndexType;
+    use lance_index::{IndexType, optimize::OptimizeOptions};
     use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
     use lance_table::format::pb::VectorIndexDetails;
 
@@ -594,11 +613,12 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
+        // Vector indices should now match basic criteria
         let result = index_matches_criteria(&index1, &criteria, &[&field], true, &schema).unwrap();
-        assert!(!result);
+        assert!(result);
 
         let result = index_matches_criteria(&index1, &criteria, &[&field], false, &schema).unwrap();
-        assert!(!result);
+        assert!(result);
     }
 
     #[test]
@@ -753,10 +773,10 @@ mod tests {
     async fn test_initialize_scalar_index_btree() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
-        use lance_index::DatasetIndexExt;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -776,6 +796,7 @@ mod tests {
 
         let btree_params = BTreeParameters {
             zone_size: Some(50),
+            range_id: None,
         };
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =
@@ -855,12 +876,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_optimize_scalar_index_btree() {
+        use crate::dataset::Dataset;
+        use arrow_array::types::Float32Type;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::ScalarIndexParams;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/source", test_dir.as_str());
+
+        // Create source dataset with BTree index
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("value", array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        // Create BTree index on source with custom zone_size
+        use lance_index::scalar::btree::BTreeParameters;
+
+        let btree_params = BTreeParameters {
+            zone_size: Some(50),
+            range_id: None,
+        };
+        let params_json = serde_json::to_value(&btree_params).unwrap();
+        let index_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree)
+                .with_params(&params_json);
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_btree".to_string()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Target should have 1 index");
+        assert_eq!(indices[0].name, "id_btree", "Index name should match");
+        assert_eq!(
+            indices[0].fields,
+            vec![0],
+            "Index should be on field 0 (id)"
+        );
+
+        // Verify the index type is correct
+        let scalar_index = dataset
+            .open_scalar_index("id", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::BTree,
+            "Index type should be BTree"
+        );
+
+        // Verify BTree parameters are preserved
+        let derived_params = scalar_index.derive_index_params().unwrap();
+        if let Some(params_json) = derived_params.params {
+            let params: BTreeParameters = serde_json::from_str(&params_json).unwrap();
+            assert_eq!(params.zone_size, Some(50), "BTree zone_size should be 50");
+        } else {
+            panic!("BTree index should have parameters");
+        }
+
+        // Append more data to dataset
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("value", array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(200), BatchCount::from(1));
+        dataset.append(reader, None).await.unwrap();
+
+        // Optimize BTree index
+        let optimize_index_options =
+            OptimizeOptions::new().index_names(vec!["id_btree".to_string()]);
+        dataset
+            .optimize_indices(&optimize_index_options)
+            .await
+            .unwrap();
+
+        // Verify BTree parameters are same after optimization
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Target should have 1 index");
+        assert_eq!(indices[0].name, "id_btree", "Index name should match");
+        assert_eq!(
+            indices[0].fields,
+            vec![0],
+            "Index should be on field 0 (id)"
+        );
+
+        let scalar_index = dataset
+            .open_scalar_index("id", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::BTree,
+            "Index type should be BTree"
+        );
+
+        let derived_params = scalar_index.derive_index_params().unwrap();
+        if let Some(params_json) = derived_params.params {
+            let params: BTreeParameters = serde_json::from_str(&params_json).unwrap();
+            assert_eq!(params.zone_size, Some(50), "BTree zone_size should be 50");
+        } else {
+            panic!("BTree index should have parameters");
+        }
+    }
+
+    #[tokio::test]
     async fn test_initialize_scalar_index_bitmap() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
-        use lance_index::scalar::ScalarIndexParams;
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::DatasetIndexExt;
+        use lance_index::scalar::ScalarIndexParams;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -937,10 +1076,10 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_inverted() {
         use crate::dataset::Dataset;
-        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-        use lance_index::DatasetIndexExt;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -1077,11 +1216,11 @@ mod tests {
     async fn test_initialize_scalar_index_zonemap() {
         use crate::dataset::Dataset;
         use arrow_array::types::Float32Type;
-        use lance_datagen::{array, BatchCount, RowCount};
-        use lance_index::metrics::NoOpMetricsCollector;
-        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
-        use lance_index::scalar::ScalarIndexParams;
+        use lance_datagen::{BatchCount, RowCount, array};
         use lance_index::DatasetIndexExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
 
         let test_dir = TempStrDir::default();
         let source_uri = format!("{}/source", test_dir.as_str());
@@ -1230,7 +1369,11 @@ mod tests {
             }
 
             for (before, expected) in result_before.iter().zip(expected.iter()) {
-                assert_eq!(before, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}'", del_pred);
+                assert_eq!(
+                    before, expected,
+                    "Zonemap index with deletions returned wrong results for deletion predicate '{}'",
+                    del_pred
+                );
             }
 
             // Now recreate the indexes for the next iteration
@@ -1249,7 +1392,11 @@ mod tests {
             }
 
             for (after, expected) in result_after.iter().zip(expected.iter()) {
-                assert_eq!(after, expected, "Zonemap index with deletions returned wrong results for deletion predicate '{}' after re-creating the index", del_pred);
+                assert_eq!(
+                    after, expected,
+                    "Zonemap index with deletions returned wrong results for deletion predicate '{}' after re-creating the index",
+                    del_pred
+                );
             }
         }
     }
@@ -1258,8 +1405,8 @@ mod tests {
     async fn test_zonemap_deletion_then_index() {
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows in two fragments: alternating boolean values
         // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
@@ -1335,8 +1482,8 @@ mod tests {
         // Verifies that zonemap index properly handles deletions that occur after index creation
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows: alternating boolean values
         // Rows 0,2,4,6,8 have value=true, rows 1,3,5,7,9 have value=false
@@ -1463,8 +1610,8 @@ mod tests {
         // After deleting rows and creating a bloom filter index, queries return fewer results than expected
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows: alternating string values "apple" and "banana"
         // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"
@@ -1550,8 +1697,8 @@ mod tests {
         // Verifies that bloom filter index properly handles deletions that occur after index creation
         use arrow::datatypes::UInt64Type;
         use lance_datagen::array;
-        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
         use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
         // Create dataset with 10 rows: alternating string values "apple" and "banana"
         // Rows 0,2,4,6,8 have value="apple", rows 1,3,5,7,9 have value="banana"

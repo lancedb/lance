@@ -10,11 +10,11 @@ use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
 use pyo3::{
+    IntoPyObjectExt,
     basic::CompareOp,
     exceptions::{PyNotImplementedError, PyValueError},
     prelude::*,
     types::PyTuple,
-    IntoPyObjectExt,
 };
 
 #[pyclass(name = "LanceField", module = "lance.schema")]
@@ -55,6 +55,21 @@ impl LanceField {
     #[getter]
     pub fn metadata(&self) -> PyResult<std::collections::HashMap<String, String>> {
         Ok(self.0.metadata.clone())
+    }
+
+    /// Check if this field is part of an unenforced primary key.
+    pub fn is_unenforced_primary_key(&self) -> bool {
+        self.0.is_unenforced_primary_key()
+    }
+
+    /// Get the position of this field within a composite primary key.
+    ///
+    /// Returns the 1-based position if explicitly set, or None if not part of
+    /// a primary key or using schema field id ordering.
+    pub fn unenforced_primary_key_position(&self) -> Option<u32> {
+        self.0
+            .unenforced_primary_key_position
+            .filter(|&pos| pos > 0)
     }
 
     pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
@@ -108,7 +123,7 @@ impl LanceSchema {
         Ok(Self(schema))
     }
 
-    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         // We don't have a single message for the schema, just protobuf message
         // for a field. So, the state will be:
         // (metadata_json, field_protos...)
@@ -165,6 +180,22 @@ impl LanceSchema {
     /// Returns None if the field is not found.
     pub fn field(&self, name: &str) -> PyResult<Option<LanceField>> {
         Ok(self.0.field(name).map(|f| LanceField(f.clone())))
+    }
+
+    /// Get a field by name or path with case-insensitive matching.
+    ///
+    /// This first tries an exact match, then falls back to case-insensitive matching.
+    /// Returns the actual field from the schema (preserving original case).
+    ///
+    /// For nested fields, use dot notation (e.g., "parent.child").
+    /// Field names containing dots must be quoted with backticks (e.g., "parent.`child.with.dot`").
+    ///
+    /// Returns None if the field is not found.
+    pub fn field_case_insensitive(&self, name: &str) -> PyResult<Option<LanceField>> {
+        Ok(self
+            .0
+            .field_case_insensitive(name)
+            .map(|f| LanceField(f.clone())))
     }
 }
 

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
-use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Operator};
 use datafusion::logical_expr::{Between, ScalarUDF, ScalarUDFImpl};
+use datafusion::logical_expr::{BinaryExpr, Operator, expr::ScalarFunction};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::getfield::GetFieldFunc;
@@ -17,20 +17,13 @@ use lance_arrow::DataTypeExt;
 
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
-use snafu::location;
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
         Expr::Literal(scalar_value, metadata) => {
-            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::invalid_input(
-                format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'"),
-                location!(),
-            ))?, metadata.clone()))
+            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::invalid_input(format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'")))?, metadata.clone()))
         }
-        _ => Err(Error::invalid_input(
-            format!("Expected a literal of type '{data_type:?}' but received: {expr}"),
-            location!(),
-        )),
+        _ => Err(Error::invalid_input(format!("Expected a literal of type '{data_type:?}' but received: {expr}"))),
     }
 }
 
@@ -201,7 +194,9 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
     match expr {
         // Coerce regexp_match to boolean by checking for non-null
         Expr::ScalarFunction(sf) if sf.func.name() == "regexp_match" => {
-            log::warn!("regexp_match now is coerced to boolean, this may be changed in the future, please use `regexp_like` instead");
+            log::warn!(
+                "regexp_match now is coerced to boolean, this may be changed in the future, please use `regexp_like` instead"
+            );
             Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
 
@@ -284,10 +279,10 @@ pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
     let parts = lance_core::datatypes::parse_field_path(field_path)?;
 
     if parts.is_empty() {
-        return Err(Error::invalid_input(
-            format!("Invalid empty field path: {}", field_path),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Invalid empty field path: {}",
+            field_path
+        )));
     }
 
     // Build the column expression, handling nested fields

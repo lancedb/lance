@@ -9,16 +9,16 @@ use std::sync::Arc;
 use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
-    cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
-    GenericListArray, LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StructArray, UInt32Array, UInt8Array,
+    Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
+    LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
+    UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
-    new_null_array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -34,12 +34,14 @@ pub mod cast;
 pub mod json;
 pub mod list;
 pub mod memory;
+pub mod scalar;
+pub mod stream;
 pub mod r#struct;
 
 /// Arrow extension metadata key for extension name
 pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
 
-/// Arrow extension metadata key for extension metadata  
+/// Arrow extension metadata key for extension metadata
 pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 /// Key used by lance to mark a field as a blob
@@ -47,6 +49,9 @@ pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
 /// Arrow extension type name for Lance blob v2 columns
 pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
+/// Metadata key for overriding the dedicated blob size threshold (in bytes)
+pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
+    "lance-encoding:blob-dedicated-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -316,7 +321,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int16Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int16Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f32)),
@@ -335,7 +340,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int32Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int32Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f32)),
@@ -354,7 +359,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<Int64Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to Int64Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -373,7 +378,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<UInt8Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to UInt8Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -392,7 +397,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .as_any()
                             .downcast_ref::<UInt32Array>()
                             .ok_or(ArrowError::ParseError(
-                                "Fail to cast primitive array to Int8Type".to_string(),
+                                "Fail to cast primitive array to UInt32Type".to_string(),
                             ))?
                             .into_iter()
                             .filter_map(|x| x.map(|y| y as f64)),
@@ -516,7 +521,7 @@ pub trait RecordBatchExt {
     /// Afterwards we add all non-matching right columns to the output.
     ///
     /// Note: This method likely does not handle nested fields correctly and you may want to consider
-    /// using [`merge_with_schema`] instead.
+    /// using [`Self::merge_with_schema`] instead.
     /// ```
     /// use std::sync::Arc;
     /// use arrow_array::*;
@@ -604,6 +609,9 @@ pub trait RecordBatchExt {
 
     /// Create a new RecordBatch with compacted memory after slicing.
     fn shrink_to_fit(&self) -> Result<RecordBatch>;
+
+    /// Helper method to sort the RecordBatch by a column
+    fn sort_by_column(&self, column: usize, options: Option<SortOptions>) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -778,6 +786,61 @@ impl RecordBatchExt for RecordBatch {
         // Deep copy the sliced record batch, instead of whole batch
         crate::deepcopy::deep_copy_batch_sliced(self)
     }
+
+    fn sort_by_column(&self, column: usize, options: Option<SortOptions>) -> Result<Self> {
+        if column >= self.num_columns() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Column index out of bounds: {}",
+                column
+            )));
+        }
+        let column = self.column(column);
+        let sorted = arrow_ord::sort::sort_to_indices(column, options, None)?;
+        self.take(&sorted)
+    }
+}
+
+/// Recursively projects an array to match the target field's structure.
+/// This handles reordering fields inside nested List<Struct> types.
+fn project_array(array: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
+    match target_field.data_type() {
+        DataType::Struct(subfields) => {
+            let struct_arr = array.as_struct();
+            let projected = project(struct_arr, subfields)?;
+            Ok(Arc::new(projected))
+        }
+        DataType::List(inner_field) => {
+            let list_arr: &ListArray = array.as_list();
+            let projected_values = project_array(list_arr.values(), inner_field.as_ref())?;
+            Ok(Arc::new(ListArray::new(
+                inner_field.clone(),
+                list_arr.offsets().clone(),
+                projected_values,
+                list_arr.nulls().cloned(),
+            )))
+        }
+        DataType::LargeList(inner_field) => {
+            let list_arr: &LargeListArray = array.as_list();
+            let projected_values = project_array(list_arr.values(), inner_field.as_ref())?;
+            Ok(Arc::new(LargeListArray::new(
+                inner_field.clone(),
+                list_arr.offsets().clone(),
+                projected_values,
+                list_arr.nulls().cloned(),
+            )))
+        }
+        DataType::FixedSizeList(inner_field, size) => {
+            let list_arr = array.as_fixed_size_list();
+            let projected_values = project_array(list_arr.values(), inner_field.as_ref())?;
+            Ok(Arc::new(FixedSizeListArray::new(
+                inner_field.clone(),
+                *size,
+                projected_values,
+                list_arr.nulls().cloned(),
+            )))
+        }
+        _ => Ok(array.clone()),
+    }
 }
 
 fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
@@ -790,16 +853,8 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
     let mut columns: Vec<ArrayRef> = vec![];
     for field in fields.iter() {
         if let Some(col) = struct_array.column_by_name(field.name()) {
-            match field.data_type() {
-                // TODO handle list-of-struct
-                DataType::Struct(subfields) => {
-                    let projected = project(col.as_struct(), subfields)?;
-                    columns.push(Arc::new(projected));
-                }
-                _ => {
-                    columns.push(col.clone());
-                }
-            }
+            let projected = project_array(col, field.as_ref())?;
+            columns.push(projected);
         } else {
             return Err(ArrowError::SchemaError(format!(
                 "field {} does not exist in the RecordBatch",
@@ -1098,6 +1153,12 @@ fn adjust_child_validity(
         Some(p) if p.null_count() == 0 => return child.clone(), // No nulls to propagate
         Some(p) => p,
     };
+
+    // Fast path: DataType::Null arrays are always entirely null by definition and cannot
+    // carry an explicit null bitmap (Arrow rejects it). No adjustment is needed.
+    if child.data_type() == &DataType::Null {
+        return child.clone();
+    }
 
     let child_validity = child.nulls();
 
@@ -1409,7 +1470,7 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
 
 /// Interleave multiple RecordBatches into a single RecordBatch.
 ///
-/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+/// Behaves like [`arrow_select::interleave::interleave`], but for RecordBatches.
 pub fn interleave_batches(
     batches: &[RecordBatch],
     indices: &[(usize, usize)],
@@ -1504,8 +1565,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, new_null_array, ListArray, StringArray};
-    use arrow_array::{Float32Array, Int32Array, StructArray};
+    use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
+    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -1932,6 +1993,31 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_null_typed_column_with_parent_validity() {
+        // Reproduces ENT-990: panic in adjust_child_validity when a Null-typed column
+        // exists on one side and the parent struct has null rows.
+        // Arrow's Null type has no null bitmap, so passing one to ArrayData::try_new panics.
+        let left_struct = StructArray::new(
+            Fields::from(vec![Field::new("a", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let right_struct = StructArray::new(
+            Fields::from(vec![Field::new("b", DataType::Null, true)]),
+            vec![Arc::new(NullArray::new(2)) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+
+        // Previously panicked: "Arrays of type Null cannot contain a null bitmask"
+        let merged = merge(&left_struct, &right_struct);
+        assert_eq!(merged.len(), 2);
+        let b_col = merged.column_by_name("b").unwrap();
+        // DataType::Null implies all-null by definition; no null bitmap is stored.
+        assert_eq!(b_col.data_type(), &DataType::Null);
+        assert_eq!(b_col.len(), 2);
+    }
+
+    #[test]
     fn test_merge_with_schema_with_nullable_struct_list_schema_mismatch() {
         // left_list setup
         let left_company_id = Arc::new(Int32Array::from(vec![None, None]));
@@ -2228,5 +2314,246 @@ mod tests {
         // merge left_list and right_list
         let merged_array = merge_with_schema(&left_list_struct, &right_list_struct, &target_fields);
         assert_eq!(merged_array.len(), 2);
+    }
+
+    #[test]
+    fn test_project_by_schema_list_struct_reorder() {
+        // Test that project_by_schema correctly reorders fields inside List<Struct>
+        // This is a regression test for issue #5702
+
+        // Source schema with inner struct fields in order: c, b, a
+        let source_inner_struct = DataType::Struct(Fields::from(vec![
+            Field::new("c", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("a", DataType::Utf8, true),
+        ]));
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "data",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    source_inner_struct.clone(),
+                    true,
+                ))),
+                true,
+            ),
+        ]));
+
+        // Create source data with c, b, a order
+        let c_array = StringArray::from(vec!["c1", "c2"]);
+        let b_array = StringArray::from(vec!["b1", "b2"]);
+        let a_array = StringArray::from(vec!["a1", "a2"]);
+        let inner_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("c", DataType::Utf8, true)),
+                Arc::new(c_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+                Arc::new(b_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("a", DataType::Utf8, true)),
+                Arc::new(a_array) as ArrayRef,
+            ),
+        ]);
+
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", source_inner_struct, true)),
+            OffsetBuffer::from_lengths([1, 1]),
+            Arc::new(inner_struct),
+            None,
+        );
+
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(list_array)],
+        )
+        .unwrap();
+
+        // Target schema with inner struct fields in order: a, b, c
+        let target_inner_struct = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Utf8, true),
+        ]));
+        let target_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "data",
+                DataType::List(Arc::new(Field::new("item", target_inner_struct, true))),
+                true,
+            ),
+        ]);
+
+        // Project should reorder the inner struct fields
+        let projected = batch.project_by_schema(&target_schema).unwrap();
+
+        // Verify the schema is correct
+        assert_eq!(projected.schema().as_ref(), &target_schema);
+
+        // Verify the data is correct by checking inner struct field order
+        let projected_list = projected.column(1).as_list::<i32>();
+        let projected_struct = projected_list.values().as_struct();
+
+        // Fields should now be in order: a, b, c
+        assert_eq!(
+            projected_struct.column_by_name("a").unwrap().as_ref(),
+            &StringArray::from(vec!["a1", "a2"]) as &dyn Array
+        );
+        assert_eq!(
+            projected_struct.column_by_name("b").unwrap().as_ref(),
+            &StringArray::from(vec!["b1", "b2"]) as &dyn Array
+        );
+        assert_eq!(
+            projected_struct.column_by_name("c").unwrap().as_ref(),
+            &StringArray::from(vec!["c1", "c2"]) as &dyn Array
+        );
+
+        // Also verify positional access matches expected order (a=0, b=1, c=2)
+        assert_eq!(
+            projected_struct.column(0).as_ref(),
+            &StringArray::from(vec!["a1", "a2"]) as &dyn Array
+        );
+        assert_eq!(
+            projected_struct.column(1).as_ref(),
+            &StringArray::from(vec!["b1", "b2"]) as &dyn Array
+        );
+        assert_eq!(
+            projected_struct.column(2).as_ref(),
+            &StringArray::from(vec!["c1", "c2"]) as &dyn Array
+        );
+    }
+
+    #[test]
+    fn test_project_by_schema_nested_list_struct() {
+        // Test deeply nested List<Struct<List<Struct>>> projection
+        let inner_struct = DataType::Struct(Fields::from(vec![
+            Field::new("y", DataType::Int32, true),
+            Field::new("x", DataType::Int32, true),
+        ]));
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("b", DataType::Utf8, true),
+                    Field::new(
+                        "inner_list",
+                        DataType::List(Arc::new(Field::new("item", inner_struct.clone(), true))),
+                        true,
+                    ),
+                    Field::new("a", DataType::Utf8, true),
+                ])),
+                true,
+            ))),
+            true,
+        )]));
+
+        // Create deeply nested data
+        let y_array = Int32Array::from(vec![1, 2]);
+        let x_array = Int32Array::from(vec![3, 4]);
+        let innermost_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("y", DataType::Int32, true)),
+                Arc::new(y_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("x", DataType::Int32, true)),
+                Arc::new(x_array) as ArrayRef,
+            ),
+        ]);
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", inner_struct.clone(), true)),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(innermost_struct),
+            None,
+        );
+
+        let b_array = StringArray::from(vec!["b1"]);
+        let a_array = StringArray::from(vec!["a1"]);
+        let middle_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+                Arc::new(b_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(
+                    "inner_list",
+                    DataType::List(Arc::new(Field::new("item", inner_struct, true))),
+                    true,
+                )),
+                Arc::new(inner_list) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("a", DataType::Utf8, true)),
+                Arc::new(a_array) as ArrayRef,
+            ),
+        ]);
+
+        let outer_list = ListArray::new(
+            Arc::new(Field::new("item", middle_struct.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(middle_struct),
+            None,
+        );
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(outer_list) as ArrayRef]).unwrap();
+
+        // Target schema with reordered fields at all levels
+        let target_inner_struct = DataType::Struct(Fields::from(vec![
+            Field::new("x", DataType::Int32, true), // x before y now
+            Field::new("y", DataType::Int32, true),
+        ]));
+        let target_schema = Schema::new(vec![Field::new(
+            "outer",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Utf8, true), // a before b now
+                    Field::new(
+                        "inner_list",
+                        DataType::List(Arc::new(Field::new("item", target_inner_struct, true))),
+                        true,
+                    ),
+                    Field::new("b", DataType::Utf8, true),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+
+        let projected = batch.project_by_schema(&target_schema).unwrap();
+
+        // Verify schema
+        assert_eq!(projected.schema().as_ref(), &target_schema);
+
+        // Verify deeply nested data is reordered correctly
+        let outer_list = projected.column(0).as_list::<i32>();
+        let middle_struct = outer_list.values().as_struct();
+
+        // Middle struct should have a first, then inner_list, then b
+        assert_eq!(
+            middle_struct.column(0).as_ref(),
+            &StringArray::from(vec!["a1"]) as &dyn Array
+        );
+        assert_eq!(
+            middle_struct.column(2).as_ref(),
+            &StringArray::from(vec!["b1"]) as &dyn Array
+        );
+
+        // Inner list's struct should have x first, then y
+        let inner_list = middle_struct.column(1).as_list::<i32>();
+        let innermost_struct = inner_list.values().as_struct();
+        assert_eq!(
+            innermost_struct.column(0).as_ref(),
+            &Int32Array::from(vec![3, 4]) as &dyn Array
+        );
+        assert_eq!(
+            innermost_struct.column(1).as_ref(),
+            &Int32Array::from(vec![1, 2]) as &dyn Array
+        );
     }
 }

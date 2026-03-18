@@ -104,7 +104,7 @@ import lance
 ds = lance.dataset(data_uri)
 read_version = ds.version # record the read version
 
-op = lance.LanceOperation.Append(schema, all_fragments)
+op = lance.LanceOperation.Append(all_fragments)
 lance.LanceDataset.commit(
     data_uri,
     op,

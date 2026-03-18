@@ -3,7 +3,7 @@
 
 use std::iter::repeat_with;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lance_linalg::distance::hamming::{hamming, hamming_scalar};
 use rand::Rng;
 

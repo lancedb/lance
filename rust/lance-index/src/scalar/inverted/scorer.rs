@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::InvertedPartition;
-use crate::scalar::inverted::query::Tokens;
 use std::collections::HashMap;
 
 // the Scorer trait is used to calculate the score of a token in a document
@@ -43,12 +42,19 @@ impl MemBM25Scorer {
     /// Incremental update bm25 scorer with one new document.
     ///
     /// # Arguments
-    /// * `tokens` - The tokens of the new document.
-    pub fn update(&mut self, tokens: &Tokens) {
-        self.total_tokens += tokens.len() as u64;
+    /// * `tokens` - The tokens of the new document that are also in the query
+    /// * `num_tokens` - The total number of tokens in the document
+    pub fn update(&mut self, doc_token_count: &HashMap<String, usize>, num_tokens: u64) {
+        self.total_tokens += num_tokens;
         self.num_docs += 1;
-        for token in tokens {
-            *self.token_docs.entry(token.clone()).or_insert(0) += 1;
+        for (token, count) in doc_token_count {
+            if let Some(old_count) = self.token_docs.get_mut(token) {
+                *old_count += *count;
+            } else {
+                // This shouldn't happen because `tokens` should only contain tokens that are in the query
+                // and we should have already initialized this with query tokens.  Still, log a warning just in case.
+                log::warn!("Token {} not found in token_docs", token);
+            }
         }
     }
 
@@ -57,7 +63,7 @@ impl MemBM25Scorer {
     }
 
     pub fn avg_doc_length(&self) -> f32 {
-        (self.total_tokens / self.num_docs as u64) as f32
+        self.total_tokens as f32 / self.num_docs as f32
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {
@@ -71,6 +77,7 @@ impl MemBM25Scorer {
 pub struct IndexBM25Scorer<'a> {
     partitions: Vec<&'a InvertedPartition>,
     num_docs: usize,
+    total_tokens: u64,
     avg_doc_length: f32,
 }
 
@@ -86,6 +93,7 @@ impl<'a> IndexBM25Scorer<'a> {
         Self {
             partitions,
             num_docs,
+            total_tokens,
             avg_doc_length: avgdl,
         }
     }
@@ -94,8 +102,8 @@ impl<'a> IndexBM25Scorer<'a> {
         self.num_docs
     }
 
-    pub fn avg_doc_length(&self) -> f32 {
-        self.avg_doc_length
+    pub fn total_tokens(&self) -> u64 {
+        self.total_tokens
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {

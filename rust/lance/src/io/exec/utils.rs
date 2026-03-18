@@ -2,14 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -27,13 +26,12 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
-use lance_core::{Result, ROW_ID};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
-use snafu::location;
 
-use crate::index::prefilter::DatasetPreFilter;
 use crate::Dataset;
+use crate::index::prefilter::DatasetPreFilter;
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
@@ -75,21 +73,18 @@ pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RowIdTreeMap::new();
+    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+        let mut allow_list = RowAddrTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
-                message: "input batch missing row id column even though it is in the schema for the stream".into(),
-                location: location!(),
-            })?;
+            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::internal("input batch missing row id column even though it is in the schema for the stream"))?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .expect("row id column in input batch had incorrect type");
             allow_list.extend(row_ids.iter().flatten())
         }
-        Ok(RowIdMask::from_allowed(allow_list))
+        Ok(RowAddrMask::from_allowed(allow_list))
     }
 }
 
@@ -98,24 +93,20 @@ pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
         let batch = self
             .0
             .try_next()
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: "Selection vector source for prefilter did not yield any batches".into(),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal("Selection vector source for prefilter did not yield any batches")
             })
             .unwrap();
-        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::Internal {
-                message: format!(
-                    "Expected selection vector input to yield binary arrays but got {}",
-                    batch["result"].data_type()
-                ),
-                location: location!(),
-            }
+        RowAddrMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+            Error::internal(format!(
+                "Expected selection vector input to yield binary arrays but got {}",
+                batch["result"].data_type()
+            ))
         })?)
     }
 }
@@ -264,10 +255,7 @@ impl<S> InstrumentedRecordBatchStreamAdapter<S> {
         let batch_count = Count::new();
         MetricBuilder::new(metrics)
             .with_partition(partition)
-            .build(MetricValue::Count {
-                name: Cow::Borrowed("output_batches"),
-                count: batch_count.clone(),
-            });
+            .build(MetricValue::OutputBatches(batch_count.clone()));
         Self {
             schema,
             stream,
@@ -435,20 +423,20 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{types::UInt32Type, RecordBatchReader};
+    use arrow_array::{RecordBatchReader, types::UInt32Type};
     use arrow_schema::SortOptions;
     use datafusion::common::NullEquality;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
         physical_plan::{
-            joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter, ExecutionPlan,
+            ExecutionPlan, joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter,
         },
     };
     use futures::{StreamExt, TryStreamExt};
     use lance_core::utils::futures::Capacity;
     use lance_datafusion::exec::OneShotExec;
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array};
 
     use super::ReplayExec;
 

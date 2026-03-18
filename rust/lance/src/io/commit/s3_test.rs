@@ -6,14 +6,14 @@ use arrow::datatypes::Int32Type;
 
 use crate::{
     dataset::{
-        builder::DatasetBuilder, CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams,
+        CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder,
     },
-    io::ObjectStoreParams,
+    io::{ObjectStoreParams, StorageOptionsAccessor},
 };
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
-use aws_sdk_s3::{config::Credentials, Client as S3Client};
+use aws_sdk_s3::{Client as S3Client, config::Credentials};
 use futures::future::try_join_all;
-use lance_datagen::{array, gen_batch, RowCount};
+use lance_datagen::{RowCount, array, gen_batch};
 use lance_io::assert_io_eq;
 use lance_io::utils::tracking_store::IOTracker;
 
@@ -186,12 +186,12 @@ async fn test_concurrent_writers() {
     // Create a table
     let store_params = ObjectStoreParams {
         object_store_wrapper: Some(io_tracker.clone()),
-        storage_options: Some(
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             CONFIG
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-        ),
+        ))),
         ..Default::default()
     };
     let write_params = WriteParams {
@@ -270,12 +270,12 @@ async fn test_ddb_open_iops() {
     // Create a table
     let store_params = ObjectStoreParams {
         object_store_wrapper: Some(io_tracker.clone()),
-        storage_options: Some(
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             CONFIG
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-        ),
+        ))),
         ..Default::default()
     };
     let write_params = WriteParams {

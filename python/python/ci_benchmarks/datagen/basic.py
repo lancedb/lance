@@ -19,6 +19,7 @@ ROWS_PER_BATCH = NUM_ROWS // NUM_BATCHES
 SCHEMA = pa.schema(
     {
         "row_number": pa.uint64(),
+        "row_number_bitmap": pa.uint64(),
         "integers": pa.int64(),
         "small_strings": pa.string(),
     }
@@ -36,9 +37,12 @@ def _gen_data():
                 pa.array(
                     [batch_idx * ROWS_PER_BATCH + i for i in range(ROWS_PER_BATCH)]
                 ),
+                pa.array(
+                    [batch_idx * ROWS_PER_BATCH + i for i in range(ROWS_PER_BATCH)]
+                ),
                 pa.array([f"payload_{i}" for i in range(ROWS_PER_BATCH)]),
             ],
-            names=["row_number", "integers", "small_strings"],
+            names=["row_number", "row_number_bitmap", "integers", "small_strings"],
         )
         yield batch
 
@@ -54,7 +58,6 @@ def _create(dataset_uri: str):
                     dataset_uri,
                     schema=SCHEMA,
                     mode="append",
-                    use_legacy_format=False,
                 )
             else:
                 raise Exception(
@@ -68,10 +71,10 @@ def _create(dataset_uri: str):
             dataset_uri,
             schema=SCHEMA,
             mode="create",
-            use_legacy_format=False,
         )
-    if ds.list_indices() == []:
+    if not ds.describe_indices():
         ds.create_scalar_index("row_number", "BTREE")
+        ds.create_scalar_index("row_number_bitmap", "BITMAP")
 
 
 def gen_basic():

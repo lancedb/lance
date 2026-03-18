@@ -61,7 +61,7 @@ def test_schema_only(tmp_path):
 def test_write_with_max_page_bytes(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
-    for version in ["2.0", "2.1"]:
+    for version in ["2.0", "2.1", "2.2", "2.3"]:
         with LanceFileWriter(
             str(path), schema, max_page_bytes=1, version=version
         ) as writer:
@@ -91,23 +91,22 @@ def test_multiple_close(tmp_path):
 
 
 def test_version(tmp_path):
-    path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
+    cases = [
+        ("foo.lance", "2.0", (0, 3)),
+        ("foo2.lance", "2.1", (2, 1)),
+        ("foo3.lance", "2.2", (2, 2)),
+        ("foo4.lance", "2.3", (2, 3)),
+    ]
 
-    with LanceFileWriter(str(path), schema, version="2.0") as writer:
-        writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    reader = LanceFileReader(str(path))
-    metadata = reader.metadata()
-    assert metadata.major_version == 0
-    assert metadata.minor_version == 3
-
-    path = tmp_path / "foo2.lance"
-    with LanceFileWriter(str(path), schema, version="2.1") as writer:
-        writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    reader = LanceFileReader(str(path))
-    metadata = reader.metadata()
-    assert metadata.major_version == 2
-    assert metadata.minor_version == 1
+    for file_name, version, (major, minor) in cases:
+        path = tmp_path / file_name
+        with LanceFileWriter(str(path), schema, version=version) as writer:
+            writer.write_batch(pa.table({"a": [1, 2, 3]}))
+        reader = LanceFileReader(str(path))
+        metadata = reader.metadata()
+        assert metadata.major_version == major
+        assert metadata.minor_version == minor
 
 
 def test_take(tmp_path):
@@ -757,3 +756,23 @@ def test_session_contains(tmp_path):
 
     assert session.contains("subdir/nested.lance")
     assert not session.contains("subdir/nonexistent.lance")
+
+
+def test_struct_null_regression():
+    import lance
+
+    # Create struct array where 2nd element is null
+    tag_array = pa.array(["valid", "null_struct", "valid", "valid"])
+    struct_array = pa.StructArray.from_arrays(
+        [tag_array],
+        fields=[pa.field("tag", pa.string(), nullable=True)],
+        mask=pa.array([True, False, True, True]),  # False = null struct element
+    )
+
+    # Create list containing these structs
+    offsets = pa.array([0, 4], type=pa.int32())
+    list_array = pa.ListArray.from_arrays(offsets, struct_array)
+    batch = pa.record_batch([pa.array([0]), list_array], names=["id", "value"])
+
+    ds = lance.write_dataset(batch, "memory://", data_storage_version="2.2")
+    ds.to_table()

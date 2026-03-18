@@ -3,30 +3,64 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use crate::{io::exec::Planner, Error, Result};
-use arrow::compute::can_cast_types;
+use super::fragment::FileFragment;
+use super::{
+    Dataset,
+    transaction::{Operation, Transaction},
+};
+use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow::compute::can_cast_types;
+use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
+use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
-use snafu::location;
-
-use super::fragment::FileFragment;
-use super::{
-    transaction::{Operation, Transaction},
-    Dataset,
-};
 
 mod optimize;
 
 use optimize::{
     ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
+
+async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
+    let field = dataset.schema().field(path).ok_or_else(|| {
+        Error::invalid_input(format!("Column \"{}\" does not exist in the dataset", path))
+    })?;
+
+    if !field.nullable {
+        return Ok(());
+    }
+
+    let mut scanner = dataset.scan();
+    scanner.project(&[path])?;
+    let mut stream = scanner.try_into_stream().await?;
+    while let Some(batch) = stream.try_next().await? {
+        // `path` can be a nested path (e.g. "b.c") which will not be found by
+        // `RecordBatch::column_by_name`. We project exactly one column and validate it directly.
+        if batch.num_columns() != 1 {
+            return Err(Error::internal(format!(
+                "Expected exactly one column in validation scan for {}, got {}",
+                path,
+                batch.num_columns()
+            )));
+        }
+        let col = batch.column(0);
+        if col.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "Column \"{}\" contains NULL values and cannot be made non-nullable",
+                path
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchInfo {
@@ -132,6 +166,72 @@ fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
     }
 }
 
+trait ArrowFieldExt {
+    fn is_packed(&self) -> bool;
+}
+
+impl ArrowFieldExt for ArrowField {
+    fn is_packed(&self) -> bool {
+        let metadata = self.metadata();
+        metadata
+            .get(PACKED_STRUCT_LEGACY_META_KEY)
+            .map(|v| v == "true")
+            .unwrap_or(metadata.contains_key(PACKED_STRUCT_META_KEY))
+    }
+}
+
+fn check_field_conflict(
+    left: &ArrowField,
+    right: &ArrowField,
+    version: &LanceFileVersion,
+) -> Result<()> {
+    if left.name() != right.name() {
+        return Ok(());
+    }
+
+    match (left.data_type(), right.data_type()) {
+        (DataType::Struct(fl), DataType::Struct(fr)) => {
+            if !version.support_add_sub_column() {
+                return Err(Error::invalid_input(format!(
+                    "Column {} is a struct col, add sub column is not supported in Lance file version {}",
+                    left.name(),
+                    version
+                )));
+            }
+
+            if left.is_packed() || right.is_packed() {
+                return Err(Error::invalid_input(format!(
+                    "Column {} is packed struct and already exists in the dataset",
+                    left.name()
+                )));
+            }
+
+            for l_field in fl.iter() {
+                if let Some((_, r_field)) = fr.find(l_field.name()) {
+                    check_field_conflict(l_field, r_field, version)?;
+                }
+            }
+            Ok(())
+        }
+        (DataType::List(fl), DataType::List(fr)) => check_field_conflict(fl, fr, version),
+        (DataType::LargeList(fl), DataType::LargeList(fr)) => check_field_conflict(fl, fr, version),
+        (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
+            check_field_conflict(fl, fr, version)
+        }
+        (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(format!(
+            "Column {} already exists in the dataset",
+            left.name()
+        ))),
+        (_, _) => Err(Error::invalid_input(format!(
+            "Type conflicts between {}({}) and {}({})",
+            left.name(),
+            left.data_type(),
+            right.name(),
+            right.data_type()
+        ))),
+    }
+}
+
 pub(super) async fn add_columns_to_fragments(
     dataset: &Dataset,
     transforms: NewColumnTransform,
@@ -141,17 +241,15 @@ pub(super) async fn add_columns_to_fragments(
 ) -> Result<(Vec<Fragment>, Schema)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
+    let version = dataset.manifest.data_storage_format.lance_file_version()?;
     let check_names = |output_schema: &ArrowSchema| {
-        let new_names = output_schema.field_names();
         for field in &dataset.schema().fields {
-            if new_names.contains(&&field.name) {
-                return Err(Error::invalid_input(
-                    format!("Column {} already exists in the dataset", field.name),
-                    location!(),
-                ));
+            if let Ok(out_field) = output_schema.field_with_name(&field.name) {
+                let ds_field = ArrowField::from(field);
+                check_field_conflict(&ds_field, out_field, &version)?;
             }
         }
-        Ok(())
+        Ok::<(), Error>(())
     };
 
     // Optimize the transforms
@@ -260,10 +358,9 @@ pub(super) async fn add_columns_to_fragments(
             // Check that the schema is compatible considering all the new columns must be nullable
             let schema = Schema::try_from(output_schema.as_ref())?;
             if !schema.all_fields_nullable() {
-                return Err(Error::InvalidInput {
-                    source: "All-null columns must be nullable.".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "All-null columns must be nullable.".into(),
+                ));
             }
 
             let fragments = fragments
@@ -276,10 +373,9 @@ pub(super) async fn add_columns_to_fragments(
             // use the NullReader for fragments that have missing columns and we can't mix legacy
             // and non-legacy readers when reading the fragment.
             if dataset.is_legacy_storage() {
-                return Err(Error::NotSupported {
-                    source: "Cannot add all-null columns to legacy dataset version.".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Cannot add all-null columns to legacy dataset version.".into(),
+                ));
             }
 
             Ok((output_schema, fragments))
@@ -408,7 +504,6 @@ async fn add_columns_from_stream(
                     stream.next().await.ok_or_else(|| {
                         Error::invalid_input(
                             "Stream ended before producing values for all rows in dataset",
-                            location!(),
                         )
                     })??
                 };
@@ -436,10 +531,9 @@ async fn add_columns_from_stream(
 
     // Ensure the stream is fully consumed
     if last_seen_batch.is_some() || stream.next().await.is_some() {
-        return Err(Error::InvalidInput {
-            source: "Stream produced more values than expected for dataset".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source(
+            "Stream produced more values than expected for dataset".into(),
+        ));
     }
 
     Ok(new_fragments)
@@ -452,8 +546,8 @@ pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],
 ) -> Result<()> {
-    // Validate we aren't making nullable columns non-nullable and that all
-    // the referenced columns actually exist.
+    // Validate referenced columns exist and enforce NOT NULL when tightening
+    // a column from nullable to non-nullable.
     let mut new_schema = dataset.schema().clone();
 
     // Mapping of old to new fields that need to be casted.
@@ -463,27 +557,17 @@ pub(super) async fn alter_columns(
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
-            Error::invalid_input(
-                format!(
-                    "Column \"{}\" does not exist in the dataset",
-                    alteration.path
-                ),
-                location!(),
-            )
+            Error::invalid_input(format!(
+                "Column \"{}\" does not exist in the dataset",
+                alteration.path
+            ))
         })?;
 
-        if let Some(nullable) = alteration.nullable {
-            // TODO: in the future, we could check the values of the column to see if
-            //       they are all non-null and thus the column could be made non-nullable.
-            if field_src.nullable && !nullable {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column \"{}\" is already nullable and thus cannot be made non-nullable",
-                        alteration.path
-                    ),
-                    location!(),
-                ));
-            }
+        if let Some(nullable) = alteration.nullable
+            && field_src.nullable
+            && !nullable
+        {
+            validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
         }
 
         let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
@@ -498,15 +582,12 @@ pub(super) async fn alter_columns(
             if !(can_cast_types(&field_src.data_type(), data_type)
                 && is_upcast_downcast(&field_src.data_type(), data_type))
             {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Cannot cast column \"{}\" from {:?} to {:?}",
-                        alteration.path,
-                        field_src.data_type(),
-                        data_type
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Cannot cast column \"{}\" from {:?} to {:?}",
+                    alteration.path,
+                    field_src.data_type(),
+                    data_type
+                )));
             }
 
             let arrow_field = ArrowField::new(
@@ -625,20 +706,20 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
         if dataset.schema().field(col).is_none() {
-            return Err(Error::invalid_input(
-                format!("Column {} does not exist in the dataset", col),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the dataset",
+                col
+            )));
         }
     }
 
+    let version = dataset.manifest.data_storage_format.lance_file_version()?;
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
-    let new_schema = dataset.manifest.schema.exclude(columns_to_remove)?;
+    let new_schema = exclude(&dataset.manifest.schema, &columns_to_remove, &version)?;
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
             "Cannot drop all columns from a dataset",
-            location!(),
         ));
     }
 
@@ -655,14 +736,40 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     Ok(())
 }
 
+/// Exclude the fields from `other` Schema, and returns a new Schema.
+pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> Result<Schema> {
+    let other: Schema = other.try_into().map_err(|_| {
+        Error::schema("The other schema is not compatible with this schema".to_string())
+    })?;
+    let mut fields = vec![];
+    for field in source.fields.iter() {
+        if let Some(other_field) = other.field(&field.name) {
+            if version.support_remove_sub_column(field)
+                && let Some(f) = field.exclude(other_field)
+            {
+                fields.push(f)
+            }
+        } else {
+            fields.push(field.clone());
+        }
+    }
+    Ok(Schema {
+        fields,
+        metadata: source.metadata.clone(),
+    })
+}
+
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use crate::dataset::WriteParams;
+    use arrow_array::{
+        ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
+    };
 
     use super::*;
-    use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
@@ -1096,9 +1203,10 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("All-null columns must be nullable."));
+        assert!(
+            err.to_string()
+                .contains("All-null columns must be nullable.")
+        );
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = ArrowSchema::new(vec![
@@ -1152,11 +1260,201 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Cannot add all-null columns to legacy dataset version"));
+        assert!(
+            err.to_string()
+                .contains("Cannot add all-null columns to legacy dataset version")
+        );
 
         Ok(())
+    }
+
+    async fn prepare_dataset(version: LanceFileVersion) -> Result<Dataset> {
+        // id: int32
+        // people: list<struct<name: utf8, age: int32, city: utf8>>
+        let person_struct_type = DataType::Struct(ArrowFields::from(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("age", DataType::Int32, false),
+            ArrowField::new("city", DataType::Utf8, false),
+        ]));
+
+        let list_of_struct_type = DataType::List(Arc::new(ArrowField::new(
+            "item",
+            person_struct_type.clone(),
+            false,
+        )));
+
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("people", list_of_struct_type.clone(), false),
+            ],
+            HashMap::<String, String>::new(),
+        ));
+
+        // Data: 3 rows, people is a list of 2, 3, 1 structs
+        let all_names = StringArray::from(vec!["Alice", "Bob", "Charlie", "David", "Eve", "Frank"]);
+        let all_ages = Int32Array::from(vec![25, 30, 35, 28, 32, 40]);
+        let all_cities = StringArray::from(vec![
+            "Beijing",
+            "Shanghai",
+            "Guangzhou",
+            "Shenzhen",
+            "Hangzhou",
+            "Chengdu",
+        ]);
+        let all_struct = StructArray::new(
+            ArrowFields::from(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("age", DataType::Int32, false),
+                ArrowField::new("city", DataType::Utf8, false),
+            ]),
+            vec![
+                Arc::new(all_names) as ArrayRef,
+                Arc::new(all_ages) as ArrayRef,
+                Arc::new(all_cities) as ArrayRef,
+            ],
+            None,
+        );
+
+        let all_people = ListArray::new(
+            Arc::new(ArrowField::new("item", person_struct_type, false)),
+            arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+                0i32, 2i32, 5i32, 6i32,
+            ])),
+            Arc::new(all_struct),
+            None,
+        );
+
+        let ids = Int32Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(all_people) as ArrayRef],
+        )?;
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            "memory://test",
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // Verify schema
+        assert_eq!(dataset.schema().fields.len(), 2);
+        assert_eq!(dataset.schema().fields[0].name, "id");
+        assert_eq!(dataset.schema().fields[1].name, "people");
+
+        Ok(dataset)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_drop_list_struct_sub_columns_legacy(
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1
+        )]
+        version: LanceFileVersion,
+    ) -> Result<()> {
+        let mut dataset = prepare_dataset(version).await?;
+
+        // drop sub-column city from list(struct)
+        dataset.drop_columns(&["people.item.city"]).await?;
+        dataset.validate().await?;
+
+        // people column has been fully removed
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert_eq!(dataset.schema().fields[0].name, "id");
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_drop_list_struct_sub_columns(
+        #[values(LanceFileVersion::V2_2)] version: LanceFileVersion,
+    ) -> Result<()> {
+        let mut dataset = prepare_dataset(version).await?;
+
+        // drop sub-column city from list(struct)
+        dataset.drop_columns(&["people.item.city"]).await?;
+        dataset.validate().await?;
+
+        // people.item only contains name, age
+        let expected_schema = ArrowSchema::new_with_metadata(
+            vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new(
+                    "people",
+                    DataType::List(Arc::new(ArrowField::new(
+                        "item",
+                        DataType::Struct(ArrowFields::from(vec![
+                            ArrowField::new("name", DataType::Utf8, false),
+                            ArrowField::new("age", DataType::Int32, false),
+                        ])),
+                        false,
+                    ))),
+                    false,
+                ),
+            ],
+            HashMap::<String, String>::new(),
+        );
+        assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
+
+        // Verify data
+        let batch = dataset.scan().try_into_batch().await?;
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+
+        let list_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let list_value = list_array.value(0);
+        let struct_array = list_value.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(struct_array.column_by_name("city").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_exclude_fields() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let projection = schema.project(&["a", "b.f2", "b.f3"]).unwrap();
+        let excluded = exclude(&schema, &projection, &LanceFileVersion::V2_2).unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(ArrowSchema::from(&excluded), expected_arrow_schema);
     }
 
     #[rstest]
@@ -1278,6 +1576,207 @@ mod test {
 
     #[rstest]
     #[tokio::test]
+    async fn test_set_not_null_succeeds(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values([1, 2, 3]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let original_fragments = dataset.fragments().to_vec();
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).set_nullable(false)])
+            .await?;
+        dataset.validate().await?;
+
+        assert_eq!(dataset.manifest.version, 2);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(
+            &ArrowSchema::from(dataset.schema()),
+            &ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)])
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_set_not_null_succeeds_nested(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::{ArrayRef, StructArray};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            )]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let original_fragments = dataset.fragments().to_vec();
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).set_nullable(false)])
+            .await?;
+        dataset.validate().await?;
+
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(
+            &ArrowSchema::from(dataset.schema()),
+            &ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "c",
+                    DataType::Int32,
+                    false
+                )])),
+                false
+            )])
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_set_not_null_fails_with_nulls(
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).set_nullable(false)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("contains NULL values"));
+        assert_eq!(
+            &ArrowSchema::from(dataset.schema()),
+            &ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)])
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_set_not_null_fails_with_nulls_nested(
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::{ArrayRef, StructArray};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+            )]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).set_nullable(false)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("contains NULL values"));
+        assert_eq!(
+            &ArrowSchema::from(dataset.schema()),
+            &ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "c",
+                    DataType::Int32,
+                    true
+                )])),
+                false
+            )])
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_cast_column(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -1288,7 +1787,7 @@ mod test {
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 
@@ -1799,5 +2298,298 @@ mod test {
             ArrowField::new("b", DataType::Int32, true),
         ]);
         assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
+    }
+
+    #[test]
+    fn test_check_field_conflict() {
+        // same struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // same nested struct
+        let inner_struct1 = ArrowField::new(
+            "inner",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        );
+        let inner_struct2 = ArrowField::new(
+            "inner",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        );
+        let field1 = ArrowField::new("test", DataType::Struct(vec![inner_struct1].into()), false);
+        let field2 = ArrowField::new("test", DataType::Struct(vec![inner_struct2].into()), false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // basic type with different name
+        let field1 = ArrowField::new("test1", DataType::Int32, false);
+        let field2 = ArrowField::new("test2", DataType::Int32, false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // basic type with same name
+        let field1 = ArrowField::new("test", DataType::Int32, false);
+        let field2 = ArrowField::new("test", DataType::Int32, false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // different basic type
+        let field1 = ArrowField::new("test", DataType::Int32, false);
+        let field2 = ArrowField::new("test", DataType::Float64, false);
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // partial conflict
+        let field1 = ArrowField::new(
+            "test",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("a", DataType::Int32, false),
+                    ArrowField::new("b", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("a", DataType::Int32, false),
+                    ArrowField::new("c", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // same list
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // list with struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // list with different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // list of struct and basic
+        let field1 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // FixedSizeList with struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // FixedSizeList with different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+                    false,
+                )),
+                2,
+            ),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // LargeList with struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+
+        // LargeList with different struct
+        let field1 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        let field2 = ArrowField::new(
+            "test",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+                false,
+            ))),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        // packed struct
+        let mut packed_meta = HashMap::new();
+        packed_meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+
+        let packed_field = ArrowField::new(
+            "packed",
+            DataType::Struct(vec![ArrowField::new("foo", DataType::Int32, false)].into()),
+            false,
+        )
+        .with_metadata(packed_meta.clone());
+
+        let field1 = ArrowField::new("test", DataType::Struct(vec![packed_field].into()), false);
+        let field2 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+
+        let new_packed_field = ArrowField::new(
+            "new_packed",
+            DataType::Struct(vec![ArrowField::new("foo", DataType::Int32, false)].into()),
+            false,
+        )
+        .with_metadata(packed_meta.clone());
+        let field3 = ArrowField::new(
+            "test",
+            DataType::Struct(vec![new_packed_field].into()),
+            false,
+        );
+        assert!(check_field_conflict(&field1, &field3, &LanceFileVersion::V2_2).is_ok());
+
+        let conflict_field = ArrowField::new(
+            "packed",
+            DataType::Struct(vec![ArrowField::new("new_col", DataType::Int32, false)].into()),
+            false,
+        )
+        .with_metadata(packed_meta);
+        let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
+        assert!(check_field_conflict(&field1, &field4, &LanceFileVersion::V2_2).is_err());
     }
 }

@@ -4,23 +4,23 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    types::{UInt32Type, UInt64Type},
     RecordBatchReader,
+    types::{UInt32Type, UInt64Type},
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
-use lance::{io::ObjectStore, Dataset};
+use lance::{Dataset, io::ObjectStore};
 use lance_core::cache::LanceCache;
+use lance_core::utils::mask::RowSetOps;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
-use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::scalar::{
-    btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
-    flat::FlatIndexMetadata,
+    IndexStore, SargableQuery, ScalarIndex, SearchResult,
+    btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
     lance_format::LanceIndexStore,
     registry::ScalarIndexPlugin,
-    IndexStore, SargableQuery, ScalarIndex, SearchResult,
 };
 use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 #[cfg(target_os = "linux")]
@@ -63,13 +63,11 @@ impl BenchmarkFixture {
     }
 
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
-        let sub_index_trainer = FlatIndexMetadata::new(arrow_schema::DataType::UInt32);
-
         train_btree_index(
             test_data_stream(),
-            &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
             None,
         )
         .await
@@ -118,7 +116,7 @@ async fn warm_indexed_equality_search(index: &dyn ScalarIndex) {
     let SearchResult::Exact(row_ids) = result else {
         panic!("Expected exact results")
     };
-    assert_eq!(row_ids.len(), Some(1));
+    assert_eq!(row_ids.true_rows().len(), Some(1));
 }
 
 async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
@@ -155,7 +153,7 @@ async fn warm_indexed_inequality_search(index: &dyn ScalarIndex) {
     };
 
     // 100Mi - 50M = 54,857,600
-    assert_eq!(row_ids.len(), Some(54857600));
+    assert_eq!(row_ids.true_rows().len(), Some(54857600));
 }
 
 async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
@@ -176,7 +174,7 @@ async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
     };
 
     // Only 3 because 150M is not in dataset
-    assert_eq!(row_ids.len(), Some(3));
+    assert_eq!(row_ids.true_rows().len(), Some(3));
 }
 
 fn bench_baseline(c: &mut Criterion) {

@@ -76,7 +76,7 @@ pub fn hamming_distance_arrow_batch(
             return Err(Error::InvalidArgumentError(format!(
                 "Unsupported data type: {:?}",
                 from.data_type()
-            )))
+            )));
         }
     };
 

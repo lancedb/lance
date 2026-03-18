@@ -6,53 +6,56 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
+
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
     execution::{
+        TaskContext,
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerBuilder,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
-        TaskContext,
     },
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
+        metrics::MetricValue,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
+    Error, Result,
     utils::{
         futures::FinallyStreamExt,
-        tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION},
     },
-    Error, Result,
 };
 use log::{debug, info, warn};
-use snafu::location;
 use tracing::Span;
 
 use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
-        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+        MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -286,9 +289,11 @@ pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + S
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    pub max_temp_directory_size: Option<u64>,
     pub batch_size: Option<usize>,
     pub target_partition: Option<usize>,
     pub execution_stats_callback: Option<ExecutionStatsCallback>,
+    pub skip_logging: bool,
 }
 
 impl std::fmt::Debug for LanceExecutionOptions {
@@ -296,8 +301,10 @@ impl std::fmt::Debug for LanceExecutionOptions {
         f.debug_struct("LanceExecutionOptions")
             .field("use_spilling", &self.use_spilling)
             .field("mem_pool_size", &self.mem_pool_size)
+            .field("max_temp_directory_size", &self.max_temp_directory_size)
             .field("batch_size", &self.batch_size)
             .field("target_partition", &self.target_partition)
+            .field("skip_logging", &self.skip_logging)
             .field(
                 "execution_stats_callback",
                 &self.execution_stats_callback.is_some(),
@@ -307,6 +314,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
@@ -320,6 +328,23 @@ impl LanceExecutionOptions {
                     }
                 })
                 .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE)
+        })
+    }
+
+    pub fn max_temp_directory_size(&self) -> u64 {
+        self.max_temp_directory_size.unwrap_or_else(|| {
+            std::env::var("LANCE_MAX_TEMP_DIRECTORY_SIZE")
+                .map(|s| match s.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse LANCE_MAX_TEMP_DIRECTORY_SIZE: {}, using default",
+                            e
+                        );
+                        DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
+                    }
+                })
+                .unwrap_or(DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE)
         })
     }
 
@@ -343,8 +368,10 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        let disk_manager_builder = DiskManagerBuilder::default()
+            .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
-            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .with_disk_manager_builder(disk_manager_builder)
             .with_memory_pool(Arc::new(FairSpillPool::new(
                 options.mem_pool_size() as usize
             )));
@@ -357,26 +384,79 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     ctx
 }
 
-static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
-    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
+/// Cache key for session contexts based on resolved configuration values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionContextCacheKey {
+    mem_pool_size: u64,
+    max_temp_directory_size: u64,
+    target_partition: Option<usize>,
+    use_spilling: bool,
+}
 
-static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
-    new_session_context(&LanceExecutionOptions {
-        use_spilling: true,
-        ..Default::default()
+impl SessionContextCacheKey {
+    fn from_options(options: &LanceExecutionOptions) -> Self {
+        Self {
+            mem_pool_size: options.mem_pool_size(),
+            max_temp_directory_size: options.max_temp_directory_size(),
+            target_partition: options.target_partition,
+            use_spilling: options.use_spilling(),
+        }
+    }
+}
+
+struct CachedSessionContext {
+    context: SessionContext,
+    last_access: std::time::Instant,
+}
+
+fn get_session_cache() -> &'static Mutex<HashMap<SessionContextCacheKey, CachedSessionContext>> {
+    static SESSION_CACHE: OnceLock<Mutex<HashMap<SessionContextCacheKey, CachedSessionContext>>> =
+        OnceLock::new();
+    SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_max_cache_size() -> usize {
+    const DEFAULT_CACHE_SIZE: usize = 4;
+    static MAX_CACHE_SIZE: OnceLock<usize> = OnceLock::new();
+    *MAX_CACHE_SIZE.get_or_init(|| {
+        std::env::var("LANCE_SESSION_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CACHE_SIZE)
     })
-});
+}
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
-    {
-        return if options.use_spilling() {
-            DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
-        } else {
-            DEFAULT_SESSION_CONTEXT.clone()
-        };
+    let key = SessionContextCacheKey::from_options(options);
+    let mut cache = get_session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // If key exists, update access time and return
+    if let Some(entry) = cache.get_mut(&key) {
+        entry.last_access = std::time::Instant::now();
+        return entry.context.clone();
     }
-    new_session_context(options)
+
+    // Evict least recently used entry if cache is full
+    if cache.len() >= get_max_cache_size()
+        && let Some(lru_key) = cache
+            .iter()
+            .min_by_key(|(_, v)| v.last_access)
+            .map(|(k, _)| k.clone())
+    {
+        cache.remove(&lru_key);
+    }
+
+    let context = new_session_context(options);
+    cache.insert(
+        key,
+        CachedSessionContext {
+            context: context.clone(),
+            last_access: std::time::Instant::now(),
+        },
+    );
+    context
 }
 
 fn get_task_context(
@@ -411,7 +491,7 @@ pub struct ExecutionSummaryCounts {
     pub all_counts: HashMap<String, usize>,
 }
 
-fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
+pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
@@ -441,7 +521,7 @@ fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
         }
     }
     for child in node.children() {
-        visit_node(child.as_ref(), counts);
+        collect_execution_metrics(child.as_ref(), counts);
     }
 }
 
@@ -451,7 +531,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
-    visit_node(plan, &mut counts);
+    collect_execution_metrics(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
         r#type = EXECUTION_PLAN_RUN,
@@ -508,10 +588,12 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    debug!(
-        "Executing plan:\n{}",
-        DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
-    );
+    if !options.skip_logging {
+        debug!(
+            "Executing plan:\n{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+        );
+    }
 
     let session_ctx = get_session_context(&options);
 
@@ -522,7 +604,9 @@ pub fn execute_plan(
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
-        report_plan_summary_metrics(plan.as_ref(), &options);
+        if !options.skip_logging {
+            report_plan_summary_metrics(plan.as_ref(), &options);
+        }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
@@ -536,18 +620,20 @@ pub async fn analyze_plan(
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
     let schema = plan.schema();
-    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+    // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
+    let analyze = Arc::new(AnalyzeExec::new(
+        true,
+        true,
+        vec![MetricType::SUMMARY],
+        plan,
+        schema,
+    ));
 
     let session_ctx = get_session_context(&options);
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
         .execute(0, get_task_context(&session_ctx, &options))
-        .map_err(|err| {
-            Error::io(
-                format!("Failed to execute analyze plan: {}", err),
-                location!(),
-            )
-        })?;
+        .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
     while (stream.next().await).is_some() {}
@@ -560,23 +646,72 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
     /// A visitor which calculates additional metrics for all the plans.
     struct CalculateVisitor {
         highest_index: usize,
-        index_to_cumulative_cpu: HashMap<usize, usize>,
+        index_to_elapsed: HashMap<usize, Duration>,
     }
+
+    /// Result of calculating metrics for a subtree
+    struct SubtreeMetrics {
+        min_start: Option<DateTime<Utc>>,
+        max_end: Option<DateTime<Utc>>,
+    }
+
     impl CalculateVisitor {
-        fn calculate_cumulative_cpu(&mut self, plan: &Arc<dyn ExecutionPlan>) -> usize {
+        fn calculate_metrics(&mut self, plan: &Arc<dyn ExecutionPlan>) -> SubtreeMetrics {
             self.highest_index += 1;
             let plan_index = self.highest_index;
-            let elapsed_cpu: usize = match plan.metrics() {
-                Some(metrics) => metrics.elapsed_compute().unwrap_or_default(),
-                None => 0,
-            };
-            let mut cumulative_cpu = elapsed_cpu;
+
+            // Get timestamps for this node
+            let (mut min_start, mut max_end) = Self::node_timerange(plan);
+
+            // Accumulate from children
             for child in plan.children() {
-                cumulative_cpu += self.calculate_cumulative_cpu(child);
+                let child_metrics = self.calculate_metrics(child);
+                min_start = Self::min_option(min_start, child_metrics.min_start);
+                max_end = Self::max_option(max_end, child_metrics.max_end);
             }
-            self.index_to_cumulative_cpu
-                .insert(plan_index, cumulative_cpu);
-            cumulative_cpu
+
+            // Calculate wall clock duration for this subtree (only if we have timestamps)
+            let elapsed = match (min_start, max_end) {
+                (Some(start), Some(end)) => Some((end - start).to_std().unwrap_or_default()),
+                _ => None,
+            };
+
+            if let Some(e) = elapsed {
+                self.index_to_elapsed.insert(plan_index, e);
+            }
+
+            SubtreeMetrics { min_start, max_end }
+        }
+
+        fn node_timerange(
+            plan: &Arc<dyn ExecutionPlan>,
+        ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+            let Some(metrics) = plan.metrics() else {
+                return (None, None);
+            };
+            let min_start = metrics
+                .iter()
+                .filter_map(|m| match m.value() {
+                    MetricValue::StartTimestamp(ts) => ts.value(),
+                    _ => None,
+                })
+                .min();
+            let max_end = metrics
+                .iter()
+                .filter_map(|m| match m.value() {
+                    MetricValue::EndTimestamp(ts) => ts.value(),
+                    _ => None,
+                })
+                .max();
+            (min_start, max_end)
+        }
+
+        fn min_option(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+            [a, b].into_iter().flatten().min()
+        }
+
+        fn max_option(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+            [a, b].into_iter().flatten().max()
         }
     }
 
@@ -594,7 +729,27 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         ) -> std::fmt::Result {
             self.highest_index += 1;
             write!(f, "{:indent$}", "", indent = self.indent * 2)?;
-            plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
+
+            // Format the plan description
+            let displayable =
+                datafusion::physical_plan::display::DisplayableExecutionPlan::new(plan.as_ref());
+            let plan_str = displayable.one_line().to_string();
+            let plan_str = plan_str.trim();
+
+            // Write operator with elapsed time inserted after the name
+            match calcs.index_to_elapsed.get(&self.highest_index) {
+                Some(elapsed) => match plan_str.find(": ") {
+                    Some(i) => write!(
+                        f,
+                        "{}: elapsed={elapsed:?}, {}",
+                        &plan_str[..i],
+                        &plan_str[i + 2..]
+                    )?,
+                    None => write!(f, "{plan_str}, elapsed={elapsed:?}")?,
+                },
+                None => write!(f, "{plan_str}")?,
+            }
+
             if let Some(metrics) = plan.metrics() {
                 let metrics = metrics
                     .aggregate_by_name()
@@ -605,12 +760,6 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
             } else {
                 write!(f, ", metrics=[]")?;
             }
-            let cumulative_cpu = calcs
-                .index_to_cumulative_cpu
-                .get(&self.highest_index)
-                .unwrap();
-            let cumulative_cpu_duration = Duration::from_nanos((*cumulative_cpu) as u64);
-            write!(f, ", cumulative_cpu={cumulative_cpu_duration:?}")?;
             writeln!(f)?;
             self.indent += 1;
             for child in plan.children() {
@@ -628,9 +777,9 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
             let mut calcs = CalculateVisitor {
                 highest_index: 0,
-                index_to_cumulative_cpu: HashMap::new(),
+                index_to_elapsed: HashMap::new(),
             };
-            calcs.calculate_cumulative_cpu(&self.plan);
+            calcs.calculate_metrics(&self.plan);
             let mut prints = PrintVisitor {
                 highest_index: 0,
                 indent: 0,
@@ -652,7 +801,7 @@ pub trait SessionContextExt {
     ) -> datafusion::common::Result<DataFrame>;
 }
 
-struct OneShotPartitionStream {
+pub struct OneShotPartitionStream {
     data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: Arc<ArrowSchema>,
 }
@@ -668,7 +817,7 @@ impl std::fmt::Debug for OneShotPartitionStream {
 }
 
 impl OneShotPartitionStream {
-    fn new(data: SendableRecordBatchStream) -> Self {
+    pub fn new(data: SendableRecordBatchStream) -> Self {
         let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
@@ -783,5 +932,113 @@ impl ExecutionPlan for StrictBatchSizeExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Serialize cache tests since they share global state
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_session_context_cache() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        // Create first session with default options
+        let opts1 = LanceExecutionOptions::default();
+        let _ctx1 = get_session_context(&opts1);
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 1);
+        }
+
+        // Same options should reuse cached session (no new entry)
+        let _ctx1_again = get_session_context(&opts1);
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 1);
+        }
+
+        // Different options should create new entry
+        let opts2 = LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        };
+        let _ctx2 = get_session_context(&opts2);
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_session_context_cache_lru_eviction() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        // Create 4 different configurations to fill the cache
+        let configs: Vec<LanceExecutionOptions> = (0..4)
+            .map(|i| LanceExecutionOptions {
+                mem_pool_size: Some((i + 1) as u64 * 1024 * 1024),
+                ..Default::default()
+            })
+            .collect();
+
+        for config in &configs {
+            let _ctx = get_session_context(config);
+        }
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 4);
+        }
+
+        // Access config[0] to make it more recently used than config[1]
+        // (config[0] was inserted first, so without this access it would be evicted)
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let _ctx = get_session_context(&configs[0]);
+
+        // Add a 5th configuration - should evict config[1] (now least recently used)
+        let opts5 = LanceExecutionOptions {
+            mem_pool_size: Some(5 * 1024 * 1024),
+            ..Default::default()
+        };
+        let _ctx5 = get_session_context(&opts5);
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 4);
+
+            // config[0] should still be present (was accessed recently)
+            let key0 = SessionContextCacheKey::from_options(&configs[0]);
+            assert!(
+                cache_guard.contains_key(&key0),
+                "config[0] should still be cached after recent access"
+            );
+
+            // config[1] should be evicted (was least recently used)
+            let key1 = SessionContextCacheKey::from_options(&configs[1]);
+            assert!(
+                !cache_guard.contains_key(&key1),
+                "config[1] should have been evicted"
+            );
+
+            // New config should be present
+            let key5 = SessionContextCacheKey::from_options(&opts5);
+            assert!(
+                cache_guard.contains_key(&key5),
+                "new config should be cached"
+            );
+        }
     }
 }

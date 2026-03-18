@@ -3,8 +3,8 @@
 
 //! Benchmark of Building PQ code from Dense Vectors.
 
-use arrow_array::{types::Float32Type, FixedSizeListArray};
-use criterion::{criterion_group, criterion_main, Criterion};
+use arrow_array::{FixedSizeListArray, types::Float32Type};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
