@@ -767,9 +767,6 @@ impl DatasetIndexExt for Dataset {
             )));
         };
 
-        // TODO: We will need some way to determine the index details here.  Perhaps
-        // we can load the index itself and get the details that way.
-
         let segment = IndexSegment::new(index_id, self.fragment_bitmap.as_ref().clone());
 
         self.commit_existing_index_segments(index_name, column, vec![segment])

@@ -56,14 +56,17 @@ use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
-use lance_index::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel};
+use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::KMeansParams;
-use lance_index::vector::pq::storage::transpose;
+use lance_index::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
 use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
 use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
-    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexSegment,
+    IndexType,
     optimize::OptimizeOptions,
     vector::{
         Query, VectorIndex,
@@ -1857,29 +1860,701 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-/// Finalize distributed merge for IVF-based vector indices.
+/// A single merge work item produced from one staging root.
 ///
-/// This helper merges partial auxiliary index files produced by distributed
-/// jobs into a unified `auxiliary.idx` and then creates a root `index.idx`
-/// using the v2 index format so that `open_vector_index_v2` can load it.
+/// Each plan says:
+/// - which staging root it belongs to
+/// - which partial shards should be consumed together
+/// - what the final committed segment metadata should look like
 ///
-/// The caller must pass `index_dir` pointing at the index UUID directory
-/// (e.g. `<table>/indices/<uuid>`). `requested_index_type` is only used as
-/// a fallback when the unified auxiliary file does not contain index
-/// metadata.
-pub async fn finalize_distributed_merge(
+/// The planner returns a `Vec<VectorIndexSegmentPlan>` so callers can decide
+/// whether to execute the work serially or fan it out externally.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VectorIndexSegmentPlan {
+    staging_index_uuid: Uuid,
+    final_segment: IndexSegment,
+    partial_shards: Vec<Uuid>,
+    estimated_bytes: u64,
+}
+
+impl VectorIndexSegmentPlan {
+    fn new(
+        staging_index_uuid: Uuid,
+        final_segment: IndexSegment,
+        partial_shards: Vec<Uuid>,
+        estimated_bytes: u64,
+    ) -> Self {
+        Self {
+            staging_index_uuid,
+            final_segment,
+            partial_shards,
+            estimated_bytes,
+        }
+    }
+
+    pub(crate) fn staging_index_uuid(&self) -> Uuid {
+        self.staging_index_uuid
+    }
+
+    pub(crate) fn final_segment(&self) -> &IndexSegment {
+        &self.final_segment
+    }
+
+    pub(crate) fn partial_shards(&self) -> &[Uuid] {
+        &self.partial_shards
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        self.estimated_bytes
+    }
+}
+
+/// Coordinator-provided shard metadata for one staging shard.
+///
+/// The distributed coordinator already knows which fragments were assigned to
+/// each shard. We pass that contract into the planner directly instead of
+/// reconstructing fragment coverage by scanning row ids back out of storage.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PartialShard {
+    uuid: Uuid,
+    fragment_bitmap: RoaringBitmap,
+}
+
+impl PartialShard {
+    pub(crate) fn new<I>(uuid: Uuid, fragment_bitmap: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        Self {
+            uuid,
+            fragment_bitmap: fragment_bitmap.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
+    pub(crate) fn fragment_bitmap(&self) -> &RoaringBitmap {
+        &self.fragment_bitmap
+    }
+}
+
+/// Plan how one staging root should be turned into final physical segments.
+///
+/// This function does not write any output. It only:
+/// - validates that the caller-supplied shard contract is self-consistent
+/// - loads enough metadata from each shard to validate that the staging root is coherent
+/// - enforces that shard fragment coverage is disjoint
+/// - groups shards into final segments according to `target_segment_bytes`
+///
+/// The grouping rule is intentionally simple:
+/// - `target_segment_bytes = None`: keep the shard boundary, so each shard becomes one segment
+/// - `target_segment_bytes = Some(limit)`: greedily pack consecutive shards until the next shard
+///   would exceed `limit`
+///
+/// Callers that want "merge everything into one final segment" should pass a
+/// sufficiently large `target_segment_bytes`.
+pub(crate) async fn plan_staging_segments(
     object_store: &ObjectStore,
-    index_dir: &object_store::path::Path,
+    index_dir: &Path,
+    partial_shards: &[PartialShard],
     requested_index_type: Option<IndexType>,
+    target_segment_bytes: Option<u64>,
+) -> Result<Vec<VectorIndexSegmentPlan>> {
+    if let Some(index_type) = requested_index_type
+        && !matches!(
+            index_type,
+            IndexType::IvfFlat
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+                | IndexType::Vector
+        )
+    {
+        return Err(Error::invalid_input(format!(
+            "Unsupported distributed vector finalize type: {}",
+            index_type
+        )));
+    }
+
+    if let Some(0) = target_segment_bytes {
+        return Err(Error::invalid_input(
+            "target_segment_bytes must be greater than zero".to_string(),
+        ));
+    }
+
+    if partial_shards.is_empty() {
+        return Err(Error::index(format!(
+            "No partial shard metadata was provided for '{}'",
+            index_dir
+        )));
+    }
+
+    let mut sorted_partial_shards = partial_shards.to_vec();
+    sorted_partial_shards.sort_by_key(|shard| shard.uuid());
+    let mut expected_shard_ids = HashSet::with_capacity(sorted_partial_shards.len());
+    for shard in &sorted_partial_shards {
+        if !expected_shard_ids.insert(shard.uuid()) {
+            return Err(Error::index(format!(
+                "Distributed vector partial shard '{}' was provided more than once",
+                shard.uuid()
+            )));
+        }
+    }
+
+    let mut partial_segments = Vec::with_capacity(sorted_partial_shards.len());
+    for partial_shard in sorted_partial_shards {
+        let partial_dir = index_dir.child(format!("partial_{}", partial_shard.uuid()));
+        partial_segments
+            .push(load_partial_vector_segment(object_store, partial_dir, &partial_shard).await?);
+    }
+
+    let staging_index_uuid = index_dir
+        .filename()
+        .ok_or_else(|| Error::index(format!("Index directory '{}' has no filename", index_dir)))
+        .and_then(|name| {
+            Uuid::parse_str(name).map_err(|err| {
+                Error::index(format!(
+                    "Index directory '{}' does not end with a valid UUID: {}",
+                    index_dir, err
+                ))
+            })
+        })?;
+
+    let first = &partial_segments[0];
+    let mut covered_fragments = RoaringBitmap::new();
+    for partial in &partial_segments {
+        if partial.segment.index_version() != first.segment.index_version() {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched index versions".to_string(),
+            ));
+        }
+        if partial.segment.index_details().map(|v| v.as_ref())
+            != first.segment.index_details().map(|v| v.as_ref())
+        {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched index details".to_string(),
+            ));
+        }
+        if partial.index_schema.index_type != first.index_schema.index_type
+            || partial.index_schema.distance_type != first.index_schema.distance_type
+        {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched index subtype metadata".to_string(),
+            ));
+        }
+        if partial.nlist != first.nlist {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched IVF partition counts".to_string(),
+            ));
+        }
+        if partial.centroids != first.centroids {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched IVF centroids".to_string(),
+            ));
+        }
+        if partial.pq_metadata != first.pq_metadata {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched PQ metadata".to_string(),
+            ));
+        }
+        if partial.sq_metadata != first.sq_metadata {
+            return Err(Error::index(
+                "Distributed vector shards have mismatched SQ metadata".to_string(),
+            ));
+        }
+        if let Some(requested_index_type) = requested_index_type
+            && requested_index_type != IndexType::Vector
+            && partial.index_schema.index_type != requested_index_type.to_string()
+        {
+            return Err(Error::index(format!(
+                "Distributed vector shard subtype '{}' does not match requested index type '{}'",
+                partial.index_schema.index_type, requested_index_type
+            )));
+        }
+        if covered_fragments.intersection_len(partial.segment.fragment_bitmap()) > 0 {
+            return Err(Error::index(
+                "Distributed vector shards have overlapping fragment coverage".to_string(),
+            ));
+        }
+        covered_fragments |= partial.segment.fragment_bitmap().clone();
+    }
+
+    if target_segment_bytes.is_none() {
+        return partial_segments
+            .into_iter()
+            .map(|partial| build_segment_plan(staging_index_uuid, vec![partial]))
+            .collect();
+    }
+
+    let target_segment_bytes = target_segment_bytes.unwrap();
+    let mut plans = Vec::new();
+    let mut current_group = Vec::new();
+    let mut current_bytes = 0_u64;
+
+    for partial in partial_segments {
+        let partial_bytes = partial.estimated_bytes;
+        if !current_group.is_empty()
+            && current_bytes.saturating_add(partial_bytes) > target_segment_bytes
+        {
+            plans.push(build_segment_plan(
+                staging_index_uuid,
+                std::mem::take(&mut current_group),
+            )?);
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(partial_bytes);
+        current_group.push(partial);
+    }
+
+    if !current_group.is_empty() {
+        plans.push(build_segment_plan(staging_index_uuid, current_group)?);
+    }
+
+    Ok(plans)
+}
+
+/// Materialize one planned segment into its final directory.
+///
+/// Most plans write directly to `indices/<final-segment-uuid>/`. The only
+/// awkward case is the legacy compat path where the target directory is also
+/// the staging root. In that case we first write into a temporary directory and
+/// then swap the final files back into place.
+pub(crate) async fn merge_staging_segment(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segment_plan: &VectorIndexSegmentPlan,
+) -> Result<IndexSegment> {
+    let final_segment = segment_plan.final_segment().clone();
+    let final_dir = indices_dir.child(final_segment.uuid().to_string());
+    let staging_dir = indices_dir.child(segment_plan.staging_index_uuid().to_string());
+    if final_dir == staging_dir {
+        let temp_dir = indices_dir.child(Uuid::new_v4().to_string());
+        merge_staging_segment_to_dir(object_store, indices_dir, &temp_dir, segment_plan, false)
+            .await?;
+
+        // Re-materializing back into the staging root is not atomic: we delete
+        // and rewrite the root files one by one because object stores do not
+        // offer a directory rename primitive. We only clean up the source
+        // `partial_*` shards after these copies succeed, so a crash here can
+        // leave a partial root artifact but should not destroy the source data.
+        for file_name in [INDEX_FILE_NAME, INDEX_AUXILIARY_FILE_NAME] {
+            let target_file = final_dir.child(file_name);
+            // ObjectStore::copy is additive. Remove any previous root artifact first so
+            // the compat path cannot leave stale files behind when re-materializing.
+            if object_store.exists(&target_file).await? {
+                object_store.delete(&target_file).await?;
+            }
+            let source_file = temp_dir.child(file_name);
+            if object_store.exists(&source_file).await? {
+                object_store.copy(&source_file, &target_file).await?;
+            }
+        }
+
+        cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
+        reset_final_segment_dir(object_store, &temp_dir).await?;
+    } else {
+        merge_staging_segment_to_dir(object_store, indices_dir, &final_dir, segment_plan, true)
+            .await?;
+    }
+
+    Ok(final_segment)
+}
+
+/// Write one planned segment into `final_dir`.
+///
+/// For a single-shard plan this is just a file copy. For a multi-shard plan we
+/// restage the selected partial shards under `final_dir/partial_*`, invoke the
+/// existing auxiliary merge kernel, and then write a fresh root `index.idx`.
+async fn merge_staging_segment_to_dir(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    final_dir: &Path,
+    segment_plan: &VectorIndexSegmentPlan,
+    cleanup_source_shards: bool,
 ) -> Result<()> {
-    // Merge per-shard auxiliary files into a unified auxiliary.idx.
+    reset_final_segment_dir(object_store, &final_dir).await?;
+
+    let partial_shards = segment_plan.partial_shards();
+    if partial_shards.len() == 1 {
+        let source_dir = indices_dir
+            .child(segment_plan.staging_index_uuid().to_string())
+            .child(format!("partial_{}", partial_shards[0]));
+        copy_partial_segment_contents(object_store, &source_dir, &final_dir).await?;
+        if cleanup_source_shards {
+            cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
+        }
+        return Ok(());
+    }
+
+    for shard_uuid in partial_shards {
+        let source_dir = indices_dir
+            .child(segment_plan.staging_index_uuid().to_string())
+            .child(format!("partial_{}", shard_uuid));
+        let staged_dir = final_dir.child(format!("partial_{}", shard_uuid));
+        copy_partial_segment_contents(object_store, &source_dir, &staged_dir).await?;
+    }
+
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
         object_store,
-        index_dir,
+        &final_dir,
     )
     .await?;
+    write_root_vector_index_from_auxiliary(object_store, &final_dir, None).await?;
+    cleanup_partial_vector_dirs(object_store, &final_dir).await?;
+    if cleanup_source_shards {
+        cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
+    }
 
-    // Open the unified auxiliary file.
+    Ok(())
+}
+
+/// Metadata recovered from one staging shard.
+///
+/// We keep this as a struct instead of passing around parallel tuples because
+/// planning needs all of these fields together: validation compares the shard
+/// metadata, grouping uses `estimated_bytes`, and final segment construction
+/// uses the recovered fragment coverage and version details.
+#[derive(Debug)]
+struct PartialVectorSegment {
+    segment: IndexSegment,
+    estimated_bytes: u64,
+    index_schema: lance_index::IndexMetadata,
+    nlist: usize,
+    centroids: Option<FixedSizeListArray>,
+    pq_metadata: Option<ProductQuantizationMetadata>,
+    sq_metadata: Option<ScalarQuantizationMetadata>,
+}
+
+/// Load the metadata needed to reason about one `partial_*` shard.
+///
+/// This reads both `index.idx` and `auxiliary.idx` because neither file alone
+/// contains the full contract:
+/// - `index.idx` tells us the precise subtype metadata
+/// - `auxiliary.idx` contains IVF metadata, quantizer metadata, and the stored
+///   row ids we use to reconstruct fragment coverage
+async fn load_partial_vector_segment(
+    object_store: &ObjectStore,
+    partial_dir: Path,
+    partial_shard: &PartialShard,
+) -> Result<PartialVectorSegment> {
+    let index_path = partial_dir.child(INDEX_FILE_NAME);
+    let aux_path = partial_dir.child(INDEX_AUXILIARY_FILE_NAME);
+
+    for required_path in [&index_path, &aux_path] {
+        if !object_store.exists(required_path).await? {
+            return Err(Error::index(format!(
+                "Distributed vector shard '{}' is missing required file '{}'",
+                partial_dir, required_path
+            )));
+        }
+    }
+
+    let index_schema = load_partial_vector_index_schema(object_store, &index_path).await?;
+    let index_type = IndexType::try_from(index_schema.index_type.as_str()).map_err(|err| {
+        Error::index(format!(
+            "Distributed vector shard '{}' has unsupported vector subtype '{}': {}",
+            partial_dir, index_schema.index_type, err
+        ))
+    })?;
+    let scheduler = ScanScheduler::new(
+        Arc::new(object_store.clone()),
+        SchedulerConfig::max_bandwidth(object_store),
+    );
+    let fh = scheduler
+        .open_file(&aux_path, &CachedFileSize::unknown())
+        .await?;
+    let reader = V2Reader::try_open(
+        fh,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        V2ReaderOptions::default(),
+    )
+    .await?;
+    let ivf_idx: u32 = reader
+        .metadata()
+        .file_schema
+        .metadata
+        .get(IVF_METADATA_KEY)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "Distributed vector shard '{}' is missing IVF metadata",
+                partial_dir
+            ))
+        })?
+        .parse()
+        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
+    let ivf_bytes = reader.read_global_buffer(ivf_idx).await?;
+    let pb_ivf: pb::Ivf = Message::decode(ivf_bytes)?;
+    let nlist = pb_ivf.lengths.len();
+    let mut centroids = pb_ivf
+        .centroids_tensor
+        .as_ref()
+        .map(FixedSizeListArray::try_from)
+        .transpose()?;
+    if centroids.is_none() {
+        let fh = scheduler
+            .open_file(&index_path, &CachedFileSize::unknown())
+            .await?;
+        let index_reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?;
+        if let Some(ivf_idx) = index_reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .and_then(|idx| idx.parse::<u32>().ok())
+        {
+            let index_ivf_bytes = index_reader.read_global_buffer(ivf_idx).await?;
+            let index_pb_ivf: pb::Ivf = Message::decode(index_ivf_bytes)?;
+            centroids = index_pb_ivf
+                .centroids_tensor
+                .as_ref()
+                .map(FixedSizeListArray::try_from)
+                .transpose()?;
+        }
+    }
+
+    let mut pq_metadata = None;
+    if let Some(pq_json) = reader.metadata().file_schema.metadata.get(PQ_METADATA_KEY) {
+        let mut metadata: ProductQuantizationMetadata = serde_json::from_str(pq_json)
+            .map_err(|err| Error::index(format!("PQ metadata parse error: {}", err)))?;
+        if metadata.codebook.is_none() {
+            let tensor_bytes = reader
+                .read_global_buffer(metadata.codebook_position as u32)
+                .await?;
+            let codebook_tensor: pb::Tensor = Message::decode(tensor_bytes)?;
+            metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        }
+        pq_metadata = Some(metadata);
+    }
+
+    let sq_metadata =
+        if let Some(sq_json) = reader.metadata().file_schema.metadata.get(SQ_METADATA_KEY) {
+            Some(
+                serde_json::from_str(sq_json)
+                    .map_err(|err| Error::index(format!("SQ metadata parse error: {}", err)))?,
+            )
+        } else {
+            None
+        };
+
+    match index_type {
+        IndexType::IvfFlat
+        | IndexType::IvfPq
+        | IndexType::IvfSq
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswSq => {}
+        other => {
+            return Err(Error::index(format!(
+                "Distributed vector shard '{}' has unsupported merge subtype '{}'",
+                partial_dir, other
+            )));
+        }
+    }
+    let segment = IndexSegment::new(
+        partial_shard.uuid(),
+        partial_shard.fragment_bitmap().clone(),
+    )
+    .with_index_details(Arc::new(crate::index::vector_index_details()))
+    .with_index_version(index_type.version());
+    let mut estimated_bytes = 0_u64;
+    let mut files = object_store.list(Some(partial_dir.clone()));
+    while let Some(item) = files.next().await {
+        let meta = item?;
+        estimated_bytes = estimated_bytes.saturating_add(meta.size);
+    }
+
+    Ok(PartialVectorSegment {
+        segment,
+        estimated_bytes,
+        index_schema,
+        nlist,
+        centroids,
+        pq_metadata,
+        sq_metadata,
+    })
+}
+
+/// Collapse one group of staging shards into a single final-segment plan.
+fn build_segment_plan(
+    staging_index_uuid: Uuid,
+    group: Vec<PartialVectorSegment>,
+) -> Result<VectorIndexSegmentPlan> {
+    debug_assert!(!group.is_empty());
+    let first = &group[0];
+    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut estimated_bytes = 0_u64;
+    let mut partial_shards = Vec::with_capacity(group.len());
+
+    for partial in &group {
+        fragment_bitmap |= partial.segment.fragment_bitmap().clone();
+        estimated_bytes = estimated_bytes.saturating_add(partial.estimated_bytes);
+        partial_shards.push(partial.segment.uuid());
+    }
+
+    let final_uuid = if group.len() == 1 {
+        first.segment.uuid()
+    } else {
+        Uuid::new_v4()
+    };
+    let mut final_segment = IndexSegment::new(final_uuid, fragment_bitmap);
+    if let Some(index_details) = first.segment.index_details().cloned() {
+        final_segment = final_segment.with_index_details(index_details);
+    }
+    final_segment = final_segment.with_index_version(first.segment.index_version());
+
+    Ok(VectorIndexSegmentPlan::new(
+        staging_index_uuid,
+        final_segment,
+        partial_shards,
+        estimated_bytes,
+    ))
+}
+
+/// Collapse an entire staging root into one final segment plan.
+///
+/// This is used by the legacy compat path where `merge_index_metadata(...)`
+/// still needs to materialize one shared UUID artifact.
+pub(crate) fn collapse_segment_plans(
+    segment_plans: &[VectorIndexSegmentPlan],
+) -> Result<VectorIndexSegmentPlan> {
+    let Some(first_plan) = segment_plans.first() else {
+        return Err(Error::index(
+            "Distributed vector finalize plan contains no segment plans".to_string(),
+        ));
+    };
+
+    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut partial_shards = Vec::new();
+    let mut estimated_bytes = 0_u64;
+
+    for plan in segment_plans {
+        fragment_bitmap |= plan.final_segment().fragment_bitmap().clone();
+        partial_shards.extend_from_slice(plan.partial_shards());
+        estimated_bytes = estimated_bytes.saturating_add(plan.estimated_bytes());
+    }
+
+    let staging_index_uuid = first_plan.staging_index_uuid();
+    let mut final_segment = IndexSegment::new(staging_index_uuid, fragment_bitmap);
+    if let Some(index_details) = first_plan.final_segment().index_details().cloned() {
+        final_segment = final_segment.with_index_details(index_details);
+    }
+    final_segment = final_segment.with_index_version(first_plan.final_segment().index_version());
+
+    Ok(VectorIndexSegmentPlan::new(
+        staging_index_uuid,
+        final_segment,
+        partial_shards,
+        estimated_bytes,
+    ))
+}
+
+/// Read the precise subtype metadata stored in a vector `index.idx`.
+async fn load_partial_vector_index_schema(
+    object_store: &ObjectStore,
+    index_path: &Path,
+) -> Result<lance_index::IndexMetadata> {
+    let scheduler = ScanScheduler::new(
+        Arc::new(object_store.clone()),
+        SchedulerConfig::max_bandwidth(object_store),
+    );
+    let fh = scheduler
+        .open_file(index_path, &CachedFileSize::unknown())
+        .await?;
+    let reader = V2Reader::try_open(
+        fh,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        V2ReaderOptions::default(),
+    )
+    .await?;
+    let idx_meta_json = reader
+        .metadata()
+        .file_schema
+        .metadata
+        .get(INDEX_METADATA_SCHEMA_KEY)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "Distributed vector shard '{}' is missing index metadata schema",
+                index_path
+            ))
+        })?;
+    serde_json::from_str(idx_meta_json).map_err(|err| {
+        Error::index(format!(
+            "Failed to parse vector index metadata from '{}': {}",
+            index_path, err
+        ))
+    })
+}
+
+/// Remove the source `partial_*` directories consumed by one segment plan.
+async fn cleanup_consumed_partial_shards(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segment_plan: &VectorIndexSegmentPlan,
+) -> Result<()> {
+    for shard_uuid in segment_plan.partial_shards() {
+        let source_dir = indices_dir
+            .child(segment_plan.staging_index_uuid().to_string())
+            .child(format!("partial_{}", shard_uuid));
+        reset_final_segment_dir(object_store, &source_dir).await?;
+    }
+    Ok(())
+}
+
+/// Copy all files that belong to one partial shard into a new directory.
+async fn copy_partial_segment_contents(
+    object_store: &ObjectStore,
+    source_dir: &Path,
+    target_dir: &Path,
+) -> Result<()> {
+    let mut files = object_store.list(Some(source_dir.clone()));
+    while let Some(item) = files.next().await {
+        let meta = item?;
+        let Some(relative_parts) = meta.location.prefix_match(source_dir) else {
+            continue;
+        };
+        let relative_parts = relative_parts.collect::<Vec<_>>();
+        if relative_parts.is_empty() {
+            continue;
+        }
+        let mut final_path = target_dir.clone();
+        for part in relative_parts {
+            final_path = final_path.child(part.as_ref());
+        }
+        object_store.copy(&meta.location, &final_path).await?;
+    }
+    Ok(())
+}
+
+/// Best-effort reset of one target directory before rewriting it.
+async fn reset_final_segment_dir(object_store: &ObjectStore, final_dir: &Path) -> Result<()> {
+    match object_store.remove_dir_all(final_dir.clone()).await {
+        Ok(()) => {}
+        Err(Error::NotFound { .. }) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+async fn write_root_vector_index_from_auxiliary(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    requested_index_type: Option<IndexType>,
+) -> Result<()> {
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
@@ -1941,7 +2616,7 @@ pub async fn finalize_distributed_merge(
                 fh,
                 None,
                 Arc::default(),
-                &lance_core::cache::LanceCache::no_cache(),
+                &LanceCache::no_cache(),
                 V2ReaderOptions::default(),
             )
             .await?;
@@ -2033,15 +2708,6 @@ pub async fn finalize_distributed_merge(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
-
-    if let Err(err) = cleanup_partial_vector_dirs(object_store, index_dir).await {
-        warn!(
-            "Failed to cleanup partial_* vector index directories under '{}': {}",
-            index_dir.as_ref(),
-            err
-        );
-    }
-
     Ok(())
 }
 

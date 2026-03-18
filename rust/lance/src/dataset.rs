@@ -2693,14 +2693,54 @@ impl Dataset {
             }
             // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
-                // Merge distributed vector index partials and finalize root index via Lance IVF helper
-                crate::index::vector::ivf::finalize_distributed_merge(
+                let mut partial_shards = self
+                    .object_store()
+                    .read_dir(index_dir.clone())
+                    .await?
+                    .into_iter()
+                    .filter(|name| name.starts_with("partial_"))
+                    .map(|name| {
+                        name.strip_prefix("partial_")
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "Distributed vector shard '{}' does not start with 'partial_'",
+                                    name
+                                ))
+                            })
+                            .and_then(|shard_uuid| {
+                                uuid::Uuid::parse_str(shard_uuid).map_err(|err| {
+                                    Error::index(format!(
+                                        "Distributed vector shard '{}' does not end with a valid UUID: {}",
+                                        name, err
+                                    ))
+                                })
+                            })
+                            .map(|shard_uuid| {
+                                crate::index::vector::ivf::PartialShard::new(
+                                    shard_uuid,
+                                    std::iter::empty::<u32>(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                partial_shards.sort_by_key(|shard| shard.uuid());
+                let segment_plans = crate::index::vector::ivf::plan_staging_segments(
                     self.object_store(),
                     &index_dir,
+                    &partial_shards,
                     Some(index_type),
+                    None,
                 )
                 .await?;
-                Ok(())
+                let merged_plan =
+                    crate::index::vector::ivf::collapse_segment_plans(&segment_plans)?;
+                crate::index::vector::ivf::merge_staging_segment(
+                    self.object_store(),
+                    &self.indices_dir(),
+                    &merged_plan,
+                )
+                .await
+                .map(|_| ())
             }
             _ => Err(Error::invalid_input_source(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
