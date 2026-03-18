@@ -1066,11 +1066,10 @@ mod tests {
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
 
-        let (store, path) = ObjectStore::from_uri(
-            "abfss://filesystem@account.dfs.core.windows.net/foo.lance",
-        )
-        .await
-        .unwrap();
+        let (store, path) =
+            ObjectStore::from_uri("abfss://filesystem@account.dfs.core.windows.net/foo.lance")
+                .await
+                .unwrap();
         assert_eq!(store.scheme, "abfss");
         assert_eq!(path.to_string(), "foo.lance");
     }
