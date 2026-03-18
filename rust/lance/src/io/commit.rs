@@ -32,7 +32,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, is_detached_version, pb,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -564,6 +564,7 @@ fn must_recalculate_fragment_bitmap(
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
+/// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
@@ -571,7 +572,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             bad_indices.into_iter().map(|(name, _)| name).collect()
         }
     };
-    for index in indices {
+    for index in indices.iter_mut() {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
@@ -595,6 +596,38 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 "the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.",
                 index.uuid
             );
+        }
+
+        // Migrate file sizes for indices that don't have them.
+        // Use indice_files_dir to handle shallow-cloned indices with base_id.
+        if index.files.is_none() && !is_system_index(index) {
+            let result = async {
+                let index_dir = dataset
+                    .indice_files_dir(index)?
+                    .child(index.uuid.to_string());
+                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+            }
+            .await;
+            match result {
+                Ok(files) => {
+                    log::debug!(
+                        "Migrated file sizes for index {} (uuid: {}): {} files",
+                        index.name,
+                        index.uuid,
+                        files.len()
+                    );
+                    index.files = Some(files);
+                }
+                Err(e) => {
+                    // Log but don't fail - file sizes are optional
+                    log::debug!(
+                        "Could not collect file sizes for index {} (uuid: {}): {}",
+                        index.name,
+                        index.uuid,
+                        e
+                    );
+                }
+            }
         }
     }
 

@@ -54,8 +54,8 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -360,12 +360,18 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
+
+            // Capture file sizes for the vector index
+            let index_dir = dataset.indices_dir().child(new_id.to_string());
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
                     &lance_table::format::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
                 index_version,
+                files: Some(files),
             }
         }
         _ => {
@@ -381,6 +387,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
+        files: created_index.files,
     }))
 }
 
@@ -557,6 +564,18 @@ impl IndexDescription for IndexDescriptionImpl {
         plugin
             .details_as_json(&self.details.0)
             .map(|v| v.to_string())
+    }
+
+    fn total_size_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        for segment in &self.segments {
+            // If any segment is missing file info, return None for backward compatibility
+            let files = segment.files.as_ref()?;
+            for file in files {
+                total += file.size_bytes;
+            }
+        }
+        Some(total)
     }
 }
 
@@ -755,24 +774,6 @@ impl DatasetIndexExt for Dataset {
         }
     }
 
-    async fn commit_existing_index(
-        &mut self,
-        index_name: &str,
-        column: &str,
-        index_id: Uuid,
-    ) -> Result<()> {
-        let Some(_field) = self.schema().field(column) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column}' does not exist"
-            )));
-        };
-
-        let segment = IndexSegment::new(index_id, self.fragment_bitmap.as_ref().clone());
-
-        self.commit_existing_index_segments(index_name, column, vec![segment])
-            .await
-    }
-
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
@@ -812,10 +813,11 @@ impl DatasetIndexExt for Dataset {
                     fields: vec![field.id],
                     dataset_version: self.manifest.version,
                     fragment_bitmap: Some(fragment_bitmap),
-                    index_details,
+                    index_details: Some(index_details),
                     index_version,
                     created_at: Some(chrono::Utc::now()),
                     base_id: None,
+                    files: None, // File info will be populated when index is created
                 }
             })
             .collect();
@@ -937,7 +939,8 @@ impl DatasetIndexExt for Dataset {
                 index_details: Some(Arc::new(res.new_index_details)),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
-                base_id: None, // Mew merged index file locates in the cloned dataset.
+                base_id: None, // New merged index file locates in the cloned dataset.
+                files: res.files,
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -1342,18 +1345,26 @@ impl DatasetIndexInternalExt for Dataset {
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
         // For example, we might want to get statistics for an index, regardless of type.
         //
-        // Currently, we solve this problem by checking for the existence of INDEX_FILE_NAME since
-        // only vector indices have this file.  In the future, once we support multiple kinds of
-        // scalar indices, we may start having this file with scalar indices too.  Once that happens
-        // we can just read this file and look at the `implementation` or `index_type` fields to
-        // determine what kind of index it is.
+        // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
+        // file list (available since file sizes tracking was added). If the file list is not
+        // available (older indices), we fall back to checking file existence via HEAD request.
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
-        if self.object_store.exists(&index_file).await? {
+
+        // Check if this is a vector index by looking at the files list
+        let is_vector_index = if let Some(files) = &index_meta.files {
+            // If we have file metadata, check if INDEX_FILE_NAME is in the list
+            files.iter().any(|f| f.path == INDEX_FILE_NAME)
+        } else {
+            // Fall back to file existence check for older indices without file metadata
+            let index_dir = self.indice_files_dir(&index_meta)?;
+            let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
+            self.object_store.exists(&index_file).await?
+        };
+
+        if is_vector_index {
             let index = self.open_vector_index(column, uuid, metrics).await?;
             Ok(index.as_index())
         } else {
@@ -1466,9 +1477,12 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file = scheduler
-                    .open_file(&index_file, &CachedFileSize::unknown())
-                    .await?;
+                let file_sizes = index_meta.file_size_map();
+                let cached_size = file_sizes
+                    .get(INDEX_FILE_NAME)
+                    .map(|&size| CachedFileSize::new(size))
+                    .unwrap_or_else(CachedFileSize::unknown);
+                let file = scheduler.open_file(&index_file, &cached_size).await?;
                 let reader = lance_file::reader::FileReader::try_open(
                     file,
                     None,
@@ -1502,6 +1516,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
+                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1514,6 +1529,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
+                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1532,6 +1548,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1545,6 +1562,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1558,6 +1576,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1574,6 +1593,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             &file_metadata_cache,
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1587,6 +1607,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1600,6 +1621,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1999,7 +2021,7 @@ mod tests {
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
-    use lance_datagen::{BatchCount, Dimension, RowCount, array};
+    use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -5182,8 +5204,18 @@ mod tests {
         .await
         .unwrap();
 
-        let seg0 = IndexSegment::new(Uuid::new_v4(), std::iter::once(0_u32));
-        let seg1 = IndexSegment::new(Uuid::new_v4(), std::iter::once(1_u32));
+        let seg0 = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(0_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
+        let seg1 = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(1_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
 
         dataset
             .commit_existing_index_segments(
@@ -5234,7 +5266,12 @@ mod tests {
 
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let base = IndexSegment::new(Uuid::new_v4(), std::iter::once(0_u32));
+        let base = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(0_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
 
         let err = dataset
             .commit_existing_index_segments(
@@ -5242,7 +5279,12 @@ mod tests {
                 "vector",
                 vec![
                     base.clone(),
-                    IndexSegment::new(base.uuid(), std::iter::once(1_u32)),
+                    IndexSegment::new(
+                        base.uuid(),
+                        std::iter::once(1_u32),
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version(),
+                    ),
                 ],
             )
             .await
@@ -5272,35 +5314,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_commit_existing_index_wraps_single_segment_commit() {
-        use lance_datagen::{BatchCount, RowCount, array};
-
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let reader = lance_datagen::gen_batch()
-            .col("id", array::step::<arrow_array::types::Int32Type>())
-            .col(
-                "vector",
-                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
-            )
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        let segment_id = Uuid::new_v4();
-
-        dataset
-            .commit_existing_index("vector_idx", "vector", segment_id)
-            .await
-            .unwrap();
-
-        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].uuid, segment_id);
     }
 
     #[tokio::test]
@@ -5453,6 +5466,634 @@ mod tests {
         assert!(
             field_path2.contains('.'),
             "Field path should contain '.' for nested field"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_file_sizes_captured() {
+        // Test that file sizes are captured when creating a scalar index
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col("values", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create a scalar index
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("test_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Get index metadata and verify files are populated
+        let indices = dataset.load_indices().await.unwrap();
+        let test_index = indices.iter().find(|idx| idx.name == "test_idx").unwrap();
+
+        assert!(
+            test_index.files.is_some(),
+            "Index should have files populated"
+        );
+        let files = test_index.files.as_ref().unwrap();
+        assert!(!files.is_empty(), "Index should have at least one file");
+
+        // Verify each file has a positive size
+        for file in files {
+            assert!(
+                file.size_bytes > 0,
+                "File {} should have positive size",
+                file.path
+            );
+        }
+
+        // Verify total_size_bytes works
+        let total_size = test_index.total_size_bytes();
+        assert!(total_size.is_some(), "total_size_bytes should return Some");
+        assert!(total_size.unwrap() > 0, "Total size should be positive");
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_file_sizes_captured() {
+        // Test that file sizes are captured when creating a vector index
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+            )
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create vector index
+        let params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_vec_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Get index metadata and verify files are populated
+        let indices = dataset.load_indices().await.unwrap();
+        let test_index = indices
+            .iter()
+            .find(|idx| idx.name == "test_vec_idx")
+            .unwrap();
+
+        assert!(
+            test_index.files.is_some(),
+            "Index should have files populated"
+        );
+        let files = test_index.files.as_ref().unwrap();
+        assert!(!files.is_empty(), "Index should have at least one file");
+
+        // Verify each file has a positive size
+        for file in files {
+            assert!(
+                file.size_bytes > 0,
+                "File {} should have positive size",
+                file.path
+            );
+        }
+
+        // Verify total_size_bytes works
+        let total_size = test_index.total_size_bytes();
+        assert!(total_size.is_some(), "total_size_bytes should return Some");
+        assert!(total_size.unwrap() > 0, "Total size should be positive");
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_total_size() {
+        // Test that describe_indices returns total_size_bytes
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("values", DataType::Utf8, false),
+        ]));
+
+        let values = StringArray::from_iter_values(["hello", "world", "foo", "bar"]);
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)),
+                Arc::new(values),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create a scalar index
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("test_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Use describe_indices to get index info
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+
+        let desc = &descriptions[0];
+        assert_eq!(desc.name(), "test_idx");
+
+        // Verify total_size_bytes is available
+        let total_size = desc.total_size_bytes();
+        assert!(total_size.is_some(), "total_size_bytes should be Some");
+        assert!(total_size.unwrap() > 0, "Total size should be positive");
+    }
+
+    /// Helper to assert that all indices have file sizes populated
+    async fn assert_all_indices_have_files(dataset: &Dataset, context: &str) {
+        let indices = dataset.load_indices().await.unwrap();
+        for index in indices.iter() {
+            // Skip system indices (mem_wal, frag_reuse) which don't have files
+            if index.name == lance_index::mem_wal::MEM_WAL_INDEX_NAME
+                || index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+            {
+                continue;
+            }
+            assert!(
+                index.files.is_some(),
+                "{}: Index '{}' should have files field populated",
+                context,
+                index.name
+            );
+            let files = index.files.as_ref().unwrap();
+            assert!(
+                !files.is_empty(),
+                "{}: Index '{}' should have at least one file",
+                context,
+                index.name
+            );
+            for file in files {
+                assert!(
+                    file.size_bytes > 0,
+                    "{}: Index '{}' file '{}' should have positive size",
+                    context,
+                    index.name,
+                    file.path
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_file_sizes_through_lifecycle() {
+        use crate::dataset::WriteDestination;
+        use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+
+        // Create initial dataset with columns for different index types
+        let data = gen_batch()
+            .col("int_col", array::step::<Int32Type>())
+            .col("str_col", array::rand_utf8(8.into(), false))
+            .col(
+                "vec_col",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(1));
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            data,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 200, // Multiple fragments for compaction
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create BTree index
+        dataset
+            .create_index(
+                &["int_col"],
+                IndexType::BTree,
+                Some("btree_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create Bitmap index
+        dataset
+            .create_index(
+                &["int_col"],
+                IndexType::Bitmap,
+                Some("bitmap_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create Inverted index for text search
+        dataset
+            .create_index(
+                &["str_col"],
+                IndexType::Inverted,
+                Some("inverted_idx".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Validate files are populated after creation
+        assert_all_indices_have_files(&dataset, "after initial creation").await;
+
+        // Append more data
+        let more_data = gen_batch()
+            .col("int_col", array::step::<Int32Type>())
+            .col("str_col", array::rand_utf8(8.into(), false))
+            .col(
+                "vec_col",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .into_reader_rows(RowCount::from(500), BatchCount::from(1));
+
+        Dataset::write(
+            more_data,
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Optimize indices (triggers update/merge)
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        // Validate files are still populated after optimize
+        assert_all_indices_have_files(&dataset, "after optimize_indices").await;
+
+        // Run compaction with deferred remap
+        let options = CompactionOptions {
+            target_rows_per_fragment: 500,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+
+        // Check if frag reuse index exists (indicates remap is needed)
+        if dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            // Remap each index
+            remapping::remap_column_index(
+                &mut dataset,
+                &["int_col"],
+                Some("btree_idx".to_string()),
+            )
+            .await
+            .unwrap();
+
+            remapping::remap_column_index(
+                &mut dataset,
+                &["int_col"],
+                Some("bitmap_idx".to_string()),
+            )
+            .await
+            .unwrap();
+
+            remapping::remap_column_index(
+                &mut dataset,
+                &["str_col"],
+                Some("inverted_idx".to_string()),
+            )
+            .await
+            .unwrap();
+
+            // Validate files are populated after remap
+            assert_all_indices_have_files(&dataset, "after remap").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_btree_index_iops() {
+        // Test that querying a BTree index uses minimal IOPs (no HEAD requests)
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with a column suitable for BTree index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let num_rows = 1000;
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        let values = Int32Array::from_iter_values((0..num_rows).map(|i| i % 100));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(values)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create BTree index
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("btree_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh to avoid cached state
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the BTree index
+        let results = dataset
+            .scan()
+            .filter("value = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs - should be minimal (no HEAD requests)
+        let stats = dataset.object_store().io_stats_incremental();
+        // We expect reads for: index metadata + index pages + data files
+        // The key assertion is that we don't have extra HEAD requests
+        assert_io_lt!(
+            stats,
+            read_iops,
+            10,
+            "BTree index query should use minimal IOPs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_index_iops() {
+        // Test that querying a Bitmap index uses minimal IOPs (no HEAD requests)
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with low-cardinality column for Bitmap index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Int32, false),
+        ]));
+
+        let num_rows = 1000;
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        // Low cardinality - only 10 unique values
+        let categories = Int32Array::from_iter_values((0..num_rows).map(|i| i % 10));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(categories)])
+            .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create Bitmap index
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Bitmap,
+                Some("bitmap_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the Bitmap index
+        let results = dataset
+            .scan()
+            .filter("category = 5")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_lt!(
+            stats,
+            read_iops,
+            10,
+            "Bitmap index query should use minimal IOPs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inverted_index_iops() {
+        // Test that querying an Inverted (FTS) index uses minimal IOPs
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with text column for Inverted index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+
+        let num_rows = 100;
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        let texts = StringArray::from_iter_values((0..num_rows).map(|i| {
+            if i % 3 == 0 {
+                format!("hello world document {}", i)
+            } else if i % 3 == 1 {
+                format!("goodbye universe text {}", i)
+            } else {
+                format!("random content item {}", i)
+            }
+        }));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create Inverted index
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("inverted_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the Inverted index (full-text search)
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_lt!(
+            stats,
+            read_iops,
+            15,
+            "Inverted index query should use minimal IOPs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_index_iops() {
+        // Test that querying an IVF_PQ vector index uses minimal IOPs
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with vector column
+        let dimension = 32;
+        let num_rows = 1000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        let vectors: Vec<Option<Vec<Option<f32>>>> = (0..num_rows)
+            .map(|i| {
+                Some(
+                    (0..dimension)
+                        .map(|j| Some((i * dimension + j) as f32 / 1000.0))
+                        .collect(),
+                )
+            })
+            .collect();
+        let vector_array =
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, dimension);
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vector_array)])
+                .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create IVF_PQ index
+        let params = VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("ivf_pq_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the IVF_PQ index (KNN search)
+        let query_vector: Vec<f32> = (0..dimension).map(|i| i as f32 / 1000.0).collect();
+        let results = dataset
+            .scan()
+            .nearest("vector", &Float32Array::from(query_vector), 10)
+            .unwrap()
+            .nprobes(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_lt!(
+            stats,
+            read_iops,
+            15,
+            "IVF_PQ index query should use minimal IOPs"
         );
     }
 

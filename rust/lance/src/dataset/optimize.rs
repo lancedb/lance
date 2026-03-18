@@ -1516,6 +1516,7 @@ pub async fn commit_compaction(
                 new_id: rewritten.new_id,
                 new_index_details: rewritten.index_details,
                 new_index_version: rewritten.index_version,
+                new_index_files: rewritten.files,
             })
             .collect()
     } else if !options.defer_index_remap && !has_address_style {

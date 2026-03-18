@@ -600,6 +600,7 @@ impl ScalarIndex for RTreeIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
             index_version: RTREE_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -964,6 +965,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
             index_version: RTREE_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 

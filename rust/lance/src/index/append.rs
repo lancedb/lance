@@ -14,7 +14,7 @@ use lance_index::{
     progress::NoopIndexBuildProgress,
     scalar::{CreatedIndex, OldIndexDataFilter, lance_format::LanceIndexStore},
 };
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata, list_index_files_with_sizes};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -33,6 +33,8 @@ pub struct IndexMergeResults<'a> {
     pub new_fragment_bitmap: RoaringBitmap,
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
+    /// List of files and their sizes for the merged index
+    pub files: Option<Vec<lance_table::format::IndexFile>>,
 }
 
 async fn build_stable_row_id_filter(
@@ -264,6 +266,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
                 });
 
+            // Capture file sizes for the new vector index
+            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+
             Ok((
                 new_uuid,
                 indices_merged,
@@ -273,6 +279,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: it.version() as u32,
+                    files: Some(files),
                 },
             ))
         }
@@ -295,6 +302,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap: frag_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
+        files: created_index.files,
     }))
 }
 

@@ -2216,7 +2216,13 @@ fn build_segment_plan(
     } else {
         Uuid::new_v4()
     };
-    let final_segment = IndexSegment::new(final_uuid, fragment_bitmap);
+    let index_type = requested_index_type.unwrap_or(IndexType::Vector);
+    let final_segment = IndexSegment::new(
+        final_uuid,
+        fragment_bitmap,
+        Arc::new(crate::index::vector_index_details()),
+        index_type.version(),
+    );
 
     Ok(VectorIndexSegmentPlan::new(
         staging_index_uuid,
@@ -2251,11 +2257,12 @@ pub(crate) fn collapse_segment_plans(
     }
 
     let staging_index_uuid = first_plan.staging_index_uuid();
-    let mut final_segment = IndexSegment::new(staging_index_uuid, fragment_bitmap);
-    if let Some(index_details) = first_plan.final_segment().index_details().cloned() {
-        final_segment = final_segment.with_index_details(index_details);
-    }
-    final_segment = final_segment.with_index_version(first_plan.final_segment().index_version());
+    let final_segment = IndexSegment::new(
+        staging_index_uuid,
+        fragment_bitmap,
+        first_plan.final_segment().index_details().clone(),
+        first_plan.final_segment().index_version(),
+    );
 
     Ok(VectorIndexSegmentPlan::new(
         staging_index_uuid,
@@ -3025,6 +3032,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -3063,6 +3071,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            files: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -3122,6 +3131,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this new index to the dataset so it can be found

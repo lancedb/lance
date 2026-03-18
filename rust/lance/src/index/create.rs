@@ -25,7 +25,7 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
@@ -358,9 +358,14 @@ impl<'a> CreateIndexBuilder<'a> {
                     )
                     .await?;
                 }
+                // Capture file sizes after vector index creation
+                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let files =
+                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version,
+                    files: Some(files),
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -392,9 +397,14 @@ impl<'a> CreateIndexBuilder<'a> {
                 } else {
                     todo!("create empty vector index when train=false");
                 }
+                // Capture file sizes after vector index creation
+                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let files =
+                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version: self.index_type.version() as u32,
+                    files: Some(files),
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -427,6 +437,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: created_index.files,
         })
     }
 
@@ -497,6 +508,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{self, gen_batch};
+    use lance_index::IndexSegment;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -951,7 +963,6 @@ mod tests {
         assert_eq!(all_covered_fragments, expected_fragments);
     }
 
-    #[allow(deprecated)]
     #[tokio::test]
     async fn test_merge_index_metadata_vector_preserves_shared_uuid_commit_workflow() {
         let tmpdir = TempStrDir::default();
@@ -1008,7 +1019,16 @@ mod tests {
         assert!(dataset.object_store().exists(&merged_root).await.unwrap());
 
         dataset
-            .commit_existing_index("vector_idx", "vector", shared_uuid)
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![IndexSegment::new(
+                    shared_uuid,
+                    fragments.iter().map(|fragment| fragment.id() as u32),
+                    Arc::new(vector_index_details()),
+                    IndexType::IvfFlat.version(),
+                )],
+            )
             .await
             .unwrap();
 
@@ -1051,7 +1071,6 @@ mod tests {
         assert!(result.num_rows() > 0);
     }
 
-    #[allow(deprecated)]
     #[tokio::test]
     async fn test_commit_existing_index_supports_local_hnsw_segments() {
         let tmpdir = TempStrDir::default();
@@ -1094,7 +1113,16 @@ mod tests {
             .unwrap();
 
         dataset
-            .commit_existing_index("vector_idx", "vector", uuid)
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![IndexSegment::new(
+                    uuid,
+                    dataset.fragment_bitmap.as_ref().clone(),
+                    Arc::new(vector_index_details()),
+                    IndexType::IvfHnswFlat.version(),
+                )],
+            )
             .await
             .unwrap();
 

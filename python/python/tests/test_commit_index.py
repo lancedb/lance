@@ -105,3 +105,77 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         )
         plan = scanner.explain_plan()
         assert "ScalarIndexQuery: query=[meta = hello]@meta_idx" in plan
+
+
+def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
+    """Test that the files field on Index round-trips through commit."""
+    from lance.dataset import Index, IndexFile
+
+    # Get info about the existing index created by the fixture
+    original_desc = dataset_with_index.describe_indices()[0]
+    index_id = original_desc.segments[0].uuid
+
+    # Verify the original index has file sizes
+    original_size = original_desc.total_size_bytes
+    assert original_size is not None and original_size > 0
+
+    # Create a new dataset without index
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+
+    # Copy the index files from dataset_with_index to dataset_without_index
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    # Get the field id
+    field_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+
+    # Create IndexFile objects with custom sizes to verify they round-trip
+    index_files = [
+        IndexFile(path="index.idx", size_bytes=1024),
+        IndexFile(path="auxiliary.bin", size_bytes=2048),
+    ]
+
+    # Create an Index object with the files field
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+        files=index_files,
+    )
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    dataset_without_index = lance.LanceDataset.commit(
+        dataset_without_index.uri,
+        create_index_op,
+        read_version=dataset_without_index.version,
+    )
+
+    # Read back the transaction to verify the files were stored
+    transactions = dataset_without_index.get_transactions(1)
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    assert transaction is not None
+    assert transaction.operation is not None
+
+    # The operation should be a CreateIndex with our index that has files
+    op = transaction.operation
+    assert len(op.new_indices) == 1
+    committed_index = op.new_indices[0]
+    assert committed_index.files is not None
+    assert len(committed_index.files) == 2
+
+    # Verify the file sizes match what we set
+    files_by_path = {f.path: f.size_bytes for f in committed_index.files}
+    assert files_by_path["index.idx"] == 1024
+    assert files_by_path["auxiliary.bin"] == 2048

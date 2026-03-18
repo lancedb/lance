@@ -142,16 +142,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
+        file_sizes: HashMap<String, u64>,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
+        let cached_size = file_sizes
+            .get(INDEX_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
         let index_reader = FileReader::try_open(
-            scheduler
-                .open_file(&uri, &CachedFileSize::unknown())
-                .await?,
+            scheduler.open_file(&uri, &cached_size).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             file_metadata_cache,
@@ -185,13 +188,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
+        let aux_cached_size = file_sizes
+            .get(INDEX_AUXILIARY_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
         let storage_reader = FileReader::try_open(
             scheduler
                 .open_file(
                     &index_dir
                         .child(uuid.as_str())
                         .child(INDEX_AUXILIARY_FILE_NAME),
-                    &CachedFileSize::unknown(),
+                    &aux_cached_size,
                 )
                 .await?,
             None,
@@ -1487,7 +1494,6 @@ mod tests {
                 .index_uuid(shared_uuid.to_string());
             // Build partial index shards without committing to manifest.
             builder.execute_uncommitted().await.unwrap();
-
             let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
             let mut new_shards = dataset
                 .object_store()
@@ -1525,6 +1531,102 @@ mod tests {
         }
 
         (shared_uuid, partial_shards)
+    }
+
+    async fn build_ivfpq_for_fragment_groups(
+        dataset: &mut Dataset,
+        fragment_groups: Vec<Vec<u32>>, // each group is a set of fragment ids
+        ivf_params: &IvfBuildParams,
+        pq_params: &PQBuildParams,
+        index_name: &str,
+    ) {
+        let shared_uuid = Uuid::new_v4();
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params.clone(),
+            pq_params.clone(),
+        );
+
+        for fragments in fragment_groups {
+            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
+            builder = builder
+                .name(index_name.to_string())
+                .fragments(fragments)
+                .index_uuid(shared_uuid.to_string());
+            builder.execute_uncommitted().await.unwrap();
+        }
+
+        dataset
+            .merge_index_metadata(&shared_uuid.to_string(), IndexType::IvfPq, None)
+            .await
+            .unwrap();
+
+        dataset
+            .commit_existing_index_segments(
+                index_name,
+                "vector",
+                vec![IndexSegment::new(
+                    shared_uuid,
+                    dataset.fragment_bitmap.as_ref().clone(),
+                    Arc::new(crate::index::vector_index_details()),
+                    IndexType::IvfPq.version(),
+                )],
+            )
+            .await
+            .unwrap();
+    }
+
+    fn assert_ivf_layout_equal(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
+        let idx_a = &stats_a["indices"][0];
+        let idx_b = &stats_b["indices"][0];
+
+        let centroids_a = idx_a["centroids"]
+            .as_array()
+            .expect("centroids should be an array");
+        let centroids_b = idx_b["centroids"]
+            .as_array()
+            .expect("centroids should be an array");
+        assert_eq!(
+            centroids_a.len(),
+            centroids_b.len(),
+            "num centroids mismatch",
+        );
+        for (row_a, row_b) in centroids_a.iter().zip(centroids_b.iter()) {
+            let row_a = row_a
+                .as_array()
+                .unwrap_or_else(|| panic!("invalid centroid row: {:?}", row_a));
+            let row_b = row_b
+                .as_array()
+                .unwrap_or_else(|| panic!("invalid centroid row: {:?}", row_b));
+            assert_eq!(row_a.len(), row_b.len(), "centroid dim mismatch");
+            for (va, vb) in row_a.iter().zip(row_b.iter()) {
+                let fa = va.as_f64().expect("centroid must be numeric") as f32;
+                let fb = vb.as_f64().expect("centroid must be numeric") as f32;
+                assert!(
+                    (fa - fb).abs() <= 1e-4,
+                    "centroid mismatch: {} vs {}",
+                    fa,
+                    fb
+                );
+            }
+        }
+
+        let parts_a = idx_a["partitions"]
+            .as_array()
+            .expect("partitions should be an array");
+        let parts_b = idx_b["partitions"]
+            .as_array()
+            .expect("partitions should be an array");
+        assert_eq!(parts_a.len(), parts_b.len(), "num partitions mismatch");
+        let sizes_a: Vec<u64> = parts_a
+            .iter()
+            .map(|p| p["size"].as_u64().expect("partition size"))
+            .collect();
+        let sizes_b: Vec<u64> = parts_b
+            .iter()
+            .map(|p| p["size"].as_u64().expect("partition size"))
+            .collect();
+        assert_eq!(sizes_a, sizes_b, "partition sizes mismatch");
     }
 
     async fn load_staging_shard_uuids(dataset: &Dataset, shared_uuid: Uuid) -> Vec<Uuid> {
@@ -1594,6 +1696,138 @@ mod tests {
             .unwrap();
 
         segments
+    }
+
+    #[tokio::test]
+    async fn test_ivfpq_recall_performance_on_two_frags_single_vs_split() {
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+
+        let (schema, batches) = make_two_fragment_batches();
+
+        let ds_single_uri = format!("{}/single", base_uri);
+        let ds_split_uri = format!("{}/split", base_uri);
+
+        let mut ds_single =
+            write_dataset_from_batches(&ds_single_uri, schema.clone(), batches.clone()).await;
+        let mut ds_split = write_dataset_from_batches(&ds_split_uri, schema, batches).await;
+
+        let fragments_single = ds_single.get_fragments();
+        assert!(
+            fragments_single.len() >= 2,
+            "expected at least 2 fragments in ds_single, got {}",
+            fragments_single.len()
+        );
+        let fragments_split = ds_split.get_fragments();
+        assert!(
+            fragments_split.len() >= 2,
+            "expected at least 2 fragments in ds_split, got {}",
+            fragments_split.len()
+        );
+
+        let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+
+        let group_single = vec![
+            fragments_single[0].id() as u32,
+            fragments_single[1].id() as u32,
+        ];
+        build_ivfpq_for_fragment_groups(
+            &mut ds_single,
+            vec![group_single],
+            &ivf_params,
+            &pq_params,
+            INDEX_NAME,
+        )
+        .await;
+
+        let group0 = vec![fragments_split[0].id() as u32];
+        let group1 = vec![fragments_split[1].id() as u32];
+        build_ivfpq_for_fragment_groups(
+            &mut ds_split,
+            vec![group0, group1],
+            &ivf_params,
+            &pq_params,
+            INDEX_NAME,
+        )
+        .await;
+
+        let stats_single_json = ds_single.index_statistics(INDEX_NAME).await.unwrap();
+        let stats_split_json = ds_split.index_statistics(INDEX_NAME).await.unwrap();
+        let stats_single: serde_json::Value = serde_json::from_str(&stats_single_json).unwrap();
+        let stats_split: serde_json::Value = serde_json::from_str(&stats_split_json).unwrap();
+        assert_ivf_layout_equal(&stats_single, &stats_split);
+
+        let ctx_single = load_vector_index_context(&ds_single, "vector", INDEX_NAME).await;
+        let ctx_split = load_vector_index_context(&ds_split, "vector", INDEX_NAME).await;
+
+        let ivf_single = ctx_single.ivf();
+        let ivf_split = ctx_split.ivf();
+        let total_partitions = ivf_single.total_partitions();
+        assert_eq!(total_partitions, ivf_split.total_partitions());
+
+        for part_id in 0..total_partitions {
+            let row_ids_single = load_partition_row_ids(ivf_single, part_id).await;
+            let row_ids_split = load_partition_row_ids(ivf_split, part_id).await;
+            let set_single: HashSet<u64> = row_ids_single.into_iter().collect();
+            let set_split: HashSet<u64> = row_ids_split.into_iter().collect();
+            assert_eq!(
+                set_single, set_split,
+                "row id set mismatch for partition {}",
+                part_id
+            );
+        }
+
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
+
+        async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
+            let mut ids_per_query = Vec::with_capacity(queries.len());
+            for q in queries {
+                let result = ds
+                    .scan()
+                    .with_row_id()
+                    .project(&["_rowid"] as &[&str])
+                    .unwrap()
+                    .nearest("vector", q.as_ref(), K)
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+
+                let row_ids = result[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u64>>();
+                ids_per_query.push(row_ids);
+            }
+            ids_per_query
+        }
+
+        let query_batch = ds_single
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(NUM_QUERIES as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = query_batch["vector"].as_fixed_size_list();
+        let queries: Vec<Arc<dyn Array>> = (0..vectors.len())
+            .map(|i| vectors.value(i) as Arc<dyn Array>)
+            .collect();
+
+        let ids_single = collect_row_ids(&ds_single, &queries).await;
+        let ids_split = collect_row_ids(&ds_split, &queries).await;
+
+        assert_eq!(
+            ids_single, ids_split,
+            "single vs split index returned different Top-K row ids",
+        );
     }
 
     #[rstest]

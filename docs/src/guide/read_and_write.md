@@ -19,6 +19,8 @@ also supports `Iterator` of `pyarrow.RecordBatch` es.
 You will need to provide a `pyarrow.Schema` for the dataset in this case.
 
 ```python
+from typing import Iterator
+
 def producer() -> Iterator[pa.RecordBatch]:
     """An iterator of RecordBatches."""
     yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])

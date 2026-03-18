@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::{Error, Result, assume_eq};
-use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2, l2::L2Prepared};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
@@ -27,7 +27,9 @@ pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 
-use self::distance::{build_distance_table_l2, compute_pq_distance};
+use self::distance::{
+    build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance,
+};
 pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
@@ -44,6 +46,10 @@ pub struct ProductQuantizer {
     pub dimension: usize,
     pub codebook: FixedSizeListArray,
     pub distance_type: DistanceType,
+    /// Pre-transposed L2 targets per sub-vector for fast f32 L2 batch computation.
+    /// Only populated when codebook is f32 and distance_type is L2
+    /// (Cosine is converted to L2 before construction, so it benefits too).
+    l2_targets: Option<Vec<L2Prepared>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
@@ -53,10 +59,43 @@ impl DeepSizeOf for ProductQuantizer {
             + self.num_bits.deep_size_of_children(_context)
             + self.dimension.deep_size_of_children(_context)
             + self.distance_type.deep_size_of_children(_context)
+            + self
+                .l2_targets
+                .as_ref()
+                .map_or(0, |v| v.iter().map(|t| t.size_bytes()).sum())
     }
 }
 
 impl ProductQuantizer {
+    /// Build per-sub-vector L2Prepared from the codebook if applicable (f32 + L2).
+    fn build_l2_targets(
+        codebook: &FixedSizeListArray,
+        distance_type: DistanceType,
+        num_sub_vectors: usize,
+        num_bits: u32,
+        dimension: usize,
+    ) -> Option<Vec<L2Prepared>> {
+        if codebook.value_type() != DataType::Float32 || distance_type != DistanceType::L2 {
+            return None;
+        }
+        let values = codebook
+            .values()
+            .as_primitive::<datatypes::Float32Type>()
+            .values();
+        let sub_dim = dimension / num_sub_vectors;
+        let num_centroids = 2_usize.pow(num_bits);
+        let block_size = sub_dim * num_centroids;
+
+        let targets = (0..num_sub_vectors)
+            .map(|sub_idx| {
+                let block_start = sub_idx * block_size;
+                let block = &values[block_start..block_start + block_size];
+                L2Prepared::new(block, sub_dim)
+            })
+            .collect();
+        Some(targets)
+    }
+
     pub fn new(
         num_sub_vectors: usize,
         num_bits: u32,
@@ -64,12 +103,20 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
+        let l2_targets = Self::build_l2_targets(
+            &codebook,
+            distance_type,
+            num_sub_vectors,
+            num_bits,
+            dimension,
+        );
         Self {
             num_bits,
             num_sub_vectors,
             dimension,
             codebook,
             distance_type,
+            l2_targets,
         }
     }
 
@@ -85,13 +132,13 @@ impl ProductQuantizer {
                 proto.dimension as i32,
             )?,
         };
-        Ok(Self {
-            num_bits: proto.num_bits,
-            num_sub_vectors: proto.num_sub_vectors as usize,
-            dimension: proto.dimension as usize,
+        Ok(Self::new(
+            proto.num_sub_vectors as usize,
+            proto.num_bits,
+            proto.dimension as usize,
             codebook,
             distance_type,
-        })
+        ))
     }
 
     #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
@@ -136,38 +183,74 @@ impl ProductQuantizer {
 
         let flatten_data = fsl.values().as_primitive::<T>();
         let sub_dim = dim / num_sub_vectors;
+        let num_centroids = 2_usize.pow(NUM_BITS);
         let total_code_length = fsl.len() * num_sub_vectors / (8 / NUM_BITS as usize);
-        let values = flatten_data
-            .values()
-            .chunks_exact(dim)
-            .flat_map(|vector| {
-                let sub_vec_code = vector
-                    .chunks_exact(sub_dim)
-                    .enumerate()
-                    .map(|(sub_idx, sub_vector)| {
-                        let centroids = get_sub_vector_centroids::<NUM_BITS, _>(
-                            codebook.values(),
-                            dim,
-                            num_sub_vectors,
-                            sub_idx,
-                        );
-                        // SAFETY: The must be 2^NUM_BITS centroids, it's safe to unwrap_or(0),
-                        // this could happen if all distances are INFs in the case of vectors are large.
-                        assume_eq!(centroids.len(), 2_usize.pow(NUM_BITS) * sub_dim);
-                        compute_partition(centroids, sub_vector, distance_type).unwrap_or(0) as u8
-                    })
-                    .collect::<Vec<_>>();
+
+        let values = if let Some(targets) = &self.l2_targets {
+            // Fast path for f32 + L2: use pre-transposed codebook.
+            // SAFETY: l2_targets is only populated when T::Native is f32.
+            let flat_f32: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    flatten_data.values().as_ptr() as *const f32,
+                    flatten_data.values().len(),
+                )
+            };
+            let mut values = vec![0u8; total_code_length];
+            let bytes_per_vector = num_sub_vectors / (8 / NUM_BITS as usize);
+            let mut dist_buf = vec![0.0f32; num_centroids];
+            for (vec_idx, vector) in flat_f32.chunks_exact(dim).enumerate() {
+                let out = &mut values[vec_idx * bytes_per_vector..][..bytes_per_vector];
                 if NUM_BITS == 4 {
-                    sub_vec_code
-                        .chunks_exact(2)
-                        .map(|v| (v[1] << 4) | v[0])
-                        .collect::<Vec<_>>()
+                    for (pair_idx, pair) in vector.chunks_exact(sub_dim * 2).enumerate() {
+                        let lo = targets[pair_idx * 2]
+                            .nearest_into(&pair[..sub_dim], &mut dist_buf)
+                            .unwrap_or(0) as u8;
+                        let hi = targets[pair_idx * 2 + 1]
+                            .nearest_into(&pair[sub_dim..], &mut dist_buf)
+                            .unwrap_or(0) as u8;
+                        out[pair_idx] = (hi << 4) | lo;
+                    }
                 } else {
-                    sub_vec_code
+                    for (sub_idx, sv) in vector.chunks_exact(sub_dim).enumerate() {
+                        out[sub_idx] = targets[sub_idx]
+                            .nearest_into(sv, &mut dist_buf)
+                            .unwrap_or(0) as u8;
+                    }
                 }
-            })
-            .exact_size(total_code_length)
-            .collect::<Vec<_>>();
+            }
+            values
+        } else {
+            flatten_data
+                .values()
+                .chunks_exact(dim)
+                .flat_map(|vector| {
+                    let sub_vec_code: Vec<u8> = vector
+                        .chunks_exact(sub_dim)
+                        .enumerate()
+                        .map(|(sub_idx, sub_vector)| {
+                            let centroids = get_sub_vector_centroids::<NUM_BITS, _>(
+                                codebook.values(),
+                                dim,
+                                num_sub_vectors,
+                                sub_idx,
+                            );
+                            assume_eq!(centroids.len(), num_centroids * sub_dim);
+                            compute_partition(centroids, sub_vector, distance_type).unwrap_or(0)
+                                as u8
+                        })
+                        .collect();
+                    if NUM_BITS == 4 {
+                        sub_vec_code
+                            .chunks_exact(2)
+                            .map(|v| (v[1] << 4) | v[0])
+                            .collect::<Vec<_>>()
+                    } else {
+                        sub_vec_code
+                    }
+                })
+                .exact_size(total_code_length)
+                .collect::<Vec<_>>()
+        };
 
         let num_sub_vectors_in_byte = if NUM_BITS == 4 {
             num_sub_vectors / 2
@@ -216,15 +299,7 @@ impl ProductQuantizer {
     /// It returns the squared L2 distance.
     fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         let distance_table = self.build_l2_distance_table(key)?;
-
-        #[cfg(target_feature = "avx512f")]
-        {
-            Ok(self.compute_l2_distance(&distance_table, code.values()))
-        }
-        #[cfg(not(target_feature = "avx512f"))]
-        {
-            Ok(self.compute_l2_distance(&distance_table, code.values()))
-        }
+        Ok(self.compute_l2_distance(&distance_table, code.values()))
     }
 
     /// Parameters
@@ -284,7 +359,13 @@ impl ProductQuantizer {
                 Ok(self.build_l2_distance_table_impl::<datatypes::Float16Type>(key.as_primitive()))
             }
             DataType::Float32 => {
-                Ok(self.build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))
+                if let Some(targets) = &self.l2_targets {
+                    let query = key.as_primitive::<datatypes::Float32Type>().values();
+                    Ok(build_distance_table_l2_prepared(targets, query))
+                } else {
+                    Ok(self
+                        .build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))
+                }
             }
             DataType::Float64 => {
                 Ok(self.build_l2_distance_table_impl::<datatypes::Float64Type>(key.as_primitive()))

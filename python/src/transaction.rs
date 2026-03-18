@@ -11,7 +11,7 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -21,7 +21,43 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// Add Index bindings
+// IndexFile bindings
+impl FromPyObject<'_> for PyLance<IndexFile> {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let path = ob.getattr("path")?.extract()?;
+        let size_bytes = ob.getattr("size_bytes")?.extract()?;
+        Ok(Self(IndexFile { path, size_bytes }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&IndexFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .expect("Failed to import lance module");
+
+        let cls = namespace
+            .getattr("IndexFile")
+            .expect("Failed to get IndexFile class");
+        cls.call1((self.0.path.clone(), self.0.size_bytes))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<IndexFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
+    }
+}
+
+// IndexMetadata bindings
 impl FromPyObject<'_> for PyLance<IndexMetadata> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let uuid = ob.getattr("uuid")?.to_string();
@@ -44,6 +80,11 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             .extract::<Option<i64>>()?
             .map(|id| id as u32);
 
+        let files: Option<Vec<IndexFile>> = ob
+            .getattr("files")?
+            .extract::<Option<Vec<PyLance<IndexFile>>>>()?
+            .map(|v| v.into_iter().map(|f| f.0).collect());
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
@@ -54,6 +95,7 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             index_version,
             created_at,
             base_id,
+            files,
         }))
     }
 }
@@ -85,6 +127,12 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         );
         let created_at = self.0.created_at;
         let base_id = self.0.base_id.map(|id| id as i64);
+        let files = self
+            .0
+            .files
+            .as_ref()
+            .map(|f| export_vec(py, f.as_slice()))
+            .transpose()?;
 
         let cls = namespace
             .getattr("Index")
@@ -98,6 +146,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             index_version,
             created_at,
             base_id,
+            files,
         ))
     }
 }
@@ -639,6 +688,7 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
                 value: new_details_value,
             },
             new_index_version,
+            new_index_files: None,
         }))
     }
 }

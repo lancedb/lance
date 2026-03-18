@@ -27,6 +27,7 @@ use serde::Serialize;
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
+pub use lance_table::format::IndexFile;
 
 pub mod bitmap;
 pub mod bloomfilter;
@@ -229,6 +230,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Delete an index file (used in the tmp spill store to keep tmp size down)
     async fn delete_index_file(&self, name: &str) -> Result<()>;
+
+    /// List all files in the index directory with their sizes.
+    ///
+    /// Returns a list of (relative_path, size_bytes) tuples.
+    /// Used to capture file metadata after index creation/modification.
+    async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>>;
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -787,6 +794,11 @@ pub struct CreatedIndex {
     ///
     /// This can be used to determine if a reader is able to load the index.
     pub index_version: u32,
+    /// List of files and their sizes for this index
+    ///
+    /// This enables skipping HEAD calls when opening indices and provides
+    /// visibility into index storage size via describe_indices().
+    pub files: Option<Vec<IndexFile>>,
 }
 
 /// The criteria that specifies how to update an index

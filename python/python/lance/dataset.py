@@ -4227,6 +4227,14 @@ class ExecuteResult(TypedDict):
 
 
 @dataclass
+class IndexFile:
+    """Metadata about a file in an index segment."""
+
+    path: str
+    size_bytes: int
+
+
+@dataclass
 class Index:
     """Represents an index in the dataset."""
 
@@ -4238,6 +4246,7 @@ class Index:
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
+    files: Optional[List["IndexFile"]] = None
 
 
 class AutoCleanupConfig(TypedDict):

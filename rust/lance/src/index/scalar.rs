@@ -299,7 +299,7 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    plugin
+    let created_index = plugin
         .train_index(
             training_data,
             &index_store,
@@ -307,7 +307,9 @@ pub(super) async fn build_scalar_index(
             fragment_ids,
             progress,
         )
-        .await
+        .await?;
+
+    Ok(created_index)
 }
 
 /// Fetches the scalar index plugin for a given index metadata
@@ -594,6 +596,7 @@ mod tests {
             index_version: 0,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
