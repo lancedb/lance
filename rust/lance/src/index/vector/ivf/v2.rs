@@ -622,9 +622,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::vector::ivf::{
-        PartialShard, collapse_segment_plans, merge_staging_segment, plan_staging_segments,
-    };
+    use crate::index::vector::ivf::{PartialShard, merge_staging_segment, plan_staging_segments};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -1903,60 +1901,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_distributed_vector_plan_rejects_mismatched_index_subtypes() {
-        let test_dir = TempStrDir::default();
-        let base_uri = test_dir.as_str();
-        let (schema, batches) = make_two_fragment_batches();
-        let dataset_uri = format!("{}/mismatch_subtype", base_uri);
-        let mut dataset = write_dataset_from_batches(&dataset_uri, schema.clone(), batches).await;
-
-        let fragments = dataset.get_fragments();
-        assert!(fragments.len() >= 2);
-        let shard0 = vec![fragments[0].id() as u32];
-        let shard1 = vec![fragments[1].id() as u32];
-        let shared_uuid = Uuid::new_v4();
-
-        let ivf_params = prepare_global_ivf(&dataset, "vector").await;
-        let (ivf_params_pq, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
-        let flat_params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
-        let pq_params =
-            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params_pq, pq_params);
-
-        dataset
-            .create_index_builder(&["vector"], IndexType::Vector, &flat_params)
-            .name("vector_idx".to_string())
-            .fragments(shard0.clone())
-            .index_uuid(shared_uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        dataset
-            .create_index_builder(&["vector"], IndexType::Vector, &pq_params)
-            .name("vector_idx".to_string())
-            .fragments(shard1.clone())
-            .index_uuid(shared_uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        let partial_shards =
-            build_partial_shards(&dataset, shared_uuid, &[shard0.clone(), shard1.clone()]).await;
-
-        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let plans = plan_staging_segments(&index_dir, &partial_shards, None, None)
-            .await
-            .unwrap();
-        let merged_plan = collapse_segment_plans(&plans).unwrap();
-        let err =
-            merge_staging_segment(dataset.object_store(), &dataset.indices_dir(), &merged_plan)
-                .await
-                .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("mismatched index subtype metadata")
-        );
-    }
-
-    #[tokio::test]
     async fn test_distributed_vector_plan_rejects_overlapping_fragment_coverage() {
         let test_dir = TempStrDir::default();
         let base_uri = test_dir.as_str();
@@ -1989,73 +1933,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
-    }
-
-    #[tokio::test]
-    async fn test_distributed_vector_plan_rejects_mismatched_ivf_centroids() {
-        let test_dir = TempStrDir::default();
-        let base_uri = test_dir.as_str();
-        let (schema, batches) = make_two_fragment_batches();
-        let dataset_uri = format!("{}/mismatch_centroids", base_uri);
-        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
-
-        let fragments = dataset.get_fragments();
-        assert!(fragments.len() >= 2);
-        let shard0 = vec![fragments[0].id() as u32];
-        let shard1 = vec![fragments[1].id() as u32];
-        let shared_uuid = Uuid::new_v4();
-
-        let ivf_params = prepare_global_ivf(&dataset, "vector").await;
-        let mut mismatched_ivf_params = prepare_global_ivf(&dataset, "vector").await;
-        let centroids = mismatched_ivf_params.centroids.as_ref().unwrap();
-        let mut values = centroids
-            .values()
-            .as_primitive::<Float32Type>()
-            .values()
-            .to_vec();
-        if !values.is_empty() {
-            values[0] += 1.0;
-        }
-        let bumped_centroids = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(values),
-            centroids.value_length(),
-        )
-        .unwrap();
-        mismatched_ivf_params.centroids = Some(Arc::new(bumped_centroids));
-
-        let flat_params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
-        let mismatched_params =
-            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, mismatched_ivf_params);
-
-        dataset
-            .create_index_builder(&["vector"], IndexType::Vector, &flat_params)
-            .name("vector_idx".to_string())
-            .fragments(shard0.clone())
-            .index_uuid(shared_uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        dataset
-            .create_index_builder(&["vector"], IndexType::Vector, &mismatched_params)
-            .name("vector_idx".to_string())
-            .fragments(shard1.clone())
-            .index_uuid(shared_uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-
-        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let partial_shards =
-            build_partial_shards(&dataset, shared_uuid, &[shard0.clone(), shard1.clone()]).await;
-        let plans = plan_staging_segments(&index_dir, &partial_shards, None, None)
-            .await
-            .unwrap();
-        let merged_plan = collapse_segment_plans(&plans).unwrap();
-        let err =
-            merge_staging_segment(dataset.object_store(), &dataset.indices_dir(), &merged_plan)
-                .await
-                .unwrap_err();
-        assert!(err.to_string().contains("mismatched IVF centroids"));
     }
 
     #[tokio::test]

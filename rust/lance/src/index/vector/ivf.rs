@@ -59,9 +59,8 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::KMeansParams;
-use lance_index::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
 use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
@@ -2094,71 +2093,7 @@ pub(crate) async fn merge_staging_segment(
     indices_dir: &Path,
     segment_plan: &VectorIndexSegmentPlan,
 ) -> Result<IndexSegment> {
-    let staging_root = indices_dir.child(segment_plan.staging_index_uuid().to_string());
-    let mut partial_segments = Vec::with_capacity(segment_plan.partial_shards().len());
-    for partial_shard in segment_plan.partial_shards() {
-        let partial_dir = staging_root.child(format!("partial_{}", partial_shard.uuid()));
-        partial_segments
-            .push(load_partial_vector_segment(object_store, partial_dir, partial_shard).await?);
-    }
-
-    let first = &partial_segments[0];
-    for partial in &partial_segments {
-        if partial.segment.index_version() != first.segment.index_version() {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched index versions".to_string(),
-            ));
-        }
-        if partial.segment.index_details().map(|v| v.as_ref())
-            != first.segment.index_details().map(|v| v.as_ref())
-        {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched index details".to_string(),
-            ));
-        }
-        if partial.index_schema.index_type != first.index_schema.index_type
-            || partial.index_schema.distance_type != first.index_schema.distance_type
-        {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched index subtype metadata".to_string(),
-            ));
-        }
-        if partial.nlist != first.nlist {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched IVF partition counts".to_string(),
-            ));
-        }
-        if partial.centroids != first.centroids {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched IVF centroids".to_string(),
-            ));
-        }
-        if partial.pq_metadata != first.pq_metadata {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched PQ metadata".to_string(),
-            ));
-        }
-        if partial.sq_metadata != first.sq_metadata {
-            return Err(Error::index(
-                "Distributed vector shards have mismatched SQ metadata".to_string(),
-            ));
-        }
-        if let Some(requested_index_type) = segment_plan.requested_index_type()
-            && requested_index_type != IndexType::Vector
-            && partial.index_schema.index_type != requested_index_type.to_string()
-        {
-            return Err(Error::index(format!(
-                "Distributed vector shard subtype '{}' does not match requested index type '{}'",
-                partial.index_schema.index_type, requested_index_type
-            )));
-        }
-    }
-
-    let mut final_segment = segment_plan.final_segment().clone();
-    if let Some(index_details) = first.segment.index_details().cloned() {
-        final_segment = final_segment.with_index_details(index_details);
-    }
-    final_segment = final_segment.with_index_version(first.segment.index_version());
+    let final_segment = segment_plan.final_segment().clone();
     let final_dir = indices_dir.child(final_segment.uuid().to_string());
     let staging_dir = indices_dir.child(segment_plan.staging_index_uuid().to_string());
     if final_dir == staging_dir {
@@ -2258,169 +2193,6 @@ async fn merge_staging_segment_to_dir(
     Ok(())
 }
 
-/// Metadata recovered from one staging shard.
-///
-/// Merge-time validation needs these fields together to verify that all shards
-/// in one segment agree on subtype, IVF topology, and quantizer state.
-#[derive(Debug)]
-struct PartialVectorSegment {
-    segment: IndexSegment,
-    index_schema: lance_index::IndexMetadata,
-    nlist: usize,
-    centroids: Option<FixedSizeListArray>,
-    pq_metadata: Option<ProductQuantizationMetadata>,
-    sq_metadata: Option<ScalarQuantizationMetadata>,
-}
-
-/// Load the metadata needed to validate one `partial_*` shard at merge time.
-///
-/// This reads both `index.idx` and `auxiliary.idx` because neither file alone
-/// contains the full contract:
-/// - `index.idx` tells us the precise subtype metadata
-/// - `auxiliary.idx` contains IVF metadata and quantizer metadata
-async fn load_partial_vector_segment(
-    object_store: &ObjectStore,
-    partial_dir: Path,
-    partial_shard: &PartialShard,
-) -> Result<PartialVectorSegment> {
-    let index_path = partial_dir.child(INDEX_FILE_NAME);
-    let aux_path = partial_dir.child(INDEX_AUXILIARY_FILE_NAME);
-
-    for required_path in [&index_path, &aux_path] {
-        if !object_store.exists(required_path).await? {
-            return Err(Error::index(format!(
-                "Distributed vector shard '{}' is missing required file '{}'",
-                partial_dir, required_path
-            )));
-        }
-    }
-
-    let index_schema = load_partial_vector_index_schema(object_store, &index_path).await?;
-    let index_type = IndexType::try_from(index_schema.index_type.as_str()).map_err(|err| {
-        Error::index(format!(
-            "Distributed vector shard '{}' has unsupported vector subtype '{}': {}",
-            partial_dir, index_schema.index_type, err
-        ))
-    })?;
-    let scheduler = ScanScheduler::new(
-        Arc::new(object_store.clone()),
-        SchedulerConfig::max_bandwidth(object_store),
-    );
-    let fh = scheduler
-        .open_file(&aux_path, &CachedFileSize::unknown())
-        .await?;
-    let reader = V2Reader::try_open(
-        fh,
-        None,
-        Arc::default(),
-        &LanceCache::no_cache(),
-        V2ReaderOptions::default(),
-    )
-    .await?;
-    let ivf_idx: u32 = reader
-        .metadata()
-        .file_schema
-        .metadata
-        .get(IVF_METADATA_KEY)
-        .ok_or_else(|| {
-            Error::index(format!(
-                "Distributed vector shard '{}' is missing IVF metadata",
-                partial_dir
-            ))
-        })?
-        .parse()
-        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
-    let ivf_bytes = reader.read_global_buffer(ivf_idx).await?;
-    let pb_ivf: pb::Ivf = Message::decode(ivf_bytes)?;
-    let nlist = pb_ivf.lengths.len();
-    let mut centroids = pb_ivf
-        .centroids_tensor
-        .as_ref()
-        .map(FixedSizeListArray::try_from)
-        .transpose()?;
-    if centroids.is_none() {
-        let fh = scheduler
-            .open_file(&index_path, &CachedFileSize::unknown())
-            .await?;
-        let index_reader = V2Reader::try_open(
-            fh,
-            None,
-            Arc::default(),
-            &LanceCache::no_cache(),
-            V2ReaderOptions::default(),
-        )
-        .await?;
-        if let Some(ivf_idx) = index_reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(IVF_METADATA_KEY)
-            .and_then(|idx| idx.parse::<u32>().ok())
-        {
-            let index_ivf_bytes = index_reader.read_global_buffer(ivf_idx).await?;
-            let index_pb_ivf: pb::Ivf = Message::decode(index_ivf_bytes)?;
-            centroids = index_pb_ivf
-                .centroids_tensor
-                .as_ref()
-                .map(FixedSizeListArray::try_from)
-                .transpose()?;
-        }
-    }
-
-    let mut pq_metadata = None;
-    if let Some(pq_json) = reader.metadata().file_schema.metadata.get(PQ_METADATA_KEY) {
-        let mut metadata: ProductQuantizationMetadata = serde_json::from_str(pq_json)
-            .map_err(|err| Error::index(format!("PQ metadata parse error: {}", err)))?;
-        if metadata.codebook.is_none() {
-            let tensor_bytes = reader
-                .read_global_buffer(metadata.codebook_position as u32)
-                .await?;
-            let codebook_tensor: pb::Tensor = Message::decode(tensor_bytes)?;
-            metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
-        }
-        pq_metadata = Some(metadata);
-    }
-
-    let sq_metadata =
-        if let Some(sq_json) = reader.metadata().file_schema.metadata.get(SQ_METADATA_KEY) {
-            Some(
-                serde_json::from_str(sq_json)
-                    .map_err(|err| Error::index(format!("SQ metadata parse error: {}", err)))?,
-            )
-        } else {
-            None
-        };
-
-    match index_type {
-        IndexType::IvfFlat
-        | IndexType::IvfPq
-        | IndexType::IvfSq
-        | IndexType::IvfHnswFlat
-        | IndexType::IvfHnswPq
-        | IndexType::IvfHnswSq => {}
-        other => {
-            return Err(Error::index(format!(
-                "Distributed vector shard '{}' has unsupported merge subtype '{}'",
-                partial_dir, other
-            )));
-        }
-    }
-    let segment = IndexSegment::new(
-        partial_shard.uuid(),
-        partial_shard.fragment_bitmap().clone(),
-    )
-    .with_index_details(Arc::new(crate::index::vector_index_details()))
-    .with_index_version(index_type.version());
-    Ok(PartialVectorSegment {
-        segment,
-        index_schema,
-        nlist,
-        centroids,
-        pq_metadata,
-        sq_metadata,
-    })
-}
-
 /// Collapse one group of staging shards into a single final-segment plan.
 fn build_segment_plan(
     staging_index_uuid: Uuid,
@@ -2492,45 +2264,6 @@ pub(crate) fn collapse_segment_plans(
         estimated_bytes,
         first_plan.requested_index_type(),
     ))
-}
-
-/// Read the precise subtype metadata stored in a vector `index.idx`.
-async fn load_partial_vector_index_schema(
-    object_store: &ObjectStore,
-    index_path: &Path,
-) -> Result<lance_index::IndexMetadata> {
-    let scheduler = ScanScheduler::new(
-        Arc::new(object_store.clone()),
-        SchedulerConfig::max_bandwidth(object_store),
-    );
-    let fh = scheduler
-        .open_file(index_path, &CachedFileSize::unknown())
-        .await?;
-    let reader = V2Reader::try_open(
-        fh,
-        None,
-        Arc::default(),
-        &LanceCache::no_cache(),
-        V2ReaderOptions::default(),
-    )
-    .await?;
-    let idx_meta_json = reader
-        .metadata()
-        .file_schema
-        .metadata
-        .get(INDEX_METADATA_SCHEMA_KEY)
-        .ok_or_else(|| {
-            Error::index(format!(
-                "Distributed vector shard '{}' is missing index metadata schema",
-                index_path
-            ))
-        })?;
-    serde_json::from_str(idx_meta_json).map_err(|err| {
-        Error::index(format!(
-            "Failed to parse vector index metadata from '{}': {}",
-            index_path, err
-        ))
-    })
 }
 
 /// Remove the source `partial_*` directories consumed by one segment plan.
