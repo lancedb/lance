@@ -131,7 +131,11 @@ impl AsyncScanner {
                 task_id,
                 result,
             }) {
-                log::error!("Failed to send completion message for task {}: {}", task_id, e);
+                log::error!(
+                    "Failed to send completion message for task {}: {}",
+                    task_id,
+                    e
+                );
             }
 
             // _cleanup_guard.drop() called here automatically, removing task from tracker
