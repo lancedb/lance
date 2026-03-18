@@ -426,7 +426,7 @@ async fn do_load_shuffled_vectors(
                 prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
                     .unwrap(),
             ),
-            IndexType::IvfPq.version() as i32,
+            IndexType::IvfPq.version(),
         )],
     )
     .await

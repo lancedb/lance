@@ -1474,7 +1474,7 @@ mod tests {
                     shared_uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     Arc::new(crate::index::vector_index_details()),
-                    IndexType::IvfPq.version() as i32,
+                    IndexType::IvfPq.version(),
                 )],
             )
             .await

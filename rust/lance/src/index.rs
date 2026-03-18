@@ -5208,13 +5208,13 @@ mod tests {
             Uuid::new_v4(),
             std::iter::once(0_u32),
             Arc::new(vector_index_details()),
-            IndexType::Vector.version() as i32,
+            IndexType::Vector.version(),
         );
         let seg1 = IndexSegment::new(
             Uuid::new_v4(),
             std::iter::once(1_u32),
             Arc::new(vector_index_details()),
-            IndexType::Vector.version() as i32,
+            IndexType::Vector.version(),
         );
 
         dataset
@@ -5270,7 +5270,7 @@ mod tests {
             Uuid::new_v4(),
             std::iter::once(0_u32),
             Arc::new(vector_index_details()),
-            IndexType::Vector.version() as i32,
+            IndexType::Vector.version(),
         );
 
         let err = dataset
@@ -5283,7 +5283,7 @@ mod tests {
                         base.uuid(),
                         std::iter::once(1_u32),
                         Arc::new(vector_index_details()),
-                        IndexType::Vector.version() as i32,
+                        IndexType::Vector.version(),
                     ),
                 ],
             )
