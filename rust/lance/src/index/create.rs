@@ -17,10 +17,13 @@ use crate::{
         vector_index_details,
     },
 };
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, try_join_all};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
+use lance_index::{
+    IndexParams, IndexSegment, IndexType, StagingIndexShard, VectorIndexSegmentPlan,
+    scalar::CreatedIndex,
+};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
@@ -494,6 +497,90 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
     }
 }
 
+/// Build final physical index segments from previously-written staging shards.
+///
+/// Use [`DatasetIndexExt::create_index_segment_builder`] to open a staging root
+/// and then either:
+///
+/// - call [`Self::plan`] and orchestrate individual segment builds externally, or
+/// - call [`Self::build_all`] to materialize all final segments on the current node.
+///
+/// This builder only materializes physical segments. Publishing those segments as
+/// a logical index still requires [`DatasetIndexExt::commit_existing_index_segments`].
+/// Together these two APIs form the canonical distributed vector finalize workflow.
+#[derive(Clone)]
+pub struct IndexSegmentBuilder<'a> {
+    dataset: &'a Dataset,
+    staging_index_uuid: String,
+    partial_shards: Vec<StagingIndexShard>,
+    target_segment_bytes: Option<u64>,
+}
+
+impl<'a> IndexSegmentBuilder<'a> {
+    pub(crate) fn new(dataset: &'a Dataset, staging_index_uuid: String) -> Self {
+        Self {
+            dataset,
+            staging_index_uuid,
+            partial_shards: Vec::new(),
+            target_segment_bytes: None,
+        }
+    }
+
+    /// Provide the coordinator-known shard contract for this staging root.
+    pub fn with_partial_shards(mut self, partial_shards: Vec<StagingIndexShard>) -> Self {
+        self.partial_shards = partial_shards;
+        self
+    }
+
+    /// Set the target size, in bytes, for merged final segments.
+    ///
+    /// When set, shard outputs will be grouped into larger final segments up to
+    /// approximately this size. When unset, each shard output becomes one final
+    /// segment.
+    pub fn with_target_segment_bytes(mut self, bytes: u64) -> Self {
+        self.target_segment_bytes = Some(bytes);
+        self
+    }
+
+    /// Plan how staging shards should be grouped into final segments.
+    pub async fn plan(&self) -> Result<Vec<VectorIndexSegmentPlan>> {
+        if self.partial_shards.is_empty() {
+            return Err(Error::invalid_input(
+                "IndexSegmentBuilder requires at least one staging shard; \
+                 call with_partial_shards(...) with coordinator-provided shard metadata"
+                    .to_string(),
+            ));
+        }
+
+        crate::index::vector::ivf::plan_staging_segments(
+            &self
+                .dataset
+                .indices_dir()
+                .child(self.staging_index_uuid.as_str()),
+            &self.partial_shards,
+            None,
+            self.target_segment_bytes,
+        )
+        .await
+    }
+
+    /// Materialize one final segment from a previously-generated plan.
+    pub async fn build(&self, plan: &VectorIndexSegmentPlan) -> Result<IndexSegment> {
+        crate::index::vector::ivf::merge_staging_segment(
+            self.dataset.object_store(),
+            &self.dataset.indices_dir(),
+            plan,
+        )
+        .await
+    }
+
+    /// Plan and materialize all final segments from this staging root.
+    pub async fn build_all(&self) -> Result<Vec<IndexSegment>> {
+        let plans = self.plan().await?;
+        try_join_all(plans.iter().map(|plan| self.build(plan))).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,7 +595,6 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{self, gen_batch};
-    use lance_index::IndexSegment;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -1048,6 +1134,121 @@ mod tests {
                 .map(|fragment| fragment.id() as u32)
                 .collect::<Vec<_>>()
         );
+
+        let query_batch = dataset
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(4), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = query_batch["vector"].as_fixed_size_list().value(0);
+        let result = dataset
+            .scan()
+            .project(&["_rowid"] as &[&str])
+            .unwrap()
+            .nearest("vector", q.as_ref(), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_index_segment_builder_vector_commits_multi_segment_logical_index() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let shared_uuid = Uuid::new_v4();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&dataset, "vector").await,
+        );
+        let staging_root = dataset.indices_dir().child(shared_uuid.to_string());
+        let mut seen_shards = std::collections::HashSet::new();
+        let mut partial_shards = Vec::new();
+
+        for fragment in fragments.iter().take(2) {
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .index_uuid(shared_uuid.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+            let shard_uuid = dataset
+                .object_store()
+                .read_dir(staging_root.clone())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|name| name.strip_prefix("partial_").map(|name| name.to_string()))
+                .map(|name| Uuid::parse_str(&name).unwrap())
+                .find(|uuid| seen_shards.insert(*uuid))
+                .expect("each staged shard build should create exactly one new partial shard");
+            partial_shards.push(StagingIndexShard::new(
+                shard_uuid,
+                [fragment.id() as u32],
+                0,
+            ));
+        }
+
+        let segments = dataset
+            .create_index_segment_builder(shared_uuid.to_string())
+            .with_partial_shards(partial_shards)
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 2);
+
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2);
+        let mut committed_fragment_sets = indices
+            .iter()
+            .map(|metadata| {
+                metadata
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        committed_fragment_sets.sort();
+        assert_eq!(committed_fragment_sets, vec![vec![0], vec![1]]);
 
         let query_batch = dataset
             .scan()

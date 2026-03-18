@@ -128,6 +128,9 @@ pub trait DatasetIndexExt {
     type IndexBuilder<'a>
     where
         Self: 'a;
+    type IndexSegmentBuilder<'a>
+    where
+        Self: 'a;
 
     /// Create a builder for creating an index on columns.
     ///
@@ -144,6 +147,21 @@ pub trait DatasetIndexExt {
         index_type: IndexType,
         params: &'a dyn IndexParams,
     ) -> Self::IndexBuilder<'a>;
+
+    /// Create a builder for materializing final index segments from staging shards.
+    ///
+    /// The staging UUID identifies a directory containing previously-built shard
+    /// outputs. The caller must provide the shard contract with
+    /// [`crate::StagingIndexShard`] so the planner knows which fragments each
+    /// shard covers.
+    ///
+    /// This is the canonical entry point for distributed vector index finalize.
+    /// After materializing the final physical segments, publish them as a
+    /// logical index with [`Self::commit_existing_index_segments`].
+    fn create_index_segment_builder<'a>(
+        &'a self,
+        staging_index_uuid: String,
+    ) -> Self::IndexSegmentBuilder<'a>;
 
     /// Create indices on columns.
     ///
@@ -275,6 +293,11 @@ pub trait DatasetIndexExt {
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
     /// Commit one or more existing physical index segments as a logical index.
+    ///
+    /// This publishes already-materialized physical segments. It does not build
+    /// or merge index data; callers should first materialize final segments with
+    /// [`Self::create_index_segment_builder`] or another index-specific build
+    /// path and then pass the resulting segments here.
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,

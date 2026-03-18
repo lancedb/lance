@@ -2663,6 +2663,16 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
+    /// Finalize a staged distributed index into a single merged root.
+    ///
+    /// For vector indices this is the legacy compatibility path that preserves
+    /// the historical `shared_uuid -> merge_index_metadata(...) -> commit_existing_index_segments(...)`
+    /// workflow. The canonical multi-segment vector workflow is:
+    ///
+    /// 1. `create_index_segment_builder(staging_uuid)`
+    /// 2. `with_partial_shards(...)`
+    /// 3. `build_all()`
+    /// 4. `commit_existing_index_segments(index_name, column, segments)`
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,

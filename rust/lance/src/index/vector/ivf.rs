@@ -65,7 +65,7 @@ use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexSegment,
-    IndexType,
+    IndexType, StagingIndexShard, VectorIndexSegmentPlan,
     optimize::OptimizeOptions,
     vector::{
         Query, VectorIndex,
@@ -1859,98 +1859,12 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-/// A single merge work item produced from one staging root.
-///
-/// Each plan says:
-/// - which staging root it belongs to
-/// - which partial shards should be consumed together
-/// - what the final committed segment metadata should look like
-///
-/// The planner returns a `Vec<VectorIndexSegmentPlan>` so callers can decide
-/// whether to execute the work serially or fan it out externally.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct VectorIndexSegmentPlan {
-    staging_index_uuid: Uuid,
-    final_segment: IndexSegment,
-    partial_shards: Vec<PartialShard>,
-    estimated_bytes: u64,
-    requested_index_type: Option<IndexType>,
-}
-
-impl VectorIndexSegmentPlan {
-    fn new(
-        staging_index_uuid: Uuid,
-        final_segment: IndexSegment,
-        partial_shards: Vec<PartialShard>,
-        estimated_bytes: u64,
-        requested_index_type: Option<IndexType>,
-    ) -> Self {
-        Self {
-            staging_index_uuid,
-            final_segment,
-            partial_shards,
-            estimated_bytes,
-            requested_index_type,
-        }
-    }
-
-    pub(crate) fn staging_index_uuid(&self) -> Uuid {
-        self.staging_index_uuid
-    }
-
-    pub(crate) fn final_segment(&self) -> &IndexSegment {
-        &self.final_segment
-    }
-
-    pub(crate) fn partial_shards(&self) -> &[PartialShard] {
-        &self.partial_shards
-    }
-
-    pub(crate) fn estimated_bytes(&self) -> u64 {
-        self.estimated_bytes
-    }
-
-    pub(crate) fn requested_index_type(&self) -> Option<IndexType> {
-        self.requested_index_type
-    }
-}
-
 /// Coordinator-provided shard metadata for one staging shard.
 ///
 /// The distributed coordinator already knows which fragments were assigned to
 /// each shard. We pass that contract into the planner directly instead of
 /// reconstructing fragment coverage by scanning row ids back out of storage.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PartialShard {
-    uuid: Uuid,
-    fragment_bitmap: RoaringBitmap,
-    estimated_bytes: u64,
-}
-
-impl PartialShard {
-    pub(crate) fn new<I>(uuid: Uuid, fragment_bitmap: I, estimated_bytes: u64) -> Self
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        Self {
-            uuid,
-            fragment_bitmap: fragment_bitmap.into_iter().collect(),
-            estimated_bytes,
-        }
-    }
-
-    pub(crate) fn uuid(&self) -> Uuid {
-        self.uuid
-    }
-
-    pub(crate) fn fragment_bitmap(&self) -> &RoaringBitmap {
-        &self.fragment_bitmap
-    }
-
-    pub(crate) fn estimated_bytes(&self) -> u64 {
-        self.estimated_bytes
-    }
-}
+pub(crate) type PartialShard = StagingIndexShard;
 
 /// Plan how one staging root should be turned into final physical segments.
 ///
