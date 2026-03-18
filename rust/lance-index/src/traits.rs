@@ -9,7 +9,6 @@ use lance_core::{Error, Result};
 
 use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
 use lance_table::format::IndexMetadata;
-use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
@@ -281,14 +280,6 @@ pub trait DatasetIndexExt {
             std::any::type_name::<Self>()
         )))
     }
-
-    #[deprecated(since = "4.0.0", note = "Use commit_existing_index_segments instead")]
-    async fn commit_existing_index(
-        &mut self,
-        index_name: &str,
-        column: &str,
-        index_id: Uuid,
-    ) -> Result<()>;
 
     async fn read_index_partition(
         &self,

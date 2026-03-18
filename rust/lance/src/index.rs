@@ -755,21 +755,6 @@ impl DatasetIndexExt for Dataset {
         }
     }
 
-    async fn commit_existing_index(
-        &mut self,
-        index_name: &str,
-        column: &str,
-        index_id: Uuid,
-    ) -> Result<()> {
-        // TODO: We will need some way to determine the index details here.  Perhaps
-        // we can load the index itself and get the details that way.
-
-        let segment = IndexSegment::new(index_id, self.fragment_bitmap.as_ref().clone());
-
-        self.commit_existing_index_segments(index_name, column, vec![segment])
-            .await
-    }
-
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
@@ -809,7 +794,7 @@ impl DatasetIndexExt for Dataset {
                     fields: vec![field.id],
                     dataset_version: self.manifest.version,
                     fragment_bitmap: Some(fragment_bitmap),
-                    index_details,
+                    index_details: Some(index_details),
                     index_version,
                     created_at: Some(chrono::Utc::now()),
                     base_id: None,
@@ -5179,8 +5164,18 @@ mod tests {
         .await
         .unwrap();
 
-        let seg0 = IndexSegment::new(Uuid::new_v4(), std::iter::once(0_u32));
-        let seg1 = IndexSegment::new(Uuid::new_v4(), std::iter::once(1_u32));
+        let seg0 = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(0_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version() as i32,
+        );
+        let seg1 = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(1_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version() as i32,
+        );
 
         dataset
             .commit_existing_index_segments(
@@ -5231,7 +5226,12 @@ mod tests {
 
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-        let base = IndexSegment::new(Uuid::new_v4(), std::iter::once(0_u32));
+        let base = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(0_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version() as i32,
+        );
 
         let err = dataset
             .commit_existing_index_segments(
@@ -5239,7 +5239,12 @@ mod tests {
                 "vector",
                 vec![
                     base.clone(),
-                    IndexSegment::new(base.uuid(), std::iter::once(1_u32)),
+                    IndexSegment::new(
+                        base.uuid(),
+                        std::iter::once(1_u32),
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version() as i32,
+                    ),
                 ],
             )
             .await
@@ -5269,35 +5274,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_commit_existing_index_wraps_single_segment_commit() {
-        use lance_datagen::{BatchCount, RowCount, array};
-
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let reader = lance_datagen::gen_batch()
-            .col("id", array::step::<arrow_array::types::Int32Type>())
-            .col(
-                "vector",
-                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
-            )
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        let segment_id = Uuid::new_v4();
-
-        dataset
-            .commit_existing_index("vector_idx", "vector", segment_id)
-            .await
-            .unwrap();
-
-        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].uuid, segment_id);
     }
 
     #[tokio::test]
