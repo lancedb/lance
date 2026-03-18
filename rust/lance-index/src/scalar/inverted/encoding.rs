@@ -5,7 +5,6 @@ use std::io::Write;
 
 use super::builder::BLOCK_SIZE;
 use super::index::{PositionStreamCodec, PostingTailCodec};
-#[cfg(test)]
 use arrow::array::LargeBinaryBuilder;
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::{Error, Result};
@@ -208,7 +207,6 @@ fn compress_posting_remainder(
     Ok(())
 }
 
-#[cfg(test)]
 pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinaryArray> {
     let mut builder = LargeBinaryBuilder::with_capacity(
         positions.len().div_ceil(BLOCK_SIZE),
@@ -246,6 +244,107 @@ fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
     dst.push(value as u8);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PositionBlockBuilder {
+    codec: PositionStreamCodec,
+    encoded_bytes: Vec<u8>,
+    pending_deltas: Vec<u32>,
+}
+
+impl Default for PositionBlockBuilder {
+    fn default() -> Self {
+        Self::new(PositionStreamCodec::PackedDelta)
+    }
+}
+
+impl PositionBlockBuilder {
+    pub(super) fn new(codec: PositionStreamCodec) -> Self {
+        Self {
+            codec,
+            encoded_bytes: Vec::new(),
+            pending_deltas: Vec::new(),
+        }
+    }
+
+    pub(super) fn size(&self) -> usize {
+        self.encoded_bytes.capacity() + self.pending_deltas.capacity() * std::mem::size_of::<u32>()
+    }
+
+    pub(super) fn append_doc_positions(&mut self, positions: &[u32]) -> Result<()> {
+        let mut previous = 0u32;
+        for (index, &position) in positions.iter().enumerate() {
+            let delta = if index == 0 {
+                position
+            } else {
+                position.checked_sub(previous).ok_or_else(|| {
+                    Error::index(format!(
+                        "positions must be sorted within a document, got {} after {}",
+                        position, previous
+                    ))
+                })?
+            };
+            self.push_delta(delta)?;
+            previous = position;
+        }
+        Ok(())
+    }
+
+    pub(super) fn append_position(
+        &mut self,
+        position: u32,
+        previous_in_doc: Option<u32>,
+    ) -> Result<()> {
+        let delta = match previous_in_doc {
+            Some(previous) => position.checked_sub(previous).ok_or_else(|| {
+                Error::index(format!(
+                    "positions must be sorted within a document, got {} after {}",
+                    position, previous
+                ))
+            })?,
+            None => position,
+        };
+        self.push_delta(delta)
+    }
+
+    pub(super) fn finish(self) -> Vec<u8> {
+        let mut bytes = self.encoded_bytes;
+        match self.codec {
+            PositionStreamCodec::VarintDocDelta | PositionStreamCodec::PackedDelta => {
+                for delta in self.pending_deltas {
+                    encode_varint_u32(&mut bytes, delta);
+                }
+            }
+        }
+        bytes
+    }
+
+    pub(super) fn decode_into(&self, frequencies: &[u32], dst: &mut Vec<u32>) -> Result<()> {
+        let bytes = self.clone().finish();
+        decode_position_stream_block(bytes.as_slice(), frequencies, self.codec, dst)
+    }
+
+    fn push_delta(&mut self, delta: u32) -> Result<()> {
+        match self.codec {
+            PositionStreamCodec::VarintDocDelta => {
+                encode_varint_u32(&mut self.encoded_bytes, delta);
+            }
+            PositionStreamCodec::PackedDelta => {
+                self.pending_deltas.push(delta);
+                if self.pending_deltas.len() == BLOCK_SIZE {
+                    let mut packed_buffer = [0u8; BLOCK_SIZE * 4 + 1];
+                    compress_block(
+                        self.pending_deltas.as_slice(),
+                        &mut packed_buffer,
+                        &mut self.encoded_bytes,
+                    )?;
+                    self.pending_deltas.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[inline]
 fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
     let mut value = 0u32;
@@ -269,6 +368,7 @@ fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
     ))
 }
 
+#[cfg(test)]
 fn encode_position_stream_varint_block_into(
     positions: &[u32],
     frequencies: &[u32],
@@ -344,6 +444,7 @@ fn decode_position_stream_varint_block(
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_position_stream_packed_block_into(
     positions: &[u32],
     frequencies: &[u32],
@@ -467,6 +568,7 @@ fn decode_position_stream_packed_block(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn encode_position_stream_block_into(
     positions: &[u32],
     frequencies: &[u32],
@@ -768,6 +870,31 @@ mod tests {
             assert_eq!(decoded, positions);
             assert!(encoded.len() < positions.len() * std::mem::size_of::<u32>());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_position_block_builder_matches_batch_encoder() -> Result<()> {
+        let frequencies = vec![1, 3, 2, 4, 1, 5];
+        let positions = vec![7, 1, 3, 8, 2, 100, 0, 4, 9, 25, 11, 2, 6, 7, 10, 15];
+
+        let mut builder = PositionBlockBuilder::new(PositionStreamCodec::PackedDelta);
+        let mut offset = 0usize;
+        for &frequency in &frequencies {
+            let end = offset + frequency as usize;
+            builder.append_doc_positions(&positions[offset..end])?;
+            offset = end;
+        }
+
+        let incremental = builder.finish();
+        let mut batch = Vec::new();
+        encode_position_stream_block_into(
+            &positions,
+            &frequencies,
+            PositionStreamCodec::PackedDelta,
+            &mut batch,
+        )?;
+        assert_eq!(incremental, batch);
         Ok(())
     }
 }

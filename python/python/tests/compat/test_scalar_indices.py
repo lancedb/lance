@@ -316,4 +316,15 @@ class FtsIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
     def skip_read_after_current_write(self, version: str) -> bool:
-        return version == "0.36.0"
+        return True
+
+    def skip_write_after_current_write(self, version: str) -> bool:
+        return True
+
+    def skip_downgrade(self, version: str) -> bool:
+        return True
+
+    def current_env(self, method_name: str) -> dict[str, str]:
+        if method_name == "check_write":
+            return {"LANCE_FTS_FORMAT_VERSION": "2"}
+        return {}

@@ -31,7 +31,7 @@ use std::{any::Any, sync::Arc};
 /// Scalar indices are made up of named collections of record batches.  This
 /// struct relies on there being a dedicated directory for the index and stores
 /// each collection in a file in the lance format.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
@@ -199,6 +199,10 @@ impl IndexReader for current_reader::FileReader {
 impl IndexStore for LanceIndexStore {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn clone_arc(&self) -> Arc<dyn IndexStore> {
+        Arc::new(self.clone())
     }
 
     fn io_parallelism(&self) -> usize {

@@ -208,6 +208,7 @@ pub trait IndexReader: Send + Sync {
 #[async_trait]
 pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
+    fn clone_arc(&self) -> Arc<dyn IndexStore>;
 
     /// Suggested I/O parallelism for the store
     fn io_parallelism(&self) -> usize;

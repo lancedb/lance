@@ -97,6 +97,7 @@ libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
+rand_distr.workspace = true
 dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true

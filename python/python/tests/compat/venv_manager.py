@@ -162,7 +162,12 @@ class VenvExecutor:
 
         return pickle.loads(data)
 
-    def execute_method(self, obj: Any, method_name: str) -> Any:
+    def execute_method(
+        self,
+        obj: Any,
+        method_name: str,
+        env_overrides: Optional[dict[str, str]] = None,
+    ) -> Any:
         """
         Execute a method on a pickled object in the virtual environment.
 
@@ -192,8 +197,8 @@ class VenvExecutor:
         # Ensure subprocess is running
         self._ensure_subprocess()
         try:
-            # Send request: (obj, method_name)
-            self._send_message((obj, method_name))
+            # Send request: (obj, method_name, env_overrides)
+            self._send_message((obj, method_name, env_overrides or {}))
 
             # Receive response
             response = self._receive_message()
