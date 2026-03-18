@@ -4047,8 +4047,8 @@ mod tests {
     use crate::prefilter::NoFilter;
     use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
     use crate::scalar::inverted::encoding::{
-        compress_positions, compress_posting_list_with_tail_codec, decompress_posting_list,
-        encode_position_stream_block_into,
+        compress_positions, compress_posting_list_with_tail_codec,
+        decompress_posting_list_with_tail_codec, encode_position_stream_block_into,
     };
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
@@ -4063,7 +4063,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
-        let mut builder = PostingListBuilder::new(false);
+        let posting_tail_codec = PostingTailCodec::Fixed32;
+        let mut builder = PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
         let n = BLOCK_SIZE + 3;
         for i in 0..n {
             builder.add(i as u32, PositionRecorder::Count(1));
@@ -4071,7 +4072,8 @@ mod tests {
         let removed = vec![5, 7];
         builder.remap(&removed);
 
-        let mut expected = PostingListBuilder::new(false);
+        let mut expected =
+            PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
         for i in 0..n - removed.len() {
             expected.add(i as u32, PositionRecorder::Count(1));
         }
@@ -4082,12 +4084,13 @@ mod tests {
         // BLOCK_SIZE + 3 elements should be reduced to BLOCK_SIZE + 1,
         // there are still 2 blocks.
         let batch = builder.to_batch(vec![1.0, 2.0]).unwrap();
-        let (doc_ids, freqs) = decompress_posting_list(
+        let (doc_ids, freqs) = decompress_posting_list_with_tail_codec(
             (n - removed.len()) as u32,
             batch[POSTING_COL]
                 .as_list::<i32>()
                 .value(0)
                 .as_binary::<i64>(),
+            posting_tail_codec,
         )
         .unwrap();
         assert!(
@@ -4248,7 +4251,7 @@ mod tests {
         assert!(batch.column_by_name(COMPRESSED_POSITION_COL).is_none());
         assert_eq!(
             batch.schema_ref().metadata().get(POSTING_TAIL_CODEC_KEY),
-            Some(&PostingTailCodec::Fixed32.as_str().to_owned())
+            None
         );
         assert_eq!(
             batch.schema_ref().metadata().get(POSITIONS_LAYOUT_KEY),
@@ -4434,7 +4437,10 @@ mod tests {
 
     #[test]
     fn test_shared_position_stream_is_smaller_for_sparse_positions() {
-        let mut builder = PostingListBuilder::new(true);
+        let mut builder = PostingListBuilder::new_with_posting_tail_codec(
+            true,
+            PostingTailCodec::VarintDelta,
+        );
         let mut legacy_positions = Vec::with_capacity(BLOCK_SIZE * 4);
         for doc_id in 0..(BLOCK_SIZE * 4) as u32 {
             let mut positions = vec![doc_id * 3 + 1];

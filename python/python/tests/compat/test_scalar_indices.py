@@ -322,9 +322,11 @@ class FtsIndex(UpgradeDowngradeTest):
         return True
 
     def skip_downgrade(self, version: str) -> bool:
-        return True
+        return version.startswith("0.")
 
     def current_env(self, method_name: str) -> dict[str, str]:
+        if method_name == "create":
+            return {"LANCE_FTS_FORMAT_VERSION": "1"}
         if method_name == "check_write":
             return {"LANCE_FTS_FORMAT_VERSION": "2"}
         return {}
