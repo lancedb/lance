@@ -620,8 +620,8 @@ mod tests {
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::vector::ivf::finalize_distributed_merge;
     use crate::index::vector::ivf::v2::IvfPq;
+    use crate::index::vector::ivf::{PartialShard, merge_staging_segment, plan_staging_segments};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -1430,106 +1430,163 @@ mod tests {
         (ivf_params, pq_params)
     }
 
-    async fn build_ivfpq_for_fragment_groups(
+    async fn prepare_global_ivf(dataset: &Dataset, vector_column: &str) -> IvfBuildParams {
+        let batch = dataset
+            .scan()
+            .project(&[vector_column.to_string()])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = batch
+            .column_by_name(vector_column)
+            .expect("vector column should exist")
+            .as_fixed_size_list();
+
+        let dim = vectors.value_length() as usize;
+        assert_eq!(dim, TWO_FRAG_DIM, "unexpected vector dimension");
+
+        let values = vectors.values().as_primitive::<Float32Type>();
+        let kmeans_params = KMeansParams::new(None, TWO_FRAG_MAX_ITERS, 1, DistanceType::L2);
+        let kmeans = train_kmeans::<Float32Type>(
+            values,
+            kmeans_params,
+            dim,
+            TWO_FRAG_NUM_PARTITIONS,
+            TWO_FRAG_SAMPLE_RATE,
+        )
+        .unwrap();
+
+        let centroids_flat = kmeans.centroids.as_primitive::<Float32Type>().clone();
+        let centroids_fsl =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids_flat, dim as i32).unwrap());
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(TWO_FRAG_NUM_PARTITIONS, centroids_fsl).unwrap();
+        ivf_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
+        ivf_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+        ivf_params
+    }
+
+    async fn build_distributed_partial_index_for_fragment_groups(
         dataset: &mut Dataset,
         fragment_groups: Vec<Vec<u32>>, // each group is a set of fragment ids
-        ivf_params: &IvfBuildParams,
-        pq_params: &PQBuildParams,
+        params: &VectorIndexParams,
         index_name: &str,
-    ) {
+    ) -> (Uuid, Vec<PartialShard>) {
         let shared_uuid = Uuid::new_v4();
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            ivf_params.clone(),
-            pq_params.clone(),
-        );
+        let mut seen_shards = HashSet::new();
+        let mut partial_shards = Vec::new();
 
         for fragments in fragment_groups {
-            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
+            let fragment_bitmap = fragments.clone();
+            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, params);
             builder = builder
                 .name(index_name.to_string())
                 .fragments(fragments)
                 .index_uuid(shared_uuid.to_string());
             // Build partial index shards without committing to manifest.
             builder.execute_uncommitted().await.unwrap();
+
+            let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
+            let mut new_shards = dataset
+                .object_store()
+                .read_dir(index_dir)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|name| name.starts_with("partial_"))
+                .filter_map(|name| {
+                    let shard_uuid = name.strip_prefix("partial_")?;
+                    let shard_uuid = Uuid::parse_str(shard_uuid).ok()?;
+                    if seen_shards.insert(shard_uuid) {
+                        Some(shard_uuid)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            new_shards.sort();
+            assert_eq!(new_shards.len(), 1);
+            partial_shards.push(PartialShard::new(new_shards[0], fragment_bitmap));
         }
 
+        (shared_uuid, partial_shards)
+    }
+
+    async fn load_staging_shard_uuids(dataset: &Dataset, shared_uuid: Uuid) -> Vec<Uuid> {
+        let mut shard_uuids = dataset
+            .object_store()
+            .read_dir(dataset.indices_dir().child(shared_uuid.to_string()))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|name| name.starts_with("partial_"))
+            .map(|name| Uuid::parse_str(name.trim_start_matches("partial_")).unwrap())
+            .collect::<Vec<_>>();
+        shard_uuids.sort();
+        shard_uuids
+    }
+
+    async fn build_partial_shards(
+        dataset: &Dataset,
+        shared_uuid: Uuid,
+        fragment_groups: &[Vec<u32>],
+    ) -> Vec<PartialShard> {
+        let shard_uuids = load_staging_shard_uuids(dataset, shared_uuid).await;
+        assert_eq!(shard_uuids.len(), fragment_groups.len());
+        shard_uuids
+            .into_iter()
+            .zip(fragment_groups.iter())
+            .map(|(shard_uuid, fragment_group)| {
+                PartialShard::new(shard_uuid, fragment_group.iter().copied())
+            })
+            .collect()
+    }
+
+    async fn materialize_distributed_plan(
+        dataset: &mut Dataset,
+        shared_uuid: Uuid,
+        partial_shards: &[PartialShard],
+        target_segment_bytes: Option<u64>,
+        index_name: &str,
+    ) -> Vec<IndexSegment> {
         let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        finalize_distributed_merge(dataset.object_store(), &index_dir, Some(IndexType::IvfPq))
-            .await
-            .unwrap();
-
-        dataset
-            .commit_existing_index_segments(
-                index_name,
-                "vector",
-                vec![IndexSegment::new(
-                    shared_uuid,
-                    dataset.fragment_bitmap.as_ref().clone(),
-                )],
-            )
-            .await
-            .unwrap();
-    }
-
-    fn assert_ivf_layout_equal(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
-        let idx_a = &stats_a["indices"][0];
-        let idx_b = &stats_b["indices"][0];
-
-        // Centroids: same shape and values (within tolerance).
-        let centroids_a = idx_a["centroids"]
-            .as_array()
-            .expect("centroids should be an array");
-        let centroids_b = idx_b["centroids"]
-            .as_array()
-            .expect("centroids should be an array");
-        assert_eq!(
-            centroids_a.len(),
-            centroids_b.len(),
-            "num centroids mismatch",
-        );
-        for (row_a, row_b) in centroids_a.iter().zip(centroids_b.iter()) {
-            let row_a = row_a
-                .as_array()
-                .unwrap_or_else(|| panic!("invalid centroid row: {:?}", row_a));
-            let row_b = row_b
-                .as_array()
-                .unwrap_or_else(|| panic!("invalid centroid row: {:?}", row_b));
-            assert_eq!(row_a.len(), row_b.len(), "centroid dim mismatch");
-            for (va, vb) in row_a.iter().zip(row_b.iter()) {
-                let fa = va.as_f64().expect("centroid must be numeric") as f32;
-                let fb = vb.as_f64().expect("centroid must be numeric") as f32;
-                assert!(
-                    (fa - fb).abs() <= 1e-4,
-                    "centroid mismatch: {} vs {}",
-                    fa,
-                    fb
-                );
-            }
+        let segment_plans = plan_staging_segments(
+            dataset.object_store(),
+            &index_dir,
+            partial_shards,
+            None,
+            target_segment_bytes,
+        )
+        .await
+        .unwrap();
+        let mut segments = Vec::with_capacity(segment_plans.len());
+        for plan in &segment_plans {
+            segments.push(
+                merge_staging_segment(dataset.object_store(), &dataset.indices_dir(), plan)
+                    .await
+                    .unwrap(),
+            );
         }
+        dataset
+            .commit_existing_index_segments(index_name, "vector", segments.clone())
+            .await
+            .unwrap();
 
-        // Partitions sizes.
-        let parts_a = idx_a["partitions"]
-            .as_array()
-            .expect("partitions should be an array");
-        let parts_b = idx_b["partitions"]
-            .as_array()
-            .expect("partitions should be an array");
-        assert_eq!(parts_a.len(), parts_b.len(), "num partitions mismatch");
-        let sizes_a: Vec<u64> = parts_a
-            .iter()
-            .map(|p| p["size"].as_u64().expect("partition size"))
-            .collect();
-        let sizes_b: Vec<u64> = parts_b
-            .iter()
-            .map(|p| p["size"].as_u64().expect("partition size"))
-            .collect();
-        assert_eq!(sizes_a, sizes_b, "partition sizes mismatch");
+        segments
     }
 
+    #[rstest]
+    #[case::ivf_flat(IndexType::IvfFlat)]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_sq(IndexType::IvfSq)]
     #[tokio::test]
-    async fn test_ivfpq_recall_performance_on_two_frags_single_vs_split() {
+    async fn test_distributed_vector_finalize_commits_multiple_segments_and_preserves_query_results(
+        #[case] index_type: IndexType,
+    ) {
         const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
 
         let test_dir = TempStrDir::default();
         let base_uri = test_dir.as_str();
@@ -1558,66 +1615,76 @@ mod tests {
             fragments_split.len()
         );
 
-        // Pretrain global IVF centroids and PQ codebook.
-        let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+        let distributed_params = match index_type {
+            IndexType::IvfFlat => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params)
+            }
+            IndexType::IvfPq => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfSq => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    SQBuildParams::default(),
+                )
+            }
+            other => panic!("unsupported test index type: {}", other),
+        };
 
-        // Build single index using two fragments in one distributed build.
-        let group_single = vec![
-            fragments_single[0].id() as u32,
-            fragments_single[1].id() as u32,
-        ];
-        build_ivfpq_for_fragment_groups(
-            &mut ds_single,
-            vec![group_single],
-            &ivf_params,
-            &pq_params,
-            INDEX_NAME,
-        )
-        .await;
+        ds_single
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &distributed_params,
+                true,
+            )
+            .await
+            .unwrap();
 
-        // Build split index: one fragment per distributed build, then merge.
-        let group0 = vec![fragments_split[0].id() as u32];
-        let group1 = vec![fragments_split[1].id() as u32];
-        build_ivfpq_for_fragment_groups(
+        let fragment_groups = fragments_split
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let expected_segment_count = fragment_groups.len();
+        let (shared_uuid, partial_shards) = build_distributed_partial_index_for_fragment_groups(
             &mut ds_split,
-            vec![group0, group1],
-            &ivf_params,
-            &pq_params,
+            fragment_groups,
+            &distributed_params,
             INDEX_NAME,
         )
         .await;
+        let segments = materialize_distributed_plan(
+            &mut ds_split,
+            shared_uuid,
+            &partial_shards,
+            None,
+            INDEX_NAME,
+        )
+        .await;
+        assert_eq!(segments.len(), expected_segment_count);
+        let staging_dir = ds_split.indices_dir().child(shared_uuid.to_string());
+        let staging_entries = ds_split.object_store().read_dir(staging_dir).await.unwrap();
+        assert!(
+            staging_entries
+                .iter()
+                .all(|entry| !entry.starts_with("partial_")),
+            "materialized segments should clean up consumed partial shards",
+        );
 
-        // Compare IVF layout via index statistics.
-        let stats_single_json = ds_single.index_statistics(INDEX_NAME).await.unwrap();
-        let stats_split_json = ds_split.index_statistics(INDEX_NAME).await.unwrap();
-        let stats_single: serde_json::Value = serde_json::from_str(&stats_single_json).unwrap();
-        let stats_split: serde_json::Value = serde_json::from_str(&stats_split_json).unwrap();
-        assert_ivf_layout_equal(&stats_single, &stats_split);
-
-        // Compare row id sets per partition.
-        let ctx_single = load_vector_index_context(&ds_single, "vector", INDEX_NAME).await;
-        let ctx_split = load_vector_index_context(&ds_split, "vector", INDEX_NAME).await;
-
-        let ivf_single = ctx_single.ivf();
-        let ivf_split = ctx_split.ivf();
-        let total_partitions = ivf_single.total_partitions();
-        assert_eq!(total_partitions, ivf_split.total_partitions());
-
-        for part_id in 0..total_partitions {
-            let row_ids_single = load_partition_row_ids(ivf_single, part_id).await;
-            let row_ids_split = load_partition_row_ids(ivf_split, part_id).await;
-            let set_single: HashSet<u64> = row_ids_single.into_iter().collect();
-            let set_split: HashSet<u64> = row_ids_split.into_iter().collect();
-            assert_eq!(
-                set_single, set_split,
-                "row id set mismatch for partition {}",
-                part_id
-            );
+        let committed_segments = ds_split.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(committed_segments.len(), expected_segment_count);
+        for committed in committed_segments {
+            let covered_fragments = committed
+                .fragment_bitmap
+                .as_ref()
+                .expect("distributed segment should have fragment coverage");
+            assert_eq!(covered_fragments.len(), 1);
         }
-
-        // Compare Top-K row ids on a deterministic set of queries.
-        const K: usize = 10;
-        const NUM_QUERIES: usize = 10;
 
         async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
             let mut ids_per_query = Vec::with_capacity(queries.len());
@@ -1664,10 +1731,408 @@ mod tests {
 
         assert_eq!(
             ids_single, ids_split,
-            "single vs split index returned different Top-K row ids",
+            "single vs segmented distributed index returned different Top-K row ids",
         );
     }
 
+    #[rstest]
+    #[case::ivf_flat(IndexType::IvfFlat)]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_sq(IndexType::IvfSq)]
+    #[tokio::test]
+    async fn test_distributed_vector_grouped_finalize_allows_concurrent_group_execution(
+        #[case] index_type: IndexType,
+    ) {
+        const INDEX_NAME: &str = "grouped_idx";
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+
+        let (schema, batches) = make_two_fragment_batches();
+        let ds_single_uri = format!("{}/grouped_single", base_uri);
+        let ds_split_uri = format!("{}/grouped_split", base_uri);
+
+        let mut ds_single =
+            write_dataset_from_batches(&ds_single_uri, schema.clone(), batches.clone()).await;
+        let mut ds_split = write_dataset_from_batches(&ds_split_uri, schema, batches).await;
+
+        let distributed_params = match index_type {
+            IndexType::IvfFlat => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params)
+            }
+            IndexType::IvfPq => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfSq => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    SQBuildParams::default(),
+                )
+            }
+            other => panic!("unsupported test index type: {}", other),
+        };
+
+        ds_single
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &distributed_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let fragment_groups = ds_split
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let (shared_uuid, partial_shards) = build_distributed_partial_index_for_fragment_groups(
+            &mut ds_split,
+            fragment_groups,
+            &distributed_params,
+            INDEX_NAME,
+        )
+        .await;
+
+        let index_dir = ds_split.indices_dir().child(shared_uuid.to_string());
+        let shard_plan = plan_staging_segments(
+            ds_split.object_store(),
+            &index_dir,
+            &partial_shards,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let shard_count = shard_plan.len();
+        assert!(shard_count >= 4);
+        let target_segment_bytes = shard_plan[0].estimated_bytes().saturating_mul(2);
+
+        let grouped_plan = plan_staging_segments(
+            ds_split.object_store(),
+            &index_dir,
+            &partial_shards,
+            None,
+            Some(target_segment_bytes),
+        )
+        .await
+        .unwrap();
+        assert!(grouped_plan.len() < shard_count);
+        assert!(
+            grouped_plan
+                .iter()
+                .any(|plan| plan.partial_shards().len() > 1)
+        );
+
+        let grouped_segments = materialize_distributed_plan(
+            &mut ds_split,
+            shared_uuid,
+            &partial_shards,
+            Some(target_segment_bytes),
+            INDEX_NAME,
+        )
+        .await;
+        assert_eq!(grouped_segments.len(), grouped_plan.len());
+
+        async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
+            let mut ids_per_query = Vec::with_capacity(queries.len());
+            for q in queries {
+                let result = ds
+                    .scan()
+                    .with_row_id()
+                    .project(&["_rowid"] as &[&str])
+                    .unwrap()
+                    .nearest("vector", q.as_ref(), K)
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+
+                ids_per_query.push(
+                    result[ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect(),
+                );
+            }
+            ids_per_query
+        }
+
+        let query_batch = ds_single
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(NUM_QUERIES as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = query_batch["vector"].as_fixed_size_list();
+        let queries: Vec<Arc<dyn Array>> = (0..vectors.len())
+            .map(|i| vectors.value(i) as Arc<dyn Array>)
+            .collect();
+
+        let ids_single = collect_row_ids(&ds_single, &queries).await;
+        let ids_split = collect_row_ids(&ds_split, &queries).await;
+        assert_eq!(ids_single, ids_split);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_vector_plan_rejects_mismatched_index_subtypes() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/mismatch_subtype", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema.clone(), batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let shard0 = vec![fragments[0].id() as u32];
+        let shard1 = vec![fragments[1].id() as u32];
+        let shared_uuid = Uuid::new_v4();
+
+        let ivf_params = prepare_global_ivf(&dataset, "vector").await;
+        let (ivf_params_pq, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+        let flat_params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
+        let pq_params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params_pq, pq_params);
+
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &flat_params)
+            .name("vector_idx".to_string())
+            .fragments(shard0.clone())
+            .index_uuid(shared_uuid.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &pq_params)
+            .name("vector_idx".to_string())
+            .fragments(shard1.clone())
+            .index_uuid(shared_uuid.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let partial_shards =
+            build_partial_shards(&dataset, shared_uuid, &[shard0.clone(), shard1.clone()]).await;
+
+        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
+        let err = plan_staging_segments(
+            dataset.object_store(),
+            &index_dir,
+            &partial_shards,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mismatched index subtype metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_distributed_vector_plan_rejects_overlapping_fragment_coverage() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/overlap_fragments", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragment = dataset.get_fragments()[0].id() as u32;
+        let shared_uuid = Uuid::new_v4();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_global_ivf(&dataset, "vector").await,
+        );
+
+        for _ in 0..2 {
+            dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment])
+                .index_uuid(shared_uuid.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        }
+
+        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
+        let partial_shards =
+            build_partial_shards(&dataset, shared_uuid, &[vec![fragment], vec![fragment]]).await;
+        let err = plan_staging_segments(
+            dataset.object_store(),
+            &index_dir,
+            &partial_shards,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("overlapping fragment coverage"));
+    }
+
+    #[tokio::test]
+    async fn test_distributed_vector_plan_rejects_mismatched_ivf_centroids() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/mismatch_centroids", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let shard0 = vec![fragments[0].id() as u32];
+        let shard1 = vec![fragments[1].id() as u32];
+        let shared_uuid = Uuid::new_v4();
+
+        let ivf_params = prepare_global_ivf(&dataset, "vector").await;
+        let mut mismatched_ivf_params = prepare_global_ivf(&dataset, "vector").await;
+        let centroids = mismatched_ivf_params.centroids.as_ref().unwrap();
+        let mut values = centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        if !values.is_empty() {
+            values[0] += 1.0;
+        }
+        let bumped_centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(values),
+            centroids.value_length(),
+        )
+        .unwrap();
+        mismatched_ivf_params.centroids = Some(Arc::new(bumped_centroids));
+
+        let flat_params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
+        let mismatched_params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, mismatched_ivf_params);
+
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &flat_params)
+            .name("vector_idx".to_string())
+            .fragments(shard0.clone())
+            .index_uuid(shared_uuid.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &mismatched_params)
+            .name("vector_idx".to_string())
+            .fragments(shard1.clone())
+            .index_uuid(shared_uuid.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
+        let partial_shards =
+            build_partial_shards(&dataset, shared_uuid, &[shard0.clone(), shard1.clone()]).await;
+        let err = plan_staging_segments(
+            dataset.object_store(),
+            &index_dir,
+            &partial_shards,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mismatched IVF centroids"));
+    }
+
+    #[tokio::test]
+    async fn test_distributed_vector_build_supports_hnsw_variants() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/distributed_hnsw_supported", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let shared_uuid = Uuid::new_v4();
+        let params = VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            prepare_global_ivf(&dataset, "vector").await,
+            HnswBuildParams::default(),
+        );
+
+        for fragment in fragments.iter().take(2) {
+            dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .index_uuid(shared_uuid.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        }
+
+        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
+        let fragment_groups = fragments
+            .iter()
+            .take(2)
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let partial_shards = build_partial_shards(&dataset, shared_uuid, &fragment_groups).await;
+        let plans = plan_staging_segments(
+            dataset.object_store(),
+            &index_dir,
+            &partial_shards,
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plans.len(), fragments.iter().take(2).count());
+
+        let mut segments = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            segments.push(
+                merge_staging_segment(dataset.object_store(), &dataset.indices_dir(), plan)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(segments.len(), plans.len());
+
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        let query_batch = dataset
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(4), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = query_batch["vector"].as_fixed_size_list().value(0);
+        let result = dataset
+            .scan()
+            .project(&["_rowid"] as &[&str])
+            .unwrap()
+            .nearest("vector", q.as_ref(), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(result.num_rows() > 0);
+    }
     async fn test_index(
         params: VectorIndexParams,
         nlist: usize,
