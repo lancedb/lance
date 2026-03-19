@@ -81,3 +81,11 @@ class CompactionOptions(TypedDict):
     """
     Whether to defer index remapping during compaction (default: False).
     """
+    max_source_fragments: Optional[int]
+    """
+    Maximum number of source fragments to compact in a single run. Tasks
+    are included until adding the next task would exceed this limit,
+    allowing for incremental compaction (e.g., compact 20 fragments at a
+    time). Fragments are processed oldest first.
+    (default: None, no limit)
+    """

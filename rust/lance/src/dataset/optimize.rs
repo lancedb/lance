@@ -201,6 +201,12 @@ pub struct CompactionOptions {
     /// Controls how much data is read at once when performing binary copy.
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
+    /// Maximum number of source fragments to compact in a single run. When set,
+    /// tasks are included in the plan until adding the next task would exceed
+    /// this limit. This allows for incremental compaction (e.g., compact 20
+    /// fragments at a time).
+    /// Defaults to `None` (no limit, all eligible fragments are compacted).
+    pub max_source_fragments: Option<usize>,
 }
 
 #[allow(deprecated)]
@@ -220,6 +226,7 @@ impl Default for CompactionOptions {
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
+            max_source_fragments: None,
         }
     }
 }
@@ -242,6 +249,7 @@ impl CompactionOptions {
     /// - `lance.compaction.batch_size`
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
+    /// - `lance.compaction.max_source_fragments`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -327,6 +335,14 @@ impl CompactionOptions {
                 }
                 "binary_copy_read_batch_bytes" => {
                     self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_source_fragments" => {
+                    self.max_source_fragments = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
                             key, value
@@ -666,17 +682,31 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let final_bins = candidate_bins
+        let all_tasks: Vec<TaskData> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
-            });
+            })
+            .collect();
+
+        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
+            let mut total_frags = 0;
+            all_tasks
+                .into_iter()
+                .take_while(|task| {
+                    total_frags += task.fragments.len();
+                    total_frags <= max_frags
+                })
+                .collect()
+        } else {
+            all_tasks
+        };
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
-        compaction_plan.extend_tasks(final_bins);
+        compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
     }
@@ -4368,6 +4398,112 @@ mod tests {
 
         // Config value should overwrite the pre-set value
         assert_eq!(opts.max_rows_per_group, 2048);
+    }
+
+    #[tokio::test]
+    async fn test_max_source_fragments() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let schema = data.schema();
+
+        // Create 10 small fragments (100 rows each) via 10 appends
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        for i in 1..10 {
+            let mut append_params = write_params.clone();
+            append_params.mode = WriteMode::Append;
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
+                test_uri,
+                Some(append_params),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+
+        // Plan without limit - all 10 fragments should be candidates.
+        // Use a target that splits the 10 fragments into multiple tasks.
+        let opts_no_limit = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan_all = plan_compaction(&dataset, &opts_no_limit).await.unwrap();
+        let total_source_frags: usize = plan_all.tasks().iter().map(|t| t.fragments.len()).sum();
+        assert_eq!(total_source_frags, 10);
+        assert!(
+            plan_all.num_tasks() > 2,
+            "need multiple tasks to test bounding, got {}",
+            plan_all.num_tasks()
+        );
+
+        // Plan with max_source_fragments=4 should include tasks covering <= 4
+        // source fragments
+        let opts_bounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(4),
+            ..Default::default()
+        };
+        let plan_bounded = plan_compaction(&dataset, &opts_bounded).await.unwrap();
+        let bounded_source_frags: usize =
+            plan_bounded.tasks().iter().map(|t| t.fragments.len()).sum();
+        assert!(
+            bounded_source_frags <= 4,
+            "expected at most 4 source fragments, got {bounded_source_frags}"
+        );
+        assert!(
+            bounded_source_frags > 0,
+            "expected at least 1 source fragment in bounded plan"
+        );
+        assert!(
+            plan_bounded.num_tasks() < plan_all.num_tasks(),
+            "bounded plan ({}) should have fewer tasks than unbounded ({})",
+            plan_bounded.num_tasks(),
+            plan_all.num_tasks()
+        );
+
+        // Execute bounded compaction incrementally
+        let mut dataset = dataset;
+        compact_files(&mut dataset, opts_bounded, None)
+            .await
+            .unwrap();
+        let after_first = dataset.get_fragments().len();
+        assert!(
+            after_first < 10,
+            "expected fewer than 10 fragments after first compaction, got {after_first}"
+        );
+        assert!(
+            after_first > 1,
+            "expected partial compaction (not fully compacted), got {after_first}"
+        );
+
+        // Run again to make more progress
+        let opts_bounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(4),
+            ..Default::default()
+        };
+        compact_files(&mut dataset, opts_bounded, None)
+            .await
+            .unwrap();
+        let after_second = dataset.get_fragments().len();
+        assert!(
+            after_second <= after_first,
+            "expected progress: {after_second} should be <= {after_first}"
+        );
     }
 
     #[tokio::test]

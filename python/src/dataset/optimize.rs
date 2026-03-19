@@ -70,6 +70,9 @@ fn parse_compaction_options(
             "binary_copy_read_batch_bytes" => {
                 opts.binary_copy_read_batch_bytes = value.extract()?;
             }
+            "max_source_fragments" => {
+                opts.max_source_fragments = value.extract()?;
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
