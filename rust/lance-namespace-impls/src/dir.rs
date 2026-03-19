@@ -6710,11 +6710,6 @@ mod tests {
             );
         }
 
-        // ============================================================
-        // Tests for count_table_rows, insert_into_table, query_table
-        // (discovered during DirectoryNamespace on COS testing)
-        // ============================================================
-
         /// Helper: create a namespace and a table with some rows, returning (namespace, table_id)
         async fn create_ns_with_table() -> (DirectoryNamespace, TempStdDir, Vec<String>) {
             use arrow::array::{Int32Array, StringArray};
