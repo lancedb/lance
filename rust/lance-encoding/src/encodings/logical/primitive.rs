@@ -5186,66 +5186,57 @@ impl PrimitiveStructuralEncoder {
             // lists with very few values), fall back to fullzip to avoid exceeding
             // the u16 per-chunk rep/def buffer size limit.
             let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
-            if too_sparse {
+
+            if !too_sparse {
+                if let DataBlock::Dictionary(dict) = data_block {
+                    log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
+                    let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+                    // TODO: https://github.com/lancedb/lance/issues/4809
+                    // If we compute stats on dictionary_data_block => panic.
+                    // If we don't compute stats on indices_data_block => panic.
+                    // This is messy.  Don't make me call compute_stat ever.
+                    indices_data_block.compute_stat();
+                    return Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        indices_data_block,
+                        repdef,
+                        row_number,
+                        Some(dictionary_data_block),
+                        num_rows,
+                        support_large_chunk,
+                    );
+                }
+            } else {
                 log::debug!(
                     "Encoding column {} with {} items using full-zip layout \
                      (rep/def too sparse for mini-block)",
                     column_idx,
                     num_values
                 );
-                let data_block = match data_block {
-                    DataBlock::Dictionary(dict) => {
-                        let (indices, _) = dict.into_parts();
-                        indices
-                    }
-                    other => other,
-                };
-                return Self::encode_full_zip(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdef,
-                    row_number,
-                    num_rows,
-                );
             }
 
-            if let DataBlock::Dictionary(dict) = data_block {
-                log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
-                let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
-                // TODO: https://github.com/lancedb/lance/issues/4809
-                // If we compute stats on dictionary_data_block => panic.
-                // If we don't compute stats on indices_data_block => panic.
-                // This is messy.  Don't make me call compute_stat ever.
-                indices_data_block.compute_stat();
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    indices_data_block,
-                    repdef,
-                    row_number,
-                    Some(dictionary_data_block),
-                    num_rows,
-                    support_large_chunk,
-                )
-            } else {
+            {
                 // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
                 // preferred structural encoding.
-                let dict_result = Self::should_dictionary_encode(&data_block, &field, version)
-                    .and_then(|budget| {
-                        log::debug!(
-                            "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                            column_idx,
-                            num_values
-                        );
-                        dict::dictionary_encode(
-                            &data_block,
-                            budget.max_dict_entries,
-                            budget.max_encoded_size,
-                        )
-                    });
+                let dict_result = if too_sparse {
+                    None
+                } else {
+                    Self::should_dictionary_encode(&data_block, &field, version)
+                        .and_then(|budget| {
+                            log::debug!(
+                                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                                column_idx,
+                                num_values
+                            );
+                            dict::dictionary_encode(
+                                &data_block,
+                                budget.max_dict_entries,
+                                budget.max_encoded_size,
+                            )
+                        })
+                };
 
                 if let Some((indices_data_block, dictionary_data_block)) = dict_result {
                     Self::encode_miniblock(
@@ -5259,7 +5250,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows,
                         support_large_chunk,
                     )
-                } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+                } else if !too_sparse && Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
                     log::debug!(
                         "Encoding column {} with {} items using mini-block layout",
                         column_idx,
@@ -5276,7 +5267,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows,
                         support_large_chunk,
                     )
-                } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,
