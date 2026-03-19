@@ -406,6 +406,8 @@ impl ANNIvfPartitionExec {
         })
     }
 
+    /// Determine whether one partition ranking can be safely reused across all
+    /// active delta indices for the query.
     fn can_share_partition_search<'a>(
         mut indices: impl Iterator<Item = &'a Arc<dyn VectorIndex>>,
     ) -> bool {
@@ -423,6 +425,9 @@ impl ANNIvfPartitionExec {
         })
     }
 
+    /// Materialize the shared partition id / centroid distance lists once so
+    /// they can be attached to multiple delta UUID batches without rebuilding
+    /// the Arrow list arrays each time.
     fn build_partition_columns(
         partitions: &UInt32Array,
         dist_q_c: &Float32Array,
@@ -443,6 +448,8 @@ impl ANNIvfPartitionExec {
         Ok((partition_col, dist_q_c_col))
     }
 
+    /// Attach a delta UUID to a partition-search result payload to match the
+    /// downstream `ANNIvfSubIndexExec` input contract.
     fn build_partition_batch(
         partition_col: ArrayRef,
         dist_q_c_col: ArrayRef,
