@@ -81,6 +81,11 @@ fn inner_plan_compaction<'local>(
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
+    let config = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.manifest.config.clone()
+    };
     let compaction_options = build_compaction_options(
         env,
         &target_rows_per_fragment,
@@ -93,6 +98,7 @@ fn inner_plan_compaction<'local>(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &config,
     )?;
 
     let plan = {
@@ -157,6 +163,11 @@ fn inner_commit_compaction<'local>(
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
+    let config = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.manifest.config.clone()
+    };
     let compaction_options = build_compaction_options(
         env,
         &target_rows_per_fragment,
@@ -169,6 +180,7 @@ fn inner_commit_compaction<'local>(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
         rewrite_result.extract_object(env)
@@ -245,6 +257,11 @@ fn inner_execute_task<'local>(
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
+    let config = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.manifest.config.clone()
+    };
     let compaction_options = build_compaction_options(
         env,
         &target_rows_per_fragment,
@@ -257,6 +274,7 @@ fn inner_execute_task<'local>(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &config,
     )?;
     let compaction_task = CompactionTask {
         task: task_data,

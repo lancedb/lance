@@ -13,7 +13,7 @@ use lance_core::Error;
 use lance_core::utils::address::RowAddress;
 use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,8 @@ pub struct RemappedIndex {
     pub new_id: Uuid,
     pub index_details: prost_types::Any,
     pub index_version: u32,
+    /// List of files in the index with their sizes.
+    pub files: Option<Vec<IndexFile>>,
 }
 
 /// When compaction runs the row ids will change.  This typically means that
@@ -283,6 +285,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     index_version: curr_index_meta.index_version,
                     created_at: curr_index_meta.created_at,
                     base_id: None,
+                    files: curr_index_meta.files.clone(),
                 },
                 RemapResult::Remapped(remapped_index) => IndexMetadata {
                     uuid: remapped_index.new_id,
@@ -294,6 +297,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     index_version: remapped_index.index_version as i32,
                     created_at: curr_index_meta.created_at,
                     base_id: None,
+                    files: remapped_index.files,
                 },
             };
 

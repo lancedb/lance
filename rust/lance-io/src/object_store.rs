@@ -1065,6 +1065,13 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
+
+        let (store, path) =
+            ObjectStore::from_uri("abfss://filesystem@account.dfs.core.windows.net/foo.lance")
+                .await
+                .unwrap();
+        assert_eq!(store.scheme, "abfss");
+        assert_eq!(path.to_string(), "foo.lance");
     }
 
     async fn test_block_size_used_test_helper(
@@ -1106,6 +1113,11 @@ mod tests {
       Some(HashMap::from([
             (String::from("account_name"), String::from("account")),
             (String::from("container_name"), String::from("container"))
+           ])))]
+    #[case("abfss://filesystem@account.dfs.core.windows.net/foo.lance",
+      Some(HashMap::from([
+            (String::from("account_name"), String::from("account")),
+            (String::from("container_name"), String::from("filesystem"))
            ])))]
     #[tokio::test]
     async fn test_block_size_used_cloud(

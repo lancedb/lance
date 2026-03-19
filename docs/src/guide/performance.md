@@ -64,7 +64,7 @@ debugging query performance.
 Lance is designed to be thread-safe and performant. Lance APIs can be called concurrently unless
 explicitly stated otherwise. Users may create multiple tables and share tables between threads.
 Operations may run in parallel on the same table, but some operations may lead to conflicts. For
-details see [conflict resolution](../format/table/transaction.md#conflict-resolution).
+details see [conflict resolution](../format/table/transaction/#conflict-resolution).
 
 Most Lance operations will use multiple threads to perform work in parallel. There are two thread
 pools in lance: the IO thread pool and the compute thread pool. The IO thread pool is used for
@@ -239,3 +239,95 @@ currently extremely slow and the btree index is much faster for large range quer
 When a bitmap index is not fully loaded into the index cache, the search time will be controlled by the number of bitmaps that
 need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
 bitmaps were loaded from disk to satisfy a query.
+
+### Vector Index
+
+Vector indexes (IVF_PQ, IVF_HNSW_SQ, etc.) are built in multiple phases, each with different memory requirements.
+
+#### IVF Training
+
+The IVF (Inverted File) phase clusters vectors into partitions using KMeans. To train the KMeans model, a sample of the
+dataset is loaded into memory. The size of this sample is determined by:
+
+```
+training_data = num_partitions * sample_rate * dimension * sizeof(data_type)
+```
+
+The default `sample_rate` is 256. For example, with 1024 partitions, 768-dimensional float32 vectors, and the default
+sample rate:
+
+```
+1024 * 256 * 768 * 4 bytes = 768 MiB
+```
+
+In addition to the training data, each KMeans iteration allocates membership and distance vectors proportional to the
+number of training vectors (8 bytes per vector). The centroids themselves require `num_partitions * dimension *
+sizeof(data_type)` bytes. In practice, the training data dominates and these additional allocations are small in
+comparison.
+
+If the dataset has fewer rows than `num_partitions * sample_rate`, the entire dataset is used for training instead.
+
+#### Quantizer Training
+
+After IVF training, a quantizer (e.g. PQ, SQ) is trained to compress vectors. This phase may sample some of the
+dataset, but the sample size is tied to properties of the quantizer and the vector dimension rather than the size of the
+dataset. As a result, quantizer training typically requires very little RAM compared to the IVF phase.
+
+#### Shuffling
+
+The final phase scans the entire vector column, transforms each vector (assigning it to an IVF partition and quantizing
+it), and writes the results into per-partition files on disk. This is a streaming operation — data is not accumulated in
+memory.
+
+The input scan uses a 2 GiB I/O readahead buffer by default (configurable via `LANCE_DEFAULT_IO_BUFFER_SIZE`) and reads
+batches of 8,192 rows. Incoming batches are transformed in parallel, with `num_cpus - 2` batches in flight at a time
+(configurable via `LANCE_CPU_THREADS`). Each batch is sorted by partition ID and the slices are written directly to the
+corresponding partition file. The in-flight memory during this phase is roughly:
+
+```
+io_readahead_buffer + num_cpu_threads * batch_size * (raw_vector_size + transformed_vector_size)
+```
+
+Each partition has an open file writer with roughly 8 MiB of accumulation buffer. In practice there shouldn't be that
+much data accumulated in a single partition anyways. Instead, the max accumulation will be roughly the final size of
+the partitions which comes out to `num_rows * (num_sub_vectors + 8) bytes`. For example, 100M rows with a 1536-dimensional
+vector will have 96 sub-vectors and so the max accumulation will be ~10GB. The additional 8 bytes per row is for the row ID.
+
+#### Storage Requirements
+
+The on-disk size of a vector index consists of the IVF centroids and the quantized vectors.
+
+The centroids require:
+
+```
+num_partitions * dimension * sizeof(data_type)
+```
+
+This is typically small. For example, 10K partitions with 768-dimensional float32 vectors is only 30 MiB.
+
+The quantized vectors make up the bulk of the index. Each row stores a quantized code plus an 8-byte row ID. The
+exact size depends on the quantizer:
+
+**PQ (Product Quantization):** Each sub-vector is quantized to a single byte, so each row requires
+`num_sub_vectors + 8` bytes. For example, 100M rows with 96 sub-vectors:
+
+```
+100M * (96 + 8) = ~9.7 GiB
+```
+
+**SQ (Scalar Quantization):** Each dimension is independently quantized to a single byte, so each row requires
+`dimension + 8` bytes. SQ preserves more information than PQ but requires more storage. For example, 100M rows with
+768-dimensional vectors:
+
+```
+100M * (768 + 8) = ~72.3 GiB
+```
+
+**RQ (RaBitQ):** Vectors are quantized to binary codes with a configurable number of bits per
+dimension. Each row also stores per-row scale and offset factors (4 bytes each) used for distance correction. Each
+row requires `dimension * num_bits / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For
+example, 100M rows with 768 dimensions and 1 bit per dimension:
+
+```
+100M * (768 * 1 / 8 + 16) = ~10.8 GiB
+```

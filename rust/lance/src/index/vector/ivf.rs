@@ -8,6 +8,7 @@ use super::{
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
+use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
@@ -59,7 +60,7 @@ use lance_index::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::v3::shuffler::IvfShuffler;
+use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
@@ -381,9 +382,11 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
+    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let merged_num = match index_type {
@@ -1895,6 +1898,8 @@ pub async fn finalize_distributed_merge(
     .await?;
 
     let meta = aux_reader.metadata();
+    // Inherit file format version from the unified auxiliary (which inherited it from shards)
+    let format_version = meta.version();
     let ivf_buf_idx: u32 = meta
         .file_schema
         .metadata
@@ -1987,7 +1992,14 @@ pub async fn finalize_distributed_merge(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = V2Writer::try_new(obj_writer, schema, V2WriterOptions::default())?;
+    let mut v2_writer = V2Writer::try_new(
+        obj_writer,
+        schema,
+        V2WriterOptions {
+            format_version: Some(format_version),
+            ..Default::default()
+        },
+    )?;
 
     // Attach precise index metadata (type + distance).
     v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);
@@ -2262,6 +2274,7 @@ mod tests {
     use crate::index::vector::IndexFileVersion;
     use crate::index::vector_index_details;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+    use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
 
@@ -2643,17 +2656,12 @@ mod tests {
             dataset_version: dataset.version().version,
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(
-                dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -2692,6 +2700,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            files: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2746,17 +2755,12 @@ mod tests {
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(
-                dataset_mut
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this new index to the dataset so it can be found
@@ -3845,6 +3849,80 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_legacy_multiple_deltas() {
+        use lance_io::assert_io_eq;
+
+        let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
+
+        // Trigger migration to repair legacy corrupt fragment bitmaps.
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.index_statistics("vector_idx").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Reopen dataset to avoid carrying index state in-memory from migration.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2, "expected two index deltas for vector_idx");
+        let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
+        assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
+
+        let sample_batch = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .project(&["vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = sample_batch["vector"]
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap()
+            .value(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .clone();
+
+        // Reset IO stats after migration and sampling.
+        dataset.object_store().io_stats_incremental();
+
+        // Prewarm should perform IO to load all index deltas into cache.
+        dataset.prewarm_index("vector_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert!(
+            stats.read_iops > 0,
+            "prewarm should have read from disk, but read_iops was 0"
+        );
+
+        // Query should not perform index IO after prewarm of all deltas.
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "query should not perform IO after prewarm"
+        );
+
+        // Second prewarm should not need IO (already cached).
+        dataset.prewarm_index("vector_idx").await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }

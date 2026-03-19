@@ -28,7 +28,8 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_file::writer::FileWriter;
+use lance_encoding::version::LanceFileVersion;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -77,6 +78,7 @@ use tracing::{Level, instrument, span};
 
 use crate::Dataset;
 use crate::dataset::ProjectionRequest;
+use crate::dataset::index::dataset_format_version;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::{infer_vector_dim, infer_vector_element_type};
 
@@ -149,6 +151,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // whether to transpose codes when building storage
     transpose_codes: bool,
 
+    // lance file version for writing index files
+    format_version: LanceFileVersion,
+
     progress: Arc<dyn IndexBuildProgress>,
 }
 
@@ -170,6 +175,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     ) -> Result<Self> {
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+        let format_version = dataset_format_version(&dataset);
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -192,6 +198,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -235,6 +242,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+        let format_version = dataset_format_version(&dataset);
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -256,6 +264,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -1046,15 +1055,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
         fields.extend(quantizer.extra_fields());
         let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
+        let writer_options = FileWriterOptions {
+            format_version: Some(self.format_version),
+            ..Default::default()
+        };
         let mut storage_writer = FileWriter::try_new(
             self.store.create(&storage_path).await?,
             storage_schema.clone(),
-            Default::default(),
+            writer_options.clone(),
         )?;
         let mut index_writer = FileWriter::try_new(
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
-            Default::default(),
+            writer_options,
         )?;
 
         // maintain the IVF partitions

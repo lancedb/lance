@@ -11,6 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
     writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
@@ -21,6 +22,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
+use lance_table::format::{IndexFile, list_index_files_with_sizes};
 use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -37,6 +39,10 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
+    /// Cached file sizes (filename -> size in bytes)
+    /// When set, used to avoid HEAD calls when opening files
+    file_sizes: HashMap<String, u64>,
+    format_version: LanceFileVersion,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -54,6 +60,21 @@ impl LanceIndexStore {
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
     ) -> Self {
+        Self::with_format_version(
+            object_store,
+            index_dir,
+            metadata_cache,
+            LanceFileVersion::V2_0,
+        )
+    }
+
+    /// Create a new index store at the given directory with a specific format version
+    pub fn with_format_version(
+        object_store: Arc<ObjectStore>,
+        index_dir: Path,
+        metadata_cache: Arc<LanceCache>,
+        format_version: LanceFileVersion,
+    ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -63,7 +84,18 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
+            file_sizes: HashMap::new(),
+            format_version,
         }
+    }
+
+    /// Set cached file sizes to avoid HEAD calls when opening files.
+    ///
+    /// The map should contain relative paths (e.g., "index.idx") as keys
+    /// and file sizes in bytes as values.
+    pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
+        self.file_sizes = file_sizes;
+        self
     }
 }
 
@@ -220,17 +252,23 @@ impl IndexStore for LanceIndexStore {
         let writer = current_writer::FileWriter::try_new(
             writer,
             schema,
-            current_writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions {
+                format_version: Some(self.format_version),
+                ..Default::default()
+            },
         )?;
         Ok(Box::new(writer))
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_scheduler = self
-            .scheduler
-            .open_file(&path, &CachedFileSize::unknown())
-            .await?;
+        // Use cached file size if available, otherwise unknown (requires HEAD call)
+        let cached_size = self
+            .file_sizes
+            .get(name)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
+        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
         match current_reader::FileReader::try_open(
             file_scheduler,
             None,
@@ -299,6 +337,10 @@ impl IndexStore for LanceIndexStore {
     async fn delete_index_file(&self, name: &str) -> Result<()> {
         let path = self.index_dir.child(name);
         self.object_store.delete(&path).await
+    }
+
+    async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+        list_index_files_with_sizes(&self.object_store, &self.index_dir).await
     }
 }
 

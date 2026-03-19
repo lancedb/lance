@@ -280,6 +280,20 @@ message IndexMetadata {
   // The base path index of the data file. Used when the file is imported or referred from another dataset.
   // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
   optional uint32 base_id = 9;
+
+  // List of files and their sizes for this index segment.
+  // This enables skipping HEAD calls when opening indices and allows reporting
+  // of index sizes without extra IO.
+  // If this is empty, the index files sizes are unknown.
+  repeated IndexFile files = 10;
+}
+
+// Metadata about a single file within an index segment.
+message IndexFile {
+  // Path relative to the index directory (e.g., "index.idx", "auxiliary.idx")
+  string path = 1;
+  // Size of the file in bytes
+  uint64 size_bytes = 2;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

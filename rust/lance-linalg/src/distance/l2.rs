@@ -174,6 +174,108 @@ impl L2 for f64 {
     }
 }
 
+/// Accumulate squared differences for one dimension into per-target results.
+///
+/// Separated into its own function so that LLVM sees `row` and `result`
+/// as non-aliasing via the function signature (`&[f32]` vs `&mut [f32]`),
+/// enabling packed SIMD vectorization (vbroadcastss + vsubps + vfmadd231ps).
+#[inline(never)]
+fn accumulate_l2_dimension(q: f32, row: &[f32], result: &mut [f32]) {
+    for (dist, &target) in result.iter_mut().zip(row.iter()) {
+        let diff = q - target;
+        *dist += diff * diff;
+    }
+}
+
+/// Pre-transposed target vectors for batched L2 distance computation.
+///
+/// Stores targets in SoA layout `[dimension][num_targets]` so the inner
+/// distance loop iterates over targets contiguously. The AoS-to-SoA
+/// transpose is done once at construction; callers should reuse the
+/// struct across many queries to amortize that cost.
+///
+/// **Cache constraint**: this is designed for cases where
+/// `num_targets × dimension × 4` fits in L1 cache (~32 KB), such as PQ
+/// sub-vector codebooks (e.g. 256 centroids × 16 dims = 16 KB).
+/// For large target sets the SoA layout causes L1 thrashing and
+/// [`l2_distance_batch`] with its AoS per-target locality is faster.
+#[derive(Debug, Clone)]
+pub struct L2Prepared {
+    transposed: Vec<f32>,
+    dimension: usize,
+    num_targets: usize,
+}
+
+impl L2Prepared {
+    /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    pub fn new(targets: &[f32], dimension: usize) -> Self {
+        let num_targets = targets.len() / dimension;
+        debug_assert_eq!(targets.len(), num_targets * dimension);
+
+        let mut transposed = vec![0.0f32; targets.len()];
+        for t in 0..num_targets {
+            for d in 0..dimension {
+                transposed[d * num_targets + t] = targets[t * dimension + d];
+            }
+        }
+
+        Self {
+            transposed,
+            dimension,
+            num_targets,
+        }
+    }
+
+    /// Compute L2 distances from `query` to every target, writing into `out`.
+    ///
+    /// `out` must have length `num_targets`. It will be zeroed before accumulation.
+    pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(query.len(), self.dimension);
+        debug_assert_eq!(out.len(), self.num_targets);
+
+        out.fill(0.0);
+        for (d, &q) in query.iter().enumerate() {
+            let row = &self.transposed[d * self.num_targets..][..self.num_targets];
+            accumulate_l2_dimension(q, row, out);
+        }
+    }
+
+    /// Compute L2 distances from `query` to every target.
+    pub fn distances(&self, query: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0f32; self.num_targets];
+        self.distances_into(query, &mut result);
+        result
+    }
+
+    /// Return the index of the nearest target to `query`, using `buf` as scratch space.
+    ///
+    /// `buf` must have length `num_targets`.
+    pub fn nearest_into(&self, query: &[f32], buf: &mut [f32]) -> Option<u32> {
+        self.distances_into(query, buf);
+        crate::kernels::argmin_value_float(buf.iter().copied()).map(|(idx, _)| idx)
+    }
+
+    /// Return the index of the nearest target to `query`.
+    pub fn nearest(&self, query: &[f32]) -> Option<u32> {
+        self.nearest_into(query, &mut vec![0.0f32; self.num_targets])
+    }
+
+    /// Number of targets in this set.
+    pub fn num_targets(&self) -> usize {
+        self.num_targets
+    }
+
+    /// Dimension of each target vector.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Size of the internal buffer in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.transposed.len() * std::mem::size_of::<f32>()
+    }
+}
+
 /// Compute L2 distance between two vectors.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
@@ -444,5 +546,102 @@ mod tests {
             l2_distance_uint_scalar(&v, &q),
             (255_u32.pow(2) * 2048) as f32
         );
+    }
+
+    #[test]
+    fn test_l2_targets_matches_scalar() {
+        let cases = vec![
+            (16, 8),   // small target count
+            (16, 16),  // exact SIMD width
+            (16, 256), // PQ-like: 256 centroids, 16-dim sub-vectors
+            (16, 17),  // one remainder
+            (16, 31),  // 15 remainder
+            (1, 32),   // dim=1
+            (3, 20),   // odd dimension
+            (128, 64), // larger dimension
+        ];
+
+        for (dim, num_targets) in cases {
+            let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1 + 0.05).collect();
+            let targets: Vec<f32> = (0..dim * num_targets)
+                .map(|i| ((i * 7 + 3) % 100) as f32 * 0.01)
+                .collect();
+
+            let expected: Vec<f32> = targets
+                .chunks_exact(dim)
+                .map(|v| l2_scalar::<f32, f32, 16>(&query, v))
+                .collect();
+
+            let prepared = L2Prepared::new(&targets, dim);
+            let actual = prepared.distances(&query);
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "length mismatch for dim={dim}, num_targets={num_targets}"
+            );
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    approx::relative_eq!(a, e, max_relative = 1e-6),
+                    "mismatch at index {i} for dim={dim}, num_targets={num_targets}: \
+                     prepared={a}, scalar={e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_l2_targets_zeros() {
+        let dim = 16;
+        let num_targets = 32;
+        let query = vec![0.0f32; dim];
+        let targets = vec![0.0f32; dim * num_targets];
+
+        let prepared = L2Prepared::new(&targets, dim);
+        let distances = prepared.distances(&query);
+        assert_eq!(distances.len(), num_targets);
+        for d in &distances {
+            assert_eq!(*d, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_l2_targets_known_values() {
+        let dim = 2;
+        let query = vec![1.0f32, 0.0];
+
+        // 16 targets: [1,0], [0,1], [2,0], [0,0], then 12x [0,0]
+        let mut targets = vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0];
+        for _ in 4..16 {
+            targets.extend_from_slice(&[0.0, 0.0]);
+        }
+
+        let prepared = L2Prepared::new(&targets, dim);
+        let distances = prepared.distances(&query);
+        assert_eq!(distances.len(), 16);
+        assert_relative_eq!(distances[0], 0.0);
+        assert_relative_eq!(distances[1], 2.0);
+        assert_relative_eq!(distances[2], 1.0);
+        assert_relative_eq!(distances[3], 1.0);
+        for d in &distances[4..] {
+            assert_relative_eq!(*d, 1.0);
+        }
+    }
+
+    #[test]
+    fn test_l2_targets_reuse() {
+        // Verify that the same L2Prepared can be queried multiple times
+        let dim = 4;
+        let targets = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let prepared = L2Prepared::new(&targets, dim);
+
+        let q1 = vec![1.0, 2.0, 3.0, 4.0];
+        let q2 = vec![5.0, 6.0, 7.0, 8.0];
+
+        let d1 = prepared.distances(&q1);
+        let d2 = prepared.distances(&q2);
+
+        assert_relative_eq!(d1[0], 0.0); // q1 == target[0]
+        assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
     }
 }

@@ -1713,7 +1713,7 @@ mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
-    use crate::scalar::{IndexReader, IndexWriter, ScalarIndex};
+    use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -1841,6 +1841,10 @@ mod tests {
             Err(Error::not_supported(
                 "CountingStore does not support deleting",
             ))
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+            Ok(vec![])
         }
     }
 

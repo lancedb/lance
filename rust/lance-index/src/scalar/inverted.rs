@@ -68,7 +68,8 @@ impl InvertedIndexPlugin {
         inverted_index.update(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: LANCE_FTS_FORMAT_VERSION.index_version(),
+            index_version: INVERTED_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 

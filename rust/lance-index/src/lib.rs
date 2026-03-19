@@ -29,9 +29,11 @@ pub mod progress;
 pub mod registry;
 pub mod scalar;
 pub mod traits;
+pub mod types;
 pub mod vector;
 
 pub use crate::traits::*;
+pub use crate::types::IndexSegment;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
 /// The name of the auxiliary index file.

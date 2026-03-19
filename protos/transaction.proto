@@ -110,6 +110,9 @@ message Transaction {
       google.protobuf.Any new_index_details = 3;
       // the version of the new index
       uint32 new_index_version = 4;
+      // Files in the new index with their sizes.
+      // Empty if file sizes are not available (e.g. older writers).
+      repeated IndexFile new_index_files = 5;
     }
 
     // A group of rewrite files that are all part of the same rewrite.

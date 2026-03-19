@@ -142,16 +142,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
+        file_sizes: HashMap<String, u64>,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
+        let cached_size = file_sizes
+            .get(INDEX_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
         let index_reader = FileReader::try_open(
-            scheduler
-                .open_file(&uri, &CachedFileSize::unknown())
-                .await?,
+            scheduler.open_file(&uri, &cached_size).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             file_metadata_cache,
@@ -185,13 +188,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
+        let aux_cached_size = file_sizes
+            .get(INDEX_AUXILIARY_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
         let storage_reader = FileReader::try_open(
             scheduler
                 .open_file(
                     &index_dir
                         .child(uuid.as_str())
                         .child(INDEX_AUXILIARY_FILE_NAME),
-                    &CachedFileSize::unknown(),
+                    &aux_cached_size,
                 )
                 .await?,
             None,
@@ -646,7 +653,7 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -1460,7 +1467,16 @@ mod tests {
             .unwrap();
 
         dataset
-            .commit_existing_index(index_name, "vector", shared_uuid)
+            .commit_existing_index_segments(
+                index_name,
+                "vector",
+                vec![IndexSegment::new(
+                    shared_uuid,
+                    dataset.fragment_bitmap.as_ref().clone(),
+                    Arc::new(crate::index::vector_index_details()),
+                    IndexType::IvfPq.version(),
+                )],
+            )
             .await
             .unwrap();
     }
@@ -2367,6 +2383,7 @@ mod tests {
             Some((dataset.clone(), vectors.clone())),
         )
         .await;
+        dataset.checkout_latest().await.unwrap();
         // retest with v3 params on the same dataset
         test_index(
             v3_params,
@@ -3507,6 +3524,121 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_pq_multiple_deltas() {
+        use lance_io::assert_io_eq;
+
+        const INDEX_NAME: &str = "my_idx";
+        const BASE_ROWS_PER_PARTITION: usize = 3_000;
+        const SMALL_APPEND_ROWS: usize = 64;
+        let offsets = [-50.0, 50.0];
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (batch, schema) = generate_clustered_batch(BASE_ROWS_PER_PARTITION, offsets);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let centroids = build_centroids_for_offsets(&offsets);
+        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let template_batch = dataset
+            .take_rows(&[0], dataset.schema().clone())
+            .await
+            .unwrap();
+        let template_values = template_batch["vector"]
+            .as_fixed_size_list()
+            .value(0)
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let mut append_params = WriteParams {
+            max_rows_per_file: 32,
+            max_rows_per_group: 32,
+            ..Default::default()
+        };
+        append_params.mode = WriteMode::Append;
+        append_constant_vector_with_params(
+            &mut dataset,
+            SMALL_APPEND_ROWS,
+            &template_values,
+            Some(append_params),
+        )
+        .await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        // Reopen dataset to avoid carrying index state in-memory from index creation.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(indices.len(), 2, "expected two index deltas for my_idx");
+        let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
+        assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
+
+        // Reset IO stats after index creation
+        dataset.object_store().io_stats_incremental();
+
+        // Prewarm should perform IO to load all index deltas into cache
+        dataset.prewarm_index(INDEX_NAME).await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert!(
+            stats.read_iops > 0,
+            "prewarm should have read from disk, but read_iops was 0"
+        );
+
+        // Query should not perform IO after prewarm of all deltas
+        let q = Float32Array::from(template_values.clone());
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "query should not perform IO after prewarm"
+        );
+
+        // Second prewarm should not need IO (already cached)
+        dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }

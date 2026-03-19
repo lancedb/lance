@@ -31,6 +31,7 @@ use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::version::LanceFileVersion;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
@@ -388,6 +389,8 @@ pub struct IvfShuffler {
     is_legacy: bool,
 
     shuffle_output_root_filename: String,
+
+    format_version: LanceFileVersion,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -423,7 +426,13 @@ impl IvfShuffler {
             unsorted_buffers: vec![],
             is_legacy,
             shuffle_output_root_filename,
+            format_version: LanceFileVersion::V2_0,
         })
+    }
+
+    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+        self.format_version = format_version;
+        self
     }
 
     /// Set the unsorted buffers to be shuffled.
@@ -778,7 +787,10 @@ impl IvfShuffler {
                     let mut file_writer = lance_file::writer::FileWriter::try_new(
                         writer,
                         lance_schema,
-                        FileWriterOptions::default(),
+                        FileWriterOptions {
+                            format_version: Some(this.format_version),
+                            ..Default::default()
+                        },
                     )?;
 
                     for partition_and_idx in shuffled.into_iter().enumerate() {

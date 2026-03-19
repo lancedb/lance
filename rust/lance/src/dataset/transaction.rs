@@ -27,7 +27,8 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
+        RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
@@ -1137,6 +1138,9 @@ pub struct RewrittenIndex {
     pub new_id: Uuid,
     pub new_index_details: prost_types::Any,
     pub new_index_version: u32,
+    /// Files in the new index with their sizes.
+    /// Empty list from older writers that didn't persist this field.
+    pub new_index_files: Option<Vec<IndexFile>>,
 }
 
 impl DeepSizeOf for RewrittenIndex {
@@ -1935,13 +1939,17 @@ impl Transaction {
                 removed_indices,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
+                let removed_uuids = removed_indices
+                    .iter()
+                    .map(|old_index| old_index.uuid)
+                    .collect::<HashSet<_>>();
+                let new_uuids = new_indices
+                    .iter()
+                    .map(|new_index| new_index.uuid)
+                    .collect::<HashSet<_>>();
                 final_indices.retain(|existing_index| {
-                    !new_indices
-                        .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                    !removed_uuids.contains(&existing_index.uuid)
+                        && !new_uuids.contains(&existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }
@@ -2512,6 +2520,10 @@ impl Transaction {
                 groups,
             )?);
             index.uuid = rewritten_index.new_id;
+            // Update file sizes to match the new index files. When not available
+            // (e.g., from older writers), clear the old file sizes to avoid
+            // using stale sizes from the pre-remap index.
+            index.files = rewritten_index.new_index_files.clone();
         }
         Ok(())
     }
@@ -3027,6 +3039,20 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 })?
                 .clone(),
             new_index_version: message.new_index_version,
+            new_index_files: if message.new_index_files.is_empty() {
+                None
+            } else {
+                Some(
+                    message
+                        .new_index_files
+                        .iter()
+                        .map(|f| IndexFile {
+                            path: f.path.clone(),
+                            size_bytes: f.size_bytes,
+                        })
+                        .collect(),
+                )
+            },
         })
     }
 }
@@ -3260,6 +3286,19 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
             new_id: Some((&value.new_id).into()),
             new_index_details: Some(value.new_index_details.clone()),
             new_index_version: value.new_index_version,
+            new_index_files: value
+                .new_index_files
+                .as_ref()
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|f| pb::IndexFile {
+                            path: f.path.clone(),
+                            size_bytes: f.size_bytes,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -3441,7 +3480,37 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use chrono::Utc;
+    use lance_core::datatypes::Schema as LanceSchema;
     use lance_io::utils::CachedFileSize;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sample_manifest() -> Manifest {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    fn sample_index_metadata(name: &str) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            name: name.to_string(),
+            dataset_version: 0,
+            fragment_bitmap: Some([0].into_iter().collect()),
+            index_details: None,
+            index_version: 1,
+            created_at: Some(Utc::now()),
+            base_id: None,
+            files: None,
+        }
+    }
 
     #[test]
     fn test_rewrite_fragments() {
@@ -3496,11 +3565,6 @@ mod tests {
 
     #[test]
     fn test_merge_fragments_valid() {
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema as LanceSchema;
-        use lance_table::format::Manifest;
-        use std::sync::Arc;
-
         // Create a simple schema for testing
         let schema = ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
@@ -3575,6 +3639,82 @@ mod tests {
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
         let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_index_build_manifest_keeps_unremoved_same_name_indices() {
+        let manifest = sample_manifest();
+        let first_index = sample_index_metadata("vector_idx");
+        let second_index = sample_index_metadata("vector_idx");
+        let third_index = sample_index_metadata("vector_idx");
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![third_index.clone()],
+                removed_indices: vec![second_index.clone()],
+            },
+            None,
+        );
+
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![first_index.clone(), second_index.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(final_indices.len(), 2);
+        assert!(final_indices.iter().any(|idx| idx.uuid == first_index.uuid));
+        assert!(final_indices.iter().any(|idx| idx.uuid == third_index.uuid));
+        assert!(
+            !final_indices
+                .iter()
+                .any(|idx| idx.uuid == second_index.uuid)
+        );
+    }
+
+    #[test]
+    fn test_create_index_build_manifest_deduplicates_relisted_indices_by_uuid() {
+        let manifest = sample_manifest();
+        let first_index = sample_index_metadata("vector_idx");
+        let second_index = sample_index_metadata("vector_idx");
+        let third_index = sample_index_metadata("vector_idx");
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![first_index.clone(), third_index.clone()],
+                removed_indices: vec![second_index.clone()],
+            },
+            None,
+        );
+
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![first_index.clone(), second_index.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(final_indices.len(), 2);
+        assert_eq!(
+            final_indices
+                .iter()
+                .filter(|idx| idx.uuid == first_index.uuid)
+                .count(),
+            1
+        );
+        assert!(final_indices.iter().any(|idx| idx.uuid == third_index.uuid));
+        assert!(
+            !final_indices
+                .iter()
+                .any(|idx| idx.uuid == second_index.uuid)
+        );
     }
 
     #[test]
@@ -3875,6 +4015,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -3896,6 +4037,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -4307,6 +4449,7 @@ mod tests {
                 value: vec![],
             },
             new_index_version: 1,
+            new_index_files: None,
         }];
 
         // Should succeed (skip missing index) instead of error

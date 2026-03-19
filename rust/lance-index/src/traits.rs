@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 
-use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
+use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
 use lance_table::format::IndexMetadata;
-use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
@@ -115,6 +114,12 @@ pub trait IndexDescription: Send + Sync {
     /// plugin.  As a result, this method may fail if there is no plugin
     /// available for the index.
     fn details(&self) -> Result<String>;
+
+    /// Returns the total size in bytes of all files across all segments.
+    ///
+    /// Returns `None` if file size information is not available for any segment
+    /// (for backward compatibility with indices created before file tracking was added).
+    fn total_size_bytes(&self) -> Option<u64>;
 }
 
 // Extends Lance Dataset with secondary index.
@@ -269,11 +274,12 @@ pub trait DatasetIndexExt {
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
-    async fn commit_existing_index(
+    /// Commit one or more existing physical index segments as a logical index.
+    async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
-        index_id: Uuid,
+        segments: Vec<IndexSegment>,
     ) -> Result<()>;
 
     async fn read_index_partition(

@@ -299,7 +299,7 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    plugin
+    let created_index = plugin
         .train_index(
             training_data,
             &index_store,
@@ -307,7 +307,9 @@ pub(super) async fn build_scalar_index(
             fragment_ids,
             progress,
         )
-        .await
+        .await?;
+
+    Ok(created_index)
 }
 
 /// Fetches the scalar index plugin for a given index metadata
@@ -461,21 +463,19 @@ pub fn index_matches_criteria(
         return Ok(true);
     };
 
-    if index_details.is_vector() {
-        // This method is only for finding matching scalar indexes today so reject any vector indexes
-        return Ok(false);
-    }
-
-    if criteria.must_support_fts && !index_details.supports_fts() {
-        return Ok(false);
-    }
-
-    // We should not use FTS / NGram indices for exact equality queries
-    // (i.e. merge insert with a join on the indexed column)
-    if criteria.must_support_exact_equality {
-        let plugin = index_details.get_plugin()?;
-        if !plugin.provides_exact_answer() {
+    // Only apply scalar-specific checks to scalar indices
+    if !index_details.is_vector() {
+        if criteria.must_support_fts && !index_details.supports_fts() {
             return Ok(false);
+        }
+
+        // We should not use FTS / NGram indices for exact equality queries
+        // (i.e. merge insert with a join on the indexed column)
+        if criteria.must_support_exact_equality {
+            let plugin = index_details.get_plugin()?;
+            if !plugin.provides_exact_answer() {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -596,6 +596,7 @@ mod tests {
             index_version: 0,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -615,11 +616,12 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
+        // Vector indices should now match basic criteria
         let result = index_matches_criteria(&index1, &criteria, &[&field], true, &schema).unwrap();
-        assert!(!result);
+        assert!(result);
 
         let result = index_matches_criteria(&index1, &criteria, &[&field], false, &schema).unwrap();
-        assert!(!result);
+        assert!(result);
     }
 
     #[test]

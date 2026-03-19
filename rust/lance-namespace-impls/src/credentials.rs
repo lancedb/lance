@@ -353,7 +353,7 @@ pub fn detect_provider_from_uri(uri: &str) -> &'static str {
     match url.scheme() {
         "s3" => "aws",
         "gs" => "gcp",
-        "az" => "azure",
+        "az" | "abfss" => "azure",
         _ => "unknown",
     }
 }
@@ -556,8 +556,16 @@ mod tests {
         assert_eq!(detect_provider_from_uri("gs://bucket/path"), "gcp");
         assert_eq!(detect_provider_from_uri("GS://bucket/path"), "gcp");
 
-        // Azure (supported scheme: az://)
+        // Azure (supported schemes: az:// and abfss://)
         assert_eq!(detect_provider_from_uri("az://container/path"), "azure");
+        assert_eq!(
+            detect_provider_from_uri("az://container@account.blob.core.windows.net/path"),
+            "azure"
+        );
+        assert_eq!(
+            detect_provider_from_uri("abfss://container@account.dfs.core.windows.net/path"),
+            "azure"
+        );
 
         // Unknown (unsupported schemes)
         assert_eq!(detect_provider_from_uri("/local/path"), "unknown");
@@ -565,10 +573,6 @@ mod tests {
         assert_eq!(detect_provider_from_uri("memory://test"), "unknown");
         // Hadoop-style schemes not supported by lance-io
         assert_eq!(detect_provider_from_uri("s3a://bucket/path"), "unknown");
-        assert_eq!(
-            detect_provider_from_uri("abfss://container@account.dfs.core.windows.net/path"),
-            "unknown"
-        );
         assert_eq!(
             detect_provider_from_uri("wasbs://container@account.blob.core.windows.net/path"),
             "unknown"

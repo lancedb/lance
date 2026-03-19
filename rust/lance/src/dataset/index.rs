@@ -14,6 +14,7 @@ use crate::index::scalar::infer_scalar_index_details;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
+use lance_encoding::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -104,6 +105,7 @@ impl IndexRemapper for DatasetIndexRemapper {
                             new_id: id,
                             index_details,
                             index_version: index.index_version as u32,
+                            files: index.files.clone(),
                         });
                     }
                     RemapResult::Remapped(remapped_index) => {
@@ -128,14 +130,30 @@ pub trait LanceIndexStoreExt {
         Self: Sized;
 }
 
+/// Extract the lance file version from a dataset, floored at V2_0.
+///
+/// Index files should never use the legacy format. If the dataset uses legacy
+/// format or doesn't have a version set, V2_0 is used as the minimum.
+pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
+    dataset
+        .manifest
+        .data_storage_format
+        .lance_file_version()
+        .ok()
+        .map(|v| v.resolve().max(LanceFileVersion::V2_0))
+        .unwrap_or(LanceFileVersion::V2_0)
+}
+
 impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
         let index_dir = dataset.indices_dir().child(uuid);
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
-        Ok(Self::new(
+        let format_version = dataset_format_version(dataset);
+        Ok(Self::with_format_version(
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
+            format_version,
         ))
     }
 
@@ -144,10 +162,13 @@ impl LanceIndexStoreExt for LanceIndexStore {
             .indice_files_dir(index)?
             .child(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
-        Ok(Self::new(
+        let format_version = dataset_format_version(dataset);
+        let store = Self::with_format_version(
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
-        ))
+            format_version,
+        );
+        Ok(store.with_file_sizes(index.file_size_map()))
     }
 }

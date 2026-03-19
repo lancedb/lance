@@ -35,7 +35,7 @@ use object_store::path::Path;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::v3::shuffler::IvfShuffler;
+use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     VectorIndex,
@@ -52,13 +52,14 @@ use lance_index::{
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use serde::Serialize;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
 use super::{DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
+use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
@@ -397,9 +398,16 @@ pub(crate) async fn build_distributed_vector_index(
         .as_ref()
         .clone();
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
+    let shuffler = create_ivf_shuffler(
+        temp_dir_path,
+        num_partitions,
+        format_version,
+        Some(progress.clone()),
+    );
 
     let filtered_dataset = dataset.clone();
 
@@ -458,7 +466,7 @@ pub(crate) async fn build_distributed_vector_index(
                     column.to_owned(),
                     index_dir,
                     params.metric_type,
-                    Box::new(shuffler),
+                    shuffler,
                     Some(ivf_params),
                     Some(()),
                     (),
@@ -479,7 +487,7 @@ pub(crate) async fn build_distributed_vector_index(
                     column.to_owned(),
                     index_dir,
                     params.metric_type,
-                    Box::new(shuffler),
+                    shuffler,
                     Some(ivf_params),
                     Some(()),
                     (),
@@ -524,7 +532,7 @@ pub(crate) async fn build_distributed_vector_index(
                         column.to_owned(),
                         index_dir,
                         params.metric_type,
-                        Box::new(shuffler),
+                        shuffler,
                         Some(ivf_params),
                         Some(pq_params.clone()),
                         (),
@@ -558,7 +566,7 @@ pub(crate) async fn build_distributed_vector_index(
                 column.to_owned(),
                 index_dir,
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 (),
@@ -585,7 +593,7 @@ pub(crate) async fn build_distributed_vector_index(
                 column.to_owned(),
                 index_dir,
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(()),
                 hnsw_params.clone(),
@@ -620,7 +628,7 @@ pub(crate) async fn build_distributed_vector_index(
                 column.to_owned(),
                 index_dir,
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(pq_params.clone()),
                 hnsw_params.clone(),
@@ -658,7 +666,7 @@ pub(crate) async fn build_distributed_vector_index(
                 column.to_owned(),
                 index_dir,
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
@@ -737,9 +745,16 @@ pub(crate) async fn build_vector_index(
     let mut ivf_params = ivf_params.clone();
     ivf_params.num_partitions = Some(num_partitions);
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions).with_progress(progress.clone());
+    let shuffler = create_ivf_shuffler(
+        temp_dir_path,
+        num_partitions,
+        format_version,
+        Some(progress.clone()),
+    );
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -748,7 +763,7 @@ pub(crate) async fn build_vector_index(
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
-                    Box::new(shuffler),
+                    shuffler,
                     Some(ivf_params),
                     Some(()),
                     (),
@@ -764,7 +779,7 @@ pub(crate) async fn build_vector_index(
                     column.to_owned(),
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
-                    Box::new(shuffler),
+                    shuffler,
                     Some(ivf_params),
                     Some(()),
                     (),
@@ -810,7 +825,7 @@ pub(crate) async fn build_vector_index(
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
                         params.metric_type,
-                        Box::new(shuffler),
+                        shuffler,
                         Some(ivf_params),
                         Some(pq_params.clone()),
                         (),
@@ -838,7 +853,7 @@ pub(crate) async fn build_vector_index(
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 (),
@@ -861,7 +876,7 @@ pub(crate) async fn build_vector_index(
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(rq_params.clone()),
                 (),
@@ -886,7 +901,7 @@ pub(crate) async fn build_vector_index(
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(()),
                 hnsw_params.clone(),
@@ -914,7 +929,7 @@ pub(crate) async fn build_vector_index(
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(pq_params.clone()),
                 hnsw_params.clone(),
@@ -942,7 +957,7 @@ pub(crate) async fn build_vector_index(
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
-                Box::new(shuffler),
+                shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
@@ -1014,10 +1029,15 @@ pub(crate) async fn build_vector_index_incremental(
         )));
     }
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = Box::new(
-        IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()).with_progress(progress.clone()),
+    let shuffler = create_ivf_shuffler(
+        temp_dir_path,
+        ivf_model.num_partitions(),
+        format_version,
+        Some(progress.clone()),
     );
 
     let index_dir = dataset.indices_dir().child(uuid);
@@ -1554,6 +1574,10 @@ pub async fn initialize_vector_index(
     )
     .await?;
 
+    // Capture file sizes for the new vector index
+    let index_dir = target_dataset.indices_dir().child(new_uuid.to_string());
+    let files = list_index_files_with_sizes(&target_dataset.object_store, &index_dir).await?;
+
     let field = target_dataset.schema().field(column_name).ok_or_else(|| {
         Error::index(format!(
             "Column '{}' not found in target dataset",
@@ -1561,17 +1585,7 @@ pub async fn initialize_vector_index(
         ))
     })?;
 
-    let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
-        Some(roaring::RoaringBitmap::new())
-    } else {
-        Some(
-            target_dataset
-                .get_fragments()
-                .iter()
-                .map(|f| f.id() as u32)
-                .collect(),
-        )
-    };
+    let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -1583,6 +1597,7 @@ pub async fn initialize_vector_index(
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        files: Some(files),
     };
 
     let transaction = Transaction::new(

@@ -1,5 +1,5 @@
 site_name: Lance
-site_description: Open Lakehouse Format for Multimodal AI
+site_description: "Documentation for Lance, an open lakehouse format for Multimodal AI"
 site_url: https://lance.org/
 docs_dir: src
 
@@ -77,9 +77,5 @@ extra:
 copyright: © 2025 Lance Format. All rights reserved.
 
 extra_css:
-  - assets/stylesheets/termynal.css
   - assets/stylesheets/home.css
-
-extra_javascript:
-  - assets/javascript/termynal.js
 
