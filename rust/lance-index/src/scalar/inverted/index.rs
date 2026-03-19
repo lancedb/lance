@@ -4064,7 +4064,8 @@ mod tests {
     #[tokio::test]
     async fn test_posting_builder_remap() {
         let posting_tail_codec = PostingTailCodec::Fixed32;
-        let mut builder = PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
+        let mut builder =
+            PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
         let n = BLOCK_SIZE + 3;
         for i in 0..n {
             builder.add(i as u32, PositionRecorder::Count(1));
@@ -4437,10 +4438,8 @@ mod tests {
 
     #[test]
     fn test_shared_position_stream_is_smaller_for_sparse_positions() {
-        let mut builder = PostingListBuilder::new_with_posting_tail_codec(
-            true,
-            PostingTailCodec::VarintDelta,
-        );
+        let mut builder =
+            PostingListBuilder::new_with_posting_tail_codec(true, PostingTailCodec::VarintDelta);
         let mut legacy_positions = Vec::with_capacity(BLOCK_SIZE * 4);
         for doc_id in 0..(BLOCK_SIZE * 4) as u32 {
             let mut positions = vec![doc_id * 3 + 1];
