@@ -16,7 +16,7 @@ import sys
 import urllib.request
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import List
+from typing import Dict, List, Optional
 
 import pytest
 from packaging.version import Version
@@ -161,17 +161,17 @@ class UpgradeDowngradeTest:
         """Return True to skip the old-version write after current-version writes."""
         return False
 
-    def current_env(self, method_name: str) -> dict[str, str]:
+    def current_env(self, method_name: str) -> Dict[str, str]:
         """Return environment overrides for methods executed in the current runtime."""
         return {}
 
-    def compat_env(self, version: str, method_name: str) -> dict[str, str]:
+    def compat_env(self, version: str, method_name: str) -> Dict[str, str]:
         """Return environment overrides for methods executed in a compat venv."""
         return {}
 
 
 @contextmanager
-def _temporary_env(overrides: dict[str, str] | None):
+def _temporary_env(overrides: Optional[Dict[str, str]]):
     if not overrides:
         yield
         return
