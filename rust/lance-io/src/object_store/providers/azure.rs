@@ -88,6 +88,14 @@ impl AzureBlobStoreProvider {
 #[async_trait::async_trait]
 impl ObjectStoreProvider for AzureBlobStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        let scheme = base_path.scheme().to_string();
+        if scheme != "az" && scheme != "abfss" {
+            return Err(Error::invalid_input(format!(
+                "Unsupported Azure scheme '{}', expected 'az' or 'abfss'",
+                scheme
+            )));
+        }
+
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
             StorageOptions(params.storage_options().cloned().unwrap_or_default());
@@ -110,7 +118,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         Ok(ObjectStore {
             inner,
-            scheme: String::from("az"),
+            scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
@@ -131,8 +139,10 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let authority = url.authority();
         let (container, account) = match authority.find("@") {
             Some(at_index) => {
-                // The URI looks like 'az://container@account.dfs.core.windows.net/path-part/file',
-                // or possibly 'az://container@account/path-part/file'.
+                // The URI has an:
+                // - az:// schema type and is similar to 'az://container@account.dfs.core.windows.net/path-part/file
+                //         or possibly 'az://container@account/path-part/file' (the short version).
+                // - abfss:// schema type and is similar to 'abfss://filesystem@account.dfs.core.windows.net/path-part/file'.
                 let container = &authority[..at_index];
                 let account = &authority[at_index + 1..];
                 (
@@ -300,6 +310,21 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_object_store_prefix_from_url_short_account() {
+        let provider = AzureBlobStoreProvider;
+        let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
+        assert_eq!(
+            "az$container@account",
+            provider
+                .calculate_object_store_prefix(
+                    &Url::parse("az://container@account/path").unwrap(),
+                    Some(&options)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn test_fail_to_calculate_object_store_prefix_from_url() {
         let provider = AzureBlobStoreProvider;
         let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
@@ -312,5 +337,92 @@ mod tests {
             .expect_err("expected error")
             .to_string();
         assert_eq!(expected, &result[..expected.len()]);
+    }
+
+    // --- abfss:// tests ---
+
+    #[test]
+    fn test_abfss_extract_path() {
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path/to/dataset.lance")
+            .unwrap();
+        let path = provider.extract_path(&url).unwrap();
+        assert_eq!(
+            path,
+            object_store::path::Path::from("path/to/dataset.lance")
+        );
+    }
+
+    #[test]
+    fn test_calculate_abfss_prefix() {
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path/to/data").unwrap();
+        let prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
+        assert_eq!(prefix, "abfss$myfs@myaccount");
+    }
+
+    #[test]
+    fn test_calculate_abfss_prefix_ignores_storage_options() {
+        let provider = AzureBlobStoreProvider;
+        let options =
+            HashMap::from_iter([("account_name".to_string(), "other_account".to_string())]);
+        let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path").unwrap();
+        let prefix = provider
+            .calculate_object_store_prefix(&url, Some(&options))
+            .unwrap();
+        assert_eq!(prefix, "abfss$myfs@myaccount");
+    }
+
+    #[tokio::test]
+    async fn test_abfss_default_uses_microsoft_builder() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "testaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert_eq!(store.scheme, "abfss");
+        assert!(!store.is_local());
+        assert!(store.is_cloud());
+        let inner_desc = store.inner.to_string();
+        assert!(
+            inner_desc.contains("MicrosoftAzure"),
+            "abfss:// without use_opendal should use MicrosoftAzureBuilder, got: {}",
+            inner_desc
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_scheme_rejected() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("wasbs://container@myaccount.blob.core.windows.net/path").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "myaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let err = provider
+            .new_store(url, &params)
+            .await
+            .expect_err("expected error for unsupported scheme");
+        assert!(
+            err.to_string().contains("Unsupported Azure scheme"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

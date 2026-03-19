@@ -309,7 +309,11 @@ impl Default for ObjectStoreRegistry {
             providers.insert("s3+ddb".into(), aws);
         }
         #[cfg(feature = "azure")]
-        providers.insert("az".into(), Arc::new(azure::AzureBlobStoreProvider));
+        {
+            let azure = Arc::new(azure::AzureBlobStoreProvider);
+            providers.insert("az".into(), azure.clone());
+            providers.insert("abfss".into(), azure);
+        }
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]

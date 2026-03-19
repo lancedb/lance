@@ -339,8 +339,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
 
     /// Batch delete table versions.
     ///
-    /// Deletes multiple version records from a table. This operation supports
-    /// deleting ranges of versions for efficient bulk cleanup.
+    /// Deletes version records for a single table using `request.id` + `request.ranges`.
     ///
     /// # Arguments
     ///
