@@ -403,7 +403,7 @@ impl MemTableFlusher {
         total_rows: usize,
     ) -> Result<()> {
         use lance_index::pbold;
-        use lance_index::scalar::inverted::LANCE_FTS_FORMAT_VERSION;
+        use lance_index::scalar::inverted::current_fts_format_version;
         use lance_index::scalar::lance_format::LanceIndexStore;
 
         let fts_configs: Vec<_> = index_configs
@@ -480,7 +480,7 @@ impl MemTableFlusher {
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
-                index_version: LANCE_FTS_FORMAT_VERSION.index_version() as i32,
+                index_version: current_fts_format_version().index_version() as i32,
                 created_at: None,
                 base_id: None,
                 files: None,

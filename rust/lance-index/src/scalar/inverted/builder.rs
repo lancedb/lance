@@ -162,8 +162,8 @@ impl InvertedIndexBuilder {
             src_store: store,
             token_set_format,
             fragment_mask,
-            format_version: *LANCE_FTS_FORMAT_VERSION,
-            posting_tail_codec: (*LANCE_FTS_FORMAT_VERSION).posting_tail_codec(),
+            format_version: current_fts_format_version(),
+            posting_tail_codec: current_fts_format_version().posting_tail_codec(),
             progress: noop_progress(),
         }
     }
@@ -534,7 +534,7 @@ impl InnerBuilder {
             id,
             with_position,
             token_set_format,
-            *LANCE_FTS_FORMAT_VERSION,
+            current_fts_format_version(),
         )
     }
 
@@ -1231,7 +1231,7 @@ pub fn legacy_inverted_list_schema(with_position: bool) -> SchemaRef {
 }
 
 pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
-    inverted_list_schema_for_version(with_position, *LANCE_FTS_FORMAT_VERSION)
+    inverted_list_schema_for_version(with_position, current_fts_format_version())
 }
 
 pub fn inverted_list_schema_for_version(

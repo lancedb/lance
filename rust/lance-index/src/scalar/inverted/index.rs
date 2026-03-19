@@ -126,10 +126,10 @@ fn resolve_fts_format_version(
     value.unwrap_or("1").parse()
 }
 
-pub static LANCE_FTS_FORMAT_VERSION: LazyLock<InvertedListFormatVersion> = LazyLock::new(|| {
+pub fn current_fts_format_version() -> InvertedListFormatVersion {
     resolve_fts_format_version(std::env::var("LANCE_FTS_FORMAT_VERSION").ok().as_deref())
         .expect("failed to parse LANCE_FTS_FORMAT_VERSION")
-});
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InvertedListFormatVersion {
@@ -788,7 +788,7 @@ impl ScalarIndex for InvertedIndex {
 
         let index_version = match self.token_set_format {
             TokenSetFormat::Arrow => 0,
-            TokenSetFormat::Fst => LANCE_FTS_FORMAT_VERSION.index_version(),
+            TokenSetFormat::Fst => current_fts_format_version().index_version(),
         };
 
         Ok(CreatedIndex {
@@ -810,7 +810,7 @@ impl ScalarIndex for InvertedIndex {
 
         let index_version = match self.token_set_format {
             TokenSetFormat::Arrow => 0,
-            TokenSetFormat::Fst => LANCE_FTS_FORMAT_VERSION.index_version(),
+            TokenSetFormat::Fst => current_fts_format_version().index_version(),
         };
 
         Ok(CreatedIndex {
@@ -2603,7 +2603,7 @@ impl PostingListBuilder {
     pub fn new(with_position: bool) -> Self {
         Self::new_with_posting_tail_codec(
             with_position,
-            LANCE_FTS_FORMAT_VERSION.posting_tail_codec(),
+            current_fts_format_version().posting_tail_codec(),
         )
     }
 
