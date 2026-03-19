@@ -235,9 +235,11 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
-    /** Maximum number of source fragments to compact in a single run. Tasks are included until
-     * adding the next task would exceed this limit, allowing for incremental compaction.
-     * Fragments are processed oldest first. */
+    /**
+     * Maximum number of source fragments to compact in a single run. Tasks are included until
+     * adding the next task would exceed this limit, allowing for incremental compaction. Fragments
+     * are processed oldest first.
+     */
     public Builder withMaxSourceFragments(long maxSourceFragments) {
       this.maxSourceFragments = Optional.of(maxSourceFragments);
       return this;
