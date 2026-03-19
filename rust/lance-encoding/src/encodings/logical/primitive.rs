@@ -3798,7 +3798,7 @@ impl PrimitiveStructuralEncoder {
         rep: Option<Vec<CompressedLevelsChunk>>,
         def: Option<Vec<CompressedLevelsChunk>>,
         support_large_chunk: bool,
-    ) -> SerializedMiniBlockPage {
+    ) -> Result<SerializedMiniBlockPage> {
         let bytes_rep = rep
             .as_ref()
             .map(|rep| rep.iter().map(|r| r.data.len()).sum::<usize>())
@@ -3842,11 +3842,21 @@ impl PrimitiveStructuralEncoder {
 
             // Write the buffer lengths
             if let Some(rep) = rep.as_ref() {
-                let bytes_rep = u16::try_from(rep.data.len()).unwrap();
+                let bytes_rep = u16::try_from(rep.data.len()).map_err(|_| {
+                    Error::internal(format!(
+                        "Repetition buffer size ({} bytes) too large",
+                        rep.data.len()
+                    ))
+                })?;
                 data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
             }
             if let Some(def) = def.as_ref() {
-                let bytes_def = u16::try_from(def.data.len()).unwrap();
+                let bytes_def = u16::try_from(def.data.len()).map_err(|_| {
+                    Error::internal(format!(
+                        "Definition buffer size ({} bytes) too large",
+                        def.data.len()
+                    ))
+                })?;
                 data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             }
 
@@ -3916,11 +3926,11 @@ impl PrimitiveStructuralEncoder {
         let data_buffer = LanceBuffer::from(data_buffer);
         let metadata_buffer = LanceBuffer::from(meta_buffer);
 
-        SerializedMiniBlockPage {
+        Ok(SerializedMiniBlockPage {
             num_buffers: miniblocks.data.len() as u64,
             data: data_buffer,
             metadata: metadata_buffer,
-        }
+        })
     }
 
     /// Compresses a buffer of levels into chunks
@@ -4448,7 +4458,7 @@ impl PrimitiveStructuralEncoder {
             .map(|cd| std::mem::take(&mut cd.data));
 
         let serialized =
-            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk);
+            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk)?;
 
         // Metadata, Data, Dictionary, (maybe) Repetition Index
         let mut data = Vec::with_capacity(4);
