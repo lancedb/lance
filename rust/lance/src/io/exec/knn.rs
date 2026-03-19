@@ -405,6 +405,53 @@ impl ANNIvfPartitionExec {
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+
+    fn can_share_partition_search<'a>(
+        mut indices: impl Iterator<Item = &'a Arc<dyn VectorIndex>>,
+    ) -> bool {
+        let Some(first_index) = indices.next() else {
+            return false;
+        };
+
+        let first_metric = first_index.metric_type();
+        let first_partitions = first_index.total_partitions();
+
+        indices.all(|index| {
+            index.metric_type() == first_metric && index.total_partitions() == first_partitions
+        })
+    }
+
+    fn build_partition_columns(
+        partitions: &UInt32Array,
+        dist_q_c: &Float32Array,
+    ) -> Result<(ArrayRef, ArrayRef)> {
+        let mut part_list_builder = ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
+            "item",
+            DataType::UInt32,
+            false,
+        ));
+        part_list_builder.append_value(partitions.iter());
+        let partition_col: ArrayRef = Arc::new(part_list_builder.finish());
+
+        let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new())
+            .with_field(Field::new("item", DataType::Float32, false));
+        dist_q_c_list_builder.append_value(dist_q_c.iter());
+        let dist_q_c_col: ArrayRef = Arc::new(dist_q_c_list_builder.finish());
+
+        Ok((partition_col, dist_q_c_col))
+    }
+
+    fn build_partition_batch(
+        partition_col: ArrayRef,
+        dist_q_c_col: ArrayRef,
+        uuid: &str,
+    ) -> Result<RecordBatch> {
+        let uuid_col = Arc::new(StringArray::from(vec![uuid]));
+        Ok(RecordBatch::try_new(
+            KNN_PARTITION_SCHEMA.clone(),
+            vec![partition_col, dist_q_c_col, uuid_col],
+        )?)
+    }
 }
 
 impl DisplayAs for ANNIvfPartitionExec {
@@ -488,62 +535,130 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
         let query = self.query.clone();
         let ds = self.dataset.clone();
+        let index_uuids = self.index_uuids.clone();
+        let open_parallelism = index_uuids.len();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
-        metrics.deltas_searched.add(self.index_uuids.len());
+        metrics.deltas_searched.add(index_uuids.len());
         let metrics_clone = metrics.clone();
 
-        let stream = stream::iter(self.index_uuids.clone())
-            .map(move |uuid| {
-                let query = query.clone();
-                let ds = ds.clone();
-                let metrics = metrics.clone();
-                async move {
-                    let index = ds
-                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
-                        .await?;
-                    let mut query = query.clone();
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
+        let stream = stream::once(async move {
+            let open_query = query.clone();
+            let open_ds = ds.clone();
+            let open_metrics = metrics.clone();
+            let opened_indices = stream::iter(index_uuids)
+                .map(move |uuid| {
+                    let query = open_query.clone();
+                    let ds = open_ds.clone();
+                    let metrics = open_metrics.clone();
+                    async move {
+                        let index = ds
+                            .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                            .await?;
+                        Ok::<_, DataFusionError>((uuid, index))
+                    }
+                })
+                .buffered(open_parallelism)
+                .try_collect::<Vec<_>>()
+                .await?;
 
-                    metrics.partitions_ranked.add(index.total_partitions());
+            let share_partitions =
+                Self::can_share_partition_search(opened_indices.iter().map(|(_, index)| index));
 
-                    let (partitions, dist_q_c) = index.find_partitions(&query).map_err(|e| {
+            let batches = if share_partitions {
+                let (_, shared_index) = opened_indices.first().expect("checked non-empty");
+                let mut shared_query = query.clone();
+                if shared_index.metric_type() == DistanceType::Cosine {
+                    let key = normalize_arrow(&shared_query.key)
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    shared_query.key = key.0;
+                }
+
+                metrics
+                    .partitions_ranked
+                    .add(shared_index.total_partitions());
+
+                let (partitions, dist_q_c) =
+                    shared_index.find_partitions(&shared_query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
+                let (partition_col, dist_q_c_col) =
+                    Self::build_partition_columns(&partitions, &dist_q_c).map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to build shared partition columns: {}",
+                            e
+                        ))
+                    })?;
 
-                    let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
-                        .with_field(Field::new("item", DataType::UInt32, false));
-                    part_list_builder.append_value(partitions.iter());
-                    let partition_col = part_list_builder.finish();
+                opened_indices
+                    .into_iter()
+                    .map(|(uuid, _)| {
+                        let batch = Self::build_partition_batch(
+                            partition_col.clone(),
+                            dist_q_c_col.clone(),
+                            &uuid,
+                        )
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to build partition batch for delta {}: {}",
+                                uuid, e
+                            ))
+                        })?;
+                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        Ok::<_, DataFusionError>(batch)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                opened_indices
+                    .into_iter()
+                    .map(|(uuid, index)| {
+                        let mut query = query.clone();
+                        if index.metric_type() == DistanceType::Cosine {
+                            let key = normalize_arrow(&query.key)
+                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                            query.key = key.0;
+                        }
 
-                    let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new())
-                        .with_field(Field::new("item", DataType::Float32, false));
-                    dist_q_c_list_builder.append_value(dist_q_c.iter());
-                    let dist_q_c_col = dist_q_c_list_builder.finish();
+                        metrics.partitions_ranked.add(index.total_partitions());
 
-                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
-                    let batch = RecordBatch::try_new(
-                        KNN_PARTITION_SCHEMA.clone(),
-                        vec![
-                            Arc::new(partition_col),
-                            Arc::new(dist_q_c_col),
-                            Arc::new(uuid_col),
-                        ],
-                    )?;
-                    metrics.baseline_metrics.record_output(batch.num_rows());
-                    Ok::<_, DataFusionError>(batch)
-                }
-            })
-            .buffered(self.index_uuids.len())
-            .finally(move || {
-                metrics_clone.baseline_metrics.done();
-                metrics_clone
-                    .baseline_metrics
-                    .elapsed_compute()
-                    .add_duration(timer.elapsed());
-            });
+                        let (partitions, dist_q_c) =
+                            index.find_partitions(&query).map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to find partitions for delta {}: {}",
+                                    uuid, e
+                                ))
+                            })?;
+                        let (partition_col, dist_q_c_col) =
+                            Self::build_partition_columns(&partitions, &dist_q_c).map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to build partition columns for delta {}: {}",
+                                    uuid, e
+                                ))
+                            })?;
+                        let batch = Self::build_partition_batch(partition_col, dist_q_c_col, &uuid)
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to build partition batch for delta {}: {}",
+                                    uuid, e
+                                ))
+                            })?;
+                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        Ok::<_, DataFusionError>(batch)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+
+            Ok::<_, DataFusionError>(stream::iter(
+                batches.into_iter().map(Ok::<_, DataFusionError>),
+            ))
+        })
+        .try_flatten()
+        .finally(move || {
+            metrics_clone.baseline_metrics.done();
+            metrics_clone
+                .baseline_metrics
+                .elapsed_compute()
+                .add_duration(timer.elapsed());
+        });
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
@@ -1344,21 +1459,33 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use std::any::Any;
+    use std::collections::HashMap;
+
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use async_trait::async_trait;
+    use datafusion::execution::SendableRecordBatchStream;
+    use deepsize::{Context, DeepSizeOf};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::Index;
+    use lance_index::metrics::MetricsCollector;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::prefilter::PreFilter;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+    use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use crate::dataset::{WriteMode, WriteParams};
@@ -1379,6 +1506,132 @@ mod tests {
             metric_type: Some(DistanceType::L2),
             use_index: true,
             dist_q_c: 0.0,
+        }
+    }
+
+    #[derive(Debug)]
+    struct PartitionSearchMockIndex {
+        partitions: usize,
+        metric_type: DistanceType,
+    }
+
+    impl DeepSizeOf for PartitionSearchMockIndex {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl Index for PartitionSearchMockIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Vector
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for PartitionSearchMockIndex {
+        async fn search(
+            &self,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!("not needed in test")
+        }
+
+        fn find_partitions(&self, _query: &Query) -> Result<(UInt32Array, Float32Array)> {
+            unimplemented!("not needed in test")
+        }
+
+        fn total_partitions(&self) -> usize {
+            self.partitions
+        }
+
+        async fn search_in_partition(
+            &self,
+            _partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!("not needed in test")
+        }
+
+        fn is_loadable(&self) -> bool {
+            false
+        }
+
+        fn use_residual(&self) -> bool {
+            false
+        }
+
+        async fn load(
+            &self,
+            _reader: Arc<dyn lance_io::traits::Reader>,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<Box<dyn VectorIndex>> {
+            unimplemented!("not needed in test")
+        }
+
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!("not needed in test")
+        }
+
+        fn num_rows(&self) -> u64 {
+            0
+        }
+
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+            Box::new(std::iter::empty())
+        }
+
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+            Ok(())
+        }
+
+        fn metric_type(&self) -> DistanceType {
+            self.metric_type
+        }
+
+        fn ivf_model(&self) -> &lance_index::vector::ivf::storage::IvfModel {
+            unimplemented!("not needed in test")
+        }
+
+        fn quantizer(&self) -> Quantizer {
+            unimplemented!("not needed in test")
+        }
+
+        fn partition_size(&self, _part_id: usize) -> usize {
+            unimplemented!("not needed in test")
+        }
+
+        fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+            unimplemented!("not needed in test")
         }
     }
 
@@ -1413,6 +1666,60 @@ mod tests {
         adjust_probes(&mut query, 10);
         assert_eq!(query.minimum_nprobes, 30);
         assert_eq!(query.maximum_nprobes, Some(50));
+    }
+
+    #[test]
+    fn test_can_share_partition_search_same_layout() {
+        let indices: Vec<Arc<dyn VectorIndex>> = vec![
+            Arc::new(PartitionSearchMockIndex {
+                partitions: 8,
+                metric_type: DistanceType::L2,
+            }),
+            Arc::new(PartitionSearchMockIndex {
+                partitions: 8,
+                metric_type: DistanceType::L2,
+            }),
+        ];
+
+        assert!(ANNIvfPartitionExec::can_share_partition_search(
+            indices.iter()
+        ));
+    }
+
+    #[test]
+    fn test_can_share_partition_search_rejects_partition_mismatch() {
+        let indices: Vec<Arc<dyn VectorIndex>> = vec![
+            Arc::new(PartitionSearchMockIndex {
+                partitions: 8,
+                metric_type: DistanceType::L2,
+            }),
+            Arc::new(PartitionSearchMockIndex {
+                partitions: 9,
+                metric_type: DistanceType::L2,
+            }),
+        ];
+
+        assert!(!ANNIvfPartitionExec::can_share_partition_search(
+            indices.iter()
+        ));
+    }
+
+    #[test]
+    fn test_can_share_partition_search_rejects_metric_mismatch() {
+        let indices: Vec<Arc<dyn VectorIndex>> = vec![
+            Arc::new(PartitionSearchMockIndex {
+                partitions: 8,
+                metric_type: DistanceType::L2,
+            }),
+            Arc::new(PartitionSearchMockIndex {
+                partitions: 8,
+                metric_type: DistanceType::Cosine,
+            }),
+        ];
+
+        assert!(!ANNIvfPartitionExec::can_share_partition_search(
+            indices.iter()
+        ));
     }
 
     #[tokio::test]
@@ -1839,7 +2146,7 @@ mod tests {
             );
             assert_eq!(
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
-                &(100 * num_deltas)
+                &100
             );
         }
     }
