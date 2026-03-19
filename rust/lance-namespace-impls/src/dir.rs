@@ -3004,9 +3004,9 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         let mode = match request.mode.as_deref() {
-            Some(m) if m.eq_ignore_ascii_case("overwrite") => lance::dataset::WriteMode::Overwrite,
-            Some(m) if m.eq_ignore_ascii_case("append") => lance::dataset::WriteMode::Append,
-            None => lance::dataset::WriteMode::Append,
+            Some(m) if m.eq_ignore_ascii_case("overwrite") => WriteMode::Overwrite,
+            Some(m) if m.eq_ignore_ascii_case("append") => WriteMode::Append,
+            None => WriteMode::Append,
             Some(m) => {
                 return Err(lance_namespace::error::NamespaceError::InvalidInput {
                     message: format!(
