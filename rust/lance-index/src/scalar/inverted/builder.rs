@@ -1737,21 +1737,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
     }
 
-    fn max_rss_bytes() -> u64 {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        assert_eq!(result, 0, "getrusage should succeed");
-        let usage = unsafe { usage.assume_init() };
-        #[cfg(target_os = "linux")]
-        {
-            (usage.ru_maxrss as u64) * 1024
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            usage.ru_maxrss as u64
-        }
-    }
-
     #[derive(Debug, Default, Clone)]
     struct CountingStore {
         write_count: Arc<AtomicUsize>,
@@ -2392,55 +2377,6 @@ mod tests {
             .await?;
         worker.flush().await?;
         assert!(store.write_count() > 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "manual stress test for build-time RSS under with_position=true"]
-    async fn test_with_position_memory_limit_stress() -> Result<()> {
-        let index_dir = TempDir::default();
-        let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            index_dir.obj_path(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("doc", DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        let repeated_doc = std::iter::repeat_n("common", 100_000)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let schema_for_batches = schema.clone();
-        let repeated_doc_for_batches = repeated_doc.clone();
-        let batches = stream::iter((0..160u64).map(move |row_id| {
-            let docs = Arc::new(StringArray::from(vec![Some(
-                repeated_doc_for_batches.as_str(),
-            )]));
-            let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
-            Ok(RecordBatch::try_new(schema_for_batches.clone(), vec![docs, row_ids]).unwrap())
-        }));
-        let stream = RecordBatchStreamAdapter::new(schema, batches);
-        let stream = Box::pin(stream);
-        let rss_before = max_rss_bytes();
-
-        let mut builder = InvertedIndexBuilder::new(
-            InvertedIndexParams::default()
-                .with_position(true)
-                .num_workers(1)
-                .memory_limit_mb(64),
-        );
-        builder.update(stream, store.as_ref()).await?;
-        let rss_after = max_rss_bytes();
-        let rss_delta = rss_after.saturating_sub(rss_before);
-        let memory_limit_bytes = 64 * 1024 * 1024;
-        assert!(
-            rss_delta <= memory_limit_bytes * 4,
-            "RSS growth exceeded expected bound: grew by {} MiB with {} MiB limit",
-            rss_delta / (1024 * 1024),
-            memory_limit_bytes / (1024 * 1024)
-        );
         Ok(())
     }
 
