@@ -413,6 +413,8 @@ impl ANNIvfPartitionExec {
             return false;
         };
 
+        // Delta indices reuse the same IVF model by construction, so matching
+        // metric type and partition count is sufficient to share partition search.
         let first_metric = first_index.metric_type();
         let first_partitions = first_index.total_partitions();
 
