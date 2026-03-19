@@ -3737,6 +3737,66 @@ impl PrimitiveStructuralEncoder {
         Self::is_narrow(data_block)
     }
 
+    /// Checks if the rep/def levels are too sparse for miniblock encoding.
+    ///
+    /// Miniblock chunks are limited to ~32KiB total. Data can use up to ~16KiB,
+    /// leaving ~16KiB for both rep and def buffers combined. Each chunk has at most
+    /// MAX_MINIBLOCK_VALUES (4096) data values, but when data has many empty/null
+    /// lists, the number of rep/def levels can far exceed the number of data values
+    /// (each empty list adds a level entry with no corresponding data value).
+    ///
+    /// We estimate the compressed bits per level by computing the max value in each
+    /// buffer and taking ceil(log2(max_val + 1)) — the minimum bits needed to
+    /// bitpack each level. We then calculate the maximum number of levels that fit
+    /// in 16KiB and compare against the actual levels-to-values ratio.
+    fn repdef_too_sparse_for_miniblock(
+        repdef: &crate::repdef::SerializedRepDefs,
+        num_values: u64,
+    ) -> bool {
+        if num_values == 0 {
+            return false;
+        }
+        let num_levels = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|r| r.len() as u64)
+            .max(repdef.definition_levels.as_ref().map(|d| d.len() as u64))
+            .unwrap_or(0);
+        if num_levels == 0 {
+            return false;
+        }
+
+        // Compute bits needed per level for each buffer (ceil of log2(max+1))
+        let bits_per_rep = repdef
+            .repetition_levels
+            .as_ref()
+            .and_then(|r| r.iter().max().copied())
+            .map(|max_val| u16::BITS - max_val.leading_zeros())
+            .unwrap_or(0) as u64;
+        let bits_per_def = repdef
+            .definition_levels
+            .as_ref()
+            .and_then(|d| d.iter().max().copied())
+            .map(|max_val| u16::BITS - max_val.leading_zeros())
+            .unwrap_or(0) as u64;
+
+        let bits_per_level = bits_per_rep + bits_per_def;
+        if bits_per_level == 0 {
+            return false;
+        }
+
+        // 16KiB budget for rep+def combined (half the ~32KiB chunk limit)
+        const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
+        let max_levels_per_chunk = REPDEF_BUDGET_BITS / bits_per_level;
+
+        // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
+        // ratio tells us how many levels a chunk of that size would need.
+        let levels_per_chunk =
+            (num_levels as f64 / num_values as f64) * miniblock::MAX_MINIBLOCK_VALUES as f64;
+
+        levels_per_chunk > max_levels_per_chunk as f64
+    }
+
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
         // Fullzip is the backup option so the only reason we wouldn't use it is if the
         // user specifically requested not to use it (in which case we're probably going
@@ -5111,6 +5171,35 @@ impl PrimitiveStructuralEncoder {
                     column_idx,
                     num_values
                 );
+                return Self::encode_full_zip(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    data_block,
+                    repdef,
+                    row_number,
+                    num_rows,
+                );
+            }
+
+            // If the rep/def levels are too sparse for miniblock (e.g. many empty
+            // lists with very few values), fall back to fullzip to avoid exceeding
+            // the u16 per-chunk rep/def buffer size limit.
+            let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
+            if too_sparse {
+                log::debug!(
+                    "Encoding column {} with {} items using full-zip layout \
+                     (rep/def too sparse for mini-block)",
+                    column_idx,
+                    num_values
+                );
+                let data_block = match data_block {
+                    DataBlock::Dictionary(dict) => {
+                        let (indices, _) = dict.into_parts();
+                        indices
+                    }
+                    other => other,
+                };
                 return Self::encode_full_zip(
                     column_idx,
                     &field,
