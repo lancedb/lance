@@ -288,12 +288,13 @@ impl<'a> FragmentCreateBuilder<'a> {
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
         let mut builder = DatasetBuilder::from_uri(self.dataset_uri);
-        let accessor = self
-            .write_params
-            .and_then(|p| p.store_params.as_ref())
-            .and_then(|p| p.storage_options_accessor.clone());
-        if let Some(accessor) = accessor {
-            builder = builder.with_storage_options_accessor(accessor);
+        if let Some(store_params) = self.write_params.and_then(|p| p.store_params.as_ref()) {
+            if let Some(accessor) = store_params.storage_options_accessor.clone() {
+                builder = builder.with_storage_options_accessor(accessor);
+            }
+            if let Some(storage_options) = store_params.storage_options() {
+                builder = builder.with_storage_options(storage_options.clone());
+            }
         }
         match builder.load().await {
             Ok(dataset) => {
@@ -592,6 +593,52 @@ mod tests {
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
+    }
+
+    #[tokio::test]
+    async fn test_append_with_storage_options() {
+        use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+        use std::collections::HashMap;
+
+        let tmp_dir = TempStrDir::default();
+
+        // Create the initial dataset
+        let data = test_data();
+        FragmentCreateBuilder::new(&tmp_dir)
+            .write(data, None)
+            .await
+            .unwrap();
+
+        // Append with storage_options set on store_params. For local filesystem
+        // these options are unused, but this exercises the code path that
+        // forwards them to DatasetBuilder when loading the existing schema.
+        let mut storage_opts = HashMap::new();
+        storage_opts.insert("allow_http".to_string(), "true".to_string());
+
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                storage_opts,
+            ))),
+            ..Default::default()
+        };
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            store_params: Some(store_params),
+            ..Default::default()
+        };
+
+        let data = test_data();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write_params(&write_params)
+            .write(data, Some(1))
+            .await
+            .unwrap();
+
+        // The schema should have been loaded from the existing dataset,
+        // giving us the correct field ids rather than defaulting to 0-based.
+        assert_eq!(fragment.id, 1);
+        assert_eq!(fragment.files.len(), 1);
+        assert_eq!(fragment.files[0].fields, vec![0, 1]);
     }
 
     #[test]
