@@ -289,7 +289,7 @@ class FtsIndex(UpgradeDowngradeTest):
             }
         )
         dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
-        dataset.create_scalar_index("text", "INVERTED")
+        dataset.create_scalar_index("text", "INVERTED", with_position=True)
 
     def check_read(self):
         """Verify FTS index can be queried."""
