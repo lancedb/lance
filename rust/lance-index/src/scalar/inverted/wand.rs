@@ -1127,6 +1127,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
             posting.next(least_id);
             self.push_head(posting);
         }
+        // In the flat-search path this is only called after `collect_tail_matches`,
+        // which drains the current tail into either `lead` or `head`. At this
+        // point `tail` is expected to be empty, so clearing it is a no-op that
+        // just resets the cached `tail_max_score`.
+        debug_assert!(self.tail.is_empty());
         self.clear_tail();
     }
 
@@ -1664,6 +1669,36 @@ mod tests {
             PanicQueryWeightScorer,
         );
         assert_eq!(wand.head.len(), 1);
+    }
+
+    #[test]
+    fn test_next_and_candidate_terminates_for_disjoint_postings() {
+        let mut docs = DocSet::default();
+        for i in 0..6 {
+            docs.append(i, 1);
+        }
+
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("a"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(vec![0, 2, 4], 1.0, None, false),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("b"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(vec![1, 3, 5], 1.0, None, false),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        assert!(wand.next_and_candidate().is_none());
     }
 
     #[rstest]
