@@ -315,12 +315,6 @@ class FtsIndex(UpgradeDowngradeTest):
         ds.insert(data)
         ds.optimize.compact_files()
 
-    def skip_read_after_current_write(self, version: str) -> bool:
-        return True
-
-    def skip_write_after_current_write(self, version: str) -> bool:
-        return True
-
     def skip_downgrade(self, version: str) -> bool:
         return version.startswith("0.")
 

@@ -157,10 +157,6 @@ class UpgradeDowngradeTest:
         """Return True to skip the current-write -> old-read downgrade test."""
         return False
 
-    def skip_write_after_current_write(self, version: str) -> bool:
-        """Return True to skip the old-version write after current-version writes."""
-        return False
-
     def current_env(self, method_name: str) -> Dict[str, str]:
         """Return environment overrides for methods executed in the current runtime."""
         return {}
@@ -356,10 +352,8 @@ def test_func({sig_params}):
     with _temporary_env(obj.current_env("check_write")):
         obj.check_write()
     # Old version: verify can still read
-    if not obj.skip_read_after_current_write(version):
-        venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
-    if not obj.skip_write_after_current_write(version):
-        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+    venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
 
     # Execute to create the function

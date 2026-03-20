@@ -131,6 +131,10 @@ pub fn current_fts_format_version() -> InvertedListFormatVersion {
         .expect("failed to parse LANCE_FTS_FORMAT_VERSION")
 }
 
+pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
+    InvertedListFormatVersion::V2
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InvertedListFormatVersion {
     #[default]
@@ -139,6 +143,13 @@ pub enum InvertedListFormatVersion {
 }
 
 impl InvertedListFormatVersion {
+    pub fn from_posting_tail_codec(codec: PostingTailCodec) -> Self {
+        match codec {
+            PostingTailCodec::Fixed32 => Self::V1,
+            PostingTailCodec::VarintDelta => Self::V2,
+        }
+    }
+
     pub fn index_version(self) -> u32 {
         match self {
             Self::V1 => INVERTED_INDEX_VERSION_V1,
@@ -350,6 +361,24 @@ impl DeepSizeOf for InvertedIndex {
 }
 
 impl InvertedIndex {
+    fn format_version(&self) -> InvertedListFormatVersion {
+        self.partitions
+            .first()
+            .map(|partition| {
+                InvertedListFormatVersion::from_posting_tail_codec(
+                    partition.inverted_list.posting_tail_codec(),
+                )
+            })
+            .unwrap_or_else(current_fts_format_version)
+    }
+
+    fn index_version(&self) -> u32 {
+        match self.token_set_format {
+            TokenSetFormat::Arrow => 0,
+            TokenSetFormat::Fst => self.format_version().index_version(),
+        }
+    }
+
     fn posting_tail_codec(&self) -> PostingTailCodec {
         self.partitions
             .first()
@@ -393,7 +422,7 @@ impl InvertedIndex {
                 self.token_set_format,
                 fragment_mask,
             )
-            .with_posting_tail_codec(self.posting_tail_codec())
+            .with_format_version(self.format_version())
         }
     }
 
@@ -786,14 +815,9 @@ impl ScalarIndex for InvertedIndex {
 
         let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
-        let index_version = match self.token_set_format {
-            TokenSetFormat::Arrow => 0,
-            TokenSetFormat::Fst => current_fts_format_version().index_version(),
-        };
-
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version,
+            index_version: self.index_version(),
             files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
@@ -808,14 +832,9 @@ impl ScalarIndex for InvertedIndex {
 
         let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
-        let index_version = match self.token_set_format {
-            TokenSetFormat::Arrow => 0,
-            TokenSetFormat::Fst => current_fts_format_version().index_version(),
-        };
-
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version,
+            index_version: self.index_version(),
             files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
@@ -4041,12 +4060,15 @@ pub fn is_phrase_query(query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::lance_tokenizer::DocType;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+    use crate::scalar::ScalarIndex;
     use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
     use crate::scalar::inverted::encoding::{
         compress_positions, compress_posting_list_with_tail_codec,
@@ -4056,7 +4078,7 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
     use arrow::array::{AsArray, LargeBinaryBuilder, ListBuilder, UInt32Builder};
     use arrow::datatypes::{Float32Type, UInt32Type};
-    use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
+    use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -4961,5 +4983,90 @@ mod tests {
             .unwrap();
 
         assert_eq!(row_ids, vec![100]);
+    }
+
+    #[tokio::test]
+    async fn test_update_preserves_loaded_v2_format_version() -> Result<()> {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let format_version = InvertedListFormatVersion::V2;
+        let posting_tail_codec = format_version.posting_tail_codec();
+        let mut partition = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            TokenSetFormat::default(),
+            format_version,
+        );
+        partition.tokens.add("hello".to_owned());
+        let mut posting_list =
+            PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
+        posting_list.add(0, PositionRecorder::Count(1));
+        partition.posting_lists.push(posting_list);
+        partition.docs.append(100, 1);
+        partition.write(src_store.as_ref()).await?;
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                posting_tail_codec.as_str().to_owned(),
+            ),
+        ]);
+        let mut writer = src_store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(index.index_version(), format_version.index_version());
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let docs = Arc::new(StringArray::from(vec![Some("hello again")]));
+        let row_ids = Arc::new(UInt64Array::from(vec![101u64]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![docs, row_ids])?;
+        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
+        let created = index
+            .update(Box::pin(stream), dest_store.as_ref(), None)
+            .await?;
+
+        assert_eq!(created.index_version, format_version.index_version());
+
+        let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(updated.index_version(), format_version.index_version());
+        assert_eq!(updated.partitions.len(), 2);
+        for partition in &updated.partitions {
+            assert_eq!(
+                partition.inverted_list.posting_tail_codec(),
+                posting_tail_codec
+            );
+        }
+
+        Ok(())
     }
 }

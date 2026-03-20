@@ -169,6 +169,8 @@ impl InvertedIndexBuilder {
     }
 
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
+        self.format_version =
+            InvertedListFormatVersion::from_posting_tail_codec(posting_tail_codec);
         self.posting_tail_codec = posting_tail_codec;
         self
     }
@@ -2021,6 +2023,25 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_with_posting_tail_codec_syncs_format_version() {
+        let builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+        )
+        .with_format_version(InvertedListFormatVersion::V2)
+        .with_posting_tail_codec(PostingTailCodec::Fixed32);
+        assert_eq!(builder.format_version, InvertedListFormatVersion::V1);
+        assert_eq!(builder.posting_tail_codec, PostingTailCodec::Fixed32);
+
+        let builder = builder.with_posting_tail_codec(PostingTailCodec::VarintDelta);
+        assert_eq!(builder.format_version, InvertedListFormatVersion::V2);
+        assert_eq!(builder.posting_tail_codec, PostingTailCodec::VarintDelta);
     }
 
     #[tokio::test]
