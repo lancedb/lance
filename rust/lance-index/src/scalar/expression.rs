@@ -474,9 +474,15 @@ fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Opti
         return None;
     }
 
+    // DataFusion's starts_with simplification escapes special characters with backslash
+    // but doesn't set escape_char. Use backslash as default escape character.
+    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
+    // See: https://github.com/apache/datafusion/issues/XXXX
+    let effective_escape_char = escape_char.or(Some('\\'));
+
     // Helper to check if a character at position i is escaped
     let is_escaped = |i: usize| -> bool {
-        if let Some(esc) = escape_char {
+        if let Some(esc) = effective_escape_char {
             if i > 0 && chars[i - 1] == esc {
                 // Check if the escape char itself is escaped
                 if i >= 2 && chars[i - 2] == esc {
@@ -518,8 +524,8 @@ fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Opti
     while i < len {
         let c = chars[i];
 
-        // Check for escape character (only if escape_char is set)
-        if let Some(esc) = escape_char
+        // Check for escape character (using effective escape char which may be inferred)
+        if let Some(esc) = effective_escape_char
             && c == esc
             && i + 1 < len
         {
@@ -2744,13 +2750,10 @@ mod tests {
         // Escaped trailing % is not a wildcard (no wildcards)
         assert_eq!(extract_like_leading_prefix(r"foo\%", Some('\\')), None);
 
-        // Without escape_char, backslash is a literal character (DataFusion behavior)
-        // "foo\%" with no escape means: prefix="foo\", then wildcard "%"
-        assert_eq!(
-            extract_like_leading_prefix(r"foo\%", None),
-            Some(("foo\\".to_string(), false))
-        );
-        // "foo\bar%" with no escape means: prefix="foo\bar", then wildcard "%"
+        // With backslash as default escape (for DataFusion starts_with compatibility):
+        // "foo\%" means escaped %, no wildcard -> None (should use equality)
+        assert_eq!(extract_like_leading_prefix(r"foo\%", None), None);
+        // "foo\bar%" - \b is not a valid escape sequence, so \ and b are literals, % is wildcard
         assert_eq!(
             extract_like_leading_prefix(r"foo\bar%", None),
             Some(("foo\\bar".to_string(), false))
@@ -2859,6 +2862,67 @@ mod tests {
             "Pattern starting with wildcard should not use index"
         );
         assert!(result.refine_expr.is_some(), "Should fall back to refine");
+    }
+
+    #[test]
+    fn test_starts_with_with_underscore_after_optimization() {
+        // Test that starts_with with underscore in prefix works correctly after DataFusion optimization
+        // DataFusion simplifies starts_with(col, 'test_ns$') to col LIKE 'test_ns$%'
+        // The underscore in the prefix should NOT be treated as a wildcard!
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "object_id",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("object_id_idx".to_string(), false)),
+            ),
+        )]);
+
+        let schema = Schema::new(vec![Field::new("object_id", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        // Create the expression with starts_with containing underscore
+        let expr = state
+            .create_logical_expr("starts_with(object_id, 'test_ns$')", &df_schema)
+            .unwrap();
+
+        // Apply DataFusion simplification (this may convert starts_with to LIKE)
+        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
+        let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+        let simplifier =
+            datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+        let simplified_expr = simplifier.simplify(expr).unwrap();
+
+        // Apply scalar indices
+        let result = apply_scalar_indices(simplified_expr, &index_info).unwrap();
+
+        // The prefix should be "test_ns$", NOT "test"
+        // This test documents the current (potentially broken) behavior
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            match query {
+                SargableQuery::LikePrefix(prefix) => {
+                    let prefix_str = match prefix {
+                        ScalarValue::Utf8(Some(s)) => s.clone(),
+                        _ => panic!("Expected Utf8 prefix"),
+                    };
+                    // Verify the prefix is correctly extracted with underscore as literal
+                    assert_eq!(
+                        prefix_str, "test_ns$",
+                        "Prefix should be 'test_ns$', not 'test' (underscore should not be a wildcard)"
+                    );
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            // If no scalar query, it means the pattern was not recognized
+            panic!("Expected scalar_query to be present");
+        }
     }
 
     #[test]
