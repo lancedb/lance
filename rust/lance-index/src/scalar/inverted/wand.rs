@@ -443,6 +443,9 @@ pub struct DocCandidate {
 }
 
 struct HeadPosting {
+    // Iterators that are already positioned on or after the next candidate doc.
+    // The heap is ordered by smallest doc id so the top element determines
+    // the next target doc to consider.
     posting: Box<PostingIterator>,
 }
 
@@ -493,7 +496,11 @@ impl Ord for HeadPosting {
 }
 
 struct TailPosting {
+    // Iterators that lag behind the current target doc but may still help the
+    // target beat the threshold if advanced to that doc.
     upper_bound: f32,
+    // Used as a tie-breaker when upper bounds are equal. Lower-cost iterators
+    // are cheaper to advance, so they are preferred.
     cost: usize,
     posting: Box<PostingIterator>,
 }
@@ -539,11 +546,25 @@ pub struct Wand<'a, S: Scorer> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     operator: Operator,
     num_terms: usize,
+    // Posting iterators whose current doc id is >= the next target doc.
+    // The heap top gives the smallest current doc id.
     head: BinaryHeap<HeadPosting>,
     #[allow(clippy::vec_box)]
+    // Posting iterators that already match the current target doc.
+    // Only these iterators participate in scoring / phrase checks for the
+    // current candidate.
     lead: Vec<Box<PostingIterator>>,
+    // Posting iterators that are behind the current target doc but still kept
+    // in play because their score upper bound could affect the decision for the
+    // current candidate.
     tail: BinaryHeap<TailPosting>,
+    // Sum of upper bounds for all iterators currently held in `tail`.
+    // This lets us cheaply decide whether the current candidate can still beat
+    // the threshold before fully advancing every lagging iterator.
     tail_max_score: f32,
+    // Block-max scores are valid for all candidate docs up to this doc id.
+    // As long as the next target stays within this window, we can reuse the
+    // current block-max view instead of recomputing it.
     up_to: u64,
     docs: &'a DocSet,
     scorer: S,
@@ -797,6 +818,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     // find the next doc candidate
+    // Find the next term-level candidate doc. The returned score is the exact
+    // contribution from the current `lead` set; additional score can still come
+    // from `tail` iterators that are advanced to the same doc later.
     fn next(&mut self) -> Result<Option<(DocInfo, f32)>> {
         if self.operator == Operator::And {
             return Ok(self.next_and_candidate().map(|doc| (doc, 0.0)));
@@ -913,6 +937,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
     }
 
+    // Move all head iterators that are already known to be behind `target`
+    // into `tail`, possibly overflowing low-value entries back into `head`.
     fn move_head_before_target_to_tail(&mut self, target: u64) {
         while matches!(self.head_doc(), Some(doc_id) if doc_id < target) {
             if let Some(posting) = self.head.pop() {
@@ -952,6 +978,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn update_max_scores(&mut self, target: u64) {
+        // Refresh the block-max window for the current target. The resulting
+        // `up_to` is the furthest doc id for which this block-max view remains
+        // valid.
         let lead_cost = self
             .lead
             .iter()
@@ -1021,9 +1050,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .lead
             .iter()
             .filter_map(|posting| {
-                posting.doc().map(|doc| {
-                    posting.score(&self.scorer, doc.frequency(), doc_length)
-                })
+                posting
+                    .doc()
+                    .map(|doc| posting.score(&self.scorer, doc.frequency(), doc_length))
             })
             .sum::<f32>();
 
@@ -1117,6 +1146,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         posting: Box<PostingIterator>,
         upper_bound: f32,
     ) -> Option<Box<PostingIterator>> {
+        // Keep only the lagging iterators that are most useful for deciding the
+        // current candidate. If a stronger tail entry arrives, evict the weakest
+        // one back to the caller so it can be advanced into `head`.
         if self.threshold <= 0.0 || upper_bound <= 0.0 {
             return Some(posting);
         }
@@ -1144,6 +1176,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn push_back_leads(&mut self, target: u64) {
+        // After finishing a candidate doc, convert the aligned iterators back
+        // into lagging iterators. Entries that do not stay in `tail` are
+        // advanced to `target` and returned to `head`.
         let leads = std::mem::take(&mut self.lead);
         for posting in leads {
             let upper_bound = posting.approximate_upper_bound();
@@ -1155,6 +1190,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn advance_tail_top(&mut self, target: u64, doc_length: u32, lead_score: &mut f32) -> bool {
+        // Advance the most promising lagging iterator to the current target.
+        // If it lands on the target, fold its exact contribution into
+        // `lead_score`; otherwise put it back into `head`.
         let Some(TailPosting {
             upper_bound,
             cost: _,
@@ -1183,6 +1221,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         doc_length: Option<u32>,
         mut score: Option<&mut f32>,
     ) {
+        // Materialize all remaining lagging iterators for `target`. This is
+        // only done once we have already decided to fully score / validate the
+        // candidate.
         let tail = std::mem::take(&mut self.tail);
         self.tail_max_score = 0.0;
         for tail_posting in tail.into_vec() {
