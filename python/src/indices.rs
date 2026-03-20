@@ -37,9 +37,7 @@ use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::{
-    DatasetIndexExt, IndexDescription, IndexSegment, IndexSegmentPlan, IndexType,
-};
+use lance_index::{DatasetIndexExt, IndexDescription, IndexSegment, IndexSegmentPlan, IndexType};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]

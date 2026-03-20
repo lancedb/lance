@@ -2101,7 +2101,10 @@ impl Dataset {
         Ok(PyLance(index_metadata))
     }
 
-    fn create_index_segment_builder(&self, staging_index_uuid: String) -> PyResult<PyIndexSegmentBuilder> {
+    fn create_index_segment_builder(
+        &self,
+        staging_index_uuid: String,
+    ) -> PyResult<PyIndexSegmentBuilder> {
         Ok(PyIndexSegmentBuilder {
             dataset: self.ds.clone(),
             staging_index_uuid,
