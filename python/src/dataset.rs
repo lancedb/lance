@@ -368,16 +368,13 @@ impl PyIndexSegmentBuilder {
             builder = builder.with_target_segment_bytes(target_segment_bytes);
         }
         let plans = rt().block_on(Some(py), builder.plan())?.infer_error()?;
-        plans.into_iter()
+        plans
+            .into_iter()
             .map(|plan| Py::new(py, PyIndexSegmentPlan::from_inner(plan)))
             .collect()
     }
 
-    fn build(
-        &self,
-        py: Python<'_>,
-        plan: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyIndexSegment>> {
+    fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
         let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
         let builder = self
             .dataset
@@ -397,7 +394,9 @@ impl PyIndexSegmentBuilder {
         if let Some(target_segment_bytes) = self.target_segment_bytes {
             builder = builder.with_target_segment_bytes(target_segment_bytes);
         }
-        let segments = rt().block_on(Some(py), builder.build_all())?.infer_error()?;
+        let segments = rt()
+            .block_on(Some(py), builder.build_all())?
+            .infer_error()?;
         segments
             .into_iter()
             .map(|segment| Py::new(py, PyIndexSegment::from_inner(segment)))
