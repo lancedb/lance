@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Options for optimizing all indices.
 #[non_exhaustive]
@@ -41,7 +42,7 @@ pub struct OptimizeOptions {
     /// These key-value pairs are stored in the transaction file
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed index jobs).
-    pub transaction_properties: Option<HashMap<String, String>>,
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl OptimizeOptions {
@@ -86,7 +87,7 @@ impl OptimizeOptions {
 
     /// Set transaction properties to store in the commit manifest.
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
-        self.transaction_properties = Some(properties);
+        self.transaction_properties = Some(Arc::new(properties));
         self
     }
 }

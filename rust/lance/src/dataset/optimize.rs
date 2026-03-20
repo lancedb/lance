@@ -215,7 +215,7 @@ pub struct CompactionOptions {
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed compaction jobs).
     #[serde(skip)]
-    pub transaction_properties: Option<HashMap<String, String>>,
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[allow(deprecated)]
@@ -391,7 +391,7 @@ impl CompactionOptions {
 
     /// Set transaction properties to store in the commit manifest.
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
-        self.transaction_properties = Some(properties);
+        self.transaction_properties = Some(Arc::new(properties));
         self
     }
 }

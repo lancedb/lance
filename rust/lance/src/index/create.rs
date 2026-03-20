@@ -56,8 +56,8 @@ pub struct CreateIndexBuilder<'a> {
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
-    /// Transaction properties to store in the commit manifest.
-    transaction_properties: Option<HashMap<String, String>>,
+    /// Transaction properties to store with this commit.
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -127,7 +127,7 @@ impl<'a> CreateIndexBuilder<'a> {
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed index jobs).
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
-        self.transaction_properties = Some(properties);
+        self.transaction_properties = Some(Arc::new(properties));
         self
     }
 

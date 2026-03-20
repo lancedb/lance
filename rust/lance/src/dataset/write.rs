@@ -226,7 +226,7 @@ pub struct WriteParams {
     /// Configuration key-value pairs for this write operation.
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
-    pub transaction_properties: Option<HashMap<String, String>>,
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 
     /// New base paths to register in the manifest during dataset creation.
     /// Each BasePath must have a properly assigned ID (non-zero).
@@ -303,7 +303,7 @@ impl WriteParams {
     /// Set the properties for this WriteParams.
     pub fn with_transaction_properties(self, properties: HashMap<String, String>) -> Self {
         Self {
-            transaction_properties: Some(properties),
+            transaction_properties: Some(Arc::new(properties)),
             ..self
         }
     }
