@@ -3264,10 +3264,7 @@ impl From<&Transaction> for pb::Transaction {
             }
         };
 
-        let transaction_properties = value
-            .transaction_properties
-            .clone()
-            .unwrap_or_default();
+        let transaction_properties = value.transaction_properties.clone().unwrap_or_default();
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
