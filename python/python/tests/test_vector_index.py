@@ -2750,6 +2750,58 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
     assert 0 < len(results) <= 5
 
 
+def test_index_segment_builder_builds_vector_segments(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "segment_builder_ds", 2000, 128)
+    frags = ds.get_fragments()
+    assert len(frags) >= 2
+    shared_uuid = str(uuid.uuid4())
+
+    builder = IndicesBuilder(ds, "vector")
+    preprocessed = builder.prepare_global_ivf_pq(
+        num_partitions=4,
+        num_subvectors=4,
+        distance_type="l2",
+        sample_rate=7,
+        max_iters=20,
+    )
+
+    partial_indices = []
+    for fragment in frags[:2]:
+        partial_indices.append(
+            ds._ds.create_index(
+                ["vector"],
+                "IVF_FLAT",
+                "vector_idx",
+                False,
+                True,
+                None,
+                {
+                    "fragment_ids": [fragment.fragment_id],
+                    "index_uuid": shared_uuid,
+                    "num_partitions": 4,
+                    "num_sub_vectors": 128,
+                    "ivf_centroids": preprocessed["ivf_centroids"],
+                    "pq_codebook": preprocessed["pq_codebook"],
+                },
+            )
+        )
+
+    segment_builder = ds.create_index_segment_builder(shared_uuid).with_partial_indices(
+        partial_indices
+    )
+    plans = segment_builder.plan()
+    assert len(plans) == 2
+    assert all(len(plan.partial_indices) == 1 for plan in plans)
+
+    segments = segment_builder.build_all()
+    assert len(segments) == 2
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
+
+    q = np.random.rand(128).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
 def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     """Ensure distributed IVF_PQ build is invariant to shard build order."""
     ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
