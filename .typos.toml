@@ -13,6 +13,7 @@ rabit = "rabit"
 flate = "flate"
 Ines = "Ines"
 alph = "alph"
+caf = "caf"
 
 [default.expect]
 nprobs = "nprobes"

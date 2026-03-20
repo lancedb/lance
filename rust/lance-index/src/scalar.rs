@@ -360,6 +360,9 @@ pub enum SargableQuery {
     FullTextSearch(FullTextSearchQuery),
     /// Retrieve all row ids where the value is null
     IsNull(),
+    /// Retrieve all row ids where the value matches LIKE 'prefix%' pattern
+    /// This is used for both explicit LIKE expressions and starts_with() function calls
+    LikePrefix(ScalarValue),
 }
 
 impl AnyQuery for SargableQuery {
@@ -407,6 +410,9 @@ impl AnyQuery for SargableQuery {
             }
             Self::Equals(val) => {
                 format!("{} = {}", col, val)
+            }
+            Self::LikePrefix(prefix) => {
+                format!("{} LIKE '{}%'", col, prefix)
             }
         }
     }
@@ -460,6 +466,16 @@ impl AnyQuery for SargableQuery {
             )),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
+            Self::LikePrefix(prefix) => {
+                let pattern = match prefix {
+                    ScalarValue::Utf8(Some(s)) => ScalarValue::Utf8(Some(format!("{}%", s))),
+                    ScalarValue::LargeUtf8(Some(s)) => {
+                        ScalarValue::LargeUtf8(Some(format!("{}%", s)))
+                    }
+                    other => other.clone(),
+                };
+                col_expr.like(Expr::Literal(pattern, None))
+            }
         }
     }
 
@@ -848,6 +864,62 @@ impl UpdateCriteria {
             data_criteria,
         }
     }
+}
+
+/// Compute the lexicographically next prefix by incrementing the last character's code point.
+/// Returns None if no valid upper bound exists.
+///
+/// This is used for LIKE prefix queries to convert `LIKE 'foo%'` to range `[foo, fop)`.
+///
+/// # UTF-8 and Unicode Handling
+///
+/// This function operates on Unicode code points (characters), not bytes. Since UTF-8
+/// byte ordering is identical to Unicode code point ordering, incrementing a character's
+/// code point produces the correct lexicographic successor for byte-wise string comparison.
+///
+/// If incrementing the last character would overflow or land in the surrogate range
+/// (U+D800-U+DFFF), we try incrementing the previous character, and so on.
+///
+/// Examples:
+/// - `"foo"` → `Some("fop")`
+/// - `"café"` → `Some("cafê")`  (é U+00E9 → ê U+00EA)
+/// - `"abc中"` → `Some("abc丮")` (中 U+4E2D → 丮 U+4E2E)
+/// - `"cafÿ"` → `Some("cafĀ")` (ÿ U+00FF → Ā U+0100)
+pub fn compute_next_prefix(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let chars: Vec<char> = prefix.chars().collect();
+
+    // Try incrementing characters from right to left
+    for i in (0..chars.len()).rev() {
+        if let Some(next_char) = next_unicode_char(chars[i]) {
+            let mut result: String = chars[..i].iter().collect();
+            result.push(next_char);
+            return Some(result);
+        }
+        // This character cannot be incremented (e.g., U+10FFFF), try previous
+    }
+
+    // All characters were at maximum value
+    None
+}
+
+/// Get the next valid Unicode scalar value after the given character.
+/// Skips the surrogate range (U+D800-U+DFFF) which is not valid in UTF-8.
+fn next_unicode_char(c: char) -> Option<char> {
+    let cp = c as u32;
+    let next_cp = cp.checked_add(1)?;
+
+    // Skip surrogate range (U+D800-U+DFFF)
+    let next_cp = if (0xD800..=0xDFFF).contains(&next_cp) {
+        0xE000
+    } else {
+        next_cp
+    };
+
+    char::from_u32(next_cp)
 }
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries

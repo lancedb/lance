@@ -537,6 +537,11 @@ impl ScalarIndex for BitmapIndex {
                     "full text search is not supported for bitmap indexes".into(),
                 ));
             }
+            SargableQuery::LikePrefix(_) => {
+                return Err(Error::not_supported_source(
+                    "LIKE prefix queries are not supported for bitmap indexes".into(),
+                ));
+            }
         };
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
