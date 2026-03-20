@@ -16,10 +16,26 @@ from datetime import datetime
 from typing import Optional
 
 import pyarrow as pa
+from ...dataset import Index
 
 class IndexConfig:
     index_type: str
     config: str
+
+class IndexSegment:
+    uuid: str
+    fragment_ids: set[int]
+    index_version: int
+
+    def __repr__(self) -> str: ...
+
+class IndexSegmentPlan:
+    staging_index_uuid: str
+    segment: IndexSegment
+    partial_indices: list[Index]
+    estimated_bytes: int
+
+    def __repr__(self) -> str: ...
 
 def train_ivf_model(
     dataset,

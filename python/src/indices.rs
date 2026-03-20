@@ -32,12 +32,14 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::PyJson;
+use crate::utils::{PyJson, PyLance};
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::{DatasetIndexExt, IndexDescription, IndexSegment, IndexType};
+use lance_index::{
+    DatasetIndexExt, IndexDescription, IndexSegment, IndexSegmentPlan, IndexType,
+};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
@@ -55,6 +57,93 @@ impl PyIndexConfig {
             index_type: index_type.to_string(),
             config: config.to_string(),
         })
+    }
+}
+
+#[pyclass(name = "IndexSegment", module = "lance.indices")]
+#[derive(Debug, Clone)]
+pub struct PyIndexSegment {
+    pub(crate) inner: IndexSegment,
+}
+
+impl PyIndexSegment {
+    pub(crate) fn from_inner(inner: IndexSegment) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyIndexSegment {
+    #[getter]
+    fn uuid(&self) -> String {
+        self.inner.uuid().to_string()
+    }
+
+    #[getter]
+    fn fragment_ids(&self) -> HashSet<u32> {
+        self.inner.fragment_bitmap().iter().collect()
+    }
+
+    #[getter]
+    fn index_version(&self) -> i32 {
+        self.inner.index_version()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexSegment(uuid={}, fragment_ids={:?}, index_version={})",
+            self.uuid(),
+            self.fragment_ids(),
+            self.index_version()
+        )
+    }
+}
+
+#[pyclass(name = "IndexSegmentPlan", module = "lance.indices")]
+#[derive(Debug, Clone)]
+pub struct PyIndexSegmentPlan {
+    pub(crate) inner: IndexSegmentPlan,
+}
+
+impl PyIndexSegmentPlan {
+    pub(crate) fn from_inner(inner: IndexSegmentPlan) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyIndexSegmentPlan {
+    #[getter]
+    fn staging_index_uuid(&self) -> String {
+        self.inner.staging_index_uuid().to_string()
+    }
+
+    #[getter]
+    fn segment(&self) -> PyIndexSegment {
+        PyIndexSegment::from_inner(self.inner.segment().clone())
+    }
+
+    #[getter]
+    fn partial_indices(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
+        self.inner
+            .partial_indices()
+            .iter()
+            .cloned()
+            .map(PyLance)
+            .collect()
+    }
+
+    #[getter]
+    fn estimated_bytes(&self) -> u64 {
+        self.inner.estimated_bytes()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexSegmentPlan(staging_index_uuid={}, partial_indices={}, estimated_bytes={})",
+            self.staging_index_uuid(),
+            self.inner.partial_indices().len(),
+            self.estimated_bytes()
+        )
     }
 }
 
@@ -619,6 +708,8 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
+    indices.add_class::<PyIndexSegment>()?;
+    indices.add_class::<PyIndexSegmentPlan>()?;
     indices.add_class::<PyIndexDescription>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;

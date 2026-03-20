@@ -47,7 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, SupportedDistributedIndices
+from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -3390,6 +3390,26 @@ class LanceDataset(pa.dataset.Dataset):
         # Merge physical index files at the index directory
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
         return None
+
+    def create_index_segment_builder(self, staging_index_uuid: str):
+        """
+        Create a builder for turning partial index outputs into committed segments.
+
+        The caller should pass the shared index UUID used during
+        :meth:`create_index` with ``fragment_ids=...`` and ``index_uuid=...``.
+        Then provide the returned partial index metadata through
+        :meth:`IndexSegmentBuilder.with_partial_indices`.
+        """
+        return self._ds.create_index_segment_builder(staging_index_uuid)
+
+    def commit_existing_index_segments(
+        self, index_name: str, column: str, segments: List[IndexSegment]
+    ) -> LanceDataset:
+        """
+        Commit built index segments as one logical index.
+        """
+        self._ds.commit_existing_index_segments(index_name, column, segments)
+        return self
 
     def session(self) -> Session:
         """
