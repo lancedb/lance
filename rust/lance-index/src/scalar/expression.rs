@@ -474,27 +474,31 @@ fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Opti
         return None;
     }
 
-    // Use backslash as default escape character (PostgreSQL/MySQL behavior).
-    // This is important because DataFusion's starts_with optimization escapes
-    // special characters with backslash but doesn't set escape_char field.
-    let esc = escape_char.unwrap_or('\\');
+    // Helper to check if a character at position i is escaped
+    let is_escaped = |i: usize| -> bool {
+        if let Some(esc) = escape_char {
+            if i > 0 && chars[i - 1] == esc {
+                // Check if the escape char itself is escaped
+                if i >= 2 && chars[i - 2] == esc {
+                    false // Escape was escaped, so this char is NOT escaped
+                } else {
+                    true // This char is escaped
+                }
+            } else {
+                false
+            }
+        } else {
+            // No escape character defined - nothing can be escaped
+            false
+        }
+    };
 
     // Pattern must contain at least one unescaped wildcard
     let has_wildcard = chars.iter().enumerate().any(|(i, &c)| {
         if c != '%' && c != '_' {
             return false;
         }
-        // Check if this wildcard is escaped
-        if i > 0 && chars[i - 1] == esc {
-            // Check if the escape char itself is escaped
-            if i >= 2 && chars[i - 2] == esc {
-                true // Escape was escaped, so wildcard is real
-            } else {
-                false // Wildcard is escaped
-            }
-        } else {
-            true // Not escaped
-        }
+        !is_escaped(i)
     });
 
     if !has_wildcard {
@@ -514,8 +518,11 @@ fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Opti
     while i < len {
         let c = chars[i];
 
-        // Check for escape character
-        if c == esc && i + 1 < len {
+        // Check for escape character (only if escape_char is set)
+        if let Some(esc) = escape_char
+            && c == esc
+            && i + 1 < len
+        {
             let next = chars[i + 1];
             if next == '%' || next == '_' || next == esc {
                 // Escaped character - add the literal character
@@ -2736,6 +2743,18 @@ mod tests {
 
         // Escaped trailing % is not a wildcard (no wildcards)
         assert_eq!(extract_like_leading_prefix(r"foo\%", Some('\\')), None);
+
+        // Without escape_char, backslash is a literal character (DataFusion behavior)
+        // "foo\%" with no escape means: prefix="foo\", then wildcard "%"
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\%", None),
+            Some(("foo\\".to_string(), false))
+        );
+        // "foo\bar%" with no escape means: prefix="foo\bar", then wildcard "%"
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\bar%", None),
+            Some(("foo\\bar".to_string(), false))
+        );
 
         // Empty pattern
         assert_eq!(extract_like_leading_prefix("", None), None);

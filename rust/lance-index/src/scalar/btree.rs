@@ -1504,26 +1504,36 @@ impl ScalarIndex for BTreeIndex {
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
             SargableQuery::LikePrefix(prefix) => {
                 // Convert LikePrefix to a range query: [prefix, next_prefix)
-                let (prefix_str, make_scalar): (&str, fn(String) -> ScalarValue) = match prefix {
-                    ScalarValue::Utf8(Some(s)) => (s.as_str(), |s| ScalarValue::Utf8(Some(s))),
+                match prefix {
+                    ScalarValue::Utf8(Some(s)) => {
+                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
+                        let end = match compute_next_prefix(s) {
+                            Some(next) => {
+                                Bound::Excluded(OrderableScalarValue(ScalarValue::Utf8(Some(next))))
+                            }
+                            None => Bound::Unbounded,
+                        };
+                        self.page_lookup
+                            .pages_between((start.as_ref(), end.as_ref()))
+                    }
                     ScalarValue::LargeUtf8(Some(s)) => {
-                        (s.as_str(), |s| ScalarValue::LargeUtf8(Some(s)))
+                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
+                        let end = match compute_next_prefix(s) {
+                            Some(next) => Bound::Excluded(OrderableScalarValue(
+                                ScalarValue::LargeUtf8(Some(next)),
+                            )),
+                            None => Bound::Unbounded,
+                        };
+                        self.page_lookup
+                            .pages_between((start.as_ref(), end.as_ref()))
                     }
                     _ => {
-                        return Err(Error::invalid_input(
-                            "LIKE prefix queries only support string types in BTree index",
-                        ));
+                        // Conservative: return all pages for non-string types
+                        // This is consistent with ZoneMap behavior
+                        self.page_lookup
+                            .pages_between((Bound::Unbounded, Bound::Unbounded))
                     }
-                };
-
-                let start = Bound::Included(OrderableScalarValue(prefix.clone()));
-                let end = match compute_next_prefix(prefix_str) {
-                    Some(next) => Bound::Excluded(OrderableScalarValue(make_scalar(next))),
-                    None => Bound::Unbounded, // Prefix is all 0xFF, no upper bound
-                };
-
-                self.page_lookup
-                    .pages_between((start.as_ref(), end.as_ref()))
+                }
             }
         };
 
@@ -2963,6 +2973,69 @@ mod tests {
                     "Should contain row 9 (testing): {:?}",
                     ids
                 );
+            }
+            _ => panic!("Expected Exact result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_search_large_utf8() {
+        use arrow::datatypes::DataType;
+        use arrow_array::LargeStringArray;
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let values = vec!["apple", "app", "application", "banana"];
+        let row_ids: Vec<u64> = (0..values.len() as u64).collect();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("value", DataType::LargeUtf8, false),
+            arrow::datatypes::Field::new("_rowid", DataType::UInt64, false),
+        ]));
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(values)),
+                Arc::new(arrow_array::UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async { Ok(batch) }),
+        ));
+
+        train_btree_index(stream, test_store.as_ref(), 100, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Test LikePrefix with LargeUtf8
+        let query = SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("app".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match &result {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert!(ids.contains(&0), "Should contain row 0 (apple)");
+                assert!(ids.contains(&1), "Should contain row 1 (app)");
+                assert!(ids.contains(&2), "Should contain row 2 (application)");
+                assert!(!ids.contains(&3), "Should not contain row 3 (banana)");
             }
             _ => panic!("Expected Exact result"),
         }

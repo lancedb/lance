@@ -2440,6 +2440,61 @@ mod tests {
         assert_eq!(result, SearchResult::at_most(expected));
     }
 
+    #[tokio::test]
+    async fn test_like_prefix_large_utf8() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test with LargeUtf8 type
+        let zones = vec![
+            ZoneMapStatistics {
+                min: ScalarValue::LargeUtf8(Some("aaa".to_string())),
+                max: ScalarValue::LargeUtf8(Some("azz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::LargeUtf8(Some("foo".to_string())),
+                max: ScalarValue::LargeUtf8(Some("foobar".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::LargeUtf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix with LargeUtf8
+        let query = SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("foo".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match only zone 1
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
     #[test]
     fn test_compute_next_prefix() {
         use super::compute_next_prefix;
