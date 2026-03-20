@@ -602,53 +602,26 @@ async fn read_shard_window_partitions(
     Ok(per_partition_batches)
 }
 
-/// Merge all partial_* vector index auxiliary files under `index_dir/{uuid}/partial_*/auxiliary.idx`
-/// into `index_dir/{uuid}/auxiliary.idx`.
+/// Merge the selected partial-shard auxiliary files into `target_dir`.
 ///
-/// Supports IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, IVF_HNSW_SQ storage types.
-/// For PQ and SQ, this assumes all partial indices share the same quantizer/codebook
-/// and distance type; it will reuse the first encountered metadata.
+/// This is the storage merge kernel for vector staged segment build. Callers
+/// choose which partial shards belong to one built segment and pass the corresponding
+/// auxiliary files here. The merge writes one unified `auxiliary.idx` into
+/// `target_dir`.
+///
+/// Supports IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
+/// IVF_HNSW_SQ storage types. For PQ and SQ, this assumes all selected partial
+/// shards share the same quantizer/codebook and distance type; it reuses the
+/// first encountered metadata.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
-    index_dir: &object_store::path::Path,
+    aux_paths: &[object_store::path::Path],
+    target_dir: &object_store::path::Path,
 ) -> Result<()> {
-    let mut aux_paths: Vec<object_store::path::Path> = Vec::new();
-    let mut stream = object_store.list(Some(index_dir.clone()));
-    while let Some(item) = stream.next().await {
-        if let Ok(meta) = item
-            && let Some(fname) = meta.location.filename()
-            && fname == INDEX_AUXILIARY_FILE_NAME
-        {
-            // Check parent dir name starts with partial_
-            let parts: Vec<_> = meta.location.parts().collect();
-            if parts.len() >= 2 {
-                let pname = parts[parts.len() - 2].as_ref();
-                if pname.starts_with("partial_") {
-                    aux_paths.push(meta.location.clone());
-                }
-            }
-        }
-    }
-
     if aux_paths.is_empty() {
-        // If a unified auxiliary file already exists at the root, no merge is required.
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-        if object_store.exists(&aux_out).await.unwrap_or(false) {
-            log::warn!(
-                "No partial_* auxiliary files found under index dir: {}, but unified auxiliary file already exists; skipping merge",
-                index_dir
-            );
-            return Ok(());
-        }
-        // For certain index types (e.g., FLAT/HNSW-only) the merge may be a no-op in distributed setups
-        // where shards were committed directly. In such cases, proceed without error to avoid blocking
-        // index manifest merge. PQ/SQ variants still require merging artifacts and will be handled by
-        // downstream open logic if missing.
-        log::warn!(
-            "No partial_* auxiliary files found under index dir: {}; proceeding without merge for index types that do not require auxiliary shards",
-            index_dir
-        );
-        return Ok(());
+        return Err(Error::index(
+            "No partial auxiliary files were selected for merge".to_string(),
+        ));
     }
 
     // Prepare IVF model and storage metadata aggregation
@@ -661,7 +634,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut format_version: Option<LanceFileVersion> = None;
 
     // Prepare output path; we'll create writer once when we know schema
-    let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_out = target_dir.child(INDEX_AUXILIARY_FILE_NAME);
 
     // We'll delay creating the V2 writer until we know the vector schema (dim and quantizer type)
     let mut v2w_opt: Option<V2Writer> = None;
@@ -682,7 +655,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
 
     // Iterate over each shard auxiliary file and merge its metadata and collect lengths
-    for aux in &aux_paths {
+    for aux in aux_paths {
         let fh = sched.open_file(aux, &CachedFileSize::unknown()).await?;
         let reader = V2Reader::try_open(
             fh,
@@ -1417,9 +1390,13 @@ mod tests {
             .await
             .unwrap();
 
-        merge_partial_vector_auxiliary_files(&object_store, &index_dir)
-            .await
-            .unwrap();
+        merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+        )
+        .await
+        .unwrap();
 
         let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
@@ -1515,7 +1492,12 @@ mod tests {
         .await
         .unwrap();
 
-        let res = merge_partial_vector_auxiliary_files(&object_store, &index_dir).await;
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+        )
+        .await;
         match res {
             Err(Error::Index { message, .. }) => {
                 assert!(
@@ -1690,9 +1672,13 @@ mod tests {
         .unwrap();
 
         // Merge PQ auxiliary files.
-        merge_partial_vector_auxiliary_files(&object_store, &index_dir)
-            .await
-            .unwrap();
+        merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+        )
+        .await
+        .unwrap();
 
         // 3) Unified auxiliary file exists.
         let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1818,7 +1804,12 @@ mod tests {
         .await
         .unwrap();
 
-        let res = merge_partial_vector_auxiliary_files(&object_store, &index_dir).await;
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+        )
+        .await;
         match res {
             Err(Error::Index { message, .. }) => {
                 assert!(
@@ -1893,9 +1884,13 @@ mod tests {
         .unwrap();
 
         // Merge must succeed and produce a unified auxiliary file.
-        merge_partial_vector_auxiliary_files(&object_store, &index_dir)
-            .await
-            .unwrap();
+        merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux_a.clone(), aux_b.clone()],
+            &index_dir,
+        )
+        .await
+        .unwrap();
 
         let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
