@@ -46,7 +46,7 @@ pub struct CommitBuilder<'a> {
     detached: bool,
     commit_config: CommitConfig,
     affected_rows: Option<RowAddrTreeMap>,
-    transaction_properties: Option<Arc<HashMap<String, String>>>,
+    transaction_properties: Option<HashMap<String, String>>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -176,7 +176,7 @@ impl<'a> CommitBuilder<'a> {
         mut self,
         transaction_properties: HashMap<String, String>,
     ) -> Self {
-        self.transaction_properties = Some(Arc::new(transaction_properties));
+        self.transaction_properties = Some(transaction_properties);
         self
     }
 

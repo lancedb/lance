@@ -57,7 +57,7 @@ pub struct Transaction {
     pub uuid: String,
     pub operation: Operation,
     pub tag: Option<String>,
-    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    pub transaction_properties: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1396,7 +1396,7 @@ pub struct TransactionBuilder {
     uuid: Option<String>,
     operation: Operation,
     tag: Option<String>,
-    transaction_properties: Option<Arc<HashMap<String, String>>>,
+    transaction_properties: Option<HashMap<String, String>>,
 }
 
 impl TransactionBuilder {
@@ -1422,7 +1422,7 @@ impl TransactionBuilder {
 
     pub fn transaction_properties(
         mut self,
-        transaction_properties: Option<Arc<HashMap<String, String>>>,
+        transaction_properties: Option<HashMap<String, String>>,
     ) -> Self {
         self.transaction_properties = transaction_properties;
         self
@@ -2265,11 +2265,6 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
-        // Merge transaction properties into manifest config if present
-        if let Some(tx_props) = &self.transaction_properties {
-            manifest.config_mut().extend(tx_props.as_ref().clone());
-        }
-
         Ok((manifest, final_indices))
     }
 
@@ -3011,7 +3006,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             transaction_properties: if message.transaction_properties.is_empty() {
                 None
             } else {
-                Some(Arc::new(message.transaction_properties))
+                Some(message.transaction_properties)
             },
         })
     }
@@ -3271,8 +3266,7 @@ impl From<&Transaction> for pb::Transaction {
 
         let transaction_properties = value
             .transaction_properties
-            .as_ref()
-            .map(|arc| arc.as_ref().clone())
+            .clone()
             .unwrap_or_default();
         Self {
             read_version: value.read_version,

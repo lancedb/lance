@@ -56,7 +56,7 @@ async fn test_read_transaction_properties() {
     properties1.insert("custom_prop".to_string(), "custom_value".to_string());
 
     let write_params = WriteParams {
-        transaction_properties: Some(Arc::new(properties1)),
+        transaction_properties: Some(properties1),
         ..Default::default()
     };
 
@@ -86,7 +86,7 @@ async fn test_read_transaction_properties() {
     properties2.insert("another_prop".to_string(), "another_value".to_string());
 
     let write_params = WriteParams {
-        transaction_properties: Some(Arc::new(properties2)),
+        transaction_properties: Some(properties2),
         mode: WriteMode::Append,
         ..Default::default()
     };

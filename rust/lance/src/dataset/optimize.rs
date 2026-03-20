@@ -209,13 +209,13 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
-    /// Transaction properties to store in the commit manifest.
+    /// Transaction properties to store with this commit.
     ///
-    /// These key-value pairs are stored in the transaction's manifest config
+    /// These key-value pairs are stored in the transaction file
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed compaction jobs).
     #[serde(skip)]
-    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    pub transaction_properties: Option<HashMap<String, String>>,
 }
 
 #[allow(deprecated)]
@@ -390,7 +390,7 @@ impl CompactionOptions {
     }
 
     /// Set transaction properties to store in the commit manifest.
-    pub fn transaction_properties(mut self, properties: Arc<HashMap<String, String>>) -> Self {
+    pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.transaction_properties = Some(properties);
         self
     }

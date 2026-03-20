@@ -57,7 +57,7 @@ pub struct CreateIndexBuilder<'a> {
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store in the commit manifest.
-    transaction_properties: Option<Arc<HashMap<String, String>>>,
+    transaction_properties: Option<HashMap<String, String>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -121,12 +121,12 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    /// Set transaction properties to store in the commit manifest.
+    /// Set transaction properties to store with this commit.
     ///
-    /// These key-value pairs are stored in the transaction's manifest config
+    /// These key-value pairs are stored in the transaction file
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed index jobs).
-    pub fn transaction_properties(mut self, properties: Arc<HashMap<String, String>>) -> Self {
+    pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.transaction_properties = Some(properties);
         self
     }

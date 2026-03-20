@@ -1528,7 +1528,7 @@ impl Dataset {
         let operation = Operation::UpdateBases { new_bases };
 
         let transaction = TransactionBuilder::new(self.manifest.version, operation)
-            .transaction_properties(transaction_properties.map(Arc::new))
+            .transaction_properties(transaction_properties)
             .build();
 
         let new_dataset = CommitBuilder::new(self.clone())
