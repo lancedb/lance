@@ -2765,26 +2765,21 @@ def test_index_segment_builder_builds_vector_segments(tmp_path):
         max_iters=20,
     )
 
-    partial_indices = []
-    for fragment in frags[:2]:
-        partial_indices.append(
-            ds._ds.create_index(
-                ["vector"],
-                "IVF_FLAT",
-                "vector_idx",
-                False,
-                True,
-                None,
-                {
-                    "fragment_ids": [fragment.fragment_id],
-                    "index_uuid": shared_uuid,
-                    "num_partitions": 4,
-                    "num_sub_vectors": 128,
-                    "ivf_centroids": preprocessed["ivf_centroids"],
-                    "pq_codebook": preprocessed["pq_codebook"],
-                },
-            )
+    partial_indices = [
+        ds.create_index_uncommitted(
+            "vector",
+            "IVF_FLAT",
+            name="vector_idx",
+            train=True,
+            fragment_ids=[fragment.fragment_id],
+            index_uuid=shared_uuid,
+            num_partitions=4,
+            num_sub_vectors=128,
+            ivf_centroids=preprocessed["ivf_centroids"],
+            pq_codebook=preprocessed["pq_codebook"],
         )
+        for fragment in frags[:2]
+    ]
 
     segment_builder = ds.create_index_segment_builder(shared_uuid).with_partial_indices(
         partial_indices

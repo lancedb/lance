@@ -86,8 +86,9 @@ The current model for distributed vector indexing has two layers of parallelism.
 
 First, multiple workers build partial shards in parallel:
 
-1. on each worker, call
+1. on each worker, call an uncommitted shard-build API such as
    `create_index_builder(...).fragments(...).index_uuid(staging_index_uuid).execute_uncommitted()`
+   or Python `create_index_uncommitted(..., fragment_ids=..., index_uuid=...)`
 2. each worker writes one `partial_<uuid>/` under the shared staging root
 
 ### Segment Build

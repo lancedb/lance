@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Optional
 
 import pyarrow as pa
+
 from ...dataset import Index
 
 class IndexConfig:

@@ -1887,7 +1887,6 @@ async fn write_ivf_hnsw_file(
 ///
 /// The planner returns a `Vec<IndexSegmentPlan>` so callers can decide
 /// whether to execute the work serially or fan it out externally.
-
 /// Plan how one staging root should be turned into built physical segments.
 ///
 /// This function does not touch storage. It only:
