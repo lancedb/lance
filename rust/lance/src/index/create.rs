@@ -17,10 +17,10 @@ use crate::{
         vector_index_details,
     },
 };
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, try_join_all};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
+use lance_index::{IndexParams, IndexSegment, IndexSegmentPlan, IndexType, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
@@ -196,6 +196,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 .map_err(|e| Error::index(format!("Invalid UUID string provided: {}", e)))?,
             None => Uuid::new_v4(),
         };
+        let mut output_index_uuid = index_id;
         let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
@@ -323,7 +324,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
-                        Box::pin(build_distributed_vector_index(
+                        let shard_uuid = Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -334,6 +335,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             self.progress.clone(),
                         ))
                         .await?;
+                        output_index_uuid = shard_uuid;
                     } else {
                         // Standard full dataset indexing
                         Box::pin(build_vector_index(
@@ -359,7 +361,14 @@ impl<'a> CreateIndexBuilder<'a> {
                     .await?;
                 }
                 // Capture file sizes after vector index creation
-                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let index_dir = if self.fragments.is_some() {
+                    self.dataset
+                        .indices_dir()
+                        .child(index_id.to_string())
+                        .child(format!("partial_{}", output_index_uuid))
+                } else {
+                    self.dataset.indices_dir().child(index_id.to_string())
+                };
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
@@ -420,7 +429,7 @@ impl<'a> CreateIndexBuilder<'a> {
         };
 
         Ok(IndexMetadata {
-            uuid: index_id,
+            uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
@@ -491,6 +500,91 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
+    }
+}
+
+/// Build physical index segments from previously-written partial index outputs.
+///
+/// Use [`DatasetIndexExt::create_index_segment_builder`] to open a staging root
+/// and then either:
+///
+/// - call [`Self::plan`] and orchestrate individual segment builds externally, or
+/// - call [`Self::build_all`] to build all segments on the current node.
+///
+/// This builder only builds physical segments. Publishing those segments as
+/// a logical index still requires [`DatasetIndexExt::commit_existing_index_segments`].
+/// Together these two APIs form the canonical distributed vector segment build workflow.
+#[derive(Clone)]
+pub struct IndexSegmentBuilder<'a> {
+    dataset: &'a Dataset,
+    staging_index_uuid: String,
+    partial_indices: Vec<IndexMetadata>,
+    target_segment_bytes: Option<u64>,
+}
+
+impl<'a> IndexSegmentBuilder<'a> {
+    pub(crate) fn new(dataset: &'a Dataset, staging_index_uuid: String) -> Self {
+        Self {
+            dataset,
+            staging_index_uuid,
+            partial_indices: Vec::new(),
+            target_segment_bytes: None,
+        }
+    }
+
+    /// Provide the partial index metadata returned by `execute_uncommitted()`
+    /// for this staging root.
+    pub fn with_partial_indices(mut self, partial_indices: Vec<IndexMetadata>) -> Self {
+        self.partial_indices = partial_indices;
+        self
+    }
+
+    /// Set the target size, in bytes, for merged built segments.
+    ///
+    /// When set, shard outputs will be grouped into larger built segments up to
+    /// approximately this size. When unset, each shard output becomes one built
+    /// segment.
+    pub fn with_target_segment_bytes(mut self, bytes: u64) -> Self {
+        self.target_segment_bytes = Some(bytes);
+        self
+    }
+
+    /// Plan how partial indices should be grouped into built segments.
+    pub async fn plan(&self) -> Result<Vec<IndexSegmentPlan>> {
+        if self.partial_indices.is_empty() {
+            return Err(Error::invalid_input(
+                "IndexSegmentBuilder requires at least one partial index; \
+                 call with_partial_indices(...) with execute_uncommitted() outputs"
+                    .to_string(),
+            ));
+        }
+
+        crate::index::vector::ivf::plan_staging_segments(
+            &self
+                .dataset
+                .indices_dir()
+                .child(self.staging_index_uuid.as_str()),
+            &self.partial_indices,
+            None,
+            self.target_segment_bytes,
+        )
+        .await
+    }
+
+    /// Build one segment from a previously-generated plan.
+    pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
+        crate::index::vector::ivf::build_staging_segment(
+            self.dataset.object_store(),
+            &self.dataset.indices_dir(),
+            plan,
+        )
+        .await
+    }
+
+    /// Plan and build all segments from this staging root.
+    pub async fn build_all(&self) -> Result<Vec<IndexSegment>> {
+        let plans = self.plan().await?;
+        try_join_all(plans.iter().map(|plan| self.build(plan))).await
     }
 }
 

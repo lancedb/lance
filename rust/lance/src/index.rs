@@ -582,6 +582,7 @@ impl IndexDescription for IndexDescriptionImpl {
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
+    type IndexSegmentBuilder<'a> = create::IndexSegmentBuilder<'a>;
 
     /// Create a builder for creating an index on columns.
     ///
@@ -625,6 +626,13 @@ impl DatasetIndexExt for Dataset {
         params: &'a dyn IndexParams,
     ) -> CreateIndexBuilder<'a> {
         CreateIndexBuilder::new(self, columns, index_type, params)
+    }
+
+    fn create_index_segment_builder<'a>(
+        &'a self,
+        staging_index_uuid: String,
+    ) -> create::IndexSegmentBuilder<'a> {
+        create::IndexSegmentBuilder::new(self, staging_index_uuid)
     }
 
     #[instrument(skip_all)]

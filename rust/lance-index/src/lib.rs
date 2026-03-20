@@ -33,7 +33,7 @@ pub mod types;
 pub mod vector;
 
 pub use crate::traits::*;
-pub use crate::types::IndexSegment;
+pub use crate::types::{IndexSegment, IndexSegmentPlan};
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
 /// The name of the auxiliary index file.
