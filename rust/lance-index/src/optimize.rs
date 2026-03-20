@@ -86,10 +86,7 @@ impl OptimizeOptions {
     }
 
     /// Set transaction properties to store in the commit manifest.
-    pub fn transaction_properties(
-        mut self,
-        properties: Arc<HashMap<String, String>>,
-    ) -> Self {
+    pub fn transaction_properties(mut self, properties: Arc<HashMap<String, String>>) -> Self {
         self.transaction_properties = Some(properties);
         self
     }

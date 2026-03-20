@@ -126,10 +126,7 @@ impl<'a> CreateIndexBuilder<'a> {
     /// These key-value pairs are stored in the transaction's manifest config
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed index jobs).
-    pub fn transaction_properties(
-        mut self,
-        properties: Arc<HashMap<String, String>>,
-    ) -> Self {
+    pub fn transaction_properties(mut self, properties: Arc<HashMap<String, String>>) -> Self {
         self.transaction_properties = Some(properties);
         self
     }

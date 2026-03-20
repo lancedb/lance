@@ -89,7 +89,9 @@ use std::sync::Arc;
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder};
+use super::transaction::{
+    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+};
 use super::utils::make_rowid_capture_stream;
 use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
@@ -388,10 +390,7 @@ impl CompactionOptions {
     }
 
     /// Set transaction properties to store in the commit manifest.
-    pub fn transaction_properties(
-        mut self,
-        properties: Arc<HashMap<String, String>>,
-    ) -> Self {
+    pub fn transaction_properties(mut self, properties: Arc<HashMap<String, String>>) -> Self {
         self.transaction_properties = Some(properties);
         self
     }
