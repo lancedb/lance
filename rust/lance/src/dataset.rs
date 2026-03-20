@@ -1776,6 +1776,27 @@ impl Dataset {
         Ok(versions)
     }
 
+    /// List all detached manifest locations.
+    ///
+    /// Detached manifests are versions that are not part of the main version history.
+    /// They are created by `commit_detached` and can be used for staging changes.
+    ///
+    /// To read transaction properties from a detached manifest:
+    /// ```ignore
+    /// let detached = dataset.list_detached_manifests().await?;
+    /// for location in detached {
+    ///     let ds = dataset.checkout_version(location.version).await?;
+    ///     let tx = ds.read_transaction().await?;
+    ///     // Access tx.transaction_properties
+    /// }
+    /// ```
+    pub async fn list_detached_manifests(&self) -> Result<Vec<ManifestLocation>> {
+        self.commit_handler
+            .list_detached_manifest_locations(&self.base, &self.object_store)
+            .try_collect()
+            .await
+    }
+
     /// Get the latest version of the dataset
     /// This is meant to be a fast path for checking if a dataset has changed. This is why
     /// we don't return the full version struct.
