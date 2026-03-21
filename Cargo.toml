@@ -89,8 +89,8 @@ async-trait = "0.1"
 axum = "0.7"
 aws-config = "1.2.0"
 aws-credential-types = "1.2.0"
-aws-sdk-dynamodb = "1.38.0"
-aws-sdk-s3 = "1.38.0"
+aws-sdk-dynamodb = { version = "1.38.0", default-features = false }
+aws-sdk-s3 = { version = "1.38.0", default-features = false }
 half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
