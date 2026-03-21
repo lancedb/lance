@@ -810,7 +810,7 @@ impl DatasetIndexExt for Dataset {
                     index_name
                 )));
             }
-            if covered_fragments.intersection_len(segment.fragment_bitmap()) > 0 {
+            if !covered_fragments.is_disjoint(segment.fragment_bitmap()) {
                 return Err(Error::invalid_input(format!(
                     "CreateIndex: overlapping fragment coverage in segment set for index '{}'",
                     index_name
