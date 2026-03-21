@@ -2061,6 +2061,23 @@ mod tests {
                 .iter()
                 .any(|plan| plan.partial_indices().len() > 1)
         );
+        let mut expected_fragment_coverage = grouped_plan
+            .iter()
+            .map(|plan| {
+                plan.partial_indices()
+                    .iter()
+                    .flat_map(|partial| {
+                        partial
+                            .fragment_bitmap
+                            .as_ref()
+                            .expect("partial shard should have fragment coverage")
+                            .iter()
+                    })
+                    .sorted()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        expected_fragment_coverage.sort();
 
         let grouped_segments = build_distributed_segments(
             &mut ds_split,
@@ -2071,6 +2088,15 @@ mod tests {
         )
         .await;
         assert_eq!(grouped_segments.len(), grouped_plan.len());
+        let mut actual_fragment_coverage = grouped_segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        actual_fragment_coverage.sort();
+        assert_eq!(
+            actual_fragment_coverage, expected_fragment_coverage,
+            "built segment coverage should equal the union of its source partial shards",
+        );
 
         async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
             let mut ids_per_query = Vec::with_capacity(queries.len());

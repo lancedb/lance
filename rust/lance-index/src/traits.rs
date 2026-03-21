@@ -297,7 +297,8 @@ pub trait DatasetIndexExt {
     /// This publishes already-built physical segments. It does not build
     /// or merge index data; callers should first build segments with
     /// [`Self::create_index_segment_builder`] or another index-specific build
-    /// path and then pass the resulting segments here.
+    /// path and then pass the resulting segments here. Segment fragment
+    /// coverage must be disjoint within a single commit.
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,

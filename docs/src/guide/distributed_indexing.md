@@ -108,6 +108,8 @@ At that point the caller has two execution choices:
 After the segments are built, publish them with
 `commit_existing_index_segments(...)`.
 
+Within a single commit, built segments must have disjoint fragment coverage.
+
 ## Internal Segmented Finalize Model
 
 Internally, Lance models distributed vector segment build as:
@@ -150,6 +152,11 @@ Lance is responsible for:
 - planning built segments from the discovered shard set
 - merging shard storage into built segment artifacts
 - committing built segments into the manifest
+
+If a staging root or built segment directory is never committed, it remains an
+unreferenced index directory under `_indices/`. These artifacts are cleaned up
+by `cleanup_old_versions(...)` using the same age-based rules as other
+unreferenced index files.
 
 This split keeps distributed scheduling outside the storage engine while still
 letting Lance own the on-disk index format.

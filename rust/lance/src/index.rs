@@ -801,6 +801,7 @@ impl DatasetIndexExt for Dataset {
         };
 
         let mut seen_segment_ids = HashSet::with_capacity(segments.len());
+        let mut covered_fragments = RoaringBitmap::new();
         for segment in &segments {
             if !seen_segment_ids.insert(segment.uuid()) {
                 return Err(Error::invalid_input(format!(
@@ -809,6 +810,13 @@ impl DatasetIndexExt for Dataset {
                     index_name
                 )));
             }
+            if covered_fragments.intersection_len(segment.fragment_bitmap()) > 0 {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: overlapping fragment coverage in segment set for index '{}'",
+                    index_name
+                )));
+            }
+            covered_fragments |= segment.fragment_bitmap().clone();
         }
 
         let new_indices = segments
@@ -5323,6 +5331,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_overlapping_fragment_coverage() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![
+                    IndexSegment::new(
+                        Uuid::new_v4(),
+                        [0_u32, 1_u32],
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version(),
+                    ),
+                    IndexSegment::new(
+                        Uuid::new_v4(),
+                        [1_u32],
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
     #[tokio::test]
