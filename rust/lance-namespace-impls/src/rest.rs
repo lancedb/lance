@@ -46,6 +46,39 @@ use serde::{Serialize, de::DeserializeOwned};
 use lance_core::{Error, Result, box_error};
 
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
+
+/// Convert an HTTP error response into a `NamespaceError`.
+///
+/// The server may include a `code` field in the JSON body. If present, use it
+/// to reconstruct the exact `NamespaceError` variant.  If the body cannot be
+/// parsed or has no code, fall back to `NamespaceError::Internal`.
+fn http_error_to_namespace_error(status: reqwest::StatusCode, content: &str) -> Error {
+    let ns_err = if let Ok(body) = serde_json::from_str::<serde_json::Value>(content) {
+        let code = body
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_u64())
+            .map(|c| c as u32);
+        let message = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or(content)
+            .to_string();
+        match code {
+            Some(code) => NamespaceError::from_code(code, message),
+            None => NamespaceError::Internal {
+                message: format!("HTTP error {}: {}", status, content),
+            },
+        }
+    } else {
+        NamespaceError::Internal {
+            message: format!("HTTP error {}: {}", status, content),
+        }
+    };
+    ns_err.into()
+}
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
@@ -522,9 +555,7 @@ impl RestNamespace {
                 Error::namespace_source(format!("Failed to parse response: {}", e).into())
             })
         } else {
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(http_error_to_namespace_error(status, &content))
         }
     }
 
@@ -557,9 +588,7 @@ impl RestNamespace {
                 Error::namespace_source(format!("Failed to parse response: {}", e).into())
             })
         } else {
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(http_error_to_namespace_error(status, &content))
         }
     }
 
@@ -589,9 +618,7 @@ impl RestNamespace {
                 .text()
                 .await
                 .map_err(|e| Error::io_source(box_error(e)))?;
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(http_error_to_namespace_error(status, &content))
         }
     }
 
@@ -624,9 +651,7 @@ impl RestNamespace {
                 Error::namespace_source(format!("Failed to parse response: {}", e).into())
             })
         } else {
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(http_error_to_namespace_error(status, &content))
         }
     }
 
@@ -659,9 +684,7 @@ impl RestNamespace {
                 .text()
                 .await
                 .map_err(|e| Error::io_source(box_error(e)))?;
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(http_error_to_namespace_error(status, &content))
         }
     }
 
@@ -986,9 +1009,7 @@ impl LanceNamespace for RestNamespace {
                 .text()
                 .await
                 .map_err(|e| Error::io_source(box_error(e)))?;
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(http_error_to_namespace_error(status, &content))
         }
     }
 

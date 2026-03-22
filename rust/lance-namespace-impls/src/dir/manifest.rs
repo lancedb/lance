@@ -1862,9 +1862,10 @@ impl LanceNamespace for ManifestNamespace {
         if exists {
             Ok(())
         } else {
-            Err(Error::namespace_source(
-                format!("Table '{}' not found", table_name).into(),
-            ))
+            Err(NamespaceError::TableNotFound {
+                message: format!("Table '{}' not found", table_name),
+            }
+            .into())
         }
     }
 
@@ -2239,9 +2240,10 @@ impl LanceNamespace for ManifestNamespace {
         if self.manifest_contains_object(&object_id).await? {
             Ok(())
         } else {
-            Err(Error::namespace_source(
-                format!("Namespace '{}' not found", object_id).into(),
-            ))
+            Err(NamespaceError::NamespaceNotFound {
+                message: format!("Namespace '{}' not found", object_id),
+            }
+            .into())
         }
     }
 

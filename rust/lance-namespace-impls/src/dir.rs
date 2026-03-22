@@ -39,6 +39,7 @@ use lance_namespace::models::{
 
 use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
 
 use crate::credentials::{
@@ -1087,9 +1088,11 @@ impl LanceNamespace for DirectoryNamespace {
             return Ok(());
         }
 
-        Err(Error::namespace_source(
-            "Child namespaces are only supported when manifest mode is enabled".into(),
-        ))
+        Err(NamespaceError::Unsupported {
+            message: "Child namespaces are only supported when manifest mode is enabled"
+                .to_string(),
+        }
+        .into())
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -1346,15 +1349,17 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table does not exist: {}", table_name),
+            }
+            .into());
         }
 
         if status.is_deregistered {
-            return Err(Error::namespace_source(
-                format!("Table is deregistered: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
         }
 
         Ok(())
@@ -2266,12 +2271,13 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.table_exists(request).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Table does not exist")
-        );
+        let err = result.unwrap_err();
+        if let Error::Namespace { source, .. } = &err {
+            let ns_err = source.downcast_ref::<NamespaceError>().unwrap();
+            assert!(matches!(ns_err, NamespaceError::TableNotFound { .. }));
+        } else {
+            panic!("Expected Namespace error, got: {}", err);
+        }
     }
 
     #[tokio::test]

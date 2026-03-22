@@ -32,6 +32,7 @@ from lance_namespace import (
     TableExistsRequest,
     connect,
 )
+from lance_namespace.errors import NamespaceNotFoundError, TableNotFoundError
 
 
 def create_test_data():
@@ -236,14 +237,14 @@ class TestTableOperations:
         rest_namespace.table_exists(exists_req)
 
     def test_table_not_exists(self, rest_namespace):
-        """Test checking if a non-existent table exists."""
+        """Test checking if a non-existent table exists raises TableNotFoundError."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
         rest_namespace.create_namespace(create_ns_req)
 
         exists_req = TableExistsRequest(id=["workspace", "nonexistent"])
 
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             rest_namespace.table_exists(exists_req)
 
     def test_drop_table(self, rest_namespace):
@@ -265,7 +266,7 @@ class TestTableOperations:
 
         # Verify table no longer exists
         exists_req = TableExistsRequest(id=["workspace", "test_table"])
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             rest_namespace.table_exists(exists_req)
 
     def test_deregister_table(self, rest_namespace):
@@ -292,7 +293,7 @@ class TestTableOperations:
         assert response.id == ["workspace", "test_table"]
 
         # Verify table no longer exists in namespace
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             rest_namespace.table_exists(exists_req)
 
     def test_register_table(self, rest_namespace):
@@ -457,7 +458,7 @@ class TestChildNamespaceOperations:
 
         # Verify table no longer exists
         exists_req = TableExistsRequest(id=["test_ns", "table1"])
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             rest_namespace.table_exists(exists_req)
 
     def test_declared_table_in_child_namespace(self, rest_namespace):
@@ -612,6 +613,13 @@ class TestBasicNamespaceOperations:
         # Check it exists (should not raise)
         exists_req = NamespaceExistsRequest(id=["workspace"])
         rest_namespace.namespace_exists(exists_req)
+
+    def test_namespace_not_exists(self, rest_namespace):
+        """Test checking if a non-existent namespace exists raises NamespaceNotFoundError."""
+        exists_req = NamespaceExistsRequest(id=["nonexistent"])
+
+        with pytest.raises(NamespaceNotFoundError):
+            rest_namespace.namespace_exists(exists_req)
 
     def test_drop_empty_namespace(self, rest_namespace):
         """Test dropping an empty namespace."""

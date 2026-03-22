@@ -25,6 +25,7 @@ use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::*;
 
 /// Configuration for the REST server
@@ -252,42 +253,62 @@ struct PaginationQuery {
 /// Convert Lance errors to HTTP responses
 fn error_to_response(err: Error) -> Response {
     match err {
-        Error::Namespace { source, .. } => {
-            let error_msg = source.to_string();
-            if error_msg.contains("not found") || error_msg.contains("does not exist") {
-                (
-                    StatusCode::NOT_FOUND,
+        Error::Namespace { ref source, .. } => {
+            if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
+                let (status, error_type) = match ns_err.code() {
+                    ErrorCode::NamespaceNotFound => {
+                        (StatusCode::NOT_FOUND, "NamespaceNotFoundException")
+                    }
+                    ErrorCode::TableNotFound => (StatusCode::NOT_FOUND, "TableNotFoundException"),
+                    ErrorCode::NamespaceAlreadyExists => {
+                        (StatusCode::CONFLICT, "NamespaceAlreadyExistsException")
+                    }
+                    ErrorCode::TableAlreadyExists => {
+                        (StatusCode::CONFLICT, "TableAlreadyExistsException")
+                    }
+                    ErrorCode::NamespaceNotEmpty => {
+                        (StatusCode::CONFLICT, "NamespaceNotEmptyException")
+                    }
+                    ErrorCode::InvalidInput => (StatusCode::BAD_REQUEST, "InvalidInputException"),
+                    ErrorCode::Unsupported => {
+                        (StatusCode::NOT_IMPLEMENTED, "UnsupportedOperationException")
+                    }
+                    ErrorCode::PermissionDenied => {
+                        (StatusCode::FORBIDDEN, "PermissionDeniedException")
+                    }
+                    ErrorCode::Unauthenticated => {
+                        (StatusCode::UNAUTHORIZED, "UnauthenticatedException")
+                    }
+                    ErrorCode::ServiceUnavailable => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ServiceUnavailableException",
+                    ),
+                    _ => (StatusCode::INTERNAL_SERVER_ERROR, "NamespaceException"),
+                };
+                return (
+                    status,
                     Json(serde_json::json!({
                         "error": {
-                            "message": error_msg,
-                            "type": "NamespaceNotFoundException"
+                            "message": ns_err.to_string(),
+                            "type": error_type,
+                            "code": ns_err.code().as_u32()
                         }
                     })),
                 )
-                    .into_response()
-            } else if error_msg.contains("already exists") {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_msg,
-                            "type": "TableAlreadyExistsException"
-                        }
-                    })),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_msg,
-                            "type": "NamespaceException"
-                        }
-                    })),
-                )
-                    .into_response()
+                    .into_response();
             }
+            // Fallback for non-NamespaceError sources
+            let error_msg = source.to_string();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": error_msg,
+                        "type": "NamespaceException"
+                    }
+                })),
+            )
+                .into_response()
         }
         Error::IO { source, .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
