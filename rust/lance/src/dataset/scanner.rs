@@ -4437,6 +4437,83 @@ impl Scanner {
 
         Ok(format!("{}", display.indent(verbose)))
     }
+
+    /// Plan a filtered read and serialize the plan to protobuf bytes.
+    ///
+    /// This enables distributed execution patterns where a master node plans
+    /// the scan and worker nodes execute portions of it. The returned bytes
+    /// encode a `FilteredReadExecProto` (including the pre-computed plan) and
+    /// can be deserialized on a worker via
+    /// [`execute_filtered_read_from_bytes`](crate::io::exec::filtered_read_proto::execute_filtered_read_from_bytes).
+    ///
+    /// The method builds a [`FilteredReadExec`] using the current scanner
+    /// settings, triggers planning (computing which fragments/rows to read),
+    /// and serializes the result.
+    #[cfg(feature = "substrait")]
+    pub async fn plan_filtered_read(&self) -> Result<Vec<u8>> {
+        use datafusion::prelude::SessionContext;
+        use prost::Message;
+
+        use crate::io::exec::filtered_read_proto::filtered_read_exec_to_proto;
+
+        // Build filter plan the same way create_plan does for non-indexed scans
+        let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
+        let filter_plan = self.create_filter_plan(use_scalar_index).await?;
+        let expr_filter_plan = &filter_plan.expr_filter_plan;
+
+        // Compute the projection — same logic as filtered_read_source
+        let effective_projection = self.projection_plan.physical_projection.clone();
+
+        let projection = if expr_filter_plan.has_refine() {
+            self.calc_eager_projection(expr_filter_plan, &effective_projection)?
+                .with_row_id()
+        } else {
+            effective_projection
+        };
+
+        // Build the FilteredReadOptions, mirroring new_filtered_read
+        let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
+            .with_filter_plan(expr_filter_plan.clone())
+            .with_projection(projection);
+
+        if let Some(ref fragments) = self.fragments {
+            read_options = read_options.with_fragments(Arc::new(fragments.clone()));
+        }
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(batch_size as u32);
+        }
+
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
+        }
+
+        if self.include_deleted_rows {
+            read_options = read_options.with_deleted_rows()?;
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        // Build scalar index input if the filter plan uses one
+        let index_input = expr_filter_plan.index_query.clone().map(|index_query| {
+            Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
+                as Arc<dyn ExecutionPlan>
+        });
+
+        let exec = FilteredReadExec::try_new(self.dataset.clone(), read_options, index_input)?;
+
+        // Trigger planning so the plan is embedded in the exec
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+        exec.ensure_plan_initialized(task_ctx).await?;
+
+        // Serialize the exec (with the now-computed plan) to proto bytes
+        let state = ctx.state();
+        let proto = filtered_read_exec_to_proto(&exec, &state).await?;
+        Ok(proto.encode_to_vec())
+    }
 }
 
 // Search over all indexed fields including nested ones, collecting columns that have an

@@ -10,7 +10,7 @@ use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
 use jni::objects::{JObject, JString};
-use jni::sys::{JNI_TRUE, jboolean, jint};
+use jni::sys::{JNI_TRUE, jboolean, jbyteArray, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance_index::scalar::FullTextSearchQuery;
@@ -560,4 +560,117 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
     let scanner_guard =
         unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
     scanner_guard.count_rows()
+}
+
+/////////////////////////////
+// Filtered Read Methods   //
+/////////////////////////////
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_FilteredRead_nativeCreatePlan<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JObject,
+    j_scanner: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_create_plan(&mut env, j_scanner))
+}
+
+fn inner_create_plan<'local>(
+    env: &mut JNIEnv<'local>,
+    j_scanner: JObject,
+) -> Result<JObject<'local>> {
+    // Step 1: plan the filtered read (what nativePlanFilteredRead did)
+    let scanner_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
+    let proto_bytes = RT.block_on(scanner_guard.inner.plan_filtered_read())?;
+    drop(scanner_guard);
+
+    // Step 2: split and inspect the plan (what nativeSplitAndInspectPlan did)
+    let result = lance::io::exec::filtered_read_proto::split_and_inspect_plan_proto(&proto_bytes)?;
+
+    // Build Java byte[] for filteredReadExecProto
+    let j_proto_bytes = env.byte_array_from_slice(&proto_bytes)?;
+
+    // Build Java ArrayList<byte[]> for splitProtos
+    let split_list = env.new_object(
+        "java/util/ArrayList",
+        "(I)V",
+        &[jni::objects::JValue::Int(result.split_protos.len() as i32)],
+    )?;
+    for bytes in &result.split_protos {
+        let j_bytes = env.byte_array_from_slice(bytes)?;
+        env.call_method(
+            &split_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[jni::objects::JValue::Object(&j_bytes.into())],
+        )?;
+    }
+
+    // Build Java int[] for fragmentIds
+    let j_fragment_ids = env.new_int_array(result.fragment_ids.len() as i32)?;
+    let int_values: Vec<i32> = result.fragment_ids.iter().map(|&id| id as i32).collect();
+    env.set_int_array_region(&j_fragment_ids, 0, &int_values)?;
+
+    // Build Java long[] for rowsPerFragment
+    let j_rows = env.new_long_array(result.rows_per_fragment.len() as i32)?;
+    env.set_long_array_region(&j_rows, 0, &result.rows_per_fragment)?;
+
+    // Construct FilteredRead(byte[], List<byte[]>, int[], long[])
+    let plan_obj = env.new_object(
+        "org/lance/ipc/FilteredRead",
+        "([BLjava/util/List;[I[J)V",
+        &[
+            jni::objects::JValue::Object(&j_proto_bytes.into()),
+            jni::objects::JValue::Object(&split_list),
+            jni::objects::JValue::Object(&j_fragment_ids.into()),
+            jni::objects::JValue::Object(&j_rows.into()),
+        ],
+    )?;
+
+    Ok(plan_obj)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_FilteredRead_nativeExecuteFilteredRead(
+    mut env: JNIEnv,
+    _cls: JObject,
+    j_dataset: JObject,
+    j_proto_bytes: jbyteArray,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_execute_filtered_read(&mut env, j_dataset, j_proto_bytes, stream_addr)
+    );
+}
+
+fn inner_execute_filtered_read(
+    env: &mut JNIEnv,
+    j_dataset: JObject,
+    j_proto_bytes: jbyteArray,
+    stream_addr: jlong,
+) -> Result<()> {
+    let j_byte_array = unsafe { jni::objects::JByteArray::from_raw(j_proto_bytes) };
+    let proto_bytes = env.convert_byte_array(j_byte_array)?;
+
+    // Get the dataset to avoid re-opening from URI
+    let dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(j_dataset, NATIVE_DATASET) }?;
+        Some(Arc::new(dataset_guard.inner.clone()))
+    };
+
+    let sendable_stream = RT.block_on(
+        lance::io::exec::filtered_read_proto::execute_filtered_read_from_bytes(
+            &proto_bytes,
+            dataset,
+        ),
+    )?;
+    let record_batch_stream = DatasetRecordBatchStream::new(sendable_stream);
+    let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
+    unsafe {
+        std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream);
+    }
+    Ok(())
 }

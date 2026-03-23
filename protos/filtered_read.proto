@@ -68,6 +68,7 @@ message FilteredReadOptionsProto {
 // RowAddrTreeMap serialized via its built-in serialize_into/deserialize_from.
 // Per-fragment filters are Substrait-encoded and deduplicated.
 message FilteredReadPlanProto {
+  // plan_to_proto: BTreeMap<u32, RowAddrSelection> serialized to buf
   bytes row_addr_tree_map = 1;
   optional U64Range scan_range_after_filter = 2;
   // Arrow IPC schema for decoding Substrait filters (matches the schema used at encode time).

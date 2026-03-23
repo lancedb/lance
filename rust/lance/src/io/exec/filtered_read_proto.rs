@@ -20,7 +20,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
-use lance_core::utils::mask::RowAddrTreeMap;
+use lance_core::utils::mask::{RowAddrSelection, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
@@ -34,6 +34,52 @@ use crate::dataset::builder::DatasetBuilder;
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
 };
+
+// =============================================================================
+// Plan metadata extraction
+// =============================================================================
+
+/// Metadata extracted from a serialized [`FilteredReadExecProto`].
+///
+/// This is a lightweight summary that Java (or other foreign callers) can use
+/// to inspect a plan without needing to understand Rust internals.
+pub struct FilteredReadPlanMetadata {
+    /// Fragment IDs in the plan.
+    pub fragment_ids: Vec<u32>,
+    /// Number of rows per fragment.  A value of `-1` means the entire fragment
+    /// will be read (corresponds to [`RowAddrSelection::Full`]).
+    pub rows_per_fragment: Vec<i64>,
+}
+
+/// Extract metadata from serialized [`FilteredReadExecProto`] bytes.
+///
+/// Returns fragment IDs and per-fragment row counts without needing a live
+/// dataset handle.  For fragments where all rows are selected
+/// ([`RowAddrSelection::Full`]), the row count is reported as `-1`.
+pub fn extract_plan_metadata(proto_bytes: &[u8]) -> Result<FilteredReadPlanMetadata> {
+    let proto = pb::FilteredReadExecProto::decode(proto_bytes)
+        .map_err(|e| Error::internal(format!("Failed to decode FilteredReadExecProto: {}", e)))?;
+    let plan = proto.plan.as_ref().ok_or_else(|| {
+        Error::invalid_input_source("Cannot extract metadata: proto has no plan".into())
+    })?;
+
+    let rows = RowAddrTreeMap::deserialize_from(Cursor::new(&plan.row_addr_tree_map))?;
+
+    let mut fragment_ids = Vec::new();
+    let mut rows_per_fragment = Vec::new();
+    for (frag_id, selection) in rows.iter() {
+        fragment_ids.push(*frag_id);
+        match selection {
+            RowAddrSelection::Full => rows_per_fragment.push(-1),
+            RowAddrSelection::Partial(bitmap) => rows_per_fragment.push(bitmap.len() as i64),
+        }
+    }
+
+    Ok(FilteredReadPlanMetadata {
+        fragment_ids,
+        rows_per_fragment,
+    })
+}
 
 // =============================================================================
 // TableIdentifier helpers (reusable by other execs)
@@ -125,6 +171,7 @@ pub async fn filtered_read_exec_to_proto(
 }
 
 /// Reconstruct a [`FilteredReadExec`] from proto.
+/// todo review
 pub async fn filtered_read_exec_from_proto(
     proto: pb::FilteredReadExecProto,
     dataset: Option<Arc<Dataset>>,
@@ -157,6 +204,193 @@ pub async fn filtered_read_exec_from_proto(
     } else {
         Ok(exec)
     }
+}
+
+/// Deserialize a [`FilteredReadExecProto`] from bytes and execute it, returning
+/// a record batch stream.
+///
+/// This is the counterpart of [`Scanner::plan_filtered_read`](crate::dataset::scanner::Scanner::plan_filtered_read):
+/// the master node plans and serializes the scan, and each worker calls this
+/// function to execute its portion.
+///
+/// If `dataset` is `Some`, it will be reused instead of re-opening from the
+/// table identifier embedded in the proto.  This is useful when the caller
+/// already has a cached dataset handle.
+pub async fn execute_filtered_read_from_bytes(
+    proto_bytes: &[u8],
+    dataset: Option<Arc<Dataset>>,
+) -> Result<datafusion::execution::SendableRecordBatchStream> {
+    let proto = pb::FilteredReadExecProto::decode(proto_bytes)
+        .map_err(|e| Error::internal(format!("Failed to decode FilteredReadExecProto: {}", e)))?;
+    let ctx = datafusion::prelude::SessionContext::new();
+    let state = ctx.state();
+    let exec = filtered_read_exec_from_proto(proto, dataset, None, &state).await?;
+
+    let task_ctx = ctx.task_ctx();
+    exec.execute(0, task_ctx)
+        .map_err(|e| Error::io_source(Box::new(e)))
+}
+
+// =============================================================================
+// Plan splitting
+// =============================================================================
+
+/// Split a serialized [`FilteredReadExecProto`] into per-fragment protos.
+///
+/// Each returned byte vector is a complete `FilteredReadExecProto` with the same
+/// table identifier and options, but with a plan containing only a single fragment.
+/// `scan_range_after_filter` is dropped from per-fragment plans because it
+/// can only be applied globally (the master must aggregate results and apply
+/// the range itself).
+pub fn split_plan_proto(proto_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let proto = pb::FilteredReadExecProto::decode(proto_bytes)
+        .map_err(|e| Error::internal(format!("Failed to decode FilteredReadExecProto: {}", e)))?;
+
+    let plan = proto
+        .plan
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input_source("Cannot split: proto has no plan".into()))?;
+
+    // Deserialize the RowAddrTreeMap to iterate fragments
+    let rows = RowAddrTreeMap::deserialize_from(Cursor::new(&plan.row_addr_tree_map))?;
+
+    let mut results = Vec::new();
+    for (fragment_id, selection) in rows.iter() {
+        // Build a new RowAddrTreeMap with just this fragment
+        let mut single_rows = RowAddrTreeMap::new();
+        match selection {
+            RowAddrSelection::Full => single_rows.insert_fragment(*fragment_id),
+            RowAddrSelection::Partial(bitmap) => {
+                single_rows.insert_bitmap(*fragment_id, bitmap.clone())
+            }
+        }
+
+        let mut buf = Vec::with_capacity(single_rows.serialized_size());
+        single_rows.serialize_into(&mut buf)?;
+
+        // Build per-fragment filter mapping
+        let mut fragment_filter_ids = HashMap::new();
+        let mut filter_expressions = Vec::new();
+        if let Some(&expr_id) = plan.fragment_filter_ids.get(fragment_id) {
+            // Copy the referenced filter expression
+            if let Some(expr_bytes) = plan.filter_expressions.get(expr_id as usize) {
+                fragment_filter_ids.insert(*fragment_id, 0u32);
+                filter_expressions.push(expr_bytes.clone());
+            }
+        }
+
+        let filter_schema_ipc = if fragment_filter_ids.is_empty() {
+            None
+        } else {
+            plan.filter_schema_ipc.clone()
+        };
+
+        let fragment_plan = pb::FilteredReadPlanProto {
+            row_addr_tree_map: buf,
+            scan_range_after_filter: None, // Can't be applied per-fragment
+            filter_schema_ipc,
+            fragment_filter_ids,
+            filter_expressions,
+        };
+
+        let fragment_proto = pb::FilteredReadExecProto {
+            table: proto.table.clone(),
+            options: proto.options.clone(),
+            plan: Some(fragment_plan),
+        };
+
+        results.push(fragment_proto.encode_to_vec());
+    }
+
+    Ok(results)
+}
+
+/// Combined result of splitting a plan and extracting its metadata.
+pub struct SplitPlanResult {
+    /// Per-fragment serialized protos (same as [`split_plan_proto`] output).
+    pub split_protos: Vec<Vec<u8>>,
+    /// Fragment IDs in plan order.
+    pub fragment_ids: Vec<u32>,
+    /// Rows per fragment (`-1` means full fragment).
+    pub rows_per_fragment: Vec<i64>,
+}
+
+/// Split a plan into per-fragment protos AND extract metadata in a single decode pass.
+///
+/// This combines the work of [`split_plan_proto`] and [`extract_plan_metadata`],
+/// avoiding redundant proto decoding and [`RowAddrTreeMap`] deserialization.
+pub fn split_and_inspect_plan_proto(proto_bytes: &[u8]) -> Result<SplitPlanResult> {
+    let proto = pb::FilteredReadExecProto::decode(proto_bytes)
+        .map_err(|e| Error::internal(format!("Failed to decode FilteredReadExecProto: {}", e)))?;
+
+    let plan = proto
+        .plan
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input_source("Cannot split: proto has no plan".into()))?;
+
+    let rows = RowAddrTreeMap::deserialize_from(Cursor::new(&plan.row_addr_tree_map))?;
+
+    let mut split_protos = Vec::new();
+    let mut fragment_ids = Vec::new();
+    let mut rows_per_fragment = Vec::new();
+
+    for (fragment_id, selection) in rows.iter() {
+        // Collect metadata
+        fragment_ids.push(*fragment_id);
+        match selection {
+            RowAddrSelection::Full => rows_per_fragment.push(-1),
+            RowAddrSelection::Partial(bitmap) => rows_per_fragment.push(bitmap.len() as i64),
+        }
+
+        // Build per-fragment split proto
+        let mut single_rows = RowAddrTreeMap::new();
+        match selection {
+            RowAddrSelection::Full => single_rows.insert_fragment(*fragment_id),
+            RowAddrSelection::Partial(bitmap) => {
+                single_rows.insert_bitmap(*fragment_id, bitmap.clone())
+            }
+        }
+
+        let mut buf = Vec::with_capacity(single_rows.serialized_size());
+        single_rows.serialize_into(&mut buf)?;
+
+        let mut fragment_filter_ids = HashMap::new();
+        let mut filter_expressions = Vec::new();
+        if let Some(&expr_id) = plan.fragment_filter_ids.get(fragment_id) {
+            if let Some(expr_bytes) = plan.filter_expressions.get(expr_id as usize) {
+                fragment_filter_ids.insert(*fragment_id, 0u32);
+                filter_expressions.push(expr_bytes.clone());
+            }
+        }
+
+        let filter_schema_ipc = if fragment_filter_ids.is_empty() {
+            None
+        } else {
+            plan.filter_schema_ipc.clone()
+        };
+
+        let fragment_plan = pb::FilteredReadPlanProto {
+            row_addr_tree_map: buf,
+            scan_range_after_filter: None,
+            filter_schema_ipc,
+            fragment_filter_ids,
+            filter_expressions,
+        };
+
+        let fragment_proto = pb::FilteredReadExecProto {
+            table: proto.table.clone(),
+            options: proto.options.clone(),
+            plan: Some(fragment_plan),
+        };
+
+        split_protos.push(fragment_proto.encode_to_vec());
+    }
+
+    Ok(SplitPlanResult {
+        split_protos,
+        fragment_ids,
+        rows_per_fragment,
+    })
 }
 
 // =============================================================================
@@ -556,7 +790,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
-    use lance_core::utils::mask::RowAddrTreeMap;
+    use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     use lance_datagen::{array, gen_batch};
     use roaring::RoaringBitmap;
     use std::collections::HashSet;
@@ -875,5 +1109,215 @@ mod tests {
         assert!(back.filters.contains_key(&1));
         // After roundtrip, the decoded expressions should be shared via Arc too
         assert!(Arc::ptr_eq(&back.filters[&0], &back.filters[&1]));
+    }
+
+    #[tokio::test]
+    async fn test_plan_serialize_execute_roundtrip() {
+        use arrow_select::concat::concat_batches;
+        use datafusion::execution::SendableRecordBatchStream;
+        use futures::TryStreamExt;
+
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Build a FilteredReadExec with a filter and plan it
+        let filter_expr = datafusion_expr::col("x").gt(datafusion_expr::lit(10u32));
+        let projection = dataset
+            .empty_projection()
+            .union_column("x", OnMissing::Error)
+            .unwrap()
+            .union_column("y", OnMissing::Error)
+            .unwrap();
+
+        let options = FilteredReadOptions::new(projection)
+            .with_filter(Some(filter_expr.clone()), Some(filter_expr))
+            .unwrap()
+            .with_batch_size(32);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        // Trigger planning
+        let task_ctx = ctx.task_ctx();
+        let plan = exec.get_or_create_plan(task_ctx.clone()).await.unwrap();
+        assert!(!plan.rows.is_empty(), "plan should have some rows");
+
+        // Serialize to bytes
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        assert!(proto.plan.is_some(), "proto should include the plan");
+        let proto_bytes = proto.encode_to_vec();
+
+        // Execute directly for reference results
+        let direct_stream: SendableRecordBatchStream = exec.execute(0, task_ctx).unwrap();
+        let direct_batches: Vec<_> = direct_stream.try_collect().await.unwrap();
+        let direct_schema = direct_batches[0].schema();
+        let direct_result = concat_batches(&direct_schema, &direct_batches).unwrap();
+
+        // Deserialize and execute via execute_filtered_read_from_bytes
+        let restored_stream = execute_filtered_read_from_bytes(&proto_bytes, Some(dataset.clone()))
+            .await
+            .unwrap();
+        let restored_batches: Vec<_> = restored_stream.try_collect().await.unwrap();
+        let restored_schema = restored_batches[0].schema();
+        let restored_result = concat_batches(&restored_schema, &restored_batches).unwrap();
+
+        // Verify results match
+        assert_eq!(
+            direct_result.num_rows(),
+            restored_result.num_rows(),
+            "row counts should match"
+        );
+        assert_eq!(
+            direct_result.schema(),
+            restored_result.schema(),
+            "schemas should match"
+        );
+        assert_eq!(
+            direct_result, restored_result,
+            "data should match after roundtrip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_plan_metadata() {
+        let dataset = make_test_dataset().await; // 2 fragments, 50 rows each
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        // Trigger planning so the proto includes a plan
+        let task_ctx = ctx.task_ctx();
+        exec.ensure_plan_initialized(task_ctx).await.unwrap();
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let proto_bytes = proto.encode_to_vec();
+
+        let metadata = extract_plan_metadata(&proto_bytes).unwrap();
+        assert_eq!(metadata.fragment_ids.len(), 2, "should have 2 fragments");
+        // Fragment IDs should be 0 and 1
+        assert!(metadata.fragment_ids.contains(&0));
+        assert!(metadata.fragment_ids.contains(&1));
+        // Each fragment should have rows (50 each or -1 for Full)
+        assert_eq!(metadata.rows_per_fragment.len(), 2);
+        for &count in &metadata.rows_per_fragment {
+            assert!(
+                count == -1 || count == 50,
+                "expected -1 (full) or 50 rows, got {}",
+                count
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_split_plan_proto() {
+        use futures::TryStreamExt;
+
+        let dataset = make_test_dataset().await; // 2 fragments, 50 rows each
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Build a FilteredReadExec and trigger planning
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(32);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        let task_ctx = ctx.task_ctx();
+        exec.ensure_plan_initialized(task_ctx).await.unwrap();
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let proto_bytes = proto.encode_to_vec();
+
+        // Split into per-fragment protos
+        let split = split_plan_proto(&proto_bytes).unwrap();
+        assert_eq!(
+            split.len(),
+            2,
+            "should split into 2 tasks (one per fragment)"
+        );
+
+        // Each split should be a valid proto that can be executed
+        let mut split_total_rows: usize = 0;
+        for split_bytes in &split {
+            let stream = execute_filtered_read_from_bytes(split_bytes, Some(dataset.clone()))
+                .await
+                .unwrap();
+            let batches: Vec<_> = stream.try_collect().await.unwrap();
+            assert!(!batches.is_empty(), "each split should produce some data");
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            split_total_rows += rows;
+        }
+
+        // Total rows from all splits should equal the total from direct execution
+        let direct_stream = execute_filtered_read_from_bytes(&proto_bytes, Some(dataset.clone()))
+            .await
+            .unwrap();
+        let direct_batches: Vec<_> = direct_stream.try_collect().await.unwrap();
+        let direct_rows: usize = direct_batches.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(
+            split_total_rows, direct_rows,
+            "split execution should produce same total rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_split_plan_proto_with_filter() {
+        use futures::TryStreamExt;
+
+        let dataset = make_test_dataset().await; // 2 fragments, 50 rows each
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Build with a filter so that per-fragment filters are present in the plan
+        let filter_expr = datafusion_expr::col("x").gt(datafusion_expr::lit(10u32));
+        let projection = dataset
+            .empty_projection()
+            .union_column("x", OnMissing::Error)
+            .unwrap()
+            .union_column("y", OnMissing::Error)
+            .unwrap();
+
+        let options = FilteredReadOptions::new(projection)
+            .with_filter(Some(filter_expr.clone()), Some(filter_expr))
+            .unwrap()
+            .with_batch_size(32);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        let task_ctx = ctx.task_ctx();
+        exec.ensure_plan_initialized(task_ctx).await.unwrap();
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let proto_bytes = proto.encode_to_vec();
+
+        // Split into per-fragment protos
+        let split = split_plan_proto(&proto_bytes).unwrap();
+        assert_eq!(
+            split.len(),
+            2,
+            "should split into 2 tasks (one per fragment)"
+        );
+
+        // Execute each split and sum rows
+        let mut split_total_rows: usize = 0;
+        for split_bytes in &split {
+            let stream = execute_filtered_read_from_bytes(split_bytes, Some(dataset.clone()))
+                .await
+                .unwrap();
+            let batches: Vec<_> = stream.try_collect().await.unwrap();
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            split_total_rows += rows;
+        }
+
+        // Compare with direct execution
+        let direct_stream = execute_filtered_read_from_bytes(&proto_bytes, Some(dataset.clone()))
+            .await
+            .unwrap();
+        let direct_batches: Vec<_> = direct_stream.try_collect().await.unwrap();
+        let direct_rows: usize = direct_batches.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(
+            split_total_rows, direct_rows,
+            "split execution with filters should produce same total rows"
+        );
     }
 }

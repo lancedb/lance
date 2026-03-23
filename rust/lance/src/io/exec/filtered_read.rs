@@ -497,6 +497,7 @@ impl FilteredReadStream {
     // 1. The index result is an exact match (we know exactly which rows will be in the result)
     // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
     // Returns: FilteredReadInternalPlan
+    // plan entry
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
         fragments: &[LoadedFragment],
@@ -1662,6 +1663,21 @@ impl FilteredReadExec {
                 ))
             })
             .await
+    }
+
+    /// Trigger internal plan computation without converting to external format.
+    /// Use this when you only need to ensure the plan is cached (e.g., before serialization).
+    pub async fn ensure_plan_initialized(&self, ctx: Arc<TaskContext>) -> Result<()> {
+        Self::get_or_create_plan_impl(
+            &self.plan,
+            self.dataset.clone(),
+            &self.options,
+            self.index_input.as_ref(),
+            0,
+            ctx,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Get the existing plan or create it if it doesn't exist
