@@ -759,12 +759,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 false => self.docs.num_tokens_by_row_id(row_id),
             };
             if self.operator == Operator::Or && !self.refine_or_candidate(doc_id, doc_length) {
-                let least_id = self.least_next_candidate_doc(doc_id);
-                if least_id == TERMINATED_DOC_ID {
-                    self.advance_tail_and_lead_to_head(doc_id + 1);
-                } else {
-                    self.advance_tail_and_lead_to_head(least_id);
-                }
+                // `flat_search` evaluates an explicit allow-list of doc ids. Unlike the
+                // regular WAND path, skipping to the next block boundary is unsafe here
+                // because later doc ids from the same block may still be present in the
+                // allow-list and need to be evaluated individually.
+                self.advance_tail_and_lead_to_head(doc_id + 1);
                 continue;
             }
 
@@ -1085,27 +1084,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for posting in remaining {
             self.push_head(posting);
         }
-    }
-
-    fn least_next_candidate_doc(&self, target: u64) -> u64 {
-        let mut least_id = self.head_doc().unwrap_or(TERMINATED_DOC_ID);
-        for posting in self
-            .lead
-            .iter()
-            .chain(self.tail.iter().map(|posting| &posting.posting))
-        {
-            match posting.block_first_doc() {
-                Some(block_doc) if block_doc <= target => {
-                    least_id =
-                        least_id.min(posting.next_block_first_doc().unwrap_or(TERMINATED_DOC_ID));
-                }
-                Some(block_doc) => {
-                    least_id = least_id.min(block_doc);
-                }
-                None => {}
-            }
-        }
-        least_id
     }
 
     fn advance_tail_and_lead_to_head(&mut self, least_id: u64) {
@@ -1469,6 +1447,18 @@ mod tests {
         }
     }
 
+    struct InverseDocLengthScorer;
+
+    impl Scorer for InverseDocLengthScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            freq as f32 / doc_tokens as f32
+        }
+    }
+
     fn generate_posting_list(
         doc_ids: Vec<u32>,
         max_score: f32,
@@ -1738,6 +1728,49 @@ mod tests {
         let candidate = wand.next().unwrap().unwrap();
         assert_eq!(candidate.0.doc_id(), 10);
         assert_eq!(wand.lead.len(), 3);
+    }
+
+    #[test]
+    fn test_flat_search_or_keeps_masked_docs_in_same_block() {
+        let mut docs = DocSet::default();
+        for i in 0..=(BLOCK_SIZE as u64 + 1) {
+            let doc_tokens = if i == 1 { 100 } else { 1 };
+            docs.append(i, doc_tokens);
+        }
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(
+                (1..=(BLOCK_SIZE as u32 + 1)).collect(),
+                1.0,
+                Some(vec![1.0, 1.0]),
+                true,
+            ),
+            docs.len(),
+        );
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            vec![posting].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        wand.threshold = 0.5;
+
+        let selected = vec![RowAddress::from(1_u64), RowAddress::from(2_u64)];
+        let result = wand
+            .flat_search(
+                &FtsSearchParams::default(),
+                Box::new(selected.into_iter()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        let matched = result.into_iter().map(|doc| doc.row_id).collect::<Vec<_>>();
+        assert_eq!(matched, vec![2]);
     }
 
     #[test]
