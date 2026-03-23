@@ -566,6 +566,12 @@ pub struct Wand<'a, S: Scorer> {
     // `None` means the window has not been initialized yet and the next
     // candidate must refresh block-max state before making pruning decisions.
     up_to: Option<u64>,
+    // For conjunctions, this is the maximum attainable score for the current
+    // block-max window `[target, up_to]`.
+    and_max_score: f32,
+    // Last conjunction doc returned to the caller. The next conjunction search
+    // resumes strictly after this doc, like Lucene's `nextDoc()/advance()`.
+    and_last_doc: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
 }
@@ -581,21 +587,37 @@ impl<'a, S: Scorer> Wand<'a, S> {
         scorer: S,
     ) -> Self {
         let mut head = BinaryHeap::new();
+        let mut lead = Vec::new();
         for posting in postings {
-            if posting.doc().is_some() {
-                head.push(HeadPosting::new(Box::new(posting)));
+            if posting.doc().is_none() {
+                continue;
             }
+            let posting = Box::new(posting);
+            if operator == Operator::And {
+                lead.push(posting);
+            } else {
+                head.push(HeadPosting::new(posting));
+            }
+        }
+        if operator == Operator::And {
+            lead.sort_unstable_by_key(|posting| posting.cost());
         }
 
         Self {
             threshold: 0.0,
             operator,
-            num_terms: head.len(),
+            num_terms: if operator == Operator::And {
+                lead.len()
+            } else {
+                head.len()
+            },
             head,
-            lead: Vec::new(),
+            lead,
             tail: BinaryHeap::new(),
             tail_max_score: 0.0,
             up_to: None,
+            and_max_score: f32::INFINITY,
+            and_last_doc: None,
             docs,
             scorer,
         }
@@ -616,8 +638,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         match (mask.max_len(), mask.iter_addrs()) {
             (Some(num_rows_matched), Some(row_ids))
-                if num_rows_matched * 100
-                    <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
+                if self.operator == Operator::Or
+                    && num_rows_matched * 100
+                        <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
             {
                 return self.flat_search(params, row_ids, metrics);
             }
@@ -637,7 +660,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Located(doc) => doc.row_id,
             };
             if !mask.selected(row_id) {
-                self.push_back_leads(doc.doc_id() + 1);
+                if self.operator == Operator::Or {
+                    self.push_back_leads(doc.doc_id() + 1);
+                }
                 continue;
             }
 
@@ -660,7 +685,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 if params.phrase_slop.is_some()
                     && !self.check_positions(params.phrase_slop.unwrap() as i32)
                 {
-                    self.push_back_leads(doc.doc_id() + 1);
                     continue;
                 }
                 self.score(doc_length)
@@ -677,7 +701,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
-            self.push_back_leads(doc.doc_id() + 1);
+            if self.operator == Operator::Or {
+                self.push_back_leads(doc.doc_id() + 1);
+            }
         }
         metrics.record_comparisons(num_comparisons);
 
@@ -876,143 +902,100 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
-        let mut postings = self.drain_all_postings();
-        if postings.len() < self.num_terms {
+        if self.lead.len() < self.num_terms {
             return None;
         }
-        postings.sort_unstable();
-
-        loop {
-            if postings.len() < self.num_terms {
+        if let Some(last_doc) = self.and_last_doc
+            && self
+                .lead
+                .first()
+                .and_then(|posting| posting.doc())
+                .map(|doc| doc.doc_id())
+                == Some(last_doc)
+        {
+            let next_target = self.and_advance_target(last_doc + 1);
+            if next_target == TERMINATED_DOC_ID {
                 return None;
             }
-            let pivot = postings.len().checked_sub(1)?;
-            let doc = postings[pivot].doc()?;
-            let doc_id = doc.doc_id();
+            self.lead[0].next(next_target);
+        }
 
-            if !Self::and_check_block_max(&mut postings, doc_id, self.threshold) {
-                let (picked_term, least_id) = Self::and_get_new_candidate(&postings, pivot);
-                if least_id == TERMINATED_DOC_ID {
+        'advance_head: loop {
+            let doc = self
+                .lead
+                .first()
+                .and_then(|posting| posting.doc())?
+                .doc_id();
+            if self.up_to.is_none_or(|up_to| doc > up_to) {
+                let next_target = self.and_advance_target(doc);
+                if next_target == TERMINATED_DOC_ID {
                     return None;
                 }
-                Self::and_move_term(&mut postings, picked_term, least_id);
-                continue;
+                if next_target != doc {
+                    self.lead[0].next(next_target);
+                    continue;
+                }
             }
 
-            if !Self::and_check_pivot_aligned(&mut postings, pivot, doc_id) {
-                continue;
+            for posting in self.lead.iter_mut().skip(1) {
+                if posting.doc()?.doc_id() < doc {
+                    posting.next(doc);
+                }
+                let next = posting.doc()?.doc_id();
+                if next > doc {
+                    let next_target = self.and_advance_target(next);
+                    if next_target == TERMINATED_DOC_ID {
+                        return None;
+                    }
+                    self.lead[0].next(next_target);
+                    continue 'advance_head;
+                }
             }
 
-            self.lead = postings;
+            self.and_last_doc = Some(doc);
             return self.lead.first().and_then(|posting| posting.doc());
         }
     }
 
-    #[allow(clippy::vec_box)]
-    fn drain_all_postings(&mut self) -> Vec<Box<PostingIterator>> {
-        let mut postings = Vec::with_capacity(self.head.len() + self.lead.len() + self.tail.len());
-        while let Some(head) = self.head.pop() {
-            postings.push(head.posting);
-        }
-        postings.append(&mut self.lead);
-        while let Some(tail) = self.tail.pop() {
-            postings.push(tail.posting);
-        }
-        self.tail_max_score = 0.0;
-        postings
-    }
-
-    #[allow(clippy::vec_box)]
-    fn and_check_block_max(
-        postings: &mut [Box<PostingIterator>],
-        target: u64,
-        threshold: f32,
-    ) -> bool {
-        let mut sum = 0.0;
-        for posting in postings {
-            posting.shallow_next(target);
-            let Some(block_doc) = posting.block_first_doc() else {
-                return false;
-            };
-            if block_doc > target {
-                return false;
-            }
-            sum += posting.block_max_score();
-        }
-        sum > threshold
-    }
-
-    #[allow(clippy::vec_box)]
-    fn and_get_new_candidate(postings: &[Box<PostingIterator>], pivot: usize) -> (usize, u64) {
-        let mut picked_term = pivot;
-        let mut max_score = postings[pivot].approximate_upper_bound();
-        let mut least_id = postings[pivot]
-            .next_block_first_doc()
-            .unwrap_or(TERMINATED_DOC_ID);
-
-        for (i, posting) in postings[..pivot].iter().enumerate().rev() {
-            let next_block_first_doc = posting.next_block_first_doc().unwrap_or(TERMINATED_DOC_ID);
-            if next_block_first_doc < least_id {
-                least_id = next_block_first_doc;
-            }
-            if posting.approximate_upper_bound() > max_score {
-                max_score = posting.approximate_upper_bound();
-                picked_term = i;
-            }
-        }
-
-        (picked_term, least_id)
-    }
-
-    #[allow(clippy::vec_box)]
-    fn and_move_term(postings: &mut Vec<Box<PostingIterator>>, picked_term: usize, least_id: u64) {
-        postings[picked_term].next(least_id);
-        let doc_id = postings[picked_term]
-            .doc()
-            .map(|d| d.doc_id())
-            .unwrap_or(TERMINATED_DOC_ID);
-        if doc_id == TERMINATED_DOC_ID {
-            postings.swap_remove(picked_term);
-        }
-        Self::and_bubble_up(postings, picked_term);
-    }
-
-    #[allow(clippy::vec_box)]
-    fn and_check_pivot_aligned(
-        postings: &mut Vec<Box<PostingIterator>>,
-        pivot: usize,
-        pivot_doc: u64,
-    ) -> bool {
-        for i in (0..=pivot).rev() {
-            postings[i].next(pivot_doc);
-            let doc_id = postings[i]
-                .doc()
-                .map(|d| d.doc_id())
-                .unwrap_or(TERMINATED_DOC_ID);
-            if doc_id != pivot_doc {
-                if doc_id == TERMINATED_DOC_ID {
-                    postings.swap_remove(i);
-                }
-                Self::and_bubble_up(postings, i);
-                return false;
-            } else {
-                Self::and_bubble_up(postings, i);
-            }
-        }
-        true
-    }
-
-    #[allow(clippy::vec_box)]
-    fn and_bubble_up(postings: &mut [Box<PostingIterator>], index: usize) {
-        if index >= postings.len() {
+    fn and_move_to_next_block(&mut self, target: u64) {
+        if self.threshold <= 0.0 {
+            self.up_to = Some(target);
+            self.and_max_score = f32::INFINITY;
             return;
         }
 
-        for i in index + 1..postings.len() {
-            if postings[i].cmp(&postings[i - 1]) >= std::cmp::Ordering::Equal {
-                break;
+        let mut up_to = TERMINATED_DOC_ID;
+        let mut max_score = 0.0;
+        for posting in &mut self.lead {
+            posting.shallow_next(target);
+            let block_end = posting
+                .next_block_first_doc()
+                .map(|doc| doc.saturating_sub(1))
+                .unwrap_or(TERMINATED_DOC_ID);
+            up_to = up_to.min(block_end.max(target));
+            max_score += posting.block_max_score();
+        }
+        self.up_to = Some(up_to);
+        self.and_max_score = max_score;
+    }
+
+    fn and_advance_target(&mut self, mut target: u64) -> u64 {
+        if self.up_to.is_none_or(|up_to| target > up_to) {
+            self.and_move_to_next_block(target);
+        }
+
+        loop {
+            let Some(up_to) = self.up_to else {
+                return TERMINATED_DOC_ID;
+            };
+            if self.and_max_score >= self.threshold {
+                return target;
             }
-            postings.swap(i - 1, i);
+            if up_to == TERMINATED_DOC_ID {
+                return TERMINATED_DOC_ID;
+            }
+            target = up_to + 1;
+            self.and_move_to_next_block(target);
         }
     }
 
@@ -1832,12 +1815,7 @@ mod tests {
                 0,
                 0,
                 1.0,
-                generate_posting_list(
-                    all_docs.clone(),
-                    1.0,
-                    Some(vec![0.02, 1.0]),
-                    true,
-                ),
+                generate_posting_list(all_docs.clone(), 1.0, Some(vec![0.02, 1.0]), true),
                 docs.len(),
             ),
             PostingIterator::with_query_weight(
@@ -1845,17 +1823,17 @@ mod tests {
                 1,
                 1,
                 1.0,
-                generate_posting_list(
-                    all_docs,
-                    1.0,
-                    Some(vec![0.02, 1.0]),
-                    true,
-                ),
+                generate_posting_list(all_docs, 1.0, Some(vec![0.02, 1.0]), true),
                 docs.len(),
             ),
         ];
 
-        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, InverseDocLengthScorer);
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
         wand.threshold = 0.5;
 
         let candidate = wand.next().unwrap().unwrap();
