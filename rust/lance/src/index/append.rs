@@ -166,9 +166,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     acc |= &b;
                     acc
                 });
-            let ineffective_old_frags: RoaringBitmap = old_indices
+            let deleted_old_frags: RoaringBitmap = old_indices
                 .iter()
-                .filter_map(|idx| idx.ineffective_fragment_bitmap(&dataset.fragment_bitmap))
+                .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
                 .fold(RoaringBitmap::new(), |mut acc, b| {
                     acc |= &b;
                     acc
@@ -232,7 +232,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // Fragment bitmap filtering is valid and cheaper in this mode.
                     Some(OldIndexDataFilter::Fragments {
                         to_keep: effective_old_frags,
-                        to_remove: ineffective_old_frags,
+                        to_remove: deleted_old_frags,
                     })
                 };
                 index

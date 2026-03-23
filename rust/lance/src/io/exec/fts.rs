@@ -259,10 +259,10 @@ impl ExecutionPlan for MatchQueryExec {
                         column,
                     ))
                 })?;
-            if !inverted_idx.invalidated_fragments().is_empty() {
+            if !inverted_idx.deleted_fragments().is_empty() {
                 Arc::get_mut(&mut pre_filter)
                     .expect("prefilter just created")
-                    .set_invalidated_fragments(inverted_idx.invalidated_fragments().clone());
+                    .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
             }
             metrics.record_parts_searched(inverted_idx.partition_count());
 
@@ -910,10 +910,10 @@ impl ExecutionPlan for PhraseQueryExec {
                         column,
                     ))
                 })?;
-            if !index.invalidated_fragments().is_empty() {
+            if !index.deleted_fragments().is_empty() {
                 Arc::get_mut(&mut pre_filter)
                     .expect("prefilter just created")
-                    .set_invalidated_fragments(index.invalidated_fragments().clone());
+                    .set_deleted_fragments(index.deleted_fragments().clone());
             }
             metrics.record_parts_searched(index.partition_count());
 

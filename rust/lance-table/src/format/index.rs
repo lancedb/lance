@@ -109,7 +109,9 @@ impl IndexMetadata {
             .map(|files| files.iter().map(|f| f.size_bytes).sum())
     }
 
-    pub fn ineffective_fragment_bitmap(
+    /// Returns the set of fragments which are part of the fragment bitmap
+    /// but no longer in the dataset.
+    pub fn deleted_fragment_bitmap(
         &self,
         existing_fragments: &RoaringBitmap,
     ) -> Option<RoaringBitmap> {

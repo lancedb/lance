@@ -126,7 +126,7 @@ pub struct InvertedIndexBuilder {
     posting_tail_codec: PostingTailCodec,
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
-    invalidated_fragments: RoaringBitmap,
+    deleted_fragments: RoaringBitmap,
 }
 
 impl InvertedIndexBuilder {
@@ -157,7 +157,7 @@ impl InvertedIndexBuilder {
         partitions: Vec<u64>,
         token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
-        invalidated_fragments: RoaringBitmap,
+        deleted_fragments: RoaringBitmap,
     ) -> Self {
         Self {
             params,
@@ -169,7 +169,7 @@ impl InvertedIndexBuilder {
             format_version: current_fts_format_version(),
             posting_tail_codec: current_fts_format_version().posting_tail_codec(),
             progress: noop_progress(),
-            invalidated_fragments,
+            deleted_fragments,
         }
     }
 
@@ -216,7 +216,7 @@ impl InvertedIndexBuilder {
         self.update_index(new_data, dest_store).await?;
 
         if let Some(OldIndexDataFilter::Fragments { to_remove, .. }) = old_data_filter {
-            self.invalidated_fragments.extend(to_remove);
+            self.deleted_fragments.extend(to_remove);
         }
 
         self.progress.stage_complete("tokenize_docs").await?;
@@ -364,10 +364,10 @@ impl InvertedIndexBuilder {
     }
 
     async fn write_metadata(&self, dest_store: &dyn IndexStore, partitions: &[u64]) -> Result<()> {
-        let mut serialized_inval_frags =
-            Vec::with_capacity(self.invalidated_fragments.serialized_size());
-        self.invalidated_fragments
-            .serialize_into(&mut serialized_inval_frags)?;
+        let mut serialized_deleted_fragments =
+            Vec::with_capacity(self.deleted_fragments.serialized_size());
+        self.deleted_fragments
+            .serialize_into(&mut serialized_deleted_fragments)?;
 
         let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
@@ -398,14 +398,15 @@ impl InvertedIndexBuilder {
         }
 
         let metadata_file_schema = Arc::new(Schema::new(vec![Field::new(
-            INVALIDATED_FRAGMENTS_COL,
+            DELETED_FRAGMENTS_COL,
             DataType::Binary,
             false,
         )]));
-        let invalid_fragments_col =
-            Arc::new(BinaryArray::from(vec![serialized_inval_frags.as_slice()])) as Arc<dyn Array>;
+        let deleted_fragments_col = Arc::new(BinaryArray::from(vec![
+            serialized_deleted_fragments.as_slice(),
+        ])) as Arc<dyn Array>;
         let record_batch =
-            RecordBatch::try_new(metadata_file_schema.clone(), vec![invalid_fragments_col])?;
+            RecordBatch::try_new(metadata_file_schema.clone(), vec![deleted_fragments_col])?;
 
         let mut writer = dest_store
             .new_index_file(METADATA_FILE, metadata_file_schema)
@@ -1571,7 +1572,7 @@ async fn merge_metadata_files(
     let mut format_version = None;
     let mut posting_tail_codec = None;
 
-    let mut invalidated_fragments = RoaringBitmap::new();
+    let mut deleted_fragments = RoaringBitmap::new();
 
     for file_name in part_metadata_files {
         let reader = store.open_index_file(file_name).await?;
@@ -1611,16 +1612,16 @@ async fn merge_metadata_files(
 
         if reader.num_rows() > 0 {
             let metadata_batch = reader.read_range(0..1, None).await?;
-            let invalid_fragments_col = metadata_batch
-                .column_by_name(INVALIDATED_FRAGMENTS_COL)
+            let deleted_fragments_col = metadata_batch
+                .column_by_name(DELETED_FRAGMENTS_COL)
                 .expect_ok()?;
-            let invalid_fragments_arr = invalid_fragments_col
+            let deleted_fragments_arr = deleted_fragments_col
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect_ok()?;
-            let part_invalid_fragments =
-                RoaringBitmap::deserialize_from(invalid_fragments_arr.value(0))?;
-            invalidated_fragments.extend(part_invalid_fragments);
+            let part_deleted_fragments =
+                RoaringBitmap::deserialize_from(deleted_fragments_arr.value(0))?;
+            deleted_fragments.extend(part_deleted_fragments);
         }
     }
 
@@ -1700,11 +1701,10 @@ async fn merge_metadata_files(
         remapped_partitions.clone(),
         token_set_format,
         None,
-        invalidated_fragments,
+        deleted_fragments,
     )
     .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
     .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
-
     builder
         .write_metadata(&*store, &remapped_partitions)
         .await?;
@@ -2584,7 +2584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_index_has_empty_invalidated_fragments() {
+    async fn test_new_index_has_empty_deleted_fragments() {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -2603,14 +2603,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            index.invalidated_fragments().is_empty(),
-            "new index should have empty invalidated fragments, got {:?}",
-            index.invalidated_fragments()
+            index.deleted_fragments().is_empty(),
+            "new index should have empty deleted fragments, got {:?}",
+            index.deleted_fragments()
         );
     }
 
     #[tokio::test]
-    async fn test_remap_preserves_invalidated_fragments() {
+    async fn test_remap_preserves_deleted_fragments() {
         let src_dir = TempDir::default();
         let dest_dir = TempDir::default();
         let src_store = Arc::new(LanceIndexStore::new(
@@ -2624,19 +2624,19 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Build an initial index with some invalidated fragments
+        // Build an initial index with some deleted fragments
         let batch = make_doc_batch("hello world", 0);
         let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
         let stream = Box::pin(stream);
 
-        let initial_invalid = RoaringBitmap::from_iter([5, 10, 42]);
+        let initial_deleted = RoaringBitmap::from_iter([5, 10, 42]);
         let mut builder = InvertedIndexBuilder::from_existing_index(
             InvertedIndexParams::default(),
             None,
             Vec::new(),
             TokenSetFormat::default(),
             None,
-            initial_invalid.clone(),
+            initial_deleted.clone(),
         );
         builder
             .update(stream, src_store.as_ref(), None)
@@ -2647,26 +2647,26 @@ mod tests {
         let index = InvertedIndex::load(src_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        assert_eq!(index.invalidated_fragments(), &initial_invalid);
+        assert_eq!(index.deleted_fragments(), &initial_deleted);
 
-        // Remap the index via the ScalarIndex trait method (identity mapping)
+        // Remap the index via the ScalarIndex trait method
         use crate::scalar::ScalarIndex;
-        let mapping = HashMap::from([(0u64, Some(0u64))]);
+        let mapping = HashMap::from([(0u64, Some(50 << 32))]);
         index.remap(&mapping, dest_store.as_ref()).await.unwrap();
 
-        // Reload from dest and verify invalidated fragments are preserved
+        // Reload from dest and verify deleted fragments are preserved
         let remapped_index = InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert_eq!(
-            remapped_index.invalidated_fragments(),
-            &initial_invalid,
-            "remap should preserve invalidated fragments"
+            remapped_index.deleted_fragments(),
+            &initial_deleted,
+            "remap should preserve deleted fragments"
         );
     }
 
     #[tokio::test]
-    async fn test_update_grows_invalidated_fragments_from_old_data_filter() {
+    async fn test_update_grows_deleted_fragments_from_old_data_filter() {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -2674,7 +2674,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Build an initial index with no invalidated fragments
+        // Build an initial index with no deleted fragments
         let batch = make_doc_batch("hello world", 0);
         let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
         let stream = Box::pin(stream);
@@ -2686,7 +2686,7 @@ mod tests {
         let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        assert!(index.invalidated_fragments().is_empty());
+        assert!(index.deleted_fragments().is_empty());
 
         let update_dir = TempDir::default();
         let update_store = Arc::new(LanceIndexStore::new(
@@ -2717,14 +2717,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            updated_index.invalidated_fragments(),
+            updated_index.deleted_fragments(),
             &RoaringBitmap::from_iter([3, 7]),
-            "update should add invalidated fragments from old_data_filter"
+            "update should add deleted fragments from old_data_filter"
         );
     }
 
     #[tokio::test]
-    async fn test_update_accumulates_invalidated_fragments() {
+    async fn test_update_accumulates_deleted_fragments() {
         let dir1 = TempDir::default();
         let store1 = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -2740,7 +2740,7 @@ mod tests {
         let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
         builder.update(stream, store1.as_ref(), None).await.unwrap();
 
-        // First update: invalidate fragments 3 and 7
+        // First update: delete fragments 3 and 7
         let index = InvertedIndex::load(store1.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
@@ -2775,7 +2775,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            index2.invalidated_fragments(),
+            index2.deleted_fragments(),
             &RoaringBitmap::from_iter([3, 7])
         );
 
@@ -2807,14 +2807,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            index3.invalidated_fragments(),
+            index3.deleted_fragments(),
             &RoaringBitmap::from_iter([3, 7, 12, 15]),
-            "invalidated fragments should accumulate across updates"
+            "deleted fragments should accumulate across updates"
         );
     }
 
     #[tokio::test]
-    async fn test_update_with_rowid_filter_does_not_grow_invalidated_fragments() {
+    async fn test_update_with_rowid_filter_does_not_grow_deleted_fragments() {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -2845,7 +2845,7 @@ mod tests {
             RecordBatchStreamAdapter::new(batch2.schema(), stream::iter(vec![Ok(batch2)]));
         let stream2 = Box::pin(stream2);
 
-        // Use RowIds filter instead of Fragments — should not affect invalidated_fragments
+        // Use RowIds filter instead of Fragments — should not affect deleted_fragments
         let mut valid_ids = lance_core::utils::mask::RowAddrTreeMap::new();
         valid_ids.insert(0);
         let old_data_filter = Some(crate::scalar::OldIndexDataFilter::RowIds(valid_ids));
@@ -2861,8 +2861,8 @@ mod tests {
                 .await
                 .unwrap();
         assert!(
-            updated_index.invalidated_fragments().is_empty(),
-            "RowIds filter should not add to invalidated fragments"
+            updated_index.deleted_fragments().is_empty(),
+            "RowIds filter should not add to deleted fragments"
         );
     }
 }

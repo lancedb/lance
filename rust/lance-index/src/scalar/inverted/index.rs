@@ -109,7 +109,7 @@ pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
-pub const INVALIDATED_FRAGMENTS_COL: &str = "invalidated_fragments";
+pub const DELETED_FRAGMENTS_COL: &str = "deleted_fragments";
 
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
@@ -345,7 +345,7 @@ pub struct InvertedIndex {
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
-    invalidated_fragments: RoaringBitmap,
+    deleted_fragments: RoaringBitmap,
 }
 
 impl Debug for InvertedIndex {
@@ -354,7 +354,7 @@ impl Debug for InvertedIndex {
             .field("params", &self.params)
             .field("token_set_format", &self.token_set_format)
             .field("partitions", &self.partitions)
-            .field("invalidated_fragments", &self.invalidated_fragments)
+            .field("deleted_fragments", &self.deleted_fragments)
             .finish()
     }
 }
@@ -404,7 +404,7 @@ impl InvertedIndex {
                 Vec::new(),
                 self.token_set_format,
                 fragment_mask,
-                self.invalidated_fragments.clone(),
+                self.deleted_fragments.clone(),
             )
             .with_posting_tail_codec(self.posting_tail_codec())
         } else {
@@ -427,7 +427,7 @@ impl InvertedIndex {
                 partitions,
                 self.token_set_format,
                 fragment_mask,
-                self.invalidated_fragments.clone(),
+                self.deleted_fragments.clone(),
             )
             .with_format_version(self.format_version())
         }
@@ -451,8 +451,8 @@ impl InvertedIndex {
     /// Most other indices remove data from deleted fragments when the index updates (copy-on-write).
     /// However, this would require an expensive copy of the FTS index.  Instead, we track the deleted
     /// fragments and prune them at search time (merge-on-read).
-    pub fn invalidated_fragments(&self) -> &RoaringBitmap {
-        &self.invalidated_fragments
+    pub fn deleted_fragments(&self) -> &RoaringBitmap {
+        &self.deleted_fragments
     }
 
     // search the documents that contain the query
@@ -623,7 +623,7 @@ impl InvertedIndex {
                 docs,
                 token_set_format: TokenSetFormat::Arrow,
             })],
-            invalidated_fragments: RoaringBitmap::new(),
+            deleted_fragments: RoaringBitmap::new(),
         }))
     }
 
@@ -665,10 +665,10 @@ impl InvertedIndex {
                     .transpose()?
                     .unwrap_or(TokenSetFormat::Arrow);
 
-                // Load invalidated_fragments if present (optional for backward compatibility)
-                let invalidated_fragments = if reader.num_rows() > 0 {
+                // Load deleted_fragments if present (optional for backward compatibility)
+                let deleted_fragments = if reader.num_rows() > 0 {
                     let metadata_batch = reader.read_range(0..1, None).await?;
-                    if let Some(col) = metadata_batch.column_by_name(INVALIDATED_FRAGMENTS_COL) {
+                    if let Some(col) = metadata_batch.column_by_name(DELETED_FRAGMENTS_COL) {
                         let arr = col.as_binary_opt::<i32>().expect_ok()?;
                         RoaringBitmap::deserialize_from(arr.value(0))?
                     } else {
@@ -710,7 +710,7 @@ impl InvertedIndex {
                     tokenizer,
                     token_set_format,
                     partitions,
-                    invalidated_fragments,
+                    deleted_fragments,
                 }))
             }
             Err(_) => {
@@ -5105,8 +5105,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_modern_index_without_invalidated_col_has_empty_bitmap() {
-        // An index created before the invalidated_fragments feature was added
+    async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
+        // An index created before the deleted_fragments feature was added
         // will have a metadata file with num_rows=0 (no record batch data).
         // The load path should gracefully handle this with an empty bitmap.
         let tmpdir = TempObjDir::default();
@@ -5123,7 +5123,7 @@ mod tests {
         builder.docs.append(100, 1);
         builder.write(store.as_ref()).await.unwrap();
 
-        // Write a metadata file WITHOUT the invalidated_fragments column
+        // Write a metadata file WITHOUT the deleted_fragments column
         // (simulates an older index version)
         let metadata = std::collections::HashMap::from_iter(vec![
             (
@@ -5149,8 +5149,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            index.invalidated_fragments().is_empty(),
-            "index without invalidated_fragments column should have empty bitmap"
+            index.deleted_fragments().is_empty(),
+            "index without deleted_fragments column should have empty bitmap"
         );
     }
 }
