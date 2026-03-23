@@ -389,15 +389,15 @@ impl ObjectStoreProvider for HubStoreProvider {
                     ))
                 })?;
 
-            let shard_params = ObjectStoreParams {
-                storage_options_accessor: (!shard_config.storage_options.is_empty()).then(|| {
-                    Arc::new(StorageOptionsAccessor::with_static_options(
-                        shard_config.storage_options,
-                    ))
-                }),
-                ..Default::default()
-            };
-
+            // We insert honor_local_prefix into the storage options so that LocalFileSystem will work
+            // as expected. It doesn't have any effect on other ObjectStore objects.
+            // Note: in the future, we will want to implement dynamic storage options providers here.
+            let mut shard_params = params.clone();
+            let mut storage_options = shard_config.storage_options;
+            storage_options.insert("honor_local_prefix".into(), "true".into());
+            shard_params.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options),
+            ));
             shards.push(HubShard {
                 inner: provider.new_store(shard_url, &shard_params).await?,
             });
@@ -457,6 +457,7 @@ mod tests {
     use futures::TryStreamExt;
     use object_store::ObjectStore as _;
     use serde_json::json;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -685,6 +686,60 @@ mod tests {
             store.store_prefix,
             format!("{HUB_SCHEME}$bucket-a@{config_path}")
         );
+
+        let location = Path::from("datasets/example.lance");
+        store
+            .inner
+            .put(&location, PutPayload::from_static(b"hello"))
+            .await
+            .unwrap();
+        let bytes = store
+            .inner
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_hub_store_with_file_object_store_endpoints() {
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        let config_path = config_file.path().to_str().unwrap().to_string();
+        let shard1_dir = tempdir().unwrap();
+        let shard2_dir = tempdir().unwrap();
+        let shard1_path = shard1_dir.path().to_str().unwrap();
+        let shard2_path = shard2_dir.path().to_str().unwrap();
+        let config = json!({
+            "buckets": {
+                "mybucket": {
+                    "shards": [
+                        {"uri": format!("file-object-store://{}", shard1_path)},
+                        {"uri": format!("file-object-store://{}", shard2_path)}
+                    ],
+                    "read": {"policy": "simple_mod"},
+                    "write": {"policy": "simple_mod"}
+                }
+            }
+        });
+        std::fs::write(config_file.path(), config.to_string()).unwrap();
+
+        let provider = HubStoreProvider;
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(HUB_STORE_CONFIG_OPTION.to_string(), config_path.clone())]),
+            ))),
+            ..Default::default()
+        };
+        let store = provider
+            .new_store(
+                Url::parse("hub://mybucket/datasets/example.lance").unwrap(),
+                &params,
+            )
+            .await
+            .unwrap();
 
         let location = Path::from("datasets/example.lance");
         store

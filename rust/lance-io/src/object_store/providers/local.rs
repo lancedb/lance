@@ -18,11 +18,23 @@ pub struct FileStoreProvider;
 #[async_trait::async_trait]
 impl ObjectStoreProvider for FileStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        // By default, file:/// and file-object-store:/// do not honor the storage prefix in the creation URL.
+        // So you could create an ObjectStore from the URL file:///foo, ask for file:///bar and get /bar rather than /foo/bar.
+        // The storage option honor_local_prefix makes it work as expected.
+        let honor_prefix = params
+            .storage_options()
+            .and_then(|options| options.get("honor_local_prefix"))
+            .is_some_and(|value| value == "true");
+        let inner = if honor_prefix {
+            Arc::new(LocalFileSystem::new_with_prefix(base_path.path())?)
+        } else {
+            Arc::new(LocalFileSystem::new())
+        };
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
-            inner: Arc::new(LocalFileSystem::new()),
+            inner,
             scheme: base_path.scheme().to_owned(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -59,6 +71,13 @@ impl ObjectStoreProvider for FileStoreProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::sync::Arc;
+
+    use object_store::PutPayload;
+    use tempfile::tempdir;
+
+    use crate::object_store::StorageOptionsAccessor;
     use crate::object_store::uri_to_url;
 
     use super::*;
@@ -104,6 +123,30 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_new_store_honors_local_prefix_option() {
+        let provider = FileStoreProvider;
+        let prefix_dir = tempdir().unwrap();
+        let base_path = Url::from_directory_path(prefix_dir.path()).unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("honor_local_prefix".to_string(), "true".to_string())]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(base_path, &params).await.unwrap();
+        let location = Path::from("nested/file.txt");
+        store
+            .inner
+            .put(&location, PutPayload::from_static(b"hello"))
+            .await
+            .unwrap();
+
+        let file_path = prefix_dir.path().join("nested/file.txt");
+        assert_eq!(fs::read(file_path).unwrap(), b"hello");
     }
 
     #[test]
