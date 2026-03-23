@@ -1183,3 +1183,62 @@ fn test_large_dataset_schema() {
 
     unsafe { lance_dataset_close(ds) };
 }
+
+// ---------------------------------------------------------------------------
+// Tests with checked-in historical test datasets
+// ---------------------------------------------------------------------------
+
+/// Helper: resolve path to a checked-in test dataset.
+fn test_data_path(relative: &str) -> String {
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("../../test_data");
+    path.push(relative);
+    assert!(path.exists(), "Test data not found at {}", path.display());
+    path.to_str().unwrap().to_string()
+}
+
+#[test]
+fn test_historical_dataset_v0_27_1() {
+    let uri = test_data_path("v0.27.1/pq_in_schema");
+    let c_uri = c_str(&uri);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "should open historical dataset");
+
+    let version = unsafe { lance_dataset_version(ds) };
+    assert!(version >= 1);
+
+    let count = unsafe { lance_dataset_count_rows(ds) };
+    assert!(count > 0, "historical dataset should have rows");
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_schema(ds, &mut ffi_schema) };
+    assert_eq!(rc, 0);
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    assert!(!schema.fields().is_empty(), "schema should have fields");
+
+    let batches = scan_all_rows(ds);
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, count as usize);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_historical_dataset_open_specific_version() {
+    let uri = test_data_path("v0.27.1/pq_in_schema");
+    let c_uri = c_str(&uri);
+
+    // This dataset has 2 versions.
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 1) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 1);
+    let count_v1 = unsafe { lance_dataset_count_rows(ds) };
+    assert!(count_v1 > 0);
+    unsafe { lance_dataset_close(ds) };
+
+    let ds2 = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 2) };
+    assert!(!ds2.is_null());
+    assert_eq!(unsafe { lance_dataset_version(ds2) }, 2);
+    unsafe { lance_dataset_close(ds2) };
+}
