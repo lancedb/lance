@@ -250,7 +250,9 @@ public class CommitBuilder {
               useStableRowIds,
               storageFormat,
               maxRetries,
-              skipAutoCleanup);
+              skipAutoCleanup,
+              namespace,
+              tableId);
       result.setAllocator(dataset.allocator());
       return result;
     }
@@ -285,7 +287,9 @@ public class CommitBuilder {
       Boolean useStableRowIds,
       String storageFormat,
       int maxRetries,
-      boolean skipAutoCleanup);
+      boolean skipAutoCleanup,
+      Object namespace,
+      Object tableId);
 
   private static native Dataset nativeCommitToUri(
       String uri,
