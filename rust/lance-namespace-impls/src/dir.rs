@@ -39,6 +39,7 @@ use lance_namespace::models::{
 
 use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
 
 use crate::credentials::{
@@ -281,9 +282,9 @@ impl DirectoryNamespaceBuilder {
     ) -> Result<Self> {
         // Extract root from properties (required)
         let root = properties.get("root").cloned().ok_or_else(|| {
-            Error::namespace_source(
-                "Missing required property 'root' for directory namespace".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Missing required property 'root' for directory namespace".to_string(),
+            })
         })?;
 
         // Extract storage options (properties prefixed with "storage.")
@@ -572,7 +573,9 @@ impl DirectoryNamespaceBuilder {
         let (object_store, base_path) = ObjectStore::from_uri_and_params(registry, root, &params)
             .await
             .map_err(|e| {
-                Error::namespace_source(format!("Failed to create object store: {}", e).into())
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to create object store: {}", e),
+                })
             })?;
 
         Ok((object_store, base_path))
@@ -716,10 +719,13 @@ impl DirectoryNamespace {
         if let Some(id) = id
             && !id.is_empty()
         {
-            return Err(Error::namespace_source(format!(
-                "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
-                id
-            ).into()));
+            return Err(NamespaceError::Unsupported {
+                message: format!(
+                    "Directory namespace only supports root namespace operations, but got namespace ID: {:?}. Expected empty ID.",
+                    id
+                ),
+            }
+            .into());
         }
         Ok(())
     }
@@ -727,15 +733,19 @@ impl DirectoryNamespace {
     /// Extract table name from table ID
     fn table_name_from_id(id: &Option<Vec<String>>) -> Result<String> {
         let id = id.as_ref().ok_or_else(|| {
-            Error::namespace_source("Directory namespace table ID cannot be empty".into())
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Directory namespace table ID cannot be empty".to_string(),
+            })
         })?;
 
         if id.len() != 1 {
-            return Err(Error::namespace_source(format!(
-                "Multi-level table IDs are only supported when manifest mode is enabled, but got: {:?}",
-                id
-            )
-            .into()));
+            return Err(NamespaceError::Unsupported {
+                message: format!(
+                    "Multi-level table IDs are only supported when manifest mode is enabled, but got: {:?}",
+                    id
+                ),
+            }
+            .into());
         }
 
         Ok(id[0].clone())
@@ -749,7 +759,9 @@ impl DirectoryNamespace {
         let describe_resp = self.describe_table(describe_req).await?;
 
         describe_resp.location.ok_or_else(|| {
-            Error::namespace_source(format!("Table location not found for: {:?}", id).into())
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!("Table location not found for: {:?}", id),
+            })
         })
     }
 
@@ -996,13 +1008,13 @@ impl DirectoryNamespace {
                                     e
                                 );
                             } else {
-                                return Err(Error::namespace_source(
-                                    format!(
+                                return Err(NamespaceError::Internal {
+                                    message: format!(
                                         "Failed to delete version {} for table at '{}': {}",
                                         version, table_uri, e
-                                    )
-                                    .into(),
-                                ));
+                                    ),
+                                }
+                                .into());
                             }
                         }
                     }
@@ -1052,9 +1064,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Err(Error::namespace_source(
-                "Root namespace already exists and cannot be created".into(),
-            ));
+            return Err(NamespaceError::NamespaceAlreadyExists {
+                message: "Root namespace already exists and cannot be created".to_string(),
+            }
+            .into());
         }
 
         Err(Error::not_supported_source(
@@ -1068,9 +1081,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Err(Error::namespace_source(
-                "Root namespace cannot be dropped".into(),
-            ));
+            return Err(NamespaceError::InvalidInput {
+                message: "Root namespace cannot be dropped".to_string(),
+            }
+            .into());
         }
 
         Err(Error::not_supported_source(
@@ -1087,9 +1101,11 @@ impl LanceNamespace for DirectoryNamespace {
             return Ok(());
         }
 
-        Err(Error::namespace_source(
-            "Child namespaces are only supported when manifest mode is enabled".into(),
-        ))
+        Err(NamespaceError::NamespaceNotFound {
+            message: "Child namespaces are only supported when manifest mode is enabled"
+                .to_string(),
+        }
+        .into())
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -1198,15 +1214,17 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         if status.is_deregistered {
-            return Err(Error::namespace_source(
-                format!("Table is deregistered: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::InvalidTableState {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
         }
 
         let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
@@ -1317,13 +1335,13 @@ impl LanceNamespace for DirectoryNamespace {
                         ..Default::default()
                     })
                 } else {
-                    Err(Error::namespace_source(
-                        format!(
+                    Err(NamespaceError::Internal {
+                        message: format!(
                             "Table directory exists but cannot load dataset {}: {:?}",
                             table_name, err
-                        )
-                        .into(),
-                    ))
+                        ),
+                    }
+                    .into())
                 }
             }
         }
@@ -1346,15 +1364,17 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         if status.is_deregistered {
-            return Err(Error::namespace_source(
-                format!("Table is deregistered: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::InvalidTableState {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
         }
 
         Ok(())
@@ -1373,9 +1393,9 @@ impl LanceNamespace for DirectoryNamespace {
             .remove_dir_all(table_path)
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!("Failed to drop table {}: {}", table_name, e).into(),
-                )
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to drop table {}: {}", table_name, e),
+                })
             })?;
 
         Ok(DropTableResponse {
@@ -1397,15 +1417,18 @@ impl LanceNamespace for DirectoryNamespace {
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
         if request_data.is_empty() {
-            return Err(Error::namespace_source(
-                "Request data (Arrow IPC stream) is required for create_table".into(),
-            ));
+            return Err(NamespaceError::InvalidInput {
+                message: "Request data (Arrow IPC stream) is required for create_table".to_string(),
+            }
+            .into());
         }
 
         // Parse the Arrow IPC stream from request_data
         let cursor = Cursor::new(request_data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
-            Error::namespace_source(format!("Invalid Arrow IPC stream: {}", e).into())
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!("Invalid Arrow IPC stream: {}", e),
+            })
         })?;
         let arrow_schema = stream_reader.schema();
 
@@ -1413,9 +1436,9 @@ impl LanceNamespace for DirectoryNamespace {
         let mut batches = Vec::new();
         for batch_result in stream_reader {
             batches.push(batch_result.map_err(|e| {
-                Error::namespace_source(
-                    format!("Failed to read batch from IPC stream: {}", e).into(),
-                )
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Failed to read batch from IPC stream: {}", e),
+                })
             })?);
         }
 
@@ -1446,7 +1469,9 @@ impl LanceNamespace for DirectoryNamespace {
         Dataset::write(reader, &table_uri, Some(write_params))
             .await
             .map_err(|e| {
-                Error::namespace_source(format!("Failed to create Lance dataset: {}", e).into())
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to create Lance dataset: {}", e),
+                })
             })?;
 
         Ok(CreateTableResponse {
@@ -1482,13 +1507,13 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(location) = &request.location {
             let location = location.trim_end_matches('/');
             if location != table_uri {
-                return Err(Error::namespace_source(
-                    format!(
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
                         "Cannot declare table {} at location {}, must be at location {}",
                         table_name, location, table_uri
-                    )
-                    .into(),
-                ));
+                    ),
+                }
+                .into());
             }
         }
 
@@ -1498,9 +1523,10 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
         if status.exists && !status.has_reserved_file {
             // Table has data but no reserved file - it was created with data
-            return Err(Error::namespace_source(
-                format!("Table already exists: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableAlreadyExists {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         // Atomically create the .lance-reserved file to mark the table as declared.
@@ -1510,7 +1536,15 @@ impl LanceNamespace for DirectoryNamespace {
 
         self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
             .await
-            .map_err(|e| Error::namespace_source(e.into()))?;
+            .map_err(|e| {
+                if e.contains("already exists") {
+                    lance_core::Error::from(NamespaceError::TableAlreadyExists {
+                        message: table_name.to_string(),
+                    })
+                } else {
+                    lance_core::Error::from(NamespaceError::Internal { message: e })
+                }
+            })?;
 
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
@@ -1564,15 +1598,17 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         if status.is_deregistered {
-            return Err(Error::namespace_source(
-                format!("Table is already deregistered: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::InvalidTableState {
+                message: format!("Table is already deregistered: {}", table_name),
+            }
+            .into());
         }
 
         // Atomically create the .lance-deregistered marker file.
@@ -1587,13 +1623,13 @@ impl LanceNamespace for DirectoryNamespace {
         )
         .await
         .map_err(|e| {
-            // Convert "already exists" to "already deregistered" for better UX
-            let message = if e.contains("already exists") {
-                format!("Table is already deregistered: {}", table_name)
+            if e.contains("already exists") {
+                lance_core::Error::from(NamespaceError::InvalidTableState {
+                    message: format!("Table is already deregistered: {}", table_name),
+                })
             } else {
-                e
-            };
-            Error::namespace_source(message.into())
+                lance_core::Error::from(NamespaceError::Internal { message: e })
+            }
         })?;
 
         Ok(lance_namespace::models::DeregisterTableResponse {
@@ -1629,13 +1665,12 @@ impl LanceNamespace for DirectoryNamespace {
             .try_collect()
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to list manifest files for table at '{}': {}",
                         table_uri, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?;
 
         let is_v2_naming = manifest_metas
@@ -1728,24 +1763,22 @@ impl LanceNamespace for DirectoryNamespace {
             .get(&staging_path)
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to read staging manifest at '{}': {}",
                         staging_manifest_path, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?
             .bytes()
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to read staging manifest bytes at '{}': {}",
                         staging_manifest_path, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?;
 
         let manifest_size = manifest_data.len() as i64;
@@ -1764,20 +1797,20 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| match e {
                 object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => Error::namespace_source(
-                    format!(
-                        "Version {} already exists for table at '{}'",
-                        version, table_uri
-                    )
-                    .into(),
-                ),
-                _ => Error::namespace_source(
-                    format!(
+                | object_store::Error::Precondition { .. } => {
+                    lance_core::Error::from(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Version {} already exists for table at '{}'",
+                            version, table_uri
+                        ),
+                    })
+                }
+                _ => lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to create version {} for table at '{}': {}",
                         version, table_uri, e
-                    )
-                    .into(),
-                ),
+                    ),
+                }),
             })?;
 
         // Delete the staging manifest after successful copy
@@ -1862,9 +1895,9 @@ impl LanceNamespace for DirectoryNamespace {
             builder = builder.with_session(sess.clone());
         }
         let mut dataset = builder.load().await.map_err(|e| {
-            Error::namespace_source(
-                format!("Failed to open table at '{}': {}", table_uri, e).into(),
-            )
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to open table at '{}': {}", table_uri, e),
+            })
         })?;
 
         if let Some(version) = request.version {
@@ -1872,13 +1905,12 @@ impl LanceNamespace for DirectoryNamespace {
                 .checkout_version(version as u64)
                 .await
                 .map_err(|e| {
-                    Error::namespace_source(
-                        format!(
+                    lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                        message: format!(
                             "Failed to checkout version {} for table at '{}': {}",
                             version, table_uri, e
-                        )
-                        .into(),
-                    )
+                        ),
+                    })
                 })?;
         }
 
@@ -2232,12 +2264,7 @@ mod tests {
 
         let result = namespace.describe_table(request).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Table does not exist")
-        );
+        assert!(result.unwrap_err().to_string().contains("Table not found"));
     }
 
     #[tokio::test]
@@ -2266,12 +2293,7 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.table_exists(request).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Table does not exist")
-        );
+        assert!(result.unwrap_err().to_string().contains("Table not found"));
     }
 
     #[tokio::test]
@@ -4634,8 +4656,8 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("does not exist"),
-            "Error should mention table does not exist, got: {}",
+            err_msg.contains("Table not found"),
+            "Error should mention table not found, got: {}",
             err_msg
         );
     }

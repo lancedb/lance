@@ -46,6 +46,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use lance_core::{Error, Result, box_error};
 
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
@@ -250,7 +251,9 @@ impl RestNamespaceBuilder {
     pub fn from_properties(properties: HashMap<String, String>) -> Result<Self> {
         // Extract URI (required)
         let uri = properties.get("uri").cloned().ok_or_else(|| {
-            Error::namespace_source("Missing required property 'uri' for REST namespace".into())
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Missing required property 'uri' for REST namespace".to_string(),
+            })
         })?;
 
         // Extract delimiter (optional)
@@ -415,7 +418,10 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
     match id {
         Some(id_parts) if !id_parts.is_empty() => Ok(id_parts.join(delimiter)),
         Some(_) => Ok(delimiter.to_string()),
-        None => Err(Error::namespace_source("Object ID is required".into())),
+        None => Err(NamespaceError::InvalidInput {
+            message: "Object ID is required".to_string(),
+        }
+        .into()),
     }
 }
 
@@ -519,12 +525,16 @@ impl RestNamespace {
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
-                Error::namespace_source(format!("Failed to parse response: {}", e).into())
+                NamespaceError::Internal {
+                    message: format!("Failed to parse response: {}", e),
+                }
+                .into()
             })
         } else {
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(NamespaceError::Internal {
+                message: format!("Response error: status={}, content={}", status, content),
+            }
+            .into())
         }
     }
 
@@ -554,12 +564,16 @@ impl RestNamespace {
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
-                Error::namespace_source(format!("Failed to parse response: {}", e).into())
+                NamespaceError::Internal {
+                    message: format!("Failed to parse response: {}", e),
+                }
+                .into()
             })
         } else {
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(NamespaceError::Internal {
+                message: format!("Response error: status={}, content={}", status, content),
+            }
+            .into())
         }
     }
 
@@ -589,9 +603,10 @@ impl RestNamespace {
                 .text()
                 .await
                 .map_err(|e| Error::io_source(box_error(e)))?;
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(NamespaceError::Internal {
+                message: format!("Response error: status={}, content={}", status, content),
+            }
+            .into())
         }
     }
 
@@ -621,12 +636,16 @@ impl RestNamespace {
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
-                Error::namespace_source(format!("Failed to parse response: {}", e).into())
+                NamespaceError::Internal {
+                    message: format!("Failed to parse response: {}", e),
+                }
+                .into()
             })
         } else {
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(NamespaceError::Internal {
+                message: format!("Response error: status={}, content={}", status, content),
+            }
+            .into())
         }
     }
 
@@ -659,9 +678,10 @@ impl RestNamespace {
                 .text()
                 .await
                 .map_err(|e| Error::io_source(box_error(e)))?;
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(NamespaceError::Internal {
+                message: format!("Response error: status={}, content={}", status, content),
+            }
+            .into())
         }
     }
 
@@ -880,7 +900,9 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
 
         let on = request.on.as_deref().ok_or_else(|| {
-            Error::namespace_source("'on' field is required for merge insert".into())
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "'on' field is required for merge insert".to_string(),
+            })
         })?;
 
         let path = format!("/v1/table/{}/merge_insert", encoded_id);
@@ -986,9 +1008,10 @@ impl LanceNamespace for RestNamespace {
                 .text()
                 .await
                 .map_err(|e| Error::io_source(box_error(e)))?;
-            Err(Error::namespace_source(
-                format!("Response error: status={}, content={}", status, content).into(),
-            ))
+            Err(NamespaceError::Internal {
+                message: format!("Response error: status={}, content={}", status, content),
+            }
+            .into())
         }
     }
 

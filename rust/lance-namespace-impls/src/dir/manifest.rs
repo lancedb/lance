@@ -1419,13 +1419,13 @@ impl ManifestNamespace {
                 version: Box::new(tv),
             });
         }
-        Err(Error::namespace_source(
-            format!(
+        Err(NamespaceError::TableVersionNotFound {
+            message: format!(
                 "Version {} not found in manifest for table {:?}",
                 version, table_id
-            )
-            .into(),
-        ))
+            ),
+        }
+        .into())
     }
 
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
@@ -1445,9 +1445,10 @@ impl ManifestNamespace {
             let partial_path = &namespace_path[..i];
             let object_id = partial_path.join(DELIMITER);
             if !self.manifest_contains_object(&object_id).await? {
-                return Err(Error::namespace_source(
-                    format!("Parent namespace '{}' does not exist", object_id).into(),
-                ));
+                return Err(NamespaceError::NamespaceNotFound {
+                    message: format!("Parent namespace '{}' does not exist", object_id),
+                }
+                .into());
             }
         }
         Ok(())
@@ -1838,9 +1839,10 @@ impl LanceNamespace for ManifestNamespace {
                     }
                 }
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", object_id).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound {
+                message: format!("Table '{}' not found", object_id),
+            }
+            .into()),
         }
     }
 
@@ -1862,9 +1864,10 @@ impl LanceNamespace for ManifestNamespace {
         if exists {
             Ok(())
         } else {
-            Err(Error::namespace_source(
-                format!("Table '{}' not found", table_name).into(),
-            ))
+            Err(NamespaceError::TableNotFound {
+                message: format!("Table '{}' not found", table_name),
+            }
+            .into())
         }
     }
 
@@ -1906,9 +1909,10 @@ impl LanceNamespace for ManifestNamespace {
 
         // Validate that request_data is provided
         if data.is_empty() {
-            return Err(Error::namespace_source(
-                "Request data (Arrow IPC stream) is required for create_table".into(),
-            ));
+            return Err(NamespaceError::InvalidInput {
+                message: "Request data (Arrow IPC stream) is required for create_table".to_string(),
+            }
+            .into());
         }
 
         // Write the data using Lance Dataset
@@ -1999,9 +2003,9 @@ impl LanceNamespace for ManifestNamespace {
                     .boxed()
                     .await
                     .map_err(|e| {
-                        Error::namespace_source(
-                            format!("Failed to delete table directory: {}", e).into(),
-                        )
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!("Failed to delete table directory: {}", e),
+                        })
                     })?;
 
                 Ok(DropTableResponse {
@@ -2010,9 +2014,10 @@ impl LanceNamespace for ManifestNamespace {
                     ..Default::default()
                 })
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", table_name).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound {
+                message: format!("Table '{}' not found", table_name),
+            }
+            .into()),
         }
     }
 
@@ -2101,9 +2106,10 @@ impl LanceNamespace for ManifestNamespace {
                 properties: info.metadata,
                 ..Default::default()
             }),
-            None => Err(Error::namespace_source(
-                format!("Namespace '{}' not found", object_id).into(),
-            )),
+            None => Err(NamespaceError::NamespaceNotFound {
+                message: format!("Namespace '{}' not found", object_id),
+            }
+            .into()),
         }
     }
 
@@ -2118,9 +2124,10 @@ impl LanceNamespace for ManifestNamespace {
 
         // Root namespace always exists and cannot be created
         if namespace_id.is_empty() {
-            return Err(Error::namespace_source(
-                "Root namespace already exists and cannot be created".into(),
-            ));
+            return Err(NamespaceError::NamespaceAlreadyExists {
+                message: "Root namespace already exists and cannot be created".to_string(),
+            }
+            .into());
         }
 
         // Validate parent namespaces exist (but not the namespace being created)
@@ -2131,9 +2138,10 @@ impl LanceNamespace for ManifestNamespace {
 
         let object_id = namespace_id.join(DELIMITER);
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::namespace_source(
-                format!("Namespace '{}' already exists", object_id).into(),
-            ));
+            return Err(NamespaceError::NamespaceAlreadyExists {
+                message: format!("Namespace '{}' already exists", object_id),
+            }
+            .into());
         }
 
         // Serialize properties if provided
@@ -2170,18 +2178,20 @@ impl LanceNamespace for ManifestNamespace {
 
         // Root namespace always exists and cannot be dropped
         if namespace_id.is_empty() {
-            return Err(Error::namespace_source(
-                "Root namespace cannot be dropped".into(),
-            ));
+            return Err(NamespaceError::InvalidInput {
+                message: "Root namespace cannot be dropped".to_string(),
+            }
+            .into());
         }
 
         let object_id = namespace_id.join(DELIMITER);
 
         // Check if namespace exists
         if !self.manifest_contains_object(&object_id).boxed().await? {
-            return Err(Error::namespace_source(
-                format!("Namespace '{}' not found", object_id).into(),
-            ));
+            return Err(NamespaceError::NamespaceNotFound {
+                message: format!("Namespace '{}' not found", object_id),
+            }
+            .into());
         }
 
         // Check for child namespaces
@@ -2210,13 +2220,13 @@ impl LanceNamespace for ManifestNamespace {
         })?;
 
         if count > 0 {
-            return Err(Error::namespace_source(
-                format!(
+            return Err(NamespaceError::NamespaceNotEmpty {
+                message: format!(
                     "Namespace '{}' is not empty (contains {} child objects)",
                     object_id, count
-                )
-                .into(),
-            ));
+                ),
+            }
+            .into());
         }
 
         self.delete_from_manifest(&object_id).boxed().await?;
@@ -2239,9 +2249,10 @@ impl LanceNamespace for ManifestNamespace {
         if self.manifest_contains_object(&object_id).await? {
             Ok(())
         } else {
-            Err(Error::namespace_source(
-                format!("Namespace '{}' not found", object_id).into(),
-            ))
+            Err(NamespaceError::NamespaceNotFound {
+                message: format!("Namespace '{}' not found", object_id),
+            }
+            .into())
         }
     }
 
@@ -2263,9 +2274,10 @@ impl LanceNamespace for ManifestNamespace {
         // Check if table already exists in manifest
         let existing = self.query_manifest_for_table(&object_id).await?;
         if existing.is_some() {
-            return Err(Error::namespace_source(
-                format!("Table '{}' already exists", table_name).into(),
-            ));
+            return Err(NamespaceError::TableAlreadyExists {
+                message: format!("Table '{}' already exists", table_name),
+            }
+            .into());
         }
 
         // Create table location path with hash-based naming
@@ -2285,13 +2297,13 @@ impl LanceNamespace for ManifestNamespace {
         if let Some(req_location) = &request.location {
             let req_location = req_location.trim_end_matches('/');
             if req_location != table_uri {
-                return Err(Error::namespace_source(
-                    format!(
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
                         "Cannot declare table {} at location {}, must be at location {}",
                         table_name, req_location, table_uri
-                    )
-                    .into(),
-                ));
+                    ),
+                }
+                .into());
             }
         }
 
@@ -2302,24 +2314,22 @@ impl LanceNamespace for ManifestNamespace {
             .create(&reserved_file_path)
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to create .lance-reserved file for table {}: {}",
                         table_name, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?
             .shutdown()
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to finalize .lance-reserved file for table {}: {}",
                         table_name, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?;
 
         // Add entry to manifest marking this as a declared table (store dir_name, not full path)
@@ -2395,9 +2405,10 @@ impl LanceNamespace for ManifestNamespace {
 
         // Check if table already exists
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::namespace_source(
-                format!("Table '{}' already exists", object_id).into(),
-            ));
+            return Err(NamespaceError::TableAlreadyExists {
+                message: format!("Table '{}' already exists", object_id),
+            }
+            .into());
         }
 
         // Register the table with its location in the manifest
@@ -2438,9 +2449,10 @@ impl LanceNamespace for ManifestNamespace {
                 Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
-                return Err(Error::namespace_source(
-                    format!("Table '{}' not found", object_id).into(),
-                ));
+                return Err(NamespaceError::TableNotFound {
+                    message: format!("Table '{}' not found", object_id),
+                }
+                .into());
             }
         };
 
