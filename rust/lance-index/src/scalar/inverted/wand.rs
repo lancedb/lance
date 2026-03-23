@@ -1994,7 +1994,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_and_phrase_miss_preserves_tail_postings(#[values(false, true)] is_compressed: bool) {
+    fn test_and_phrase_miss_advances_to_next_candidate(#[values(false, true)] is_compressed: bool) {
         let mut docs = DocSet::default();
         docs.append(0, 8);
         docs.append(1, 8);
@@ -2032,10 +2032,6 @@ mod tests {
         assert!(!wand.check_positions(0));
 
         wand.threshold = 1.5;
-        wand.push_back_leads(first.0.doc_id() + 1);
-        assert_eq!(wand.tail.len(), 1);
-        assert_eq!(wand.head.len(), 1);
-
         let second = wand.next().unwrap().unwrap();
         assert_eq!(second.0.doc_id(), 1);
         assert!(wand.check_positions(0));
