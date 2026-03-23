@@ -52,7 +52,6 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
 pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {

@@ -24,6 +24,7 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+pub mod hub;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -89,6 +90,7 @@ pub struct ObjectStoreRegistryStats {
 /// - `file`: A local file object store, with optimized code paths.
 /// - `file-object-store`: A local file object store that uses the ObjectStore API,
 ///   for all operations. Used for testing with ObjectStore wrappers.
+/// - `hub`: A composite object store that routes operations across configured shards.
 /// - `s3`: An S3 object store.
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
@@ -301,6 +303,7 @@ impl Default for ObjectStoreRegistry {
             "file-object-store".into(),
             Arc::new(local::FileStoreProvider),
         );
+        providers.insert("hub".into(), Arc::new(hub::HubStoreProvider));
 
         #[cfg(feature = "aws")]
         {
