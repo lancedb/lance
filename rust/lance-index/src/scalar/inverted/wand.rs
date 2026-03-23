@@ -563,9 +563,9 @@ pub struct Wand<'a, S: Scorer> {
     // the threshold before fully advancing every lagging iterator.
     tail_max_score: f32,
     // Block-max scores are valid for all candidate docs up to this doc id.
-    // As long as the next target stays within this window, we can reuse the
-    // current block-max view instead of recomputing it.
-    up_to: u64,
+    // `None` means the window has not been initialized yet and the next
+    // candidate must refresh block-max state before making pruning decisions.
+    up_to: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
 }
@@ -595,7 +595,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             lead: Vec::new(),
             tail: BinaryHeap::new(),
             tail_max_score: 0.0,
-            up_to: TERMINATED_DOC_ID,
+            up_to: None,
             docs,
             scorer,
         }
@@ -826,7 +826,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
 
         while let Some(target) = self.head_doc() {
-            if target > self.up_to {
+            if self.up_to.is_none_or(|up_to| target > up_to) {
                 self.update_max_scores(target);
             }
             self.move_head_doc_to_lead(target);
@@ -880,27 +880,31 @@ impl<'a, S: Scorer> Wand<'a, S> {
         if postings.len() < self.num_terms {
             return None;
         }
-
-        let mut target = postings
-            .iter()
-            .filter_map(|posting| posting.doc().map(|doc| doc.doc_id()))
-            .max()?;
+        postings.sort_unstable();
 
         loop {
-            let mut aligned = true;
-            for posting in &mut postings {
-                posting.next(target);
-                let doc = posting.doc()?;
-                if doc.doc_id() != target {
-                    target = target.max(doc.doc_id());
-                    aligned = false;
+            if postings.len() < self.num_terms {
+                return None;
+            }
+            let pivot = postings.len().checked_sub(1)?;
+            let doc = postings[pivot].doc()?;
+            let doc_id = doc.doc_id();
+
+            if !Self::and_check_block_max(&mut postings, doc_id, self.threshold) {
+                let (picked_term, least_id) = Self::and_get_new_candidate(&postings, pivot);
+                if least_id == TERMINATED_DOC_ID {
+                    return None;
                 }
+                Self::and_move_term(&mut postings, picked_term, least_id);
+                continue;
             }
 
-            if aligned {
-                self.lead = postings;
-                return self.lead.first().and_then(|posting| posting.doc());
+            if !Self::and_check_pivot_aligned(&mut postings, pivot, doc_id) {
+                continue;
             }
+
+            self.lead = postings;
+            return self.lead.first().and_then(|posting| posting.doc());
         }
     }
 
@@ -918,6 +922,101 @@ impl<'a, S: Scorer> Wand<'a, S> {
         postings
     }
 
+    #[allow(clippy::vec_box)]
+    fn and_check_block_max(
+        postings: &mut [Box<PostingIterator>],
+        target: u64,
+        threshold: f32,
+    ) -> bool {
+        let mut sum = 0.0;
+        for posting in postings {
+            posting.shallow_next(target);
+            let Some(block_doc) = posting.block_first_doc() else {
+                return false;
+            };
+            if block_doc > target {
+                return false;
+            }
+            sum += posting.block_max_score();
+        }
+        sum > threshold
+    }
+
+    #[allow(clippy::vec_box)]
+    fn and_get_new_candidate(postings: &[Box<PostingIterator>], pivot: usize) -> (usize, u64) {
+        let mut picked_term = pivot;
+        let mut max_score = postings[pivot].approximate_upper_bound();
+        let mut least_id = postings[pivot]
+            .next_block_first_doc()
+            .unwrap_or(TERMINATED_DOC_ID);
+
+        for (i, posting) in postings[..pivot].iter().enumerate().rev() {
+            let next_block_first_doc = posting.next_block_first_doc().unwrap_or(TERMINATED_DOC_ID);
+            if next_block_first_doc < least_id {
+                least_id = next_block_first_doc;
+            }
+            if posting.approximate_upper_bound() > max_score {
+                max_score = posting.approximate_upper_bound();
+                picked_term = i;
+            }
+        }
+
+        (picked_term, least_id)
+    }
+
+    #[allow(clippy::vec_box)]
+    fn and_move_term(postings: &mut Vec<Box<PostingIterator>>, picked_term: usize, least_id: u64) {
+        postings[picked_term].next(least_id);
+        let doc_id = postings[picked_term]
+            .doc()
+            .map(|d| d.doc_id())
+            .unwrap_or(TERMINATED_DOC_ID);
+        if doc_id == TERMINATED_DOC_ID {
+            postings.swap_remove(picked_term);
+        }
+        Self::and_bubble_up(postings, picked_term);
+    }
+
+    #[allow(clippy::vec_box)]
+    fn and_check_pivot_aligned(
+        postings: &mut Vec<Box<PostingIterator>>,
+        pivot: usize,
+        pivot_doc: u64,
+    ) -> bool {
+        for i in (0..=pivot).rev() {
+            postings[i].next(pivot_doc);
+            let doc_id = postings[i]
+                .doc()
+                .map(|d| d.doc_id())
+                .unwrap_or(TERMINATED_DOC_ID);
+            if doc_id != pivot_doc {
+                if doc_id == TERMINATED_DOC_ID {
+                    postings.swap_remove(i);
+                }
+                Self::and_bubble_up(postings, i);
+                return false;
+            } else {
+                Self::and_bubble_up(postings, i);
+            }
+        }
+        true
+    }
+
+    #[allow(clippy::vec_box)]
+    fn and_bubble_up(postings: &mut [Box<PostingIterator>], index: usize) {
+        if index >= postings.len() {
+            return;
+        }
+
+        for i in index + 1..postings.len() {
+            if postings[i].cmp(&postings[i - 1]) >= std::cmp::Ordering::Equal {
+                break;
+            }
+            postings.swap(i - 1, i);
+        }
+    }
+
+    #[allow(clippy::vec_box)]
     fn head_doc(&self) -> Option<u64> {
         self.head.peek().map(HeadPosting::doc_id)
     }
@@ -953,7 +1052,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn can_target_beat_threshold(&mut self, target: u64) -> bool {
-        if target > self.up_to {
+        if self.up_to.is_none_or(|up_to| target > up_to) {
             self.update_max_scores(target);
         }
 
@@ -1021,7 +1120,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .unwrap_or(TERMINATED_DOC_ID);
             up_to = up_to.min(block_end.max(target));
         }
-        self.up_to = up_to;
+        self.up_to = Some(up_to);
 
         let tail = std::mem::take(&mut self.tail);
         self.tail_max_score = 0.0;
@@ -1662,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_next_and_candidate_terminates_for_disjoint_postings() {
+    fn test_and_search_terminates_for_disjoint_postings() {
         let mut docs = DocSet::default();
         for i in 0..6 {
             docs.append(i, 1);
@@ -1688,7 +1787,79 @@ mod tests {
         ];
 
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
-        assert!(wand.next_and_candidate().is_none());
+        assert!(wand.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_up_to_refreshes_on_first_candidate() {
+        let mut docs = DocSet::default();
+        for i in 0..=(BLOCK_SIZE as u64 + 1) {
+            docs.append(i, 1);
+        }
+
+        let postings = vec![PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(
+                (0..=(BLOCK_SIZE as u32 + 1)).collect(),
+                1.0,
+                Some(vec![1.0, 1.0]),
+                true,
+            ),
+            docs.len(),
+        )];
+
+        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
+        assert!(wand.up_to.is_none());
+        let _ = wand.next().unwrap();
+        assert!(wand.up_to.is_some());
+    }
+
+    #[test]
+    fn test_and_search_prunes_with_threshold_and_keeps_candidate() {
+        let mut docs = DocSet::default();
+        for i in 0..(2 * BLOCK_SIZE as u64) {
+            let doc_tokens = if i < BLOCK_SIZE as u64 { 100 } else { 1 };
+            docs.append(i, doc_tokens);
+        }
+        let all_docs = (0..2 * BLOCK_SIZE as u32).collect::<Vec<_>>();
+
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("a"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(
+                    all_docs.clone(),
+                    1.0,
+                    Some(vec![0.02, 1.0]),
+                    true,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("b"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(
+                    all_docs,
+                    1.0,
+                    Some(vec![0.02, 1.0]),
+                    true,
+                ),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, InverseDocLengthScorer);
+        wand.threshold = 0.5;
+
+        let candidate = wand.next().unwrap().unwrap();
+        assert_eq!(candidate.0.doc_id(), BLOCK_SIZE as u64);
     }
 
     #[rstest]
