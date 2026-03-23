@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+[package]
+name = "lance-c"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "C/C++ bindings for the Lance columnar data format"
+keywords = ["lance", "ffi", "c", "cpp", "arrow"]
+categories = ["database-implementations", "external-ffi-bindings"]
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+lance = { workspace = true }
+lance-core = { workspace = true }
+lance-io = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+futures = { workspace = true }
+log = { workspace = true }
+pin-project = { workspace = true }
+snafu = "0.8"
+
+[dev-dependencies]
+lance = { workspace = true }
+lance-datagen = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tempfile = "3"

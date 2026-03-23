@@ -17,6 +17,7 @@ members = [
     "rust/lance-test-macros",
     "rust/lance-testing",
     "rust/lance-tools",
+    "rust/lance-c",
     "rust/compression/fsst",
     "rust/compression/bitpacking",
 ]
