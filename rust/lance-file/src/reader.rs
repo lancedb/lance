@@ -131,6 +131,19 @@ impl CachedFileMetadata {
             ),
         }
     }
+
+    /// Map a column name to its index in `column_infos`.
+    /// For composite types (e.g. FixedSizeList), returns the leaf
+    /// child column index (the one holding the actual data).
+    pub fn column_index(&self, name: &str) -> Option<u32> {
+        let file_version = self.version();
+        let proj = ReaderProjection::from_column_names(
+            file_version,
+            &self.file_schema,
+            &[name],
+        ).ok()?;
+        proj.column_indices.last().copied()
+    }
 }
 
 /// Selecting columns from a lance file requires specifying both the

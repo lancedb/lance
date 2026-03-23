@@ -355,6 +355,246 @@ impl ColumnInfo {
             .map(|page| page.encoding.is_structural())
             .unwrap_or(false)
     }
+
+    /// True when on-disk bytes are the same as the in-memory representation:
+    /// non-nullable, fixed-width, uncompressed flat encoding with no dictionary.
+    /// Callers can safely reinterpret the raw bytes as typed values.
+    ///
+    /// Also returns true for FullZipLayout pages (large data stored flat)
+    /// and 1-buffer structural pages (small data stored inline).
+    pub fn is_trivially_decodable(&self) -> bool {
+        if self.page_infos.is_empty() {
+            return false;
+        }
+        self.page_infos.iter().all(|page| {
+            if let Some(mb) = page.miniblock_layout() {
+                return is_trivial_miniblock(mb);
+            }
+            if let Some(fz) = page.full_zip_layout() {
+                return is_trivial_full_zip(fz);
+            }
+            // Accept single-buffer pages: either 1-buffer structural (small inline
+            // data) or legacy v2.0 pages with flat data. In both cases the buffer
+            // contains raw values directly.
+            page.buffer_offsets_and_sizes.len() == 1
+        })
+    }
+
+    /// For trivially-decodable columns, return per-page descriptors that
+    /// let callers locate raw data in the file without parsing the encoding.
+    /// Returns None if any page is not trivially decodable.
+    pub fn trivial_page_descriptors(&self) -> Option<Vec<TrivialPageDescriptor>> {
+        if !self.is_trivially_decodable() {
+            return None;
+        }
+        let mut descriptors = Vec::with_capacity(self.page_infos.len());
+        let mut page_row_offset = 0u64;
+
+        for page in self.page_infos.iter() {
+            let bufs = &page.buffer_offsets_and_sizes;
+            let mb = page.miniblock_layout();
+            let fz = page.full_zip_layout();
+            let bits_per_value = if let Some(mb) = mb {
+                trivial_bits_per_value(mb).unwrap()
+            } else if let Some(fz) = fz {
+                match &fz.details {
+                    Some(crate::format::pb21::full_zip_layout::Details::BitsPerValue(b)) => *b as u64,
+                    _ => continue,
+                }
+            } else if bufs.len() == 1 && page.num_rows > 0 {
+                (bufs[0].1 / page.num_rows) * 8
+            } else {
+                continue;
+            };
+
+            if bufs.len() >= 2 && mb.is_some() {
+                // Miniblock with meta + data buffers
+                let (meta_offset, meta_size) = bufs[0];
+                let (data_offset, _) = bufs[bufs.len() - 1];
+                descriptors.push(TrivialPageDescriptor {
+                    meta_buf_offset: meta_offset,
+                    meta_buf_size: meta_size,
+                    data_buf_offset: data_offset,
+                    num_rows: page.num_rows,
+                    page_row_offset,
+                    has_large_chunk: mb.unwrap().has_large_chunk,
+                    bits_per_value,
+                });
+            } else if bufs.len() <= 2 {
+                // Flat: single buffer with raw data, no chunks
+                let (buf_offset, _) = bufs[bufs.len() - 1];
+                descriptors.push(TrivialPageDescriptor {
+                    meta_buf_offset: 0,
+                    meta_buf_size: 0,
+                    data_buf_offset: buf_offset,
+                    num_rows: page.num_rows,
+                    page_row_offset,
+                    has_large_chunk: false,
+                    bits_per_value,
+                });
+            }
+            page_row_offset += page.num_rows;
+        }
+        Some(descriptors)
+    }
+}
+
+impl PageInfo {
+    /// Extract the MiniBlockLayout if this page uses structural miniblock encoding.
+    pub fn miniblock_layout(&self) -> Option<&crate::format::pb21::MiniBlockLayout> {
+        match &self.encoding {
+            PageEncoding::Structural(pl) => pl.layout.as_ref().and_then(|l| match l {
+                crate::format::pb21::page_layout::Layout::MiniBlockLayout(mb) => Some(mb),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Extract the FullZipLayout if this page uses structural full-zip encoding.
+    pub fn full_zip_layout(&self) -> Option<&crate::format::pb21::FullZipLayout> {
+        match &self.encoding {
+            PageEncoding::Structural(pl) => pl.layout.as_ref().and_then(|l| match l {
+                crate::format::pb21::page_layout::Layout::FullZipLayout(fz) => Some(fz),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Descriptor for a page in a trivially-decodable column.
+/// Contains everything needed to locate raw value data in the file.
+#[derive(Debug, Clone)]
+pub struct TrivialPageDescriptor {
+    /// File offset of the miniblock meta buffer (0 if no meta buffer)
+    pub meta_buf_offset: u64,
+    /// Size of the meta buffer in bytes (0 if no meta buffer)
+    pub meta_buf_size: u64,
+    /// File offset where the data buffer starts
+    pub data_buf_offset: u64,
+    /// Number of rows in this page
+    pub num_rows: u64,
+    /// Cumulative row offset of this page within the column
+    pub page_row_offset: u64,
+    /// Whether chunks use u32 (true) or u16 (false) meta words
+    pub has_large_chunk: bool,
+    /// Bits per value (e.g. 32 for f32, 64 for f64)
+    pub bits_per_value: u64,
+}
+
+const MINIBLOCK_ALIGNMENT: usize = 8;
+const CHUNK_HEADER_BYTES: u64 = 8;
+
+/// Parse miniblock chunk metadata to produce raw data byte ranges.
+///
+/// Each returned tuple is (file_byte_offset, byte_length, num_rows) pointing
+/// to raw value data (past the chunk header) within the data buffer.
+pub fn miniblock_raw_data_ranges(
+    meta_bytes: &[u8],
+    data_buf_file_offset: u64,
+    total_items: u64,
+    has_large_chunk: bool,
+    bits_per_value: u64,
+) -> Vec<(u64, usize, u64)> {
+    let word_size = if has_large_chunk { 4 } else { 2 };
+    let num_chunks = meta_bytes.len() / word_size;
+    let mut ranges = Vec::with_capacity(num_chunks);
+    let mut offset = data_buf_file_offset;
+    let mut rows_used = 0u64;
+
+    for i in 0..num_chunks {
+        let word = if has_large_chunk {
+            u32::from_le_bytes([
+                meta_bytes[i * 4],
+                meta_bytes[i * 4 + 1],
+                meta_bytes[i * 4 + 2],
+                meta_bytes[i * 4 + 3],
+            ])
+        } else {
+            u16::from_le_bytes([meta_bytes[i * 2], meta_bytes[i * 2 + 1]]) as u32
+        };
+
+        let log_num_values = word & 0x0F;
+        let divided_bytes = word >> 4;
+        let chunk_total = (divided_bytes as usize + 1) * MINIBLOCK_ALIGNMENT;
+        let num_values = if i < num_chunks - 1 {
+            1u64 << log_num_values
+        } else {
+            total_items - rows_used
+        };
+        rows_used += num_values;
+
+        let data_offset = offset + CHUNK_HEADER_BYTES;
+        let data_len = (num_values * bits_per_value / 8) as usize;
+        ranges.push((data_offset, data_len, num_values));
+        offset += chunk_total as u64;
+    }
+    ranges
+}
+
+fn is_trivial_full_zip(fz: &crate::format::pb21::FullZipLayout) -> bool {
+    // No rep/def levels
+    if fz.bits_rep != 0 || fz.bits_def != 0 {
+        return false;
+    }
+    // Must be fixed-width
+    let bpv = match &fz.details {
+        Some(crate::format::pb21::full_zip_layout::Details::BitsPerValue(bpv)) => *bpv,
+        _ => return false,
+    };
+    // Whole bytes, no sub-byte packing
+    if bpv == 0 || bpv % 8 != 0 {
+        return false;
+    }
+    // No value compression (or flat without buffer compression)
+    if let Some(vc) = &fz.value_compression {
+        use crate::format::pb21::compressive_encoding::Compression;
+        match vc.compression.as_ref() {
+            Some(Compression::Flat(flat)) => {
+                if flat.data.is_some() {
+                    return false;
+                }
+            }
+            None => {} // no compression = fine
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_trivial_miniblock(mb: &crate::format::pb21::MiniBlockLayout) -> bool {
+    // No rep/def levels
+    if mb.rep_compression.is_some() || mb.def_compression.is_some() {
+        return false;
+    }
+    // No dictionary
+    if mb.dictionary.is_some() {
+        return false;
+    }
+    // Single value buffer
+    if mb.num_buffers != 1 {
+        return false;
+    }
+    // Value compression must be Flat with no buffer compression
+    trivial_bits_per_value(mb).is_some()
+}
+
+fn trivial_bits_per_value(mb: &crate::format::pb21::MiniBlockLayout) -> Option<u64> {
+    use crate::format::pb21::compressive_encoding::Compression;
+    let vc = mb.value_compression.as_ref()?;
+    match vc.compression.as_ref()? {
+        Compression::Flat(flat) => {
+            if flat.data.is_some() {
+                return None; // has buffer compression
+            }
+            if flat.bits_per_value == 0 || flat.bits_per_value % 8 != 0 {
+                return None;
+            }
+            Some(flat.bits_per_value)
+        }
+        _ => None,
+    }
 }
 
 enum RootScheduler {
