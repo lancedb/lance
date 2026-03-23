@@ -521,12 +521,11 @@ mod tests {
 
         // Build az:// operator (uses Azblob backend)
         let az_url = Url::parse("az://test-container/path").unwrap();
-        let az_operator = AzureBlobStoreProvider::build_opendal_operator(&az_url, &common_opts)
-            .unwrap();
+        let az_operator =
+            AzureBlobStoreProvider::build_opendal_operator(&az_url, &common_opts).unwrap();
 
         // Build abfss:// operator (uses Azdls backend)
-        let abfss_url =
-            Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+        let abfss_url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
         let abfss_operator =
             AzureBlobStoreProvider::build_opendal_operator(&abfss_url, &common_opts).unwrap();
 
