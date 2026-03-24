@@ -301,15 +301,24 @@ pub async fn hamming_clustering_sampled(
 
     // Read data
     let (hashes, row_ids) = if use_sampling {
-        // Random sample using take()
+        // Random sample using take_rows() with _rowid
         let indices: Vec<u64> = sample(&mut rng(), total_rows, effective_sample)
             .iter()
             .map(|i| i as u64)
             .collect();
 
-        let projection =
-            crate::dataset::ProjectionRequest::from_columns([column], dataset.schema());
-        let batch = dataset.take(&indices, projection).await?;
+        let batch = dataset
+            .take_rows(
+                &indices,
+                crate::dataset::ProjectionRequest::from_columns([column], dataset.schema()),
+            )
+            .await?;
+
+        let rowid_col = batch.column_by_name("_rowid").ok_or_else(|| {
+            Error::invalid_input("_rowid column not found in take_rows result".to_string())
+        })?;
+        let row_ids = rowid_col.as_primitive::<UInt64Type>();
+        let row_id_vec: Vec<u64> = row_ids.values().to_vec();
 
         let hash_col = batch.column_by_name(column).ok_or_else(|| {
             Error::invalid_input(format!("Column '{}' not found in result", column))
@@ -317,7 +326,7 @@ pub async fn hamming_clustering_sampled(
         let hashes_arr = hash_col.as_fixed_size_list();
         let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
 
-        (hashes, indices)
+        (hashes, row_id_vec)
     } else {
         // Full scan
         let batch = dataset
