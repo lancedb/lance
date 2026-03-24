@@ -10,9 +10,9 @@ use futures::TryStreamExt;
 use futures::stream::StreamExt;
 
 use lance::dataset::Dataset;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance::{Error, Result};
-use lance_index::DatasetIndexExt;
 use lance_linalg::distance::MetricType;
 
 #[derive(Parser)]
