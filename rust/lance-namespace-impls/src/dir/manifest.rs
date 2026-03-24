@@ -1863,7 +1863,7 @@ impl LanceNamespace for ManifestNamespace {
             Ok(())
         } else {
             Err(NamespaceError::TableNotFound {
-                message: format!("Table '{}' not found", table_name),
+                message: format!("'{}'", table_name),
             }
             .into())
         }
@@ -2241,7 +2241,7 @@ impl LanceNamespace for ManifestNamespace {
             Ok(())
         } else {
             Err(NamespaceError::NamespaceNotFound {
-                message: format!("Namespace '{}' not found", object_id),
+                message: format!("'{}'", object_id),
             }
             .into())
         }

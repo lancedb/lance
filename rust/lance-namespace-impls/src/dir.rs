@@ -1348,16 +1348,9 @@ impl LanceNamespace for DirectoryNamespace {
         // Atomically check table existence and deregistration status
         let status = self.check_table_status(&table_name).await;
 
-        if !status.exists {
+        if !status.exists || status.is_deregistered {
             return Err(NamespaceError::TableNotFound {
-                message: format!("Table does not exist: {}", table_name),
-            }
-            .into());
-        }
-
-        if status.is_deregistered {
-            return Err(NamespaceError::TableNotFound {
-                message: format!("Table is deregistered: {}", table_name),
+                message: format!("'{}'", table_name),
             }
             .into());
         }
