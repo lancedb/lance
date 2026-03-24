@@ -1407,6 +1407,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_index_ivf_rq_preserves_index_version_on_segment_commit_path() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(128),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
+
+        let committed = dataset
+            .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
+            .await
+            .unwrap();
+
+        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+
+        let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+    }
+
+    #[tokio::test]
     async fn test_optimize_should_not_removes_delta_indices() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());

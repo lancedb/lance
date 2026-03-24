@@ -1906,6 +1906,7 @@ pub(crate) async fn plan_segments(
             IndexType::IvfFlat
                 | IndexType::IvfPq
                 | IndexType::IvfSq
+                | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
@@ -2098,12 +2099,15 @@ fn build_segment_plan(
     } else {
         Uuid::new_v4()
     };
-    let index_type = requested_index_type.unwrap_or(IndexType::Vector);
+    let index_version = match requested_index_type {
+        Some(index_type) => index_type.version(),
+        None => infer_source_index_version(&group)?,
+    };
     let segment = IndexSegment::new(
         segment_uuid,
         fragment_bitmap,
         Arc::new(crate::index::vector_index_details()),
-        index_type.version(),
+        index_version,
     );
 
     Ok(IndexSegmentPlan::new(
@@ -2112,6 +2116,17 @@ fn build_segment_plan(
         estimated_bytes,
         requested_index_type,
     ))
+}
+
+fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
+    debug_assert!(!group.is_empty());
+    let first = group[0].index_version;
+    if group.iter().any(|segment| segment.index_version != first) {
+        return Err(Error::index(
+            "Distributed vector segments must all have the same index version".to_string(),
+        ));
+    }
+    Ok(first)
 }
 
 fn estimate_source_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
