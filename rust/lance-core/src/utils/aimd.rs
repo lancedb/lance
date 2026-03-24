@@ -19,12 +19,15 @@ use crate::Result;
 
 /// Configuration for the AIMD rate controller.
 ///
-/// Use builder methods to customize. Defaults are tuned for cloud object stores:
-/// - initial_rate: 200 req/s (conservative start)
-/// - min_rate: 1 req/s (prevents starvation)
-/// - max_rate: 5000 req/s (ceiling; 0.0 disables ceiling)
+/// Use builder methods to customize. Defaults are tuned for cloud object stores
+/// and will start at about 40% of the max rate and require 10 seconds to reach
+/// the max rate.
+///
+/// - initial_rate: 2000 req/s
+/// - min_rate: 1 req/s
+/// - max_rate: 5000 req/s (0.0 disables ceiling)
 /// - decrease_factor: 0.5 (halve on throttle)
-/// - additive_increment: 10 req/s per success window
+/// - additive_increment: 300 req/s per success window
 /// - window_duration: 1 second
 /// - throttle_threshold: 0.0 (any throttle triggers decrease)
 #[derive(Debug, Clone)]
@@ -41,11 +44,11 @@ pub struct AimdConfig {
 impl Default for AimdConfig {
     fn default() -> Self {
         Self {
-            initial_rate: 200.0,
+            initial_rate: 2000.0,
             min_rate: 1.0,
             max_rate: 5000.0,
             decrease_factor: 0.5,
-            additive_increment: 10.0,
+            additive_increment: 300.0,
             window_duration: Duration::from_secs(1),
             throttle_threshold: 0.0,
         }
