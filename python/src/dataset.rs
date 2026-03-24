@@ -2764,17 +2764,17 @@ impl Dataset {
             .block_on(Some(py), get_ivf_partition_info(ds, index_name))?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let partitions: Vec<_> = result
+        let partitions: PyResult<Vec<_>> = result
             .iter()
             .map(|p| {
                 let dict = PyDict::new(py);
-                dict.set_item("partition_id", p.partition_id).unwrap();
-                dict.set_item("size", p.size).unwrap();
-                dict.into()
+                dict.set_item("partition_id", p.partition_id)?;
+                dict.set_item("size", p.size)?;
+                Ok(dict.into())
             })
             .collect();
 
-        Ok(partitions)
+        partitions
     }
 
     /// Perform pairwise hamming distance clustering on sampled rows from a dataset.

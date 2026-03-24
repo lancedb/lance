@@ -310,7 +310,10 @@ pub async fn hamming_clustering_sampled(
         let batch = dataset
             .take_rows(
                 &indices,
-                crate::dataset::ProjectionRequest::from_columns([column], dataset.schema()),
+                crate::dataset::ProjectionRequest::from_columns(
+                    [column, "_rowid"],
+                    dataset.schema(),
+                ),
             )
             .await?;
 
@@ -514,8 +517,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hamming_cluster_partition_invalid_column() {
-        // Integration tests would require a real dataset with an IVF_FLAT index
-        // Unit tests verify error handling for edge cases
+    async fn test_hamming_clustering_for_ivf_partition() {
+        use arrow_array::{FixedSizeListArray, RecordBatchIterator, UInt8Array};
+        use arrow_schema::{Field, Schema};
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::vector::ivf::IvfBuildParams;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        // Create test data with hash column (FixedSizeList<UInt8, 8>)
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hash",
+            arrow_schema::DataType::FixedSizeList(
+                Arc::new(Field::new("item", arrow_schema::DataType::UInt8, true)),
+                8,
+            ),
+            false,
+        )]));
+
+        // Generate hashes with some duplicates (similar hashes)
+        let num_rows = 100;
+        let mut hash_bytes = Vec::with_capacity(num_rows * 8);
+        for i in 0..num_rows {
+            // Create groups of similar hashes
+            let base = (i / 10) as u64; // 10 groups
+            let variation = (i % 10) as u64;
+            let hash = base.wrapping_mul(0x123456789) ^ variation;
+            hash_bytes.extend_from_slice(&hash.to_le_bytes());
+        }
+        let values = UInt8Array::from(hash_bytes);
+        let hash_array =
+            FixedSizeListArray::try_new_from_values(values, 8).expect("create hash array");
+
+        let batch =
+            arrow_array::RecordBatch::try_new(schema.clone(), vec![Arc::new(hash_array)]).unwrap();
+
+        // Write dataset
+        let temp_dir = tempdir().unwrap();
+        let uri = temp_dir.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+
+        // Create IVF_FLAT index with 4 partitions
+        let ivf_params = IvfBuildParams::new(4);
+        let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::Hamming,
+            ivf_params,
+        );
+
+        dataset
+            .create_index(
+                &["hash"],
+                crate::index::IndexType::Vector,
+                None,
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Load and test
+        let dataset = crate::Dataset::open(uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index_name = &indices[0].name;
+
+        // Test clustering on partition 0
+        let reader = hamming_clustering_for_ivf_partition(&dataset, index_name, 0, 10)
+            .await
+            .unwrap();
+        let clusters = collect_clusters(reader);
+
+        // Verify we get valid results (may or may not have clusters depending on data distribution)
+        // At minimum, verify no panics and valid schema
+        for (rep, dups) in &clusters {
+            assert!(*rep < num_rows as u64 * 10); // row IDs should be reasonable
+            for dup in dups {
+                assert!(*dup < num_rows as u64 * 10);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hamming_clustering_for_ivf_partition_invalid_index() {
+        use arrow_array::{FixedSizeListArray, RecordBatchIterator, UInt8Array};
+        use arrow_schema::{Field, Schema};
+        use lance_arrow::FixedSizeListArrayExt;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hash",
+            arrow_schema::DataType::FixedSizeList(
+                Arc::new(Field::new("item", arrow_schema::DataType::UInt8, true)),
+                8,
+            ),
+            false,
+        )]));
+
+        let values = UInt8Array::from(vec![0u8; 80]); // 10 rows * 8 bytes
+        let hash_array = FixedSizeListArray::try_new_from_values(values, 8).unwrap();
+        let batch =
+            arrow_array::RecordBatch::try_new(schema.clone(), vec![Arc::new(hash_array)]).unwrap();
+
+        let temp_dir = tempdir().unwrap();
+        let uri = temp_dir.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+
+        // Test with non-existent index
+        let result = hamming_clustering_for_ivf_partition(&dataset, "nonexistent", 0, 10).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("not found"), "Error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_hamming_clustering_sampled_integration() {
+        use arrow_array::{FixedSizeListArray, RecordBatchIterator, UInt8Array};
+        use arrow_schema::{Field, Schema};
+        use lance_arrow::FixedSizeListArrayExt;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hash",
+            arrow_schema::DataType::FixedSizeList(
+                Arc::new(Field::new("item", arrow_schema::DataType::UInt8, true)),
+                8,
+            ),
+            false,
+        )]));
+
+        // Create 50 rows with some duplicate hashes
+        let num_rows = 50;
+        let mut hash_bytes = Vec::with_capacity(num_rows * 8);
+        for i in 0..num_rows {
+            // Create some identical hashes (groups of 5)
+            let hash = (i / 5) as u64;
+            hash_bytes.extend_from_slice(&hash.to_le_bytes());
+        }
+        let values = UInt8Array::from(hash_bytes);
+        let hash_array = FixedSizeListArray::try_new_from_values(values, 8).unwrap();
+        let batch =
+            arrow_array::RecordBatch::try_new(schema.clone(), vec![Arc::new(hash_array)]).unwrap();
+
+        let temp_dir = tempdir().unwrap();
+        let uri = temp_dir.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        crate::Dataset::write(reader, uri, None).await.unwrap();
+
+        let dataset = crate::Dataset::open(uri).await.unwrap();
+
+        // Test full scan (no sampling)
+        let reader = hamming_clustering_sampled(&dataset, "hash", None, 0)
+            .await
+            .unwrap();
+        let clusters = collect_clusters(reader);
+
+        // With threshold 0 (exact match) and groups of 5 identical hashes,
+        // we should have 10 clusters with 4 duplicates each
+        assert_eq!(clusters.len(), 10);
+        for (_, dups) in &clusters {
+            assert_eq!(dups.len(), 4);
+        }
+
+        // Test with sampling
+        let reader = hamming_clustering_sampled(&dataset, "hash", Some(20), 0)
+            .await
+            .unwrap();
+        let clusters = collect_clusters(reader);
+        // With sampling, we may get fewer clusters
+        assert!(clusters.len() <= 10);
     }
 }

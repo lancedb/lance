@@ -147,17 +147,17 @@ impl PairwiseResult {
         self.distances.extend(other.distances);
     }
 
-    /// Convert to Arrow RecordBatch.
-    pub fn to_record_batch(&self) -> RecordBatch {
+    /// Convert to Arrow RecordBatch, consuming self.
+    pub fn into_record_batch(self) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id_a", DataType::UInt64, false),
             Field::new("row_id_b", DataType::UInt64, false),
             Field::new("distance", DataType::UInt32, false),
         ]));
 
-        let row_id_a = Arc::new(UInt64Array::from(self.row_id_a.clone()));
-        let row_id_b = Arc::new(UInt64Array::from(self.row_id_b.clone()));
-        let distances = Arc::new(UInt32Array::from(self.distances.clone()));
+        let row_id_a = Arc::new(UInt64Array::from(self.row_id_a));
+        let row_id_b = Arc::new(UInt64Array::from(self.row_id_b));
+        let distances = Arc::new(UInt32Array::from(self.distances));
 
         RecordBatch::try_new(schema, vec![row_id_a, row_id_b, distances])
             .expect("Failed to create RecordBatch")
@@ -401,13 +401,6 @@ fn compute_balanced_chunks(n: usize, target_pairs_per_chunk: usize) -> Vec<(usiz
             current_start = i + 1;
             current_pairs = 0;
         }
-    }
-
-    if current_start < n
-        && (chunks.is_empty() || chunks.last().unwrap().1 < n)
-        && let Some(last) = chunks.last_mut()
-    {
-        last.1 = n;
     }
 
     chunks
@@ -875,10 +868,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_record_batch() {
+    fn test_into_record_batch() {
         let hashes = vec![0b0000u64, 0b0001, 0b0011];
         let result = pairwise_hamming_distance(&hashes, None, None);
-        let batch = result.to_record_batch();
+        let batch = result.into_record_batch();
 
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 3);
