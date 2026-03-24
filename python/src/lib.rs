@@ -235,9 +235,15 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
 
 #[pymodule]
 fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let env = Env::new()
-        .filter_or("LANCE_LOG", "warn")
-        .write_style("LANCE_LOG_STYLE");
+    // If RUST_LOG is set, use it (Env::default reads RUST_LOG)
+    // Otherwise, use LANCE_LOG with a default of "warn"
+    let env = if env::var("RUST_LOG").is_ok() {
+        Env::default().write_style("LANCE_LOG_STYLE")
+    } else {
+        Env::new()
+            .filter_or("LANCE_LOG", "warn")
+            .write_style("LANCE_LOG_STYLE")
+    };
     let mut log_builder = env_logger::Builder::from_env(env);
     set_timestamp_precision(&mut log_builder);
     set_log_file_target(&mut log_builder);

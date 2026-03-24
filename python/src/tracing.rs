@@ -45,10 +45,10 @@ use tracing::span;
 use tracing::subscriber;
 use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::Registry;
 
 static SUBSCRIBER: LazyLock<Arc<RwLock<Option<LoggingPassthroughState>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(None)));
