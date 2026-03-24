@@ -45,16 +45,19 @@ use tracing::debug;
 ///
 /// However, the builtin object stores all use RetryError when retries are configured and
 /// throttle errors are returned.  Sadly, RetryError is not a public type, so we have to
-/// infer it from the error message.  These error messages currently look like:
+/// infer it from the error message.  This is potentially dangerous because these errors
+/// often include the URI itself and that URI could have any characters in it (e.g. if we
+/// look for 429 then we might match a 429 in a UUID).These error messages currently look like:
 ///
 /// ", after ... retries, max_retries: ..., retry_timeout: ..."
 ///
-/// So, as a crude heuristic, which should work for the builtin object stores, and might
-/// match custom object stores, we simply look for the string "retries" in the error message.
+/// So, as a crude heuristic, which should work for the builtin object stores, but won't
+/// work for custom object stores, we simply look for the string "retries, max_retries"
+/// in the error message.
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
-        source.to_string().contains("retries")
+        source.to_string().contains("retries, max_retries")
     } else {
         false
     }
