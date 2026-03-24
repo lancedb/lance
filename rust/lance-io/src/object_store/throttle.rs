@@ -40,21 +40,21 @@ use tracing::debug;
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
-/// The `object_store` crate surfaces these as `Error::Generic` with the HTTP
-/// status or cloud-specific message embedded in the source chain. We match
-/// against known patterns from S3, GCS, and Azure.
+/// Regrettably, this information is not fully exposed by the `object_store` crate.
+/// There is no generic mechanism for a custom object store to return a throttle error.
+///
+/// However, the builtin object stores all use RetryError when retries are configured and
+/// throttle errors are returned.  Sadly, RetryError is not a public type, so we have to
+/// infer it from the error message.  These error messages currently look like:
+///
+/// ", after ... retries, max_retries: ..., retry_timeout: ..."
+///
+/// So, as a crude heuristic, which should work for the builtin object stores, and might
+/// match custom object stores, we simply look for the string "retries" in the error message.
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
-        let msg = source.to_string();
-        // Check for common throttle patterns from cloud stores
-        msg.contains("429")
-            || msg.contains("Too Many Requests")
-            || msg.contains("503")
-            || msg.contains("Service Unavailable")
-            || msg.contains("SlowDown")
-            || msg.contains("Throttling")
-            || msg.contains("RequestLimitExceeded")
+        source.to_string().contains("retries")
     } else {
         false
     }
@@ -504,16 +504,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::http_429("HTTP 429 Too Many Requests", true)]
-    #[case::too_many_requests("Too Many Requests", true)]
-    #[case::http_503("HTTP 503 Service Unavailable", true)]
-    #[case::service_unavailable("Service Unavailable", true)]
-    #[case::s3_slowdown("SlowDown: Please reduce your request rate", true)]
-    #[case::throttling("Throttling: Rate exceeded", true)]
-    #[case::request_limit("RequestLimitExceeded", true)]
+    #[case::retry_error("Error after 10 retries, max_retries: 10, retry_timeout: 180s", true)]
+    #[case::retries_in_message(
+        "request failed, after 3 retries, max_retries: 5, retry_timeout: 60s",
+        true
+    )]
     #[case::not_found("Object not found", false)]
     #[case::permission_denied("Access denied", false)]
     #[case::timeout("Connection timed out", false)]
+    #[case::http_429_without_retries("HTTP 429 Too Many Requests", false)]
+    #[case::slowdown_without_retries("SlowDown: Please reduce your request rate", false)]
     fn test_is_throttle_error(#[case] msg: &str, #[case] expected: bool) {
         let err = make_generic_error(msg);
         assert_eq!(
@@ -751,7 +751,8 @@ mod tests {
             let errors = futures::stream::iter((0..n).map(|_| {
                 Err(object_store::Error::Generic {
                     store: "ThrottlingListMock",
-                    source: "HTTP 503 Service Unavailable: SlowDown".into(),
+                    source: "request failed, after 3 retries, max_retries: 5, retry_timeout: 60s"
+                        .into(),
                 })
             }));
             errors.chain(inner_stream).boxed()
@@ -929,7 +930,8 @@ mod tests {
         fn throttle_error() -> object_store::Error {
             object_store::Error::Generic {
                 store: "RateLimitingMock",
-                source: "HTTP 503 Service Unavailable: SlowDown".into(),
+                source: "request failed, after 10 retries, max_retries: 10, retry_timeout: 180s"
+                    .into(),
             }
         }
     }
