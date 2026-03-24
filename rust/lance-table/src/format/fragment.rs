@@ -303,6 +303,12 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Physical row offsets updated by an in-flight column rewrite.
+    ///
+    /// This is transient commit-time state. It is not persisted in fragment metadata.
+    #[serde(skip)]
+    pub pending_updated_row_offsets: Option<Vec<u32>>,
 }
 
 impl Fragment {
@@ -315,6 +321,7 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }
     }
 
@@ -354,6 +361,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }
     }
 
@@ -480,6 +488,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            pending_updated_row_offsets: None,
         })
     }
 }

@@ -84,6 +84,9 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    _pending_updated_row_offsets: Optional[List[int]] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def num_deletions(self) -> int:
@@ -118,7 +121,9 @@ class FragmentMetadata:
                 self.deletion_file.asdict() if self.deletion_file is not None else None
             ),
             row_id_meta=(
-                self.row_id_meta.asdict() if self.row_id_meta is not None else None
+                json.loads(self.row_id_meta.json())
+                if self.row_id_meta is not None
+                else None
             ),
             created_at_version_meta=(
                 json.loads(self.created_at_version_meta.json())
@@ -130,6 +135,7 @@ class FragmentMetadata:
                 if self.last_updated_at_version_meta is not None
                 else None
             ),
+            _pending_updated_row_offsets=self._pending_updated_row_offsets,
         )
 
     @staticmethod
@@ -142,7 +148,7 @@ class FragmentMetadata:
 
         row_id_meta = json_data.get("row_id_meta")
         if row_id_meta is not None:
-            row_id_meta = RowIdMeta(**row_id_meta)
+            row_id_meta = RowIdMeta.from_json(json.dumps(row_id_meta))
 
         created_at_version_meta = json_data.get("created_at_version_meta")
         if created_at_version_meta is not None:
@@ -156,6 +162,8 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        pending_updated_row_offsets = json_data.get("_pending_updated_row_offsets")
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -164,6 +172,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            _pending_updated_row_offsets=pending_updated_row_offsets,
         )
 
 

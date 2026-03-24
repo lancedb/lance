@@ -21,9 +21,11 @@ import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.fragment.FragmentUpdateResult;
 import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 import org.lance.operation.Update.UpdateMode;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.TimeStampSecTZVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -32,6 +34,10 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -110,7 +116,9 @@ public class UpdateTest extends OperationTestBase {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.UpdateColumnTestDataset testDataset =
           new TestUtils.UpdateColumnTestDataset(allocator, datasetPath);
-      dataset = testDataset.createEmptyDataset();
+      dataset =
+          testDataset.createDatasetWithWriteParams(
+              new org.lance.WriteParams.Builder().withEnableStableRowIds(true).build());
       /* dataset content
        * _rowid |   id   |     name     | timeStamp |
        *   0:   |    0   |  "Person 0"  |     0     |
@@ -146,13 +154,14 @@ public class UpdateTest extends OperationTestBase {
        *   3:   |  null  |     null     |
        */
       FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
+      FragmentMetadata serializedUpdatedFragment =
+          serializeAndDeserialize(updateResult.getUpdatedFragment());
       try (Transaction updateTxn =
           new Transaction.Builder()
               .readVersion(dataset.version())
               .operation(
                   Update.builder()
-                      .updatedFragments(
-                          Collections.singletonList(updateResult.getUpdatedFragment()))
+                      .updatedFragments(Collections.singletonList(serializedUpdatedFragment))
                       .fieldsModified(updateResult.getFieldsModified())
                       .build())
               .build()) {
@@ -160,10 +169,17 @@ public class UpdateTest extends OperationTestBase {
           assertEquals(3, dataset.version());
           assertEquals(3, dataset.latestVersion());
           Fragment fragment = dataset.getFragments().get(0);
-          try (LanceScanner scanner = fragment.newScan(rowCount)) {
+          try (LanceScanner scanner =
+              fragment.newScan(
+                  new ScanOptions.Builder()
+                      .batchSize((long) rowCount)
+                      .columns(
+                          Arrays.asList("id", "name", "timeStamp", "_row_last_updated_at_version"))
+                      .build())) {
             List<Integer> actualIds = new ArrayList<>(rowCount);
             List<String> actualNames = new ArrayList<>(rowCount);
             List<Long> actualTimeStamps = new ArrayList<>(rowCount);
+            List<Long> actualLastUpdatedVersions = new ArrayList<>(rowCount);
             try (ArrowReader reader = scanner.scanBatches()) {
               while (reader.loadNextBatch()) {
                 VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -181,6 +197,14 @@ public class UpdateTest extends OperationTestBase {
                   actualTimeStamps.add(
                       timeStampVector.isNull(i) ? null : timeStampVector.getObject(i));
                 }
+                FieldVector lastUpdatedVector =
+                    (FieldVector) root.getVector("_row_last_updated_at_version");
+                for (int i = 0; i < lastUpdatedVector.getValueCount(); i++) {
+                  Number lastUpdatedValue =
+                      lastUpdatedVector.isNull(i) ? null : (Number) lastUpdatedVector.getObject(i);
+                  actualLastUpdatedVersions.add(
+                      lastUpdatedValue == null ? null : lastUpdatedValue.longValue());
+                }
               }
             }
             /* result dataset content
@@ -196,12 +220,27 @@ public class UpdateTest extends OperationTestBase {
             List<String> expectNames =
                 Arrays.asList("Update 0", null, "Update 2", null, "Person 4", null);
             List<Long> expectTimeStamps = Arrays.asList(0L, null, 2L, null, 4L, null);
+            List<Long> expectLastUpdatedVersions = Arrays.asList(3L, 3L, 3L, 3L, 2L, 2L);
             assertEquals(expectIds, actualIds);
             assertEquals(expectNames, actualNames);
             assertEquals(expectTimeStamps, actualTimeStamps);
+            assertEquals(expectLastUpdatedVersions, actualLastUpdatedVersions);
           }
         }
       }
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static <T> T serializeAndDeserialize(T object) throws Exception {
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    try (ObjectOutputStream out = new ObjectOutputStream(outputStream)) {
+      out.writeObject(object);
+    }
+
+    try (ObjectInputStream in =
+        new ObjectInputStream(new ByteArrayInputStream(outputStream.toByteArray()))) {
+      return (T) in.readObject();
     }
   }
 }

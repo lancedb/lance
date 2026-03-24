@@ -211,16 +211,12 @@ impl HashJoiner {
         Ok(())
     }
 
-    /// Collecting the data using the index column from left table,
-    /// invalid join column values in left table will be filled with origin values in left table
-    ///
-    /// Will run in parallel over columns using all available cores.
-    pub(super) async fn collect_with_fallback(
+    pub(super) async fn collect_with_fallback_and_matches(
         &self,
         left_batch: &RecordBatch,
         index_column: ArrayRef,
         dataset: &Dataset,
-    ) -> Result<RecordBatch> {
+    ) -> Result<(RecordBatch, Vec<u32>)> {
         if index_column.data_type() != &self.index_type {
             return Err(Error::invalid_input(format!(
                 "Index column type mismatch: expected {}, got {}",
@@ -240,6 +236,17 @@ impl HashJoiner {
                     .get(&row.owned())
                     .map(|(batch_i, row_i)| (*batch_i, *row_i))
                     .unwrap_or((left_batch_index, left_rowi))
+            })
+            .collect::<Vec<_>>();
+        let matched_rows = indices
+            .iter()
+            .enumerate()
+            .filter_map(|(left_rowi, (batch_i, _))| {
+                if *batch_i == left_batch_index {
+                    None
+                } else {
+                    Some(left_rowi as u32)
+                }
             })
             .collect::<Vec<_>>();
         let indices = Arc::new(indices);
@@ -276,7 +283,10 @@ impl HashJoiner {
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
+        Ok((
+            RecordBatch::try_new(self.batches[0].schema(), columns)?,
+            matched_rows,
+        ))
     }
 }
 

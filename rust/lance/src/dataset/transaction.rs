@@ -1673,7 +1673,9 @@ impl Transaction {
                 let existing_fragments = maybe_existing_fragments?;
 
                 // Apply updates to existing fragments
-                let updated_frags: Vec<Fragment> = existing_fragments
+                let original_fragments_map: std::collections::HashMap<u64, &Fragment> =
+                    existing_fragments.iter().map(|f| (f.id, f)).collect();
+                let mut updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
                         if removed_fragment_ids.contains(&f.id) {
@@ -1687,13 +1689,14 @@ impl Transaction {
                     })
                     .collect();
 
-                // Update version metadata for updated fragments if stable row IDs are enabled
-                // Note: We don't update version metadata for fragments with deletion vectors
-                // because the version sequences are indexed by physical row position, not logical position.
-                // Version metadata for deleted rows will be filtered out during scan using the deletion vector.
-                if next_row_id.is_some() {
-                    // Version metadata will be properly set during compaction when deletions are materialized
-                }
+                Self::refresh_rewrite_columns_last_updated_meta(
+                    updated_frags.as_mut_slice(),
+                    updated_fragments,
+                    &original_fragments_map,
+                    update_mode.clone(),
+                    next_row_id.is_some(),
+                    current_manifest.map(|m| m.version).unwrap_or_default(),
+                )?;
 
                 final_fragments.extend(updated_frags);
 
@@ -2309,6 +2312,71 @@ impl Transaction {
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
+    fn refresh_rewrite_columns_last_updated_meta(
+        updated_frags: &mut [Fragment],
+        updated_fragments: &[Fragment],
+        original_fragments_map: &HashMap<u64, &Fragment>,
+        update_mode: Option<UpdateMode>,
+        stable_row_ids_enabled: bool,
+        prev_version: u64,
+    ) -> Result<()> {
+        let rewrite_columns = update_mode == Some(UpdateMode::RewriteColumns);
+        let updated_fragment_ids = updated_fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<HashSet<_>>();
+        let has_partial_rewrite_offsets = updated_fragments
+            .iter()
+            .any(|fragment| fragment.pending_updated_row_offsets.is_some());
+        if !stable_row_ids_enabled || (!rewrite_columns && !has_partial_rewrite_offsets) {
+            return Ok(());
+        }
+
+        let new_version = prev_version + 1;
+        for fragment in updated_frags
+            .iter_mut()
+            .filter(|fragment| updated_fragment_ids.contains(&fragment.id))
+        {
+            let preserves_existing_last_updated_meta = original_fragments_map
+                .get(&fragment.id)
+                .is_some_and(|original_fragment| {
+                    fragment.last_updated_at_version_meta
+                        != original_fragment.last_updated_at_version_meta
+                });
+
+            match fragment.pending_updated_row_offsets.take() {
+                Some(updated_offsets)
+                    if !matches!(
+                        fragment.last_updated_at_version_meta,
+                        Some(lance_table::format::RowDatasetVersionMeta::External(_))
+                    ) =>
+                {
+                    let updated_offsets = updated_offsets
+                        .into_iter()
+                        .map(|offset| offset as usize)
+                        .collect::<Vec<_>>();
+                    lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                        fragment,
+                        &updated_offsets,
+                        new_version,
+                        prev_version,
+                    )?;
+                }
+                Some(_) => {
+                    fragment.last_updated_at_version_meta =
+                        lance_table::rowids::version::build_version_meta(fragment, new_version);
+                }
+                None if rewrite_columns && !preserves_existing_last_updated_meta => {
+                    fragment.last_updated_at_version_meta =
+                        lance_table::rowids::version::build_version_meta(fragment, new_version);
+                }
+                None => {}
+            }
+        }
+
+        Ok(())
+    }
+
     fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
@@ -3788,6 +3856,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }];
         let mut next_row_id = 0;
 
@@ -3820,6 +3889,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }];
         let mut next_row_id = 100;
 
@@ -3852,6 +3922,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }];
         let mut next_row_id = 100;
 
@@ -3887,6 +3958,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }];
         let mut next_row_id = 100;
 
@@ -3915,6 +3987,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                pending_updated_row_offsets: None,
             },
             Fragment {
                 id: 2,
@@ -3924,6 +3997,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                pending_updated_row_offsets: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3968,6 +4042,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            pending_updated_row_offsets: None,
         }];
         let mut next_row_id = 0;
 

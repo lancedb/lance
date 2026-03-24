@@ -31,6 +31,7 @@ public class FragmentMetadata implements Serializable {
   private final long physicalRows;
   private final DeletionFile deletionFile;
   private final RowIdMeta rowIdMeta;
+  private final long[] pendingUpdatedRowOffsets;
 
   public FragmentMetadata(
       int id,
@@ -38,11 +39,22 @@ public class FragmentMetadata implements Serializable {
       Long physicalRows,
       DeletionFile deletionFile,
       RowIdMeta rowIdMeta) {
+    this(id, files, physicalRows, deletionFile, rowIdMeta, null);
+  }
+
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      long[] pendingUpdatedRowOffsets) {
     this.id = id;
     this.files = files;
     this.physicalRows = physicalRows;
     this.deletionFile = deletionFile;
     this.rowIdMeta = rowIdMeta;
+    this.pendingUpdatedRowOffsets = pendingUpdatedRowOffsets;
   }
 
   public int getId() {
@@ -78,6 +90,13 @@ public class FragmentMetadata implements Serializable {
 
   public RowIdMeta getRowIdMeta() {
     return rowIdMeta;
+  }
+
+  /**
+   * Internal commit-time state used to preserve per-row rewrite metadata across JNI round-trips.
+   */
+  public long[] getPendingUpdatedRowOffsets() {
+    return pendingUpdatedRowOffsets;
   }
 
   @Override

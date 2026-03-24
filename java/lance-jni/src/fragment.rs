@@ -5,7 +5,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
-use jni::objects::{JIntArray, JValue, JValueGen};
+use jni::objects::{JIntArray, JLongArray, JValue, JValueGen};
 use jni::{
     JNIEnv,
     objects::{JObject, JString},
@@ -444,7 +444,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;[J)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResult";
@@ -574,6 +574,18 @@ impl IntoJava for &Fragment {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
+        let pending_updated_row_offsets = match &self.pending_updated_row_offsets {
+            Some(offsets) => {
+                let java_offsets = env.new_long_array(offsets.len() as i32)?;
+                let java_offsets_slice = offsets
+                    .iter()
+                    .map(|offset| i64::from(*offset))
+                    .collect::<Vec<_>>();
+                env.set_long_array_region(&java_offsets, 0, &java_offsets_slice)?;
+                JObject::from(java_offsets)
+            }
+            None => JObject::null(),
+        };
 
         env.new_object(
             FRAGMENT_METADATA_CLASS,
@@ -584,6 +596,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(physical_rows),
                 JValueGen::Object(&deletion_file),
                 JValueGen::Object(&row_id_meta),
+                JValueGen::Object(&pending_updated_row_offsets),
             ],
         )
         .map_err(|e| {
@@ -642,6 +655,14 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         } else {
             Some(row_id_meta.extract_object(env)?)
         };
+        let pending_updated_row_offsets = env
+            .call_method(self, "getPendingUpdatedRowOffsets", "()[J", &[])?
+            .l()?;
+        let pending_updated_row_offsets = if pending_updated_row_offsets.is_null() {
+            None
+        } else {
+            Some(JLongArray::from(pending_updated_row_offsets).extract_object(env)?)
+        };
         Ok(Fragment {
             id,
             files,
@@ -650,6 +671,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             row_id_meta,
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            pending_updated_row_offsets,
         })
     }
 }

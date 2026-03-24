@@ -563,6 +563,204 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
 
 
+def test_fragment_update_columns_updates_last_updated_version(tmp_path):
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "value": [10, 20, 30, 40],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_last_updated"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
+            "value": [100, 300],
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["value", "_row_last_updated_at_version"]
+    ).to_pydict()
+    assert result["value"] == [100, 20, 300, 40]
+    assert result["_row_last_updated_at_version"] == [2, 1, 2, 1]
+
+
+def test_fragment_update_columns_preserves_last_updated_version_across_json(tmp_path):
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "value": [10, 20, 30, 40],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_last_updated_json"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
+            "value": [100, 300],
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment = FragmentMetadata.from_json(
+        json.dumps(updated_fragment.to_json())
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["value", "_row_last_updated_at_version"]
+    ).to_pydict()
+    assert result["value"] == [100, 20, 300, 40]
+    assert result["_row_last_updated_at_version"] == [2, 1, 2, 1]
+
+
+def test_fragment_update_columns_rewrite_columns_without_pending_offsets(tmp_path):
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "value": [10, 20, 30, 40],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_rewrite_columns_fallback"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
+            "value": [100, 300],
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment = lance.fragment.FragmentMetadata(
+        id=updated_fragment.id,
+        files=updated_fragment.files,
+        physical_rows=updated_fragment.physical_rows,
+        deletion_file=updated_fragment.deletion_file,
+        row_id_meta=updated_fragment.row_id_meta,
+        created_at_version_meta=updated_fragment.created_at_version_meta,
+        last_updated_at_version_meta=updated_fragment.last_updated_at_version_meta,
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["value", "_row_last_updated_at_version"]
+    ).to_pydict()
+    assert result["value"] == [100, 20, 300, 40]
+    assert result["_row_last_updated_at_version"] == [2, 2, 2, 2]
+
+
+def test_fragment_update_columns_does_not_refresh_untouched_fragments(tmp_path):
+    data = pa.table(
+        {
+            "id": list(range(8)),
+            "value": list(range(10, 18)),
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_untouched_fragments"
+    dataset = lance.write_dataset(
+        data,
+        dataset_uri,
+        enable_stable_row_ids=True,
+        max_rows_per_file=4,
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        pa.table(
+            {
+                "_rowid": pa.array([0, 2], type=pa.uint64()),
+                "value": [100, 300],
+            }
+        )
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["id", "_row_last_updated_at_version"]
+    ).to_pydict()
+    assert result["id"] == list(range(8))
+    assert result["_row_last_updated_at_version"] == [2, 1, 2, 1, 1, 1, 1, 1]
+
+
+def test_fragment_update_columns_updates_non_zero_fragment_versions(tmp_path):
+    data = pa.table(
+        {
+            "id": list(range(8)),
+            "value": list(range(10, 18)),
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_non_zero_fragment"
+    dataset = lance.write_dataset(
+        data,
+        dataset_uri,
+        enable_stable_row_ids=True,
+        max_rows_per_file=4,
+    )
+
+    fragment = dataset.get_fragment(1)
+    updated_fragment, fields_modified = fragment.update_columns(
+        pa.table(
+            {
+                "_rowid": pa.array([4, 6], type=pa.uint64()),
+                "value": [140, 160],
+            }
+        )
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["value", "_row_last_updated_at_version"]
+    ).to_pydict()
+    assert result["value"] == [10, 11, 12, 13, 140, 15, 160, 17]
+    assert result["_row_last_updated_at_version"] == [1, 1, 1, 1, 2, 1, 2, 1]
+
+
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
     """Test fragment update columns with custom join key."""
     # Create initial dataset

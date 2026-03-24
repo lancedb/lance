@@ -1570,6 +1570,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                pending_updated_row_offsets: None,
             },
             Fragment {
                 id: 1,
@@ -1582,6 +1583,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                pending_updated_row_offsets: None,
             },
         ];
 
@@ -1619,6 +1621,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                pending_updated_row_offsets: None,
             },
             Fragment {
                 id: 1,
@@ -1631,6 +1634,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                pending_updated_row_offsets: None,
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);

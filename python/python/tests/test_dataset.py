@@ -831,6 +831,31 @@ def test_take_version_system_columns(tmp_path: Path):
     assert created_at == [dataset.version] * 2
 
 
+def test_merge_insert_partial_rewrite_columns_preserves_last_updated_versions(
+    tmp_path: Path,
+):
+    table = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "value": [10, 20, 30, 40],
+            "tag": ["a", "b", "c", "d"],
+        }
+    )
+    base_dir = tmp_path / "test_merge_insert_partial_rewrite_columns_versions"
+    dataset = lance.write_dataset(table, base_dir, enable_stable_row_ids=True)
+
+    new_table = pa.table({"id": [2], "value": [200]})
+    dataset.merge_insert("id").when_matched_update_all().execute(new_table)
+
+    result = dataset.to_table(
+        columns=["id", "value", "tag", "_row_last_updated_at_version"]
+    ).to_pydict()
+    assert result["id"] == [1, 2, 3, 4]
+    assert result["value"] == [10, 200, 30, 40]
+    assert result["tag"] == ["a", "b", "c", "d"]
+    assert result["_row_last_updated_at_version"] == [1, 2, 1, 1]
+
+
 @pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
 def test_take_duplicate_index(tmp_path: Path, indices: List[int]):
     table = pa.table({"x": range(24)})

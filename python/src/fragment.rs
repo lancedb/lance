@@ -757,6 +757,9 @@ impl FromPyObject<'_> for PyLance<Fragment> {
         let created_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
             ob.getattr("created_at_version_meta")?.extract()?;
         let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
+        let pending_updated_row_offsets = ob
+            .getattr("_pending_updated_row_offsets")?
+            .extract::<Option<Vec<u32>>>()?;
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -766,6 +769,7 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            pending_updated_row_offsets,
         }))
     }
 }
@@ -798,6 +802,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .created_at_version_meta
             .as_ref()
             .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let pending_updated_row_offsets = self.0.pending_updated_row_offsets.clone();
 
         cls.call1((
             self.0.id,
@@ -807,6 +812,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            pending_updated_row_offsets,
         ))
     }
 }

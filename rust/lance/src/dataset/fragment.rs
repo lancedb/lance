@@ -23,6 +23,7 @@ use futures::future::try_join_all;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
@@ -1645,7 +1646,12 @@ impl FileFragment {
         // Prepare the read projection: align with the write_schema's columns and append the left_on column.
         let mut read_columns: Vec<String> =
             write_schema.fields.iter().map(|f| f.name.clone()).collect();
-        read_columns.push(left_on.to_string());
+        if !read_columns.iter().any(|column| column == left_on) {
+            read_columns.push(left_on.to_string());
+        }
+        if !read_columns.iter().any(|column| column == ROW_ADDR) {
+            read_columns.push(ROW_ADDR.to_string());
+        }
         let mut updater = self
             .updater(
                 Some(&read_columns),
@@ -1655,14 +1661,25 @@ impl FileFragment {
             .await?;
         // Hash join
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
+        let mut updated_row_offsets = Vec::new();
         while let Some(batch) = updater.next().await? {
-            let updated_batch = joiner
-                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset())
+            let (updated_batch, matched_rows) = joiner
+                .collect_with_fallback_and_matches(batch, batch[left_on].clone(), self.dataset())
                 .await?;
+            if !matched_rows.is_empty() {
+                let row_addrs: &UInt64Array = as_primitive_array(batch[ROW_ADDR].as_ref());
+                updated_row_offsets.extend(matched_rows.into_iter().map(|row_idx| {
+                    let row_addr = row_addrs.value(row_idx as usize);
+                    RowAddress::from(row_addr).row_offset()
+                }));
+            }
             updater.update(updated_batch).await?;
         }
 
         let mut updated_fragment = updater.finish().await?;
+        updated_row_offsets.sort_unstable();
+        updated_row_offsets.dedup();
+        updated_fragment.pending_updated_row_offsets = Some(updated_row_offsets);
         // Mark fields in updated data files as obsolete ("tombstone").
         let updated_fields = updated_fragment.files.last().unwrap().fields.clone();
         for data_file in &mut updated_fragment.files.iter_mut().rev().skip(1) {
@@ -2628,6 +2645,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
+    use lance_core::ROW_LAST_UPDATED_AT_VERSION;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
     use lance_file::version::LanceFileVersion;
@@ -2702,6 +2720,7 @@ mod tests {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             data_storage_version: Some(LanceFileVersion::Stable),
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2881,6 +2900,33 @@ mod tests {
             batches1[0].column_by_name("col1").unwrap().as_ref(),
             &Int64Array::from(expected_col1)
         );
+        let mut scanner1 = dataset1.scan();
+        scanner1.project(&[ROW_LAST_UPDATED_AT_VERSION]).unwrap();
+        let version_batches1 = scanner1
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let expected_last_updated_v1 = dataset1.version().version;
+        assert_eq!(
+            version_batches1[0]
+                .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                .unwrap()
+                .as_ref(),
+            &UInt64Array::from(
+                (0..40)
+                    .map(|idx| {
+                        if idx == 0 || idx == 3 {
+                            1
+                        } else {
+                            expected_last_updated_v1
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            )
+        );
 
         // Test update with user specified keys
         let _ = dataset1
@@ -2961,6 +3007,33 @@ mod tests {
         assert_eq!(
             batches2[0].column_by_name("col2").unwrap().as_ref(),
             &BooleanArray::from(expected_col2)
+        );
+        let mut scanner3 = dataset2.scan();
+        scanner3.project(&[ROW_LAST_UPDATED_AT_VERSION]).unwrap();
+        let version_batches2 = scanner3
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let expected_last_updated_v2 = dataset2.version().version;
+        assert_eq!(
+            version_batches2[0]
+                .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                .unwrap()
+                .as_ref(),
+            &UInt64Array::from(
+                (0..40)
+                    .map(|idx| {
+                        if idx == 0 || idx == 3 {
+                            1
+                        } else {
+                            expected_last_updated_v2
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            )
         );
     }
 
