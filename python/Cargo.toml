@@ -68,7 +68,7 @@ serde = "1.0.197"
 serde_yaml = "0.9.34"
 snafu = "0.9"
 tracing-chrome = "0.7.1"
-tracing-subscriber = "0.3.17"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 tracing = { version = "0.1" }
 url = "2.5.0"
 bytes = "1.4"

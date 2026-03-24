@@ -47,6 +47,7 @@ use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
 use tracing_subscriber::Registry;
 use tracing_subscriber::filter;
+use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 
@@ -337,28 +338,36 @@ pub fn trace_to_chrome(path: Option<&str>) -> PyResult<TraceGuard> {
 }
 
 pub fn initialize_tracing(level: log::Level) {
-    let level_filter = match level {
-        log::Level::Trace => filter::LevelFilter::TRACE,
-        log::Level::Debug => filter::LevelFilter::DEBUG,
-        log::Level::Info => filter::LevelFilter::INFO,
-        log::Level::Warn => filter::LevelFilter::WARN,
-        log::Level::Error => filter::LevelFilter::ERROR,
-    };
-    // Narrow down to just our targets, otherwise we get a lot of spam from
-    // our dependencies. The target check is based on a prefix, so `lance` is
-    // sufficient to match `lance_*`.
-    let filter = filter::Targets::new()
-        .with_target("lance", level_filter)
-        .with_target("pylance", level_filter);
-
     SUBSCRIBER
         .write()
         .unwrap()
         .replace(LoggingPassthroughState::new(level));
 
-    let subscriber =
-        Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
-    subscriber::set_global_default(subscriber).unwrap();
+    // If RUST_LOG is set, use EnvFilter to respect it (allows configuring any target)
+    // Otherwise, fall back to filtering only lance/pylance targets
+    if std::env::var("RUST_LOG").is_ok() {
+        let filter = EnvFilter::from_default_env();
+        let subscriber =
+            Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
+        subscriber::set_global_default(subscriber).unwrap();
+    } else {
+        let level_filter = match level {
+            log::Level::Trace => filter::LevelFilter::TRACE,
+            log::Level::Debug => filter::LevelFilter::DEBUG,
+            log::Level::Info => filter::LevelFilter::INFO,
+            log::Level::Warn => filter::LevelFilter::WARN,
+            log::Level::Error => filter::LevelFilter::ERROR,
+        };
+        // Narrow down to just our targets, otherwise we get a lot of spam from
+        // our dependencies. The target check is based on a prefix, so `lance` is
+        // sufficient to match `lance_*`.
+        let filter = filter::Targets::new()
+            .with_target("lance", level_filter)
+            .with_target("pylance", level_filter);
+        let subscriber =
+            Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
+        subscriber::set_global_default(subscriber).unwrap();
+    }
 }
 
 #[pyfunction]
