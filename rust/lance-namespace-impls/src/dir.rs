@@ -2002,10 +2002,24 @@ mod tests {
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_namespace::error::{ErrorCode, NamespaceError};
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
+
+    /// Assert that a `lance_core::Error` wraps a `NamespaceError::TableNotFound`.
+    fn assert_table_not_found(err: &lance_core::Error) {
+        match err {
+            lance_core::Error::Namespace { source, .. } => {
+                let ns_err = source
+                    .downcast_ref::<NamespaceError>()
+                    .expect("source should be NamespaceError");
+                assert_eq!(ns_err.code(), ErrorCode::TableNotFound);
+            }
+            other => panic!("Expected Namespace error, got: {other}"),
+        }
+    }
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -2235,8 +2249,9 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
 
         let result = namespace.describe_table(request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Table not found"));
+        let err = result.unwrap_err();
+        assert_table_not_found(&err);
+        assert!(err.to_string().contains("Table not found"));
     }
 
     #[tokio::test]
@@ -2264,8 +2279,9 @@ mod tests {
         let mut request = TableExistsRequest::new();
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.table_exists(request).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Table not found"));
+        let err = result.unwrap_err();
+        assert_table_not_found(&err);
+        assert!(err.to_string().contains("Table not found"));
     }
 
     #[tokio::test]

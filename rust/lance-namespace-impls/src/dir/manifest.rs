@@ -2462,11 +2462,25 @@ mod tests {
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::LanceNamespace;
+    use lance_namespace::error::{ErrorCode, NamespaceError};
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
         ListTablesRequest, TableExistsRequest,
     };
     use rstest::rstest;
+
+    /// Assert that a `lance_core::Error` wraps a `NamespaceError::TableNotFound`.
+    fn assert_table_not_found(err: &lance_core::Error) {
+        match err {
+            lance_core::Error::Namespace { source, .. } => {
+                let ns_err = source
+                    .downcast_ref::<NamespaceError>()
+                    .expect("source should be NamespaceError");
+                assert_eq!(ns_err.code(), ErrorCode::TableNotFound);
+            }
+            other => panic!("Expected Namespace error, got: {other}"),
+        }
+    }
 
     fn create_test_ipc_data() -> Vec<u8> {
         use arrow::array::{Int32Array, StringArray};
@@ -2555,7 +2569,7 @@ mod tests {
         let mut request = TableExistsRequest::new();
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.table_exists(request).await;
-        assert!(result.is_err());
+        assert_table_not_found(&result.unwrap_err());
 
         // Create table
         let buffer = create_test_ipc_data();
@@ -2591,7 +2605,7 @@ mod tests {
         let mut request = DescribeTableRequest::new();
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.describe_table(request).await;
-        assert!(result.is_err());
+        assert_table_not_found(&result.unwrap_err());
 
         // Create table
         let buffer = create_test_ipc_data();
@@ -2813,7 +2827,7 @@ mod tests {
         let mut drop_request = DropTableRequest::new();
         drop_request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.drop_table(drop_request).await;
-        assert!(result.is_err());
+        assert_table_not_found(&result.unwrap_err());
     }
 
     #[rstest]
