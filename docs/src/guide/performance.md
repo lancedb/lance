@@ -163,11 +163,31 @@ In summary, scans could use up to `(2 * io_buffer_size) + (batch_size * num_comp
 Keep in mind that `io_buffer_size` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
 
-The above limits refer to limits per-scan. There is an additional limit on the number of IOPS that is applied
-across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable.
-The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
-with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
-can often lead to issues with excessive retries and timeouts from the object store.
+### Cloud Store Throttling
+
+Cloud object stores (S3, GCS, Azure) are automatically wrapped with an AIMD (Additive Increase / Multiplicative
+Decrease) rate limiter. When the store returns throttle errors (HTTP 429/503), the request rate decreases
+multiplicatively. During sustained success, the rate increases additively. This applies to all operations
+(reads, writes, deletes, lists) and replaces the old `LANCE_PROCESS_IO_THREADS_LIMIT` process-wide cap.
+
+Local and in-memory stores are **not** throttled.
+
+The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
+over environment variables:
+
+| Setting            | Storage Option Key              | Env Var                         | Default |
+| ------------------ | ------------------------------- | ------------------------------- | ------- |
+| Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
+| Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
+| Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
+| Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
+
+These initial settings are balanced and should work for most
+use cases. For example, S3 can typically get up to 5000
+req/s and with these settings we should get there in about
+10 seconds.
 
 ## Indexes
 

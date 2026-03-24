@@ -20,6 +20,7 @@
 //! let throttled = AimdThrottledStore::new(target, AimdThrottleConfig::default()).unwrap();
 //! ```
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
@@ -139,6 +140,89 @@ impl AimdThrottleConfig {
             burst_capacity,
             ..self
         }
+    }
+
+    /// Build an `AimdThrottleConfig` from storage options and environment variables.
+    ///
+    /// Storage options take precedence over environment variables, which take
+    /// precedence over defaults. A single AIMD config is applied to all four
+    /// operation categories (read/write/delete/list).
+    ///
+    /// | Setting              | Storage Option Key               | Env Var                          | Default |
+    /// |----------------------|----------------------------------|----------------------------------|---------|
+    /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
+    /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
+    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
+    /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
+    /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
+    /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
+    pub fn from_storage_options(
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> lance_core::Result<Self> {
+        fn resolve_f64(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: f64,
+        ) -> lance_core::Result<f64> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<f64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<f64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        fn resolve_u32(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: u32,
+        ) -> lance_core::Result<u32> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<u32>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<u32>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
+        let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
+        let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
+        let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
+        let additive_increment =
+            resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
+        let burst_capacity = resolve_u32("lance_aimd_burst_capacity", storage_options, 100)?;
+
+        let aimd = AimdConfig::default()
+            .with_initial_rate(initial_rate)
+            .with_min_rate(min_rate)
+            .with_max_rate(max_rate)
+            .with_decrease_factor(decrease_factor)
+            .with_additive_increment(additive_increment);
+
+        Ok(Self::default()
+            .with_aimd(aimd)
+            .with_burst_capacity(burst_capacity))
     }
 }
 

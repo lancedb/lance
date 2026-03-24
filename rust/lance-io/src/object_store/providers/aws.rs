@@ -30,6 +30,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     StorageOptionsProvider,
+    throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
 
@@ -159,6 +160,9 @@ impl ObjectStoreProvider for AwsStoreProvider {
             self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
                 .await?
         };
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let inner =
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>;
 
         Ok(ObjectStore {
             inner,

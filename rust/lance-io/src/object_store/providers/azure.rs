@@ -21,6 +21,7 @@ use url::Url;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
 
@@ -163,6 +164,9 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             self.build_microsoft_azure_store(&base_path, &storage_options)
                 .await?
         };
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let inner =
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>;
 
         Ok(ObjectStore {
             inner,
