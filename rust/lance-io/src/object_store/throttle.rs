@@ -109,10 +109,7 @@ impl AimdThrottleConfig {
 
     /// Set the AIMD configuration for read operations.
     pub fn with_read_aimd(self, aimd: AimdConfig) -> Self {
-        Self {
-            read: aimd,
-            ..self
-        }
+        Self { read: aimd, ..self }
     }
 
     /// Set the AIMD configuration for write operations.
@@ -133,10 +130,7 @@ impl AimdThrottleConfig {
 
     /// Set the AIMD configuration for list operations.
     pub fn with_list_aimd(self, aimd: AimdConfig) -> Self {
-        Self {
-            list: aimd,
-            ..self
-        }
+        Self { list: aimd, ..self }
     }
 
     pub fn with_burst_capacity(self, burst_capacity: u32) -> Self {
@@ -199,27 +193,31 @@ impl OperationThrottle {
     }
 
     /// Acquire a token from the bucket, sleeping if none are available.
+    ///
+    /// Each caller reserves a token immediately (allowing `tokens` to go
+    /// negative) so that concurrent waiters queue behind each other instead
+    /// of all waking at the same instant (thundering herd).
     async fn acquire_token(&self) {
-        loop {
-            let sleep_duration = {
-                let mut bucket = self.bucket.lock().await;
-                let now = std::time::Instant::now();
-                let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-                bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
-                bucket.last_refill = now;
+        let sleep_duration = {
+            let mut bucket = self.bucket.lock().await;
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+            bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
+            bucket.last_refill = now;
 
-                if bucket.tokens >= 1.0 {
-                    bucket.tokens -= 1.0;
-                    return;
-                }
+            // Reserve a token (may go negative to queue behind other waiters)
+            bucket.tokens -= 1.0;
 
-                // Calculate how long to wait for one token
-                let deficit = 1.0 - bucket.tokens;
-                std::time::Duration::from_secs_f64(deficit / bucket.rate)
-            };
+            if bucket.tokens >= 0.0 {
+                // Had a token available, no need to sleep
+                return;
+            }
 
-            tokio::time::sleep(sleep_duration).await;
-        }
+            // Sleep proportional to our position in the queue
+            std::time::Duration::from_secs_f64(-bucket.tokens / bucket.rate)
+        };
+
+        tokio::time::sleep(sleep_duration).await;
     }
 
     /// Update the bucket's fill rate from the controller.
@@ -315,7 +313,9 @@ impl AimdThrottledStore {
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for AimdThrottledStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        self.write.throttled(|| self.target.put(location, bytes)).await
+        self.write
+            .throttled(|| self.target.put(location, bytes))
+            .await
     }
 
     async fn put_opts(
@@ -372,9 +372,7 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
-        self.delete
-            .throttled(|| self.target.delete(location))
-            .await
+        self.delete.throttled(|| self.target.delete(location)).await
     }
 
     fn delete_stream<'a>(
@@ -426,10 +424,10 @@ impl ObjectStore for AimdThrottledStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use object_store::memory::InMemory;
     use rstest::rstest;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn make_generic_error(msg: &str) -> object_store::Error {
         object_store::Error::Generic {
@@ -506,7 +504,10 @@ mod tests {
 
         // Wait for window to expire and trigger evaluation
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        throttled.read.controller.record_outcome(RequestOutcome::Success);
+        throttled
+            .read
+            .controller
+            .record_outcome(RequestOutcome::Success);
 
         let new_rate = throttled.read.controller.current_rate();
         assert!(
@@ -535,13 +536,19 @@ mod tests {
             .controller
             .record_outcome(RequestOutcome::Throttled);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        throttled.read.controller.record_outcome(RequestOutcome::Success);
+        throttled
+            .read
+            .controller
+            .record_outcome(RequestOutcome::Success);
         let decreased_rate = throttled.read.controller.current_rate();
         assert_eq!(decreased_rate, 50.0);
 
         // Now recover via success
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        throttled.read.controller.record_outcome(RequestOutcome::Success);
+        throttled
+            .read
+            .controller
+            .record_outcome(RequestOutcome::Success);
         let recovered_rate = throttled.read.controller.current_rate();
         assert_eq!(recovered_rate, 60.0);
     }
@@ -621,7 +628,10 @@ mod tests {
             .controller
             .record_outcome(RequestOutcome::Throttled);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        throttled.read.controller.record_outcome(RequestOutcome::Success);
+        throttled
+            .read
+            .controller
+            .record_outcome(RequestOutcome::Success);
 
         let read_rate = throttled.read.controller.current_rate();
         let write_rate = throttled.write.controller.current_rate();
@@ -769,11 +779,7 @@ mod tests {
             }
         }
 
-        async fn get_ranges(
-            &self,
-            location: &Path,
-            ranges: &[Range<u64>],
-        ) -> OSResult<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             if self.check_rate() {
                 self.inner.get_ranges(location, ranges).await
             } else {
@@ -922,10 +928,7 @@ mod tests {
         );
 
         // The initial burst exceeds mock capacity, so throttling must occur.
-        assert!(
-            throttled > 0,
-            "Expected some throttled requests but got 0"
-        );
+        assert!(throttled > 0, "Expected some throttled requests but got 0");
 
         // Without AIMD, raw tokio tasks against InMemory would fire 100k+ req/s.
         // AIMD should keep the total well under 5000 over 2s.
