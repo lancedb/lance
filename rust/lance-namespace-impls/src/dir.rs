@@ -4644,8 +4644,8 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("does not exist"),
-            "Error should mention table does not exist, got: {}",
+            err_msg.contains("not found"),
+            "Error should mention table not found, got: {}",
             err_msg
         );
     }
