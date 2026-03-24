@@ -25,7 +25,7 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, build_prefilter};
-use crate::{Dataset, index::DatasetIndexInternalExt};
+use crate::{Dataset, dataset::ProjectionRequest, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -33,6 +33,7 @@ use lance_index::scalar::inverted::query::{
     BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, Tokens, collect_query_tokens,
     has_query_token,
 };
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
@@ -45,6 +46,14 @@ pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
     baseline_metrics: BaselineMetrics,
+}
+
+const STOP_WORD_PLACEHOLDER: &str = "__lance_stop_word__";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenWithPosition {
+    text: String,
+    position: u32,
 }
 
 impl FtsIndexMetrics {
@@ -786,6 +795,177 @@ impl PhraseQueryExec {
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
+
+    fn collect_tokens_with_positions(
+        text: &str,
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        is_query: bool,
+    ) -> Vec<TokenWithPosition> {
+        let mut stream = if is_query {
+            tokenizer.token_stream_for_search(text)
+        } else {
+            tokenizer.token_stream_for_doc(text)
+        };
+
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(TokenWithPosition {
+                text: token.text.clone(),
+                position: token.position as u32,
+            });
+        }
+        tokens
+    }
+
+    fn collect_phrase_tokens_with_stop_words(
+        text: &str,
+        params: &InvertedIndexParams,
+        is_query: bool,
+    ) -> DataFusionResult<Vec<String>> {
+        let mut all_tokens_tokenizer = params
+            .clone()
+            .remove_stop_words(false)
+            .build()
+            .map_err(DataFusionError::from)?;
+        let mut filtered_tokenizer = params.clone().build().map_err(DataFusionError::from)?;
+
+        let all_tokens =
+            Self::collect_tokens_with_positions(text, &mut all_tokens_tokenizer, is_query);
+        let filtered_tokens =
+            Self::collect_tokens_with_positions(text, &mut filtered_tokenizer, is_query);
+
+        let mut filtered_idx = 0usize;
+        let mut phrase_tokens = Vec::with_capacity(all_tokens.len());
+        for token in all_tokens {
+            if filtered_tokens.get(filtered_idx) == Some(&token) {
+                phrase_tokens.push(token.text);
+                filtered_idx += 1;
+            } else {
+                phrase_tokens.push(STOP_WORD_PLACEHOLDER.to_string());
+            }
+        }
+        Ok(phrase_tokens)
+    }
+
+    fn matches_phrase_tokens(doc_tokens: &[String], query_tokens: &[String], slop: u32) -> bool {
+        if query_tokens.is_empty() {
+            return false;
+        }
+
+        for (doc_idx, token) in doc_tokens.iter().enumerate() {
+            if token == &query_tokens[0]
+                && Self::matches_phrase_tokens_from(doc_tokens, query_tokens, doc_idx, 1, slop)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matches_phrase_tokens_from(
+        doc_tokens: &[String],
+        query_tokens: &[String],
+        previous_doc_idx: usize,
+        next_query_idx: usize,
+        slop: u32,
+    ) -> bool {
+        if next_query_idx == query_tokens.len() {
+            return true;
+        }
+
+        let min_doc_idx = previous_doc_idx.saturating_add(1);
+        if min_doc_idx >= doc_tokens.len() {
+            return false;
+        }
+
+        let max_doc_idx = previous_doc_idx
+            .saturating_add(1 + slop as usize)
+            .min(doc_tokens.len() - 1);
+        if min_doc_idx > max_doc_idx {
+            return false;
+        }
+
+        for doc_idx in min_doc_idx..=max_doc_idx {
+            if doc_tokens[doc_idx] == query_tokens[next_query_idx]
+                && Self::matches_phrase_tokens_from(
+                    doc_tokens,
+                    query_tokens,
+                    doc_idx,
+                    next_query_idx + 1,
+                    slop,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn filter_stop_word_phrase_matches(
+        dataset: Arc<Dataset>,
+        column: &str,
+        row_ids: Vec<u64>,
+        scores: Vec<f32>,
+        params: &InvertedIndexParams,
+        query: &PhraseQuery,
+    ) -> DataFusionResult<(Vec<u64>, Vec<f32>)> {
+        let query_tokens = Self::collect_phrase_tokens_with_stop_words(&query.terms, params, true)?;
+        if !query_tokens
+            .iter()
+            .any(|token| token == STOP_WORD_PLACEHOLDER)
+        {
+            return Ok((row_ids, scores));
+        }
+
+        let projection = ProjectionRequest::from_columns([column], dataset.schema());
+        let batch = dataset
+            .take_rows(&row_ids, projection)
+            .await
+            .map_err(DataFusionError::from)?;
+        let text_column = batch.column_by_name(column).ok_or_else(|| {
+            DataFusionError::Execution(format!("Column {} not found in batch", column))
+        })?;
+
+        let mut filtered_row_ids = Vec::with_capacity(row_ids.len());
+        let mut filtered_scores = Vec::with_capacity(scores.len());
+        match text_column.data_type() {
+            DataType::Utf8 => {
+                let text_column = text_column.as_string::<i32>();
+                for ((row_id, score), value) in
+                    row_ids.into_iter().zip(scores).zip(text_column.iter())
+                {
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let doc_tokens =
+                        Self::collect_phrase_tokens_with_stop_words(value, params, false)?;
+                    if Self::matches_phrase_tokens(&doc_tokens, &query_tokens, query.slop) {
+                        filtered_row_ids.push(row_id);
+                        filtered_scores.push(score);
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                let text_column = text_column.as_string::<i64>();
+                for ((row_id, score), value) in
+                    row_ids.into_iter().zip(scores).zip(text_column.iter())
+                {
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let doc_tokens =
+                        Self::collect_phrase_tokens_with_stop_words(value, params, false)?;
+                    if Self::matches_phrase_tokens(&doc_tokens, &query_tokens, query.slop) {
+                        filtered_row_ids.push(row_id);
+                        filtered_scores.push(score);
+                    }
+                }
+            }
+            _ => return Ok((row_ids, scores)),
+        }
+
+        Ok((filtered_row_ids, filtered_scores))
+    }
 }
 
 impl ExecutionPlan for PhraseQueryExec {
@@ -872,10 +1052,13 @@ impl ExecutionPlan for PhraseQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let column = query.column.ok_or(DataFusionError::Execution(format!(
-                "column not set for PhraseQuery {}",
-                query.terms
-            )))?;
+            let column = query
+                .column
+                .clone()
+                .ok_or(DataFusionError::Execution(format!(
+                    "column not set for PhraseQuery {}",
+                    query.terms
+                )))?;
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
@@ -892,7 +1075,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 context.clone(),
                 partition,
                 &prefilter_source,
-                ds,
+                ds.clone(),
                 &[index_meta],
             )?;
 
@@ -909,6 +1092,7 @@ impl ExecutionPlan for PhraseQueryExec {
 
             let mut tokenizer = index.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let index_params = index.params().clone();
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
@@ -921,6 +1105,15 @@ impl ExecutionPlan for PhraseQueryExec {
                 )
                 .boxed()
                 .await?;
+            let (doc_ids, scores) = Self::filter_stop_word_phrase_matches(
+                ds.clone(),
+                &column,
+                doc_ids,
+                scores,
+                &index_params,
+                &query,
+            )
+            .await?;
             metrics.baseline_metrics.record_output(doc_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
