@@ -9,10 +9,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+    RecordBatchReader, UInt32Array, UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
 use crate::{Error, Result};
@@ -599,6 +603,81 @@ impl ClusteringResult {
     pub fn num_unique(&self) -> usize {
         self.clusters.len()
     }
+
+    /// Get the schema for clustering result batches.
+    pub fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("representative", DataType::UInt64, false),
+            Field::new(
+                "duplicates",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+                false,
+            ),
+        ]))
+    }
+
+    /// Convert to Arrow RecordBatch with columns:
+    /// - `representative`: UInt64
+    /// - `duplicates`: List<UInt64>
+    pub fn to_record_batch(&self) -> RecordBatch {
+        let schema = Self::schema();
+
+        let mut representatives = Vec::with_capacity(self.clusters.len());
+        let mut duplicates_builder = ListBuilder::new(UInt64Builder::new());
+
+        for cluster in &self.clusters {
+            representatives.push(cluster.representative);
+            for &dup in &cluster.duplicates {
+                duplicates_builder.values().append_value(dup);
+            }
+            duplicates_builder.append(true);
+        }
+
+        let representative_array: ArrayRef = Arc::new(UInt64Array::from(representatives));
+        let duplicates_array: ArrayRef = Arc::new(duplicates_builder.finish());
+
+        RecordBatch::try_new(schema, vec![representative_array, duplicates_array])
+            .expect("Failed to create RecordBatch")
+    }
+
+    /// Convert to a RecordBatchReader that yields batches of the specified size.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Number of clusters per batch (default: 10000)
+    pub fn into_reader(self, batch_size: Option<usize>) -> Box<dyn RecordBatchReader + Send> {
+        let batch_size = batch_size.unwrap_or(10_000);
+        let schema = Self::schema();
+
+        if self.clusters.is_empty() {
+            // Return empty reader
+            let batches: Vec<std::result::Result<RecordBatch, arrow_schema::ArrowError>> = vec![];
+            return Box::new(RecordBatchIterator::new(batches, schema));
+        }
+
+        let batches: Vec<std::result::Result<RecordBatch, arrow_schema::ArrowError>> = self
+            .clusters
+            .chunks(batch_size)
+            .map(|chunk| {
+                let mut representatives = Vec::with_capacity(chunk.len());
+                let mut duplicates_builder = ListBuilder::new(UInt64Builder::new());
+
+                for cluster in chunk {
+                    representatives.push(cluster.representative);
+                    for &dup in &cluster.duplicates {
+                        duplicates_builder.values().append_value(dup);
+                    }
+                    duplicates_builder.append(true);
+                }
+
+                let representative_array: ArrayRef = Arc::new(UInt64Array::from(representatives));
+                let duplicates_array: ArrayRef = Arc::new(duplicates_builder.finish());
+
+                RecordBatch::try_new(Self::schema(), vec![representative_array, duplicates_array])
+            })
+            .collect();
+
+        Box::new(RecordBatchIterator::new(batches, schema))
+    }
 }
 
 /// Cluster edges using union-find algorithm.
@@ -994,10 +1073,10 @@ mod tests {
 
         // All row IDs should be in range [1000, 1100)
         for &id in &result.row_id_a {
-            assert!(id >= 1000 && id < 1100, "row_id_a {} out of range", id);
+            assert!((1000..1100).contains(&id), "row_id_a {} out of range", id);
         }
         for &id in &result.row_id_b {
-            assert!(id >= 1000 && id < 1100, "row_id_b {} out of range", id);
+            assert!((1000..1100).contains(&id), "row_id_b {} out of range", id);
         }
         // row_id_a should always be less than row_id_b (upper triangular)
         for (&a, &b) in result.row_id_a.iter().zip(result.row_id_b.iter()) {

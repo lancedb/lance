@@ -2710,13 +2710,10 @@ impl Dataset {
     ///
     /// Returns
     /// -------
-    /// dict
-    ///     A dictionary containing:
-    ///     - 'num_clusters': int - Number of clusters found
-    ///     - 'num_duplicates': int - Total number of duplicate row IDs
-    ///     - 'clusters': List[dict] - List of clusters, each with:
-    ///         - 'representative': int - The representative row ID
-    ///         - 'duplicates': List[int] - List of duplicate row IDs
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     #[pyo3(signature = (index_name, partition_id, hamming_threshold))]
     fn hamming_clustering_for_ivf_partition(
         &self,
@@ -2724,11 +2721,11 @@ impl Dataset {
         index_name: &str,
         partition_id: usize,
         hamming_threshold: u32,
-    ) -> PyResult<Py<PyDict>> {
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         use lance::index::vector::hamming::hamming_clustering_for_ivf_partition;
 
         let ds = self.ds.as_ref();
-        let result = rt()
+        let reader = rt()
             .block_on(
                 Some(py),
                 hamming_clustering_for_ivf_partition(
@@ -2740,27 +2737,7 @@ impl Dataset {
             )?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let dict = PyDict::new(py);
-        dict.set_item("num_clusters", result.num_clusters())?;
-        dict.set_item("num_duplicates", result.num_duplicates())?;
-
-        let clusters_list: Vec<_> = result
-            .clusters
-            .iter()
-            .map(|c| {
-                let cluster_dict = PyDict::new(py);
-                cluster_dict
-                    .set_item("representative", c.representative)
-                    .unwrap();
-                cluster_dict
-                    .set_item("duplicates", c.duplicates.clone())
-                    .unwrap();
-                cluster_dict
-            })
-            .collect();
-        dict.set_item("clusters", clusters_list)?;
-
-        Ok(dict.into())
+        Ok(PyArrowType(reader))
     }
 
     /// Get partition information for an IVF_FLAT index.
@@ -2817,19 +2794,10 @@ impl Dataset {
     ///
     /// Returns
     /// -------
-    /// dict
-    ///     A dictionary containing:
-    ///
-    ///     - 'num_clusters': int - Number of clusters found
-    ///     - 'num_duplicates': int - Total number of duplicate row IDs
-    ///     - 'num_rows': int - Number of rows processed
-    ///     - 'total_pairs': int - Total number of pairs compared
-    ///     - 'edges_found': int - Number of edges (pairs within threshold)
-    ///     - 'read_time_ms': float - Time spent reading data in milliseconds
-    ///     - 'compute_time_ms': float - Time spent computing distances in milliseconds
-    ///     - 'cluster_time_ms': float - Time spent clustering in milliseconds
-    ///     - 'pairs_per_sec': float - Pairs compared per second
-    ///     - 'clusters': List[dict] - List of clusters
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     #[pyo3(signature = (column, sample_size, hamming_threshold))]
     fn hamming_clustering_sampled(
         &self,
@@ -2837,52 +2805,18 @@ impl Dataset {
         column: &str,
         sample_size: Option<usize>,
         hamming_threshold: u32,
-    ) -> PyResult<Py<PyDict>> {
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         use lance::index::vector::hamming::hamming_clustering_sampled;
 
         let ds = self.ds.as_ref();
-        let result = rt()
+        let reader = rt()
             .block_on(
                 Some(py),
                 hamming_clustering_sampled(ds, column, sample_size, hamming_threshold),
             )?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let dict = PyDict::new(py);
-        dict.set_item("num_clusters", result.clustering.num_clusters())?;
-        dict.set_item("num_duplicates", result.clustering.num_duplicates())?;
-        dict.set_item("num_rows", result.num_rows)?;
-        dict.set_item("total_pairs", result.total_pairs)?;
-        dict.set_item("edges_found", result.pairwise.len())?;
-        dict.set_item("read_time_ms", result.read_time.as_secs_f64() * 1000.0)?;
-        dict.set_item(
-            "compute_time_ms",
-            result.compute_time.as_secs_f64() * 1000.0,
-        )?;
-        dict.set_item(
-            "cluster_time_ms",
-            result.cluster_time.as_secs_f64() * 1000.0,
-        )?;
-        dict.set_item("pairs_per_sec", result.pairs_per_sec())?;
-
-        let clusters_list: Vec<_> = result
-            .clustering
-            .clusters
-            .iter()
-            .map(|c| {
-                let cluster_dict = PyDict::new(py);
-                cluster_dict
-                    .set_item("representative", c.representative)
-                    .unwrap();
-                cluster_dict
-                    .set_item("duplicates", c.duplicates.clone())
-                    .unwrap();
-                cluster_dict
-            })
-            .collect();
-        dict.set_item("clusters", clusters_list)?;
-
-        Ok(dict.into())
+        Ok(PyArrowType(reader))
     }
 }
 

@@ -6,8 +6,9 @@
 //! This module provides functionality to perform pairwise hamming distance
 //! computation and clustering on specific partitions of IVF_FLAT indices.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use arrow_array::RecordBatchReader;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_schema::DataType;
@@ -19,7 +20,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex};
 use lance_index::vector::flat::storage::FLAT_COLUMN;
 use lance_index::vector::storage::VectorStore;
 use lance_linalg::distance::{
-    ClusteringResult, PairwiseResult, cluster_pairwise_result, extract_hashes_from_fixed_list,
+    ClusteringResult, cluster_pairwise_result, extract_hashes_from_fixed_list,
     pairwise_hamming_distance_parallel,
 };
 use rand::rng;
@@ -45,7 +46,9 @@ use super::ivf::v2::IVFIndex;
 ///
 /// # Returns
 ///
-/// A `ClusteringResult` containing clusters of similar row IDs.
+/// A `RecordBatchReader` yielding batches with columns:
+/// - `representative`: UInt64 - The representative row ID for each cluster
+/// - `duplicates`: List<UInt64> - List of duplicate row IDs in each cluster
 ///
 /// # Errors
 ///
@@ -58,7 +61,7 @@ pub async fn hamming_clustering_for_ivf_partition(
     index_name: &str,
     partition_id: usize,
     hamming_threshold: u32,
-) -> Result<ClusteringResult> {
+) -> Result<Box<dyn RecordBatchReader + Send>> {
     // Load indices and find the IVF_FLAT index
     let indices = dataset.load_indices().await?;
     let index_meta = indices
@@ -134,17 +137,19 @@ pub async fn hamming_clustering_for_ivf_partition(
     let row_id_slice: Vec<u64> = storage.row_ids().copied().collect();
 
     if row_id_slice.is_empty() {
-        return Ok(ClusteringResult {
+        let empty = ClusteringResult {
             clusters: Vec::new(),
-        });
+        };
+        return Ok(empty.into_reader(None));
     }
 
     // Get vectors from the storage batches
     let batches: Vec<_> = storage.to_batches()?.collect();
     if batches.is_empty() {
-        return Ok(ClusteringResult {
+        let empty = ClusteringResult {
             clusters: Vec::new(),
-        });
+        };
+        return Ok(empty.into_reader(None));
     }
 
     // Extract the hash vectors from the FLAT_COLUMN
@@ -170,7 +175,7 @@ pub async fn hamming_clustering_for_ivf_partition(
     // Cluster the results
     let clustering = cluster_pairwise_result(&pairwise_result);
 
-    Ok(clustering)
+    Ok(clustering.into_reader(None))
 }
 
 /// Get partition statistics for an IVF_FLAT index.
@@ -234,44 +239,6 @@ pub struct PartitionInfo {
     pub size: usize,
 }
 
-/// Result of hamming clustering with timing information.
-#[derive(Debug, Clone)]
-pub struct HammingClusterResult {
-    /// The clustering result.
-    pub clustering: ClusteringResult,
-    /// The pairwise result (edges found).
-    pub pairwise: PairwiseResult,
-    /// Number of rows processed.
-    pub num_rows: usize,
-    /// Total number of pairs compared.
-    pub total_pairs: u64,
-    /// Time spent reading data.
-    pub read_time: Duration,
-    /// Time spent extracting hashes.
-    pub extract_time: Duration,
-    /// Time spent computing pairwise distances.
-    pub compute_time: Duration,
-    /// Time spent clustering.
-    pub cluster_time: Duration,
-}
-
-impl HammingClusterResult {
-    /// Pairs compared per second during the compute phase.
-    pub fn pairs_per_sec(&self) -> f64 {
-        self.total_pairs as f64 / self.compute_time.as_secs_f64()
-    }
-
-    /// Total processing time (excluding read).
-    pub fn processing_time(&self) -> Duration {
-        self.extract_time + self.compute_time + self.cluster_time
-    }
-
-    /// Total time including read.
-    pub fn total_time(&self) -> Duration {
-        self.read_time + self.processing_time()
-    }
-}
-
 /// Perform pairwise hamming distance clustering on sampled rows from a dataset.
 ///
 /// This function samples N rows randomly from the dataset, extracts hashes,
@@ -287,13 +254,15 @@ impl HammingClusterResult {
 ///
 /// # Returns
 ///
-/// A `HammingClusterResult` containing clusters and timing information.
+/// A `RecordBatchReader` yielding batches with columns:
+/// - `representative`: UInt64 - The representative row ID for each cluster
+/// - `duplicates`: List<UInt64> - List of duplicate row IDs in each cluster
 pub async fn hamming_clustering_sampled(
     dataset: &Dataset,
     column: &str,
     sample_size: Option<usize>,
     hamming_threshold: u32,
-) -> Result<HammingClusterResult> {
+) -> Result<Box<dyn RecordBatchReader + Send>> {
     // Validate column exists and has correct type
     let schema = dataset.schema();
     let field = schema.field(column).ok_or_else(|| {
@@ -330,8 +299,7 @@ pub async fn hamming_clustering_sampled(
     let use_sampling = sample_size.is_some_and(|s| s < total_rows);
     let effective_sample = sample_size.unwrap_or(total_rows).min(total_rows);
 
-    // Stage 1: Read data
-    let t_read_start = Instant::now();
+    // Read data
     let (hashes, row_ids) = if use_sampling {
         // Random sample using take()
         let indices: Vec<u64> = sample(&mut rng(), total_rows, effective_sample)
@@ -373,55 +341,28 @@ pub async fn hamming_clustering_sampled(
 
         (hashes, row_id_vec)
     };
-    let read_time = t_read_start.elapsed();
 
-    // Stage 2: Already extracted hashes during read
-    let extract_time = Duration::ZERO; // Hashes extracted during read
-
-    let num_rows = hashes.len();
-    if num_rows < 2 {
-        return Ok(HammingClusterResult {
-            clustering: ClusteringResult {
-                clusters: Vec::new(),
-            },
-            pairwise: PairwiseResult::default(),
-            num_rows,
-            total_pairs: 0,
-            read_time,
-            extract_time,
-            compute_time: Duration::ZERO,
-            cluster_time: Duration::ZERO,
-        });
+    if hashes.len() < 2 {
+        let empty = ClusteringResult {
+            clusters: Vec::new(),
+        };
+        return Ok(empty.into_reader(None));
     }
 
-    let total_pairs = (num_rows as u64) * (num_rows as u64 - 1) / 2;
-
-    // Stage 3: Compute pairwise hamming distances
-    let t_compute_start = Instant::now();
+    // Compute pairwise hamming distances
     let pairwise =
         pairwise_hamming_distance_parallel(&hashes, Some(&row_ids), Some(hamming_threshold));
-    let compute_time = t_compute_start.elapsed();
 
-    // Stage 4: Cluster edges
-    let t_cluster_start = Instant::now();
+    // Cluster edges
     let clustering = cluster_pairwise_result(&pairwise);
-    let cluster_time = t_cluster_start.elapsed();
 
-    Ok(HammingClusterResult {
-        clustering,
-        pairwise,
-        num_rows,
-        total_pairs,
-        read_time,
-        extract_time,
-        compute_time,
-        cluster_time,
-    })
+    Ok(clustering.into_reader(None))
 }
 
 /// Perform pairwise hamming distance clustering on provided hashes (no I/O).
 ///
 /// This is useful for benchmarking the pure compute performance without I/O.
+/// Logs timing information via tracing.
 ///
 /// # Arguments
 ///
@@ -431,26 +372,20 @@ pub async fn hamming_clustering_sampled(
 ///
 /// # Returns
 ///
-/// A `HammingClusterResult` containing clusters and timing information.
-pub fn hamming_cluster_hashes(
+/// A `RecordBatchReader` yielding batches with columns:
+/// - `representative`: UInt64 - The representative row ID for each cluster
+/// - `duplicates`: List<UInt64> - List of duplicate row IDs in each cluster
+pub fn hamming_clustering_from_hashes(
     hashes: &[u64],
     row_ids: Option<&[u64]>,
     hamming_threshold: u32,
-) -> HammingClusterResult {
+) -> Box<dyn RecordBatchReader + Send> {
     let num_rows = hashes.len();
     if num_rows < 2 {
-        return HammingClusterResult {
-            clustering: ClusteringResult {
-                clusters: Vec::new(),
-            },
-            pairwise: PairwiseResult::default(),
-            num_rows,
-            total_pairs: 0,
-            read_time: Duration::ZERO,
-            extract_time: Duration::ZERO,
-            compute_time: Duration::ZERO,
-            cluster_time: Duration::ZERO,
+        let empty = ClusteringResult {
+            clusters: Vec::new(),
         };
+        return empty.into_reader(None);
     }
 
     let total_pairs = (num_rows as u64) * (num_rows as u64 - 1) / 2;
@@ -465,24 +400,64 @@ pub fn hamming_cluster_hashes(
     let clustering = cluster_pairwise_result(&pairwise);
     let cluster_time = t_cluster_start.elapsed();
 
-    HammingClusterResult {
-        clustering,
-        pairwise,
+    // Log timing info
+    let pairs_per_sec = if compute_time.as_secs_f64() > 0.0 {
+        total_pairs as f64 / compute_time.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
         num_rows,
         total_pairs,
-        read_time: Duration::ZERO,
-        extract_time: Duration::ZERO,
-        compute_time,
-        cluster_time,
-    }
+        edges = pairwise.len(),
+        compute_time_ms = compute_time.as_millis(),
+        cluster_time_ms = cluster_time.as_millis(),
+        pairs_per_sec_millions = pairs_per_sec / 1_000_000.0,
+        num_clusters = clustering.num_clusters(),
+        num_duplicates = clustering.num_duplicates(),
+        "Hamming clustering completed"
+    );
+
+    clustering.into_reader(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Array;
+
+    /// Helper to collect all clusters from a reader.
+    fn collect_clusters(reader: Box<dyn RecordBatchReader + Send>) -> Vec<(u64, Vec<u64>)> {
+        let mut clusters = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let reps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+            let dups = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let rep = reps.value(i);
+                let dup_arr = dups.value(i);
+                let dup_values = dup_arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .unwrap();
+                let duplicates: Vec<u64> = dup_values.values().to_vec();
+                clusters.push((rep, duplicates));
+            }
+        }
+        clusters
+    }
 
     #[test]
-    fn test_hamming_cluster_hashes_basic() {
+    fn test_hamming_clustering_from_hashes_basic() {
         // Create some test hashes with known distances
         let hashes = vec![
             0b0000u64, // hash 0
@@ -491,18 +466,17 @@ mod tests {
             0b1111u64, // hash 3 - distance 2 from hash 2, distance 4 from hash 0
         ];
 
-        let result = hamming_cluster_hashes(&hashes, None, 1);
+        let reader = hamming_clustering_from_hashes(&hashes, None, 1);
+        let clusters = collect_clusters(reader);
 
         // With threshold 1, pairs (0,1) and (1,2) should be connected
         // This forms one cluster: {0, 1, 2}
-        assert_eq!(result.num_rows, 4);
-        assert_eq!(result.total_pairs, 6); // C(4,2) = 6
-        assert_eq!(result.clustering.num_clusters(), 1);
-        assert_eq!(result.clustering.num_duplicates(), 2); // 2 duplicates in the cluster
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].1.len(), 2); // 2 duplicates in the cluster
     }
 
     #[test]
-    fn test_hamming_cluster_hashes_no_clusters() {
+    fn test_hamming_clustering_from_hashes_no_clusters() {
         // All hashes are far apart
         let hashes = vec![
             0x0000000000000000u64,
@@ -510,23 +484,24 @@ mod tests {
             0xAAAAAAAAAAAAAAAAu64,
         ];
 
-        let result = hamming_cluster_hashes(&hashes, None, 5);
+        let reader = hamming_clustering_from_hashes(&hashes, None, 5);
+        let clusters = collect_clusters(reader);
 
         // With threshold 5, no pairs should be connected (min distance is 32)
-        assert_eq!(result.clustering.num_clusters(), 0);
-        assert_eq!(result.pairwise.len(), 0);
+        assert_eq!(clusters.len(), 0);
     }
 
     #[test]
-    fn test_hamming_cluster_hashes_with_row_ids() {
+    fn test_hamming_clustering_from_hashes_with_row_ids() {
         let hashes = vec![0b0000u64, 0b0001u64];
         let row_ids = vec![100u64, 200u64];
 
-        let result = hamming_cluster_hashes(&hashes, Some(&row_ids), 1);
+        let reader = hamming_clustering_from_hashes(&hashes, Some(&row_ids), 1);
+        let clusters = collect_clusters(reader);
 
-        assert_eq!(result.clustering.num_clusters(), 1);
-        assert_eq!(result.clustering.clusters[0].representative, 100);
-        assert_eq!(result.clustering.clusters[0].duplicates, vec![200]);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].0, 100); // representative
+        assert_eq!(clusters[0].1, vec![200]); // duplicates
     }
 
     #[tokio::test]

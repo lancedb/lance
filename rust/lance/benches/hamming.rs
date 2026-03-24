@@ -26,7 +26,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use lance_arrow::FixedSizeListArrayExt;
 use rand::Rng;
 
-use lance::index::vector::hamming::{hamming_cluster_hashes, hamming_clustering_sampled};
+use lance::index::vector::hamming::{hamming_clustering_from_hashes, hamming_clustering_sampled};
 use lance::{Dataset, dataset::WriteParams};
 use lance_linalg::distance::pairwise_hamming_distance_parallel;
 
@@ -106,7 +106,7 @@ fn bench_cluster_hashes(c: &mut Criterion) {
             &hashes,
             |b, hashes| {
                 b.iter(|| {
-                    hamming_cluster_hashes(hashes, None, 10);
+                    hamming_clustering_from_hashes(hashes, None, 10);
                 });
             },
         );
@@ -190,22 +190,20 @@ fn run_quick_bench() {
         let hashes = generate_random_hashes(size);
         let total_pairs = (size as u64) * (size as u64 - 1) / 2;
 
+        println!("Size: {} rows, {} pairs", size, total_pairs);
         let start = Instant::now();
-        let result = hamming_cluster_hashes(&hashes, None, 10);
+        let reader = hamming_clustering_from_hashes(&hashes, None, 10);
+        // Consume the reader to count clusters
+        let cluster_count: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         let elapsed = start.elapsed();
 
         let pairs_per_sec = total_pairs as f64 / elapsed.as_secs_f64();
-
-        println!("Size: {} rows", size);
-        println!("  Total pairs: {}", total_pairs);
-        println!("  Time: {:?}", elapsed);
         println!(
-            "  Throughput: {:.2}M pairs/sec",
+            "  Total time: {:?} ({:.2}M pairs/sec)",
+            elapsed,
             pairs_per_sec / 1_000_000.0
         );
-        println!("  Edges found: {}", result.pairwise.len());
-        println!("  Clusters: {}", result.clustering.num_clusters());
-        println!("  Duplicates: {}", result.clustering.num_duplicates());
+        println!("  Total clusters: {}", cluster_count);
         println!();
     }
 }

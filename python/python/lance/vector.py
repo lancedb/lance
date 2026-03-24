@@ -765,7 +765,7 @@ def hamming_clustering_for_ivf_partition(
     index_name: str,
     partition_id: int,
     hamming_threshold: int,
-) -> dict:
+) -> pa.RecordBatchReader:
     """
     Perform hamming clustering on a partition of an IVF_FLAT index.
 
@@ -786,14 +786,11 @@ def hamming_clustering_for_ivf_partition(
 
     Returns
     -------
-    dict
-        A dictionary containing:
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
 
-        - 'num_clusters': int - Number of clusters found
-        - 'num_duplicates': int - Total number of duplicate row IDs
-        - 'clusters': list[dict] - List of clusters, each with:
-            - 'representative': int - The representative row ID
-            - 'duplicates': list[int] - List of duplicate row IDs
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     """
     return dataset._ds.hamming_clustering_for_ivf_partition(
         index_name, partition_id, hamming_threshold
@@ -827,7 +824,7 @@ def hamming_clustering_sampled(
     column: str,
     sample_size: Optional[int] = None,
     hamming_threshold: int = 10,
-) -> dict:
+) -> pa.RecordBatchReader:
     """
     Perform pairwise hamming distance clustering on a sample of the dataset.
 
@@ -848,20 +845,11 @@ def hamming_clustering_sampled(
 
     Returns
     -------
-    dict
-        A dictionary containing:
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
 
-        - 'num_clusters': int - Number of clusters found
-        - 'num_duplicates': int - Total number of duplicate row IDs
-        - 'clusters': list[dict] - List of clusters, each with:
-            - 'representative': int - The representative row ID
-            - 'duplicates': list[int] - List of duplicate row IDs
-        - 'num_rows': int - Number of rows processed
-        - 'total_pairs': int - Total number of pairs compared
-        - 'read_time_ms': float - Time spent reading data in milliseconds
-        - 'compute_time_ms': float - Time spent computing distances in ms
-        - 'cluster_time_ms': float - Time spent clustering in milliseconds
-        - 'total_time_ms': float - Total time in milliseconds
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     """
     return dataset._ds.hamming_clustering_sampled(
         column, sample_size, hamming_threshold
