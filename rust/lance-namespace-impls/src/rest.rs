@@ -43,7 +43,7 @@ use lance_namespace::models::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 
-use lance_core::{Error, Result, box_error};
+use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -543,13 +543,18 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
         let status = resp.status();
-        let content = resp
-            .text()
-            .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {}", e),
+            })
+        })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
@@ -579,13 +584,18 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
         let status = resp.status();
-        let content = resp
-            .text()
-            .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {}", e),
+            })
+        })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
@@ -615,16 +625,21 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
         let status = resp.status();
         if status.is_success() {
             Ok(())
         } else {
-            let content = resp
-                .text()
-                .await
-                .map_err(|e| Error::io_source(box_error(e)))?;
+            let content = resp.text().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response body: {}", e),
+                })
+            })?;
             Err(Self::parse_error_response(status, &content))
         }
     }
@@ -645,13 +660,18 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
         let status = resp.status();
-        let content = resp
-            .text()
-            .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {}", e),
+            })
+        })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
@@ -682,18 +702,25 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
         let status = resp.status();
         if status.is_success() {
-            resp.bytes()
-                .await
-                .map_err(|e| Error::io_source(box_error(e)))
+            resp.bytes().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response bytes: {}", e),
+                })
+            })
         } else {
-            let content = resp
-                .text()
-                .await
-                .map_err(|e| Error::io_source(box_error(e)))?;
+            let content = resp.text().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response body: {}", e),
+                })
+            })?;
             Err(Self::parse_error_response(status, &content))
         }
     }
@@ -1009,18 +1036,25 @@ impl LanceNamespace for RestNamespace {
             .rest_client
             .execute(req_builder, "query_table", &id)
             .await
-            .map_err(|e| Error::io_source(box_error(e)))?;
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
         let status = resp.status();
         if status.is_success() {
-            resp.bytes()
-                .await
-                .map_err(|e| Error::io_source(box_error(e)))
+            resp.bytes().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response bytes: {}", e),
+                })
+            })
         } else {
-            let content = resp
-                .text()
-                .await
-                .map_err(|e| Error::io_source(box_error(e)))?;
+            let content = resp.text().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response body: {}", e),
+                })
+            })?;
             Err(Self::parse_error_response(status, &content))
         }
     }

@@ -462,13 +462,14 @@ async fn create_aws_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use aws::{AwsCredentialVendor, AwsCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // AWS requires role_arn to be configured
     let role_arn = properties.get(aws_props::ROLE_ARN).ok_or_else(|| {
-        Error::invalid_input_source(
-            "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set".into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message: "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set"
+                .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, aws_props::DURATION_MILLIS);
@@ -516,14 +517,15 @@ fn create_azure_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use azure::{AzureCredentialVendor, AzureCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // Azure requires account_name to be configured
     let account_name = properties.get(azure_props::ACCOUNT_NAME).ok_or_else(|| {
-        Error::invalid_input_source(
-            "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
-                .into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message:
+                "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
+                    .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, azure_props::DURATION_MILLIS);

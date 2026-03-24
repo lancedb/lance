@@ -37,7 +37,7 @@ use lance_namespace::models::{
     TableExistsRequest, TableVersion,
 };
 
-use lance_core::{Error, Result, box_error};
+use lance_core::Result;
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
@@ -486,9 +486,10 @@ impl DirectoryNamespaceBuilder {
     pub async fn build(self) -> Result<DirectoryNamespace> {
         // Validate: table_version_storage_enabled requires manifest_enabled
         if self.table_version_storage_enabled && !self.manifest_enabled {
-            return Err(Error::invalid_input(
-                "table_version_storage_enabled requires manifest_enabled=true",
-            ));
+            return Err(NamespaceError::InvalidInput {
+                message: "table_version_storage_enabled requires manifest_enabled=true".to_string(),
+            }
+            .into());
         }
 
         let (object_store, base_path) =
@@ -688,10 +689,9 @@ impl DirectoryNamespace {
             .read_dir(self.base_path.clone())
             .await
             .map_err(|e| {
-                Error::io_source(box_error(std::io::Error::other(format!(
-                    "Failed to list directory: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to list directory: {}", e),
+                })
             })?;
 
         for entry in entries {
@@ -1070,9 +1070,11 @@ impl LanceNamespace for DirectoryNamespace {
             .into());
         }
 
-        Err(Error::not_supported_source(
-            "Child namespaces are only supported when manifest mode is enabled".into(),
-        ))
+        Err(NamespaceError::Unsupported {
+            message: "Child namespaces are only supported when manifest mode is enabled"
+                .to_string(),
+        }
+        .into())
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
@@ -1087,9 +1089,11 @@ impl LanceNamespace for DirectoryNamespace {
             .into());
         }
 
-        Err(Error::not_supported_source(
-            "Child namespaces are only supported when manifest mode is enabled".into(),
-        ))
+        Err(NamespaceError::Unsupported {
+            message: "Child namespaces are only supported when manifest mode is enabled"
+                .to_string(),
+        }
+        .into())
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
@@ -1110,19 +1114,22 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
         // Validate that namespace ID is provided
-        let namespace_id = request
-            .id
-            .as_ref()
-            .ok_or_else(|| Error::invalid_input_source("Namespace ID is required".into()))?;
+        let namespace_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
+        })?;
 
         // For child namespaces, always delegate to manifest (if enabled)
         if !namespace_id.is_empty() {
             if let Some(ref manifest_ns) = self.manifest_ns {
                 return manifest_ns.list_tables(request).await;
             }
-            return Err(Error::not_supported_source(
-                "Child namespaces are only supported when manifest mode is enabled".into(),
-            ));
+            return Err(NamespaceError::Unsupported {
+                message: "Child namespaces are only supported when manifest mode is enabled"
+                    .to_string(),
+            }
+            .into());
         }
 
         // When only manifest is enabled (no directory listing), delegate directly to manifest
@@ -1351,8 +1358,11 @@ impl LanceNamespace for DirectoryNamespace {
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.table_exists(request.clone()).await {
                 Ok(()) => return Ok(()),
-                Err(_) if self.dir_listing_enabled => {
-                    // Fall through to directory check
+                Err(_)
+                    if self.dir_listing_enabled
+                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
+                {
+                    // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
             }
@@ -1575,9 +1585,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Without manifest, register_table is not supported
-        Err(Error::not_supported_source(
-            "register_table is only supported when manifest mode is enabled".into(),
-        ))
+        Err(NamespaceError::Unsupported {
+            message: "register_table is only supported when manifest mode is enabled".to_string(),
+        }
+        .into())
     }
 
     async fn deregister_table(

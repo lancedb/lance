@@ -154,7 +154,9 @@ impl RestAdapter {
 
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             log::error!("RestAdapter::start() failed to bind to {}: {}", addr, e);
-            Error::io_source(Box::new(e))
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to bind to {}: {}", addr, e),
+            })
         })?;
 
         // Get the actual port (important when port 0 was specified)
