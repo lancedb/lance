@@ -992,7 +992,6 @@ impl InvertedPartition {
             return Ok(Vec::new());
         }
         if !is_phrase_query {
-            // remove duplicates
             token_ids.sort_unstable_by_key(|(token_id, _)| *token_id);
             token_ids.dedup_by_key(|(token_id, _)| *token_id);
         }
@@ -1006,10 +1005,13 @@ impl InvertedPartition {
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
 
-                Result::Ok(PostingIterator::new(
+                let query_weight = idf(posting.len(), num_docs);
+
+                Result::Ok(PostingIterator::with_query_weight(
                     token,
                     token_id,
                     position as u32,
+                    query_weight,
                     posting,
                     num_docs,
                 ))
@@ -4803,7 +4805,6 @@ mod tests {
             "prewarm should not leave cached posting lists sharing the same values buffer"
         );
     }
-
     #[test]
     fn test_block_max_scores_capacity_matches_block_count() {
         let mut docs = DocSet::default();

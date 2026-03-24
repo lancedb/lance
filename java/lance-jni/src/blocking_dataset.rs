@@ -341,6 +341,7 @@ impl BlockingDataset {
         storage_format: Option<LanceFileVersion>,
         max_retries: u32,
         skip_auto_cleanup: bool,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
@@ -357,6 +358,9 @@ impl BlockingDataset {
         }
         if skip_auto_cleanup {
             builder = builder.with_skip_auto_cleanup(true);
+        }
+        if let Some(handler) = commit_handler {
+            builder = builder.with_commit_handler(handler);
         }
         let new_dataset = RT.block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })

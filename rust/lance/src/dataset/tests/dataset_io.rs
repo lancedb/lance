@@ -1616,3 +1616,57 @@ async fn test_dataset_uri_roundtrips() {
         dataset.latest_version_id().await.unwrap()
     );
 }
+
+/// A commit handler whose resolve_latest_location always returns an IO error.
+/// Used to verify that non-NotFound errors from resolve_latest_location are
+/// propagated as-is rather than being wrapped as DatasetNotFound.
+#[derive(Debug)]
+struct ErroringCommitHandler;
+
+#[async_trait::async_trait]
+impl lance_table::io::commit::CommitHandler for ErroringCommitHandler {
+    async fn resolve_latest_location(
+        &self,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> Result<lance_table::io::commit::ManifestLocation> {
+        Err(Error::io("simulated I/O error".to_string()))
+    }
+
+    async fn commit(
+        &self,
+        _manifest: &mut lance_table::format::Manifest,
+        _indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: lance_table::io::commit::ManifestWriter,
+        _naming_scheme: lance_table::io::commit::ManifestNamingScheme,
+        _transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<
+        lance_table::io::commit::ManifestLocation,
+        lance_table::io::commit::CommitError,
+    > {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn test_open_dataset_non_not_found_error_is_not_masked() {
+    // When resolve_latest_location returns an IO error, it should propagate
+    // as an IO error, not be wrapped as DatasetNotFound.
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let location = url::Url::parse("memory://test").unwrap();
+
+    #[allow(deprecated)]
+    let result = DatasetBuilder::from_uri("memory://test")
+        .with_object_store(store, location, Arc::new(ErroringCommitHandler))
+        .load()
+        .await;
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, Error::IO { .. }),
+        "Expected IO error but got: {:?}",
+        err,
+    );
+}
