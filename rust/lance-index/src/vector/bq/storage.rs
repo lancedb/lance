@@ -23,7 +23,7 @@ use lance_linalg::simd::{self};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
@@ -52,10 +52,18 @@ pub struct RabitQuantizationMetadata {
     pub fast_rotation_signs: Option<Vec<u8>>,
     #[serde(default = "default_rotation_type_compat")]
     pub rotation_type: RQRotationType,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     pub code_dim: u32,
     pub num_bits: u8,
     pub packed: bool,
+}
+
+fn default_on_null<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(|value| value.unwrap_or_default())
 }
 
 fn default_rotation_type_compat() -> RQRotationType {
@@ -880,6 +888,25 @@ mod tests {
         let mut dist_table = vec![0.0; SEGMENT_NUM_CODES];
         build_dist_table_for_subvec::<Float32Type>(&sub_vec, &mut dist_table);
         assert_eq!(dist_table, expected);
+    }
+
+    #[test]
+    fn test_rabit_metadata_deserializes_null_code_dim() {
+        let metadata = serde_json::from_str::<RabitQuantizationMetadata>(
+            r#"{
+                "rotate_mat_position": null,
+                "fast_rotation_signs": [1, 2, 3, 4],
+                "rotation_type": "fast",
+                "code_dim": null,
+                "num_bits": 1,
+                "packed": false
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.code_dim, 0);
+        assert_eq!(metadata.rotation_type, RQRotationType::Fast);
+        assert_eq!(metadata.fast_rotation_signs, Some(vec![1, 2, 3, 4]));
     }
 
     #[test]
