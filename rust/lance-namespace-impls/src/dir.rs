@@ -39,6 +39,7 @@ use lance_namespace::models::{
 
 use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
+use lance_namespace::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
 
 use crate::credentials::{
@@ -1198,9 +1199,10 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         if status.is_deregistered {
@@ -1346,9 +1348,10 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         if status.is_deregistered {
@@ -1564,9 +1567,10 @@ impl LanceNamespace for DirectoryNamespace {
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
-            return Err(Error::namespace_source(
-                format!("Table does not exist: {}", table_name).into(),
-            ));
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         if status.is_deregistered {
@@ -2236,7 +2240,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Table does not exist")
+                .contains("Table not found")
         );
     }
 
@@ -2270,7 +2274,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Table does not exist")
+                .contains("Table not found")
         );
     }
 

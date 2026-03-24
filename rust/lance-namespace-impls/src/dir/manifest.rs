@@ -1838,9 +1838,10 @@ impl LanceNamespace for ManifestNamespace {
                     }
                 }
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", object_id).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound {
+                message: object_id.to_string(),
+            }
+            .into()),
         }
     }
 
@@ -1862,9 +1863,10 @@ impl LanceNamespace for ManifestNamespace {
         if exists {
             Ok(())
         } else {
-            Err(Error::namespace_source(
-                format!("Table '{}' not found", table_name).into(),
-            ))
+            Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into())
         }
     }
 
@@ -2010,9 +2012,10 @@ impl LanceNamespace for ManifestNamespace {
                     ..Default::default()
                 })
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", table_name).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into()),
         }
     }
 
@@ -2438,9 +2441,10 @@ impl LanceNamespace for ManifestNamespace {
                 Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
-                return Err(Error::namespace_source(
-                    format!("Table '{}' not found", object_id).into(),
-                ));
+                return Err(NamespaceError::TableNotFound {
+                    message: object_id.to_string(),
+                }
+                .into());
             }
         };
 
