@@ -1832,6 +1832,7 @@ async fn test_fts_phrase_query_with_removed_stop_words() {
         assert_eq!(result.num_rows(), 2, "query={query}, ids={ids:?}");
         assert!(ids.contains(&0), "query={query}, ids={ids:?}");
         assert!(ids.contains(&1), "query={query}, ids={ids:?}");
+        assert!(!ids.contains(&2), "query={query}, ids={ids:?}");
     }
 }
 

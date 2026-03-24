@@ -819,20 +819,13 @@ impl PhraseQueryExec {
 
     fn collect_phrase_tokens_with_stop_words(
         text: &str,
-        params: &InvertedIndexParams,
+        all_tokens_tokenizer: &mut Box<dyn LanceTokenizer>,
+        filtered_tokenizer: &mut Box<dyn LanceTokenizer>,
         is_query: bool,
-    ) -> DataFusionResult<Vec<String>> {
-        let mut all_tokens_tokenizer = params
-            .clone()
-            .remove_stop_words(false)
-            .build()
-            .map_err(DataFusionError::from)?;
-        let mut filtered_tokenizer = params.clone().build().map_err(DataFusionError::from)?;
-
-        let all_tokens =
-            Self::collect_tokens_with_positions(text, &mut all_tokens_tokenizer, is_query);
+    ) -> Vec<String> {
+        let all_tokens = Self::collect_tokens_with_positions(text, all_tokens_tokenizer, is_query);
         let filtered_tokens =
-            Self::collect_tokens_with_positions(text, &mut filtered_tokenizer, is_query);
+            Self::collect_tokens_with_positions(text, filtered_tokenizer, is_query);
 
         let mut filtered_idx = 0usize;
         let mut phrase_tokens = Vec::with_capacity(all_tokens.len());
@@ -844,7 +837,19 @@ impl PhraseQueryExec {
                 phrase_tokens.push(STOP_WORD_PLACEHOLDER.to_string());
             }
         }
-        Ok(phrase_tokens)
+        phrase_tokens
+    }
+
+    fn build_phrase_tokenizers(
+        params: &InvertedIndexParams,
+    ) -> DataFusionResult<(Box<dyn LanceTokenizer>, Box<dyn LanceTokenizer>)> {
+        let all_tokens_tokenizer = params
+            .clone()
+            .remove_stop_words(false)
+            .build()
+            .map_err(DataFusionError::from)?;
+        let filtered_tokenizer = params.clone().build().map_err(DataFusionError::from)?;
+        Ok((all_tokens_tokenizer, filtered_tokenizer))
     }
 
     fn matches_phrase_tokens(doc_tokens: &[String], query_tokens: &[String], slop: u32) -> bool {
@@ -869,6 +874,9 @@ impl PhraseQueryExec {
         next_query_idx: usize,
         slop: u32,
     ) -> bool {
+        // Phrase slop is typically small in practice. This recursive search keeps the
+        // implementation simple for the post-validation path, which only runs for
+        // stop-word phrase queries after indexed candidate generation.
         if next_query_idx == query_tokens.len() {
             return true;
         }
@@ -909,7 +917,14 @@ impl PhraseQueryExec {
         params: &InvertedIndexParams,
         query: &PhraseQuery,
     ) -> DataFusionResult<(Vec<u64>, Vec<f32>)> {
-        let query_tokens = Self::collect_phrase_tokens_with_stop_words(&query.terms, params, true)?;
+        let (mut all_tokens_tokenizer, mut filtered_tokenizer) =
+            Self::build_phrase_tokenizers(params)?;
+        let query_tokens = Self::collect_phrase_tokens_with_stop_words(
+            &query.terms,
+            &mut all_tokens_tokenizer,
+            &mut filtered_tokenizer,
+            true,
+        );
         if !query_tokens
             .iter()
             .any(|token| token == STOP_WORD_PLACEHOLDER)
@@ -937,8 +952,12 @@ impl PhraseQueryExec {
                     let Some(value) = value else {
                         continue;
                     };
-                    let doc_tokens =
-                        Self::collect_phrase_tokens_with_stop_words(value, params, false)?;
+                    let doc_tokens = Self::collect_phrase_tokens_with_stop_words(
+                        value,
+                        &mut all_tokens_tokenizer,
+                        &mut filtered_tokenizer,
+                        false,
+                    );
                     if Self::matches_phrase_tokens(&doc_tokens, &query_tokens, query.slop) {
                         filtered_row_ids.push(row_id);
                         filtered_scores.push(score);
@@ -953,8 +972,12 @@ impl PhraseQueryExec {
                     let Some(value) = value else {
                         continue;
                     };
-                    let doc_tokens =
-                        Self::collect_phrase_tokens_with_stop_words(value, params, false)?;
+                    let doc_tokens = Self::collect_phrase_tokens_with_stop_words(
+                        value,
+                        &mut all_tokens_tokenizer,
+                        &mut filtered_tokenizer,
+                        false,
+                    );
                     if Self::matches_phrase_tokens(&doc_tokens, &query_tokens, query.slop) {
                         filtered_row_ids.push(row_id);
                         filtered_scores.push(score);
