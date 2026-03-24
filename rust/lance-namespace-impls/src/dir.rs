@@ -2236,12 +2236,7 @@ mod tests {
 
         let result = namespace.describe_table(request).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Table not found")
-        );
+        assert!(result.unwrap_err().to_string().contains("Table not found"));
     }
 
     #[tokio::test]
@@ -2270,12 +2265,7 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.table_exists(request).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Table not found")
-        );
+        assert!(result.unwrap_err().to_string().contains("Table not found"));
     }
 
     #[tokio::test]
