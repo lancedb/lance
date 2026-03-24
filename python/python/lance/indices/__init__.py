@@ -27,13 +27,7 @@ class IndexFileVersion(str, Enum):
     V3 = "V3"
 
 
-class SupportedDistributedIndices(str, Enum):
+class SupportedScalarDistributedIndices(str, Enum):
     # Scalar index types
     BTREE = "BTREE"
     INVERTED = "INVERTED"
-    # Precise vector index types supported by distributed merge
-    IVF_FLAT = "IVF_FLAT"
-    IVF_PQ = "IVF_PQ"
-    IVF_SQ = "IVF_SQ"
-    # Deprecated generic placeholder (kept for backward compatibility)
-    VECTOR = "VECTOR"

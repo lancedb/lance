@@ -148,20 +148,17 @@ pub trait DatasetIndexExt {
         params: &'a dyn IndexParams,
     ) -> Self::IndexBuilder<'a>;
 
-    /// Create a builder for building index segments from partial index outputs.
+    /// Create a builder for building physical index segments from uncommitted
+    /// vector index outputs.
     ///
-    /// The staging UUID identifies a directory containing previously-built shard
-    /// outputs. The caller supplies the partial index metadata returned by
+    /// The caller supplies the uncommitted index metadata returned by
     /// `execute_uncommitted()` so the builder can plan segment grouping without
-    /// rediscovering shard coverage.
+    /// rediscovering fragment coverage.
     ///
     /// This is the canonical entry point for distributed vector segment build.
     /// After building the physical segments, publish them as a
     /// logical index with [`Self::commit_existing_index_segments`].
-    fn create_index_segment_builder<'a>(
-        &'a self,
-        staging_index_uuid: String,
-    ) -> Self::IndexSegmentBuilder<'a>;
+    fn create_index_segment_builder<'a>(&'a self) -> Self::IndexSegmentBuilder<'a>;
 
     /// Create indices on columns.
     ///

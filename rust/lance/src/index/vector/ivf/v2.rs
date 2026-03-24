@@ -618,7 +618,6 @@ mod tests {
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use futures::StreamExt;
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
@@ -629,7 +628,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::vector::ivf::{build_staging_segment, plan_staging_segments};
+    use crate::index::vector::ivf::{build_segment, plan_segments};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -671,7 +670,6 @@ mod tests {
     use rand::distr::uniform::SampleUniform;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
-    use uuid::Uuid;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
@@ -1476,25 +1474,21 @@ mod tests {
         ivf_params
     }
 
-    async fn build_distributed_partial_index_for_fragment_groups(
+    async fn build_segments_for_fragment_groups(
         dataset: &mut Dataset,
         fragment_groups: Vec<Vec<u32>>, // each group is a set of fragment ids
         params: &VectorIndexParams,
         index_name: &str,
-    ) -> (Uuid, Vec<IndexMetadata>) {
-        let shared_uuid = Uuid::new_v4();
-        let mut partial_indices = Vec::new();
+    ) -> Vec<IndexMetadata> {
+        let mut segments = Vec::new();
 
         for fragments in fragment_groups {
             let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, params);
-            builder = builder
-                .name(index_name.to_string())
-                .fragments(fragments)
-                .index_uuid(shared_uuid.to_string());
-            partial_indices.push(builder.execute_uncommitted().await.unwrap());
+            builder = builder.name(index_name.to_string()).fragments(fragments);
+            segments.push(builder.execute_uncommitted().await.unwrap());
         }
 
-        (shared_uuid, partial_indices)
+        segments
     }
 
     async fn build_ivfpq_for_fragment_groups(
@@ -1504,40 +1498,16 @@ mod tests {
         pq_params: &PQBuildParams,
         index_name: &str,
     ) {
-        let shared_uuid = Uuid::new_v4();
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params.clone(),
             pq_params.clone(),
         );
 
-        for fragments in fragment_groups {
-            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
-            builder = builder
-                .name(index_name.to_string())
-                .fragments(fragments)
-                .index_uuid(shared_uuid.to_string());
-            builder.execute_uncommitted().await.unwrap();
-        }
-
-        dataset
-            .merge_index_metadata(&shared_uuid.to_string(), IndexType::IvfPq, None)
-            .await
-            .unwrap();
-
-        dataset
-            .commit_existing_index_segments(
-                index_name,
-                "vector",
-                vec![IndexSegment::new(
-                    shared_uuid,
-                    dataset.fragment_bitmap.as_ref().clone(),
-                    Arc::new(crate::index::vector_index_details()),
-                    IndexType::IvfPq.version(),
-                )],
-            )
-            .await
-            .unwrap();
+        let segments =
+            build_segments_for_fragment_groups(dataset, fragment_groups, &params, index_name).await;
+        let built_segments = build_distributed_segments(dataset, &segments, None, index_name).await;
+        assert!(!built_segments.is_empty());
     }
 
     fn assert_ivf_layout_equal(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
@@ -1593,92 +1563,32 @@ mod tests {
         assert_eq!(sizes_a, sizes_b, "partition sizes mismatch");
     }
 
-    async fn load_staging_shard_uuids(dataset: &Dataset, shared_uuid: Uuid) -> Vec<Uuid> {
-        let mut shard_uuids = dataset
-            .object_store()
-            .read_dir(dataset.indices_dir().child(shared_uuid.to_string()))
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|name| name.starts_with("partial_"))
-            .map(|name| Uuid::parse_str(name.trim_start_matches("partial_")).unwrap())
-            .collect::<Vec<_>>();
-        shard_uuids.sort();
-        shard_uuids
-    }
-
-    /// Reconstruct the caller-side shard contract used by the tests.
-    ///
-    /// Production callers are expected to already know this mapping from
-    /// distributed scheduling state. The test helper rebuilds it by inspecting
-    /// which `partial_*` directories were created and pairing them with the
-    /// fragment groups we originally assigned.
-    async fn build_partial_indices(
-        dataset: &Dataset,
-        shared_uuid: Uuid,
-        fragment_groups: &[Vec<u32>],
-    ) -> Vec<IndexMetadata> {
-        let shard_uuids = load_staging_shard_uuids(dataset, shared_uuid).await;
-        assert_eq!(shard_uuids.len(), fragment_groups.len());
-        let mut partial_indices = Vec::with_capacity(shard_uuids.len());
-        for (shard_uuid, fragment_group) in shard_uuids.into_iter().zip(fragment_groups.iter()) {
-            let partial_dir = dataset
-                .indices_dir()
-                .child(shared_uuid.to_string())
-                .child(format!("partial_{}", shard_uuid));
-            let mut estimated_bytes = 0_u64;
-            let mut files = dataset.object_store().list(Some(partial_dir));
-            while let Some(item) = files.next().await {
-                estimated_bytes += item.unwrap().size;
-            }
-            partial_indices.push(IndexMetadata {
-                uuid: shard_uuid,
-                name: String::new(),
-                fields: Vec::new(),
-                dataset_version: dataset.version().version,
-                fragment_bitmap: Some(fragment_group.iter().copied().collect()),
-                index_details: None,
-                index_version: IndexType::Vector.version(),
-                created_at: None,
-                base_id: None,
-                files: Some(vec![lance_table::format::IndexFile {
-                    path: String::new(),
-                    size_bytes: estimated_bytes,
-                }]),
-            });
-        }
-        partial_indices
-    }
-
-    /// Execute the internal staged segment-build workflow used by the
-    /// regression tests: plan segment groups from caller-provided shard
+    /// Execute the internal segment workflow used by the
+    /// regression tests: plan segment groups from caller-provided segment
     /// metadata, build each segment, and publish them as one logical index.
     async fn build_distributed_segments(
         dataset: &mut Dataset,
-        shared_uuid: Uuid,
-        partial_indices: &[IndexMetadata],
+        segments: &[IndexMetadata],
         target_segment_bytes: Option<u64>,
         index_name: &str,
     ) -> Vec<IndexSegment> {
-        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let segment_plans =
-            plan_staging_segments(&index_dir, partial_indices, None, target_segment_bytes)
-                .await
-                .unwrap();
-        let mut segments = Vec::with_capacity(segment_plans.len());
+        let segment_plans = plan_segments(segments, None, target_segment_bytes)
+            .await
+            .unwrap();
+        let mut built_segments = Vec::with_capacity(segment_plans.len());
         for plan in &segment_plans {
-            segments.push(
-                build_staging_segment(dataset.object_store(), &dataset.indices_dir(), plan)
+            built_segments.push(
+                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
                     .await
                     .unwrap(),
             );
         }
         dataset
-            .commit_existing_index_segments(index_name, "vector", segments.clone())
+            .commit_existing_index_segments(index_name, "vector", built_segments.clone())
             .await
             .unwrap();
 
-        segments
+        built_segments
     }
 
     #[tokio::test]
@@ -1888,30 +1798,30 @@ mod tests {
             .map(|fragment| vec![fragment.id() as u32])
             .collect::<Vec<_>>();
         let expected_segment_count = fragment_groups.len();
-        let (shared_uuid, partial_indices) = build_distributed_partial_index_for_fragment_groups(
+        let segments = build_segments_for_fragment_groups(
             &mut ds_split,
             fragment_groups,
             &distributed_params,
             INDEX_NAME,
         )
         .await;
-        let segments = build_distributed_segments(
-            &mut ds_split,
-            shared_uuid,
-            &partial_indices,
-            None,
-            INDEX_NAME,
-        )
-        .await;
+        let segments = build_distributed_segments(&mut ds_split, &segments, None, INDEX_NAME).await;
         assert_eq!(segments.len(), expected_segment_count);
-        let staging_dir = ds_split.indices_dir().child(shared_uuid.to_string());
-        let staging_entries = ds_split.object_store().read_dir(staging_dir).await.unwrap();
-        assert!(
-            staging_entries
-                .iter()
-                .all(|entry| !entry.starts_with("partial_")),
-            "built segments should clean up consumed partial shards",
-        );
+        for segment in &segments {
+            let segment_index = ds_split
+                .indices_dir()
+                .child(segment.uuid().to_string())
+                .child(crate::index::INDEX_FILE_NAME);
+            assert!(
+                ds_split
+                    .object_store()
+                    .exists(&segment_index)
+                    .await
+                    .unwrap(),
+                "segment file should exist at {}",
+                segment_index
+            );
+        }
 
         let committed_segments = ds_split.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(committed_segments.len(), expected_segment_count);
@@ -2031,7 +1941,7 @@ mod tests {
             .into_iter()
             .map(|fragment| vec![fragment.id() as u32])
             .collect::<Vec<_>>();
-        let (shared_uuid, partial_indices) = build_distributed_partial_index_for_fragment_groups(
+        let segments = build_segments_for_fragment_groups(
             &mut ds_split,
             fragment_groups,
             &distributed_params,
@@ -2039,33 +1949,20 @@ mod tests {
         )
         .await;
 
-        let index_dir = ds_split.indices_dir().child(shared_uuid.to_string());
-        let shard_plan = plan_staging_segments(&index_dir, &partial_indices, None, None)
-            .await
-            .unwrap();
+        let shard_plan = plan_segments(&segments, None, None).await.unwrap();
         let shard_count = shard_plan.len();
         assert!(shard_count >= 4);
         let target_segment_bytes = shard_plan[0].estimated_bytes().saturating_mul(2);
 
-        let grouped_plan = plan_staging_segments(
-            &index_dir,
-            &partial_indices,
-            None,
-            Some(target_segment_bytes),
-        )
-        .await
-        .unwrap();
+        let grouped_plan = plan_segments(&segments, None, Some(target_segment_bytes))
+            .await
+            .unwrap();
         assert!(grouped_plan.len() < shard_count);
-        assert!(
-            grouped_plan
-                .iter()
-                .any(|plan| plan.partial_indices().len() > 1)
-        );
+        assert!(grouped_plan.iter().any(|plan| plan.segments().len() > 1));
 
         let grouped_segments = build_distributed_segments(
             &mut ds_split,
-            shared_uuid,
-            &partial_indices,
+            &segments,
             Some(target_segment_bytes),
             INDEX_NAME,
         )
@@ -2126,29 +2023,24 @@ mod tests {
         let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
 
         let fragment = dataset.get_fragments()[0].id() as u32;
-        let shared_uuid = Uuid::new_v4();
         let params = VectorIndexParams::with_ivf_flat_params(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
         );
+        let mut segments = Vec::new();
 
         for _ in 0..2 {
-            dataset
+            let segment = dataset
                 .create_index_builder(&["vector"], IndexType::Vector, &params)
                 .name("vector_idx".to_string())
                 .fragments(vec![fragment])
-                .index_uuid(shared_uuid.to_string())
                 .execute_uncommitted()
                 .await
                 .unwrap();
+            segments.push(segment);
         }
 
-        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let partial_indices =
-            build_partial_indices(&dataset, shared_uuid, &[vec![fragment], vec![fragment]]).await;
-        let err = plan_staging_segments(&index_dir, &partial_indices, None, None)
-            .await
-            .unwrap_err();
+        let err = plan_segments(&segments, None, None).await.unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
@@ -2162,40 +2054,31 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert!(fragments.len() >= 2);
-        let shared_uuid = Uuid::new_v4();
         let params = VectorIndexParams::ivf_hnsw(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
             HnswBuildParams::default(),
         );
+        let mut segments = Vec::new();
 
         for fragment in fragments.iter().take(2) {
-            dataset
+            let segment = dataset
                 .create_index_builder(&["vector"], IndexType::Vector, &params)
                 .name("vector_idx".to_string())
                 .fragments(vec![fragment.id() as u32])
-                .index_uuid(shared_uuid.to_string())
                 .execute_uncommitted()
                 .await
                 .unwrap();
+            segments.push(segment);
         }
 
-        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        let fragment_groups = fragments
-            .iter()
-            .take(2)
-            .map(|fragment| vec![fragment.id() as u32])
-            .collect::<Vec<_>>();
-        let partial_indices = build_partial_indices(&dataset, shared_uuid, &fragment_groups).await;
-        let plans = plan_staging_segments(&index_dir, &partial_indices, None, Some(1))
-            .await
-            .unwrap();
+        let plans = plan_segments(&segments, None, Some(1)).await.unwrap();
         assert_eq!(plans.len(), fragments.iter().take(2).count());
 
         let mut segments = Vec::with_capacity(plans.len());
         for plan in &plans {
             segments.push(
-                build_staging_segment(dataset.object_store(), &dataset.indices_dir(), plan)
+                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
                     .await
                     .unwrap(),
             );

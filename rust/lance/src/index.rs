@@ -628,11 +628,8 @@ impl DatasetIndexExt for Dataset {
         CreateIndexBuilder::new(self, columns, index_type, params)
     }
 
-    fn create_index_segment_builder<'a>(
-        &'a self,
-        staging_index_uuid: String,
-    ) -> create::IndexSegmentBuilder<'a> {
-        create::IndexSegmentBuilder::new(self, staging_index_uuid)
+    fn create_index_segment_builder<'a>(&'a self) -> create::IndexSegmentBuilder<'a> {
+        create::IndexSegmentBuilder::new(self)
     }
 
     #[instrument(skip_all)]

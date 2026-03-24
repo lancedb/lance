@@ -2684,7 +2684,7 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
-    /// Merge a staged distributed index into a single root artifact.
+    /// Merge a distributed scalar index into a single root artifact.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
@@ -2713,61 +2713,13 @@ impl Dataset {
                 )
                 .await
             }
-            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
-                let mut partial_indices = self
-                    .object_store()
-                    .read_dir(index_dir.clone())
-                    .await?
-                    .into_iter()
-                    .filter(|name| name.starts_with("partial_"))
-                    .map(|name| {
-                        name.strip_prefix("partial_")
-                            .ok_or_else(|| {
-                                Error::index(format!(
-                                    "Distributed vector shard '{}' does not start with 'partial_'",
-                                    name
-                                ))
-                            })
-                            .and_then(|shard_uuid| {
-                                uuid::Uuid::parse_str(shard_uuid).map_err(|err| {
-                                    Error::index(format!(
-                                        "Distributed vector shard '{}' does not end with a valid UUID: {}",
-                                        name, err
-                                    ))
-                                })
-                            })
-                            .map(|shard_uuid| IndexMetadata {
-                                uuid: shard_uuid,
-                                name: String::new(),
-                                fields: Vec::new(),
-                                dataset_version: self.manifest.version,
-                                fragment_bitmap: Some(RoaringBitmap::new()),
-                                index_details: None,
-                                index_version: index_type.version(),
-                                created_at: None,
-                                base_id: None,
-                                files: Some(Vec::new()),
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                partial_indices.sort_by_key(|index| index.uuid);
-                let segment_plans = crate::index::vector::ivf::plan_staging_segments(
-                    &index_dir,
-                    &partial_indices,
-                    Some(index_type),
-                    None,
-                )
-                .await?;
-                let merged_plan =
-                    crate::index::vector::ivf::collapse_segment_plans(&segment_plans)?;
-                crate::index::vector::ivf::build_staging_segment(
-                    self.object_store(),
-                    &self.indices_dir(),
-                    &merged_plan,
-                )
-                .await
-                .map(|_| ())
+                Err(Error::invalid_input(
+                    "Vector distributed indexing no longer supports merge_index_metadata; \
+                     build segments, use create_index_segment_builder(), \
+                     and commit with commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             _ => Err(Error::invalid_input_source(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

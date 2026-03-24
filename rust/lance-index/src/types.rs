@@ -76,13 +76,12 @@ impl IndexSegment {
     }
 }
 
-/// A plan for building one physical segment from one or more vector index
-/// partial indices.
+/// A plan for building one physical segment from one or more existing
+/// vector index segments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSegmentPlan {
-    staging_index_uuid: Uuid,
     segment: IndexSegment,
-    partial_indices: Vec<IndexMetadata>,
+    segments: Vec<IndexMetadata>,
     estimated_bytes: u64,
     requested_index_type: Option<IndexType>,
 }
@@ -90,24 +89,17 @@ pub struct IndexSegmentPlan {
 impl IndexSegmentPlan {
     /// Create a plan for one built segment.
     pub fn new(
-        staging_index_uuid: Uuid,
         segment: IndexSegment,
-        partial_indices: Vec<IndexMetadata>,
+        segments: Vec<IndexMetadata>,
         estimated_bytes: u64,
         requested_index_type: Option<IndexType>,
     ) -> Self {
         Self {
-            staging_index_uuid,
             segment,
-            partial_indices,
+            segments,
             estimated_bytes,
             requested_index_type,
         }
-    }
-
-    /// Return the staging index UUID that owns the partial shard outputs.
-    pub fn staging_index_uuid(&self) -> Uuid {
-        self.staging_index_uuid
     }
 
     /// Return the segment metadata that should be committed after this plan is built.
@@ -115,9 +107,9 @@ impl IndexSegmentPlan {
         &self.segment
     }
 
-    /// Return the uncommitted partial index metadata that should be combined into the segment.
-    pub fn partial_indices(&self) -> &[IndexMetadata] {
-        &self.partial_indices
+    /// Return the input segment metadata that should be combined into the segment.
+    pub fn segments(&self) -> &[IndexMetadata] {
+        &self.segments
     }
 
     /// Return the estimated number of bytes covered by this plan.
