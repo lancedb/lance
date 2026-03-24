@@ -62,6 +62,7 @@ from .fragment import (
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
+from .indices import IndexSegmentDescription as IndexSegmentDescription
 from .indices import IndexSegmentPlan as IndexSegmentPlan
 from .lance import PySearchFilter
 from .optimize import (
@@ -234,6 +235,9 @@ class _Dataset:
     def serialized_manifest(self) -> bytes: ...
     def load_indices(self) -> List[Index]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
+    def describe_index_segments(
+        self, index_name: Optional[str] = None
+    ) -> List[IndexSegmentDescription]: ...
     def scanner(
         self,
         columns: Optional[List[str]] = None,

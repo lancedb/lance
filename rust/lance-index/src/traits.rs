@@ -77,6 +77,13 @@ pub trait IndexDescription: Send + Sync {
     /// IndexMetadata for each segment of the index.
     fn metadata(&self) -> &[IndexMetadata];
 
+    /// Returns the physical index segments that make up this logical index.
+    ///
+    /// This is an alias for [`Self::metadata`] with a less ambiguous name.
+    fn segments(&self) -> &[IndexMetadata] {
+        self.metadata()
+    }
+
     /// Returns the index type URL
     ///
     /// This is extracted from the type url of the index details
@@ -210,6 +217,8 @@ pub trait DatasetIndexExt {
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
     /// The cache is invalidated when the dataset version (Manifest) is changed.
+    ///
+    /// Each returned entry represents a physical index segment from the manifest.
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>>;
 
     /// Loads all the indies of a given UUID.
@@ -241,6 +250,21 @@ pub trait DatasetIndexExt {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// Describe physical index segments.
+    ///
+    /// When `name` is provided, only segments belonging to the named logical
+    /// index are returned. Otherwise, all index segments in the current dataset
+    /// version are returned.
+    async fn describe_index_segments(&self, name: Option<&str>) -> Result<Vec<IndexMetadata>> {
+        match name {
+            Some(name) => self.load_indices_by_name(name).await,
+            None => self
+                .load_indices()
+                .await
+                .map(|indices| indices.as_ref().clone()),
+        }
     }
 
     /// Loads a specific index with the given index name.

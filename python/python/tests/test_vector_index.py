@@ -1644,6 +1644,28 @@ def test_optimize_indices(indexed_dataset):
     assert stats["num_indices"] == 2
 
 
+def test_logical_and_physical_index_views(indexed_dataset):
+    data = create_table()
+    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
+
+    logical_indices = indexed_dataset.describe_indices()
+    assert len(logical_indices) == 1
+    assert logical_indices[0].name == "vector_idx"
+    assert len(logical_indices[0].segments) == 2
+
+    physical_segments = indexed_dataset.describe_index_segments("vector_idx")
+    assert len(physical_segments) == 2
+    assert all(segment.fragment_ids for segment in physical_segments)
+
+    all_segments = indexed_dataset.describe_index_segments()
+    assert len(all_segments) == 2
+
+    stats = indexed_dataset.stats.index_stats("vector_idx")
+    assert stats["num_segments"] == stats["num_indices"] == 2
+    assert stats["segments"] == stats["indices"]
+
+
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()

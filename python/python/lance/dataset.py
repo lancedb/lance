@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .io import StorageOptionsProvider
-    from .lance.indices import IndexDescription
+    from .lance.indices import IndexDescription, IndexSegmentDescription
     from .progress import FragmentWriteProgress
     from .types import ReaderLike
 
@@ -641,12 +641,14 @@ class LanceDataset(pa.dataset.Dataset):
 
     def list_indices(self) -> List[Index]:
         """
-        Returns index information for all indices in the dataset.
+        Returns physical index segment information for all indices in the dataset.
 
         This method is deprecated as it requires loading the statistics for each index
-        which can be a very expensive operation.  Instead use describe_indices() to
-        list index information and index_statistics() to get the statistics for
-        individual indexes of interest.
+        which can be a very expensive operation.  It also exposes physical index
+        segments directly.  Instead use describe_indices() for logical index
+        descriptions, describe_index_segments() for explicit segment inspection,
+        and index_statistics() to get the statistics for individual indexes of
+        interest.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -657,8 +659,21 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.load_indices()
 
     def describe_indices(self) -> List[IndexDescription]:
-        """Returns index information for all indices in the dataset."""
+        """Returns logical index information aggregated across all segments."""
         return self._ds.describe_indices()
+
+    def describe_index_segments(
+        self, index_name: Optional[str] = None
+    ) -> List[IndexSegmentDescription]:
+        """
+        Returns physical index segment information.
+
+        Parameters
+        ----------
+        index_name: Optional[str]
+            If provided, only return segments belonging to the named logical index.
+        """
+        return self._ds.describe_index_segments(index_name)
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(

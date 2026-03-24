@@ -87,7 +87,10 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentPlan};
+use crate::indices::{
+    PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentDescription,
+    PyIndexSegmentPlan,
+};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
@@ -2795,6 +2798,22 @@ impl Dataset {
         Ok(indices
             .into_iter()
             .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
+            .collect())
+    }
+
+    #[pyo3(signature=(index_name=None))]
+    fn describe_index_segments(
+        &self,
+        py: Python<'_>,
+        index_name: Option<&str>,
+    ) -> PyResult<Vec<PyIndexSegmentDescription>> {
+        let new_self = self.ds.as_ref().clone();
+        let indices = rt()
+            .block_on(Some(py), new_self.describe_index_segments(index_name))?
+            .infer_error()?;
+        Ok(indices
+            .iter()
+            .map(PyIndexSegmentDescription::from_metadata)
             .collect())
     }
 

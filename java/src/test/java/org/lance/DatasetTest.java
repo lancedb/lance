@@ -1914,7 +1914,13 @@ public class DatasetTest {
         assertTrue(desc.getRowsIndexed() > 0, "rowsIndexed should be positive");
         assertNotNull(desc.getMetadata(), "Metadata list should not be null");
         assertFalse(desc.getMetadata().isEmpty(), "Metadata list should not be empty");
+        assertEquals(
+            desc.getMetadata(), desc.getSegments(), "segments alias should match metadata");
         assertNotNull(desc.getDetailsJson(), "Details JSON should not be null");
+
+        List<Index> physicalSegments = dataset.getIndexSegments("index1");
+        assertEquals(1, physicalSegments.size(), "Expected exactly one physical segment");
+        assertEquals("index1", physicalSegments.get(0).name());
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
@@ -1922,6 +1928,10 @@ public class DatasetTest {
           assertTrue(indexDesc.getRowsIndexed() > 0, "rowsIndexed should be positive");
           assertNotNull(indexDesc.getMetadata(), "Metadata list should not be null");
           assertFalse(indexDesc.getMetadata().isEmpty(), "Metadata list should not be empty");
+          assertEquals(
+              indexDesc.getMetadata(),
+              indexDesc.getSegments(),
+              "segments alias should match metadata");
           assertNotNull(indexDesc.getDetailsJson(), "Details JSON should not be null");
         }
       }

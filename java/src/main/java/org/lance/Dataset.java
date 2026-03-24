@@ -1207,7 +1207,11 @@ public class Dataset implements Closeable {
   /**
    * Get all indexes with full metadata.
    *
-   * @return list of Index objects with complete metadata including index type and fragment coverage
+   * <p>Each returned {@link Index} is a physical index segment from the manifest. Use {@link
+   * #describeIndices()} for the logical-index view.
+   *
+   * @return list of Index objects with complete segment metadata, including index type and fragment
+   *     coverage
    */
   public List<Index> getIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1217,6 +1221,20 @@ public class Dataset implements Closeable {
   }
 
   private native List<Index> nativeGetIndexes();
+
+  /**
+   * Get physical index segments for a specific logical index name.
+   *
+   * @param indexName logical index name
+   * @return list of physical index segments belonging to the logical index
+   */
+  public List<Index> getIndexSegments(String indexName) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    return getIndexes().stream()
+        .filter(index -> indexName.equals(index.name()))
+        .collect(Collectors.toList());
+  }
 
   /**
    * Get statistics for a specific index in JSON form.
