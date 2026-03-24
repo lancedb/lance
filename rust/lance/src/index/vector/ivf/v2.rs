@@ -1685,6 +1685,7 @@ mod tests {
                     .unwrap()
                     .nearest("vector", q.as_ref(), K)
                     .unwrap()
+                    .minimum_nprobes(TWO_FRAG_NUM_PARTITIONS)
                     .try_into_batch()
                     .await
                     .unwrap();
