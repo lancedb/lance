@@ -332,7 +332,7 @@ pub struct PyIndexSegmentBuilder {
 }
 
 impl PyIndexSegmentBuilder {
-    fn into_builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
+    fn builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
         let mut builder = self
             .dataset
             .create_index_segment_builder()
@@ -368,7 +368,7 @@ impl PyIndexSegmentBuilder {
 
     fn plan(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegmentPlan>>> {
         let plans = rt()
-            .block_on(Some(py), self.into_builder().plan())?
+            .block_on(Some(py), self.builder().plan())?
             .infer_error()?;
         plans
             .into_iter()
@@ -379,14 +379,14 @@ impl PyIndexSegmentBuilder {
     fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
         let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
         let segment = rt()
-            .block_on(Some(py), self.into_builder().build(&plan.inner))?
+            .block_on(Some(py), self.builder().build(&plan.inner))?
             .infer_error()?;
         Py::new(py, PyIndexSegment::from_inner(segment))
     }
 
     fn build_all(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegment>>> {
         let segments = rt()
-            .block_on(Some(py), self.into_builder().build_all())?
+            .block_on(Some(py), self.builder().build_all())?
             .infer_error()?;
         segments
             .into_iter()
