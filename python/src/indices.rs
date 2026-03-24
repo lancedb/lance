@@ -118,12 +118,7 @@ impl PyIndexSegmentPlan {
 
     #[getter]
     fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner
-            .segments()
-            .iter()
-            .cloned()
-            .map(PyLance)
-            .collect()
+        self.inner.segments().iter().cloned().map(PyLance).collect()
     }
 
     #[getter]
