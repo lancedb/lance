@@ -3789,6 +3789,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deregister_nonexistent_table_v1() {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = DeregisterTableRequest::new();
+        request.id = Some(vec!["nonexistent".to_string()]);
+        let err = namespace.deregister_table(request).await.unwrap_err();
+        assert_table_not_found(&err);
+        assert!(err.to_string().contains("Table not found"));
+    }
+
+    #[tokio::test]
     async fn test_deregister_table_v1_already_deregistered() {
         use lance_namespace::models::DeregisterTableRequest;
 

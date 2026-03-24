@@ -2834,6 +2834,29 @@ mod tests {
     #[case::with_optimization(true)]
     #[case::without_optimization(false)]
     #[tokio::test]
+    async fn test_deregister_nonexistent_table(#[case] inline_optimization: bool) {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = DeregisterTableRequest::new();
+        request.id = Some(vec!["nonexistent".to_string()]);
+        let err = dir_namespace.deregister_table(request).await.unwrap_err();
+        assert_table_not_found(&err);
+        assert!(err.to_string().contains("Table not found"));
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
     async fn test_create_duplicate_table_fails(#[case] inline_optimization: bool) {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
