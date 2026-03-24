@@ -278,16 +278,14 @@ mod tests {
     #[test]
     fn test_index_segment_plan_accessors() {
         let uuid = Uuid::new_v4();
-        let segment = IndexSegment::new(
-            uuid,
-            [1_u32, 3],
-            Arc::new(prost_types::Any::default()),
-            7,
-        );
+        let segment = IndexSegment::new(uuid, [1_u32, 3], Arc::new(prost_types::Any::default()), 7);
         let plan = IndexSegmentPlan::new(segment.clone(), vec![], 128, Some(IndexType::BTree));
 
         assert_eq!(segment.uuid(), uuid);
-        assert_eq!(segment.fragment_bitmap().iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(
+            segment.fragment_bitmap().iter().collect::<Vec<_>>(),
+            vec![1, 3]
+        );
         assert_eq!(segment.index_version(), 7);
         assert_eq!(plan.segment().uuid(), uuid);
         assert_eq!(plan.estimated_bytes(), 128);
