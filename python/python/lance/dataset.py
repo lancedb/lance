@@ -2591,14 +2591,14 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
-            method returns an IndexMetadata object but does not commit the index
-            to the dataset. The index can be committed later using the commit API.
+            method returns metadata for one segment but does not commit
+            the index to the dataset. The segment can be planned, merged, and
+            committed later using the segment builder and commit APIs.
             This parameter is passed via kwargs internally.
         index_uuid : str, optional
-            A UUID to use for fragment-level distributed indexing
-            multiple fragment-level indices need to share UUID for later merging.
-            If not provided, a new UUID will be generated. This parameter is passed via
-            kwargs internally.
+            A UUID to use for the segment written by this call.
+            If not provided, a new UUID will be generated. This parameter is
+            passed via kwargs internally.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3258,12 +3258,12 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
-            method creates temporary index metadata but does not commit the index
-            to the dataset. The index can be committed later using
-            merge_index_metadata(index_uuid, "VECTOR", column=..., index_name=...).
+            method creates one segment but does not commit the index
+            to the dataset. The returned metadata can be passed to
+            ``create_index_segment_builder().with_segments(...)``
+            and then committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
-            A UUID to use for fragment-level distributed indexing. Multiple
-            fragment-level indices need to share UUID for later merging.
+            A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
         target_partition_size: int, optional
             The target partition size. If set, the number of partitions will be computed
@@ -3426,33 +3426,32 @@ class LanceDataset(pa.dataset.Dataset):
         **kwargs,
     ) -> Index:
         """
-        Create one uncommitted partial index and return its metadata.
+        Create one segment without publishing it and return its metadata.
 
-        This is the public shard-build API for distributed index construction.
-        Unlike :meth:`create_index`, this method does not publish the index into
-        the dataset manifest. Instead, it writes one partial index under the
-        staging UUID and returns the resulting :class:`Index` metadata.
+        This is the public distributed-build API for vector index
+        construction. Unlike :meth:`create_index`, this method does not publish
+        the index into the dataset manifest. Instead, it writes one segment
+        under ``_indices/<segment_uuid>/`` and returns the resulting
+        :class:`Index` metadata.
 
         Callers should:
 
-        1. run :meth:`create_index_uncommitted` on each worker with the worker's
-           assigned ``fragment_ids`` and a shared ``index_uuid``
+        1. run :meth:`create_index_uncommitted` on each worker with that worker's
+           assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. pass them to :meth:`IndexSegmentBuilder.with_partial_indices`
-        4. build one or more segments and commit them with
+        3. pass them to :meth:`IndexSegmentBuilder.with_segments`
+        4. build one or more physical segments and commit them with
            :meth:`commit_existing_index_segments`
 
-        Parameters are the same as :meth:`create_index`, with two additional
-        requirements for distributed shard build:
+        Parameters are the same as :meth:`create_index`, with one additional
+        requirement:
 
         - ``fragment_ids`` must be provided
-        - workers that belong to the same distributed build must share the same
-          ``index_uuid``
 
         Returns
         -------
         Index
-            Metadata for the partial index that was written by this call.
+            Metadata for the segment that was written by this call.
         """
         return self._create_index_impl(
             column,
@@ -3514,16 +3513,17 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readhead: Optional[int] = None,
     ):
         """
-        Merge distributed index metadata for supported scalar
-        and vector index types.
+        Merge distributed scalar index metadata.
 
-        This method supports all index types defined in
-        :class:`lance.indices.SupportedDistributedIndices`,
-        including scalar indices and precise vector index types.
+        Vector distributed indexing no longer uses this API. For vector indices,
+        build segments with :meth:`create_index_uncommitted`, plan or
+        merge them with :meth:`create_index_segment_builder`, and publish them
+        with :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
-        This API merges temporary index files (e.g., per-fragment partials).
+        This API merges temporary scalar index files (for example per-fragment
+        BTree or inverted index outputs).
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
@@ -3531,11 +3531,11 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         index_uuid: str
-            The shared UUID used when building fragment-level indices.
+            The shared UUID used when building fragment-level scalar indices.
         index_type: str
             Index type name. Must be one of the enum values in
             :class:`lance.indices.SupportedDistributedIndices`
-            (for example ``"IVF_PQ"``).
+            supported by scalar distributed merge.
         batch_readhead: int, optional
             Prefetch concurrency used by BTREE merge reader. Default: 1.
         """
@@ -3552,16 +3552,15 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
         return None
 
-    def create_index_segment_builder(self, staging_index_uuid: str):
+    def create_index_segment_builder(self):
         """
-        Create a builder for turning partial index outputs into committed segments.
+        Create a builder for turning existing segments into physical segments.
 
-        The caller should pass the shared index UUID used during
-        :meth:`create_index` with ``fragment_ids=...`` and ``index_uuid=...``.
-        Then provide the returned partial index metadata through
-        :meth:`IndexSegmentBuilder.with_partial_indices`.
+        Provide the segment metadata returned by
+        :meth:`create_index_uncommitted` through
+        :meth:`IndexSegmentBuilder.with_segments`.
         """
-        return self._ds.create_index_segment_builder(staging_index_uuid)
+        return self._ds.create_index_segment_builder()
 
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[IndexSegment]

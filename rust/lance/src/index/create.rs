@@ -8,7 +8,7 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt,
+        DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
         scalar::build_scalar_index,
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
@@ -337,7 +337,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
-                        let shard_uuid = Box::pin(build_distributed_vector_index(
+                        let segment_uuid = Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -348,7 +348,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             self.progress.clone(),
                         ))
                         .await?;
-                        output_index_uuid = shard_uuid;
+                        output_index_uuid = segment_uuid;
                     } else {
                         // Standard full dataset indexing
                         Box::pin(build_vector_index(
@@ -374,14 +374,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     .await?;
                 }
                 // Capture file sizes after vector index creation
-                let index_dir = if self.fragments.is_some() {
-                    self.dataset
-                        .indices_dir()
-                        .child(index_id.to_string())
-                        .child(format!("partial_{}", output_index_uuid))
-                } else {
-                    self.dataset.indices_dir().child(index_id.to_string())
-                };
+                let index_dir = self
+                    .dataset
+                    .indices_dir()
+                    .child(output_index_uuid.to_string());
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
@@ -478,15 +474,42 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = TransactionBuilder::new(
-            new_idx.dataset_version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices,
-            },
-        )
-        .transaction_properties(self.transaction_properties.clone())
-        .build();
+        let transaction = if uses_segment_commit_path(self.index_type) {
+            let field_id = *new_idx.fields.first().ok_or_else(|| {
+                Error::internal(format!(
+                    "Index '{}' is missing field ids after build",
+                    new_idx.name
+                ))
+            })?;
+            let segments = self
+                .dataset
+                .create_index_segment_builder()
+                .with_segments(vec![new_idx.clone()])
+                .build_all()
+                .await?;
+            let new_indices =
+                build_index_metadata_from_segments(self.dataset, &new_idx.name, field_id, segments)
+                    .await?;
+            TransactionBuilder::new(
+                new_idx.dataset_version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            )
+            .transaction_properties(self.transaction_properties.clone())
+            .build()
+        } else {
+            TransactionBuilder::new(
+                new_idx.dataset_version,
+                Operation::CreateIndex {
+                    new_indices: vec![new_idx],
+                    removed_indices,
+                },
+            )
+            .transaction_properties(self.transaction_properties.clone())
+            .build()
+        };
 
         self.dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
@@ -508,6 +531,20 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
+fn uses_segment_commit_path(index_type: IndexType) -> bool {
+    matches!(
+        index_type,
+        IndexType::Vector
+            | IndexType::IvfPq
+            | IndexType::IvfSq
+            | IndexType::IvfFlat
+            | IndexType::IvfRq
+            | IndexType::IvfHnswFlat
+            | IndexType::IvfHnswPq
+            | IndexType::IvfHnswSq
+    )
+}
+
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
     type Output = Result<IndexMetadata>;
     type IntoFuture = BoxFuture<'a, Result<IndexMetadata>>;
@@ -517,10 +554,9 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
     }
 }
 
-/// Build physical index segments from previously-written partial index outputs.
+/// Build physical index segments from previously-written vector segment outputs.
 ///
-/// Use [`DatasetIndexExt::create_index_segment_builder`] to open a staging root
-/// and then either:
+/// Use [`DatasetIndexExt::create_index_segment_builder`] and then either:
 ///
 /// - call [`Self::plan`] and orchestrate individual segment builds externally, or
 /// - call [`Self::build_all`] to build all segments on the current node.
@@ -531,63 +567,55 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 #[derive(Clone)]
 pub struct IndexSegmentBuilder<'a> {
     dataset: &'a Dataset,
-    staging_index_uuid: String,
-    partial_indices: Vec<IndexMetadata>,
+    segments: Vec<IndexMetadata>,
     target_segment_bytes: Option<u64>,
 }
 
 impl<'a> IndexSegmentBuilder<'a> {
-    pub(crate) fn new(dataset: &'a Dataset, staging_index_uuid: String) -> Self {
+    pub(crate) fn new(dataset: &'a Dataset) -> Self {
         Self {
             dataset,
-            staging_index_uuid,
-            partial_indices: Vec::new(),
+            segments: Vec::new(),
             target_segment_bytes: None,
         }
     }
 
-    /// Provide the partial index metadata returned by `execute_uncommitted()`
-    /// for this staging root.
-    pub fn with_partial_indices(mut self, partial_indices: Vec<IndexMetadata>) -> Self {
-        self.partial_indices = partial_indices;
+    /// Provide the segment metadata returned by `execute_uncommitted()`.
+    ///
+    /// These segments must already exist in storage and must not have been
+    /// published into a logical index yet.
+    pub fn with_segments(mut self, segments: Vec<IndexMetadata>) -> Self {
+        self.segments = segments;
         self
     }
 
-    /// Set the target size, in bytes, for merged built segments.
+    /// Set the target size, in bytes, for merged physical segments.
     ///
-    /// When set, shard outputs will be grouped into larger built segments up to
-    /// approximately this size. When unset, each shard output becomes one built
-    /// segment.
+    /// When set, input segments will be grouped into larger physical segments
+    /// up to approximately this size. When unset, each input segment becomes
+    /// one physical segment.
     pub fn with_target_segment_bytes(mut self, bytes: u64) -> Self {
         self.target_segment_bytes = Some(bytes);
         self
     }
 
-    /// Plan how partial indices should be grouped into built segments.
+    /// Plan how input segments should be grouped into physical segments.
     pub async fn plan(&self) -> Result<Vec<IndexSegmentPlan>> {
-        if self.partial_indices.is_empty() {
+        if self.segments.is_empty() {
             return Err(Error::invalid_input(
-                "IndexSegmentBuilder requires at least one partial index; \
-                 call with_partial_indices(...) with execute_uncommitted() outputs"
+                "IndexSegmentBuilder requires at least one segment; \
+                 call with_segments(...) with execute_uncommitted() outputs"
                     .to_string(),
             ));
         }
 
-        crate::index::vector::ivf::plan_staging_segments(
-            &self
-                .dataset
-                .indices_dir()
-                .child(self.staging_index_uuid.as_str()),
-            &self.partial_indices,
-            None,
-            self.target_segment_bytes,
-        )
-        .await
+        crate::index::vector::ivf::plan_segments(&self.segments, None, self.target_segment_bytes)
+            .await
     }
 
     /// Build one segment from a previously-generated plan.
     pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        crate::index::vector::ivf::build_staging_segment(
+        crate::index::vector::ivf::build_segment(
             self.dataset.object_store(),
             &self.dataset.indices_dir(),
             plan,
@@ -595,7 +623,7 @@ impl<'a> IndexSegmentBuilder<'a> {
         .await
     }
 
-    /// Plan and build all segments from this staging root.
+    /// Plan and build all segments from the provided inputs.
     pub async fn build_all(&self) -> Result<Vec<IndexSegment>> {
         let plans = self.plan().await?;
         try_join_all(plans.iter().map(|plan| self.build(plan))).await
@@ -1071,7 +1099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_index_metadata_vector_preserves_shared_uuid_commit_workflow() {
+    async fn test_vector_execute_uncommitted_segments_commit_without_staging() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -1099,62 +1127,54 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert!(fragments.len() >= 2);
-        let shared_uuid = Uuid::new_v4();
         let params = VectorIndexParams::with_ivf_flat_params(
             DistanceType::L2,
             prepare_vector_ivf(&dataset, "vector").await,
         );
+        let mut input_segments = Vec::new();
 
         for fragment in &fragments {
-            let mut builder =
+            let segment =
                 CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
                     .name("vector_idx".to_string())
                     .fragments(vec![fragment.id() as u32])
-                    .index_uuid(shared_uuid.to_string());
-            builder.execute_uncommitted().await.unwrap();
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            let segment_index = dataset
+                .indices_dir()
+                .child(segment.uuid.to_string())
+                .child(crate::index::INDEX_FILE_NAME);
+            assert!(dataset.object_store().exists(&segment_index).await.unwrap());
+            input_segments.push(segment);
         }
 
-        dataset
-            .merge_index_metadata(&shared_uuid.to_string(), IndexType::IvfFlat, None)
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_segments(input_segments.clone())
+            .build_all()
             .await
             .unwrap();
-
-        let merged_root = dataset
-            .indices_dir()
-            .child(shared_uuid.to_string())
-            .child(crate::index::INDEX_FILE_NAME);
-        assert!(dataset.object_store().exists(&merged_root).await.unwrap());
+        assert_eq!(segments.len(), fragments.len());
+        let mut built_segment_ids = segments
+            .iter()
+            .map(|segment| segment.uuid())
+            .collect::<Vec<_>>();
+        built_segment_ids.sort();
+        let mut input_segment_ids = input_segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        input_segment_ids.sort();
+        assert_eq!(built_segment_ids, input_segment_ids);
 
         dataset
-            .commit_existing_index_segments(
-                "vector_idx",
-                "vector",
-                vec![IndexSegment::new(
-                    shared_uuid,
-                    fragments.iter().map(|fragment| fragment.id() as u32),
-                    Arc::new(vector_index_details()),
-                    IndexType::IvfFlat.version(),
-                )],
-            )
+            .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
             .unwrap();
 
         let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].uuid, shared_uuid);
-        let committed_fragments: Vec<u32> = indices[0]
-            .fragment_bitmap
-            .as_ref()
-            .unwrap()
-            .iter()
-            .collect();
-        assert_eq!(
-            committed_fragments,
-            fragments
-                .iter()
-                .map(|fragment| fragment.id() as u32)
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(indices.len(), fragments.len());
 
         let query_batch = dataset
             .scan()
@@ -1207,28 +1227,26 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert!(fragments.len() >= 2);
-        let shared_uuid = Uuid::new_v4();
         let params = VectorIndexParams::with_ivf_flat_params(
             DistanceType::L2,
             prepare_vector_ivf(&dataset, "vector").await,
         );
-        let mut partial_indices = Vec::new();
+        let mut input_segments = Vec::new();
 
         for fragment in fragments.iter().take(2) {
-            let index_metadata =
+            let segment =
                 CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
                     .name("vector_idx".to_string())
                     .fragments(vec![fragment.id() as u32])
-                    .index_uuid(shared_uuid.to_string())
                     .execute_uncommitted()
                     .await
                     .unwrap();
-            partial_indices.push(index_metadata);
+            input_segments.push(segment);
         }
 
         let segments = dataset
-            .create_index_segment_builder(shared_uuid.to_string())
-            .with_partial_indices(partial_indices)
+            .create_index_segment_builder()
+            .with_segments(input_segments)
             .build_all()
             .await
             .unwrap();
@@ -1339,6 +1357,84 @@ mod tests {
             indices[0].fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref()
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_index_vector_commits_with_segment_metadata() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(128),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&dataset, "vector").await,
+        );
+
+        let committed = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        assert!(
+            committed
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.is_empty()),
+            "single-machine vector create_index should preserve committed file info"
+        );
+
+        let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].uuid, committed.uuid);
+        assert!(
+            loaded[0]
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.is_empty()),
+            "committed metadata loaded from the manifest should include file info"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_index_ivf_rq_preserves_index_version_on_segment_commit_path() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(128),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
+
+        let committed = dataset
+            .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
+            .await
+            .unwrap();
+
+        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+
+        let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
     }
 
     #[tokio::test]

@@ -112,23 +112,13 @@ impl PyIndexSegmentPlan {
 #[pymethods]
 impl PyIndexSegmentPlan {
     #[getter]
-    fn staging_index_uuid(&self) -> String {
-        self.inner.staging_index_uuid().to_string()
-    }
-
-    #[getter]
     fn segment(&self) -> PyIndexSegment {
         PyIndexSegment::from_inner(self.inner.segment().clone())
     }
 
     #[getter]
-    fn partial_indices(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner
-            .partial_indices()
-            .iter()
-            .cloned()
-            .map(PyLance)
-            .collect()
+    fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
+        self.inner.segments().iter().cloned().map(PyLance).collect()
     }
 
     #[getter]
@@ -137,9 +127,8 @@ impl PyIndexSegmentPlan {
     }
     fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentPlan(staging_index_uuid={}, partial_indices={}, estimated_bytes={})",
-            self.staging_index_uuid(),
-            self.inner.partial_indices().len(),
+            "IndexSegmentPlan(segments={}, estimated_bytes={})",
+            self.inner.segments().len(),
             self.estimated_bytes()
         )
     }

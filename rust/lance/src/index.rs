@@ -87,6 +87,57 @@ use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 
+fn validate_index_segments(index_name: &str, segments: &[IndexSegment]) -> Result<()> {
+    if segments.is_empty() {
+        return Err(Error::invalid_input(
+            "CreateIndex: at least one index segment is required".to_string(),
+        ));
+    }
+
+    let mut seen_segment_ids = HashSet::with_capacity(segments.len());
+    for segment in segments {
+        if !seen_segment_ids.insert(segment.uuid()) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: duplicate segment uuid {} for index '{}'",
+                segment.uuid(),
+                index_name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn build_index_metadata_from_segments(
+    dataset: &Dataset,
+    index_name: &str,
+    field_id: i32,
+    segments: Vec<IndexSegment>,
+) -> Result<Vec<IndexMetadata>> {
+    validate_index_segments(index_name, &segments)?;
+
+    let mut new_indices = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        let index_dir = dataset.indices_dir().child(uuid.to_string());
+        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        new_indices.push(IndexMetadata {
+            uuid,
+            name: index_name.to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(fragment_bitmap),
+            index_details: Some(index_details),
+            index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(files),
+        });
+    }
+
+    Ok(new_indices)
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub struct ScalarIndexCacheKey<'a> {
@@ -628,11 +679,8 @@ impl DatasetIndexExt for Dataset {
         CreateIndexBuilder::new(self, columns, index_type, params)
     }
 
-    fn create_index_segment_builder<'a>(
-        &'a self,
-        staging_index_uuid: String,
-    ) -> create::IndexSegmentBuilder<'a> {
-        create::IndexSegmentBuilder::new(self, staging_index_uuid)
+    fn create_index_segment_builder<'a>(&'a self) -> create::IndexSegmentBuilder<'a> {
+        create::IndexSegmentBuilder::new(self)
     }
 
     #[instrument(skip_all)]
@@ -800,35 +848,8 @@ impl DatasetIndexExt for Dataset {
             )));
         };
 
-        let mut seen_segment_ids = HashSet::with_capacity(segments.len());
-        for segment in &segments {
-            if !seen_segment_ids.insert(segment.uuid()) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: duplicate segment uuid {} for index '{}'",
-                    segment.uuid(),
-                    index_name
-                )));
-            }
-        }
-
-        let new_indices = segments
-            .into_iter()
-            .map(|segment| {
-                let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-                IndexMetadata {
-                    uuid,
-                    name: index_name.to_string(),
-                    fields: vec![field.id],
-                    dataset_version: self.manifest.version,
-                    fragment_bitmap: Some(fragment_bitmap),
-                    index_details: Some(index_details),
-                    index_version,
-                    created_at: Some(chrono::Utc::now()),
-                    base_id: None,
-                    files: None, // File info will be populated when index is created
-                }
-            })
-            .collect();
+        let new_indices =
+            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -5225,6 +5246,24 @@ mod tests {
             Arc::new(vector_index_details()),
             IndexType::Vector.version(),
         );
+        let seg0_path = dataset
+            .indices_dir()
+            .child(seg0.uuid().to_string())
+            .child(INDEX_FILE_NAME);
+        let seg1_path = dataset
+            .indices_dir()
+            .child(seg1.uuid().to_string())
+            .child(INDEX_FILE_NAME);
+        dataset
+            .object_store()
+            .put(&seg0_path, b"seg0")
+            .await
+            .unwrap();
+        dataset
+            .object_store()
+            .put(&seg1_path, b"seg1")
+            .await
+            .unwrap();
 
         dataset
             .commit_existing_index_segments(
@@ -5255,6 +5294,12 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([vec![0], vec![1]]),
             "each committed segment should preserve its fragment coverage"
+        );
+        assert!(
+            committed
+                .iter()
+                .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
+            "committed segment metadata should capture on-disk file info"
         );
     }
 

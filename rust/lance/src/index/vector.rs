@@ -431,9 +431,9 @@ pub(crate) async fn build_distributed_vector_index(
 
     let filtered_dataset = dataset.clone();
 
-    let out_base = dataset.indices_dir().child(uuid);
-    let shard_uuid = Uuid::new_v4();
-    let index_dir = out_base.child(format!("partial_{}", shard_uuid));
+    let segment_uuid = Uuid::parse_str(uuid)
+        .map_err(|err| Error::invalid_input(format!("Invalid index UUID '{uuid}': {err}")))?;
+    let index_dir = dataset.indices_dir().child(segment_uuid.to_string());
 
     let fragment_filter = fragment_ids.to_vec();
 
@@ -700,7 +700,7 @@ pub(crate) async fn build_distributed_vector_index(
         }
     };
 
-    Ok(shard_uuid)
+    Ok(segment_uuid)
 }
 
 /// Build a Vector Index
