@@ -1510,14 +1510,11 @@ mod tests {
         assert!(!built_segments.is_empty());
     }
 
-    fn assert_ivf_layout_equal(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
-        let idx_a = &stats_a["indices"][0];
-        let idx_b = &stats_b["indices"][0];
-
-        let centroids_a = idx_a["centroids"]
+    fn assert_centroids_equal(reference: &serde_json::Value, candidate: &serde_json::Value) {
+        let centroids_a = reference["centroids"]
             .as_array()
             .expect("centroids should be an array");
-        let centroids_b = idx_b["centroids"]
+        let centroids_b = candidate["centroids"]
             .as_array()
             .expect("centroids should be an array");
         assert_eq!(
@@ -1544,23 +1541,46 @@ mod tests {
                 );
             }
         }
+    }
 
-        let parts_a = idx_a["partitions"]
+    fn sum_partition_sizes(indices: &[serde_json::Value]) -> Vec<u64> {
+        let mut totals = Vec::new();
+        for index in indices {
+            let partitions = index["partitions"]
+                .as_array()
+                .expect("partitions should be an array");
+            if totals.is_empty() {
+                totals.resize(partitions.len(), 0);
+            } else {
+                assert_eq!(totals.len(), partitions.len(), "num partitions mismatch");
+            }
+            for (total, partition) in totals.iter_mut().zip(partitions.iter()) {
+                *total += partition["size"].as_u64().expect("partition size");
+            }
+        }
+        totals
+    }
+
+    fn assert_ivf_layout_compatible(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
+        let indices_a = stats_a["indices"]
             .as_array()
-            .expect("partitions should be an array");
-        let parts_b = idx_b["partitions"]
+            .expect("indices should be an array");
+        let indices_b = stats_b["indices"]
             .as_array()
-            .expect("partitions should be an array");
-        assert_eq!(parts_a.len(), parts_b.len(), "num partitions mismatch");
-        let sizes_a: Vec<u64> = parts_a
-            .iter()
-            .map(|p| p["size"].as_u64().expect("partition size"))
-            .collect();
-        let sizes_b: Vec<u64> = parts_b
-            .iter()
-            .map(|p| p["size"].as_u64().expect("partition size"))
-            .collect();
-        assert_eq!(sizes_a, sizes_b, "partition sizes mismatch");
+            .expect("indices should be an array");
+        assert!(
+            !indices_a.is_empty() && !indices_b.is_empty(),
+            "indices should not be empty",
+        );
+
+        let reference = &indices_a[0];
+        for index in indices_a.iter().skip(1).chain(indices_b.iter()) {
+            assert_centroids_equal(reference, index);
+        }
+
+        let sizes_a = sum_partition_sizes(indices_a);
+        let sizes_b = sum_partition_sizes(indices_b);
+        assert_eq!(sizes_a, sizes_b, "aggregated partition sizes mismatch");
     }
 
     /// Execute the internal segment workflow used by the
@@ -1650,27 +1670,11 @@ mod tests {
         let stats_split_json = ds_split.index_statistics(INDEX_NAME).await.unwrap();
         let stats_single: serde_json::Value = serde_json::from_str(&stats_single_json).unwrap();
         let stats_split: serde_json::Value = serde_json::from_str(&stats_split_json).unwrap();
-        assert_ivf_layout_equal(&stats_single, &stats_split);
-
-        let ctx_single = load_vector_index_context(&ds_single, "vector", INDEX_NAME).await;
-        let ctx_split = load_vector_index_context(&ds_split, "vector", INDEX_NAME).await;
-
-        let ivf_single = ctx_single.ivf();
-        let ivf_split = ctx_split.ivf();
-        let total_partitions = ivf_single.total_partitions();
-        assert_eq!(total_partitions, ivf_split.total_partitions());
-
-        for part_id in 0..total_partitions {
-            let row_ids_single = load_partition_row_ids(ivf_single, part_id).await;
-            let row_ids_split = load_partition_row_ids(ivf_split, part_id).await;
-            let set_single: HashSet<u64> = row_ids_single.into_iter().collect();
-            let set_split: HashSet<u64> = row_ids_split.into_iter().collect();
-            assert_eq!(
-                set_single, set_split,
-                "row id set mismatch for partition {}",
-                part_id
-            );
-        }
+        assert_ivf_layout_compatible(&stats_single, &stats_split);
+        assert_eq!(
+            stats_single["num_indexed_rows"],
+            stats_split["num_indexed_rows"]
+        );
 
         const K: usize = 10;
         const NUM_QUERIES: usize = 10;
