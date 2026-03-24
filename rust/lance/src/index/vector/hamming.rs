@@ -48,7 +48,7 @@ use super::ivf::v2::IVFIndex;
 ///
 /// A `RecordBatchReader` yielding batches with columns:
 /// - `representative`: UInt64 - The representative row ID for each cluster
-/// - `duplicates`: List<UInt64> - List of duplicate row IDs in each cluster
+/// - `duplicates`: `List<UInt64>` - List of duplicate row IDs in each cluster
 ///
 /// # Errors
 ///
@@ -256,7 +256,7 @@ pub struct PartitionInfo {
 ///
 /// A `RecordBatchReader` yielding batches with columns:
 /// - `representative`: UInt64 - The representative row ID for each cluster
-/// - `duplicates`: List<UInt64> - List of duplicate row IDs in each cluster
+/// - `duplicates`: `List<UInt64>` - List of duplicate row IDs in each cluster
 pub async fn hamming_clustering_sampled(
     dataset: &Dataset,
     column: &str,
@@ -386,7 +386,7 @@ pub async fn hamming_clustering_sampled(
 ///
 /// A `RecordBatchReader` yielding batches with columns:
 /// - `representative`: UInt64 - The representative row ID for each cluster
-/// - `duplicates`: List<UInt64> - List of duplicate row IDs in each cluster
+/// - `duplicates`: `List<UInt64>` - List of duplicate row IDs in each cluster
 pub fn hamming_clustering_from_hashes(
     hashes: &[u64],
     row_ids: Option<&[u64]>,

@@ -610,8 +610,8 @@ impl ClusteringResult {
     }
 
     /// Convert to Arrow RecordBatch with columns:
-    /// - `representative`: UInt64
-    /// - `duplicates`: List<UInt64>
+    /// - `representative`: `UInt64`
+    /// - `duplicates`: `List<UInt64>`
     pub fn to_record_batch(&self) -> RecordBatch {
         let schema = Self::schema();
 
