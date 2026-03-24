@@ -505,20 +505,20 @@ impl RestNamespace {
     /// Attempts to parse a JSON body with `{"error": {"code": N, "message": "..."}}`.
     /// Falls back to `NamespaceError::Internal` if parsing fails.
     fn parse_error_response(status: reqwest::StatusCode, content: &str) -> lance_core::Error {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
-            if let Some(error_obj) = json.get("error") {
-                let code = error_obj
-                    .get("code")
-                    .and_then(|c| c.as_u64())
-                    .map(|c| c as u32);
-                let message = error_obj
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or(content);
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
+            && let Some(error_obj) = json.get("error")
+        {
+            let code = error_obj
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as u32);
+            let message = error_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(content);
 
-                if let Some(code) = code {
-                    return NamespaceError::from_code(code, message).into();
-                }
+            if let Some(code) = code {
+                return NamespaceError::from_code(code, message).into();
             }
         }
 
