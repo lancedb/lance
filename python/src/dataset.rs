@@ -332,7 +332,7 @@ pub struct PyIndexSegmentBuilder {
 }
 
 impl PyIndexSegmentBuilder {
-    fn into_builder(&self) -> lance::dataset::index::IndexSegmentBuilder<'_> {
+    fn into_builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
         let mut builder = self
             .dataset
             .create_index_segment_builder()
