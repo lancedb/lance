@@ -45,11 +45,10 @@ use tracing::span;
 use tracing::subscriber;
 use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
-use tracing_subscriber::Registry;
-use tracing_subscriber::filter;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::Registry;
 
 static SUBSCRIBER: LazyLock<Arc<RwLock<Option<LoggingPassthroughState>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(None)));
@@ -343,31 +342,24 @@ pub fn initialize_tracing(level: log::Level) {
         .unwrap()
         .replace(LoggingPassthroughState::new(level));
 
-    // If RUST_LOG is set, use EnvFilter to respect it (allows configuring any target)
+    // If RUST_LOG is set, use it directly (allows configuring any target)
     // Otherwise, fall back to filtering only lance/pylance targets
-    if std::env::var("RUST_LOG").is_ok() {
-        let filter = EnvFilter::from_default_env();
-        let subscriber =
-            Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
-        subscriber::set_global_default(subscriber).unwrap();
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
     } else {
-        let level_filter = match level {
-            log::Level::Trace => filter::LevelFilter::TRACE,
-            log::Level::Debug => filter::LevelFilter::DEBUG,
-            log::Level::Info => filter::LevelFilter::INFO,
-            log::Level::Warn => filter::LevelFilter::WARN,
-            log::Level::Error => filter::LevelFilter::ERROR,
+        let level_str = match level {
+            log::Level::Trace => "trace",
+            log::Level::Debug => "debug",
+            log::Level::Info => "info",
+            log::Level::Warn => "warn",
+            log::Level::Error => "error",
         };
-        // Narrow down to just our targets, otherwise we get a lot of spam from
-        // our dependencies. The target check is based on a prefix, so `lance` is
-        // sufficient to match `lance_*`.
-        let filter = filter::Targets::new()
-            .with_target("lance", level_filter)
-            .with_target("pylance", level_filter);
-        let subscriber =
-            Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
-        subscriber::set_global_default(subscriber).unwrap();
-    }
+        EnvFilter::new(format!("lance={level_str},pylance={level_str}"))
+    };
+
+    let subscriber =
+        Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
+    subscriber::set_global_default(subscriber).unwrap();
 }
 
 #[pyfunction]
