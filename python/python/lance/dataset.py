@@ -47,7 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, IndexSegment, SupportedScalarDistributedIndices
+from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -3534,7 +3534,7 @@ class LanceDataset(pa.dataset.Dataset):
             The shared UUID used when building fragment-level scalar indices.
         index_type: str
             Index type name. Must be one of the enum values in
-            :class:`lance.indices.SupportedScalarDistributedIndices`
+            :class:`lance.indices.SupportedDistributedIndices`
             supported by scalar distributed merge.
         batch_readhead: int, optional
             Prefetch concurrency used by BTREE merge reader. Default: 1.
@@ -3542,7 +3542,7 @@ class LanceDataset(pa.dataset.Dataset):
         # Normalize type
         t = index_type.upper()
 
-        valid = {member.name for member in SupportedScalarDistributedIndices}
+        valid = {member.name for member in SupportedDistributedIndices}
         if t not in valid:
             raise NotImplementedError(
                 f"Only {', '.join(sorted(valid))} are supported, received {index_type}"

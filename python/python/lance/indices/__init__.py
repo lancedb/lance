@@ -27,7 +27,7 @@ class IndexFileVersion(str, Enum):
     V3 = "V3"
 
 
-class SupportedScalarDistributedIndices(str, Enum):
+class SupportedDistributedIndices(str, Enum):
     # Scalar index types
     BTREE = "BTREE"
     INVERTED = "INVERTED"
