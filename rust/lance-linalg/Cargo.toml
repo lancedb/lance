@@ -19,6 +19,7 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 num-traits = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
@@ -52,10 +53,6 @@ harness = false
 
 [[bench]]
 name = "cosine"
-harness = false
-
-[[bench]]
-name = "hamming"
 harness = false
 
 [[bench]]

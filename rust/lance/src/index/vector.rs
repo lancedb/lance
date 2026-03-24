@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 pub mod builder;
+pub mod hamming;
 pub mod ivf;
 pub mod pq;
 pub mod utils;

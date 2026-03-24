@@ -195,5 +195,9 @@ harness = false
 name = "mem_wal_read"
 harness = false
 
+[[bench]]
+name = "hamming"
+harness = false
+
 [lints]
 workspace = true

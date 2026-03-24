@@ -753,3 +753,116 @@ def one_pass_assign_ivf_pq_on_accelerator(
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
+
+
+# =============================================================================
+# Hamming Distance Clustering
+# =============================================================================
+
+
+def hamming_clustering_for_ivf_partition(
+    dataset: "LanceDataset",
+    index_name: str,
+    partition_id: int,
+    hamming_threshold: int,
+) -> dict:
+    """
+    Perform hamming clustering on a partition of an IVF_FLAT index.
+
+    Loads a partition from an IVF_FLAT index on a hash column, computes
+    pairwise hamming distances between all hashes in the partition,
+    filters by threshold, and clusters the results using union-find.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column with an IVF_FLAT index.
+    index_name : str
+        Name of the IVF_FLAT index on the hash column
+    partition_id : int
+        The partition ID within the IVF_FLAT index
+    hamming_threshold : int
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    dict
+        A dictionary containing:
+
+        - 'num_clusters': int - Number of clusters found
+        - 'num_duplicates': int - Total number of duplicate row IDs
+        - 'clusters': list[dict] - List of clusters, each with:
+            - 'representative': int - The representative row ID
+            - 'duplicates': list[int] - List of duplicate row IDs
+    """
+    return dataset._ds.hamming_clustering_for_ivf_partition(
+        index_name, partition_id, hamming_threshold
+    )
+
+
+def get_ivf_partition_info(
+    dataset: "LanceDataset",
+    index_name: str,
+) -> List[dict]:
+    """
+    Get partition information for an IVF_FLAT index.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column with an IVF_FLAT index.
+    index_name : str
+        Name of the IVF_FLAT index
+
+    Returns
+    -------
+    list[dict]
+        List of partition info dicts with 'partition_id' and 'size'
+    """
+    return dataset._ds.get_ivf_partition_info(index_name)
+
+
+def hamming_clustering_sampled(
+    dataset: "LanceDataset",
+    column: str,
+    sample_size: Optional[int] = None,
+    hamming_threshold: int = 10,
+) -> dict:
+    """
+    Perform pairwise hamming distance clustering on a sample of the dataset.
+
+    Randomly samples rows from the dataset, computes pairwise hamming distances
+    between all hashes in the sample, filters by threshold, and clusters the
+    results using union-find.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column.
+    column : str
+        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    sample_size : int, optional
+        Number of rows to sample. If None, uses all rows.
+    hamming_threshold : int, default 10
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    dict
+        A dictionary containing:
+
+        - 'num_clusters': int - Number of clusters found
+        - 'num_duplicates': int - Total number of duplicate row IDs
+        - 'clusters': list[dict] - List of clusters, each with:
+            - 'representative': int - The representative row ID
+            - 'duplicates': list[int] - List of duplicate row IDs
+        - 'num_rows': int - Number of rows processed
+        - 'total_pairs': int - Total number of pairs compared
+        - 'read_time_ms': float - Time spent reading data in milliseconds
+        - 'compute_time_ms': float - Time spent computing distances in ms
+        - 'cluster_time_ms': float - Time spent clustering in milliseconds
+        - 'total_time_ms': float - Total time in milliseconds
+    """
+    return dataset._ds.hamming_clustering_sampled(
+        column, sample_size, hamming_threshold
+    )
