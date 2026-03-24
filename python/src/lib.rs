@@ -52,7 +52,7 @@ use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
 };
-use lance_index::DatasetIndexExt;
+use ::lance::index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
