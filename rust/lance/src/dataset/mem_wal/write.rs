@@ -2128,16 +2128,17 @@ mod tests {
 mod region_writer_tests {
     use std::sync::Arc;
 
+    use crate::index::DatasetIndexExt;
     use arrow_array::{
         FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::scalar::inverted::InvertedIndexParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::builder::PQBuildParams;
-    use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use uuid::Uuid;
 

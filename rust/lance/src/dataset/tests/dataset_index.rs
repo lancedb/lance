@@ -13,6 +13,7 @@ use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
+use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -31,7 +32,6 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},

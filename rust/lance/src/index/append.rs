@@ -310,6 +310,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 mod tests {
     use super::*;
 
+    use crate::index::DatasetIndexExt;
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -324,7 +325,7 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        DatasetIndexExt, IndexType,
+        IndexType,
         scalar::ScalarIndexParams,
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };

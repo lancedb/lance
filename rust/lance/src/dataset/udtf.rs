@@ -259,13 +259,14 @@ impl FtsQueryUDTFBuilder {
 pub mod tests {
     use crate::Dataset;
     use crate::dataset::udtf::FtsQueryUDTFBuilder;
+    use crate::index::DatasetIndexExt;
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
+    use lance_index::IndexType;
     use lance_index::scalar::InvertedIndexParams;
-    use lance_index::{DatasetIndexExt, IndexType};
     use std::sync::Arc;
 
     #[tokio::test]

@@ -1344,6 +1344,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{
@@ -1353,10 +1354,10 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;

@@ -47,9 +47,7 @@ use lance_index::vector::{
     pq::PQBuildParams,
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
-use lance_index::{
-    DatasetIndexExt, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType,
-};
+use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
@@ -58,7 +56,7 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
+use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
@@ -1688,6 +1686,7 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
 mod tests {
     use super::*;
     use crate::dataset::Dataset;
+    use crate::index::DatasetIndexExt;
     use arrow_array::Array;
     use arrow_array::RecordBatch;
     use arrow_array::types::{Float32Type, Int32Type};
@@ -1695,7 +1694,6 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
-    use lance_index::DatasetIndexExt;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
 

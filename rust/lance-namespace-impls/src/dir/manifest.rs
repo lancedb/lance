@@ -18,6 +18,7 @@ use lance::dataset::{
     DeleteBuilder, MergeInsertBuilder, ReadParams, WhenMatched, WhenNotMatched, WriteParams,
     builder::DatasetBuilder,
 };
+use lance::index::DatasetIndexExt;
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
@@ -26,7 +27,6 @@ use lance_core::{Error, Result, box_error};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_index::traits::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
