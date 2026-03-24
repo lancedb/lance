@@ -15,10 +15,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use lance_io::object_store::throttle::{AimdThrottleConfig, AimdThrottleWrapper};
+//! use lance_io::object_store::throttle::{AimdThrottleConfig, AimdThrottledStore};
 //!
-//! let wrapper = AimdThrottleWrapper::new(AimdThrottleConfig::default());
-//! // Use as ObjectStoreParams::object_store_wrapper
+//! let throttled = AimdThrottledStore::new(target, AimdThrottleConfig::default()).unwrap();
 //! ```
 
 use std::fmt::{Debug, Display, Formatter};
@@ -27,17 +26,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use tokio::sync::Mutex;
 use tracing::debug;
-
-use super::WrappingObjectStore;
 
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
@@ -141,29 +139,6 @@ impl AimdThrottleConfig {
     }
 }
 
-/// Factory that creates [`AimdThrottledStore`] wrappers.
-///
-/// Implements [`WrappingObjectStore`] so it can be passed to
-/// `ObjectStoreParams::object_store_wrapper`.
-#[derive(Debug, Clone)]
-pub struct AimdThrottleWrapper {
-    config: AimdThrottleConfig,
-}
-
-impl AimdThrottleWrapper {
-    pub fn new(config: AimdThrottleConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl WrappingObjectStore for AimdThrottleWrapper {
-    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        // unwrap is safe: config validation would have already been done, and
-        // if not, default config always validates.
-        Arc::new(AimdThrottledStore::new(target, self.config.clone()).expect("invalid AIMD config"))
-    }
-}
-
 struct TokenBucketState {
     tokens: f64,
     last_refill: std::time::Instant,
@@ -226,6 +201,25 @@ impl OperationThrottle {
         bucket.rate = new_rate;
     }
 
+    /// Classify a result and feed it back to the AIMD controller without
+    /// acquiring a token. Uses `try_lock` for the bucket update so that if the
+    /// bucket lock is contended the rate update is deferred to the next
+    /// `throttled()` call.
+    fn observe_outcome<T>(&self, result: &OSResult<T>) {
+        let outcome = match result {
+            Ok(_) => RequestOutcome::Success,
+            Err(err) if is_throttle_error(err) => {
+                debug!("Throttle error detected in stream, decreasing rate");
+                RequestOutcome::Throttled
+            }
+            Err(_) => RequestOutcome::Success,
+        };
+        let new_rate = self.controller.record_outcome(outcome);
+        if let Ok(mut bucket) = self.bucket.try_lock() {
+            bucket.rate = new_rate;
+        }
+    }
+
     /// Execute an operation with throttling: acquire token, run, classify result.
     async fn throttled<T, F, Fut>(&self, f: F) -> OSResult<T>
     where
@@ -257,6 +251,44 @@ impl Debug for OperationThrottle {
     }
 }
 
+/// A [`MultipartUpload`] wrapper that throttles `put_part` and observes
+/// outcomes from `put_part` and `complete`, feeding them back to the write
+/// AIMD controller.
+struct ThrottledMultipartUpload {
+    target: Box<dyn MultipartUpload>,
+    write: Arc<OperationThrottle>,
+}
+
+impl Debug for ThrottledMultipartUpload {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThrottledMultipartUpload").finish()
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for ThrottledMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let write = Arc::clone(&self.write);
+        let fut = self.target.put_part(data);
+        Box::pin(async move {
+            write.acquire_token().await;
+            let result = fut.await;
+            write.observe_outcome(&result);
+            result
+        })
+    }
+
+    async fn complete(&mut self) -> OSResult<PutResult> {
+        let result = self.target.complete().await;
+        self.write.observe_outcome(&result);
+        result
+    }
+
+    async fn abort(&mut self) -> OSResult<()> {
+        self.target.abort().await
+    }
+}
+
 /// An ObjectStore wrapper that rate-limits operations using per-category token
 /// buckets whose fill rates are controlled by AIMD algorithms.
 ///
@@ -266,13 +298,18 @@ impl Debug for OperationThrottle {
 /// - **delete**: `delete`
 /// - **list**: `list_with_delimiter`
 ///
-/// Streaming operations (`list`, `list_with_offset`, `delete_stream`) pass through without throttling.
+/// Streaming operations (`list`, `list_with_offset`, `delete_stream`) do not acquire tokens,
+/// but observe each yielded item and feed the result back to the AIMD controller so it can
+/// adjust the rate for other operations in the same category.
+///
+/// This is not perfect but probably as close as we can get without moving the throttle into
+/// the object_store crate itself.
 pub struct AimdThrottledStore {
     target: Arc<dyn ObjectStore>,
-    read: OperationThrottle,
-    write: OperationThrottle,
-    delete: OperationThrottle,
-    list: OperationThrottle,
+    read: Arc<OperationThrottle>,
+    write: Arc<OperationThrottle>,
+    delete: Arc<OperationThrottle>,
+    list: Arc<OperationThrottle>,
 }
 
 impl Debug for AimdThrottledStore {
@@ -301,10 +338,10 @@ impl AimdThrottledStore {
         let burst = config.burst_capacity as f64;
         Ok(Self {
             target,
-            read: OperationThrottle::new(config.read, burst)?,
-            write: OperationThrottle::new(config.write, burst)?,
-            delete: OperationThrottle::new(config.delete, burst)?,
-            list: OperationThrottle::new(config.list, burst)?,
+            read: Arc::new(OperationThrottle::new(config.read, burst)?),
+            write: Arc::new(OperationThrottle::new(config.write, burst)?),
+            delete: Arc::new(OperationThrottle::new(config.delete, burst)?),
+            list: Arc::new(OperationThrottle::new(config.list, burst)?),
         })
     }
 }
@@ -330,9 +367,14 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-        self.write
+        let target = self
+            .write
             .throttled(|| self.target.put_multipart(location))
-            .await
+            .await?;
+        Ok(Box::new(ThrottledMultipartUpload {
+            target,
+            write: Arc::clone(&self.write),
+        }))
     }
 
     async fn put_multipart_opts(
@@ -340,9 +382,14 @@ impl ObjectStore for AimdThrottledStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn MultipartUpload>> {
-        self.write
+        let target = self
+            .write
             .throttled(|| self.target.put_multipart_opts(location, opts))
-            .await
+            .await?;
+        Ok(Box::new(ThrottledMultipartUpload {
+            target,
+            write: Arc::clone(&self.write),
+        }))
     }
 
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
@@ -379,11 +426,24 @@ impl ObjectStore for AimdThrottledStore {
         &'a self,
         locations: BoxStream<'a, OSResult<Path>>,
     ) -> BoxStream<'a, OSResult<Path>> {
-        self.target.delete_stream(locations)
+        self.target
+            .delete_stream(locations)
+            .map(|item| {
+                self.delete.observe_outcome(&item);
+                item
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.target.list(prefix)
+        let throttle = Arc::clone(&self.list);
+        self.target
+            .list(prefix)
+            .map(move |item| {
+                throttle.observe_outcome(&item);
+                item
+            })
+            .boxed()
     }
 
     fn list_with_offset(
@@ -391,7 +451,14 @@ impl ObjectStore for AimdThrottledStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.target.list_with_offset(prefix, offset)
+        let throttle = Arc::clone(&self.list);
+        self.target
+            .list_with_offset(prefix, offset)
+            .map(move |item| {
+                throttle.observe_outcome(&item);
+                item
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
@@ -554,16 +621,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wrapping_object_store_trait() {
-        let wrapper = AimdThrottleWrapper::new(AimdThrottleConfig::default());
+    async fn test_as_dyn_object_store() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let wrapped = wrapper.wrap("test://", store);
+        let throttled: Arc<dyn ObjectStore> =
+            Arc::new(AimdThrottledStore::new(store, AimdThrottleConfig::default()).unwrap());
 
         let path = Path::from("test/data.bin");
         let data = PutPayload::from_static(b"test data");
-        wrapped.put(&path, data).await.unwrap();
+        throttled.put(&path, data).await.unwrap();
 
-        let result = wrapped.get(&path).await.unwrap();
+        let result = throttled.get(&path).await.unwrap();
         let bytes = result.bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), b"test data");
     }
@@ -596,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_passthrough() {
+    async fn test_list_observes_outcomes() {
         let store = Arc::new(InMemory::new());
         let config = AimdThrottleConfig::default();
         let throttled = AimdThrottledStore::new(store.clone(), config).unwrap();
@@ -605,10 +672,161 @@ mod tests {
         let data = PutPayload::from_static(b"data");
         store.put(&path, data).await.unwrap();
 
-        use futures::StreamExt;
         let items: Vec<_> = throttled.list(Some(&Path::from("prefix"))).collect().await;
         assert_eq!(items.len(), 1);
         assert!(items[0].is_ok());
+    }
+
+    /// A mock store whose `list` stream yields a configurable sequence of
+    /// Ok / throttle-error items. Used to verify that the AIMD wrapper
+    /// observes errors surfaced inside list streams.
+    struct ThrottlingListMockStore {
+        inner: InMemory,
+        /// Number of throttle errors to inject at the start of each list call.
+        throttle_count: usize,
+    }
+
+    impl Display for ThrottlingListMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ThrottlingListMockStore")
+        }
+    }
+
+    impl Debug for ThrottlingListMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ThrottlingListMockStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ThrottlingListMockStore {
+        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
+            self.inner.put(location, bytes).await
+        }
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get(&self, location: &Path) -> OSResult<GetResult> {
+            self.inner.get(location).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
+            self.inner.get_range(location, range).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+        async fn delete(&self, location: &Path) -> OSResult<()> {
+            self.inner.delete(location).await
+        }
+        fn delete_stream<'a>(
+            &'a self,
+            locations: BoxStream<'a, OSResult<Path>>,
+        ) -> BoxStream<'a, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let n = self.throttle_count;
+            let inner_stream = self.inner.list(prefix);
+            let errors = futures::stream::iter((0..n).map(|_| {
+                Err(object_store::Error::Generic {
+                    store: "ThrottlingListMock",
+                    source: "HTTP 503 Service Unavailable: SlowDown".into(),
+                })
+            }));
+            errors.chain(inner_stream).boxed()
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.rename(from, to).await
+        }
+        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.rename_if_not_exists(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_stream_throttle_errors_decrease_rate() {
+        let mock = Arc::new(ThrottlingListMockStore {
+            inner: InMemory::new(),
+            throttle_count: 5,
+        });
+
+        // Seed a file so the real items come through after the errors.
+        mock.put(
+            &Path::from("prefix/file.txt"),
+            PutPayload::from_static(b"data"),
+        )
+        .await
+        .unwrap();
+
+        let config = AimdThrottleConfig::default().with_list_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_decrease_factor(0.5)
+                .with_window_duration(std::time::Duration::from_millis(10)),
+        );
+        let throttled = AimdThrottledStore::new(mock as Arc<dyn ObjectStore>, config).unwrap();
+
+        let initial_rate = throttled.list.controller.current_rate();
+        assert_eq!(initial_rate, 100.0);
+
+        let items: Vec<_> = throttled.list(Some(&Path::from("prefix"))).collect().await;
+
+        // 5 errors + 1 real item
+        assert_eq!(items.len(), 6);
+        assert!(items[0].is_err());
+        assert!(items[5].is_ok());
+
+        // Wait for the AIMD window to expire and trigger evaluation.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        throttled
+            .list
+            .controller
+            .record_outcome(RequestOutcome::Success);
+
+        let new_rate = throttled.list.controller.current_rate();
+        assert!(
+            new_rate < initial_rate,
+            "List rate should decrease after stream throttle errors: {} < {}",
+            new_rate,
+            initial_rate
+        );
     }
 
     #[tokio::test]
