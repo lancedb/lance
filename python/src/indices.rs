@@ -11,6 +11,7 @@ use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
+use lance::index::vector::pq::build_pq_model_in_fragments;
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -205,6 +206,7 @@ async fn do_train_ivf_model(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
     // We verify distance_type earlier so can unwrap here
     let distance_type = DistanceType::try_from(distance_type).unwrap();
@@ -220,6 +222,7 @@ async fn do_train_ivf_model(
         dimension,
         distance_type,
         &params,
+        fragment_ids.as_deref(),
         Arc::new(NoopIndexBuildProgress),
     )
     .await
@@ -230,6 +233,7 @@ async fn do_train_ivf_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature=(dataset, column, dimension, num_partitions, distance_type, sample_rate, max_iters, fragment_ids=None))]
 fn train_ivf_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -239,6 +243,7 @@ fn train_ivf_model<'py>(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let centroids = rt().block_on(
         Some(py),
@@ -250,6 +255,7 @@ fn train_ivf_model<'py>(
             distance_type,
             sample_rate,
             max_iters,
+            fragment_ids,
         ),
     )??;
     centroids.to_pyarrow(py)
@@ -265,6 +271,7 @@ async fn do_train_pq_model(
     sample_rate: u32,
     max_iters: u32,
     ivf_model: IvfModel,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
     // We verify distance_type earlier so can unwrap here
     let distance_type = DistanceType::try_from(distance_type).unwrap();
@@ -275,13 +282,14 @@ async fn do_train_pq_model(
         sample_rate: sample_rate as usize,
         ..Default::default()
     };
-    let pq_model = lance::index::vector::pq::build_pq_model(
+    let pq_model = build_pq_model_in_fragments(
         dataset.ds.as_ref(),
         column,
         dimension,
         distance_type,
         &params,
         Some(&ivf_model),
+        fragment_ids.as_deref(),
     )
     .await
     .infer_error()?;
@@ -290,6 +298,7 @@ async fn do_train_pq_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, sample_rate, max_iters, ivf_centroids, fragment_ids=None))]
 fn train_pq_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -300,6 +309,7 @@ fn train_pq_model<'py>(
     sample_rate: u32,
     max_iters: u32,
     ivf_centroids: PyArrowType<ArrayData>,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -320,6 +330,7 @@ fn train_pq_model<'py>(
             sample_rate,
             max_iters,
             ivf_model,
+            fragment_ids,
         ),
     )??;
     codebook.to_pyarrow(py)

@@ -405,6 +405,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     dim,
                     self.distance_type,
                     ivf_params,
+                    None,
                     self.progress.clone(),
                 )
                 .await
@@ -434,7 +435,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             sample_size_hint
         );
         let training_data =
-            utils::maybe_sample_training_data(dataset, &self.column, sample_size_hint).await?;
+            utils::maybe_sample_training_data(dataset, &self.column, sample_size_hint, None)
+                .await?;
         info!(
             "Finished loading training data in {:02} seconds",
             start.elapsed().as_secs_f32()
