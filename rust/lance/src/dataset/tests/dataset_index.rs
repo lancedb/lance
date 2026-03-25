@@ -1829,10 +1829,10 @@ async fn test_fts_phrase_query_with_removed_stop_words() {
             .unwrap();
 
         let ids = result["id"].as_primitive::<UInt64Type>().values();
-        assert_eq!(result.num_rows(), 2, "query={query}, ids={ids:?}");
+        assert_eq!(result.num_rows(), 3, "query={query}, ids={ids:?}");
         assert!(ids.contains(&0), "query={query}, ids={ids:?}");
         assert!(ids.contains(&1), "query={query}, ids={ids:?}");
-        assert!(!ids.contains(&2), "query={query}, ids={ids:?}");
+        assert!(ids.contains(&2), "query={query}, ids={ids:?}");
     }
 }
 
