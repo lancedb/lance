@@ -295,7 +295,7 @@ fn error_to_response(err: Error) -> Response {
                     status,
                     Json(serde_json::json!({
                         "error": {
-                            "message": ns_err.to_string(),
+                            "message": ns_err.message(),
                             "code": code
                         }
                     })),
@@ -2232,8 +2232,8 @@ mod tests {
             );
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("is not empty"),
-                "Error should be 'is not empty', got: {}",
+                err_msg.contains("not empty"),
+                "Error should contain 'not empty', got: {}",
                 err_msg
             );
         }
@@ -2333,8 +2333,8 @@ mod tests {
             assert!(result.is_err(), "Cannot create root namespace");
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("Root namespace already exists and cannot be created"),
-                "Error should be 'Root namespace already exists and cannot be created', got: {}",
+                err_msg.contains("already exists") && err_msg.contains("root namespace"),
+                "Error should contain 'already exists' and 'root namespace', got: {}",
                 err_msg
             );
 
