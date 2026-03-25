@@ -1994,6 +1994,44 @@ mod tests {
     }
 
     #[rstest]
+    fn test_exact_phrase_respects_query_position_gaps(#[values(false, true)] is_compressed: bool) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("want"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![0_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("apple"),
+                1,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![2_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        assert!(wand.check_exact_positions());
+        assert!(wand.check_positions(0));
+    }
+
+    #[rstest]
     fn test_and_phrase_miss_advances_to_next_candidate(#[values(false, true)] is_compressed: bool) {
         let mut docs = DocSet::default();
         docs.append(0, 8);

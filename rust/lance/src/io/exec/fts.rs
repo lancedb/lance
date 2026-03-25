@@ -877,10 +877,13 @@ impl ExecutionPlan for PhraseQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let column = query.column.ok_or(DataFusionError::Execution(format!(
-                "column not set for PhraseQuery {}",
-                query.terms
-            )))?;
+            let column = query
+                .column
+                .clone()
+                .ok_or(DataFusionError::Execution(format!(
+                    "column not set for PhraseQuery {}",
+                    query.terms
+                )))?;
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
@@ -897,7 +900,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 context.clone(),
                 partition,
                 &prefilter_source,
-                ds,
+                ds.clone(),
                 &[index_meta],
             )?;
 

@@ -1776,6 +1776,125 @@ async fn test_fts_phrase_query() {
     assert_eq!(result.num_rows(), 0);
 }
 
+#[tokio::test]
+async fn test_fts_phrase_query_with_removed_stop_words() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "want the apple",
+        "want an apple",
+        "want green apple",
+        "apple want the",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .remove_stop_words(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["want the apple", "want an apple"] {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new(query.to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(result.num_rows(), 3, "query={query}, ids={ids:?}");
+        assert!(ids.contains(&0), "query={query}, ids={ids:?}");
+        assert!(ids.contains(&1), "query={query}, ids={ids:?}");
+        assert!(ids.contains(&2), "query={query}, ids={ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query_preserves_stop_word_gaps() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "the united states of america",
+        "the united states and america",
+        "united states america",
+        "the united states of north america",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .remove_stop_words(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("the united states of america".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert_eq!(result.num_rows(), 2, "ids={ids:?}");
+    assert!(ids.contains(&0), "ids={ids:?}");
+    assert!(ids.contains(&1), "ids={ids:?}");
+    assert!(!ids.contains(&2), "ids={ids:?}");
+    assert!(!ids.contains(&3), "ids={ids:?}");
+}
+
 async fn prepare_json_dataset() -> (Dataset, String) {
     let text_col = Arc::new(StringArray::from(vec![
         r#"{

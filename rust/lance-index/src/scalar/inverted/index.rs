@@ -492,7 +492,12 @@ impl InvertedIndex {
                     if postings.is_empty() {
                         return Result::Ok(PartitionCandidates::empty());
                     }
-                    let mut tokens_by_position = vec![String::new(); postings.len()];
+                    let max_position = postings
+                        .iter()
+                        .map(|posting| posting.term_index() as usize)
+                        .max()
+                        .unwrap_or_default();
+                    let mut tokens_by_position = vec![String::new(); max_position + 1];
                     for posting in &postings {
                         let idx = posting.term_index() as usize;
                         tokens_by_position[idx] = posting.token().to_owned();
@@ -1011,11 +1016,14 @@ impl InvertedPartition {
             true => self.expand_fuzzy(tokens, params)?,
             false => tokens.clone(),
         };
+        let token_positions = (0..tokens.len())
+            .map(|index| tokens.position(index))
+            .collect::<Vec<_>>();
         let mut token_ids = Vec::with_capacity(tokens.len());
-        for token in tokens {
+        for (index, token) in tokens.into_iter().enumerate() {
             let token_id = self.map(&token);
             if let Some(token_id) = token_id {
-                token_ids.push((token_id, token));
+                token_ids.push((token_id, token, token_positions[index]));
             } else if is_phrase_query {
                 // if the token is not found, we can't do phrase query
                 return Ok(Vec::new());
@@ -1025,14 +1033,13 @@ impl InvertedPartition {
             return Ok(Vec::new());
         }
         if !is_phrase_query {
-            token_ids.sort_unstable_by_key(|(token_id, _)| *token_id);
-            token_ids.dedup_by_key(|(token_id, _)| *token_id);
+            token_ids.sort_unstable_by_key(|(token_id, _, _)| *token_id);
+            token_ids.dedup_by_key(|(token_id, _, _)| *token_id);
         }
 
         let num_docs = self.docs.len();
         stream::iter(token_ids)
-            .enumerate()
-            .map(|(position, (token_id, token))| async move {
+            .map(|(token_id, token, position)| async move {
                 let posting = self
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
@@ -1043,7 +1050,7 @@ impl InvertedPartition {
                 Result::Ok(PostingIterator::with_query_weight(
                     token,
                     token_id,
-                    position as u32,
+                    position,
                     query_weight,
                     posting,
                     num_docs,
