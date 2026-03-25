@@ -1150,29 +1150,24 @@ impl ManifestNamespace {
         Ok(())
     }
 
-    /// Delete an entry from the manifest table
-    pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
-        let predicate = format!("object_id = '{}'", object_id);
-
-        // Get dataset and use DeleteBuilder with configured retries
-        let _mutation_guard = self.manifest_mutation_lock.lock().await;
+    /// Shared helper that executes a delete against the manifest dataset
+    /// using the given filter predicate, then runs inline optimization.
+    async fn delete_by_filter(&self, filter: &str, error_context: &str) -> Result<()> {
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset = Arc::new(dataset_guard.clone());
-        drop(dataset_guard); // Drop read guard before delete
+        drop(dataset_guard);
 
-        let new_dataset = DeleteBuilder::new(dataset, &predicate)
+        let new_dataset = DeleteBuilder::new(dataset, filter)
             .execute()
             .await
-            .map_err(|e| convert_lance_commit_error(&e, "Failed to delete", None))?;
+            .map_err(|e| convert_lance_commit_error(&e, error_context, None))?;
 
-        // Update the wrapper with the new dataset
         self.manifest_dataset
             .set_latest(
                 Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
             )
             .await;
 
-        // Run inline optimization after delete
         if let Err(e) = self.run_inline_optimization().await {
             log::warn!(
                 "Unexpected failure when running inline optimization: {:?}",
@@ -1181,6 +1176,12 @@ impl ManifestNamespace {
         }
 
         Ok(())
+    }
+
+    /// Delete an entry from the manifest table
+    pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
+        let predicate = format!("object_id = '{}'", object_id);
+        self.delete_by_filter(&predicate, "Failed to delete").await
     }
 
     /// Query the manifest for all versions of a table, sorted by version.
@@ -1460,6 +1461,29 @@ impl ManifestNamespace {
         }
 
         Ok(deleted_count)
+    }
+
+    /// Delete all table_version entries for a given table from the manifest.
+    ///
+    /// This is used during `drop_table` to clean up all version records stored
+    /// in the `__manifest` table when `table_version_storage_enabled` is true.
+    /// Without this cleanup, `drop_namespace` would fail because it counts
+    /// these version entries as child objects of the namespace.
+    ///
+    /// Uses a `starts_with` filter on object_id to match all versions of the table,
+    /// since version object_ids are formatted as `{table_object_id}${zero_padded_version}`.
+    pub async fn delete_all_table_versions_for_table(&self, table_object_id: &str) -> Result<()> {
+        let escaped_id = table_object_id.replace('\'', "''");
+        let prefix = format!("{}{}", escaped_id, DELIMITER);
+        let filter = format!(
+            "object_type = 'table_version' AND starts_with(object_id, '{}')",
+            prefix
+        );
+
+        // Directly execute the delete without pre-scanning; DeleteBuilder is a
+        // no-op when no rows match, matching the delete_from_manifest pattern.
+        self.delete_by_filter(&filter, "Failed to delete table version entries")
+            .await
     }
 
     /// Set a property flag in the __manifest table's metadata key-value map.
@@ -2369,8 +2393,17 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
-                // Delete from manifest first
+                // Delete the table entry from manifest first
                 self.delete_from_manifest(&object_id).boxed().await?;
+
+                // Also delete all table_version entries for this table from manifest.
+                // When table_version_storage_enabled is true, version records are stored
+                // with object_type='table_version' and object_id='{table_object_id}${version}'.
+                // If not cleaned up, drop_namespace will fail because it sees these as
+                // child objects of the namespace.
+                self.delete_all_table_versions_for_table(&object_id)
+                    .boxed()
+                    .await?;
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.clone().join(info.location.as_str());
@@ -2846,6 +2879,13 @@ impl LanceNamespace for ManifestNamespace {
             Some(info) => {
                 // Delete from manifest only (leave physical data intact)
                 self.delete_from_manifest(&object_id).boxed().await?;
+
+                // Also clean up any table_version entries so that a
+                // subsequent drop_namespace does not fail on orphans.
+                self.delete_all_table_versions_for_table(&object_id)
+                    .boxed()
+                    .await?;
+
                 Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
@@ -4068,5 +4108,167 @@ mod tests {
         let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
         assert_eq!(n, names(&["c", "d"]));
         assert_eq!(next, Some("d".to_string()));
+    /// Test that drop_table with table_version_storage_enabled cleans up
+    /// version entries so that a subsequent drop_namespace succeeds.
+    /// This is the scenario described in the PR body.
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_table_with_versions_then_drop_namespace(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DropNamespaceRequest, DropTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .table_version_storage_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a namespace
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["ns1".to_string()]);
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+
+        // Create a table inside the namespace
+        let buffer = create_test_ipc_data();
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["ns1".to_string(), "my_table".to_string()]);
+        dir_namespace
+            .create_table(create_table_req, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        // Manually insert a table_version entry to simulate version tracking
+        let manifest_ns = dir_namespace.manifest_ns.as_ref().unwrap();
+        let table_object_id = ManifestNamespace::build_object_id(&["ns1".to_string()], "my_table");
+        let version_object_id = ManifestNamespace::build_version_object_id(&table_object_id, 1);
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![super::ManifestEntry {
+                    object_id: version_object_id,
+                    object_type: super::ObjectType::TableVersion,
+                    location: None,
+                    metadata: Some("{\"manifest_path\":\"fake\"}".to_string()),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Drop the table — should also clean up version entries
+        let mut drop_table_req = DropTableRequest::new();
+        drop_table_req.id = Some(vec!["ns1".to_string(), "my_table".to_string()]);
+        dir_namespace.drop_table(drop_table_req).await.unwrap();
+
+        // Verify the table is gone
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec!["ns1".to_string()]);
+        let list_resp = dir_namespace.list_tables(list_req).await.unwrap();
+        assert!(
+            list_resp.tables.is_empty(),
+            "Table should be gone after drop"
+        );
+
+        // Now drop the namespace — this must succeed because version entries
+        // were cleaned up during drop_table.
+        let mut drop_ns_req = DropNamespaceRequest::new();
+        drop_ns_req.id = Some(vec!["ns1".to_string()]);
+        let result = dir_namespace.drop_namespace(drop_ns_req).await;
+        assert!(
+            result.is_ok(),
+            "drop_namespace should succeed after drop_table cleaned up version entries: {:?}",
+            result.err()
+        );
+    }
+
+    /// Test that delete_all_table_versions_for_table removes version entries
+    /// but does not affect the table entry itself.
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_delete_all_table_versions_for_table(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .table_version_storage_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let buffer = create_test_ipc_data();
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["versioned_table".to_string()]);
+        dir_namespace
+            .create_table(create_req, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        let manifest_ns = dir_namespace.manifest_ns.as_ref().unwrap();
+        let table_object_id = ManifestNamespace::build_object_id(&[], "versioned_table");
+
+        // Insert several table_version entries
+        for v in 1..=3 {
+            let version_oid = ManifestNamespace::build_version_object_id(&table_object_id, v);
+            manifest_ns
+                .insert_into_manifest_with_metadata(
+                    vec![super::ManifestEntry {
+                        object_id: version_oid,
+                        object_type: super::ObjectType::TableVersion,
+                        location: None,
+                        metadata: Some(format!("{{\"manifest_path\":\"v{}\"}}", v)),
+                    }],
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Verify versions exist
+        let versions = manifest_ns
+            .query_table_versions(&table_object_id, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.len(),
+            3,
+            "Should have 3 version entries before cleanup"
+        );
+
+        // Delete all version entries
+        manifest_ns
+            .delete_all_table_versions_for_table(&table_object_id)
+            .await
+            .unwrap();
+
+        // Verify all version entries are gone
+        let versions_after = manifest_ns
+            .query_table_versions(&table_object_id, false, None)
+            .await
+            .unwrap();
+        assert!(
+            versions_after.is_empty(),
+            "All version entries should be removed, found {}",
+            versions_after.len()
+        );
+
+        // Verify the table entry itself is NOT affected
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["versioned_table".to_string()]);
+        let exists_result = dir_namespace.table_exists(exists_req).await;
+        assert!(
+            exists_result.is_ok(),
+            "Table entry should still exist after deleting version entries: {:?}",
+            exists_result.err()
+        );
     }
 }
