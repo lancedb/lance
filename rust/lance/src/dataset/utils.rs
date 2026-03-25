@@ -281,9 +281,14 @@ pub fn object_store_params_for_base_path<'a>(
         None => ObjectStoreParams::default(),
         Some(params) => params.clone(),
     };
+    let base_path_prefix = format!("base{}.", base_path.id);
     if let Some(params_storage_options) = output_params.storage_options() {
         for (k, v) in params_storage_options {
-            merged_storage_options.insert(k.into(), v.into());
+            if let Some(stripped) = k.strip_prefix(&base_path_prefix) {
+                merged_storage_options.insert(stripped.into(), v.into());
+            } else {
+                merged_storage_options.insert(k.into(), v.into());
+            }
         }
     }
     let input_accessor = output_params.storage_options_accessor.unwrap_or_default();
