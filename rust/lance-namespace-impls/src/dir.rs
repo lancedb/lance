@@ -1145,7 +1145,7 @@ impl DirectoryNamespace {
                 })?
                 .ok_or_else(|| {
                     lance_core::Error::from(NamespaceError::TransactionNotFound {
-                        message: format!("Transaction not found for version {}", version),
+                        message: format!("version {}", version),
                     })
                 })?;
             return Ok((version, transaction));
@@ -1179,7 +1179,7 @@ impl DirectoryNamespace {
         }
 
         Err(NamespaceError::TransactionNotFound {
-            message: format!("Transaction not found: {}", id),
+            message: id.to_string(),
         }
         .into())
     }
@@ -1484,7 +1484,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
             return Err(NamespaceError::NamespaceAlreadyExists {
-                message: "Root namespace already exists and cannot be created".to_string(),
+                message: "root namespace".to_string(),
             }
             .into());
         }

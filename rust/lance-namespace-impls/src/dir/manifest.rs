@@ -1414,10 +1414,7 @@ impl ManifestNamespace {
             });
         }
         Err(NamespaceError::TableVersionNotFound {
-            message: format!(
-                "Version {} not found in manifest for table {:?}",
-                version, table_id
-            ),
+            message: format!("version {} for table {:?}", version, table_id),
         }
         .into())
     }
@@ -1443,7 +1440,7 @@ impl ManifestNamespace {
             let object_id = partial_path.join(DELIMITER);
             if !self.manifest_contains_object(&object_id).await? {
                 return Err(NamespaceError::NamespaceNotFound {
-                    message: format!("Parent namespace '{}' does not exist", object_id),
+                    message: format!("parent namespace '{}'", object_id),
                 }
                 .into());
             }
@@ -1841,7 +1838,7 @@ impl LanceNamespace for ManifestNamespace {
                 }
             }
             None => Err(NamespaceError::TableNotFound {
-                message: format!("Table '{}' not found", object_id),
+                message: object_id.to_string(),
             }
             .into()),
         }
@@ -1868,7 +1865,7 @@ impl LanceNamespace for ManifestNamespace {
             Ok(())
         } else {
             Err(NamespaceError::TableNotFound {
-                message: format!("Table '{}' not found", table_name),
+                message: table_name.to_string(),
             }
             .into())
         }
@@ -2033,7 +2030,7 @@ impl LanceNamespace for ManifestNamespace {
                 })
             }
             None => Err(NamespaceError::TableNotFound {
-                message: format!("Table '{}' not found", table_name),
+                message: table_name.to_string(),
             }
             .into()),
         }
@@ -2125,7 +2122,7 @@ impl LanceNamespace for ManifestNamespace {
                 ..Default::default()
             }),
             None => Err(NamespaceError::NamespaceNotFound {
-                message: format!("Namespace '{}' not found", object_id),
+                message: object_id.to_string(),
             }
             .into()),
         }
@@ -2144,7 +2141,7 @@ impl LanceNamespace for ManifestNamespace {
         // Root namespace always exists and cannot be created
         if namespace_id.is_empty() {
             return Err(NamespaceError::NamespaceAlreadyExists {
-                message: "Root namespace already exists and cannot be created".to_string(),
+                message: "root namespace".to_string(),
             }
             .into());
         }
@@ -2158,7 +2155,7 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = namespace_id.join(DELIMITER);
         if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::NamespaceAlreadyExists {
-                message: format!("Namespace '{}' already exists", object_id),
+                message: object_id.to_string(),
             }
             .into());
         }
@@ -2209,7 +2206,7 @@ impl LanceNamespace for ManifestNamespace {
         // Check if namespace exists
         if !self.manifest_contains_object(&object_id).boxed().await? {
             return Err(NamespaceError::NamespaceNotFound {
-                message: format!("Namespace '{}' not found", object_id),
+                message: object_id.to_string(),
             }
             .into());
         }
@@ -2238,10 +2235,7 @@ impl LanceNamespace for ManifestNamespace {
 
         if count > 0 {
             return Err(NamespaceError::NamespaceNotEmpty {
-                message: format!(
-                    "Namespace '{}' is not empty (contains {} child objects)",
-                    object_id, count
-                ),
+                message: format!("'{}' (contains {} child objects)", object_id, count),
             }
             .into());
         }
@@ -2268,7 +2262,7 @@ impl LanceNamespace for ManifestNamespace {
             Ok(())
         } else {
             Err(NamespaceError::NamespaceNotFound {
-                message: format!("Namespace '{}' not found", object_id),
+                message: object_id.to_string(),
             }
             .into())
         }
@@ -2295,7 +2289,7 @@ impl LanceNamespace for ManifestNamespace {
         let existing = self.query_manifest_for_table(&object_id).await?;
         if existing.is_some() {
             return Err(NamespaceError::TableAlreadyExists {
-                message: format!("Table '{}' already exists", table_name),
+                message: table_name.to_string(),
             }
             .into());
         }
@@ -2437,7 +2431,7 @@ impl LanceNamespace for ManifestNamespace {
         // Check if table already exists
         if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::TableAlreadyExists {
-                message: format!("Table '{}' already exists", object_id),
+                message: object_id.to_string(),
             }
             .into());
         }
@@ -2483,7 +2477,7 @@ impl LanceNamespace for ManifestNamespace {
             }
             None => {
                 return Err(NamespaceError::TableNotFound {
-                    message: format!("Table '{}' not found", object_id),
+                    message: object_id.to_string(),
                 }
                 .into());
             }
