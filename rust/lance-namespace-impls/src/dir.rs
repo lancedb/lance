@@ -816,13 +816,13 @@ impl DirectoryNamespace {
         if let Some(version) = version
             && version < 0
         {
-            return Err(Error::invalid_input_source(
-                format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "Table version for {} must be non-negative, got {}",
                     operation, version
-                )
-                .into(),
-            ));
+                ),
+            }
+            .into());
         }
 
         let mut builder = DatasetBuilder::from_uri(table_uri);
@@ -834,24 +834,22 @@ impl DirectoryNamespace {
         }
 
         let dataset = builder.load().await.map_err(|e| {
-            Error::namespace_source(
-                format!(
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!(
                     "Failed to open table at '{}' for {}: {}",
                     table_uri, operation, e
-                )
-                .into(),
-            )
+                ),
+            })
         })?;
 
         if let Some(version) = version {
             return dataset.checkout_version(version as u64).await.map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                    message: format!(
                         "Failed to checkout version {} for table at '{}' during {}: {}",
                         version, table_uri, operation, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             });
         }
 
@@ -875,22 +873,22 @@ impl DirectoryNamespace {
             "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
-            other => Err(Error::invalid_input_source(
-                format!("Unsupported index_type '{}'", other).into(),
-            )),
+            other => Err(NamespaceError::InvalidInput {
+                message: format!("Unsupported index_type '{}'", other),
+            }
+            .into()),
         }
     }
 
     fn parse_metric_type(distance_type: Option<&str>) -> Result<MetricType> {
         let distance_type = distance_type.unwrap_or("l2");
         MetricType::try_from(distance_type).map_err(|e| {
-            Error::invalid_input_source(
-                format!(
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!(
                     "Unsupported distance_type '{}' for vector index: {}",
                     distance_type, e
-                )
-                .into(),
-            )
+                ),
+            })
         })
     }
 
@@ -938,13 +936,13 @@ impl DirectoryNamespace {
                 }
                 if let Some(max_token_length) = request.max_token_length {
                     if max_token_length < 0 {
-                        return Err(Error::invalid_input_source(
-                            format!(
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
                                 "FTS max_token_length must be non-negative, got {}",
                                 max_token_length
-                            )
-                            .into(),
-                        ));
+                            ),
+                        }
+                        .into());
                     }
                     params = params.max_token_length(Some(max_token_length as usize));
                 }
@@ -1020,9 +1018,10 @@ impl DirectoryNamespace {
                 ),
             },
             other => {
-                return Err(Error::invalid_input_source(
-                    format!("Unsupported index type for namespace API: {}", other).into(),
-                ));
+                return Err(NamespaceError::InvalidInput {
+                    message: format!("Unsupported index type for namespace API: {}", other),
+                }
+                .into());
             }
         })
     }
@@ -1137,26 +1136,28 @@ impl DirectoryNamespace {
                 .read_transaction_by_version(version)
                 .await
                 .map_err(|e| {
-                    Error::namespace_source(
-                        format!("Failed to read transaction for version {}: {}", version, e).into(),
-                    )
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to read transaction for version {}: {}",
+                            version, e
+                        ),
+                    })
                 })?
                 .ok_or_else(|| {
-                    Error::namespace_source(
-                        format!("Transaction not found for version {}", version).into(),
-                    )
+                    lance_core::Error::from(NamespaceError::TransactionNotFound {
+                        message: format!("Transaction not found for version {}", version),
+                    })
                 })?;
             return Ok((version, transaction));
         }
 
         let versions = dataset.versions().await.map_err(|e| {
-            Error::namespace_source(
-                format!(
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
                     "Failed to list table versions while resolving transaction '{}': {}",
                     id, e
-                )
-                .into(),
-            )
+                ),
+            })
         })?;
 
         for version in versions.into_iter().rev() {
@@ -1164,13 +1165,12 @@ impl DirectoryNamespace {
                 .read_transaction_by_version(version.version)
                 .await
                 .map_err(|e| {
-                    Error::namespace_source(
-                        format!(
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
                             "Failed to read transaction for version {} while resolving '{}': {}",
                             version.version, id, e
-                        )
-                        .into(),
-                    )
+                        ),
+                    })
                 })?
                 && transaction.uuid == id
             {
@@ -1178,9 +1178,10 @@ impl DirectoryNamespace {
             }
         }
 
-        Err(Error::namespace_source(
-            format!("Transaction not found: {}", id).into(),
-        ))
+        Err(NamespaceError::TransactionNotFound {
+            message: format!("Transaction not found: {}", id),
+        }
+        .into())
     }
 
     fn table_full_uri(&self, table_name: &str) -> String {
@@ -2468,30 +2469,28 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to create {} index '{}' on column '{}' for table '{}': {}",
                         request.index_type,
                         request.name.as_deref().unwrap_or("<auto-generated>"),
                         request.column,
                         table_uri,
                         e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?;
 
         let transaction_id = dataset
             .read_transaction()
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to read committed transaction after creating index on '{}': {}",
                         table_uri, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?
             .map(|transaction| transaction.uuid);
 
@@ -2510,9 +2509,9 @@ impl LanceNamespace for DirectoryNamespace {
             .describe_indices(None)
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!("Failed to describe table indices for '{}': {}", table_uri, e).into(),
-                )
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to describe table indices for '{}': {}", table_uri, e),
+                })
             })?
             .into_iter()
             .filter(|description| {
@@ -2530,22 +2529,20 @@ impl LanceNamespace for DirectoryNamespace {
                         dataset
                             .schema()
                             .field_path(i32::try_from(*field_id).map_err(|e| {
-                                Error::namespace_source(
-                                    format!(
+                                lance_core::Error::from(NamespaceError::Internal {
+                                    message: format!(
                                         "Field id {} does not fit in i32 for table '{}': {}",
                                         field_id, table_uri, e
-                                    )
-                                    .into(),
-                                )
+                                    ),
+                                })
                             })?)
                             .map_err(|e| {
-                            Error::namespace_source(
-                                format!(
+                            lance_core::Error::from(NamespaceError::Internal {
+                                message: format!(
                                     "Failed to resolve field path for field_id {} in table '{}': {}",
                                     field_id, table_uri, e
-                                )
-                                .into(),
-                            )
+                                ),
+                            })
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -2575,48 +2572,46 @@ impl LanceNamespace for DirectoryNamespace {
             .load_dataset(&table_uri, request.version, "describe_table_index_stats")
             .await?;
         let index_name = request.index_name.as_deref().ok_or_else(|| {
-            Error::invalid_input_source(
-                "Index name is required for describe_table_index_stats".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Index name is required for describe_table_index_stats".to_string(),
+            })
         })?;
         let metadatas = dataset
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to load index '{}' metadata for table '{}': {}",
                         index_name, table_uri, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?;
         if metadatas.first().is_some_and(is_system_index) {
-            return Err(Error::not_supported_source(
-                format!("System index '{}' is not exposed by this API", index_name).into(),
-            ));
+            return Err(NamespaceError::Unsupported {
+                message: format!("System index '{}' is not exposed by this API", index_name),
+            }
+            .into());
         }
 
         let stats =
             <Dataset as lance_index::DatasetIndexExt>::index_statistics(&dataset, index_name)
                 .await
                 .map_err(|e| {
-                    Error::namespace_source(
-                        format!(
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
                             "Failed to describe index statistics for '{}' on table '{}': {}",
                             index_name, table_uri, e
-                        )
-                        .into(),
-                    )
+                        ),
+                    })
                 })?;
         let stats: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-            Error::namespace_source(
-                format!(
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
                     "Failed to parse index statistics for '{}' on table '{}': {}",
                     index_name, table_uri, e
-                )
-                .into(),
-            )
+                ),
+            })
         })?;
 
         Ok(Self::describe_table_index_stats_response(&stats))
@@ -2627,18 +2622,19 @@ impl LanceNamespace for DirectoryNamespace {
         request: DescribeTransactionRequest,
     ) -> Result<DescribeTransactionResponse> {
         let mut request_id = request.id.ok_or_else(|| {
-            Error::invalid_input_source(
-                "Transaction id must include table id and transaction identifier".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Transaction id must include table id and transaction identifier"
+                    .to_string(),
+            })
         })?;
         if request_id.len() < 2 {
-            return Err(Error::invalid_input_source(
-                format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "Transaction request id must include table id and transaction identifier, got {:?}",
                     request_id
-                )
-                .into(),
-            ));
+                ),
+            }
+            .into());
         }
 
         let id = request_id.pop().expect("request_id len checked above");
@@ -2658,13 +2654,13 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateTableScalarIndexResponse> {
         let index_type = Self::parse_index_type(&request.index_type)?;
         if !index_type.is_scalar() {
-            return Err(Error::invalid_input_source(
-                format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "create_table_scalar_index only supports scalar index types, got {}",
                     request.index_type
-                )
-                .into(),
-            ));
+                ),
+            }
+            .into());
         }
 
         let response = self.create_table_index(request).await?;
@@ -2679,7 +2675,9 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<DropTableIndexResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let index_name = request.index_name.as_deref().ok_or_else(|| {
-            Error::invalid_input_source("Index name is required for drop_table_index".into())
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Index name is required for drop_table_index".to_string(),
+            })
         })?;
         let mut dataset = self
             .load_dataset(&table_uri, None, "drop_table_index")
@@ -2688,45 +2686,42 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to load index '{}' before dropping it from table '{}': {}",
                         index_name, table_uri, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?;
         if metadatas.first().is_some_and(is_system_index) {
-            return Err(Error::not_supported_source(
-                format!(
+            return Err(NamespaceError::Unsupported {
+                message: format!(
                     "System index '{}' cannot be dropped via this API",
                     index_name
-                )
-                .into(),
-            ));
+                ),
+            }
+            .into());
         }
 
         dataset.drop_index(index_name).await.map_err(|e| {
-            Error::namespace_source(
-                format!(
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
                     "Failed to drop index '{}' from table '{}': {}",
                     index_name, table_uri, e
-                )
-                .into(),
-            )
+                ),
+            })
         })?;
 
         let transaction_id = dataset
             .read_transaction()
             .await
             .map_err(|e| {
-                Error::namespace_source(
-                    format!(
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
                         "Failed to read committed transaction after dropping index '{}' from '{}': {}",
                         index_name, table_uri, e
-                    )
-                    .into(),
-                )
+                    ),
+                })
             })?
             .map(|transaction| transaction.uuid);
 
