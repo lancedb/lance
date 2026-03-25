@@ -369,9 +369,7 @@ class TestMultiBase:
 
         base_paths = dataset._ds.base_paths()
         path1_base = next(bp for bp in base_paths.values() if bp.name == "path1")
-        assert path1_base.storage_options == {
-            "azure_storage_account_name": "account1"
-        }
+        assert path1_base.storage_options == {"azure_storage_account_name": "account1"}
 
     def test_multi_base_target_by_path_uri(self):
         """Test using path URIs instead of names in target_bases."""
