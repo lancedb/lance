@@ -51,7 +51,8 @@ class IndicesBuilder:
             the dataset containing the data
         column: str
             The vector column to index, must be a fixed size list of floats
-            or 1-dimensional fixed-shape tensor column.
+            (or unsigned integers for hamming distance) or 1-dimensional
+            fixed-shape tensor column.
         """
         self.dataset = dataset
         self.column = self._normalize_column(column)
@@ -89,7 +90,7 @@ class IndicesBuilder:
             overtraining, reduced recall, and require large nprobes values.  If not
             specified the default will be the integer nearest the square root of the
             number of rows.
-        distance_type: "l2" | "dot" | "cosine"
+        distance_type: "l2" | "dot" | "cosine" | "hamming"
             The distance type to used.  This is defined in more detail in the LanceDB
             documentation on creating indices.
         accelerator: str | torch.Device
@@ -529,6 +530,7 @@ class IndicesBuilder:
             "cosine",
             "euclidean",
             "dot",
+            "hamming",
         ]:
             raise ValueError(f"Distance type {distance_type} not supported.")
         return distance_type.lower()
@@ -555,10 +557,13 @@ class IndicesBuilder:
                     f"Vector column {c} must be FixedSizeListArray "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
-            if not pa.types.is_floating(field.type.value_type):
+            if not (
+                pa.types.is_floating(field.type.value_type)
+                or pa.types.is_unsigned_integer(field.type.value_type)
+            ):
                 raise TypeError(
-                    f"Vector column {c} must have floating value type, "
-                    f"got {field.type.value_type}"
+                    f"Vector column {c} must have floating or unsigned integer "
+                    f"value type, got {field.type.value_type}"
                 )
 
         return column

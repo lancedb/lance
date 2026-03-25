@@ -77,6 +77,31 @@ def test_ivf_centroids(tmpdir, rand_dataset):
     assert ivf.centroids == reloaded.centroids
 
 
+def test_ivf_centroids_hamming(tmpdir):
+    num_rows = NUM_ROWS
+    vectors = np.random.randint(0, 256, size=(num_rows, DIMENSION), dtype=np.uint8)
+    vectors_flat = vectors.reshape(-1)
+    vectors_arr = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors_flat, type=pa.uint8()), DIMENSION
+    )
+    table = pa.Table.from_arrays([vectors_arr], names=["vectors"])
+    uri = str(tmpdir / "hamming_dataset")
+    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        sample_rate=16, distance_type="hamming"
+    )
+
+    assert ivf.distance_type == "hamming"
+    expected_partitions = round(math.sqrt(num_rows))
+    assert len(ivf.centroids) == expected_partitions
+
+    ivf.save(str(tmpdir / "ivf_hamming"))
+    reloaded = IvfModel.load(str(tmpdir / "ivf_hamming"))
+    assert reloaded.distance_type == "hamming"
+    assert ivf.centroids == reloaded.centroids
+
+
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
