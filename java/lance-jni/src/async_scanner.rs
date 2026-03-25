@@ -122,9 +122,21 @@ impl AsyncScanner {
                          This indicates a critical initialization failure.",
                         task_id
                     );
-                    return; // Task will never complete, but won't crash JVM
+                    // Clean up the FFI stream pointer to prevent memory leak
+                    if let Ok(ptr) = result {
+                        unsafe {
+                            drop(Box::from_raw(
+                                ptr as *mut arrow::ffi_stream::FFI_ArrowArrayStream,
+                            ));
+                        }
+                        log::debug!("Cleaned up FFI stream pointer for task {}", task_id);
+                    }
+                    return;
                 }
             };
+
+            // Save the pointer before sending so we can clean up on failure
+            let result_ptr = result.as_ref().ok().copied();
 
             if let Err(e) = dispatcher.send(DispatcherMessage {
                 scanner_global_ref: global_ref_for_task,
@@ -136,6 +148,15 @@ impl AsyncScanner {
                     task_id,
                     e
                 );
+                // Clean up the FFI stream pointer to prevent memory leak
+                if let Some(ptr) = result_ptr {
+                    unsafe {
+                        drop(Box::from_raw(
+                            ptr as *mut arrow::ffi_stream::FFI_ArrowArrayStream,
+                        ));
+                    }
+                    log::debug!("Cleaned up FFI stream pointer for task {}", task_id);
+                }
             }
 
             // _cleanup_guard.drop() called here automatically, removing task from tracker

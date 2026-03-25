@@ -94,6 +94,7 @@ fn handle_error(
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to create JString for error: {:?}", e);
+            let _ = env.exception_clear();
             return;
         }
     };
@@ -114,6 +115,8 @@ fn handle_error(
 
     if let Err(e) = result {
         log::error!("Failed to call failTask: {:?}", e);
+        // Clear any pending JNI exception to protect the dispatcher loop
+        let _ = env.exception_clear();
     }
 }
 
@@ -139,5 +142,17 @@ fn handle_success(
 
     if let Err(e) = result {
         log::error!("Failed to call completeTask: {:?}", e);
+        // Clear any pending JNI exception to protect the dispatcher loop
+        let _ = env.exception_clear();
+        // Clean up the FFI stream since Java won't receive it
+        unsafe {
+            drop(Box::from_raw(
+                result_ptr as *mut arrow::ffi_stream::FFI_ArrowArrayStream,
+            ));
+        }
+        log::debug!(
+            "Cleaned up FFI stream pointer for task {} after completeTask failure",
+            task_id
+        );
     }
 }
