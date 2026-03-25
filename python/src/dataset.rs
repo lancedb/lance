@@ -87,7 +87,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::{PyIndexConfig, PyIndexDescription};
+use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentPlan};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
@@ -320,6 +320,78 @@ impl MergeInsertBuilder {
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+}
+
+#[pyclass(name = "IndexSegmentBuilder", module = "lance", subclass)]
+#[derive(Clone)]
+pub struct PyIndexSegmentBuilder {
+    dataset: Arc<LanceDataset>,
+    segments: Vec<IndexMetadata>,
+    target_segment_bytes: Option<u64>,
+}
+
+impl PyIndexSegmentBuilder {
+    fn builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
+        let mut builder = self
+            .dataset
+            .create_index_segment_builder()
+            .with_segments(self.segments.clone());
+        if let Some(target_segment_bytes) = self.target_segment_bytes {
+            builder = builder.with_target_segment_bytes(target_segment_bytes);
+        }
+        builder
+    }
+}
+
+#[pymethods]
+impl PyIndexSegmentBuilder {
+    fn with_segments<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        segments: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let mut indices = Vec::new();
+        for item in segments.try_iter()? {
+            indices.push(item?.extract::<PyLance<IndexMetadata>>()?.0);
+        }
+        slf.segments = indices;
+        Ok(slf)
+    }
+
+    fn with_target_segment_bytes<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        bytes: u64,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.target_segment_bytes = Some(bytes);
+        Ok(slf)
+    }
+
+    fn plan(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegmentPlan>>> {
+        let plans = rt()
+            .block_on(Some(py), self.builder().plan())?
+            .infer_error()?;
+        plans
+            .into_iter()
+            .map(|plan| Py::new(py, PyIndexSegmentPlan::from_inner(plan)))
+            .collect()
+    }
+
+    fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
+        let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
+        let segment = rt()
+            .block_on(Some(py), self.builder().build(&plan.inner))?
+            .infer_error()?;
+        Py::new(py, PyIndexSegment::from_inner(segment))
+    }
+
+    fn build_all(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegment>>> {
+        let segments = rt()
+            .block_on(Some(py), self.builder().build_all())?
+            .infer_error()?;
+        segments
+            .into_iter()
+            .map(|segment| Py::new(py, PyIndexSegment::from_inner(segment)))
+            .collect()
     }
 }
 
@@ -2017,6 +2089,34 @@ impl Dataset {
         };
 
         Ok(PyLance(index_metadata))
+    }
+
+    fn create_index_segment_builder(&self) -> PyResult<PyIndexSegmentBuilder> {
+        Ok(PyIndexSegmentBuilder {
+            dataset: self.ds.clone(),
+            segments: Vec::new(),
+            target_segment_bytes: None,
+        })
+    }
+
+    fn commit_existing_index_segments(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<PyRef<'_, PyIndexSegment>>,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let segments = segments
+            .into_iter()
+            .map(|segment| segment.inner.clone())
+            .collect();
+        rt().block_on(
+            None,
+            new_self.commit_existing_index_segments(index_name, column, segments),
+        )?
+        .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn drop_index(&mut self, name: &str) -> PyResult<()> {

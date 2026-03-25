@@ -35,6 +35,7 @@ use super::local::LocalObjectReader;
 mod list_retry;
 pub mod providers;
 pub mod storage_options;
+pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};

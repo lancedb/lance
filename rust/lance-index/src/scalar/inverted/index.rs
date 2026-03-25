@@ -109,6 +109,7 @@ pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
+pub const DELETED_FRAGMENTS_COL: &str = "deleted_fragments";
 
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
@@ -342,6 +343,9 @@ pub struct InvertedIndex {
     tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
+    // Fragments which are contained in the index, but no longer in the dataset.
+    // These should be pruned at search time since we don't prune them at update time.
+    deleted_fragments: RoaringBitmap,
 }
 
 impl Debug for InvertedIndex {
@@ -350,6 +354,7 @@ impl Debug for InvertedIndex {
             .field("params", &self.params)
             .field("token_set_format", &self.token_set_format)
             .field("partitions", &self.partitions)
+            .field("deleted_fragments", &self.deleted_fragments)
             .finish()
     }
 }
@@ -399,6 +404,7 @@ impl InvertedIndex {
                 Vec::new(),
                 self.token_set_format,
                 fragment_mask,
+                self.deleted_fragments.clone(),
             )
             .with_posting_tail_codec(self.posting_tail_codec())
         } else {
@@ -421,6 +427,7 @@ impl InvertedIndex {
                 partitions,
                 self.token_set_format,
                 fragment_mask,
+                self.deleted_fragments.clone(),
             )
             .with_format_version(self.format_version())
         }
@@ -437,6 +444,15 @@ impl InvertedIndex {
     /// Returns the number of partitions in this inverted index.
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
+    }
+
+    /// Returns the set of fragments which are contained in the index, but no longer in the dataset.
+    ///
+    /// Most other indices remove data from deleted fragments when the index updates (copy-on-write).
+    /// However, this would require an expensive copy of the FTS index.  Instead, we track the deleted
+    /// fragments and prune them at search time (merge-on-read).
+    pub fn deleted_fragments(&self) -> &RoaringBitmap {
+        &self.deleted_fragments
     }
 
     // search the documents that contain the query
@@ -476,7 +492,12 @@ impl InvertedIndex {
                     if postings.is_empty() {
                         return Result::Ok(PartitionCandidates::empty());
                     }
-                    let mut tokens_by_position = vec![String::new(); postings.len()];
+                    let max_position = postings
+                        .iter()
+                        .map(|posting| posting.term_index() as usize)
+                        .max()
+                        .unwrap_or_default();
+                    let mut tokens_by_position = vec![String::new(); max_position + 1];
                     for posting in &postings {
                         let idx = posting.term_index() as usize;
                         tokens_by_position[idx] = posting.token().to_owned();
@@ -607,6 +628,7 @@ impl InvertedIndex {
                 docs,
                 token_set_format: TokenSetFormat::Arrow,
             })],
+            deleted_fragments: RoaringBitmap::new(),
         }))
     }
 
@@ -648,6 +670,19 @@ impl InvertedIndex {
                     .transpose()?
                     .unwrap_or(TokenSetFormat::Arrow);
 
+                // Load deleted_fragments if present (optional for backward compatibility)
+                let deleted_fragments = if reader.num_rows() > 0 {
+                    let metadata_batch = reader.read_range(0..1, None).await?;
+                    if let Some(col) = metadata_batch.column_by_name(DELETED_FRAGMENTS_COL) {
+                        let arr = col.as_binary_opt::<i32>().expect_ok()?;
+                        RoaringBitmap::deserialize_from(arr.value(0))?
+                    } else {
+                        RoaringBitmap::new()
+                    }
+                } else {
+                    RoaringBitmap::new()
+                };
+
                 let format = token_set_format;
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
@@ -680,6 +715,7 @@ impl InvertedIndex {
                     tokenizer,
                     token_set_format,
                     partitions,
+                    deleted_fragments,
                 }))
             }
             Err(_) => {
@@ -826,9 +862,11 @@ impl ScalarIndex for InvertedIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        self.to_builder().update(new_data, dest_store).await?;
+        self.to_builder()
+            .update(new_data, dest_store, old_data_filter)
+            .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
@@ -978,11 +1016,14 @@ impl InvertedPartition {
             true => self.expand_fuzzy(tokens, params)?,
             false => tokens.clone(),
         };
+        let token_positions = (0..tokens.len())
+            .map(|index| tokens.position(index))
+            .collect::<Vec<_>>();
         let mut token_ids = Vec::with_capacity(tokens.len());
-        for token in tokens {
+        for (index, token) in tokens.into_iter().enumerate() {
             let token_id = self.map(&token);
             if let Some(token_id) = token_id {
-                token_ids.push((token_id, token));
+                token_ids.push((token_id, token, token_positions[index]));
             } else if is_phrase_query {
                 // if the token is not found, we can't do phrase query
                 return Ok(Vec::new());
@@ -992,24 +1033,25 @@ impl InvertedPartition {
             return Ok(Vec::new());
         }
         if !is_phrase_query {
-            // remove duplicates
-            token_ids.sort_unstable_by_key(|(token_id, _)| *token_id);
-            token_ids.dedup_by_key(|(token_id, _)| *token_id);
+            token_ids.sort_unstable_by_key(|(token_id, _, _)| *token_id);
+            token_ids.dedup_by_key(|(token_id, _, _)| *token_id);
         }
 
         let num_docs = self.docs.len();
         stream::iter(token_ids)
-            .enumerate()
-            .map(|(position, (token_id, token))| async move {
+            .map(|(token_id, token, position)| async move {
                 let posting = self
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
 
-                Result::Ok(PostingIterator::new(
+                let query_weight = idf(posting.len(), num_docs);
+
+                Result::Ok(PostingIterator::with_query_weight(
                     token,
                     token_id,
-                    position as u32,
+                    position,
+                    query_weight,
                     posting,
                     num_docs,
                 ))
@@ -4803,7 +4845,6 @@ mod tests {
             "prewarm should not leave cached posting lists sharing the same values buffer"
         );
     }
-
     #[test]
     fn test_block_max_scores_capacity_matches_block_count() {
         let mut docs = DocSet::default();
@@ -5068,5 +5109,55 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
+        // An index created before the deleted_fragments feature was added
+        // will have a metadata file with num_rows=0 (no record batch data).
+        // The load path should gracefully handle this with an empty bitmap.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("test".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.docs.append(100, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        // Write a metadata file WITHOUT the deleted_fragments column
+        // (simulates an older index version)
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            index.deleted_fragments().is_empty(),
+            "index without deleted_fragments column should have empty bitmap"
+        );
     }
 }

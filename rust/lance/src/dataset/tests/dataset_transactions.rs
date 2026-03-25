@@ -377,3 +377,122 @@ async fn test_inline_transaction() {
     let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx);
 }
+
+#[tokio::test]
+async fn test_list_detached_manifests() {
+    let test_uri = TempStrDir::default();
+
+    // Create initial dataset
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+            &test_uri,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+
+    // Initially there should be no detached manifests
+    let detached = dataset.list_detached_manifests().await.unwrap();
+    assert!(detached.is_empty());
+
+    // Create a detached transaction with properties
+    let mut properties = HashMap::new();
+    properties.insert("detached_key".to_string(), "detached_value".to_string());
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+    )
+    .unwrap();
+
+    // Use execute_uncommitted + CommitBuilder with_detached(true)
+    let transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            transaction_properties: Some(Arc::new(properties.clone())),
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch2])
+        .await
+        .unwrap();
+
+    CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(transaction)
+        .await
+        .unwrap();
+
+    // Now there should be one detached manifest
+    let detached = dataset.list_detached_manifests().await.unwrap();
+    assert_eq!(detached.len(), 1);
+
+    // The detached version should have the high bit set
+    let detached_version = detached[0].version;
+    assert!(lance_table::format::is_detached_version(detached_version));
+
+    // We should be able to checkout the detached version and read transaction properties
+    let checked_out = dataset.checkout_version(detached_version).await.unwrap();
+    let tx = checked_out.read_transaction().await.unwrap().unwrap();
+    let tx_props = tx.transaction_properties.unwrap();
+    assert_eq!(
+        tx_props.get("detached_key"),
+        Some(&"detached_value".to_string())
+    );
+
+    // The detached dataset should have more rows
+    assert_eq!(checked_out.count_rows(None).await.unwrap(), 6);
+
+    // Create another detached transaction
+    let batch3 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7, 8, 9]))],
+    )
+    .unwrap();
+
+    let mut properties2 = HashMap::new();
+    properties2.insert("second_key".to_string(), "second_value".to_string());
+
+    let transaction2 = InsertBuilder::new(dataset.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            transaction_properties: Some(Arc::new(properties2)),
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch3])
+        .await
+        .unwrap();
+
+    CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(transaction2)
+        .await
+        .unwrap();
+
+    // Now there should be two detached manifests
+    let detached = dataset.list_detached_manifests().await.unwrap();
+    assert_eq!(detached.len(), 2);
+
+    // Both should be detached versions
+    for loc in &detached {
+        assert!(lance_table::format::is_detached_version(loc.version));
+    }
+
+    // Regular versions() should not include detached manifests
+    let versions = dataset.versions().await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version, 1);
+}

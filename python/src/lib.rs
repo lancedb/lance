@@ -44,7 +44,9 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
+use dataset::{
+    DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PyIndexSegmentBuilder, PySearchFilter,
+};
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -252,6 +254,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRowIdMeta>()?;
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
+    m.add_class::<PyIndexSegmentBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;

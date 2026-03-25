@@ -889,4 +889,55 @@ mod tests {
         // Actual: panic at primitive.rs:1362 - assertion failed: rows_avail > 0
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_large_string_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        // 2.5 million rows, mostly empty lists. ~100 lists have 10 short strings each.
+        let num_rows = 2_500_000u32;
+        let num_non_empty = 100u32;
+        let strings_per_list = 10;
+
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+
+        // Spread non-empty lists evenly across the range
+        let step = num_rows / num_non_empty;
+        let mut next_non_empty = step / 2;
+
+        for i in 0..num_rows {
+            if i == next_non_empty {
+                let vals: Vec<Option<&str>> = (0..strings_per_list)
+                    .map(|j| match j % 4 {
+                        0 => Some("a"),
+                        1 => Some("bb"),
+                        2 => Some("ccc"),
+                        _ => Some("d"),
+                    })
+                    .collect();
+                list_builder.append_value(vals);
+                next_non_empty = next_non_empty.saturating_add(step);
+            } else {
+                list_builder.append_value([] as [Option<&str>; 0]);
+            }
+        }
+        let list_array = list_builder.finish();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
 }

@@ -28,6 +28,9 @@ use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::label_list::{
+    LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
+};
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
@@ -331,6 +334,43 @@ pub async fn fetch_index_details(
     Ok(index_details)
 }
 
+async fn validate_label_list_index_compatibility(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+    index_store: &Arc<LanceIndexStore>,
+) -> Result<()> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Ok(());
+    };
+
+    if !field.nullable {
+        return Ok(());
+    }
+
+    if index.index_version < LABEL_LIST_NULLS_MIN_VERSION {
+        log::warn!(
+            "LabelList index {} is old; NOT filters may be incorrect on nullable lists. Consider rebuilding.",
+            index.name
+        );
+        return Ok(());
+    }
+
+    let reader = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+    if !reader
+        .schema()
+        .metadata
+        .contains_key(LABEL_LIST_NULLS_METADATA_KEY)
+    {
+        return Err(Error::internal(format!(
+            "LabelList index {} is missing required metadata key {}",
+            index.name, LABEL_LIST_NULLS_METADATA_KEY
+        )));
+    }
+
+    Ok(())
+}
+
 pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
@@ -342,6 +382,10 @@ pub async fn open_scalar_index(
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
+
+    if index_details.type_url.ends_with("LabelListIndexDetails") {
+        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
+    }
 
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 

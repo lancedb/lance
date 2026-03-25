@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use crate::IndexType;
+use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -71,5 +73,52 @@ impl IndexSegment {
             self.index_details,
             self.index_version,
         )
+    }
+}
+
+/// A plan for building one physical segment from one or more existing
+/// vector index segments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexSegmentPlan {
+    segment: IndexSegment,
+    segments: Vec<IndexMetadata>,
+    estimated_bytes: u64,
+    requested_index_type: Option<IndexType>,
+}
+
+impl IndexSegmentPlan {
+    /// Create a plan for one built segment.
+    pub fn new(
+        segment: IndexSegment,
+        segments: Vec<IndexMetadata>,
+        estimated_bytes: u64,
+        requested_index_type: Option<IndexType>,
+    ) -> Self {
+        Self {
+            segment,
+            segments,
+            estimated_bytes,
+            requested_index_type,
+        }
+    }
+
+    /// Return the segment metadata that should be committed after this plan is built.
+    pub fn segment(&self) -> &IndexSegment {
+        &self.segment
+    }
+
+    /// Return the input segment metadata that should be combined into the segment.
+    pub fn segments(&self) -> &[IndexMetadata] {
+        &self.segments
+    }
+
+    /// Return the estimated number of bytes covered by this plan.
+    pub fn estimated_bytes(&self) -> u64 {
+        self.estimated_bytes
+    }
+
+    /// Return the requested logical index type, if one was supplied to the planner.
+    pub fn requested_index_type(&self) -> Option<IndexType> {
+        self.requested_index_type
     }
 }

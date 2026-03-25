@@ -1705,3 +1705,369 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         "Fragment 0 should be removed from index bitmap after DataReplacement on indexed column"
     );
 }
+/// Regression test: inverted (FTS) index should not carry stale data after
+/// merge_insert + compact + optimize_indices.
+///
+/// This is the FTS equivalent of test_merge_insert_with_reordered_columns_and_index.
+/// The inverted index's update() ignores the valid_old_fragments filter, so stale
+/// posting list entries from pruned fragments survive the merge and cause errors
+/// when queries try to resolve the old row addresses.
+#[tokio::test]
+async fn test_fts_index_stale_data_after_merge_insert_compact_optimize() {
+    use lance_index::scalar::{FullTextSearchQuery, inverted::InvertedIndexParams};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+
+    // Step 1: Create dataset with 2 rows in separate fragments
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![
+                "the quick brown fox",
+                "the lazy dog",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_fts_stale",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force 2 fragments
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Step 2: Create FTS inverted index on 'text'
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Sanity check: searching "quick" should return 1 result
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 3: merge_insert with reversed column order (text, id)
+    // This triggers the RewriteColumns/DataReplacement path, which prunes the
+    // index fragment bitmap for the 'text' column.
+    let reversed_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("text", DataType::Utf8, true),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source_batch = RecordBatch::try_new(
+        reversed_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "updated fox text",
+                "new entry here",
+            ])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch)],
+        reversed_schema.clone(),
+    ));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+    let mut dataset = dataset.as_ref().clone();
+
+    // Step 4: compact_files — moves rows to new fragment(s)
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    // Step 5: optimize_indices — should rebuild the FTS index without stale data.
+    // With the current bug, the inverted index ignores valid_old_fragments and
+    // merges stale posting list entries pointing at now-deleted fragments.
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Step 6: FTS search should not error and should return correct results.
+    // "quick" appeared in the original data for id=0 (never updated), so it
+    // should still be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'quick' after optimize, got {}",
+        results.num_rows()
+    );
+
+    // "lazy" was in the original text for id=1, but id=1 was updated to
+    // "updated fox text". The old posting for "lazy" should have been filtered
+    // out during the index update.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        0,
+        "Expected 0 results for 'lazy' (stale data should be filtered), got {}",
+        results.num_rows()
+    );
+
+    // "updated" should be found (new text for id=1)
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("updated".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // "entry" should be found (new row id=2)
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("entry".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 7: Another merge_insert should NOT error
+    let source_batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["final text"])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job2 = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+
+    let reader2 = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch2)],
+        schema.clone(),
+    ));
+    let (final_dataset, _) = merge_job2.execute(reader_to_stream(reader2)).await.unwrap();
+    final_dataset.validate().await.unwrap();
+}
+
+/// Regression test: when rows are updated in-place, the FTS index must
+/// invalidate old entries and allow re-indexing incrementally.
+///
+/// Sequence:
+/// 1. Write fragments 1 and 2.
+/// 2. Create FTS index covering fragments 1 and 2.
+/// 3. Update fragment 1 in-place via merge_insert (DataReplacement path).
+///    This removes fragment 1 from the index's fragment_bitmap.
+/// 4. Call optimize_indices (append) to create a new index segment covering
+///    the updated fragment 1.
+/// 5. Call optimize_indices (merge) to merge both segments. The first segment
+///    contains the old, invalidated values for fragment 1; the second segment
+///    contains the new, valid values. We must keep only the new values.
+#[tokio::test]
+async fn test_fts_index_incremental_reindex_after_in_place_update() {
+    use lance_index::scalar::{FullTextSearchQuery, inverted::InvertedIndexParams};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+
+    // Step 1: Create dataset with 2 rows in separate fragments
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![
+                "the quick brown fox",
+                "the lazy dog",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_fts_incremental_reindex",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force 2 fragments
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Step 2: Create FTS inverted index on 'text'
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Sanity check: "quick" and "lazy" should each return 1 result
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    // Step 3: merge_insert with reversed column order to trigger
+    // RewriteColumns/DataReplacement path, which prunes the index
+    // fragment bitmap for the updated fragment.
+    // Update id=1 ("the lazy dog" -> "a speedy cat")
+    let reversed_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("text", DataType::Utf8, true),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source_batch = RecordBatch::try_new(
+        reversed_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a speedy cat"])),
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source_batch)],
+        reversed_schema.clone(),
+    ));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+    let mut dataset = dataset.as_ref().clone();
+
+    // Step 4: First optimize_indices (append) — creates a new index segment
+    // covering the updated (previously unindexed) fragment.
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    // At this point we have two index segments:
+    //  - Segment 1: original index (has old data for fragment with id=1)
+    //  - Segment 2: new delta index (has new data for the updated fragment)
+
+    // Step 5: Second optimize_indices (merge all) — merges both segments.
+    // The merge must discard old invalidated entries from segment 1 for
+    // the updated fragment and keep only the new entries from segment 2.
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Step 6: Verify search correctness after merge.
+
+    // "quick" was in the original data for id=0 (not updated), should still be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("quick".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'quick' (id=0 was not updated), got {}",
+        results.num_rows()
+    );
+
+    // "lazy" was in the old text for id=1 which was updated to "a speedy cat".
+    // The old posting for "lazy" must have been filtered out during the merge.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lazy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        0,
+        "Expected 0 results for 'lazy' (stale data should be filtered), got {}",
+        results.num_rows()
+    );
+
+    // "speedy" is in the new text for id=1, should be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("speedy".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'speedy' (new text for id=1), got {}",
+        results.num_rows()
+    );
+
+    // "cat" is in the new text for id=1, should be found.
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("cat".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        results.num_rows(),
+        1,
+        "Expected 1 result for 'cat' (new text for id=1), got {}",
+        results.num_rows()
+    );
+}

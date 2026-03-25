@@ -7514,6 +7514,558 @@ mod test {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_like_prefix_with_btree_index() {
+        // Create dataset with string data that has various prefixes
+        // Avoid LIKE special characters (%, _) in data to keep tests simple
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(data, "memory://test_like", None)
+            .await
+            .unwrap();
+
+        // Create BTree index on string column
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test 1: Verify LIKE 'app%' uses scalar index and returns correct results
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("name LIKE 'app%'"),
+            "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
+             range_before=None, range_after=None, row_id=false, row_addr=false, \
+             full_filter=name LIKE Utf8(\"app%\"), refine_filter=--
+               ScalarIndexQuery: query=[name LIKE 'app%']@name_idx",
+        )
+        .await
+        .unwrap();
+
+        // Verify correct results for LIKE 'app%'
+        let results = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: apple, application, app (repeated in cycle)
+        assert!(names.iter().all(|n| n.starts_with("app")));
+        assert!(!names.is_empty());
+
+        // Test 2: Verify starts_with() uses scalar index (simple prefix without special chars)
+        // Note: DataFusion optimizes starts_with() to LIKE before our index planning
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("starts_with(name, 'ban')"),
+            "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
+             range_before=None, range_after=None, row_id=false, row_addr=false, \
+             full_filter=name LIKE Utf8(\"ban%\"), refine_filter=--
+               ScalarIndexQuery: query=[name LIKE 'ban%']@name_idx",
+        )
+        .await
+        .unwrap();
+
+        // Verify correct results for starts_with
+        let results = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: banana, band
+        assert!(names.iter().all(|n| n.starts_with("ban")));
+        assert!(!names.is_empty());
+
+        // Test 3: LIKE with pattern requiring refine (e.g., 'test%2')
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("name LIKE 'test%2'"),
+            "ProjectionExec: expr=[name@0 as name, id@1 as id]
+  LanceRead: uri=..., projection=[name, id], num_fragments=1, \
+range_before=None, range_after=None, row_id=true, row_addr=false, \
+full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
+    ScalarIndexQuery: query=[name LIKE 'test%']@name_idx",
+        )
+        .await
+        .unwrap();
+
+        // Verify correct results for LIKE 'test%2' (needs refine)
+        let results = dataset
+            .scan()
+            .filter("name LIKE 'test%2'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: testns2 (ends with '2')
+        assert!(
+            names
+                .iter()
+                .all(|n| n.starts_with("test") && n.ends_with("2"))
+        );
+
+        // Test 4: LIKE starting with wildcard should NOT use scalar index for pruning
+        // Verify by checking the plan does NOT have ScalarIndexQuery
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE '%app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            !plan_str.contains("ScalarIndexQuery"),
+            "LIKE '%app%' should not use scalar index, but got: {}",
+            plan_str
+        );
+
+        // Verify correct results for LIKE '%app%'
+        let results = dataset
+            .scan()
+            .filter("name LIKE '%app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: apple, application, app (contain 'app')
+        assert!(names.iter().all(|n| n.contains("app")));
+
+        // Test 5: NOT LIKE should NOT use scalar index
+        let mut scanner = dataset.scan();
+        scanner.filter("name NOT LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            !plan_str.contains("ScalarIndexQuery"),
+            "NOT LIKE should not use scalar index, but got: {}",
+            plan_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_correctness_with_btree_index() {
+        // Create dataset with deterministic string data for exact result verification
+        let names: Vec<&str> = vec![
+            "alpha", "alphabet", "beta", "gamma", "delta", "epsilon", "eta", "theta", "iota",
+            "kappa",
+        ];
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..10)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(data)],
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+        );
+
+        let mut dataset = Dataset::write(reader, "memory://test_like_correctness", None)
+            .await
+            .unwrap();
+
+        // Create BTree index
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test with index
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Test without index (for comparison)
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Both should return same results: alpha, alphabet
+        assert_eq!(with_index.num_rows(), without_index.num_rows());
+        assert_eq!(with_index.num_rows(), 2);
+
+        let with_index_names: BTreeSet<String> = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        let without_index_names: BTreeSet<String> = without_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        assert_eq!(with_index_names, without_index_names);
+        assert_eq!(
+            with_index_names,
+            BTreeSet::from(["alpha".to_string(), "alphabet".to_string()])
+        );
+
+        // Test starts_with correctness
+        let starts_with_result = dataset
+            .scan()
+            .filter("starts_with(name, 'e')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let starts_with_names: BTreeSet<String> = starts_with_result
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        // Should match: epsilon, eta
+        assert_eq!(
+            starts_with_names,
+            BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_with_zone_map() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        // Create dataset with string data that has various prefixes
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(data, "memory://test_like_zonemap", None)
+            .await
+            .unwrap();
+
+        // Create ZoneMap index on string column
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test 1: Verify LIKE 'app%' uses zone map index
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        // Zone map uses ScalarIndexExec with LikePrefix query
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "LIKE 'app%' should use zone map index with LikePrefix, but got: {}",
+            plan_str
+        );
+
+        // Verify correct results for LIKE 'app%'
+        let results = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with("app")));
+        assert!(!names.is_empty());
+
+        // Test 2: Verify starts_with() uses zone map index
+        let mut scanner = dataset.scan();
+        scanner.filter("starts_with(name, 'ban')").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "starts_with should use zone map index with LikePrefix, but got: {}",
+            plan_str
+        );
+
+        // Verify correct results
+        let results = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with("ban")));
+
+        // Test 3: LIKE with refine pattern still uses zone map for prefix pruning
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'test%2'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "LIKE 'test%2' should use zone map index for prefix, but got: {}",
+            plan_str
+        );
+
+        // Test 4: LIKE starting with wildcard should NOT use zone map
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE '%app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            !plan_str.contains("LikePrefix"),
+            "LIKE '%app%' should not use LikePrefix index, but got: {}",
+            plan_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_correctness_with_zone_map() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        // Create dataset with deterministic string data for exact result verification
+        let names: Vec<&str> = vec![
+            "alpha", "alphabet", "beta", "gamma", "delta", "epsilon", "eta", "theta", "iota",
+            "kappa",
+        ];
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..10)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(data)],
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+        );
+
+        let mut dataset = Dataset::write(reader, "memory://test_like_correctness_zonemap", None)
+            .await
+            .unwrap();
+
+        // Create ZoneMap index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test with zone map index
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Test without index (for comparison)
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Both should return same results: alpha, alphabet
+        assert_eq!(with_index.num_rows(), without_index.num_rows());
+        assert_eq!(with_index.num_rows(), 2);
+
+        let with_index_names: BTreeSet<String> = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        let without_index_names: BTreeSet<String> = without_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        assert_eq!(with_index_names, without_index_names);
+        assert_eq!(
+            with_index_names,
+            BTreeSet::from(["alpha".to_string(), "alphabet".to_string()])
+        );
+
+        // Test starts_with correctness with zone map
+        let starts_with_result = dataset
+            .scan()
+            .filter("starts_with(name, 'e')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let starts_with_names: BTreeSet<String> = starts_with_result
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        // Should match: epsilon, eta
+        assert_eq!(
+            starts_with_names,
+            BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_late_materialization(

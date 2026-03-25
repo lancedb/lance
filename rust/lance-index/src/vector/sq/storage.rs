@@ -36,7 +36,7 @@ use crate::{
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
     pub dim: usize,
     pub num_bits: u16,

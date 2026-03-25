@@ -2,17 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
-use crate::scalar::IndexStore;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
+use crate::scalar::{IndexStore, OldIndexDataFilter};
 use crate::vector::graph::OrderedFloat;
 use crate::{progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
-use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
@@ -27,6 +27,7 @@ use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cp
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -125,6 +126,7 @@ pub struct InvertedIndexBuilder {
     posting_tail_codec: PostingTailCodec,
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
+    deleted_fragments: RoaringBitmap,
 }
 
 impl InvertedIndexBuilder {
@@ -139,6 +141,7 @@ impl InvertedIndexBuilder {
             Vec::new(),
             TokenSetFormat::default(),
             fragment_mask,
+            RoaringBitmap::new(),
         )
     }
 
@@ -154,6 +157,7 @@ impl InvertedIndexBuilder {
         partitions: Vec<u64>,
         token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
+        deleted_fragments: RoaringBitmap,
     ) -> Self {
         Self {
             params,
@@ -165,6 +169,7 @@ impl InvertedIndexBuilder {
             format_version: current_fts_format_version(),
             posting_tail_codec: current_fts_format_version().posting_tail_codec(),
             progress: noop_progress(),
+            deleted_fragments,
         }
     }
 
@@ -190,6 +195,7 @@ impl InvertedIndexBuilder {
         &mut self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<()> {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
@@ -208,6 +214,11 @@ impl InvertedIndexBuilder {
             .stage_start("tokenize_docs", None, "rows")
             .await?;
         self.update_index(new_data, dest_store).await?;
+
+        if let Some(OldIndexDataFilter::Fragments { to_remove, .. }) = old_data_filter {
+            self.deleted_fragments.extend(to_remove);
+        }
+
         self.progress.stage_complete("tokenize_docs").await?;
         self.write(dest_store).await?;
         Ok(())
@@ -353,6 +364,11 @@ impl InvertedIndexBuilder {
     }
 
     async fn write_metadata(&self, dest_store: &dyn IndexStore, partitions: &[u64]) -> Result<()> {
+        let mut serialized_deleted_fragments =
+            Vec::with_capacity(self.deleted_fragments.serialized_size());
+        self.deleted_fragments
+            .serialize_into(&mut serialized_deleted_fragments)?;
+
         let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
@@ -365,6 +381,7 @@ impl InvertedIndexBuilder {
                 self.posting_tail_codec.as_str().to_owned(),
             ),
         ]);
+
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
@@ -379,9 +396,22 @@ impl InvertedIndexBuilder {
                     .to_owned(),
             );
         }
+
+        let metadata_file_schema = Arc::new(Schema::new(vec![Field::new(
+            DELETED_FRAGMENTS_COL,
+            DataType::Binary,
+            false,
+        )]));
+        let deleted_fragments_col = Arc::new(BinaryArray::from(vec![
+            serialized_deleted_fragments.as_slice(),
+        ])) as Arc<dyn Array>;
+        let record_batch =
+            RecordBatch::try_new(metadata_file_schema.clone(), vec![deleted_fragments_col])?;
+
         let mut writer = dest_store
-            .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
+            .new_index_file(METADATA_FILE, metadata_file_schema)
             .await?;
+        writer.write_record_batch(record_batch).await?;
         writer.finish_with_metadata(metadata).await?;
         Ok(())
     }
@@ -1542,6 +1572,8 @@ async fn merge_metadata_files(
     let mut format_version = None;
     let mut posting_tail_codec = None;
 
+    let mut deleted_fragments = RoaringBitmap::new();
+
     for file_name in part_metadata_files {
         let reader = store.open_index_file(file_name).await?;
         let metadata = &reader.schema().metadata;
@@ -1576,6 +1608,20 @@ async fn merge_metadata_files(
         }
         if posting_tail_codec.is_none() {
             posting_tail_codec = Some(parse_posting_tail_codec(metadata)?);
+        }
+
+        if reader.num_rows() > 0 {
+            let metadata_batch = reader.read_range(0..1, None).await?;
+            let deleted_fragments_col = metadata_batch
+                .column_by_name(DELETED_FRAGMENTS_COL)
+                .expect_ok()?;
+            let deleted_fragments_arr = deleted_fragments_col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect_ok()?;
+            let part_deleted_fragments =
+                RoaringBitmap::deserialize_from(deleted_fragments_arr.value(0))?;
+            deleted_fragments.extend(part_deleted_fragments);
         }
     }
 
@@ -1655,6 +1701,7 @@ async fn merge_metadata_files(
         remapped_partitions.clone(),
         token_set_format,
         None,
+        deleted_fragments,
     )
     .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
     .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
@@ -1931,6 +1978,7 @@ mod tests {
             partitions.clone(),
             token_set_format,
             None,
+            RoaringBitmap::new(),
         );
         builder.write(dest_store.as_ref()).await?;
 
@@ -1987,6 +2035,7 @@ mod tests {
             vec![0],
             TokenSetFormat::default(),
             None,
+            RoaringBitmap::new(),
         )
         .with_posting_tail_codec(posting_tail_codec);
         metadata_writer
@@ -2033,6 +2082,7 @@ mod tests {
             Vec::new(),
             TokenSetFormat::default(),
             None,
+            RoaringBitmap::new(),
         )
         .with_format_version(InvertedListFormatVersion::V2)
         .with_posting_tail_codec(PostingTailCodec::Fixed32);
@@ -2073,7 +2123,7 @@ mod tests {
         .max_token_length(None);
 
         let mut builder = InvertedIndexBuilder::new(params);
-        builder.update(stream, store.as_ref()).await?;
+        builder.update(stream, store.as_ref(), None).await?;
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.partitions.len(), 1);
@@ -2166,7 +2216,7 @@ mod tests {
         let progress = Arc::new(RecordingProgress::default());
         let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default())
             .with_progress(progress.clone());
-        builder.update(stream, store.as_ref()).await?;
+        builder.update(stream, store.as_ref(), None).await?;
 
         let events = progress.events.lock().await.clone();
         let tags = events
@@ -2260,7 +2310,7 @@ mod tests {
         let progress = Arc::new(RecordingProgress::default());
         let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default())
             .with_progress(progress.clone());
-        builder.update(stream, store.as_ref()).await?;
+        builder.update(stream, store.as_ref(), None).await?;
 
         let tags = progress
             .events
@@ -2297,7 +2347,7 @@ mod tests {
         let mut builder =
             InvertedIndexBuilder::new(InvertedIndexParams::default().memory_limit_mb(0));
         let err = builder
-            .update(stream, store.as_ref())
+            .update(stream, store.as_ref(), None)
             .await
             .expect_err("single doc should exceed zero worker memory limit");
         assert!(
@@ -2530,6 +2580,289 @@ mod tests {
         assert!(
             result.to_string().contains("injected progress failure"),
             "unexpected error: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_index_has_empty_deleted_fragments() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch("hello world", 0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
+        builder.update(stream, store.as_ref(), None).await.unwrap();
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            index.deleted_fragments().is_empty(),
+            "new index should have empty deleted fragments, got {:?}",
+            index.deleted_fragments()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remap_preserves_deleted_fragments() {
+        let src_dir = TempDir::default();
+        let dest_dir = TempDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Build an initial index with some deleted fragments
+        let batch = make_doc_batch("hello world", 0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let initial_deleted = RoaringBitmap::from_iter([5, 10, 42]);
+        let mut builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            initial_deleted.clone(),
+        );
+        builder
+            .update(stream, src_store.as_ref(), None)
+            .await
+            .unwrap();
+
+        // Load it back and confirm the invalidated fragments are set
+        let index = InvertedIndex::load(src_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.deleted_fragments(), &initial_deleted);
+
+        // Remap the index via the ScalarIndex trait method
+        use crate::scalar::ScalarIndex;
+        let mapping = HashMap::from([(0u64, Some(50 << 32))]);
+        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+
+        // Reload from dest and verify deleted fragments are preserved
+        let remapped_index = InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            remapped_index.deleted_fragments(),
+            &initial_deleted,
+            "remap should preserve deleted fragments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_grows_deleted_fragments_from_old_data_filter() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Build an initial index with no deleted fragments
+        let batch = make_doc_batch("hello world", 0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
+        builder.update(stream, store.as_ref(), None).await.unwrap();
+
+        // Load the index and update it with an old_data_filter that invalidates fragments
+        let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(index.deleted_fragments().is_empty());
+
+        let update_dir = TempDir::default();
+        let update_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            update_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch2 = make_doc_batch("new document", 1 << 32 | 1);
+        let stream2 =
+            RecordBatchStreamAdapter::new(batch2.schema(), stream::iter(vec![Ok(batch2)]));
+        let stream2 = Box::pin(stream2);
+
+        let old_data_filter = Some(crate::scalar::OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([0]),
+            to_remove: RoaringBitmap::from_iter([3, 7]),
+        });
+
+        // Use ScalarIndex::update trait method
+        use crate::scalar::ScalarIndex;
+        index
+            .update(stream2, update_store.as_ref(), old_data_filter)
+            .await
+            .unwrap();
+
+        let updated_index =
+            InvertedIndex::load(update_store.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+        assert_eq!(
+            updated_index.deleted_fragments(),
+            &RoaringBitmap::from_iter([3, 7]),
+            "update should add deleted fragments from old_data_filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_accumulates_deleted_fragments() {
+        let dir1 = TempDir::default();
+        let store1 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dir1.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Build initial index
+        let batch = make_doc_batch("hello world", 0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
+        builder.update(stream, store1.as_ref(), None).await.unwrap();
+
+        // First update: delete fragments 3 and 7
+        let index = InvertedIndex::load(store1.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let dir2 = TempDir::default();
+        let store2 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dir2.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch2 = make_doc_batch("second doc", 1 << 32 | 1);
+        let stream2 =
+            RecordBatchStreamAdapter::new(batch2.schema(), stream::iter(vec![Ok(batch2)]));
+        let stream2 = Box::pin(stream2);
+
+        use crate::scalar::ScalarIndex;
+        index
+            .update(
+                stream2,
+                store2.as_ref(),
+                Some(crate::scalar::OldIndexDataFilter::Fragments {
+                    to_keep: RoaringBitmap::from_iter([0]),
+                    to_remove: RoaringBitmap::from_iter([3, 7]),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Second update: invalidate additional fragments 12 and 15
+        let index2 = InvertedIndex::load(store2.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            index2.deleted_fragments(),
+            &RoaringBitmap::from_iter([3, 7])
+        );
+
+        let dir3 = TempDir::default();
+        let store3 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dir3.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch3 = make_doc_batch("third doc", 2 << 32 | 2);
+        let stream3 =
+            RecordBatchStreamAdapter::new(batch3.schema(), stream::iter(vec![Ok(batch3)]));
+        let stream3 = Box::pin(stream3);
+
+        index2
+            .update(
+                stream3,
+                store3.as_ref(),
+                Some(crate::scalar::OldIndexDataFilter::Fragments {
+                    to_keep: RoaringBitmap::from_iter([0, 1]),
+                    to_remove: RoaringBitmap::from_iter([12, 15]),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let index3 = InvertedIndex::load(store3.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            index3.deleted_fragments(),
+            &RoaringBitmap::from_iter([3, 7, 12, 15]),
+            "deleted fragments should accumulate across updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_with_rowid_filter_does_not_grow_deleted_fragments() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch("hello world", 0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
+        builder.update(stream, store.as_ref(), None).await.unwrap();
+
+        let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let update_dir = TempDir::default();
+        let update_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            update_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch2 = make_doc_batch("new doc", 1);
+        let stream2 =
+            RecordBatchStreamAdapter::new(batch2.schema(), stream::iter(vec![Ok(batch2)]));
+        let stream2 = Box::pin(stream2);
+
+        // Use RowIds filter instead of Fragments — should not affect deleted_fragments
+        let mut valid_ids = lance_core::utils::mask::RowAddrTreeMap::new();
+        valid_ids.insert(0);
+        let old_data_filter = Some(crate::scalar::OldIndexDataFilter::RowIds(valid_ids));
+
+        use crate::scalar::ScalarIndex;
+        index
+            .update(stream2, update_store.as_ref(), old_data_filter)
+            .await
+            .unwrap();
+
+        let updated_index =
+            InvertedIndex::load(update_store.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+        assert!(
+            updated_index.deleted_fragments().is_empty(),
+            "RowIds filter should not add to deleted fragments"
         );
     }
 }

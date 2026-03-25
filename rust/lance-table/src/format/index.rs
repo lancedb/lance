@@ -108,6 +108,16 @@ impl IndexMetadata {
             .as_ref()
             .map(|files| files.iter().map(|f| f.size_bytes).sum())
     }
+
+    /// Returns the set of fragments which are part of the fragment bitmap
+    /// but no longer in the dataset.
+    pub fn deleted_fragment_bitmap(
+        &self,
+        existing_fragments: &RoaringBitmap,
+    ) -> Option<RoaringBitmap> {
+        let fragment_bitmap = self.fragment_bitmap.as_ref()?;
+        Some(fragment_bitmap - existing_fragments)
+    }
 }
 
 impl DeepSizeOf for IndexMetadata {

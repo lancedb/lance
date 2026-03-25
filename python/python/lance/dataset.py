@@ -47,7 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, SupportedDistributedIndices
+from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -2591,14 +2591,14 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
-            method returns an IndexMetadata object but does not commit the index
-            to the dataset. The index can be committed later using the commit API.
+            method returns metadata for one segment but does not commit
+            the index to the dataset. The segment can be planned, merged, and
+            committed later using the segment builder and commit APIs.
             This parameter is passed via kwargs internally.
         index_uuid : str, optional
-            A UUID to use for fragment-level distributed indexing
-            multiple fragment-level indices need to share UUID for later merging.
-            If not provided, a new UUID will be generated. This parameter is passed via
-            kwargs internally.
+            A UUID to use for the segment written by this call.
+            If not provided, a new UUID will be generated. This parameter is
+            passed via kwargs internally.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2785,7 +2785,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
-    def create_index(
+    def _create_index_impl(
         self,
         column: Union[str, List[str]],
         index_type: str,
@@ -2804,198 +2804,25 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size: Optional[int] = None,
         shuffle_partition_batches: Optional[int] = None,
         shuffle_partition_concurrency: Optional[int] = None,
-        # experimental parameters
         ivf_centroids_file: Optional[str] = None,
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         train: bool = True,
-        # distributed indexing parameters
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        require_commit: bool = True,
         **kwargs,
-    ) -> LanceDataset:
-        """Create index on column.
-
-        **Experimental API**
-
-        Parameters
-        ----------
-        column : str
-            The column to be indexed.
-        index_type : str
-            The type of the index.
-            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
-        name : str, optional
-            The index name. If not provided, it will be generated from the
-            column name.
-        metric : str
-            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine"
-            or "dot" (dot product). Default is "L2".
-        replace : bool
-            Replace the existing index if it exists.
-        num_partitions : int, optional
-            The number of partitions of IVF (Inverted File Index).
-            Deprecated. Use target_partition_size instead.
-        ivf_centroids : optional
-            It can be either :py:class:`np.ndarray`,
-            :py:class:`pyarrow.FixedSizeListArray` or
-            :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_partitions x dimension`` array of existing K-mean centroids
-            for IVF clustering. If not provided, a new KMeans model will be trained.
-        pq_codebook : optional,
-            It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
-            or :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
-            array of K-mean centroids for PQ codebook.
-
-            Note: ``nbits`` is always 8 for now.
-            If not provided, a new PQ model will be trained.
-        num_sub_vectors : int, optional
-            The number of sub-vectors for PQ (Product Quantization).
-        accelerator : str or ``torch.Device``, optional
-            If set, use an accelerator to speed up the training process.
-            Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
-            If not set, use the CPU.
-        index_cache_size : int, optional
-            The size of the index cache in number of entries. Default value is 256.
-        shuffle_partition_batches : int, optional
-            The number of batches, using the row group size of the dataset, to include
-            in each shuffle partition. Default value is 10240.
-
-            Assuming the row group size is 1024, each shuffle partition will hold
-            10240 * 1024 = 10,485,760 rows. By making this value smaller, this shuffle
-            will consume less memory but will take longer to complete, and vice versa.
-        shuffle_partition_concurrency : int, optional
-            The number of shuffle partitions to process concurrently. Default value is 2
-
-            By making this value smaller, this shuffle will consume less memory but will
-            take longer to complete, and vice versa.
-        storage_options : optional, dict
-            Extra options that make sense for a particular storage connection. This is
-            used to store connection parameters like credentials, endpoint, etc.
-        filter_nan: bool
-            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
-            values are present (and otherwise will not). Disables the null filter used
-            for nullable columns. Obtains a small speed boost.
-        train : bool, default True
-            If True, the index will be trained on the data (e.g., compute IVF
-            centroids, PQ codebooks). If False, an empty index structure will be
-            created without training, which can be populated later.
-        fragment_ids : List[int], optional
-            If provided, the index will be created only on the specified fragments.
-            This enables distributed/fragment-level indexing. When provided, the
-            method creates temporary index metadata but does not commit the index
-            to the dataset. The index can be committed later using
-            merge_index_metadata(index_uuid, "VECTOR", column=..., index_name=...).
-        index_uuid : str, optional
-            A UUID to use for fragment-level distributed indexing. Multiple
-            fragment-level indices need to share UUID for later merging.
-            If not provided, a new UUID will be generated.
-        target_partition_size: int, optional
-            The target partition size. If set, the number of partitions will be computed
-            based on the target partition size.
-            Otherwise, the target partition size will be set by index type.
-        kwargs :
-            Parameters passed to the index building process.
-
-
-
-        The SQ (Scalar Quantization) is available for only ``IVF_HNSW_SQ`` index type,
-        this quantization method is used to reduce the memory usage of the index,
-        it maps the float vectors to integer vectors, each integer is of ``num_bits``,
-        now only 8 bits are supported.
-
-        If ``index_type`` is "IVF_*", then the following parameters are required:
-            num_partitions
-
-        If ``index_type`` is with "PQ", then the following parameters are required:
-            num_sub_vectors
-
-        Optional parameters for `IVF_PQ`:
-
-            - ivf_centroids
-                Existing K-mean centroids for IVF clustering.
-            - num_bits
-                The number of bits for PQ (Product Quantization). Default is 8.
-                Only 4, 8 are supported.
-            - index_file_version
-                The version of the index file. Default is "V3".
-
-        Optional parameters for `IVF_RQ`:
-
-            - num_bits
-                The number of bits for RQ (Rabit Quantization). Default is 1.
-
-        Optional parameters for `IVF_HNSW_*`:
-            max_level
-                Int, the maximum number of levels in the graph.
-            m
-                Int, the number of edges per node in the graph.
-            ef_construction
-                Int, the number of nodes to examine during the construction.
-
-        Examples
-        --------
-
-        .. code-block:: python
-
-            import lance
-
-            dataset = lance.dataset("/tmp/sift.lance")
-            dataset.create_index(
-                "vector",
-                "IVF_PQ",
-                num_partitions=256,
-                num_sub_vectors=16
+    ) -> Index:
+        if not require_commit and fragment_ids is None:
+            raise ValueError(
+                "create_index_uncommitted requires fragment_ids "
+                "for distributed index build"
             )
 
-        .. code-block:: python
-
-            import lance
-
-            dataset = lance.dataset("/tmp/sift.lance")
-            dataset.create_index(
-                "vector",
-                "IVF_HNSW_SQ",
-                num_partitions=256,
-            )
-
-        Experimental Accelerator (GPU) support:
-
-        - *accelerate*: use GPU to train IVF partitions.
-            Only supports CUDA (Nvidia) or MPS (Apple) currently.
-            Requires PyTorch being installed.
-
-        .. code-block:: python
-
-            import lance
-
-            dataset = lance.dataset("/tmp/sift.lance")
-            dataset.create_index(
-                "vector",
-                "IVF_PQ",
-                num_partitions=256,
-                num_sub_vectors=16,
-                accelerator="cuda"
-            )
-
-        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
-        type. Providing an accelerator for other index types will fall back to CPU
-        index building.
-
-        References
-        ----------
-        * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
-        * IVF introduced in `Video Google: a text retrieval approach to object matching
-          in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
-        * `Product quantization for nearest neighbor search
-          <https://hal.inria.fr/inria-00514462v2/document>`_
-
-        """
         # Only support building index for 1 column from the API aspect, however
         # the internal implementation might support building multi-column index later.
         if isinstance(column, str):
@@ -3103,13 +2930,21 @@ class LanceDataset(pa.dataset.Dataset):
             pass
 
         if torch_detected:
-            if fragment_ids is not None or index_uuid is not None:
-                LOGGER.info(
-                    "Torch detected; "
-                    "enforce single-node indexing (distributed is CPU-only)."
-                )
-            fragment_ids = None
-            index_uuid = None
+            if require_commit:
+                if fragment_ids is not None or index_uuid is not None:
+                    LOGGER.info(
+                        "Torch detected; "
+                        "enforce single-node indexing (distributed is CPU-only)."
+                    )
+                fragment_ids = None
+                index_uuid = None
+            else:
+                if index_uuid is not None:
+                    LOGGER.info(
+                        "Torch detected; "
+                        "enforce single-node indexing (distributed is CPU-only)."
+                    )
+                index_uuid = None
 
         if accelerator is not None:
             from .vector import (
@@ -3302,7 +3137,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["index_uuid"] = index_uuid
 
         timers["final_create_index:start"] = time.time()
-        self._ds.create_index(
+        index = self._ds.create_index(
             column, index_type, name, replace, train, storage_options, kwargs
         )
         timers["final_create_index:end"] = time.time()
@@ -3318,7 +3153,332 @@ class LanceDataset(pa.dataset.Dataset):
                 "Temporary shuffle buffers stored at %s, you may want to delete it.",
                 kwargs["precomputed_shuffle_buffers_path"],
             )
+        return index
+
+    def create_index(
+        self,
+        column: Union[str, List[str]],
+        index_type: str,
+        name: Optional[str] = None,
+        metric: str = "L2",
+        replace: bool = False,
+        num_partitions: Optional[int] = None,
+        ivf_centroids: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        pq_codebook: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        num_sub_vectors: Optional[int] = None,
+        accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
+        # experimental parameters
+        ivf_centroids_file: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
+        train: bool = True,
+        # distributed indexing parameters
+        fragment_ids: Optional[List[int]] = None,
+        index_uuid: Optional[str] = None,
+        *,
+        target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
+        **kwargs,
+    ) -> LanceDataset:
+        """Create index on column.
+
+        **Experimental API**
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.
+        index_type : str
+            The type of the index.
+            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
+        name : str, optional
+            The index name. If not provided, it will be generated from the
+            column name.
+        metric : str
+            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine"
+            or "dot" (dot product). Default is "L2".
+        replace : bool
+            Replace the existing index if it exists.
+        num_partitions : int, optional
+            The number of partitions of IVF (Inverted File Index).
+            Deprecated. Use target_partition_size instead.
+        ivf_centroids : optional
+            It can be either :py:class:`np.ndarray`,
+            :py:class:`pyarrow.FixedSizeListArray` or
+            :py:class:`pyarrow.FixedShapeTensorArray`.
+            A ``num_partitions x dimension`` array of existing K-mean centroids
+            for IVF clustering. If not provided, a new KMeans model will be trained.
+        pq_codebook : optional,
+            It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
+            or :py:class:`pyarrow.FixedShapeTensorArray`.
+            A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
+            array of K-mean centroids for PQ codebook.
+
+            Note: ``nbits`` is always 8 for now.
+            If not provided, a new PQ model will be trained.
+        num_sub_vectors : int, optional
+            The number of sub-vectors for PQ (Product Quantization).
+        accelerator : str or ``torch.Device``, optional
+            If set, use an accelerator to speed up the training process.
+            Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
+            If not set, use the CPU.
+        index_cache_size : int, optional
+            The size of the index cache in number of entries. Default value is 256.
+        shuffle_partition_batches : int, optional
+            The number of batches, using the row group size of the dataset, to include
+            in each shuffle partition. Default value is 10240.
+
+            Assuming the row group size is 1024, each shuffle partition will hold
+            10240 * 1024 = 10,485,760 rows. By making this value smaller, this shuffle
+            will consume less memory but will take longer to complete, and vice versa.
+        shuffle_partition_concurrency : int, optional
+            The number of shuffle partitions to process concurrently. Default value is 2
+
+            By making this value smaller, this shuffle will consume less memory but will
+            take longer to complete, and vice versa.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
+        filter_nan: bool
+            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
+            values are present (and otherwise will not). Disables the null filter used
+            for nullable columns. Obtains a small speed boost.
+        train : bool, default True
+            If True, the index will be trained on the data (e.g., compute IVF
+            centroids, PQ codebooks). If False, an empty index structure will be
+            created without training, which can be populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method creates one segment but does not commit the index
+            to the dataset. The returned metadata can be passed to
+            ``create_index_segment_builder().with_segments(...)``
+            and then committed with ``commit_existing_index_segments(...)``.
+        index_uuid : str, optional
+            A UUID to use for the segment written by this call.
+            If not provided, a new UUID will be generated.
+        target_partition_size: int, optional
+            The target partition size. If set, the number of partitions will be computed
+            based on the target partition size.
+            Otherwise, the target partition size will be set by index type.
+        kwargs :
+            Parameters passed to the index building process.
+
+
+
+        The SQ (Scalar Quantization) is available for only ``IVF_HNSW_SQ`` index type,
+        this quantization method is used to reduce the memory usage of the index,
+        it maps the float vectors to integer vectors, each integer is of ``num_bits``,
+        now only 8 bits are supported.
+
+        If ``index_type`` is "IVF_*", then the following parameters are required:
+            num_partitions
+
+        If ``index_type`` is with "PQ", then the following parameters are required:
+            num_sub_vectors
+
+        Optional parameters for `IVF_PQ`:
+
+            - ivf_centroids
+                Existing K-mean centroids for IVF clustering.
+            - num_bits
+                The number of bits for PQ (Product Quantization). Default is 8.
+                Only 4, 8 are supported.
+            - index_file_version
+                The version of the index file. Default is "V3".
+
+        Optional parameters for `IVF_RQ`:
+
+            - num_bits
+                The number of bits for RQ (Rabit Quantization). Default is 1.
+
+        Optional parameters for `IVF_HNSW_*`:
+            max_level
+                Int, the maximum number of levels in the graph.
+            m
+                Int, the number of edges per node in the graph.
+            ef_construction
+                Int, the number of nodes to examine during the construction.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_PQ",
+                num_partitions=256,
+                num_sub_vectors=16
+            )
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_HNSW_SQ",
+                num_partitions=256,
+            )
+
+        Experimental Accelerator (GPU) support:
+
+        - *accelerate*: use GPU to train IVF partitions.
+            Only supports CUDA (Nvidia) or MPS (Apple) currently.
+            Requires PyTorch being installed.
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_PQ",
+                num_partitions=256,
+                num_sub_vectors=16,
+                accelerator="cuda"
+            )
+
+        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
+        type. Providing an accelerator for other index types will fall back to CPU
+        index building.
+
+        References
+        ----------
+        * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
+        * IVF introduced in `Video Google: a text retrieval approach to object matching
+          in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
+        * `Product quantization for nearest neighbor search
+          <https://hal.inria.fr/inria-00514462v2/document>`_
+
+        """
+        self._create_index_impl(
+            column,
+            index_type,
+            name=name,
+            metric=metric,
+            replace=replace,
+            num_partitions=num_partitions,
+            ivf_centroids=ivf_centroids,
+            pq_codebook=pq_codebook,
+            num_sub_vectors=num_sub_vectors,
+            accelerator=accelerator,
+            index_cache_size=index_cache_size,
+            shuffle_partition_batches=shuffle_partition_batches,
+            shuffle_partition_concurrency=shuffle_partition_concurrency,
+            ivf_centroids_file=ivf_centroids_file,
+            precomputed_partition_dataset=precomputed_partition_dataset,
+            storage_options=storage_options,
+            filter_nan=filter_nan,
+            train=train,
+            fragment_ids=fragment_ids,
+            index_uuid=index_uuid,
+            target_partition_size=target_partition_size,
+            skip_transpose=skip_transpose,
+            require_commit=True,
+            **kwargs,
+        )
         return self
+
+    def create_index_uncommitted(
+        self,
+        column: Union[str, List[str]],
+        index_type: str,
+        name: Optional[str] = None,
+        metric: str = "L2",
+        replace: bool = False,
+        num_partitions: Optional[int] = None,
+        ivf_centroids: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        pq_codebook: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        num_sub_vectors: Optional[int] = None,
+        accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
+        ivf_centroids_file: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
+        train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        index_uuid: Optional[str] = None,
+        *,
+        target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
+        **kwargs,
+    ) -> Index:
+        """
+        Create one segment without publishing it and return its metadata.
+
+        This is the public distributed-build API for vector index
+        construction. Unlike :meth:`create_index`, this method does not publish
+        the index into the dataset manifest. Instead, it writes one segment
+        under ``_indices/<segment_uuid>/`` and returns the resulting
+        :class:`Index` metadata.
+
+        Callers should:
+
+        1. run :meth:`create_index_uncommitted` on each worker with that worker's
+           assigned ``fragment_ids``
+        2. collect the returned :class:`Index` objects
+        3. pass them to :meth:`IndexSegmentBuilder.with_segments`
+        4. build one or more physical segments and commit them with
+           :meth:`commit_existing_index_segments`
+
+        Parameters are the same as :meth:`create_index`, with one additional
+        requirement:
+
+        - ``fragment_ids`` must be provided
+
+        Returns
+        -------
+        Index
+            Metadata for the segment that was written by this call.
+        """
+        return self._create_index_impl(
+            column,
+            index_type,
+            name=name,
+            metric=metric,
+            replace=replace,
+            num_partitions=num_partitions,
+            ivf_centroids=ivf_centroids,
+            pq_codebook=pq_codebook,
+            num_sub_vectors=num_sub_vectors,
+            accelerator=accelerator,
+            index_cache_size=index_cache_size,
+            shuffle_partition_batches=shuffle_partition_batches,
+            shuffle_partition_concurrency=shuffle_partition_concurrency,
+            ivf_centroids_file=ivf_centroids_file,
+            precomputed_partition_dataset=precomputed_partition_dataset,
+            storage_options=storage_options,
+            filter_nan=filter_nan,
+            train=train,
+            fragment_ids=fragment_ids,
+            index_uuid=index_uuid,
+            target_partition_size=target_partition_size,
+            skip_transpose=skip_transpose,
+            require_commit=False,
+            **kwargs,
+        )
 
     def drop_index(self, name: str):
         """
@@ -3353,16 +3513,17 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readhead: Optional[int] = None,
     ):
         """
-        Merge distributed index metadata for supported scalar
-        and vector index types.
+        Merge distributed scalar index metadata.
 
-        This method supports all index types defined in
-        :class:`lance.indices.SupportedDistributedIndices`,
-        including scalar indices and precise vector index types.
+        Vector distributed indexing no longer uses this API. For vector indices,
+        build segments with :meth:`create_index_uncommitted`, plan or
+        merge them with :meth:`create_index_segment_builder`, and publish them
+        with :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
-        This API merges temporary index files (e.g., per-fragment partials).
+        This API merges temporary scalar index files (for example per-fragment
+        BTree or inverted index outputs).
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
@@ -3370,11 +3531,11 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         index_uuid: str
-            The shared UUID used when building fragment-level indices.
+            The shared UUID used when building fragment-level scalar indices.
         index_type: str
             Index type name. Must be one of the enum values in
             :class:`lance.indices.SupportedDistributedIndices`
-            (for example ``"IVF_PQ"``).
+            supported by scalar distributed merge.
         batch_readhead: int, optional
             Prefetch concurrency used by BTREE merge reader. Default: 1.
         """
@@ -3390,6 +3551,25 @@ class LanceDataset(pa.dataset.Dataset):
         # Merge physical index files at the index directory
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
         return None
+
+    def create_index_segment_builder(self):
+        """
+        Create a builder for turning existing segments into physical segments.
+
+        Provide the segment metadata returned by
+        :meth:`create_index_uncommitted` through
+        :meth:`IndexSegmentBuilder.with_segments`.
+        """
+        return self._ds.create_index_segment_builder()
+
+    def commit_existing_index_segments(
+        self, index_name: str, column: str, segments: List[IndexSegment]
+    ) -> LanceDataset:
+        """
+        Commit built index segments as one logical index.
+        """
+        self._ds.commit_existing_index_segments(index_name, column, segments)
+        return self
 
     def session(self) -> Session:
         """

@@ -115,6 +115,19 @@ impl ManifestNamingScheme {
         }
     }
 
+    /// Parse a detached version from a filename like `d123456.manifest`.
+    ///
+    /// Returns the full version number with the detached mask bit set.
+    pub fn parse_detached_version(filename: &str) -> Option<u64> {
+        if !filename.starts_with(DETACHED_VERSION_PREFIX) {
+            return None;
+        }
+        let without_prefix = &filename[DETACHED_VERSION_PREFIX.len()..];
+        without_prefix
+            .split_once('.')
+            .and_then(|(version_str, _)| version_str.parse::<u64>().ok())
+    }
+
     pub fn detect_scheme(filename: &str) -> Option<Self> {
         if filename.starts_with(DETACHED_VERSION_PREFIX) {
             // Currently, detached versions must imply V2
@@ -261,9 +274,14 @@ async fn current_manifest_path(
     let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
-        if let Some(scheme) = ManifestNamingScheme::detect_scheme(res.location.filename().unwrap())
-        {
-            future::ready(Ok(Some((scheme, res))))
+        let filename = res.location.filename().unwrap();
+        if let Some(scheme) = ManifestNamingScheme::detect_scheme(filename) {
+            // Only include if we can parse a version (skip detached versions)
+            if scheme.parse_version(filename).is_some() {
+                future::ready(Ok(Some((scheme, res))))
+            } else {
+                future::ready(Ok(None))
+            }
         } else {
             future::ready(Ok(None))
         }
@@ -428,6 +446,38 @@ fn list_manifests<'a>(
         .boxed()
 }
 
+/// Convert object metadata to ManifestLocation for detached manifests.
+fn detached_manifest_location_from_meta(
+    meta: object_store::ObjectMeta,
+) -> Option<ManifestLocation> {
+    let filename = meta.location.filename()?;
+    let version = ManifestNamingScheme::parse_detached_version(filename)?;
+    Some(ManifestLocation {
+        version,
+        path: meta.location,
+        size: Some(meta.size),
+        naming_scheme: ManifestNamingScheme::V2,
+        e_tag: meta.e_tag,
+    })
+}
+
+/// List all detached manifest files in the versions directory.
+pub fn list_detached_manifests<'a>(
+    base_path: &Path,
+    object_store: &'a dyn OSObjectStore,
+) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
+    object_store
+        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
+        .filter_map(|obj_meta| {
+            futures::future::ready(
+                obj_meta
+                    .map(detached_manifest_location_from_meta)
+                    .transpose(),
+            )
+        })
+        .boxed()
+}
+
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
@@ -462,6 +512,17 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &dyn OSObjectStore,
     ) -> Result<ManifestLocation> {
         default_resolve_version(base_path, version, object_store).await
+    }
+
+    /// List detached manifest locations.
+    ///
+    /// Returns a stream of detached manifest locations in arbitrary order.
+    fn list_detached_manifest_locations<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        list_detached_manifests(base_path, &object_store.inner).boxed()
     }
 
     /// If `sorted_descending` is `true`, the stream will yield manifests in descending
@@ -1217,5 +1278,78 @@ mod tests {
         assert_eq!(location.version, 11);
         assert_eq!(location.naming_scheme, naming_scheme);
         assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
+    }
+
+    #[test]
+    fn test_parse_detached_version() {
+        // Valid detached version filenames
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("d12345.manifest"),
+            Some(12345)
+        );
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("d9223372036854775808.manifest"),
+            Some(9223372036854775808)
+        );
+
+        // Invalid: not starting with 'd' prefix
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("12345.manifest"),
+            None
+        );
+
+        // Invalid: regular V2 manifest
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("18446744073709551615.manifest"),
+            None
+        );
+
+        // Invalid: no extension
+        assert_eq!(ManifestNamingScheme::parse_detached_version("d12345"), None);
+    }
+
+    #[tokio::test]
+    async fn test_list_detached_manifests() {
+        use crate::format::DETACHED_VERSION_MASK;
+        use futures::TryStreamExt;
+
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+        let versions_dir = base.child(VERSIONS_DIR);
+
+        // Create some regular manifests
+        for version in [1, 2, 3] {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // Create some detached manifests
+        let detached_versions: Vec<u64> = vec![
+            100 | DETACHED_VERSION_MASK,
+            200 | DETACHED_VERSION_MASK,
+            300 | DETACHED_VERSION_MASK,
+        ];
+        for version in &detached_versions {
+            let path = versions_dir.child(format!("d{}.manifest", version));
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // List detached manifests
+        let detached_locations: Vec<ManifestLocation> =
+            list_detached_manifests(&base, &object_store.inner)
+                .try_collect()
+                .await
+                .unwrap();
+
+        assert_eq!(detached_locations.len(), 3);
+        for loc in &detached_locations {
+            assert_eq!(loc.naming_scheme, ManifestNamingScheme::V2);
+        }
+
+        let mut found_versions: Vec<u64> = detached_locations.iter().map(|l| l.version).collect();
+        found_versions.sort();
+        let mut expected_versions = detached_versions.clone();
+        expected_versions.sort();
+        assert_eq!(found_versions, expected_versions);
     }
 }

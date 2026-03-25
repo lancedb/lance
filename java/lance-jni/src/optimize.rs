@@ -45,6 +45,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
+    max_source_fragments: JObject,            // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -60,7 +61,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             batch_size,
             defer_index_remap,
             compaction_mode,
-            binary_copy_read_batch_bytes
+            binary_copy_read_batch_bytes,
+            max_source_fragments
         ),
         JObject::null()
     )
@@ -80,6 +82,7 @@ fn inner_plan_compaction<'local>(
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
+    max_source_fragments: JObject,            // Optional<Long>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -98,6 +101,7 @@ fn inner_plan_compaction<'local>(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &max_source_fragments,
         &config,
     )?;
 
@@ -125,6 +129,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
+    max_source_fragments: JObject,            // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -142,6 +147,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
             defer_index_remap,
             compaction_mode,
             binary_copy_read_batch_bytes,
+            max_source_fragments,
         ),
         JObject::null()
     )
@@ -162,6 +168,7 @@ fn inner_commit_compaction<'local>(
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
+    max_source_fragments: JObject,            // Optional<Long>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -180,6 +187,7 @@ fn inner_commit_compaction<'local>(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &max_source_fragments,
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -216,6 +224,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
+    max_source_fragments: JObject,            // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -233,7 +242,8 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             batch_size,
             defer_index_remap,
             compaction_mode,
-            binary_copy_read_batch_bytes
+            binary_copy_read_batch_bytes,
+            max_source_fragments
         ),
         JObject::null()
     )
@@ -255,6 +265,7 @@ fn inner_execute_task<'local>(
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
+    max_source_fragments: JObject,            // Optional<Long>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let config = {
@@ -274,6 +285,7 @@ fn inner_execute_task<'local>(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &max_source_fragments,
         &config,
     )?;
     let compaction_task = CompactionTask {
@@ -300,7 +312,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -362,6 +374,9 @@ impl IntoJava for &CompactionOptions {
         let binary_copy_read_batch_bytes =
             to_java_long_obj(env, self.binary_copy_read_batch_bytes.map(|v| v as i64))?;
         let binary_copy_read_batch_bytes_opt = to_java_optional(env, binary_copy_read_batch_bytes)?;
+        let max_source_fragments =
+            to_java_long_obj(env, self.max_source_fragments.map(|v| v as i64))?;
+        let max_source_fragments_opt = to_java_optional(env, max_source_fragments)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -377,6 +392,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&defer_index_remap_opt),
                 JValueGen::Object(&compaction_mode_opt),
                 JValueGen::Object(&binary_copy_read_batch_bytes_opt),
+                JValueGen::Object(&max_source_fragments_opt),
             ],
         )?)
     }

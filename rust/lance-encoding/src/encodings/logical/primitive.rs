@@ -3737,6 +3737,66 @@ impl PrimitiveStructuralEncoder {
         Self::is_narrow(data_block)
     }
 
+    /// Checks if the rep/def levels are too sparse for miniblock encoding.
+    ///
+    /// Miniblock chunks are limited to ~32KiB total. Data can use up to ~16KiB,
+    /// leaving ~16KiB for both rep and def buffers combined. Each chunk has at most
+    /// MAX_MINIBLOCK_VALUES (4096) data values, but when data has many empty/null
+    /// lists, the number of rep/def levels can far exceed the number of data values
+    /// (each empty list adds a level entry with no corresponding data value).
+    ///
+    /// We estimate the compressed bits per level by computing the max value in each
+    /// buffer and taking ceil(log2(max_val + 1)) — the minimum bits needed to
+    /// bitpack each level. We then calculate the maximum number of levels that fit
+    /// in 16KiB and compare against the actual levels-to-values ratio.
+    fn repdef_too_sparse_for_miniblock(
+        repdef: &crate::repdef::SerializedRepDefs,
+        num_values: u64,
+    ) -> bool {
+        if num_values == 0 {
+            return false;
+        }
+        let num_levels = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|r| r.len() as u64)
+            .max(repdef.definition_levels.as_ref().map(|d| d.len() as u64))
+            .unwrap_or(0);
+        if num_levels == 0 {
+            return false;
+        }
+
+        // Compute bits needed per level for each buffer (ceil of log2(max+1))
+        let bits_per_rep = repdef
+            .repetition_levels
+            .as_ref()
+            .and_then(|r| r.iter().max().copied())
+            .map(|max_val| u16::BITS - max_val.leading_zeros())
+            .unwrap_or(0) as u64;
+        let bits_per_def = repdef
+            .definition_levels
+            .as_ref()
+            .and_then(|d| d.iter().max().copied())
+            .map(|max_val| u16::BITS - max_val.leading_zeros())
+            .unwrap_or(0) as u64;
+
+        let bits_per_level = bits_per_rep + bits_per_def;
+        if bits_per_level == 0 {
+            return false;
+        }
+
+        // 16KiB budget for rep+def combined (half the ~32KiB chunk limit)
+        const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
+        let max_levels_per_chunk = REPDEF_BUDGET_BITS / bits_per_level;
+
+        // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
+        // ratio tells us how many levels a chunk of that size would need.
+        let levels_per_chunk =
+            (num_levels as f64 / num_values as f64) * miniblock::MAX_MINIBLOCK_VALUES as f64;
+
+        levels_per_chunk > max_levels_per_chunk as f64
+    }
+
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
         // Fullzip is the backup option so the only reason we wouldn't use it is if the
         // user specifically requested not to use it (in which case we're probably going
@@ -3798,7 +3858,7 @@ impl PrimitiveStructuralEncoder {
         rep: Option<Vec<CompressedLevelsChunk>>,
         def: Option<Vec<CompressedLevelsChunk>>,
         support_large_chunk: bool,
-    ) -> SerializedMiniBlockPage {
+    ) -> Result<SerializedMiniBlockPage> {
         let bytes_rep = rep
             .as_ref()
             .map(|rep| rep.iter().map(|r| r.data.len()).sum::<usize>())
@@ -3842,11 +3902,21 @@ impl PrimitiveStructuralEncoder {
 
             // Write the buffer lengths
             if let Some(rep) = rep.as_ref() {
-                let bytes_rep = u16::try_from(rep.data.len()).unwrap();
+                let bytes_rep = u16::try_from(rep.data.len()).map_err(|_| {
+                    Error::internal(format!(
+                        "Repetition buffer size ({} bytes) too large",
+                        rep.data.len()
+                    ))
+                })?;
                 data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
             }
             if let Some(def) = def.as_ref() {
-                let bytes_def = u16::try_from(def.data.len()).unwrap();
+                let bytes_def = u16::try_from(def.data.len()).map_err(|_| {
+                    Error::internal(format!(
+                        "Definition buffer size ({} bytes) too large",
+                        def.data.len()
+                    ))
+                })?;
                 data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             }
 
@@ -3916,11 +3986,11 @@ impl PrimitiveStructuralEncoder {
         let data_buffer = LanceBuffer::from(data_buffer);
         let metadata_buffer = LanceBuffer::from(meta_buffer);
 
-        SerializedMiniBlockPage {
+        Ok(SerializedMiniBlockPage {
             num_buffers: miniblocks.data.len() as u64,
             data: data_buffer,
             metadata: metadata_buffer,
-        }
+        })
     }
 
     /// Compresses a buffer of levels into chunks
@@ -4448,7 +4518,7 @@ impl PrimitiveStructuralEncoder {
             .map(|cd| std::mem::take(&mut cd.data));
 
         let serialized =
-            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk);
+            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk)?;
 
         // Metadata, Data, Dictionary, (maybe) Repetition Index
         let mut data = Vec::with_capacity(4);
@@ -5112,41 +5182,61 @@ impl PrimitiveStructuralEncoder {
                 );
             }
 
-            if let DataBlock::Dictionary(dict) = data_block {
-                log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
-                let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
-                // TODO: https://github.com/lancedb/lance/issues/4809
-                // If we compute stats on dictionary_data_block => panic.
-                // If we don't compute stats on indices_data_block => panic.
-                // This is messy.  Don't make me call compute_stat ever.
-                indices_data_block.compute_stat();
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    indices_data_block,
-                    repdef,
-                    row_number,
-                    Some(dictionary_data_block),
-                    num_rows,
-                    support_large_chunk,
-                )
+            // If the rep/def levels are too sparse for miniblock (e.g. many empty
+            // lists with very few values), fall back to fullzip to avoid exceeding
+            // the u16 per-chunk rep/def buffer size limit.
+            let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
+
+            if !too_sparse {
+                if let DataBlock::Dictionary(dict) = data_block {
+                    log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
+                    let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+                    // TODO: https://github.com/lancedb/lance/issues/4809
+                    // If we compute stats on dictionary_data_block => panic.
+                    // If we don't compute stats on indices_data_block => panic.
+                    // This is messy.  Don't make me call compute_stat ever.
+                    indices_data_block.compute_stat();
+                    return Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        indices_data_block,
+                        repdef,
+                        row_number,
+                        Some(dictionary_data_block),
+                        num_rows,
+                        support_large_chunk,
+                    );
+                }
             } else {
+                log::debug!(
+                    "Encoding column {} with {} items using full-zip layout \
+                     (rep/def too sparse for mini-block)",
+                    column_idx,
+                    num_values
+                );
+            }
+
+            {
                 // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
                 // preferred structural encoding.
-                let dict_result = Self::should_dictionary_encode(&data_block, &field, version)
-                    .and_then(|budget| {
-                        log::debug!(
-                            "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                            column_idx,
-                            num_values
-                        );
-                        dict::dictionary_encode(
-                            &data_block,
-                            budget.max_dict_entries,
-                            budget.max_encoded_size,
-                        )
-                    });
+                let dict_result = if too_sparse {
+                    None
+                } else {
+                    Self::should_dictionary_encode(&data_block, &field, version)
+                        .and_then(|budget| {
+                            log::debug!(
+                                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                                column_idx,
+                                num_values
+                            );
+                            dict::dictionary_encode(
+                                &data_block,
+                                budget.max_dict_entries,
+                                budget.max_encoded_size,
+                            )
+                        })
+                };
 
                 if let Some((indices_data_block, dictionary_data_block)) = dict_result {
                     Self::encode_miniblock(
@@ -5160,7 +5250,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows,
                         support_large_chunk,
                     )
-                } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+                } else if !too_sparse && Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
                     log::debug!(
                         "Encoding column {} with {} items using mini-block layout",
                         column_idx,
@@ -5177,7 +5267,7 @@ impl PrimitiveStructuralEncoder {
                         num_rows,
                         support_large_chunk,
                     )
-                } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,

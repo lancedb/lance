@@ -13,6 +13,7 @@ use std::{
 use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    compute_next_prefix,
 };
 use crate::{Index, IndexType};
 use crate::{
@@ -1501,6 +1502,39 @@ impl ScalarIndex for BTreeIndex {
                 ));
             }
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
+            SargableQuery::LikePrefix(prefix) => {
+                // Convert LikePrefix to a range query: [prefix, next_prefix)
+                match prefix {
+                    ScalarValue::Utf8(Some(s)) => {
+                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
+                        let end = match compute_next_prefix(s) {
+                            Some(next) => {
+                                Bound::Excluded(OrderableScalarValue(ScalarValue::Utf8(Some(next))))
+                            }
+                            None => Bound::Unbounded,
+                        };
+                        self.page_lookup
+                            .pages_between((start.as_ref(), end.as_ref()))
+                    }
+                    ScalarValue::LargeUtf8(Some(s)) => {
+                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
+                        let end = match compute_next_prefix(s) {
+                            Some(next) => Bound::Excluded(OrderableScalarValue(
+                                ScalarValue::LargeUtf8(Some(next)),
+                            )),
+                            None => Bound::Unbounded,
+                        };
+                        self.page_lookup
+                            .pages_between((start.as_ref(), end.as_ref()))
+                    }
+                    _ => {
+                        // Conservative: return all pages for non-string types
+                        // This is consistent with ZoneMap behavior
+                        self.page_lookup
+                            .pages_between((Bound::Unbounded, Bound::Unbounded))
+                    }
+                }
+            }
         };
 
         // For non-IsNull queries, also include null pages so that null row IDs
@@ -2811,6 +2845,203 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_search() {
+        use arrow::datatypes::DataType;
+        use arrow_array::StringArray;
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create string data with various prefixes
+        let values = vec![
+            "apple",
+            "app",
+            "application",
+            "banana",
+            "band",
+            "test_ns$table1",
+            "test_ns$table2",
+            "test_ns2$table1",
+            "test",
+            "testing",
+        ];
+        let row_ids: Vec<u64> = (0..values.len() as u64).collect();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("value", DataType::Utf8, false),
+            arrow::datatypes::Field::new("_rowid", DataType::UInt64, false),
+        ]));
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(values.clone())),
+                Arc::new(arrow_array::UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async { Ok(batch) }),
+        ));
+
+        train_btree_index(stream, test_store.as_ref(), 100, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Test LikePrefix for "app" - should match "apple", "app", "application" (row ids 0, 1, 2)
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("app".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match &result {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert!(ids.contains(&0), "Should contain row 0 (apple)");
+                assert!(ids.contains(&1), "Should contain row 1 (app)");
+                assert!(ids.contains(&2), "Should contain row 2 (application)");
+                assert!(!ids.contains(&3), "Should not contain row 3 (banana)");
+            }
+            _ => panic!("Expected Exact result"),
+        }
+
+        // Test LikePrefix for "test_ns$" - should match "test_ns$table1", "test_ns$table2" (row ids 5, 6)
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("test_ns$".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match &result {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert!(ids.contains(&5), "Should contain row 5 (test_ns$table1)");
+                assert!(ids.contains(&6), "Should contain row 6 (test_ns$table2)");
+                assert!(
+                    !ids.contains(&7),
+                    "Should not contain row 7 (test_ns2$table1)"
+                );
+            }
+            _ => panic!("Expected Exact result"),
+        }
+
+        // Test LikePrefix for "test" - should match "test", "testing", "test_ns$table1", "test_ns$table2", "test_ns2$table1"
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("test".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match &result {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert!(
+                    ids.contains(&5),
+                    "Should contain row 5 (test_ns$table1): {:?}",
+                    ids
+                );
+                assert!(
+                    ids.contains(&6),
+                    "Should contain row 6 (test_ns$table2): {:?}",
+                    ids
+                );
+                assert!(
+                    ids.contains(&7),
+                    "Should contain row 7 (test_ns2$table1): {:?}",
+                    ids
+                );
+                assert!(ids.contains(&8), "Should contain row 8 (test): {:?}", ids);
+                assert!(
+                    ids.contains(&9),
+                    "Should contain row 9 (testing): {:?}",
+                    ids
+                );
+            }
+            _ => panic!("Expected Exact result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_search_large_utf8() {
+        use arrow::datatypes::DataType;
+        use arrow_array::LargeStringArray;
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let values = vec!["apple", "app", "application", "banana"];
+        let row_ids: Vec<u64> = (0..values.len() as u64).collect();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("value", DataType::LargeUtf8, false),
+            arrow::datatypes::Field::new("_rowid", DataType::UInt64, false),
+        ]));
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(values)),
+                Arc::new(arrow_array::UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async { Ok(batch) }),
+        ));
+
+        train_btree_index(stream, test_store.as_ref(), 100, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Test LikePrefix with LargeUtf8
+        let query = SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("app".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match &result {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert!(ids.contains(&0), "Should contain row 0 (apple)");
+                assert!(ids.contains(&1), "Should contain row 1 (app)");
+                assert!(ids.contains(&2), "Should contain row 2 (application)");
+                assert!(!ids.contains(&3), "Should not contain row 3 (banana)");
+            }
+            _ => panic!("Expected Exact result"),
+        }
     }
 
     #[tokio::test]

@@ -49,6 +49,9 @@ pub struct DatasetPreFilter {
     // these tasks only when we've done as much work as we can without them.
     pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowAddrMask>>>>,
     pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowAddrMask>>>,
+    // Fragment IDs whose data is still in the index but has been removed from the dataset.
+    // Used by FTS merge-on-read to prune stale fragments at search time.
+    pub(super) deleted_fragments: Option<RoaringBitmap>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -74,6 +77,7 @@ impl DatasetPreFilter {
         Self {
             deleted_ids,
             filtered_ids,
+            deleted_fragments: None,
             final_mask: Mutex::new(OnceCell::new()),
         }
     }
@@ -174,6 +178,14 @@ impl DatasetPreFilter {
             .await
     }
 
+    /// Sets the deleted fragment IDs to block during search.
+    ///
+    /// Used by FTS indices which track fragments that have been removed from the
+    /// dataset but whose data is still present in the index (merge-on-read).
+    pub fn set_deleted_fragments(&mut self, fragments: RoaringBitmap) {
+        self.deleted_fragments = Some(fragments);
+    }
+
     /// Creates a task to load mask to filter out deleted rows.
     ///
     /// Sometimes this will be a block list of row ids that are deleted, based
@@ -244,6 +256,13 @@ impl PreFilter for DatasetPreFilter {
             if let Some(deleted_ids) = &self.deleted_ids {
                 combined = combined & (*deleted_ids.get_ready()).clone();
             }
+            if let Some(deleted) = &self.deleted_fragments {
+                let mut block_list = RowAddrTreeMap::new();
+                for frag_id in deleted.iter() {
+                    block_list.insert_fragment(frag_id);
+                }
+                combined = combined & RowAddrMask::from_block(block_list);
+            }
             Arc::new(combined)
         });
 
@@ -251,7 +270,9 @@ impl PreFilter for DatasetPreFilter {
     }
 
     fn is_empty(&self) -> bool {
-        self.deleted_ids.is_none() && self.filtered_ids.is_none()
+        self.deleted_ids.is_none()
+            && self.filtered_ids.is_none()
+            && self.deleted_fragments.is_none()
     }
 
     /// Get the row id mask for this prefilter

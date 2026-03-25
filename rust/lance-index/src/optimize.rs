@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 /// Options for optimizing all indices.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
@@ -33,6 +36,13 @@ pub struct OptimizeOptions {
     ///
     /// NOTE: this option is only supported for v3 vector indices.
     pub retrain: bool,
+
+    /// Transaction properties to store with this commit.
+    ///
+    /// These key-value pairs are stored in the transaction file
+    /// and can be read later to identify the source of the commit
+    /// (e.g., job_id for tracking completed index jobs).
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl OptimizeOptions {
@@ -61,6 +71,7 @@ impl OptimizeOptions {
             num_indices_to_merge: None,
             index_names: None,
             retrain: true,
+            ..Default::default()
         }
     }
 
@@ -71,6 +82,12 @@ impl OptimizeOptions {
 
     pub fn index_names(mut self, names: Vec<String>) -> Self {
         self.index_names = Some(names);
+        self
+    }
+
+    /// Set transaction properties to store in the commit manifest.
+    pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.transaction_properties = Some(Arc::new(properties));
         self
     }
 }

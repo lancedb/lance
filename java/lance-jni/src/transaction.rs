@@ -623,6 +623,8 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     storage_format_obj: JObject,
     max_retries: jint,
     skip_auto_cleanup: jboolean,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -637,6 +639,8 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             storage_format_obj,
             max_retries as u32,
             skip_auto_cleanup != 0,
+            namespace_obj,
+            table_id_obj,
         )
     )
 }
@@ -653,6 +657,8 @@ fn inner_commit_to_dataset<'local>(
     storage_format_obj: JObject,
     max_retries: u32,
     skip_auto_cleanup: bool,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
 ) -> Result<JObject<'local>> {
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
@@ -745,6 +751,15 @@ fn inner_commit_to_dataset<'local>(
         Some(&mut java_blocking_ds),
     )?;
 
+    // Set namespace commit handler if provided
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let commit_handler = namespace_info.map(|(ns, tid)| {
+        let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+        Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        }) as Arc<dyn CommitHandler>
+    });
+
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
@@ -757,6 +772,7 @@ fn inner_commit_to_dataset<'local>(
             storage_format,
             max_retries,
             skip_auto_cleanup,
+            commit_handler,
         )?
     };
     new_blocking_ds.into_java(env)
