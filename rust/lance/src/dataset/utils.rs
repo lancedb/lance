@@ -297,3 +297,71 @@ pub fn object_store_params_for_base_path<'a>(
     ));
     Cow::Owned(output_params)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::object_store_params_for_base_path;
+    use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use lance_table::format::BasePath;
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_object_store_params_for_base_path_borrows_without_base_storage_options() {
+        let input_params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("azure_storage_account_name".to_string(), "my-storage-account".to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let base_path = BasePath::new(7, "az://container/path".to_string(), None, false);
+
+        let output_params = object_store_params_for_base_path(&base_path, Some(&input_params));
+
+        match output_params {
+            Cow::Borrowed(params) => assert_eq!(params, &input_params),
+            Cow::Owned(_) => panic!("expected borrowed params when base storage options are empty"),
+        }
+    }
+
+    #[test]
+    fn test_object_store_params_for_base_path_merges_base_specific_storage_options() {
+        let input_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("base1.azure_storage_account_key".to_string(), "mykey1".to_string()),
+                    ("base7.azure_storage_account_key".to_string(), "mykey7".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let base_path = BasePath::new(7, "az://container/path".to_string(), None, false)
+            .with_storage_options(HashMap::from([
+                ("azure_storage_account_name".to_string(), "myaccount7".to_string()),
+            ]));
+
+        let output_params = object_store_params_for_base_path(&base_path, Some(&input_params));
+
+        let Cow::Owned(output_params) = output_params else {
+            panic!("expected owned params when storage options must be merged");
+        };
+        let storage_options = output_params
+            .storage_options()
+            .expect("merged params should contain storage options");
+        assert_eq!(
+            storage_options.get("base1.azure_storage_account_key"),
+            Some(&"mykey1".to_string())
+        );
+        assert_eq!(
+            storage_options.get("azure_storage_account_key"),
+            Some(&"mykey7".to_string())
+        );
+        assert_eq!(
+            storage_options.get("azure_storage_account_name"),
+            Some(&"myaccount7".to_string())
+        );
+        assert_eq!(3, storage_options.len());
+    }
+}
