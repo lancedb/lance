@@ -2795,14 +2795,16 @@ impl Dataset {
         index_name: Option<&str>,
     ) -> PyResult<Vec<PyIndexSegmentDescription>> {
         let new_self = self.ds.as_ref().clone();
-        let mut indices = rt()
+        let indices = rt()
             .block_on(Some(py), new_self.load_indices())?
             .infer_error()?;
-        if let Some(index_name) = index_name {
-            indices.retain(|segment| segment.name == index_name);
-        }
         Ok(indices
             .iter()
+            .filter(|segment| {
+                index_name
+                    .map(|index_name| segment.name == index_name)
+                    .unwrap_or(true)
+            })
             .map(PyIndexSegmentDescription::from_metadata)
             .collect())
     }
