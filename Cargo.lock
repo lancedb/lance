@@ -4410,6 +4410,7 @@ dependencies = [
  "prost 0.13.5",
  "rand 0.9.2",
  "roaring",
+ "rstest",
  "serde_json",
  "snafu",
  "tempfile",
