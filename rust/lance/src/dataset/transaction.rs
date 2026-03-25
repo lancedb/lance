@@ -2228,14 +2228,17 @@ impl Transaction {
             // Validate and add new base paths to the manifest
             for new_base in new_bases {
                 // Check for conflicts with existing base paths
-                if let Some(existing_base) = manifest
-                    .base_paths
-                    .values()
-                    .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
-                {
+                if let Some(existing_base) = manifest.base_paths.values().find(|bp| {
+                    (bp.name == new_base.name && bp.name.is_some()) || bp.matches_identity(new_base)
+                }) {
                     return Err(Error::invalid_input(format!(
-                        "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
-                        new_base.name, new_base.path, existing_base.name, existing_base.path
+                        "Conflict detected: base path already exists. New base: name='{:?}', path='{}', storage_options={:?}. Existing base: name='{:?}', path='{}', storage_options={:?}",
+                        new_base.name,
+                        new_base.path,
+                        new_base.storage_options,
+                        existing_base.name,
+                        existing_base.path,
+                        existing_base.storage_options
                     )));
                 }
 

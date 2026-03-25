@@ -15,6 +15,9 @@ package org.lance;
 
 import com.google.common.base.MoreObjects;
 
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 public final class BasePath {
@@ -22,12 +25,23 @@ public final class BasePath {
   private final Optional<String> name;
   private final String path;
   private final boolean isDatasetRoot;
+  private final Map<String, String> storageOptions;
 
   public BasePath(int id, Optional<String> name, String path, boolean isDatasetRoot) {
+    this(id, name, path, isDatasetRoot, Collections.emptyMap());
+  }
+
+  public BasePath(
+      int id,
+      Optional<String> name,
+      String path,
+      boolean isDatasetRoot,
+      Map<String, String> storageOptions) {
     this.id = id;
     this.name = name;
     this.path = path;
     this.isDatasetRoot = isDatasetRoot;
+    this.storageOptions = Collections.unmodifiableMap(new HashMap<>(storageOptions));
   }
 
   public int getId() {
@@ -46,6 +60,10 @@ public final class BasePath {
     return isDatasetRoot;
   }
 
+  public Map<String, String> getStorageOptions() {
+    return storageOptions;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -53,6 +71,7 @@ public final class BasePath {
         .add("name", name)
         .add("path", path)
         .add("isDatasetRoot", isDatasetRoot)
+        .add("storageOptions", storageOptions)
         .toString();
   }
 }

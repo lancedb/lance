@@ -495,25 +495,34 @@ pub struct DatasetBasePath {
     pub path: String,
     #[pyo3(get)]
     pub is_dataset_root: bool,
+    #[pyo3(get)]
+    pub storage_options: HashMap<String, String>,
 }
 
 #[pymethods]
 impl DatasetBasePath {
     #[new]
-    #[pyo3(signature = (path, name = None, is_dataset_root = false, id = None))]
-    fn new(path: String, name: Option<String>, is_dataset_root: bool, id: Option<u32>) -> Self {
+    #[pyo3(signature = (path, name = None, is_dataset_root = false, id = None, storage_options = None))]
+    fn new(
+        path: String,
+        name: Option<String>,
+        is_dataset_root: bool,
+        id: Option<u32>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> Self {
         Self {
             id: id.unwrap_or(0),
             name,
             path,
             is_dataset_root,
+            storage_options: storage_options.unwrap_or_default(),
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "DatasetBasePath(id={}, name={:?}, path={}, is_dataset_root={})",
-            self.id, self.name, self.path, self.is_dataset_root
+            "DatasetBasePath(id={}, name={:?}, path={}, is_dataset_root={}, storage_options={:?})",
+            self.id, self.name, self.path, self.is_dataset_root, self.storage_options
         )
     }
 }
@@ -525,6 +534,7 @@ impl From<BasePath> for DatasetBasePath {
             name: base_path.name,
             path: base_path.path,
             is_dataset_root: base_path.is_dataset_root,
+            storage_options: base_path.storage_options,
         }
     }
 }
@@ -537,6 +547,7 @@ impl From<DatasetBasePath> for BasePath {
             py_base_path.name,
             py_base_path.is_dataset_root,
         )
+        .with_storage_options(py_base_path.storage_options)
     }
 }
 

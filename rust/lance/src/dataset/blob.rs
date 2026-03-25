@@ -1352,6 +1352,7 @@ mod tests {
                         name: Some("blob_base".to_string()),
                         path: base_uri,
                         is_dataset_root,
+                        storage_options: Default::default(),
                     }]),
                     target_bases: Some(vec![1]),
                     ..Default::default()
@@ -1894,6 +1895,7 @@ mod tests {
                         name: Some("external".to_string()),
                         path: base_uri,
                         is_dataset_root: false,
+                        storage_options: Default::default(),
                     }]),
                     ..Default::default()
                 }),

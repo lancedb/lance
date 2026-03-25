@@ -192,6 +192,17 @@ impl fmt::Debug for StorageOptionsAccessor {
     }
 }
 
+impl Default for StorageOptionsAccessor {
+    fn default() -> Self {
+        Self {
+            initial_options: None,
+            provider: None,
+            cache: Arc::new(RwLock::new(None)),
+            refresh_offset: Duration::from_millis(DEFAULT_REFRESH_OFFSET_MILLIS),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedStorageOptions {
     options: HashMap<String, String>,
@@ -199,6 +210,18 @@ struct CachedStorageOptions {
 }
 
 impl StorageOptionsAccessor {
+    pub fn clone_with_new_initial_options(
+        &self,
+        new_initial_options: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            initial_options: new_initial_options,
+            provider: self.provider.clone(),
+            cache: self.cache.clone(),
+            refresh_offset: self.refresh_offset.clone(),
+        }
+    }
+
     /// Extract refresh offset from storage options, or use default
     fn extract_refresh_offset(options: &HashMap<String, String>) -> Duration {
         options

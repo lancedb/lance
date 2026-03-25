@@ -1221,8 +1221,8 @@ impl<'a> TransactionRebase<'a> {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
                             }
-                            // Check for path conflicts
-                            if new_base.path == committed_base.path {
+                            // Check for storage identity conflicts
+                            if new_base.matches_identity(committed_base) {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
                             }
@@ -2774,6 +2774,7 @@ mod tests {
                     path: "s3://bucket1/path1".to_string(),
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2786,6 +2787,7 @@ mod tests {
                     path: "s3://bucket2/path2".to_string(),
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2810,6 +2812,7 @@ mod tests {
                     path: "s3://bucket1/path1".to_string(),
                     name: Some("duplicate_name".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2822,6 +2825,7 @@ mod tests {
                     path: "s3://bucket2/path2".to_string(),
                     name: Some("duplicate_name".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2851,6 +2855,7 @@ mod tests {
                     path: "s3://bucket/duplicate_path".to_string(),
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2863,6 +2868,7 @@ mod tests {
                     path: "s3://bucket/duplicate_path".to_string(),
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2880,6 +2886,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_bases_same_path_different_storage_options_no_conflict() {
+        let dataset = test_dataset(10, 2).await;
+
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::UpdateBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 1,
+                    path: "s3://bucket/shared_path".to_string(),
+                    name: Some("base1".to_string()),
+                    is_dataset_root: false,
+                    storage_options: HashMap::from([(
+                        "azure_storage_account_name".to_string(),
+                        "account_a".to_string(),
+                    )]),
+                }],
+            },
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::UpdateBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 2,
+                    path: "s3://bucket/shared_path".to_string(),
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                    storage_options: HashMap::from([(
+                        "azure_storage_account_name".to_string(),
+                        "account_b".to_string(),
+                    )]),
+                }],
+            },
+        );
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
+    #[tokio::test]
     async fn test_add_bases_id_conflict() {
         let dataset = test_dataset(10, 2).await;
 
@@ -2892,6 +2940,7 @@ mod tests {
                     path: "s3://bucket1/path1".to_string(),
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2904,6 +2953,7 @@ mod tests {
                     path: "s3://bucket2/path2".to_string(),
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2932,6 +2982,7 @@ mod tests {
                     path: "s3://bucket/path".to_string(),
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -2983,12 +3034,14 @@ mod tests {
                         path: "s3://bucket1/path1".to_string(),
                         name: Some("base1".to_string()),
                         is_dataset_root: false,
+                        storage_options: Default::default(),
                     },
                     lance_table::format::BasePath {
                         id: 2,
                         path: "s3://bucket2/path2".to_string(),
                         name: Some("base2".to_string()),
                         is_dataset_root: false,
+                        storage_options: Default::default(),
                     },
                 ],
             },
@@ -3003,6 +3056,7 @@ mod tests {
                     path: "s3://bucket1/path1".to_string(), // Same path as txn1's first base
                     name: Some("base3".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -3032,6 +3086,7 @@ mod tests {
                     path: "s3://bucket1/path1".to_string(),
                     name: None,
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -3044,6 +3099,7 @@ mod tests {
                     path: "s3://bucket2/path2".to_string(),
                     name: None,
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -3068,6 +3124,7 @@ mod tests {
                     path: "s3://bucket1/path1".to_string(),
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );
@@ -3080,6 +3137,7 @@ mod tests {
                     path: "s3://bucket2/path2".to_string(),
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
+                    storage_options: Default::default(),
                 }],
             },
         );

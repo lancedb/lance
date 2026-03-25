@@ -12,6 +12,7 @@ use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -558,6 +559,8 @@ pub struct BasePath {
     pub is_dataset_root: bool,
     /// The full URI string (e.g., "s3://bucket/path")
     pub path: String,
+    /// Storage options that are part of this base path's identity.
+    pub storage_options: HashMap<String, String>,
 }
 
 impl BasePath {
@@ -575,7 +578,22 @@ impl BasePath {
             name,
             is_dataset_root,
             path,
+            storage_options: HashMap::new(),
         }
+    }
+
+    /// Return a copy of this base path with identity-defining storage options attached.
+    pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
+        self.storage_options = storage_options;
+        self
+    }
+
+    /// Returns true when both base paths refer to the same underlying storage location.
+    ///
+    /// The path alone is not always sufficient to identify a store. Some providers also
+    /// require storage options such as an account name.
+    pub fn matches_identity(&self, other: &Self) -> bool {
+        self.path == other.path && self.storage_options == other.storage_options
     }
 
     /// Extract the object store path from this BasePath's URI.
@@ -590,6 +608,7 @@ impl DeepSizeOf for BasePath {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.name.deep_size_of_children(context)
             + self.path.deep_size_of_children(context) * 2
+            + self.storage_options.deep_size_of_children(context)
             + size_of::<bool>()
     }
 }
@@ -824,7 +843,7 @@ impl ProtoStruct for Manifest {
 
 impl From<pb::BasePath> for BasePath {
     fn from(p: pb::BasePath) -> Self {
-        Self::new(p.id, p.path, p.name, p.is_dataset_root)
+        Self::new(p.id, p.path, p.name, p.is_dataset_root).with_storage_options(p.storage_options)
     }
 }
 
@@ -835,6 +854,7 @@ impl From<BasePath> for pb::BasePath {
             name: p.name,
             is_dataset_root: p.is_dataset_root,
             path: p.path,
+            storage_options: p.storage_options,
         }
     }
 }
@@ -989,6 +1009,7 @@ impl From<&Manifest> for pb::Manifest {
                     name: base_path.name.clone(),
                     is_dataset_root: base_path.is_dataset_root,
                     path: base_path.path.clone(),
+                    storage_options: base_path.storage_options.clone(),
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),

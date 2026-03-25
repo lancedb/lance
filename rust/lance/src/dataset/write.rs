@@ -43,7 +43,7 @@ use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
-use super::utils::SchemaAdapter;
+use super::utils::{SchemaAdapter, object_store_params_for_base_path};
 
 mod commit;
 pub mod delete;
@@ -508,19 +508,29 @@ pub async fn validate_and_resolve_target_bases(
         let mut resolved_ids = Vec::new();
         for reference in names_or_paths {
             let ref_str = reference.as_str();
-            let id = all_bases
+            let matching_ids = all_bases
                 .iter()
-                .find(|(_, base)| {
+                .filter(|(_, base)| {
                     base.name.as_ref().map(|n| n == ref_str).unwrap_or(false)
                         || base.path == ref_str
                 })
                 .map(|(&id, _)| id)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
+                .collect::<Vec<_>>();
+            let id = match matching_ids.as_slice() {
+                [] => {
+                    return Err(Error::invalid_input(format!(
                         "Base reference '{}' not found in available bases",
                         ref_str
-                    ))
-                })?;
+                    )));
+                }
+                [id] => *id,
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "Base reference '{}' is ambiguous across multiple base paths. Use a unique base name or base ID instead.",
+                        ref_str
+                    )));
+                }
+            };
 
             resolved_ids.push(id);
         }
@@ -547,11 +557,13 @@ pub async fn validate_and_resolve_target_bases(
                     target_base_id
                 ))
             })?;
+            let base_store_params =
+                object_store_params_for_base_path(base_path, Some(&store_params));
 
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
-                &store_params,
+                &base_store_params,
             )
             .await?;
 
@@ -597,10 +609,12 @@ async fn append_external_initial_bases(
 ) -> Result<()> {
     if let Some(initial_bases) = initial_bases {
         for base_path in initial_bases {
+            let base_store_params =
+                object_store_params_for_base_path(base_path, Some(store_params));
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
-                store_params,
+                &base_store_params,
             )
             .await?;
             append_external_base_candidate(
@@ -629,10 +643,12 @@ async fn build_external_base_resolver(
 
     if let Some(dataset) = dataset {
         for base_path in dataset.manifest.base_paths.values() {
+            let base_store_params =
+                object_store_params_for_base_path(base_path, Some(&store_params));
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
-                &store_params,
+                &base_store_params,
             )
             .await?;
             append_external_base_candidate(
@@ -1871,24 +1887,28 @@ mod tests {
                     name: Some("bucket1".to_string()),
                     path: "s3://bucket1/path1".to_string(),
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 },
                 BasePath {
                     id: 2,
                     name: Some("bucket2".to_string()),
                     path: "s3://bucket2/path2".to_string(),
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 },
                 BasePath {
                     id: 3,
                     name: Some("azure-az-base".to_string()),
                     path: "az://container/path1".to_string(),
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 },
                 BasePath {
                     id: 4,
                     name: Some("azure-abfss-base".to_string()),
                     path: "abfss://filesystem@account.dfs.core.windows.net/path1".to_string(),
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 },
             ]),
             target_bases: Some(vec![1]), // Use ID 1 which corresponds to bucket1
@@ -1963,12 +1983,17 @@ mod tests {
                         name: Some("base1".to_string()),
                         path: base1_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: HashMap::from([(
+                            "azure_storage_account_name".to_string(),
+                            "account1".to_string(),
+                        )]),
                     },
                     BasePath {
                         id: 2,
                         name: Some("base2".to_string()),
                         path: base2_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                 ]),
                 target_bases: Some(vec![1]),
@@ -1996,6 +2021,16 @@ mod tests {
                 .base_paths
                 .values()
                 .any(|bp| bp.name == Some("base2".to_string()))
+        );
+        let base1 = dataset
+            .manifest
+            .base_paths
+            .values()
+            .find(|bp| bp.name == Some("base1".to_string()))
+            .expect("base1 should be registered in manifest");
+        assert_eq!(
+            base1.storage_options.get("azure_storage_account_name"),
+            Some(&"account1".to_string())
         );
 
         // Verify data was written to base1
@@ -2025,6 +2060,7 @@ mod tests {
                     name: Some("base1".to_string()),
                     path: base1_uri.clone(),
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 }]),
                 target_bases: Some(vec![1]),
                 target_base_names_or_paths: Some(vec!["base1".to_string()]),
@@ -2067,12 +2103,14 @@ mod tests {
                         name: Some("base1".to_string()),
                         path: base1_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                     BasePath {
                         id: 2,
                         name: Some("base2".to_string()),
                         path: base2_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                 ]),
                 target_bases: Some(vec![1]),
@@ -2144,6 +2182,7 @@ mod tests {
                     name: Some("base3".to_string()),
                     path: _base3_uri.clone(),
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 }]),
                 target_bases: Some(vec![1]),
                 ..Default::default()
@@ -2184,12 +2223,14 @@ mod tests {
                         name: Some("base1".to_string()),
                         path: base1_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                     BasePath {
                         id: 2,
                         name: Some("base2".to_string()),
                         path: base2_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                 ]),
                 target_bases: Some(vec![1]),
@@ -2267,6 +2308,7 @@ mod tests {
                     name: Some("base3".to_string()),
                     path: base3_uri,
                     is_dataset_root: true,
+                    storage_options: Default::default(),
                 }]),
                 target_bases: Some(vec![1]),
                 ..Default::default()
@@ -2315,12 +2357,14 @@ mod tests {
                         name: Some("base1".to_string()),
                         path: base1_uri.clone(),
                         is_dataset_root: true, // Files will go to base1/data/
+                        storage_options: Default::default(),
                     },
                     BasePath {
                         id: 2,
                         name: Some("base2".to_string()),
                         path: base2_uri.clone(),
                         is_dataset_root: false, // Files will go directly to base2/
+                        storage_options: Default::default(),
                     },
                 ]),
                 target_bases: Some(vec![1, 2]), // Write to both bases
@@ -2460,12 +2504,14 @@ mod tests {
                         name: Some("base1".to_string()),
                         path: base1_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                     BasePath {
                         id: 2,
                         name: Some("base2".to_string()),
                         path: base2_uri.clone(),
                         is_dataset_root: true,
+                        storage_options: Default::default(),
                     },
                 ]),
                 target_base_names_or_paths: Some(vec!["base1".to_string()]), // Use name

@@ -13,6 +13,8 @@ use lance_arrow::json::{
     is_arrow_json_field, is_json_field,
 };
 use lance_core::ROW_ID;
+use lance_io::object_store::ObjectStoreParams;
+use lance_table::format::BasePath;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
@@ -263,4 +265,30 @@ impl SchemaAdapter {
             converted_stream,
         ))
     }
+}
+
+pub(crate) fn object_store_params_for_base_path<'a>(
+    base_path: &BasePath,
+    input_params: Option<&'a ObjectStoreParams>,
+) -> Cow<'a, ObjectStoreParams> {
+    if let Some(params) = input_params
+        && base_path.storage_options.is_empty()
+    {
+        return Cow::Borrowed(params);
+    }
+    let mut merged_storage_options = base_path.storage_options.clone();
+    let mut output_params = match input_params {
+        None => ObjectStoreParams::default(),
+        Some(params) => params.clone(),
+    };
+    if let Some(params_storage_options) = output_params.storage_options() {
+        for (k, v) in params_storage_options {
+            merged_storage_options.insert(k.into(), v.into());
+        }
+    }
+    let input_accessor = output_params.storage_options_accessor.unwrap_or_default();
+    output_params.storage_options_accessor = Some(Arc::new(
+        input_accessor.clone_with_new_initial_options(Some(merged_storage_options)),
+    ));
+    Cow::Owned(output_params)
 }

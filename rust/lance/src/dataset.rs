@@ -93,6 +93,7 @@ use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
+use self::utils::object_store_params_for_base_path;
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
@@ -1676,14 +1677,14 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-
+        let store_params =
+            object_store_params_for_base_path(base_path, self.store_params.as_deref());
         let (store, _) = ObjectStore::from_uri_and_params(
             self.session.store_registry(),
             &base_path.path,
-            &self.store_params.as_deref().cloned().unwrap_or_default(),
+            store_params.as_ref(),
         )
         .await?;
-
         Ok(store)
     }
 

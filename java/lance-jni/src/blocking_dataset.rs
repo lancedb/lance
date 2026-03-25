@@ -70,11 +70,21 @@ impl FromJObjectWithEnv<BasePath> for JObject<'_> {
         let name = env.get_optional_string_from_method(self, "getName")?;
         let path = env.get_string_from_method(self, "getPath")?;
         let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;
+        let storage_options_obj = env
+            .call_method(self, "getStorageOptions", "()Ljava/util/Map;", &[])?
+            .l()?;
+        let storage_options = if storage_options_obj.is_null() {
+            HashMap::new()
+        } else {
+            let map = JMap::from_env(env, &storage_options_obj)?;
+            to_rust_map(env, &map)?
+        };
         Ok(BasePath {
             id,
             name,
             path,
             is_dataset_root,
+            storage_options,
         })
     }
 }

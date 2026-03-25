@@ -219,6 +219,10 @@ message BasePath {
   bool is_dataset_root = 3;
   // Note: This absolute path will be directly used by Path:parse(),
   string path = 4;
+  // Storage options relevant to identifying the base path. For example, azure_storage_account_name
+  // goes here. Credentials and options which don't affect the identity of the data being stored
+  // should not be placed here.
+  map<string, string> storage_options = 5;
 }
 
 // Auxiliary Data attached to a version.
