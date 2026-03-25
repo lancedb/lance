@@ -267,7 +267,7 @@ impl SchemaAdapter {
     }
 }
 
-pub(crate) fn object_store_params_for_base_path<'a>(
+pub fn object_store_params_for_base_path<'a>(
     base_path: &BasePath,
     input_params: Option<&'a ObjectStoreParams>,
 ) -> Cow<'a, ObjectStoreParams> {

@@ -218,7 +218,7 @@ impl StorageOptionsAccessor {
             initial_options: new_initial_options,
             provider: self.provider.clone(),
             cache: Arc::new(RwLock::new(None)),
-            refresh_offset: self.refresh_offset.clone(),
+            refresh_offset: self.refresh_offset,
         }
     }
 
