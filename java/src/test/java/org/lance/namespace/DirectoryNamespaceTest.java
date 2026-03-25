@@ -13,12 +13,17 @@
  */
 package org.lance.namespace;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
+import org.lance.Fragment;
+import org.lance.FragmentMetadata;
 import org.lance.ReadOptions;
+import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.namespace.model.*;
 import org.lance.namespace.model.DescribeTableVersionRequest;
 import org.lance.namespace.model.DescribeTableVersionResponse;
+import org.lance.operation.Append;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -669,6 +674,148 @@ public class DirectoryNamespaceTest {
           namespace.getDescribeTableVersionCount(),
           "describe_table_version should have been called once when opening version 1");
 
+      namespace.close();
+    }
+  }
+
+  @Test
+  void testDatasetBasedCommitBuilderWithNamespace(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TableVersionTrackingNamespace namespace =
+          new TableVersionTrackingNamespace(managedVersioningTempDir);
+      String tableName = "test_table";
+      List<String> tableId = Arrays.asList(tableName);
+
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
+
+      // Create initial dataset through namespace using WriteDatasetBuilder
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+        idVector.allocateNew(2);
+        nameVector.allocateNew(2);
+        idVector.set(0, 1);
+        idVector.set(1, 2);
+        nameVector.set(0, "Alice".getBytes());
+        nameVector.set(1, "Bob".getBytes());
+        idVector.setValueCount(2);
+        nameVector.setValueCount(2);
+        root.setRowCount(2);
+
+        ArrowReader reader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return root;
+              }
+            };
+
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(reader)
+                .namespace(namespace)
+                .tableId(tableId)
+                .mode(WriteParams.WriteMode.CREATE)
+                .execute()) {
+          assertEquals(2, dataset.countRows());
+          assertEquals(1, dataset.version());
+        }
+      }
+
+      // Verify initial create used createTableVersion once
+      assertEquals(
+          1,
+          namespace.getCreateTableVersionCount(),
+          "create_table_version should be called once during CREATE");
+
+      // Open dataset through namespace (returns dataset with managed versioning)
+      Dataset existingDataset =
+          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build();
+
+      // Get the dataset URI for Fragment.create()
+      String datasetUri = existingDataset.uri();
+
+      // Create a new fragment independently (simulating Spark worker behavior)
+      List<FragmentMetadata> fragments;
+      try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector idVector = (IntVector) appendRoot.getVector("id");
+        VarCharVector nameVector = (VarCharVector) appendRoot.getVector("name");
+
+        idVector.allocateNew(2);
+        nameVector.allocateNew(2);
+        idVector.set(0, 3);
+        idVector.set(1, 4);
+        nameVector.set(0, "Charlie".getBytes());
+        nameVector.set(1, "Diana".getBytes());
+        idVector.setValueCount(2);
+        nameVector.setValueCount(2);
+        appendRoot.setRowCount(2);
+
+        fragments =
+            Fragment.create(datasetUri, allocator, appendRoot, new WriteParams.Builder().build());
+      }
+
+      // Commit using dataset-based CommitBuilder WITH namespace (the new path)
+      int createCountBefore = namespace.getCreateTableVersionCount();
+      try (Transaction txn =
+              new Transaction.Builder()
+                  .readVersion(existingDataset.version())
+                  .operation(Append.builder().fragments(fragments).build())
+                  .build();
+          Dataset committed =
+              new CommitBuilder(existingDataset)
+                  .namespace(namespace)
+                  .tableId(tableId)
+                  .execute(txn)) {
+        assertEquals(2, committed.version());
+        assertEquals(4, committed.countRows());
+      }
+
+      // Verify createTableVersion was called for the dataset-based commit
+      assertEquals(
+          createCountBefore + 1,
+          namespace.getCreateTableVersionCount(),
+          "create_table_version should be called for dataset-based CommitBuilder with namespace");
+
+      // Verify the data is accessible through namespace
+      try (Dataset latestDs =
+          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+        assertEquals(4, latestDs.countRows());
+        assertEquals(2, latestDs.version());
+      }
+
+      existingDataset.close();
       namespace.close();
     }
   }

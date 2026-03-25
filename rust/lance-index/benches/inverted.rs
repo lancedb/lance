@@ -98,7 +98,7 @@ fn bench_inverted(c: &mut Criterion) {
                 InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(false));
             black_box({
                 builder
-                    .update(stream, indexing_store.as_ref())
+                    .update(stream, indexing_store.as_ref(), None)
                     .await
                     .unwrap();
                 builder
@@ -119,7 +119,7 @@ fn bench_inverted(c: &mut Criterion) {
                     InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(true));
                 black_box({
                     builder
-                        .update(stream, indexing_with_positions_store.as_ref())
+                        .update(stream, indexing_with_positions_store.as_ref(), None)
                         .await
                         .unwrap();
                     builder
@@ -135,7 +135,7 @@ fn bench_inverted(c: &mut Criterion) {
         let mut builder =
             InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(true));
         builder
-            .update(stream, phrase_search_store.as_ref())
+            .update(stream, phrase_search_store.as_ref(), None)
             .await
             .unwrap();
     });

@@ -242,7 +242,7 @@ impl ExecutionPlan for MatchQueryExec {
                 .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
-            let pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
@@ -259,6 +259,11 @@ impl ExecutionPlan for MatchQueryExec {
                         column,
                     ))
                 })?;
+            if !inverted_idx.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
+            }
             metrics.record_parts_searched(inverted_idx.partition_count());
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
@@ -872,10 +877,13 @@ impl ExecutionPlan for PhraseQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let column = query.column.ok_or(DataFusionError::Execution(format!(
-                "column not set for PhraseQuery {}",
-                query.terms
-            )))?;
+            let column = query
+                .column
+                .clone()
+                .ok_or(DataFusionError::Execution(format!(
+                    "column not set for PhraseQuery {}",
+                    query.terms
+                )))?;
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
@@ -888,11 +896,11 @@ impl ExecutionPlan for PhraseQueryExec {
                 .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
-            let pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
-                ds,
+                ds.clone(),
                 &[index_meta],
             )?;
 
@@ -905,6 +913,11 @@ impl ExecutionPlan for PhraseQueryExec {
                         column,
                     ))
                 })?;
+            if !index.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(index.deleted_fragments().clone());
+            }
             metrics.record_parts_searched(index.partition_count());
 
             let mut tokenizer = index.tokenizer();

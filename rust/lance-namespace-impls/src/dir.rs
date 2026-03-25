@@ -14,9 +14,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::index::{IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
+use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
+use lance_index::vector::{
+    bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    sq::builder::SQBuildParams,
+};
+use lance_index::{DatasetIndexExt, IndexType, is_system_index};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_linalg::distance::MetricType;
 use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
@@ -27,14 +36,18 @@ use std::sync::Arc;
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableVersionRequest,
     CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
-    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse, Identity,
-    ListNamespacesRequest, ListNamespacesResponse, ListTableVersionsRequest,
-    ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
-    TableExistsRequest, TableVersion,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse, Identity,
+    IndexContent, ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
+    ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
+    TableVersion,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -56,6 +69,35 @@ pub(crate) struct TableStatus {
     pub(crate) is_deregistered: bool,
     /// Whether the table has a `.lance-reserved` marker file (declared but not written)
     pub(crate) has_reserved_file: bool,
+}
+
+enum DirectoryIndexParams {
+    Scalar {
+        index_type: IndexType,
+        params: ScalarIndexParams,
+    },
+    Inverted(InvertedIndexParams),
+    Vector {
+        index_type: IndexType,
+        params: VectorIndexParams,
+    },
+}
+
+impl DirectoryIndexParams {
+    fn index_type(&self) -> IndexType {
+        match self {
+            Self::Scalar { index_type, .. } | Self::Vector { index_type, .. } => *index_type,
+            Self::Inverted(_) => IndexType::Inverted,
+        }
+    }
+
+    fn params(&self) -> &dyn IndexParams {
+        match self {
+            Self::Scalar { params, .. } => params,
+            Self::Inverted(params) => params,
+            Self::Vector { params, .. } => params,
+        }
+    }
 }
 
 /// Builder for creating a DirectoryNamespace.
@@ -751,6 +793,382 @@ impl DirectoryNamespace {
         describe_resp.location.ok_or_else(|| {
             Error::namespace_source(format!("Table location not found for: {:?}", id).into())
         })
+    }
+
+    async fn load_dataset(
+        &self,
+        table_uri: &str,
+        version: Option<i64>,
+        operation: &str,
+    ) -> Result<Dataset> {
+        if let Some(version) = version
+            && version < 0
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Table version for {} must be non-negative, got {}",
+                    operation, version
+                )
+                .into(),
+            ));
+        }
+
+        let mut builder = DatasetBuilder::from_uri(table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+
+        let dataset = builder.load().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to open table at '{}' for {}: {}",
+                    table_uri, operation, e
+                )
+                .into(),
+            )
+        })?;
+
+        if let Some(version) = version {
+            return dataset.checkout_version(version as u64).await.map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to checkout version {} for table at '{}' during {}: {}",
+                        version, table_uri, operation, e
+                    )
+                    .into(),
+                )
+            });
+        }
+
+        Ok(dataset)
+    }
+
+    fn parse_index_type(index_type: &str) -> Result<IndexType> {
+        match index_type.trim().to_ascii_uppercase().as_str() {
+            "SCALAR" | "BTREE" => Ok(IndexType::BTree),
+            "BITMAP" => Ok(IndexType::Bitmap),
+            "LABEL_LIST" | "LABELLIST" => Ok(IndexType::LabelList),
+            "INVERTED" | "FTS" => Ok(IndexType::Inverted),
+            "NGRAM" => Ok(IndexType::NGram),
+            "ZONEMAP" | "ZONE_MAP" => Ok(IndexType::ZoneMap),
+            "BLOOMFILTER" | "BLOOM_FILTER" => Ok(IndexType::BloomFilter),
+            "RTREE" | "R_TREE" => Ok(IndexType::RTree),
+            "VECTOR" | "IVF_PQ" => Ok(IndexType::IvfPq),
+            "IVF_FLAT" => Ok(IndexType::IvfFlat),
+            "IVF_SQ" => Ok(IndexType::IvfSq),
+            "IVF_RQ" => Ok(IndexType::IvfRq),
+            "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
+            "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
+            "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
+            other => Err(Error::invalid_input_source(
+                format!("Unsupported index_type '{}'", other).into(),
+            )),
+        }
+    }
+
+    fn parse_metric_type(distance_type: Option<&str>) -> Result<MetricType> {
+        let distance_type = distance_type.unwrap_or("l2");
+        MetricType::try_from(distance_type).map_err(|e| {
+            Error::invalid_input_source(
+                format!(
+                    "Unsupported distance_type '{}' for vector index: {}",
+                    distance_type, e
+                )
+                .into(),
+            )
+        })
+    }
+
+    fn build_index_params(request: &CreateTableIndexRequest) -> Result<DirectoryIndexParams> {
+        let index_type = Self::parse_index_type(&request.index_type)?;
+        Ok(match index_type {
+            IndexType::BTree => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            },
+            IndexType::Bitmap => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            },
+            IndexType::LabelList => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList),
+            },
+            IndexType::NGram => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            },
+            IndexType::ZoneMap => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            },
+            IndexType::BloomFilter => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+            },
+            IndexType::RTree => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::RTree),
+            },
+            IndexType::Inverted => {
+                let mut params = InvertedIndexParams::default();
+                if let Some(with_position) = request.with_position {
+                    params = params.with_position(with_position);
+                }
+                if let Some(base_tokenizer) = &request.base_tokenizer {
+                    params = params.base_tokenizer(base_tokenizer.clone());
+                }
+                if let Some(language) = &request.language {
+                    params = params.language(language)?;
+                }
+                if let Some(max_token_length) = request.max_token_length {
+                    if max_token_length < 0 {
+                        return Err(Error::invalid_input_source(
+                            format!(
+                                "FTS max_token_length must be non-negative, got {}",
+                                max_token_length
+                            )
+                            .into(),
+                        ));
+                    }
+                    params = params.max_token_length(Some(max_token_length as usize));
+                }
+                if let Some(lower_case) = request.lower_case {
+                    params = params.lower_case(lower_case);
+                }
+                if let Some(stem) = request.stem {
+                    params = params.stem(stem);
+                }
+                if let Some(remove_stop_words) = request.remove_stop_words {
+                    params = params.remove_stop_words(remove_stop_words);
+                }
+                if let Some(ascii_folding) = request.ascii_folding {
+                    params = params.ascii_folding(ascii_folding);
+                }
+                DirectoryIndexParams::Inverted(params)
+            }
+            IndexType::IvfFlat => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_flat_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                ),
+            },
+            IndexType::IvfPq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_pq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    PQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfSq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_sq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    SQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfRq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_rq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    RQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfHnswFlat => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::ivf_hnsw(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    HnswBuildParams::default(),
+                ),
+            },
+            IndexType::IvfHnswSq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_hnsw_sq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    HnswBuildParams::default(),
+                    SQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfHnswPq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_hnsw_pq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    HnswBuildParams::default(),
+                    PQBuildParams::default(),
+                ),
+            },
+            other => {
+                return Err(Error::invalid_input_source(
+                    format!("Unsupported index type for namespace API: {}", other).into(),
+                ));
+            }
+        })
+    }
+
+    fn paginate_indices(
+        indices: &mut Vec<IndexContent>,
+        page_token: Option<String>,
+        limit: Option<i32>,
+    ) -> Option<String> {
+        indices.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+
+        if let Some(start_after) = page_token {
+            if let Some(index) = indices
+                .iter()
+                .position(|index| index.index_name.as_str() > start_after.as_str())
+            {
+                indices.drain(0..index);
+            } else {
+                indices.clear();
+            }
+        }
+
+        let mut next_page_token = None;
+        if let Some(limit) = limit
+            && limit >= 0
+        {
+            let limit = limit as usize;
+            if limit > 0 && indices.len() > limit {
+                next_page_token = Some(indices[limit - 1].index_name.clone());
+            }
+            indices.truncate(limit);
+        }
+        if indices.is_empty() {
+            None
+        } else {
+            next_page_token
+        }
+    }
+
+    fn transaction_operation_name(transaction: &Transaction) -> String {
+        match &transaction.operation {
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } if new_indices.is_empty() && !removed_indices.is_empty() => "DropIndex".to_string(),
+            _ => transaction.operation.to_string(),
+        }
+    }
+
+    fn transaction_response(
+        version: u64,
+        transaction: &Transaction,
+    ) -> DescribeTransactionResponse {
+        let mut properties = transaction
+            .transaction_properties
+            .as_ref()
+            .map(|properties| (**properties).clone())
+            .unwrap_or_default();
+        properties.insert("uuid".to_string(), transaction.uuid.clone());
+        properties.insert("version".to_string(), version.to_string());
+        properties.insert(
+            "read_version".to_string(),
+            transaction.read_version.to_string(),
+        );
+        properties.insert(
+            "operation".to_string(),
+            Self::transaction_operation_name(transaction),
+        );
+        if let Some(tag) = &transaction.tag {
+            properties.insert("tag".to_string(), tag.clone());
+        }
+
+        DescribeTransactionResponse {
+            status: "SUCCEEDED".to_string(),
+            properties: Some(properties),
+        }
+    }
+
+    fn describe_table_index_stats_response(
+        stats: &serde_json::Value,
+    ) -> DescribeTableIndexStatsResponse {
+        let get_i64 = |key: &str| {
+            stats.get(key).and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))
+            })
+        };
+
+        DescribeTableIndexStatsResponse {
+            distance_type: stats
+                .get("distance_type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            index_type: stats
+                .get("index_type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            num_indexed_rows: get_i64("num_indexed_rows"),
+            num_unindexed_rows: get_i64("num_unindexed_rows"),
+            num_indices: get_i64("num_indices").and_then(|value| i32::try_from(value).ok()),
+        }
+    }
+
+    /// When transaction_id is not parseable as a version number (i.e. it's a UUID),
+    /// find_transaction iterates through every version in reverse, reading each
+    /// transaction file from storage. For tables with many versions this will
+    /// be extremely slow — each iteration is a separate I/O call.
+    async fn find_transaction(&self, dataset: &Dataset, id: &str) -> Result<(u64, Transaction)> {
+        if let Ok(version) = id.parse::<u64>() {
+            let transaction = dataset
+                .read_transaction_by_version(version)
+                .await
+                .map_err(|e| {
+                    Error::namespace_source(
+                        format!("Failed to read transaction for version {}: {}", version, e).into(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    Error::namespace_source(
+                        format!("Transaction not found for version {}", version).into(),
+                    )
+                })?;
+            return Ok((version, transaction));
+        }
+
+        let versions = dataset.versions().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to list table versions while resolving transaction '{}': {}",
+                    id, e
+                )
+                .into(),
+            )
+        })?;
+
+        for version in versions.into_iter().rev() {
+            if let Some(transaction) = dataset
+                .read_transaction_by_version(version.version)
+                .await
+                .map_err(|e| {
+                    Error::namespace_source(
+                        format!(
+                            "Failed to read transaction for version {} while resolving '{}': {}",
+                            version.version, id, e
+                        )
+                        .into(),
+                    )
+                })?
+                && transaction.uuid == id
+            {
+                return Ok((version.version, transaction));
+            }
+        }
+
+        Err(Error::namespace_source(
+            format!("Transaction not found: {}", id).into(),
+        ))
     }
 
     fn table_full_uri(&self, table_name: &str) -> String {
@@ -1987,6 +2405,291 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
+    async fn create_table_index(
+        &self,
+        request: CreateTableIndexRequest,
+    ) -> Result<CreateTableIndexResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "create_table_index")
+            .await?;
+        let index_request = Self::build_index_params(&request)?;
+
+        dataset
+            .create_index(
+                &[request.column.as_str()],
+                index_request.index_type(),
+                request.name.clone(),
+                index_request.params(),
+                false,
+            )
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to create {} index '{}' on column '{}' for table '{}': {}",
+                        request.index_type,
+                        request.name.as_deref().unwrap_or("<auto-generated>"),
+                        request.column,
+                        table_uri,
+                        e
+                    )
+                    .into(),
+                )
+            })?;
+
+        let transaction_id = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read committed transaction after creating index on '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?
+            .map(|transaction| transaction.uuid);
+
+        Ok(CreateTableIndexResponse { transaction_id })
+    }
+
+    async fn list_table_indices(
+        &self,
+        request: ListTableIndicesRequest,
+    ) -> Result<ListTableIndicesResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, request.version, "list_table_indices")
+            .await?;
+        let mut indices = dataset
+            .describe_indices(None)
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!("Failed to describe table indices for '{}': {}", table_uri, e).into(),
+                )
+            })?
+            .into_iter()
+            .filter(|description| {
+                description
+                    .metadata()
+                    .first()
+                    .map(|metadata| !is_system_index(metadata))
+                    .unwrap_or(false)
+            })
+            .map(|description| {
+                let columns = description
+                    .field_ids()
+                    .iter()
+                        .map(|field_id| {
+                        dataset
+                            .schema()
+                            .field_path(i32::try_from(*field_id).map_err(|e| {
+                                Error::namespace_source(
+                                    format!(
+                                        "Field id {} does not fit in i32 for table '{}': {}",
+                                        field_id, table_uri, e
+                                    )
+                                    .into(),
+                                )
+                            })?)
+                            .map_err(|e| {
+                            Error::namespace_source(
+                                format!(
+                                    "Failed to resolve field path for field_id {} in table '{}': {}",
+                                    field_id, table_uri, e
+                                )
+                                .into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Ok(IndexContent {
+                    index_name: description.name().to_string(),
+                    index_uuid: description.metadata()[0].uuid.to_string(),
+                    columns,
+                    status: "SUCCEEDED".to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let page_token = Self::paginate_indices(&mut indices, request.page_token, request.limit);
+        Ok(ListTableIndicesResponse {
+            indexes: indices,
+            page_token,
+        })
+    }
+
+    async fn describe_table_index_stats(
+        &self,
+        request: DescribeTableIndexStatsRequest,
+    ) -> Result<DescribeTableIndexStatsResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, request.version, "describe_table_index_stats")
+            .await?;
+        let index_name = request.index_name.as_deref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "Index name is required for describe_table_index_stats".into(),
+            )
+        })?;
+        let metadatas = dataset
+            .load_indices_by_name(index_name)
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to load index '{}' metadata for table '{}': {}",
+                        index_name, table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+        if metadatas.first().is_some_and(is_system_index) {
+            return Err(Error::not_supported_source(
+                format!("System index '{}' is not exposed by this API", index_name).into(),
+            ));
+        }
+
+        let stats =
+            <Dataset as lance_index::DatasetIndexExt>::index_statistics(&dataset, index_name)
+                .await
+                .map_err(|e| {
+                    Error::namespace_source(
+                        format!(
+                            "Failed to describe index statistics for '{}' on table '{}': {}",
+                            index_name, table_uri, e
+                        )
+                        .into(),
+                    )
+                })?;
+        let stats: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to parse index statistics for '{}' on table '{}': {}",
+                    index_name, table_uri, e
+                )
+                .into(),
+            )
+        })?;
+
+        Ok(Self::describe_table_index_stats_response(&stats))
+    }
+
+    async fn describe_transaction(
+        &self,
+        request: DescribeTransactionRequest,
+    ) -> Result<DescribeTransactionResponse> {
+        let mut request_id = request.id.ok_or_else(|| {
+            Error::invalid_input_source(
+                "Transaction id must include table id and transaction identifier".into(),
+            )
+        })?;
+        if request_id.len() < 2 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Transaction request id must include table id and transaction identifier, got {:?}",
+                    request_id
+                )
+                .into(),
+            ));
+        }
+
+        let id = request_id.pop().expect("request_id len checked above");
+        let table_id = Some(request_id);
+        let table_uri = self.resolve_table_location(&table_id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "describe_transaction")
+            .await?;
+        let (version, transaction) = self.find_transaction(&dataset, &id).await?;
+
+        Ok(Self::transaction_response(version, &transaction))
+    }
+
+    async fn create_table_scalar_index(
+        &self,
+        request: CreateTableIndexRequest,
+    ) -> Result<CreateTableScalarIndexResponse> {
+        let index_type = Self::parse_index_type(&request.index_type)?;
+        if !index_type.is_scalar() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "create_table_scalar_index only supports scalar index types, got {}",
+                    request.index_type
+                )
+                .into(),
+            ));
+        }
+
+        let response = self.create_table_index(request).await?;
+        Ok(CreateTableScalarIndexResponse {
+            transaction_id: response.transaction_id,
+        })
+    }
+
+    async fn drop_table_index(
+        &self,
+        request: DropTableIndexRequest,
+    ) -> Result<DropTableIndexResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let index_name = request.index_name.as_deref().ok_or_else(|| {
+            Error::invalid_input_source("Index name is required for drop_table_index".into())
+        })?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "drop_table_index")
+            .await?;
+        let metadatas = dataset
+            .load_indices_by_name(index_name)
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to load index '{}' before dropping it from table '{}': {}",
+                        index_name, table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+        if metadatas.first().is_some_and(is_system_index) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "System index '{}' cannot be dropped via this API",
+                    index_name
+                )
+                .into(),
+            ));
+        }
+
+        dataset.drop_index(index_name).await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to drop index '{}' from table '{}': {}",
+                    index_name, table_uri, e
+                )
+                .into(),
+            )
+        })?;
+
+        let transaction_id = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read committed transaction after dropping index '{}' from '{}': {}",
+                        index_name, table_uri, e
+                    )
+                    .into(),
+                )
+            })?
+            .map(|transaction| transaction.uuid);
+
+        Ok(DropTableIndexResponse { transaction_id })
+    }
+
     fn namespace_id(&self) -> String {
         format!("DirectoryNamespace {{ root: {:?} }}", self.root)
     }
@@ -1998,6 +2701,7 @@ mod tests {
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_index::DatasetIndexExt;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
@@ -2032,6 +2736,23 @@ mod tests {
         buffer
     }
 
+    fn create_ipc_data_from_batches(
+        schema: Arc<arrow_schema::Schema>,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Vec<u8> {
+        use arrow::ipc::writer::StreamWriter;
+
+        let mut buffer = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+            for batch in &batches {
+                writer.write(batch).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buffer
+    }
+
     /// Helper to create a simple test schema
     fn create_test_schema() -> JsonArrowSchema {
         let int_type = JsonArrowDataType::new("int32".to_string());
@@ -2055,6 +2776,107 @@ mod tests {
             fields: vec![id_field, name_field],
             metadata: None,
         }
+    }
+
+    fn create_scalar_table_ipc_data() -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "cory"])),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    fn create_vector_table_ipc_data() -> Vec<u8> {
+        use arrow::array::{FixedSizeListArray, Float32Array, Int32Array};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+        let vector_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vectors = FixedSizeListArray::try_new(
+            vector_field,
+            2,
+            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6])),
+            None,
+        )
+        .unwrap();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(vectors)],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    async fn create_scalar_table(namespace: &DirectoryNamespace, table_name: &str) {
+        let mut create_table_request = CreateTableRequest::new();
+        create_table_request.id = Some(vec![table_name.to_string()]);
+        namespace
+            .create_table(
+                create_table_request,
+                Bytes::from(create_scalar_table_ipc_data()),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn create_vector_table(namespace: &DirectoryNamespace, table_name: &str) {
+        let mut create_table_request = CreateTableRequest::new();
+        create_table_request.id = Some(vec![table_name.to_string()]);
+        namespace
+            .create_table(
+                create_table_request,
+                Bytes::from(create_vector_table_ipc_data()),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn open_dataset(namespace: &DirectoryNamespace, table_name: &str) -> Dataset {
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec![table_name.to_string()]);
+        let table_uri = namespace
+            .describe_table(describe_request)
+            .await
+            .unwrap()
+            .location
+            .expect("table location should exist");
+        Dataset::open(&table_uri).await.unwrap()
+    }
+
+    async fn create_scalar_index(
+        namespace: &DirectoryNamespace,
+        table_name: &str,
+        index_name: &str,
+    ) -> Option<String> {
+        use lance_namespace::models::CreateTableIndexRequest;
+
+        let mut create_index_request =
+            CreateTableIndexRequest::new("id".to_string(), "BTREE".to_string());
+        create_index_request.id = Some(vec![table_name.to_string()]);
+        create_index_request.name = Some(index_name.to_string());
+        namespace
+            .create_table_scalar_index(create_index_request)
+            .await
+            .unwrap()
+            .transaction_id
     }
 
     #[tokio::test]
@@ -2197,6 +3019,256 @@ mod tests {
             0,
             "Namespace should have no tables yet"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_scalar_index() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let dataset = open_dataset(&namespace, "users").await;
+        let expected_transaction_id = dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.uuid);
+        assert_eq!(transaction_id, expected_transaction_id);
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(indices.iter().any(|index| index.name == "users_id_idx"));
+    }
+
+    #[tokio::test]
+    async fn test_create_vector_index() {
+        use lance_namespace::models::CreateTableIndexRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_vector_table(&namespace, "vectors").await;
+
+        let mut create_index_request =
+            CreateTableIndexRequest::new("vector".to_string(), "IVF_FLAT".to_string());
+        create_index_request.id = Some(vec!["vectors".to_string()]);
+        create_index_request.name = Some("vector_idx".to_string());
+        create_index_request.distance_type = Some("l2".to_string());
+        let transaction_id = namespace
+            .create_table_index(create_index_request)
+            .await
+            .unwrap()
+            .transaction_id;
+
+        let dataset = open_dataset(&namespace, "vectors").await;
+        let expected_transaction_id = dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.uuid);
+        assert_eq!(transaction_id, expected_transaction_id);
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(indices.iter().any(|index| index.name == "vector_idx"));
+    }
+
+    #[tokio::test]
+    async fn test_list_table_indices() {
+        use lance_namespace::models::ListTableIndicesRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        create_scalar_index(&namespace, "users", "a_idx").await;
+        create_scalar_index(&namespace, "users", "b_idx").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let response = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["users".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.indexes.len(), 3);
+        assert_eq!(response.indexes[0].index_name, "a_idx");
+        assert_eq!(response.indexes[1].index_name, "b_idx");
+        assert_eq!(response.indexes[2].index_name, "users_id_idx");
+        assert!(response.page_token.is_none());
+        let users_id_idx = response
+            .indexes
+            .iter()
+            .find(|index| index.index_name == "users_id_idx")
+            .unwrap();
+        assert_eq!(users_id_idx.columns, vec!["id"]);
+        assert_eq!(users_id_idx.status, "SUCCEEDED");
+
+        let dataset = open_dataset(&namespace, "users").await;
+        let expected_transaction_id = dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.uuid);
+        assert_eq!(transaction_id, expected_transaction_id);
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices
+                .iter()
+                .filter(|index| index.name == "users_id_idx")
+                .count(),
+            1
+        );
+
+        let first_page = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["users".to_string()]),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first_page.indexes.len(), 2);
+        assert_eq!(first_page.indexes[0].index_name, "a_idx");
+        assert_eq!(first_page.indexes[1].index_name, "b_idx");
+        assert_eq!(first_page.page_token.as_deref(), Some("b_idx"));
+
+        let second_page = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["users".to_string()]),
+                page_token: first_page.page_token.clone(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(second_page.indexes.len(), 1);
+        assert_eq!(second_page.indexes[0].index_name, "users_id_idx");
+        assert!(second_page.page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_index_stats() {
+        use lance_namespace::models::DescribeTableIndexStatsRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let response = namespace
+            .describe_table_index_stats(DescribeTableIndexStatsRequest {
+                id: Some(vec!["users".to_string()]),
+                index_name: Some("users_id_idx".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.index_type, Some("BTree".to_string()));
+        assert_eq!(response.num_indices, Some(1));
+        assert_eq!(response.num_indexed_rows, Some(3));
+        assert_eq!(response.num_unindexed_rows, Some(0));
+
+        let dataset = open_dataset(&namespace, "users").await;
+        let expected_transaction_id = dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.uuid);
+        assert_eq!(transaction_id, expected_transaction_id);
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("users_id_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["index_type"], "BTree");
+        assert_eq!(stats["num_indices"], 1);
+        assert_eq!(stats["num_indexed_rows"], 3);
+        assert_eq!(stats["num_unindexed_rows"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_describe_transaction() {
+        use lance_namespace::models::DescribeTransactionRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let dataset = open_dataset(&namespace, "users").await;
+        let latest_transaction = dataset.read_transaction().await.unwrap();
+        assert_eq!(
+            transaction_id,
+            latest_transaction
+                .as_ref()
+                .map(|transaction| transaction.uuid.clone())
+        );
+
+        if let Some(transaction_id) = transaction_id {
+            let response = namespace
+                .describe_transaction(DescribeTransactionRequest {
+                    id: Some(vec!["users".to_string(), transaction_id.clone()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status, "SUCCEEDED");
+            assert_eq!(
+                response
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.get("operation")),
+                Some(&"CreateIndex".to_string())
+            );
+            assert_eq!(
+                response
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.get("uuid")),
+                Some(&transaction_id)
+            );
+        } else {
+            assert!(latest_transaction.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_index() {
+        use lance_namespace::models::{DropTableIndexRequest, ListTableIndicesRequest};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let create_transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let drop_transaction_id = namespace
+            .drop_table_index(DropTableIndexRequest {
+                id: Some(vec!["users".to_string()]),
+                index_name: Some("users_id_idx".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .transaction_id;
+
+        let dataset = open_dataset(&namespace, "users").await;
+        let previous_dataset = dataset
+            .checkout_version(dataset.version().version - 1)
+            .await
+            .unwrap();
+        let previous_transaction_id = previous_dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.uuid);
+        assert_eq!(create_transaction_id, previous_transaction_id);
+        let expected_drop_transaction_id = dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.uuid);
+        assert_eq!(drop_transaction_id, expected_drop_transaction_id);
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(!indices.iter().any(|index| index.name == "users_id_idx"));
+
+        let list_response = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["users".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(list_response.indexes.is_empty());
     }
 
     #[tokio::test]

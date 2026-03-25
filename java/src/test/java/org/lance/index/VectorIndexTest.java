@@ -13,18 +13,15 @@
  */
 package org.lance.index;
 
-import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestVectorDataset;
-import org.lance.Transaction;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
-import org.lance.operation.CreateIndex;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -33,8 +30,6 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
-import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -75,72 +70,40 @@ public class VectorIndexTest {
         IndexParams indexParams =
             IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
 
-        UUID indexUUID = UUID.randomUUID();
+        Index firstSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_FLAT,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                    .build());
 
-        // Partially create index on the first fragment
-        dataset.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_FLAT,
-                    indexParams)
-                .withIndexName(TestVectorDataset.indexName)
-                .withIndexUUID(indexUUID.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-
-        // Partially create index on the second fragment with the same UUID
-        dataset.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_FLAT,
-                    indexParams)
-                .withIndexName(TestVectorDataset.indexName)
-                .withIndexUUID(indexUUID.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
-                .build());
+        Index secondSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_FLAT,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                    .build());
 
         // The index should not be visible before metadata merge & commit
         assertFalse(
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_FLAT index should not present before commit");
 
-        // Merge index metadata for all fragment-level pieces
-        dataset.mergeIndexMetadata(indexUUID.toString(), IndexType.IVF_FLAT, Optional.empty());
+        List<Index> builtSegments =
+            dataset.buildIndexSegments(List.of(firstSegment, secondSegment), Optional.empty());
+        assertEquals(2, builtSegments.size());
 
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals(TestVectorDataset.vectorColumnName))
-                .findAny()
-                .orElseThrow(
-                    () -> new RuntimeException("Cannot find vector field for TestVectorDataset"))
-                .getId();
-
-        long datasetVersion = dataset.version();
-
-        Index index =
-            Index.builder()
-                .uuid(indexUUID)
-                .name(TestVectorDataset.indexName)
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(
-                    fragments.stream().limit(2).map(Fragment::getId).collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(dataset.version())
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
-          }
-        }
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
     }
   }
@@ -200,68 +163,39 @@ public class VectorIndexTest {
         IndexParams indexParams =
             IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
 
-        UUID indexUUID = UUID.randomUUID();
+        Index firstSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_PQ,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                    .build());
 
-        dataset.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_PQ,
-                    indexParams)
-                .withIndexName(TestVectorDataset.indexName)
-                .withIndexUUID(indexUUID.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-
-        dataset.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_PQ,
-                    indexParams)
-                .withIndexName(TestVectorDataset.indexName)
-                .withIndexUUID(indexUUID.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
-                .build());
+        Index secondSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_PQ,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                    .build());
 
         assertFalse(
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_PQ index should not present before commit");
 
-        dataset.mergeIndexMetadata(indexUUID.toString(), IndexType.IVF_PQ, Optional.empty());
+        List<Index> builtSegments =
+            dataset.buildIndexSegments(List.of(firstSegment, secondSegment), Optional.empty());
+        assertEquals(2, builtSegments.size());
 
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals(TestVectorDataset.vectorColumnName))
-                .findAny()
-                .orElseThrow(
-                    () -> new RuntimeException("Cannot find vector field for TestVectorDataset"))
-                .getId();
-
-        long datasetVersion = dataset.version();
-
-        Index index =
-            Index.builder()
-                .uuid(indexUUID)
-                .name(TestVectorDataset.indexName)
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(
-                    fragments.stream().limit(2).map(Fragment::getId).collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(dataset.version())
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
-          }
-        }
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
     }
   }
@@ -305,68 +239,39 @@ public class VectorIndexTest {
         IndexParams indexParams =
             IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
 
-        UUID indexUUID = UUID.randomUUID();
+        Index firstSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_SQ,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                    .build());
 
-        dataset.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_SQ,
-                    indexParams)
-                .withIndexName(TestVectorDataset.indexName)
-                .withIndexUUID(indexUUID.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-
-        dataset.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_SQ,
-                    indexParams)
-                .withIndexName(TestVectorDataset.indexName)
-                .withIndexUUID(indexUUID.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
-                .build());
+        Index secondSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_SQ,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                    .build());
 
         assertFalse(
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_SQ index should not present before commit");
 
-        dataset.mergeIndexMetadata(indexUUID.toString(), IndexType.IVF_SQ, Optional.empty());
+        List<Index> builtSegments =
+            dataset.buildIndexSegments(List.of(firstSegment, secondSegment), Optional.empty());
+        assertEquals(2, builtSegments.size());
 
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals(TestVectorDataset.vectorColumnName))
-                .findAny()
-                .orElseThrow(
-                    () -> new RuntimeException("Cannot find vector field for TestVectorDataset"))
-                .getId();
-
-        long datasetVersion = dataset.version();
-
-        Index index =
-            Index.builder()
-                .uuid(indexUUID)
-                .name(TestVectorDataset.indexName)
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(
-                    fragments.stream().limit(2).map(Fragment::getId).collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(dataset.version())
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
-          }
-        }
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
     }
   }

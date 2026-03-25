@@ -7,6 +7,7 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -173,6 +174,12 @@ pub trait IndexWriter: Send {
     ///
     /// E.g. if this is the third time this is called this method will return 2
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
+    /// Adds a global buffer and returns its index.
+    async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+        Err(Error::not_supported(
+            "global buffers are not supported by this index writer",
+        ))
+    }
     /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
     /// Finishes writing the file and closes the file with additional metadata
@@ -184,6 +191,12 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
+    /// Reads a global buffer by index.
+    async fn read_global_buffer(&self, _index: u32) -> Result<Bytes> {
+        Err(Error::not_supported(
+            "global buffers are not supported by this index reader",
+        ))
+    }
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.
@@ -836,10 +849,13 @@ pub struct UpdateCriteria {
 /// - stable row IDs: use exact row-id membership instead
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
-    /// Keep old rows whose row-address fragment is in this bitmap.
+    /// Keeps track of which fragments are still valid and which are no longer valid.
     ///
     /// This is valid for address-style row IDs.
-    Fragments(RoaringBitmap),
+    Fragments {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+    },
     /// Keep old rows whose row IDs are in this exact allow-list.
     ///
     /// This is required for stable row IDs, where row IDs are opaque and
@@ -851,9 +867,9 @@ impl OldIndexDataFilter {
     /// Build a boolean mask that keeps only row IDs selected by this filter.
     pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
         match self {
-            Self::Fragments(valid_fragments) => row_ids
+            Self::Fragments { to_keep, .. } => row_ids
                 .iter()
-                .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+                .map(|id| id.map(|id| to_keep.contains((id >> 32) as u32)))
                 .collect(),
             Self::RowIds(valid_row_ids) => row_ids
                 .iter()

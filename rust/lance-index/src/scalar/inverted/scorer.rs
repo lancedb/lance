@@ -10,13 +10,6 @@ use std::collections::HashMap;
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
-    // calculate the contribution of the token in the document
-    // token: the token to score
-    // freq: the frequency of the token in the document
-    // doc_tokens: the number of tokens in the document
-    fn score(&self, token: &str, freq: u32, doc_tokens: u32) -> f32 {
-        self.query_weight(token) * self.doc_weight(freq, doc_tokens)
-    }
 }
 
 // BM25 parameters

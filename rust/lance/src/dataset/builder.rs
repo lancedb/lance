@@ -717,7 +717,12 @@ impl DatasetBuilder {
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)
                     .await
-                    .map_err(|e| Error::dataset_not_found(base_path.to_string(), Box::new(e)))?,
+                    .map_err(|e| match &e {
+                        Error::NotFound { .. } => {
+                            Error::dataset_not_found(base_path.to_string(), Box::new(e))
+                        }
+                        _ => e,
+                    })?,
             };
             let manifest = Dataset::load_manifest(
                 &object_store,

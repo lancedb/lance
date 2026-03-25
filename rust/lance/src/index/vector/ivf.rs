@@ -1862,48 +1862,41 @@ async fn write_ivf_hnsw_file(
 
 /// Distributed vector segment build uses three storage-level concepts:
 ///
-/// - A **staging root** is the shared UUID directory used during distributed
-///   shard build. Each worker writes one `partial_<uuid>/` directory under this
-///   root by calling `execute_uncommitted()` with the same `index_uuid`.
-/// - A **partial shard** is one such worker output. The caller provides the
-///   `IndexMetadata` returned by `execute_uncommitted()` so the planner knows
-///   shard UUIDs, fragment coverage, and approximate shard sizes.
-/// - A **built segment** is a physical index segment that can be committed into
-///   the manifest with `commit_existing_index_segments(...)`.
+/// - A **segment** is a worker output written by `execute_uncommitted()`. It
+///   already lives at its final storage path under `indices/<segment_uuid>/`,
+///   but it is not yet published in the manifest.
+/// - A **physical segment** is an `IndexSegment` that can be committed into the
+///   manifest with `commit_existing_index_segments(...)`.
+/// - A **logical index** is the user-visible index identified by name; it may
+///   contain one or more physical segments.
 ///
-/// The staged segment-build path is therefore:
+/// The segment-build path is therefore:
 ///
-/// 1. workers build `partial_*` shards under one staging root
-/// 2. the caller groups those shards into one or more built segments
-/// 3. each segment is built from its selected shards
+/// 1. workers build segments
+/// 2. the caller groups those segments into one or more physical segments
+/// 3. each grouped segment is built from its selected inputs
 /// 4. the resulting physical segments are committed as one logical index
 ///
-/// A single merge work item produced from one staging root.
-///
 /// Each plan says:
-/// - which staging root it belongs to
-/// - which partial shards should be consumed together
-/// - what the built segment metadata should look like
+/// - which source segments should be consumed together
+/// - what the physical segment metadata should look like
 ///
-/// The planner returns a `Vec<IndexSegmentPlan>` so callers can decide
-/// whether to execute the work serially or fan it out externally.
-/// Plan how one staging root should be turned into built physical segments.
+/// The planner returns a `Vec<IndexSegmentPlan>` so callers can decide whether
+/// to execute the work serially or fan it out externally.
 ///
 /// This function does not touch storage. It only:
-/// - validates that the caller-supplied shard contract is self-consistent
-/// - enforces that shard fragment coverage is disjoint
-/// - groups shards into built segments according to `target_segment_bytes`
+/// - validates that the caller-supplied segment contract is self-consistent
+/// - enforces that source fragment coverage is disjoint
+/// - groups source segments into physical segments according to
+///   `target_segment_bytes`
 ///
 /// The grouping rule is intentionally simple:
-/// - `target_segment_bytes = None`: keep the shard boundary, so each shard becomes one segment
-/// - `target_segment_bytes = Some(limit)`: greedily pack consecutive shards until the next shard
-///   would exceed `limit`
-///
-/// Callers that want one built segment for the entire staging root should pass a
-/// sufficiently large `target_segment_bytes`.
-pub(crate) async fn plan_staging_segments(
-    index_dir: &Path,
-    partial_indices: &[TableIndexMetadata],
+/// - `target_segment_bytes = None`: keep the existing segment boundary, so each
+///   input segment becomes one physical segment
+/// - `target_segment_bytes = Some(limit)`: greedily pack consecutive source
+///   segments until the next source would exceed `limit`
+pub(crate) async fn plan_segments(
+    segments: &[TableIndexMetadata],
     requested_index_type: Option<IndexType>,
     target_segment_bytes: Option<u64>,
 ) -> Result<Vec<IndexSegmentPlan>> {
@@ -1913,6 +1906,7 @@ pub(crate) async fn plan_staging_segments(
             IndexType::IvfFlat
                 | IndexType::IvfPq
                 | IndexType::IvfSq
+                | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
@@ -1931,43 +1925,28 @@ pub(crate) async fn plan_staging_segments(
         ));
     }
 
-    if partial_indices.is_empty() {
-        return Err(Error::index(format!(
-            "No partial index metadata was provided for '{}'",
-            index_dir
-        )));
+    if segments.is_empty() {
+        return Err(Error::index("No segment metadata was provided".to_string()));
     }
 
-    let mut sorted_partial_indices = partial_indices.to_vec();
-    sorted_partial_indices.sort_by_key(|index| index.uuid);
-    let mut expected_shard_ids = HashSet::with_capacity(sorted_partial_indices.len());
-    for partial_index in &sorted_partial_indices {
-        if !expected_shard_ids.insert(partial_index.uuid) {
+    let mut sorted_segments = segments.to_vec();
+    sorted_segments.sort_by_key(|index| index.uuid);
+    let mut expected_segment_ids = HashSet::with_capacity(sorted_segments.len());
+    for segment in &sorted_segments {
+        if !expected_segment_ids.insert(segment.uuid) {
             return Err(Error::index(format!(
-                "Distributed vector partial shard '{}' was provided more than once",
-                partial_index.uuid
+                "Distributed vector segment '{}' was provided more than once",
+                segment.uuid
             )));
         }
     }
 
-    let staging_index_uuid = index_dir
-        .filename()
-        .ok_or_else(|| Error::index(format!("Index directory '{}' has no filename", index_dir)))
-        .and_then(|name| {
-            Uuid::parse_str(name).map_err(|err| {
-                Error::index(format!(
-                    "Index directory '{}' does not end with a valid UUID: {}",
-                    index_dir, err
-                ))
-            })
-        })?;
-
     let mut covered_fragments = RoaringBitmap::new();
-    for partial_index in &sorted_partial_indices {
-        let fragment_bitmap = partial_index.fragment_bitmap.as_ref().ok_or_else(|| {
+    for segment in &sorted_segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
             Error::index(format!(
-                "Partial index '{}' is missing fragment coverage",
-                partial_index.uuid
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
             ))
         })?;
         if covered_fragments.intersection_len(fragment_bitmap) > 0 {
@@ -1979,15 +1958,9 @@ pub(crate) async fn plan_staging_segments(
     }
 
     if target_segment_bytes.is_none() {
-        return sorted_partial_indices
+        return sorted_segments
             .into_iter()
-            .map(|partial_index| {
-                build_segment_plan(
-                    staging_index_uuid,
-                    vec![partial_index],
-                    requested_index_type,
-                )
-            })
+            .map(|segment| build_segment_plan(vec![segment], requested_index_type))
             .collect();
     }
 
@@ -1996,28 +1969,23 @@ pub(crate) async fn plan_staging_segments(
     let mut current_group = Vec::new();
     let mut current_bytes = 0_u64;
 
-    for partial_index in sorted_partial_indices {
-        let partial_bytes = estimate_partial_index_bytes(&partial_index);
+    for segment in sorted_segments {
+        let source_bytes = estimate_source_index_bytes(&segment);
         if !current_group.is_empty()
-            && current_bytes.saturating_add(partial_bytes) > target_segment_bytes
+            && current_bytes.saturating_add(source_bytes) > target_segment_bytes
         {
             plans.push(build_segment_plan(
-                staging_index_uuid,
                 std::mem::take(&mut current_group),
                 requested_index_type,
             )?);
             current_bytes = 0;
         }
-        current_bytes = current_bytes.saturating_add(partial_bytes);
-        current_group.push(partial_index);
+        current_bytes = current_bytes.saturating_add(source_bytes);
+        current_group.push(segment);
     }
 
     if !current_group.is_empty() {
-        plans.push(build_segment_plan(
-            staging_index_uuid,
-            current_group,
-            requested_index_type,
-        )?);
+        plans.push(build_segment_plan(current_group, requested_index_type)?);
     }
 
     Ok(plans)
@@ -2025,96 +1993,63 @@ pub(crate) async fn plan_staging_segments(
 
 /// Build one planned segment into its output directory.
 ///
-/// Most plans write directly to `indices/<built-segment-uuid>/`. If the target
-/// directory is also the staging root, we first write into a temporary
-/// directory and then swap the final files back into place.
-///
-/// This is similar in shape to a compaction step: several temporary shard
-/// outputs are consumed and replaced by a new built physical segment. The
-/// difference is that this operates on index shard outputs instead of data
-/// fragments.
-pub(crate) async fn build_staging_segment(
+/// Single-source plans are already materialized and return immediately. For
+/// multi-source plans, this function writes a new merged physical segment under
+/// `indices/<segment_uuid>/`.
+pub(crate) async fn build_segment(
     object_store: &ObjectStore,
     indices_dir: &Path,
     segment_plan: &IndexSegmentPlan,
 ) -> Result<IndexSegment> {
     let built_segment = segment_plan.segment().clone();
-    let final_dir = indices_dir.child(built_segment.uuid().to_string());
-    let staging_dir = indices_dir.child(segment_plan.staging_index_uuid().to_string());
-    if final_dir == staging_dir {
-        let temp_dir = indices_dir.child(Uuid::new_v4().to_string());
-        build_staging_segment_to_dir(object_store, indices_dir, &temp_dir, segment_plan, false)
-            .await?;
+    let segments = segment_plan.segments();
+    debug_assert!(
+        !segments.is_empty(),
+        "segment plans must have at least one source segment"
+    );
 
-        // Re-materializing back into the staging root is not atomic: we delete
-        // and rewrite the root files one by one because object stores do not
-        // offer a directory rename primitive. We only clean up the source
-        // `partial_*` shards after these copies succeed, so a crash here can
-        // leave a partial root artifact but should not destroy the source data.
-        for file_name in [INDEX_FILE_NAME, INDEX_AUXILIARY_FILE_NAME] {
-            let target_file = final_dir.child(file_name);
-            // ObjectStore::copy is additive. Remove any previous root artifact first so
-            // re-materialization back into the staging root does not leave stale files
-            // behind.
-            if object_store.exists(&target_file).await? {
-                object_store.delete(&target_file).await?;
-            }
-            let source_file = temp_dir.child(file_name);
-            if object_store.exists(&source_file).await? {
-                object_store.copy(&source_file, &target_file).await?;
-            }
-        }
-
-        cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
-        reset_final_segment_dir(object_store, &temp_dir).await?;
-    } else {
-        build_staging_segment_to_dir(object_store, indices_dir, &final_dir, segment_plan, true)
-            .await?;
+    if segments.len() == 1 && segments[0].uuid == built_segment.uuid() {
+        return Ok(built_segment);
     }
+
+    let final_dir = indices_dir.child(built_segment.uuid().to_string());
+    merge_segments_to_dir(object_store, indices_dir, &final_dir, segment_plan).await?;
 
     Ok(built_segment)
 }
 
-/// Write one built segment into `final_dir`.
+/// Merge the selected input segments into `final_dir`.
 ///
-/// For a single-shard plan this is just a file copy. For a multi-shard plan we
-/// read the selected `partial_*` shards directly from the staging root and
-/// write the merged auxiliary/index files into `final_dir`.
-async fn build_staging_segment_to_dir(
+/// Callers must only invoke this helper for multi-source plans. It reads the
+/// selected input segments directly from `indices/<segment_uuid>/` and writes
+/// the merged auxiliary/index files into `final_dir`.
+async fn merge_segments_to_dir(
     object_store: &ObjectStore,
     indices_dir: &Path,
     final_dir: &Path,
     segment_plan: &IndexSegmentPlan,
-    cleanup_source_shards: bool,
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
 
-    let partial_indices = segment_plan.partial_indices();
-    if partial_indices.len() == 1 {
-        let source_dir = indices_dir
-            .child(segment_plan.staging_index_uuid().to_string())
-            .child(format!("partial_{}", partial_indices[0].uuid));
-        copy_partial_segment_contents(object_store, &source_dir, final_dir).await?;
-        if cleanup_source_shards {
-            cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
-        }
-        return Ok(());
-    }
+    let segments = segment_plan.segments();
+    debug_assert!(
+        segments.len() > 1,
+        "merge helper should only be used for multi-source plans"
+    );
 
-    let staging_root = indices_dir.child(segment_plan.staging_index_uuid().to_string());
-    let aux_paths = partial_indices
+    let aux_paths = segments
         .iter()
-        .map(|partial_index| {
-            staging_root
-                .child(format!("partial_{}", partial_index.uuid))
+        .map(|segment| {
+            indices_dir
+                .child(segment.uuid.to_string())
                 .child(INDEX_AUXILIARY_FILE_NAME)
         })
         .collect::<Vec<_>>();
-    let partial_index_paths = partial_indices
+    let source_index_paths = segments
         .iter()
-        .map(|partial_index| {
-            staging_root
-                .child(format!("partial_{}", partial_index.uuid))
+        .map(|segment| {
+            indices_dir
+                .child(segment.uuid.to_string())
                 .child(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
@@ -2129,19 +2064,15 @@ async fn build_staging_segment_to_dir(
         object_store,
         final_dir,
         segment_plan.requested_index_type(),
-        &partial_index_paths,
+        &source_index_paths,
     )
     .await?;
-    if cleanup_source_shards {
-        cleanup_consumed_partial_shards(object_store, indices_dir, segment_plan).await?;
-    }
 
     Ok(())
 }
 
-/// Collapse one group of staging shards into a single built-segment plan.
+/// Collapse one group of source segments into a single physical-segment plan.
 fn build_segment_plan(
-    staging_index_uuid: Uuid,
     group: Vec<TableIndexMetadata>,
     requested_index_type: Option<IndexType>,
 ) -> Result<IndexSegmentPlan> {
@@ -2149,130 +2080,61 @@ fn build_segment_plan(
     let first = &group[0];
     let mut fragment_bitmap = RoaringBitmap::new();
     let mut estimated_bytes = 0_u64;
-    let mut partial_indices = Vec::with_capacity(group.len());
+    let mut segments = Vec::with_capacity(group.len());
 
-    for partial_index in &group {
-        let partial_fragment_bitmap = partial_index.fragment_bitmap.as_ref().ok_or_else(|| {
+    for segment in &group {
+        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
             Error::index(format!(
-                "Partial index '{}' is missing fragment coverage",
-                partial_index.uuid
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
             ))
         })?;
-        fragment_bitmap |= partial_fragment_bitmap.clone();
-        estimated_bytes =
-            estimated_bytes.saturating_add(estimate_partial_index_bytes(partial_index));
-        partial_indices.push(partial_index.clone());
+        fragment_bitmap |= source_fragment_bitmap.clone();
+        estimated_bytes = estimated_bytes.saturating_add(estimate_source_index_bytes(segment));
+        segments.push(segment.clone());
     }
 
-    let final_uuid = if group.len() == 1 {
+    let segment_uuid = if group.len() == 1 {
         first.uuid
     } else {
         Uuid::new_v4()
     };
-    let index_type = requested_index_type.unwrap_or(IndexType::Vector);
+    let index_version = match requested_index_type {
+        Some(index_type) => index_type.version(),
+        None => infer_source_index_version(&group)?,
+    };
     let segment = IndexSegment::new(
-        final_uuid,
+        segment_uuid,
         fragment_bitmap,
         Arc::new(crate::index::vector_index_details()),
-        index_type.version(),
+        index_version,
     );
 
     Ok(IndexSegmentPlan::new(
-        staging_index_uuid,
         segment,
-        partial_indices,
+        segments,
         estimated_bytes,
         requested_index_type,
     ))
 }
 
-/// Collapse an entire staging root into one built-segment plan.
-///
-/// Some callers want one final output for the entire staging root instead of
-/// one output per planned group. This helper reduces an existing set of plans
-/// into a single plan covering the same shard set.
-pub(crate) fn collapse_segment_plans(
-    segment_plans: &[IndexSegmentPlan],
-) -> Result<IndexSegmentPlan> {
-    let Some(first_plan) = segment_plans.first() else {
+fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
+    debug_assert!(!group.is_empty());
+    let first = group[0].index_version;
+    if group.iter().any(|segment| segment.index_version != first) {
         return Err(Error::index(
-            "Distributed vector segment build plan contains no segment plans".to_string(),
+            "Distributed vector segments must all have the same index version".to_string(),
         ));
-    };
-
-    let mut fragment_bitmap = RoaringBitmap::new();
-    let mut partial_indices = Vec::new();
-    let mut estimated_bytes = 0_u64;
-
-    for plan in segment_plans {
-        fragment_bitmap |= plan.segment().fragment_bitmap().clone();
-        partial_indices.extend_from_slice(plan.partial_indices());
-        estimated_bytes = estimated_bytes.saturating_add(plan.estimated_bytes());
     }
-
-    let staging_index_uuid = first_plan.staging_index_uuid();
-    let segment = IndexSegment::new(
-        staging_index_uuid,
-        fragment_bitmap,
-        first_plan.segment().index_details().clone(),
-        first_plan.segment().index_version(),
-    );
-
-    Ok(IndexSegmentPlan::new(
-        staging_index_uuid,
-        segment,
-        partial_indices,
-        estimated_bytes,
-        first_plan.requested_index_type(),
-    ))
+    Ok(first)
 }
 
-/// Remove the source `partial_*` directories consumed by one segment plan.
-async fn cleanup_consumed_partial_shards(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
-    segment_plan: &IndexSegmentPlan,
-) -> Result<()> {
-    for partial_index in segment_plan.partial_indices() {
-        let source_dir = indices_dir
-            .child(segment_plan.staging_index_uuid().to_string())
-            .child(format!("partial_{}", partial_index.uuid));
-        reset_final_segment_dir(object_store, &source_dir).await?;
-    }
-    Ok(())
-}
-
-fn estimate_partial_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
+fn estimate_source_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
     index_metadata
         .files
         .as_ref()
         .map(|files| files.iter().map(|file| file.size_bytes).sum())
         .unwrap_or(0)
-}
-
-/// Copy all files that belong to one partial shard into a new directory.
-async fn copy_partial_segment_contents(
-    object_store: &ObjectStore,
-    source_dir: &Path,
-    target_dir: &Path,
-) -> Result<()> {
-    let mut files = object_store.list(Some(source_dir.clone()));
-    while let Some(item) = files.next().await {
-        let meta = item?;
-        let Some(relative_parts) = meta.location.prefix_match(source_dir) else {
-            continue;
-        };
-        let relative_parts = relative_parts.collect::<Vec<_>>();
-        if relative_parts.is_empty() {
-            continue;
-        }
-        let mut final_path = target_dir.clone();
-        for part in relative_parts {
-            final_path = final_path.child(part.as_ref());
-        }
-        object_store.copy(&meta.location, &final_path).await?;
-    }
-    Ok(())
 }
 
 /// Best-effort reset of one target directory before rewriting it.
