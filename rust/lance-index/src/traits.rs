@@ -252,21 +252,6 @@ pub trait DatasetIndexExt {
         })
     }
 
-    /// Describe physical index segments.
-    ///
-    /// When `name` is provided, only segments belonging to the named logical
-    /// index are returned. Otherwise, all index segments in the current dataset
-    /// version are returned.
-    async fn describe_index_segments(&self, name: Option<&str>) -> Result<Vec<IndexMetadata>> {
-        match name {
-            Some(name) => self.load_indices_by_name(name).await,
-            None => self
-                .load_indices()
-                .await
-                .map(|indices| indices.as_ref().clone()),
-        }
-    }
-
     /// Loads a specific index with the given index name.
     /// This function only works for indices that are unique.
     /// If there are multiple indices sharing the same name, please use [`Self::load_indices_by_name`]
