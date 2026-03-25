@@ -2718,7 +2718,7 @@ impl Scanner {
             TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
-                    row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                    row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
                 self.u64s_as_take_input(addrs)
             }

@@ -54,7 +54,7 @@ use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
@@ -1466,7 +1466,8 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
-        let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
+        let fragments = self.get_fragments();
+        let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 
@@ -1484,14 +1485,74 @@ impl Dataset {
 
     /// Randomly sample `n` rows from the dataset.
     ///
+    /// If `fragment_ids` is provided, sampling is limited to rows from those
+    /// fragments in the current dataset version.
+    ///
     /// The returned rows are in row-id order (not random order), which allows
     /// the underlying take operation to use an efficient sorted code path.
-    pub async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+    pub async fn sample(
+        &self,
+        n: usize,
+        projection: &Schema,
+        fragment_ids: Option<&[u32]>,
+    ) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows(None).await?;
-        let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
-        ids.sort_unstable();
-        self.take(&ids, projection.clone()).await
+
+        match fragment_ids {
+            None => {
+                let num_rows = self.count_rows(None).await?;
+                let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+                ids.sort_unstable();
+                self.take(&ids, projection.clone()).await
+            }
+            Some(fragment_ids) => {
+                if fragment_ids.is_empty() {
+                    return Err(Error::invalid_input(
+                        "Dataset::sample does not accept an empty fragment_ids list".to_string(),
+                    ));
+                }
+
+                let selected_fragment_ids = fragment_ids.iter().copied().collect::<BTreeSet<_>>();
+                let selected_fragments = self
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|fragment| selected_fragment_ids.contains(&(fragment.id() as u32)))
+                    .collect::<Vec<_>>();
+
+                if selected_fragments.len() != selected_fragment_ids.len() {
+                    let present_fragment_ids = selected_fragments
+                        .iter()
+                        .map(|fragment| fragment.id() as u32)
+                        .collect::<HashSet<_>>();
+                    let missing_fragment_ids = selected_fragment_ids
+                        .into_iter()
+                        .filter(|fragment_id| !present_fragment_ids.contains(fragment_id))
+                        .collect::<Vec<_>>();
+                    return Err(Error::invalid_input(format!(
+                        "Dataset::sample received fragment ids that are not part of the current dataset version: {missing_fragment_ids:?}",
+                    )));
+                }
+
+                let num_rows = stream::iter(selected_fragments.iter().cloned())
+                    .map(|fragment| async move { fragment.count_rows(None).await })
+                    .buffer_unordered(16)
+                    .try_fold(0_u64, |acc, rows| async move { Ok(acc + rows as u64) })
+                    .await?;
+
+                let mut offsets = (0..num_rows).choose_multiple(&mut rand::rng(), n);
+                offsets.sort_unstable();
+
+                let row_addrs = row_offsets_to_row_addresses(&selected_fragments, &offsets).await?;
+                let dataset = Arc::new(self.clone());
+                let projection = Arc::new(
+                    ProjectionRequest::from(projection.clone())
+                        .into_projection_plan(dataset.clone())?,
+                );
+                TakeBuilder::try_new_from_addresses(dataset, row_addrs, projection)?
+                    .execute()
+                    .await
+            }
+        }
     }
 
     /// Delete rows based on a predicate.
