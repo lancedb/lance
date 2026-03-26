@@ -15,7 +15,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::index::vector::{VectorIndexParams, ivf::finalize_distributed_merge};
+use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::{
@@ -397,7 +397,6 @@ fn bench_distributed_merge_only(c: &mut Criterion) {
 
     for (bench_case, fixture) in fixtures {
         let target_uuid = working_uuid(bench_case);
-        let target_index_dir = dataset.indices_dir().child(target_uuid.to_string());
         let target_index_dir_fs = dataset_root()
             .join("_indices")
             .join(target_uuid.to_string());
@@ -409,16 +408,15 @@ fn bench_distributed_merge_only(c: &mut Criterion) {
             &bench_case,
             |b, _| {
                 let dataset = dataset.clone();
-                let target_index_dir = target_index_dir.clone();
                 let target_index_dir_fs = target_index_dir_fs.clone();
                 let source_index_dir_fs = source_index_dir_fs.clone();
                 b.iter_batched(
                     || prepare_iteration_target(&source_index_dir_fs, &target_index_dir_fs),
                     |_| {
-                        rt.block_on(finalize_distributed_merge(
-                            dataset.object_store(),
-                            &target_index_dir,
-                            Some(IndexType::IvfPq),
+                        rt.block_on(dataset.merge_index_metadata(
+                            &target_uuid.to_string(),
+                            IndexType::IvfPq,
+                            None,
                         ))
                         .unwrap();
                     },
