@@ -65,7 +65,6 @@ use super::{
 use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::{
@@ -445,7 +444,6 @@ impl InvertedIndex {
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
     }
-
     /// Returns the set of fragments which are contained in the index, but no longer in the dataset.
     ///
     /// Most other indices remove data from deleted fragments when the index updates (copy-on-write).
@@ -455,11 +453,19 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
-    // search the documents that contain the query
-    // return the row ids of the documents sorted by bm25 score
-    // ref: https://en.wikipedia.org/wiki/Okapi_BM25
-    // we first calculate in-partition BM25 scores,
-    // then re-calculate the scores for the top k documents across all partitions
+    pub fn bm25_base_scorer(&self, query_tokens: &Tokens) -> MemBM25Scorer {
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let token_docs = query_tokens
+            .into_iter()
+            .map(|token| (token.to_string(), scorer.num_docs_containing_token(token)))
+            .collect::<HashMap<_, _>>();
+        MemBM25Scorer::new(scorer.total_tokens(), scorer.num_docs(), token_docs)
+    }
+
+    /// Search documents that match the query and return row ids sorted by BM25 score.
+    ///
+    /// When `base_scorer` is provided, search uses those corpus-level BM25 statistics
+    /// instead of deriving them from this segment alone.
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
@@ -468,7 +474,16 @@ impl InvertedIndex {
         operator: Operator,
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
+        base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let local_scorer;
+        let scorer: &dyn Scorer = if let Some(base_scorer) = base_scorer {
+            base_scorer
+        } else {
+            local_scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+            &local_scorer
+        };
+
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -523,7 +538,6 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
             if res.candidates.is_empty() {
@@ -800,6 +814,7 @@ impl InvertedIndex {
                 Operator::And,
                 Arc::new(NoFilter),
                 Arc::new(NoOpMetricsCollector),
+                None,
             )
             .boxed()
             .await?;
@@ -3922,7 +3937,7 @@ async fn tokenize_and_count(
 /// In order to calculate BM25 scores we need to know token counts for the entire corpus.  We extract these from the
 /// counted input of the flat search combined with any counts recorded for the indexed portion.
 fn initialize_scorer(
-    index: &Option<InvertedIndex>,
+    base_scorer: Option<&MemBM25Scorer>,
     query_tokens: &Tokens,
     counted_input: &RecordBatch,
 ) -> MemBM25Scorer {
@@ -3930,14 +3945,12 @@ fn initialize_scorer(
     let mut num_docs = 0;
     let mut all_token_counts = vec![0; query_tokens.len()];
 
-    if let Some(index) = index {
-        let index_bm25_scorer = IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
+    if let Some(base_scorer) = base_scorer {
+        total_tokens += base_scorer.total_tokens;
+        num_docs += base_scorer.num_docs;
         for (token_index, token) in query_tokens.into_iter().enumerate() {
-            let token_nq = index_bm25_scorer.num_docs_containing_token(token);
-            all_token_counts[token_index] = token_nq as u64;
+            all_token_counts[token_index] = base_scorer.num_docs_containing_token(token) as u64;
         }
-        total_tokens += index_bm25_scorer.total_tokens();
-        num_docs += index_bm25_scorer.num_docs();
     }
 
     num_docs += counted_input.num_rows();
@@ -4039,18 +4052,11 @@ pub async fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: String,
-    index: &Option<InvertedIndex>,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
     target_batch_size: usize,
 ) -> DataFusionResult<SendableRecordBatchStream> {
-    let mut tokenizer = match index {
-        Some(index) => index.tokenizer(),
-        None => Box::new(TextTokenizer::new(
-            tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default(),
-            )
-            .build(),
-        )),
-    };
+    let mut tokenizer = tokenizer;
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
     let input_schema = input.schema();
@@ -4078,7 +4084,7 @@ pub async fn flat_bm25_search_stream(
         tokenize_and_count(chunked, tokenizer, query_tokens.clone(), doc_col_idx).await?;
 
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize)
-    let scorer = initialize_scorer(index, query_tokens.as_ref(), &counted_input);
+    let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
 
     // Finally we emit batches according to the target batch size
@@ -4739,7 +4745,7 @@ mod tests {
         let metrics = Arc::new(NoOpMetricsCollector);
 
         let (row_ids, scores) = index
-            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
             .await
             .unwrap();
 
@@ -4924,7 +4930,7 @@ mod tests {
         let metrics = Arc::new(NoOpMetricsCollector);
 
         let (row_ids, scores) = index
-            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
             .await
             .unwrap();
 
@@ -5019,7 +5025,7 @@ mod tests {
         let metrics = Arc::new(NoOpMetricsCollector);
 
         let (row_ids, _scores) = index
-            .bm25_search(tokens, params, Operator::And, prefilter, metrics)
+            .bm25_search(tokens, params, Operator::And, prefilter, metrics, None)
             .await
             .unwrap();
 

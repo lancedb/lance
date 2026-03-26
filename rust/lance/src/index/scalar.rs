@@ -4,6 +4,8 @@
 //! Utilities for integrating scalar indices with datasets
 //!
 
+pub(crate) mod inverted;
+
 use std::sync::{Arc, LazyLock};
 
 use crate::index::DatasetIndexExt;

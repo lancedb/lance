@@ -85,6 +85,7 @@ use crate::index::vector::utils::{
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+    load_fts_segment_details, load_fts_segments,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -3231,20 +3232,15 @@ impl Scanner {
             "the column must be specified in the query".to_string(),
         ))?;
 
-        let index_meta = self
-            .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
-            .await?
-            .ok_or(Error::invalid_input(format!(
-                "No Inverted index found for column {}",
-                column
-            )))?;
+        let segments =
+            load_fts_segments(&self.dataset, &column)
+                .await?
+                .ok_or(Error::invalid_input(format!(
+                    "No Inverted index found for column {}",
+                    column
+                )))?;
+        let details = load_fts_segment_details(&self.dataset, &column, &segments).await?;
 
-        let details_any =
-            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
-        let details = details_any
-            .as_ref()
-            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
         if !details.with_position {
             return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
                 .to_string()));

@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
-        scalar::build_scalar_index,
+        scalar::{IndexDetails, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
@@ -556,7 +556,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
     }
 }
 
-/// Build physical index segments from previously-written vector segment outputs.
+/// Build physical index segments from previously-written uncommitted index outputs.
 ///
 /// Use [`DatasetIndexExt::create_index_segment_builder`] and then either:
 ///
@@ -565,7 +565,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 ///
 /// This builder only builds physical segments. Publishing those segments as
 /// a logical index still requires [`DatasetIndexExt::commit_existing_index_segments`].
-/// Together these two APIs form the canonical distributed vector segment build workflow.
+/// Together these two APIs form the canonical segment-based index build workflow.
 #[derive(Clone)]
 pub struct IndexSegmentBuilder<'a> {
     dataset: &'a Dataset,
@@ -611,18 +611,62 @@ impl<'a> IndexSegmentBuilder<'a> {
             ));
         }
 
-        crate::index::vector::ivf::plan_segments(&self.segments, None, self.target_segment_bytes)
-            .await
+        let index_details = self.segments[0]
+            .index_details
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid_input("input segment is missing index details".to_string())
+            })?
+            .clone();
+        let details = IndexDetails(index_details);
+        let index_type = if details.supports_fts() {
+            IndexType::Inverted
+        } else if details.is_vector() {
+            IndexType::Vector
+        } else {
+            return Err(Error::invalid_input(
+                "IndexSegmentBuilder only supports vector and FTS segments".to_string(),
+            ));
+        };
+        match index_type {
+            IndexType::Inverted => crate::index::scalar::inverted::plan_segments(
+                &self.segments,
+                self.target_segment_bytes,
+            ),
+            IndexType::Vector => {
+                crate::index::vector::ivf::plan_segments(
+                    &self.segments,
+                    None,
+                    self.target_segment_bytes,
+                )
+                .await
+            }
+            unsupported => Err(Error::invalid_input(format!(
+                "IndexSegmentBuilder does not support planning segments for index type {}",
+                unsupported
+            ))),
+        }
     }
 
     /// Build one segment from a previously-generated plan.
     pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        crate::index::vector::ivf::build_segment(
-            self.dataset.object_store(),
-            &self.dataset.indices_dir(),
-            plan,
-        )
-        .await
+        match plan.requested_index_type().unwrap_or(IndexType::Vector) {
+            IndexType::Inverted => {
+                crate::index::scalar::inverted::build_segment(self.dataset, plan).await
+            }
+            IndexType::Vector => {
+                crate::index::vector::ivf::build_segment(
+                    self.dataset.object_store(),
+                    &self.dataset.indices_dir(),
+                    plan,
+                )
+                .await
+            }
+            unsupported => Err(Error::invalid_input(format!(
+                "IndexSegmentBuilder does not support building segments for index type {}",
+                unsupported
+            ))),
+        }
     }
 
     /// Plan and build all segments from the provided inputs.

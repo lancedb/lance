@@ -81,7 +81,7 @@ impl IndexSegment {
 }
 
 /// A plan for building one physical segment from one or more existing
-/// vector index segments.
+/// uncommitted index segments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSegmentPlan {
     segment: IndexSegment,
@@ -149,13 +149,13 @@ pub trait DatasetIndexExt {
     ) -> Self::IndexBuilder<'a>;
 
     /// Create a builder for building physical index segments from uncommitted
-    /// vector index outputs.
+    /// index outputs.
     ///
     /// The caller supplies the uncommitted index metadata returned by
     /// `execute_uncommitted()` so the builder can plan segment grouping without
     /// rediscovering fragment coverage.
     ///
-    /// This is the canonical entry point for distributed vector segment build.
+    /// This is the canonical entry point for segment-based index build.
     /// After building the physical segments, publish them as a
     /// logical index with [`Self::commit_existing_index_segments`].
     fn create_index_segment_builder<'a>(&'a self) -> Self::IndexSegmentBuilder<'a>;
