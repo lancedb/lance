@@ -2364,6 +2364,36 @@ def test_index_prewarm(tmp_path: Path):
     ).to_table()
     assert scan_stats.parts_loaded == 0
 
+    phrase_path = tmp_path / "phrase"
+    phrase_table = pa.table(
+        {
+            "fts": ["word word" for _ in range(test_table_size)],
+        }
+    )
+    ds = lance.write_dataset(phrase_table, phrase_path)
+    ds.create_scalar_index("fts", index_type="INVERTED", with_position=True)
+
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx")
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query > cache_entries_after_prewarm
+
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx", with_position=True)
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query == cache_entries_after_prewarm
+
+    with pytest.raises(
+        TypeError, match="LanceDataset\\.prewarm_index\\(\\) takes 2 positional arguments"
+    ):
+        ds.prewarm_index("fts_idx", True)
+
 
 def test_btree_prewarm(tmp_path: Path):
     scan_stats = None
