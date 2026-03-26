@@ -7,7 +7,7 @@ use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
-    index::{DatasetIndexInternalExt, prefilter::DatasetPreFilter},
+    index::{DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter},
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
@@ -40,7 +40,7 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
-    DatasetIndexExt, IndexCriteria,
+    IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
@@ -733,6 +733,7 @@ impl ExecutionPlan for MaterializeIndexExec {
 mod tests {
     use std::{ops::Bound, sync::Arc};
 
+    use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
@@ -742,7 +743,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
-        DatasetIndexExt, IndexType,
+        IndexType,
         scalar::{
             SargableQuery, ScalarIndexParams,
             expression::{ScalarIndexExpr, ScalarIndexSearch},

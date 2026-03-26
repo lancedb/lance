@@ -34,6 +34,7 @@ use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use ::lance::datafusion::LanceTableProvider;
+use ::lance::index::DatasetIndexExt;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
@@ -52,7 +53,6 @@ use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
 };
-use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;

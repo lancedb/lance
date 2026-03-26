@@ -149,12 +149,13 @@ fn is_index_remap_caught_up(
 mod tests {
     use super::*;
     use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+    use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::{assert_false, assert_true};
     use arrow_array::types::{Float32Type, Int32Type};
     use lance_datagen::Dimension;
+    use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_index::{DatasetIndexExt, IndexType};
 
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {

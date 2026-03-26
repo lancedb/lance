@@ -11,12 +11,12 @@ use crate::{Dataset, Result};
 use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
+use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
 
 use futures::{StreamExt, TryStreamExt};
 use rstest::rstest;

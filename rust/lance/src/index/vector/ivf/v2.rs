@@ -626,7 +626,9 @@ mod tests {
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
+    use crate::index::IndexSegment;
     use crate::index::vector::ivf::v2::IvfPq;
     use crate::index::vector::ivf::{build_segment, plan_segments};
     use crate::utils::test::copy_test_data_to_tmp;
@@ -644,6 +646,7 @@ mod tests {
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
+    use lance_index::IndexType;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -653,7 +656,6 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};

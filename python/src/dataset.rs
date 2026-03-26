@@ -55,7 +55,7 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexInternalExt, vector::VectorIndexParams};
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -67,7 +67,7 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    DatasetIndexExt, IndexParams, IndexType,
+    IndexParams, IndexType,
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
