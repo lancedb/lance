@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::redundant_pub_crate)]
+
 use std::sync::Arc;
 
 use lance_index::pbold::InvertedIndexDetails;
