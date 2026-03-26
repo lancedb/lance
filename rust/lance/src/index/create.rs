@@ -616,18 +616,30 @@ impl<'a> IndexSegmentBuilder<'a> {
         }
 
         let infer_index_type = |segment: &IndexMetadata| -> Result<IndexType> {
-            let index_details = segment.index_details.as_ref().ok_or_else(|| {
-                Error::invalid_input("input segment is missing index details".to_string())
-            })?;
-            let details = IndexDetails(index_details.clone());
-            if details.supports_fts() {
+            if let Some(index_details) = segment.index_details.as_ref() {
+                let details = IndexDetails(index_details.clone());
+                if details.supports_fts() {
+                    return Ok(IndexType::Inverted);
+                }
+                if details.is_vector() {
+                    return Ok(IndexType::Vector);
+                }
+            }
+
+            if segment.files.as_ref().is_some_and(|files| {
+                files.iter().any(|file| {
+                    file.path == lance_index::scalar::inverted::METADATA_FILE
+                        || file.path.starts_with("part_")
+                })
+            }) {
                 Ok(IndexType::Inverted)
-            } else if details.is_vector() {
+            } else if segment.files.is_some() {
                 Ok(IndexType::Vector)
             } else {
-                Err(Error::invalid_input(
-                    "IndexSegmentBuilder only supports vector and FTS segments".to_string(),
-                ))
+                Err(Error::invalid_input(format!(
+                    "IndexSegmentBuilder could not infer the index type for segment {}",
+                    segment.uuid
+                )))
             }
         };
 
@@ -658,7 +670,7 @@ impl<'a> IndexSegmentBuilder<'a> {
             IndexType::Vector => {
                 crate::index::vector::ivf::plan_segments(
                     &self.segments,
-                    Some(IndexType::Vector),
+                    None,
                     self.target_segment_bytes,
                 )
                 .await
@@ -672,12 +684,23 @@ impl<'a> IndexSegmentBuilder<'a> {
 
     /// Build one segment from a previously-generated plan.
     pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        match plan.requested_index_type().ok_or_else(|| {
-            Error::invalid_input(
-                "IndexSegmentBuilder requires planned segments to declare an index type"
-                    .to_string(),
-            )
-        })? {
+        let index_type = if let Some(index_type) = plan.requested_index_type() {
+            index_type
+        } else {
+            let details = IndexDetails(plan.segment().index_details().clone());
+            if details.supports_fts() {
+                IndexType::Inverted
+            } else if details.is_vector() {
+                IndexType::Vector
+            } else {
+                return Err(Error::invalid_input(
+                    "IndexSegmentBuilder requires planned segments to declare an index type"
+                        .to_string(),
+                ));
+            }
+        };
+
+        match index_type {
             IndexType::Inverted => {
                 crate::index::scalar::inverted::build_segment(self.dataset, plan).await
             }
@@ -1366,6 +1389,62 @@ mod tests {
             .await
             .unwrap();
         assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_index_segment_builder_vector_segments_without_index_details() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&dataset, "vector").await,
+        );
+        let mut input_segments = Vec::new();
+
+        for fragment in fragments.iter().take(2) {
+            let mut segment =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segment.index_details = None;
+            input_segments.push(segment);
+        }
+
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_segments(input_segments)
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 2);
     }
 
     #[tokio::test]
