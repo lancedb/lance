@@ -790,8 +790,13 @@ public class Dataset implements Closeable {
    * @return the version id of the dataset
    */
   public long version() {
-    return getVersion().getId();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetVersionId();
+    }
   }
+
+  private native long nativeGetVersionId();
 
   /**
    * Gets the currently checked out version of the dataset.

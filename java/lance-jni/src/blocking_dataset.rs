@@ -236,6 +236,10 @@ impl BlockingDataset {
         Ok(version)
     }
 
+    pub fn version_id(&self) -> u64 {
+        self.inner.version_id()
+    }
+
     pub fn list_versions(&self) -> Result<Vec<Version>> {
         let versions = RT.block_on(self.inner.versions())?;
         Ok(versions)
@@ -1623,6 +1627,20 @@ fn inner_get_version<'local>(
         dataset_guard.version()?
     };
     version.into_java(env)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionId(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(env, inner_get_version_id(&mut env, java_dataset), -1) as jlong
+}
+
+fn inner_get_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    Ok(dataset_guard.version_id())
 }
 
 #[unsafe(no_mangle)]
