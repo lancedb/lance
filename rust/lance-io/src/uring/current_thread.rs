@@ -17,7 +17,7 @@ use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::location;
@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use tracing::instrument;
 
 // Re-use file handle types from reader.rs
-use super::reader::{CacheKey, CachedReaderData, UringFileHandle, HANDLE_CACHE};
+use super::reader::{CacheKey, CachedReaderData, HANDLE_CACHE, UringFileHandle};
 
 /// Global counter for generating unique user_data values
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -94,15 +94,20 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
         // Generate unique user_data
         let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // Get buffer pointer from request state
-        let buffer_ptr = {
+        // Get buffer pointer, adjusting for any bytes already read (short read retry)
+        let (buffer_ptr, read_offset, read_length) = {
             let state = request.state.lock().unwrap();
-            state.buffer.as_ptr() as *mut u8
+            let br = state.bytes_read;
+            (
+                unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                request.offset + br as u64,
+                (request.length - br) as u32,
+            )
         };
 
         // Prepare read operation
-        let read_op = opcode::Read::new(types::Fd(request.fd), buffer_ptr, request.length as u32)
-            .offset(request.offset);
+        let read_op =
+            opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length).offset(read_offset);
 
         // Get submission queue
         let mut sq = uring.ring.submission();
@@ -139,6 +144,7 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
         let mut opt = cell.borrow_mut();
         if let Some(ref mut uring) = *opt {
             let mut completed = 0;
+            let mut retries: Vec<Arc<IoRequest>> = Vec::new();
 
             // Process all available completions
             for cqe in uring.ring.completion() {
@@ -147,10 +153,36 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
 
                 if let Some(request) = uring.pending.remove(&user_data) {
                     let mut state = request.state.lock().unwrap();
-                    state.completed = true;
 
                     if result < 0 {
+                        // Kernel error
                         state.err = Some(io::Error::from_raw_os_error(-result));
+                        state.completed = true;
+                    } else if result == 0 {
+                        // EOF before full read completed
+                        let br = state.bytes_read;
+                        state.err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("unexpected EOF: read {} of {} bytes", br, request.length),
+                        ));
+                        state.buffer.truncate(br);
+                        state.completed = true;
+                    } else {
+                        // Positive result: n bytes read
+                        let n = result as usize;
+                        state.bytes_read += n;
+                        let br = state.bytes_read;
+
+                        if br >= request.length {
+                            // Full read complete
+                            state.buffer.truncate(br);
+                            state.completed = true;
+                        } else {
+                            // Short read — need retry; don't mark completed or wake
+                            drop(state);
+                            retries.push(request);
+                            continue;
+                        }
                     }
 
                     // Wake waiting future
@@ -164,6 +196,42 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                 } else {
                     log::warn!("Received completion for unknown user_data: {}", user_data);
                 }
+            }
+
+            // Resubmit short-read retries
+            for request in retries {
+                // Generate unique user_data
+                let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+                let (buffer_ptr, read_offset, read_length) = {
+                    let state = request.state.lock().unwrap();
+                    let br = state.bytes_read;
+                    (
+                        unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                        request.offset + br as u64,
+                        (request.length - br) as u32,
+                    )
+                };
+
+                let read_op = opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length)
+                    .offset(read_offset);
+
+                let mut sq = uring.ring.submission();
+                if sq.is_full() {
+                    drop(sq);
+                    log::error!("Failed to resubmit short read: SQ full");
+                    continue;
+                }
+
+                unsafe {
+                    if sq.push(&read_op.build().user_data(user_data)).is_err() {
+                        log::error!("Failed to push short-read retry to SQ");
+                        continue;
+                    }
+                }
+                drop(sq);
+
+                uring.pending.insert(user_data, request);
             }
 
             if completed > 0 {
@@ -303,6 +371,7 @@ impl UringCurrentThreadReader {
                 waker: None,
                 err: None,
                 buffer,
+                bytes_read: 0,
             }),
         });
 

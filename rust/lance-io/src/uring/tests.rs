@@ -196,6 +196,55 @@ async fn test_path() -> Result<()> {
     Ok(())
 }
 
+/// Test that reading past EOF returns an error.
+///
+/// This exercises the case where `known_size` passed to `open_with_size` is larger
+/// than the actual file, causing io_uring to hit EOF before the full read completes.
+#[tokio::test]
+async fn test_short_read_get_all() -> Result<()> {
+    let actual_size: usize = 8192;
+    let (file, _expected_data) = create_test_file(actual_size)?;
+    let file_path = file.path().to_str().unwrap();
+    let uri = format!("file+uring://{}", file_path);
+
+    let (store, path) = ObjectStore::from_uri(&uri).await?;
+
+    // Open with inflated known_size — the reader will think the file is 2x its real size
+    let inflated_size = actual_size * 2;
+    let reader = store.open_with_size(&path, inflated_size).await?;
+
+    // get_all() will submit a read for inflated_size bytes from an actual_size file.
+    // The kernel reads actual_size bytes then returns 0 (EOF) — this should be an error.
+    let result = reader.get_all().await;
+    assert!(result.is_err(), "reading past EOF should return an error");
+
+    Ok(())
+}
+
+/// Test that a range read extending past EOF returns an error.
+#[tokio::test]
+async fn test_short_read_get_range_past_eof() -> Result<()> {
+    let actual_size: usize = 8192;
+    let (file, _expected_data) = create_test_file(actual_size)?;
+    let file_path = file.path().to_str().unwrap();
+    let uri = format!("file+uring://{}", file_path);
+
+    let (store, path) = ObjectStore::from_uri(&uri).await?;
+    let reader = store.open(&path).await?;
+
+    // Request a range that starts inside the file but extends past EOF.
+    // File is 8192 bytes; reading 4096..16384 hits EOF — this should be an error.
+    let range_start = 4096;
+    let range_end = actual_size * 2; // 16384, well past EOF
+    let result = reader.get_range(range_start..range_end).await;
+    assert!(
+        result.is_err(),
+        "range extending past EOF should return an error"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_uring_not_enabled_with_file_scheme() -> Result<()> {
     // Verify that files opened with file:// don't use uring

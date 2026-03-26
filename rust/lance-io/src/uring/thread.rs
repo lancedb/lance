@@ -7,13 +7,13 @@
 //! and processes read requests from a channel. Readers send requests via
 //! an MPSC channel, and the thread handles submission and completion processing.
 
-use super::requests::IoRequest;
 use super::DEFAULT_URING_QUEUE_DEPTH;
-use io_uring::{opcode, types, IoUring};
+use super::requests::IoRequest;
+use io_uring::{IoUring, opcode, types};
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -155,11 +155,21 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
         }
 
         // Process all available completions first
+        let mut needs_submit = false;
         let completions = process_completions(&mut ring, &mut pending);
         match completions {
-            Ok(count) => {
-                completed_iops += count.iops;
-                completed_sectors += count.sectors;
+            Ok(result) => {
+                completed_iops += result.iops;
+                completed_sectors += result.sectors;
+
+                // Resubmit any short-read retries
+                for request in result.retries {
+                    if let Err(e) = push_to_sq(&mut ring, &mut pending, request) {
+                        log::error!("Failed to resubmit short read: {}", e);
+                    } else {
+                        needs_submit = true;
+                    }
+                }
             }
             Err(e) => {
                 log::error!("Error processing io_uring completions: {}", e);
@@ -208,14 +218,14 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     // All senders dropped - submit batch and shutdown
-                    if batch_count > 0 {
-                        if let Err(e) = ring.submit() {
-                            log::error!(
-                                "io_uring[{}]: Failed to submit io_uring batch: {}",
-                                thread_id,
-                                e
-                            );
-                        }
+                    if batch_count > 0
+                        && let Err(e) = ring.submit()
+                    {
+                        log::error!(
+                            "io_uring[{}]: Failed to submit io_uring batch: {}",
+                            thread_id,
+                            e
+                        );
                     }
                     log::info!(
                         "io_uring thread {} shutting down (channel disconnected)",
@@ -226,15 +236,15 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
             }
         }
 
-        // Submit the batch if we have any requests
-        if batch_count > 0 {
-            if let Err(e) = ring.submit() {
-                log::error!(
-                    "Failed to submit io_uring batch of {} requests: {}",
-                    batch_count,
-                    e
-                );
-            }
+        // Submit if we have any requests (from channel or retries)
+        if (batch_count > 0 || needs_submit)
+            && let Err(e) = ring.submit()
+        {
+            log::error!(
+                "Failed to submit io_uring batch of {} requests: {}",
+                batch_count,
+                e
+            );
         }
     }
 }
@@ -251,15 +261,20 @@ fn push_to_sq(
     // Generate unique user_data
     let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    // Get buffer pointer from request state
-    let buffer_ptr = {
+    // Get buffer pointer, adjusting for any bytes already read (short read retry)
+    let (buffer_ptr, read_offset, read_length) = {
         let state = request.state.lock().unwrap();
-        state.buffer.as_ptr() as *mut u8
+        let br = state.bytes_read;
+        (
+            unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+            request.offset + br as u64,
+            (request.length - br) as u32,
+        )
     };
 
     // Prepare read operation
-    let read_op = opcode::Read::new(types::Fd(request.fd), buffer_ptr, request.length as u32)
-        .offset(request.offset);
+    let read_op =
+        opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length).offset(read_offset);
 
     // Get submission queue
     let mut sq = ring.submission();
@@ -286,23 +301,26 @@ fn push_to_sq(
     Ok(())
 }
 
-struct CompletionStats {
+struct CompletionResult {
     iops: usize,
     sectors: usize,
+    retries: Vec<Arc<IoRequest>>,
 }
 
 /// Process all available completions from the io_uring.
 ///
 /// This iterates through the completion queue, matches completions to requests,
-/// updates their state, and wakes any waiting futures.
+/// updates their state, and wakes any waiting futures. Short reads are collected
+/// into `retries` for resubmission; EOF before a full read is an error.
 ///
-/// Returns the number of completions processed.
+/// Returns completion stats and a list of requests needing resubmission.
 fn process_completions(
     ring: &mut IoUring,
     pending: &mut HashMap<u64, Arc<IoRequest>>,
-) -> io::Result<CompletionStats> {
+) -> io::Result<CompletionResult> {
     let mut iops = 0;
     let mut sectors = 0;
+    let mut retries = Vec::new();
 
     // Process all available completions
     for cqe in ring.completion() {
@@ -312,16 +330,43 @@ fn process_completions(
         // Look up request
         if let Some(request) = pending.remove(&user_data) {
             let mut state = request.state.lock().unwrap();
-            state.completed = true;
 
-            // Handle result
             if result < 0 {
+                // Kernel error
                 state.err = Some(io::Error::from_raw_os_error(-result));
-            } else if request.length > 0 {
-                let first_sector = request.offset / 4096;
-                let last_sector = (request.offset + request.length as u64 - 1) / 4096;
-                let num_sectors = (last_sector - first_sector + 1) as usize;
-                sectors += num_sectors;
+                state.completed = true;
+            } else if result == 0 {
+                // EOF before full read completed
+                let br = state.bytes_read;
+                state.err = Some(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("unexpected EOF: read {} of {} bytes", br, request.length),
+                ));
+                state.buffer.truncate(br);
+                state.completed = true;
+            } else {
+                // Positive result: n bytes read
+                let n = result as usize;
+                state.bytes_read += n;
+                let br = state.bytes_read;
+
+                if br >= request.length {
+                    // Full read complete
+                    state.buffer.truncate(br);
+                    state.completed = true;
+
+                    if request.length > 0 {
+                        let first_sector = request.offset / 4096;
+                        let last_sector = (request.offset + request.length as u64 - 1) / 4096;
+                        let num_sectors = (last_sector - first_sector + 1) as usize;
+                        sectors += num_sectors;
+                    }
+                } else {
+                    // Short read — need retry; don't mark completed or wake
+                    drop(state);
+                    retries.push(request);
+                    continue;
+                }
             }
 
             // Wake the future if it's waiting
@@ -336,5 +381,9 @@ fn process_completions(
         }
     }
 
-    Ok(CompletionStats { iops, sectors })
+    Ok(CompletionResult {
+        iops,
+        sectors,
+        retries,
+    })
 }

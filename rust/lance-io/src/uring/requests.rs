@@ -15,6 +15,8 @@ pub(super) struct RequestState {
     pub waker: Option<Waker>,
     pub err: Option<io::Error>,
     pub buffer: BytesMut,
+    /// Accumulated bytes read across retries (for handling short reads).
+    pub bytes_read: usize,
 }
 
 /// I/O request object that contains all state for a single read operation.

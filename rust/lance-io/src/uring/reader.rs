@@ -208,6 +208,7 @@ impl UringReader {
                 waker: None,
                 err: None,
                 buffer,
+                bytes_read: 0,
             }),
         });
 

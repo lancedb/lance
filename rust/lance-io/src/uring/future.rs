@@ -31,6 +31,8 @@ impl Future for UringReadFuture {
                     source: Box::new(err),
                 })),
                 None => {
+                    let br = state.bytes_read;
+                    state.buffer.truncate(br);
                     let bytes = std::mem::take(&mut state.buffer).freeze();
                     Poll::Ready(Ok(bytes))
                 }

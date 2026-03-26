@@ -47,6 +47,8 @@ impl Future for UringCurrentThreadFuture {
                     }));
                 }
                 None => {
+                    let br = state.bytes_read;
+                    state.buffer.truncate(br);
                     let bytes = std::mem::take(&mut state.buffer).freeze();
                     return Poll::Ready(Ok(bytes));
                 }
@@ -77,6 +79,8 @@ impl Future for UringCurrentThreadFuture {
                     }));
                 }
                 None => {
+                    let br = state.bytes_read;
+                    state.buffer.truncate(br);
                     let bytes = std::mem::take(&mut state.buffer).freeze();
                     return Poll::Ready(Ok(bytes));
                 }
