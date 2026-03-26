@@ -88,8 +88,7 @@ use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{
-    PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentDescription,
-    PyIndexSegmentPlan,
+    PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentPlan,
 };
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
@@ -2785,27 +2784,6 @@ impl Dataset {
         Ok(indices
             .into_iter()
             .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
-            .collect())
-    }
-
-    #[pyo3(signature=(index_name=None))]
-    fn describe_index_segments(
-        &self,
-        py: Python<'_>,
-        index_name: Option<&str>,
-    ) -> PyResult<Vec<PyIndexSegmentDescription>> {
-        let new_self = self.ds.as_ref().clone();
-        let indices = rt()
-            .block_on(Some(py), new_self.load_indices())?
-            .infer_error()?;
-        Ok(indices
-            .iter()
-            .filter(|segment| {
-                index_name
-                    .map(|index_name| segment.name == index_name)
-                    .unwrap_or(true)
-            })
-            .map(PyIndexSegmentDescription::from_metadata)
             .collect())
     }
 

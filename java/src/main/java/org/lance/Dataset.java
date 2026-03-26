@@ -1268,20 +1268,6 @@ public class Dataset implements Closeable {
   private native List<Index> nativeGetIndexes();
 
   /**
-   * Get physical index segments for a specific logical index name.
-   *
-   * @param indexName logical index name
-   * @return list of physical index segments belonging to the logical index
-   */
-  public List<Index> getIndexSegments(String indexName) {
-    Preconditions.checkArgument(
-        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
-    return getIndexes().stream()
-        .filter(index -> indexName.equals(index.name()))
-        .collect(Collectors.toList());
-  }
-
-  /**
    * Get statistics for a specific index in JSON form.
    *
    * <p>The JSON structure matches the Rust/Python index_statistics API.

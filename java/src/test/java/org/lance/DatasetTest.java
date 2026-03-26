@@ -1918,9 +1918,8 @@ public class DatasetTest {
             desc.getMetadata(), desc.getSegments(), "segments alias should match metadata");
         assertNotNull(desc.getDetailsJson(), "Details JSON should not be null");
 
-        List<Index> physicalSegments = dataset.getIndexSegments("index1");
-        assertEquals(1, physicalSegments.size(), "Expected exactly one physical segment");
-        assertEquals("index1", physicalSegments.get(0).name());
+        assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
+        assertEquals("index1", desc.getSegments().get(0).name());
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");

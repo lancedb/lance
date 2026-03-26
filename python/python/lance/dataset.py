@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .io import StorageOptionsProvider
-    from .lance.indices import IndexDescription, IndexSegmentDescription
+    from .lance.indices import IndexDescription
     from .progress import FragmentWriteProgress
     from .types import ReaderLike
 
@@ -646,9 +646,8 @@ class LanceDataset(pa.dataset.Dataset):
         This method is deprecated as it requires loading the statistics for each index
         which can be a very expensive operation.  It also exposes physical index
         segments directly.  Instead use describe_indices() for logical index
-        descriptions, describe_index_segments() for explicit segment inspection,
-        and index_statistics() to get the statistics for individual indexes of
-        interest.
+        descriptions and index_statistics() to get the statistics for individual
+        indexes of interest.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -661,19 +660,6 @@ class LanceDataset(pa.dataset.Dataset):
     def describe_indices(self) -> List[IndexDescription]:
         """Returns logical index information aggregated across all segments."""
         return self._ds.describe_indices()
-
-    def describe_index_segments(
-        self, index_name: Optional[str] = None
-    ) -> List[IndexSegmentDescription]:
-        """
-        Returns physical index segment information.
-
-        Parameters
-        ----------
-        index_name: Optional[str]
-            If provided, only return segments belonging to the named logical index.
-        """
-        return self._ds.describe_index_segments(index_name)
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
