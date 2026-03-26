@@ -8,6 +8,7 @@ use std::sync::Arc;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::{IndexType, scalar::lance_format::LanceIndexStore};
 use lance_table::format::IndexMetadata;
+use prost::Message;
 
 use crate::{
     Dataset, Error, Result,
@@ -155,7 +156,12 @@ pub(crate) async fn load_segment_details(
     let mut expected_details: Option<InvertedIndexDetails> = None;
     for meta in segments {
         let details_any = fetch_index_details(dataset, column, meta).await?;
-        let details = details_any.as_ref().to_msg::<InvertedIndexDetails>()?;
+        let details =
+            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|err| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {err}"
+                ))
+            })?;
         match &expected_details {
             Some(expected) if expected != &details => {
                 return Err(Error::invalid_input(format!(
@@ -173,4 +179,18 @@ pub(crate) async fn load_segment_details(
             column
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_legacy_inverted_details_type_url() {
+        let mut details_any = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
+        details_any.type_url = "/lance.index.pb.InvertedIndexDetails".to_string();
+
+        let decoded = InvertedIndexDetails::decode(details_any.value.as_slice()).unwrap();
+        assert_eq!(decoded, InvertedIndexDetails::default());
+    }
 }
