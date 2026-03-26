@@ -480,7 +480,7 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type) {
+        let transaction = if uses_segment_commit_path(self.index_type, &new_idx.name, self.params) {
             let field_id = *new_idx.fields.first().ok_or_else(|| {
                 Error::internal(format!(
                     "Index '{}' is missing field ids after build",
@@ -561,7 +561,15 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
-fn uses_segment_commit_path(index_type: IndexType) -> bool {
+fn uses_segment_commit_path(
+    index_type: IndexType,
+    index_name: &str,
+    params: &dyn IndexParams,
+) -> bool {
+    if index_name != LANCE_VECTOR_INDEX {
+        return false;
+    }
+
     matches!(
         index_type,
         IndexType::Vector
@@ -572,7 +580,7 @@ fn uses_segment_commit_path(index_type: IndexType) -> bool {
             | IndexType::IvfHnswFlat
             | IndexType::IvfHnswPq
             | IndexType::IvfHnswSq
-    )
+    ) && params.as_any().is::<VectorIndexParams>()
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
