@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
+use lance_index::pbold::InvertedIndexDetails;
 use lance_index::{IndexType, scalar::lance_format::LanceIndexStore};
 use lance_table::format::IndexMetadata;
 
 use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
-    index::{IndexSegment, IndexSegmentPlan},
+    index::{DatasetIndexExt, IndexSegment, IndexSegmentPlan, scalar::fetch_index_details},
 };
 
 /// Plan physical segments for staged inverted-index outputs.
@@ -107,4 +108,67 @@ pub(crate) async fn build_segment(
     )
     .await?;
     Ok(built_segment)
+}
+
+/// Load all committed inverted-index segments that belong to the same named index.
+pub(crate) async fn load_segments(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Option<Vec<IndexMetadata>>> {
+    let Some(index_meta) = dataset
+        .load_scalar_index(
+            lance_index::IndexCriteria::default()
+                .for_column(column)
+                .supports_fts(),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let indices = dataset.load_indices_by_name(&index_meta.name).await?;
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    let expected_fields = indices[0].fields.clone();
+    for meta in &indices {
+        if meta.fields != expected_fields {
+            return Err(Error::invalid_input(format!(
+                "FTS index {} has inconsistent fields across segments",
+                index_meta.name
+            )));
+        }
+    }
+
+    Ok(Some(indices))
+}
+
+/// Load and validate the shared inverted-index details across committed segments.
+pub(crate) async fn load_segment_details(
+    dataset: &Dataset,
+    column: &str,
+    segments: &[IndexMetadata],
+) -> Result<InvertedIndexDetails> {
+    let mut expected_details: Option<InvertedIndexDetails> = None;
+    for meta in segments {
+        let details_any = fetch_index_details(dataset, column, meta).await?;
+        let details = details_any.as_ref().to_msg::<InvertedIndexDetails>()?;
+        match &expected_details {
+            Some(expected) if expected != &details => {
+                return Err(Error::invalid_input(format!(
+                    "FTS index {} has inconsistent inverted index details across segments",
+                    meta.name
+                )));
+            }
+            Some(_) => {}
+            None => expected_details = Some(details),
+        }
+    }
+    expected_details.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "FTS index for column {} requires at least one segment",
+            column
+        ))
+    })
 }

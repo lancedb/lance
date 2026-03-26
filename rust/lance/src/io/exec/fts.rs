@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{AsArray, BooleanBuilder};
@@ -17,6 +17,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -26,12 +27,9 @@ use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, build_prefilter};
-use crate::index::DatasetIndexExt;
-use crate::index::scalar::fetch_index_details;
+use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
-use lance_index::IndexCriteria;
 use lance_index::metrics::MetricsCollector;
-use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -41,69 +39,10 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
+    FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, flat_bm25_search_stream,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use tracing::instrument;
-
-/// Load all FTS segments that belong to the same named index for a column.
-pub(crate) async fn load_fts_segments(
-    dataset: &Dataset,
-    column: &str,
-) -> Result<Option<Vec<IndexMetadata>>> {
-    let Some(index_meta) = dataset
-        .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
-        .await?
-    else {
-        return Ok(None);
-    };
-
-    let indices = dataset.load_indices_by_name(&index_meta.name).await?;
-    if indices.is_empty() {
-        return Ok(None);
-    }
-
-    let expected_fields = indices[0].fields.clone();
-    for meta in &indices {
-        if meta.fields != expected_fields {
-            return Err(Error::invalid_input(format!(
-                "FTS index {} has inconsistent fields across segments",
-                index_meta.name
-            )));
-        }
-    }
-
-    Ok(Some(indices))
-}
-
-/// Load and validate the shared FTS details across a set of segments.
-pub(crate) async fn load_fts_segment_details(
-    dataset: &Dataset,
-    column: &str,
-    segments: &[IndexMetadata],
-) -> Result<InvertedIndexDetails> {
-    let mut expected_details: Option<InvertedIndexDetails> = None;
-    for meta in segments {
-        let details_any = fetch_index_details(dataset, column, meta).await?;
-        let details = details_any.as_ref().to_msg::<InvertedIndexDetails>()?;
-        match &expected_details {
-            Some(expected) if expected != &details => {
-                return Err(Error::invalid_input(format!(
-                    "FTS index {} has inconsistent inverted index details across segments",
-                    meta.name
-                )));
-            }
-            Some(_) => {}
-            None => expected_details = Some(details),
-        }
-    }
-    expected_details.ok_or_else(|| {
-        Error::invalid_input(format!(
-            "FTS index for column {} requires at least one segment",
-            column
-        ))
-    })
-}
 
 /// Open one FTS segment as an [`InvertedIndex`].
 async fn open_fts_segment(
@@ -124,6 +63,77 @@ async fn open_fts_segment(
             ))
         })?;
     Ok(Arc::new(inverted.clone()))
+}
+
+/// Open all committed FTS segments for a column.
+///
+/// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
+/// current correctness-first path opens each committed segment before scoring.
+async fn open_fts_segments(
+    dataset: &Dataset,
+    column: &str,
+    segments: &[IndexMetadata],
+    metrics: &IndexMetrics,
+) -> Result<Vec<Arc<InvertedIndex>>> {
+    try_join_all(
+        segments
+            .iter()
+            .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
+    )
+    .await
+}
+
+/// Expand fuzzy query tokens across all segments so the shared BM25 scorer sees every term
+/// that any segment-local search may score.
+fn scorer_tokens(
+    indices: &[Arc<InvertedIndex>],
+    query_tokens: &Tokens,
+    params: &FtsSearchParams,
+) -> Result<Tokens> {
+    if !matches!(params.fuzziness, Some(n) if n != 0) {
+        return Ok(query_tokens.clone());
+    }
+
+    let mut tokens = Vec::new();
+    let mut positions = Vec::new();
+    let mut seen = HashSet::new();
+    for index in indices {
+        let expanded = index.expand_fuzzy_tokens(query_tokens, params)?;
+        for idx in 0..expanded.len() {
+            let token = expanded.get_token(idx);
+            if seen.insert(token.to_string()) {
+                tokens.push(token.to_string());
+                positions.push(expanded.position(idx));
+            }
+        }
+    }
+    Ok(Tokens::with_positions(
+        tokens,
+        positions,
+        query_tokens.token_type().clone(),
+    ))
+}
+
+/// Build a shared BM25 scorer for a set of committed FTS segments.
+fn build_global_bm25_scorer(
+    indices: &[Arc<InvertedIndex>],
+    query_tokens: &Tokens,
+    params: &FtsSearchParams,
+) -> Result<MemBM25Scorer> {
+    let scorer_tokens = scorer_tokens(indices, query_tokens, params)?;
+    let first_index = indices.first().ok_or_else(|| {
+        Error::invalid_input("FTS index requires at least one segment".to_string())
+    })?;
+    let mut base_scorer = first_index.bm25_base_scorer(&scorer_tokens);
+    for index in indices.iter().skip(1) {
+        let segment_scorer = index.bm25_base_scorer(&scorer_tokens);
+        base_scorer.total_tokens += segment_scorer.total_tokens;
+        base_scorer.num_docs += segment_scorer.num_docs;
+        for (token, count) in segment_scorer.token_docs {
+            *base_scorer.token_docs.entry(token).or_insert(0) += count;
+        }
+    }
+    Ok(base_scorer)
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
@@ -323,19 +333,15 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let segments =
-                load_fts_segments(&ds, &column)
-                    .await?
-                    .ok_or(DataFusionError::Execution(format!(
-                        "No Inverted index found for column {}",
-                        column,
-                    )))?;
-            let _details = load_fts_segment_details(&ds, &column, &segments).await?;
-            let mut indices = Vec::with_capacity(segments.len());
-            for segment in &segments {
-                indices
-                    .push(open_fts_segment(&ds, &column, segment, &metrics.index_metrics).await?);
-            }
+            let segments = load_segments(&ds, &column)
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
+            let _details = load_segment_details(&ds, &column, &segments).await?;
+            let indices =
+                open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
             let mut pre_filter =
                 build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
@@ -380,15 +386,7 @@ impl ExecutionPlan for MatchQueryExec {
                 }
             };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-            let mut base_scorer = first_index.bm25_base_scorer(&tokens);
-            for index in indices.iter().skip(1) {
-                let segment_scorer = index.bm25_base_scorer(&tokens);
-                base_scorer.total_tokens += segment_scorer.total_tokens;
-                base_scorer.num_docs += segment_scorer.num_docs;
-                for (token, count) in segment_scorer.token_docs {
-                    *base_scorer.token_docs.entry(token).or_insert(0) += count;
-                }
-            }
+            let base_scorer = build_global_bm25_scorer(&indices, &tokens, &params)?;
 
             pre_filter.wait_for_ready().await?;
             let tokens = Arc::new(tokens);
@@ -498,7 +496,7 @@ impl FlatMatchFilterExec {
         column: &str,
         metrics: &IndexMetrics,
     ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
-        if let Some(segments) = load_fts_segments(dataset, column).await? {
+        if let Some(segments) = load_segments(dataset, column).await? {
             let index_meta = segments.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {} has no segments",
@@ -784,16 +782,12 @@ impl ExecutionPlan for FlatMatchQueryExec {
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
-            let segments = load_fts_segments(&ds, &column).await?;
+            let segments = load_segments(&ds, &column).await?;
             let (tokenizer, base_scorer) = match segments {
                 Some(segments) => {
-                    let _details = load_fts_segment_details(&ds, &column, &segments).await?;
-                    let mut indices = Vec::with_capacity(segments.len());
-                    for segment in &segments {
-                        indices.push(
-                            open_fts_segment(&ds, &column, segment, &metrics.index_metrics).await?,
-                        );
-                    }
+                    let _details = load_segment_details(&ds, &column, &segments).await?;
+                    let indices =
+                        open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
                     metrics.record_parts_searched(
                         indices.iter().map(|index| index.partition_count()).sum(),
                     );
@@ -802,15 +796,8 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     ))?;
                     let mut tokenizer = first_index.tokenizer();
                     let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                    let mut base_scorer = first_index.bm25_base_scorer(&query_tokens);
-                    for index in indices.iter().skip(1) {
-                        let segment_scorer = index.bm25_base_scorer(&query_tokens);
-                        base_scorer.total_tokens += segment_scorer.total_tokens;
-                        base_scorer.num_docs += segment_scorer.num_docs;
-                        for (token, count) in segment_scorer.token_docs {
-                            *base_scorer.token_docs.entry(token).or_insert(0) += count;
-                        }
-                    }
+                    let base_scorer =
+                        build_global_bm25_scorer(&indices, &query_tokens, &FtsSearchParams::new())?;
                     (tokenizer, Some(base_scorer))
                 }
                 None => (default_text_tokenizer(), None),
@@ -1007,19 +994,15 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let segments =
-                load_fts_segments(&ds, &column)
-                    .await?
-                    .ok_or(DataFusionError::Execution(format!(
-                        "No Inverted index found for column {}",
-                        column,
-                    )))?;
-            let _details = load_fts_segment_details(&ds, &column, &segments).await?;
-            let mut indices = Vec::with_capacity(segments.len());
-            for segment in &segments {
-                indices
-                    .push(open_fts_segment(&ds, &column, segment, &metrics.index_metrics).await?);
-            }
+            let segments = load_segments(&ds, &column)
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
+            let _details = load_segment_details(&ds, &column, &segments).await?;
+            let indices =
+                open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
             let mut pre_filter =
                 build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
@@ -1044,15 +1027,7 @@ impl ExecutionPlan for PhraseQueryExec {
             )))?;
             let mut tokenizer = first_index.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-            let mut base_scorer = first_index.bm25_base_scorer(&tokens);
-            for index in indices.iter().skip(1) {
-                let segment_scorer = index.bm25_base_scorer(&tokens);
-                base_scorer.total_tokens += segment_scorer.total_tokens;
-                base_scorer.num_docs += segment_scorer.num_docs;
-                for (token, count) in segment_scorer.token_docs {
-                    *base_scorer.token_docs.entry(token).or_insert(0) += count;
-                }
-            }
+            let base_scorer = build_global_bm25_scorer(&indices, &tokens, &params)?;
 
             pre_filter.wait_for_ready().await?;
             let tokens = Arc::new(tokens);

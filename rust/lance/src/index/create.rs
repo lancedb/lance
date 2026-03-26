@@ -26,7 +26,11 @@ use lance_index::{
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
-use std::{collections::HashMap, future::IntoFuture, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    future::IntoFuture,
+    sync::Arc,
+};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -611,23 +615,41 @@ impl<'a> IndexSegmentBuilder<'a> {
             ));
         }
 
-        let index_details = self.segments[0]
-            .index_details
-            .as_ref()
-            .ok_or_else(|| {
+        let infer_index_type = |segment: &IndexMetadata| -> Result<IndexType> {
+            let index_details = segment.index_details.as_ref().ok_or_else(|| {
                 Error::invalid_input("input segment is missing index details".to_string())
-            })?
-            .clone();
-        let details = IndexDetails(index_details);
-        let index_type = if details.supports_fts() {
-            IndexType::Inverted
-        } else if details.is_vector() {
-            IndexType::Vector
-        } else {
-            return Err(Error::invalid_input(
-                "IndexSegmentBuilder only supports vector and FTS segments".to_string(),
-            ));
+            })?;
+            let details = IndexDetails(index_details.clone());
+            if details.supports_fts() {
+                Ok(IndexType::Inverted)
+            } else if details.is_vector() {
+                Ok(IndexType::Vector)
+            } else {
+                Err(Error::invalid_input(
+                    "IndexSegmentBuilder only supports vector and FTS segments".to_string(),
+                ))
+            }
         };
+
+        let index_type = infer_index_type(&self.segments[0])?;
+        let mut seen_segment_ids = HashSet::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            if !seen_segment_ids.insert(segment.uuid) {
+                return Err(Error::invalid_input(format!(
+                    "IndexSegmentBuilder received duplicate segment uuid {}",
+                    segment.uuid
+                )));
+            }
+            let segment_index_type = infer_index_type(segment)?;
+            if segment_index_type != index_type {
+                return Err(Error::invalid_input(format!(
+                    "IndexSegmentBuilder requires all input segments to have the same index type; \
+                     expected {}, got {} for segment {}",
+                    index_type, segment_index_type, segment.uuid
+                )));
+            }
+        }
+
         match index_type {
             IndexType::Inverted => crate::index::scalar::inverted::plan_segments(
                 &self.segments,
@@ -636,7 +658,7 @@ impl<'a> IndexSegmentBuilder<'a> {
             IndexType::Vector => {
                 crate::index::vector::ivf::plan_segments(
                     &self.segments,
-                    None,
+                    Some(IndexType::Vector),
                     self.target_segment_bytes,
                 )
                 .await
@@ -650,7 +672,12 @@ impl<'a> IndexSegmentBuilder<'a> {
 
     /// Build one segment from a previously-generated plan.
     pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        match plan.requested_index_type().unwrap_or(IndexType::Vector) {
+        match plan.requested_index_type().ok_or_else(|| {
+            Error::invalid_input(
+                "IndexSegmentBuilder requires planned segments to declare an index type"
+                    .to_string(),
+            )
+        })? {
             IndexType::Inverted => {
                 crate::index::scalar::inverted::build_segment(self.dataset, plan).await
             }
@@ -1403,6 +1430,170 @@ mod tests {
 
         let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
         assert_eq!(indices.len(), input_segments.len());
+    }
+
+    #[tokio::test]
+    async fn test_index_segment_builder_rejects_duplicate_segment_uuids() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::default();
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+                .name("text_idx".to_string())
+                .fragments(vec![0])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        let err = dataset
+            .create_index_segment_builder()
+            .with_segments(vec![segment.clone(), segment])
+            .build_all()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate segment uuid"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_segment_builder_rejects_mixed_index_types() {
+        let text_tmpdir = TempStrDir::default();
+        let text_dataset_uri = format!("file://{}", text_tmpdir.as_str());
+        let text_batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut text_dataset = Dataset::write(
+            text_batches,
+            &text_dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let inverted_params = InvertedIndexParams::default();
+        let text_segment = CreateIndexBuilder::new(
+            &mut text_dataset,
+            &["text"],
+            IndexType::Inverted,
+            &inverted_params,
+        )
+        .name("text_idx".to_string())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+        let vector_tmpdir = TempStrDir::default();
+        let vector_dataset_uri = format!("file://{}", vector_tmpdir.as_str());
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(8)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(64),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut vector_dataset = Dataset::write(
+            reader,
+            &vector_dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let vector_params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&vector_dataset, "vector").await,
+        );
+        let vector_segment = CreateIndexBuilder::new(
+            &mut vector_dataset,
+            &["vector"],
+            IndexType::Vector,
+            &vector_params,
+        )
+        .name("vector_idx".to_string())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+        let err = text_dataset
+            .create_index_segment_builder()
+            .with_segments(vec![text_segment, vector_segment])
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("same index type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_segment_builder_requires_requested_index_type() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10))],
+            create_text_batch(0, 1).schema(),
+        );
+        let dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let segment = IndexSegment::new(
+            Uuid::new_v4(),
+            [0_u32],
+            Arc::new(prost_types::Any::default()),
+            0,
+        );
+        let plan = IndexSegmentPlan::new(segment, Vec::new(), 0, None);
+        let err = dataset
+            .create_index_segment_builder()
+            .build(&plan)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("declare an index type"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

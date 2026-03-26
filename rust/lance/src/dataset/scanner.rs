@@ -79,13 +79,13 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
-    load_fts_segment_details, load_fts_segments,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -3232,14 +3232,13 @@ impl Scanner {
             "the column must be specified in the query".to_string(),
         ))?;
 
-        let segments =
-            load_fts_segments(&self.dataset, &column)
-                .await?
-                .ok_or(Error::invalid_input(format!(
-                    "No Inverted index found for column {}",
-                    column
-                )))?;
-        let details = load_fts_segment_details(&self.dataset, &column, &segments).await?;
+        let segments = load_segments(&self.dataset, &column)
+            .await?
+            .ok_or(Error::invalid_input(format!(
+                "No Inverted index found for column {}",
+                column
+            )))?;
+        let details = load_segment_details(&self.dataset, &column, &segments).await?;
 
         if !details.with_position {
             return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"

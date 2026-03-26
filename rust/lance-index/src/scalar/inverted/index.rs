@@ -8,7 +8,11 @@ use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
 };
-use std::{collections::HashMap, ops::Range, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    time::Instant,
+};
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
@@ -460,6 +464,28 @@ impl InvertedIndex {
             .map(|token| (token.to_string(), scorer.num_docs_containing_token(token)))
             .collect::<HashMap<_, _>>();
         MemBM25Scorer::new(scorer.total_tokens(), scorer.num_docs(), token_docs)
+    }
+
+    /// Expand fuzzy query tokens against all partitions in this segment.
+    pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
+        let mut expanded_tokens = Vec::new();
+        let mut expanded_positions = Vec::new();
+        let mut seen = HashSet::new();
+        for partition in &self.partitions {
+            let expanded = partition.expand_fuzzy(tokens, params)?;
+            for idx in 0..expanded.len() {
+                let token = expanded.get_token(idx);
+                if seen.insert(token.to_string()) {
+                    expanded_tokens.push(token.to_string());
+                    expanded_positions.push(expanded.position(idx));
+                }
+            }
+        }
+        Ok(Tokens::with_positions(
+            expanded_tokens,
+            expanded_positions,
+            tokens.token_type().clone(),
+        ))
     }
 
     /// Search documents that match the query and return row ids sorted by BM25 score.

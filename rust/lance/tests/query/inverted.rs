@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
 };
@@ -233,6 +234,83 @@ async fn test_segmented_inverted_match_query() {
         .unwrap();
     assert_fts_expected(&original, &ds, query.clone(), None, &[0, 2, 5]).await;
     test_fts(&original, &ds, "text", "lance", None, true, false).await;
+}
+
+#[tokio::test]
+async fn test_segmented_inverted_fuzzy_match_uses_global_idf() {
+    let test_dir = tempfile::tempdir().unwrap();
+    let test_uri = test_dir.path().to_str().unwrap();
+
+    let batches = vec![
+        RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
+            (
+                "text",
+                Arc::new(StringArray::from(vec![Some("lance")])) as ArrayRef,
+            ),
+        ])
+        .unwrap(),
+        RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            (
+                "text",
+                Arc::new(StringArray::from(vec![Some("lance lance lance")])) as ArrayRef,
+            ),
+        ])
+        .unwrap(),
+    ];
+    let schema = batches[0].schema();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let mut ds = Dataset::write(
+        reader,
+        test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let params = base_inverted_params(false);
+    let fragment_ids = ds
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut metadatas = Vec::<IndexMetadata>::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        let mut builder = ds
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("segmented_fuzzy".to_string())
+            .fragments(vec![fragment_id]);
+        metadatas.push(builder.execute_uncommitted().await.unwrap());
+    }
+    let segments = ds
+        .create_index_segment_builder()
+        .with_segments(metadatas)
+        .build_all()
+        .await
+        .unwrap();
+    ds.commit_existing_index_segments("segmented_fuzzy", "text", segments)
+        .await
+        .unwrap();
+
+    let batch = ds
+        .scan()
+        .full_text_search(
+            FullTextSearchQuery::new_fuzzy("lnce".to_string(), Some(1))
+                .with_column("text".to_string())
+                .unwrap()
+                .limit(Some(1)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["id"].as_primitive::<arrow_array::types::Int32Type>();
+    assert_eq!(ids.values(), &[1]);
 }
 
 #[tokio::test]
