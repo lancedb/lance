@@ -2699,8 +2699,8 @@ mod tests {
     use super::*;
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
-    use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance::index::DatasetIndexExt;
+    use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
