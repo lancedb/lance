@@ -312,7 +312,10 @@ mod tests {
         let input_params = ObjectStoreParams {
             block_size: Some(1024),
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([("azure_storage_account_name".to_string(), "my-storage-account".to_string())]),
+                HashMap::from([(
+                    "azure_storage_account_name".to_string(),
+                    "my-storage-account".to_string(),
+                )]),
             ))),
             ..Default::default()
         };
@@ -331,16 +334,23 @@ mod tests {
         let input_params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
-                    ("base1.azure_storage_account_key".to_string(), "mykey1".to_string()),
-                    ("base7.azure_storage_account_key".to_string(), "mykey7".to_string()),
+                    (
+                        "base1.azure_storage_account_key".to_string(),
+                        "mykey1".to_string(),
+                    ),
+                    (
+                        "base7.azure_storage_account_key".to_string(),
+                        "mykey7".to_string(),
+                    ),
                 ]),
             ))),
             ..Default::default()
         };
         let base_path = BasePath::new(7, "az://container/path".to_string(), None, false)
-            .with_storage_options(HashMap::from([
-                ("azure_storage_account_name".to_string(), "myaccount7".to_string()),
-            ]));
+            .with_storage_options(HashMap::from([(
+                "azure_storage_account_name".to_string(),
+                "myaccount7".to_string(),
+            )]));
 
         let output_params = object_store_params_for_base_path(&base_path, Some(&input_params));
 
