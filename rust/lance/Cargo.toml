@@ -184,6 +184,10 @@ name = "vector_throughput"
 harness = false
 
 [[bench]]
+name = "distributed_vector_build"
+harness = false
+
+[[bench]]
 name = "mem_wal_write"
 harness = false
 
