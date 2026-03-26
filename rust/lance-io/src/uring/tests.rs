@@ -6,6 +6,7 @@
 use crate::object_store::ObjectStore;
 use lance_core::Result;
 use std::io::Write;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 /// Helper to create a temporary file with test data
@@ -240,6 +241,133 @@ async fn test_short_read_get_range_past_eof() -> Result<()> {
     assert!(
         result.is_err(),
         "range extending past EOF should return an error"
+    );
+
+    Ok(())
+}
+
+/// Test that when push_to_sq fails (SQ full), the request's future returns
+/// an error instead of hanging forever.
+///
+/// This directly tests the thread-path scenario: create an IoUring with
+/// queue_depth=2, fill the SQ, then try to push a 3rd request. The 3rd
+/// request's future should return an error within the timeout.
+///
+/// BUG: currently the failed push silently drops the request, so the
+/// future hangs and the timeout fires.
+#[tokio::test]
+async fn test_retry_sq_full_thread() -> Result<()> {
+    use super::future::UringReadFuture;
+    use super::requests::{IoRequest, RequestState};
+    use super::thread::push_to_sq;
+    use bytes::BytesMut;
+    use io_uring::IoUring;
+    use std::collections::HashMap;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Arc, Mutex};
+
+    let (file, _) = create_test_file(4096)?;
+    let fd = file.as_file().as_raw_fd();
+
+    // Create a tiny ring with queue_depth=2
+    let mut ring = IoUring::new(2).unwrap();
+    let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::new();
+
+    // Helper to create a request
+    let make_request = || {
+        Arc::new(IoRequest {
+            fd,
+            offset: 0,
+            length: 4096,
+            thread_id: std::thread::current().id(),
+            state: Mutex::new(RequestState {
+                completed: false,
+                waker: None,
+                err: None,
+                buffer: BytesMut::zeroed(4096),
+                bytes_read: 0,
+            }),
+        })
+    };
+
+    // Fill the SQ (capacity=2)
+    let _r1 = make_request();
+    let _r2 = make_request();
+    push_to_sq(&mut ring, &mut pending, _r1).unwrap();
+    push_to_sq(&mut ring, &mut pending, _r2).unwrap();
+
+    // 3rd push should fail — SQ is full
+    let r3 = make_request();
+    let push_result = push_to_sq(&mut ring, &mut pending, r3.clone());
+    assert!(push_result.is_err(), "3rd push should fail (SQ full)");
+
+    // r3's future should return an error, not hang forever.
+    // BUG: currently nobody sets completed=true or err on r3, so the future hangs.
+    let future = UringReadFuture { request: r3 };
+    let result = tokio::time::timeout(Duration::from_secs(2), future).await;
+    assert!(
+        result.is_ok(),
+        "future timed out — request was dropped without error on SQ-full push failure"
+    );
+
+    Ok(())
+}
+
+/// Test that when push_to_sq fails (SQ full) on the current-thread path,
+/// the request's future returns an error instead of hanging forever.
+///
+/// Uses UringCurrentThreadFuture (which will be a no-op poller since the
+/// thread-local URING has no knowledge of this request) after push_to_sq
+/// has already completed the request with an error.
+#[tokio::test(flavor = "current_thread")]
+async fn test_retry_sq_full_current_thread() -> Result<()> {
+    use super::current_thread_future::UringCurrentThreadFuture;
+    use super::requests::{IoRequest, RequestState};
+    use super::thread::push_to_sq;
+    use bytes::BytesMut;
+    use io_uring::IoUring;
+    use std::collections::HashMap;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Arc, Mutex};
+
+    let (file, _) = create_test_file(4096)?;
+    let fd = file.as_file().as_raw_fd();
+
+    // Create a tiny ring with queue_depth=2
+    let mut ring = IoUring::new(2).unwrap();
+    let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::new();
+
+    let make_request = || {
+        Arc::new(IoRequest {
+            fd,
+            offset: 0,
+            length: 4096,
+            thread_id: std::thread::current().id(),
+            state: Mutex::new(RequestState {
+                completed: false,
+                waker: None,
+                err: None,
+                buffer: BytesMut::zeroed(4096),
+                bytes_read: 0,
+            }),
+        })
+    };
+
+    // Fill the SQ (capacity=2)
+    push_to_sq(&mut ring, &mut pending, make_request()).unwrap();
+    push_to_sq(&mut ring, &mut pending, make_request()).unwrap();
+
+    // 3rd push should fail — SQ is full
+    let r3 = make_request();
+    let push_result = push_to_sq(&mut ring, &mut pending, r3.clone());
+    assert!(push_result.is_err(), "3rd push should fail (SQ full)");
+
+    // r3's future should return an error, not hang forever.
+    let future = UringCurrentThreadFuture::new(r3);
+    let result = tokio::time::timeout(Duration::from_secs(2), future).await;
+    assert!(
+        result.is_ok(),
+        "future timed out — request was dropped without error on SQ-full push failure"
     );
 
     Ok(())

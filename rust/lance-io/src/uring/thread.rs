@@ -253,7 +253,7 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
 ///
 /// This generates a unique user_data ID, prepares the read operation,
 /// and pushes it to the SQ. The caller is responsible for calling ring.submit().
-fn push_to_sq(
+pub(super) fn push_to_sq(
     ring: &mut IoUring,
     pending: &mut HashMap<u64, Arc<IoRequest>>,
     request: Arc<IoRequest>,
@@ -282,6 +282,10 @@ fn push_to_sq(
     // Check if SQ has space
     if sq.is_full() {
         drop(sq);
+        request.fail(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "io_uring submission queue full",
+        ));
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "io_uring submission queue full",
@@ -290,8 +294,11 @@ fn push_to_sq(
 
     // Push to SQ
     unsafe {
-        sq.push(&read_op.build().user_data(user_data))
-            .map_err(|_| io::Error::other("Failed to push to SQ"))?;
+        if sq.push(&read_op.build().user_data(user_data)).is_err() {
+            drop(sq);
+            request.fail(io::Error::other("Failed to push to SQ"));
+            return Err(io::Error::other("Failed to push to SQ"));
+        }
     }
     drop(sq);
 

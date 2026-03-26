@@ -36,3 +36,19 @@ pub(super) struct IoRequest {
     /// Completion flag - set to true when operation completes.
     pub state: Mutex<RequestState>,
 }
+
+impl IoRequest {
+    /// Mark this request as failed with the given error.
+    ///
+    /// Sets the error, marks completed, and wakes any waiting future.
+    /// Used when a request cannot be submitted (e.g. SQ full).
+    pub(super) fn fail(&self, err: io::Error) {
+        let mut state = self.state.lock().unwrap();
+        state.err = Some(err);
+        state.completed = true;
+        if let Some(waker) = state.waker.take() {
+            drop(state);
+            waker.wake();
+        }
+    }
+}

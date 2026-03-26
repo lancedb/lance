@@ -219,13 +219,18 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                 let mut sq = uring.ring.submission();
                 if sq.is_full() {
                     drop(sq);
-                    log::error!("Failed to resubmit short read: SQ full");
+                    request.fail(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "io_uring submission queue full during retry",
+                    ));
+                    uring.pending_count -= 1;
                     continue;
                 }
 
                 unsafe {
                     if sq.push(&read_op.build().user_data(user_data)).is_err() {
-                        log::error!("Failed to push short-read retry to SQ");
+                        request.fail(io::Error::other("Failed to push short-read retry to SQ"));
+                        uring.pending_count -= 1;
                         continue;
                     }
                 }
