@@ -45,6 +45,8 @@ use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
 
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
 #[tokio::test]
 async fn test_truncate_table() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -1483,24 +1485,13 @@ async fn test_sample_with_fragment_ids(
 #[tokio::test]
 async fn test_sample_with_empty_fragment_ids_rejected(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-    data_storage_version: LanceFileVersion,
+    _data_storage_version: LanceFileVersion,
 ) {
-    let test_uri = TempStrDir::default();
-    let data = gen_batch()
+    let dataset = gen_batch()
         .col("i", array::step::<Int32Type>())
-        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
-    let dataset = Dataset::write(
-        data,
-        &test_uri,
-        Some(WriteParams {
-            max_rows_per_file: 4,
-            max_rows_per_group: 2,
-            data_storage_version: Some(data_storage_version),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
 
     let projection = dataset.schema().project(&["i"]).unwrap();
     let err = dataset.sample(1, &projection, Some(&[])).await.unwrap_err();
@@ -1516,24 +1507,13 @@ async fn test_sample_with_empty_fragment_ids_rejected(
 #[tokio::test]
 async fn test_sample_with_unknown_fragment_ids_rejected(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-    data_storage_version: LanceFileVersion,
+    _data_storage_version: LanceFileVersion,
 ) {
-    let test_uri = TempStrDir::default();
-    let data = gen_batch()
+    let dataset = gen_batch()
         .col("i", array::step::<Int32Type>())
-        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
-    let dataset = Dataset::write(
-        data,
-        &test_uri,
-        Some(WriteParams {
-            max_rows_per_file: 4,
-            max_rows_per_group: 2,
-            data_storage_version: Some(data_storage_version),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
 
     let projection = dataset.schema().project(&["i"]).unwrap();
     let err = dataset
