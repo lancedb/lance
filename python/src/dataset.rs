@@ -327,6 +327,7 @@ impl MergeInsertBuilder {
 #[derive(Clone)]
 pub struct PyIndexSegmentBuilder {
     dataset: Arc<LanceDataset>,
+    index_type: Option<IndexType>,
     segments: Vec<IndexMetadata>,
     target_segment_bytes: Option<u64>,
 }
@@ -337,6 +338,9 @@ impl PyIndexSegmentBuilder {
             .dataset
             .create_index_segment_builder()
             .with_segments(self.segments.clone());
+        if let Some(index_type) = self.index_type {
+            builder = builder.with_index_type(index_type);
+        }
         if let Some(target_segment_bytes) = self.target_segment_bytes {
             builder = builder.with_target_segment_bytes(target_segment_bytes);
         }
@@ -346,6 +350,30 @@ impl PyIndexSegmentBuilder {
 
 #[pymethods]
 impl PyIndexSegmentBuilder {
+    fn with_index_type<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        index_type: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let normalized = index_type.to_uppercase();
+        slf.index_type = Some(match normalized.as_str() {
+            "INVERTED" | "FTS" => IndexType::Inverted,
+            "VECTOR" => IndexType::Vector,
+            "IVF_FLAT" => IndexType::IvfFlat,
+            "IVF_PQ" => IndexType::IvfPq,
+            "IVF_SQ" => IndexType::IvfSq,
+            "IVF_RQ" => IndexType::IvfRq,
+            "IVF_HNSW_FLAT" => IndexType::IvfHnswFlat,
+            "IVF_HNSW_PQ" => IndexType::IvfHnswPq,
+            "IVF_HNSW_SQ" => IndexType::IvfHnswSq,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unsupported index type for segment builder: {index_type}"
+                )));
+            }
+        });
+        Ok(slf)
+    }
+
     fn with_segments<'a>(
         mut slf: PyRefMut<'a, Self>,
         segments: &Bound<'_, PyAny>,
@@ -2094,6 +2122,7 @@ impl Dataset {
     fn create_index_segment_builder(&self) -> PyResult<PyIndexSegmentBuilder> {
         Ok(PyIndexSegmentBuilder {
             dataset: self.ds.clone(),
+            index_type: None,
             segments: Vec::new(),
             target_segment_bytes: None,
         })

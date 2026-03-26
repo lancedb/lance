@@ -3260,7 +3260,7 @@ class LanceDataset(pa.dataset.Dataset):
             This enables distributed/fragment-level indexing. When provided, the
             method creates one segment but does not commit the index
             to the dataset. The returned metadata can be passed to
-            ``create_index_segment_builder().with_segments(...)``
+            ``create_index_segment_builder().with_index_type(...).with_segments(...)``
             and then committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
@@ -3439,8 +3439,10 @@ class LanceDataset(pa.dataset.Dataset):
         1. run :meth:`create_index_uncommitted` on each worker with that worker's
            assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. pass them to :meth:`IndexSegmentBuilder.with_segments`
-        4. build one or more physical segments and commit them with
+        3. call :meth:`IndexSegmentBuilder.with_index_type` with the concrete
+           distributed index type
+        4. pass them to :meth:`IndexSegmentBuilder.with_segments`
+        5. build one or more physical segments and commit them with
            :meth:`commit_existing_index_segments`
 
         Parameters are the same as :meth:`create_index`, with one additional
@@ -3558,7 +3560,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Provide the segment metadata returned by
         :meth:`create_index_uncommitted` through
-        :meth:`IndexSegmentBuilder.with_segments`.
+        :meth:`IndexSegmentBuilder.with_segments`, and declare the segment type
+        with :meth:`IndexSegmentBuilder.with_index_type`.
         """
         return self._ds.create_index_segment_builder()
 

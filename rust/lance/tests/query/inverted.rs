@@ -213,6 +213,7 @@ async fn test_segmented_inverted_match_query() {
     }
     let segments = ds
         .create_index_segment_builder()
+        .with_index_type(IndexType::Inverted)
         .with_segments(metadatas.clone())
         .build_all()
         .await
@@ -289,6 +290,7 @@ async fn test_segmented_inverted_fuzzy_match_uses_global_idf() {
     }
     let segments = ds
         .create_index_segment_builder()
+        .with_index_type(IndexType::Inverted)
         .with_segments(metadatas)
         .build_all()
         .await
@@ -374,6 +376,7 @@ async fn test_segmented_inverted_phrase_query() {
     }
     let segments = ds
         .create_index_segment_builder()
+        .with_index_type(IndexType::Inverted)
         .with_segments(metadatas)
         .build_all()
         .await
@@ -443,6 +446,7 @@ async fn test_segmented_inverted_match_query_with_unindexed_fragments() {
     }
     let segments = ds
         .create_index_segment_builder()
+        .with_index_type(IndexType::Inverted)
         .with_segments(metadatas)
         .build_all()
         .await

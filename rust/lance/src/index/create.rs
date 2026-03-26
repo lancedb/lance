@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
-        scalar::{IndexDetails, build_scalar_index},
+        scalar::build_scalar_index,
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
@@ -487,9 +487,33 @@ impl<'a> CreateIndexBuilder<'a> {
                     new_idx.name
                 ))
             })?;
+            let segment_index_type = match self.index_type {
+                IndexType::Vector
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfFlat
+                | IndexType::IvfRq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq => self
+                    .params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                    .ok_or_else(|| {
+                        Error::index("Vector index type must take a VectorIndexParams".to_string())
+                    })?
+                    .index_type(),
+                unsupported => {
+                    return Err(Error::internal(format!(
+                        "Segment commit path does not support index type {}",
+                        unsupported
+                    )));
+                }
+            };
             let segments = self
                 .dataset
                 .create_index_segment_builder()
+                .with_index_type(segment_index_type)
                 .with_segments(vec![new_idx.clone()])
                 .build_all()
                 .await?;
@@ -564,6 +588,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 ///
 /// Use [`DatasetIndexExt::create_index_segment_builder`] and then either:
 ///
+/// - call [`Self::with_index_type`] with the concrete segment type first, then
 /// - call [`Self::plan`] and orchestrate individual segment builds externally, or
 /// - call [`Self::build_all`] to build all segments on the current node.
 ///
@@ -573,6 +598,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 #[derive(Clone)]
 pub struct IndexSegmentBuilder<'a> {
     dataset: &'a Dataset,
+    index_type: Option<IndexType>,
     segments: Vec<IndexMetadata>,
     target_segment_bytes: Option<u64>,
 }
@@ -581,9 +607,16 @@ impl<'a> IndexSegmentBuilder<'a> {
     pub(crate) fn new(dataset: &'a Dataset) -> Self {
         Self {
             dataset,
+            index_type: None,
             segments: Vec::new(),
             target_segment_bytes: None,
         }
+    }
+
+    /// Declare the concrete index type of the staged segments.
+    pub fn with_index_type(mut self, index_type: IndexType) -> Self {
+        self.index_type = Some(index_type);
+        self
     }
 
     /// Provide the segment metadata returned by `execute_uncommitted()`.
@@ -614,50 +647,18 @@ impl<'a> IndexSegmentBuilder<'a> {
                     .to_string(),
             ));
         }
-
-        let infer_index_type = |segment: &IndexMetadata| -> Result<IndexType> {
-            if let Some(index_details) = segment.index_details.as_ref() {
-                let details = IndexDetails(index_details.clone());
-                if details.supports_fts() {
-                    return Ok(IndexType::Inverted);
-                }
-                if details.is_vector() {
-                    return Ok(IndexType::Vector);
-                }
-            }
-
-            if segment.files.as_ref().is_some_and(|files| {
-                files.iter().any(|file| {
-                    file.path == lance_index::scalar::inverted::METADATA_FILE
-                        || file.path.starts_with("part_")
-                })
-            }) {
-                Ok(IndexType::Inverted)
-            } else if segment.files.is_some() {
-                Ok(IndexType::Vector)
-            } else {
-                Err(Error::invalid_input(format!(
-                    "IndexSegmentBuilder could not infer the index type for segment {}",
-                    segment.uuid
-                )))
-            }
-        };
-
-        let index_type = infer_index_type(&self.segments[0])?;
+        let index_type = self.index_type.ok_or_else(|| {
+            Error::invalid_input(
+                "IndexSegmentBuilder requires an explicit index type; call with_index_type(...)"
+                    .to_string(),
+            )
+        })?;
         let mut seen_segment_ids = HashSet::with_capacity(self.segments.len());
         for segment in &self.segments {
             if !seen_segment_ids.insert(segment.uuid) {
                 return Err(Error::invalid_input(format!(
                     "IndexSegmentBuilder received duplicate segment uuid {}",
                     segment.uuid
-                )));
-            }
-            let segment_index_type = infer_index_type(segment)?;
-            if segment_index_type != index_type {
-                return Err(Error::invalid_input(format!(
-                    "IndexSegmentBuilder requires all input segments to have the same index type; \
-                     expected {}, got {} for segment {}",
-                    index_type, segment_index_type, segment.uuid
                 )));
             }
         }
@@ -670,7 +671,21 @@ impl<'a> IndexSegmentBuilder<'a> {
             IndexType::Vector => {
                 crate::index::vector::ivf::plan_segments(
                     &self.segments,
-                    None,
+                    Some(index_type),
+                    self.target_segment_bytes,
+                )
+                .await
+            }
+            IndexType::IvfFlat
+            | IndexType::IvfPq
+            | IndexType::IvfSq
+            | IndexType::IvfRq
+            | IndexType::IvfHnswFlat
+            | IndexType::IvfHnswPq
+            | IndexType::IvfHnswSq => {
+                crate::index::vector::ivf::plan_segments(
+                    &self.segments,
+                    Some(index_type),
                     self.target_segment_bytes,
                 )
                 .await
@@ -684,27 +699,23 @@ impl<'a> IndexSegmentBuilder<'a> {
 
     /// Build one segment from a previously-generated plan.
     pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        let index_type = if let Some(index_type) = plan.requested_index_type() {
-            index_type
-        } else {
-            let details = IndexDetails(plan.segment().index_details().clone());
-            if details.supports_fts() {
-                IndexType::Inverted
-            } else if details.is_vector() {
-                IndexType::Vector
-            } else {
-                return Err(Error::invalid_input(
-                    "IndexSegmentBuilder requires planned segments to declare an index type"
-                        .to_string(),
-                ));
-            }
-        };
-
-        match index_type {
+        match plan.requested_index_type().ok_or_else(|| {
+            Error::invalid_input(
+                "IndexSegmentBuilder requires planned segments to declare an index type"
+                    .to_string(),
+            )
+        })? {
             IndexType::Inverted => {
                 crate::index::scalar::inverted::build_segment(self.dataset, plan).await
             }
-            IndexType::Vector => {
+            IndexType::Vector
+            | IndexType::IvfFlat
+            | IndexType::IvfPq
+            | IndexType::IvfSq
+            | IndexType::IvfRq
+            | IndexType::IvfHnswFlat
+            | IndexType::IvfHnswPq
+            | IndexType::IvfHnswSq => {
                 crate::index::vector::ivf::build_segment(
                     self.dataset.object_store(),
                     &self.dataset.indices_dir(),
@@ -1247,6 +1258,7 @@ mod tests {
 
         let segments = dataset
             .create_index_segment_builder()
+            .with_index_type(params.index_type())
             .with_segments(input_segments.clone())
             .build_all()
             .await
@@ -1342,6 +1354,7 @@ mod tests {
 
         let segments = dataset
             .create_index_segment_builder()
+            .with_index_type(params.index_type())
             .with_segments(input_segments)
             .build_all()
             .await
@@ -1440,6 +1453,7 @@ mod tests {
 
         let segments = dataset
             .create_index_segment_builder()
+            .with_index_type(params.index_type())
             .with_segments(input_segments)
             .build_all()
             .await
@@ -1488,6 +1502,7 @@ mod tests {
 
         let segments = dataset
             .create_index_segment_builder()
+            .with_index_type(IndexType::Inverted)
             .with_segments(input_segments.clone())
             .build_all()
             .await
@@ -1543,6 +1558,7 @@ mod tests {
 
         let err = dataset
             .create_index_segment_builder()
+            .with_index_type(IndexType::Inverted)
             .with_segments(vec![segment.clone(), segment])
             .build_all()
             .await
@@ -1554,16 +1570,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_rejects_mixed_index_types() {
-        let text_tmpdir = TempStrDir::default();
-        let text_dataset_uri = format!("file://{}", text_tmpdir.as_str());
-        let text_batches = RecordBatchIterator::new(
+    async fn test_index_segment_builder_requires_explicit_index_type() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batches = RecordBatchIterator::new(
             vec![Ok(create_text_batch(0, 10))],
             create_text_batch(0, 1).schema(),
         );
-        let mut text_dataset = Dataset::write(
-            text_batches,
-            &text_dataset_uri,
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
             Some(WriteParams {
                 max_rows_per_file: 10,
                 mode: WriteMode::Overwrite,
@@ -1572,66 +1589,24 @@ mod tests {
         )
         .await
         .unwrap();
-        let inverted_params = InvertedIndexParams::default();
-        let text_segment = CreateIndexBuilder::new(
-            &mut text_dataset,
-            &["text"],
-            IndexType::Inverted,
-            &inverted_params,
-        )
-        .name("text_idx".to_string())
-        .fragments(vec![0])
-        .execute_uncommitted()
-        .await
-        .unwrap();
 
-        let vector_tmpdir = TempStrDir::default();
-        let vector_dataset_uri = format!("file://{}", vector_tmpdir.as_str());
-        let reader = gen_batch()
-            .col("id", lance_datagen::array::step::<Int32Type>())
-            .col(
-                "vector",
-                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(8)),
-            )
-            .into_reader_rows(
-                lance_datagen::RowCount::from(64),
-                lance_datagen::BatchCount::from(1),
-            );
-        let mut vector_dataset = Dataset::write(
-            reader,
-            &vector_dataset_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                mode: WriteMode::Overwrite,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let vector_params = VectorIndexParams::with_ivf_flat_params(
-            DistanceType::L2,
-            prepare_vector_ivf(&vector_dataset, "vector").await,
-        );
-        let vector_segment = CreateIndexBuilder::new(
-            &mut vector_dataset,
-            &["vector"],
-            IndexType::Vector,
-            &vector_params,
-        )
-        .name("vector_idx".to_string())
-        .fragments(vec![0])
-        .execute_uncommitted()
-        .await
-        .unwrap();
+        let params = InvertedIndexParams::default();
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+                .name("text_idx".to_string())
+                .fragments(vec![0])
+                .execute_uncommitted()
+                .await
+                .unwrap();
 
-        let err = text_dataset
+        let err = dataset
             .create_index_segment_builder()
-            .with_segments(vec![text_segment, vector_segment])
+            .with_segments(vec![segment])
             .plan()
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("same index type"),
+            err.to_string().contains("requires an explicit index type"),
             "unexpected error: {err}"
         );
     }
@@ -1666,6 +1641,7 @@ mod tests {
         let plan = IndexSegmentPlan::new(segment, Vec::new(), 0, None);
         let err = dataset
             .create_index_segment_builder()
+            .with_index_type(IndexType::Inverted)
             .build(&plan)
             .await
             .unwrap_err();

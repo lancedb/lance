@@ -2133,7 +2133,10 @@ def build_distributed_vector_index(
         )
 
     segments = (
-        dataset.create_index_segment_builder().with_segments(segments).build_all()
+        dataset.create_index_segment_builder()
+        .with_index_type(index_type)
+        .with_segments(segments)
+        .build_all()
     )
     return dataset.commit_existing_index_segments(f"{column}_idx", column, segments)
 
@@ -2506,7 +2509,12 @@ def test_metadata_merge_pq_success(tmp_path):
             ivf_centroids=pre["ivf_centroids"],
             pq_codebook=pre["pq_codebook"],
         )
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
+        segments = (
+            ds.create_index_segment_builder()
+            .with_index_type("IVF_PQ")
+            .with_segments(segments)
+            .build_all()
+        )
         ds = _commit_segments_helper(ds, segments, "vector")
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
@@ -2545,7 +2553,12 @@ def test_distributed_workflow_merge_and_search(tmp_path):
             ivf_centroids=pre["ivf_centroids"],
             pq_codebook=pre["pq_codebook"],
         )
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
+        segments = (
+            ds.create_index_segment_builder()
+            .with_index_type("IVF_PQ")
+            .with_segments(segments)
+            .build_all()
+        )
         ds = _commit_segments_helper(ds, segments, "vector")
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
@@ -2581,7 +2594,12 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
         ivf_centroids=preprocessed["ivf_centroids"],
         pq_codebook=preprocessed["pq_codebook"],
     )
-    segments = ds.create_index_segment_builder().with_segments(segments).build_all()
+    segments = (
+        ds.create_index_segment_builder()
+        .with_index_type("IVF_FLAT")
+        .with_segments(segments)
+        .build_all()
+    )
     ds = _commit_segments_helper(ds, segments, column="vector")
     q = np.random.rand(128).astype(np.float32)
     result = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
@@ -2634,7 +2652,12 @@ def test_distributed_ivf_parameterized(tmp_path, index_type, num_sub_vectors):
             ds.create_index_uncommitted(**kwargs1),
             ds.create_index_uncommitted(**kwargs2),
         ]
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
+        segments = (
+            ds.create_index_segment_builder()
+            .with_index_type(index_type)
+            .with_segments(segments)
+            .build_all()
+        )
         ds = _commit_segments_helper(ds, segments, "vector")
 
         q = np.random.rand(128).astype(np.float32)
@@ -2697,6 +2720,7 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
 
     segments = (
         ds.create_index_segment_builder()
+        .with_index_type(index_type)
         .with_segments([segment1, segment2])
         .build_all()
     )
@@ -2735,7 +2759,11 @@ def test_index_segment_builder_builds_vector_segments(tmp_path):
         for fragment in frags[:2]
     ]
 
-    segment_builder = ds.create_index_segment_builder().with_segments(segments)
+    segment_builder = (
+        ds.create_index_segment_builder()
+        .with_index_type("IVF_FLAT")
+        .with_segments(segments)
+    )
     plans = segment_builder.plan()
     assert len(plans) == 2
     assert all(len(plan.segments) == 1 for plan in plans)
@@ -2805,6 +2833,7 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
             )
             segments = (
                 ds_copy.create_index_segment_builder()
+                .with_index_type("IVF_PQ")
                 .with_segments(segments)
                 .build_all()
             )

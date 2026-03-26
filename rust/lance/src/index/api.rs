@@ -152,7 +152,8 @@ pub trait DatasetIndexExt {
     /// index outputs.
     ///
     /// The caller supplies the uncommitted index metadata returned by
-    /// `execute_uncommitted()` so the builder can plan segment grouping without
+    /// `execute_uncommitted()` and then declares the concrete index type with
+    /// `with_index_type(...)` so the builder can plan segment grouping without
     /// rediscovering fragment coverage.
     ///
     /// This is the canonical entry point for segment-based index build.
