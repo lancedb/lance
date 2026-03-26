@@ -1075,6 +1075,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeBuildIndexSegments<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     java_segments: JObject,
+    index_type: jint,
     target_segment_bytes_jobj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -1083,6 +1084,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeBuildIndexSegments<'local>(
             &mut env,
             java_dataset,
             java_segments,
+            index_type,
             target_segment_bytes_jobj
         )
     )
@@ -1092,9 +1094,11 @@ fn inner_build_index_segments<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_segments: JObject,
+    index_type: jint,
     target_segment_bytes_jobj: JObject,
 ) -> Result<JObject<'local>> {
     let segments = import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+    let index_type = IndexType::try_from(index_type)?;
     let target_segment_bytes = env
         .get_long_opt(&target_segment_bytes_jobj)?
         .map(|v| v as u64);
@@ -1106,6 +1110,7 @@ fn inner_build_index_segments<'local>(
         let mut builder = dataset_guard
             .inner
             .create_index_segment_builder()
+            .with_index_type(index_type)
             .with_segments(segments);
         if let Some(target_segment_bytes) = target_segment_bytes {
             builder = builder.with_target_segment_bytes(target_segment_bytes);

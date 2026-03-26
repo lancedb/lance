@@ -96,7 +96,8 @@ public class VectorIndexTest {
             "Partially created IVF_FLAT index should not present before commit");
 
         List<Index> builtSegments =
-            dataset.buildIndexSegments(List.of(firstSegment, secondSegment), Optional.empty());
+            dataset.buildIndexSegments(
+                List.of(firstSegment, secondSegment), IndexType.IVF_FLAT, Optional.empty());
         assertEquals(2, builtSegments.size());
 
         List<Index> committed =
@@ -188,7 +189,8 @@ public class VectorIndexTest {
             "Partially created IVF_PQ index should not present before commit");
 
         List<Index> builtSegments =
-            dataset.buildIndexSegments(List.of(firstSegment, secondSegment), Optional.empty());
+            dataset.buildIndexSegments(
+                List.of(firstSegment, secondSegment), IndexType.IVF_PQ, Optional.empty());
         assertEquals(2, builtSegments.size());
 
         List<Index> committed =
@@ -264,7 +266,8 @@ public class VectorIndexTest {
             "Partially created IVF_SQ index should not present before commit");
 
         List<Index> builtSegments =
-            dataset.buildIndexSegments(List.of(firstSegment, secondSegment), Optional.empty());
+            dataset.buildIndexSegments(
+                List.of(firstSegment, secondSegment), IndexType.IVF_SQ, Optional.empty());
         assertEquals(2, builtSegments.size());
 
         List<Index> committed =

@@ -1024,20 +1024,38 @@ public class Dataset implements Closeable {
    *
    * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
    *     fragmentIds are provided
+   * @param indexType concrete index type for the staged segments
    * @param targetSegmentBytes optional size target for merged physical segments
    * @return built physical segment metadata
    */
-  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
+  public List<Index> buildIndexSegments(
+      List<Index> segments, IndexType indexType, Optional<Long> targetSegmentBytes) {
     Preconditions.checkNotNull(segments, "segments cannot be null");
     Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
+    Preconditions.checkNotNull(indexType, "indexType cannot be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeBuildIndexSegments(segments, targetSegmentBytes);
+      return nativeBuildIndexSegments(segments, indexType.getValue(), targetSegmentBytes);
     }
   }
 
+  /**
+   * Build physical vector index segments from previously-created fragment-level index outputs.
+   *
+   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
+   *     fragmentIds are provided
+   * @param targetSegmentBytes optional size target for merged physical segments
+   * @return built physical segment metadata
+   */
+  @Deprecated
+  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
+    throw new IllegalArgumentException(
+        "buildIndexSegments now requires an explicit index type; call "
+            + "buildIndexSegments(segments, indexType, targetSegmentBytes)");
+  }
+
   private native List<Index> nativeBuildIndexSegments(
-      List<Index> segments, Optional<Long> targetSegmentBytes);
+      List<Index> segments, int indexType, Optional<Long> targetSegmentBytes);
 
   /**
    * Publish one or more existing physical index segments as a logical index.
