@@ -42,7 +42,6 @@ static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct ThreadLocalUring {
     ring: IoUring,
     pending: HashMap<u64, Arc<IoRequest>>,
-    pending_count: usize,
 }
 
 thread_local! {
@@ -77,7 +76,6 @@ fn ensure_uring_initialized(
         *opt = Some(ThreadLocalUring {
             ring,
             pending: HashMap::new(),
-            pending_count: 0,
         });
     }
 
@@ -130,7 +128,6 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
 
         // Track request in pending map
         uring.pending.insert(user_data, request);
-        uring.pending_count += 1;
 
         // Don't submit here - let the future handle submission
 
@@ -181,6 +178,7 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                             // Short read — need retry; don't mark completed or wake
                             drop(state);
                             retries.push(request);
+
                             continue;
                         }
                     }
@@ -192,7 +190,6 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                     }
 
                     completed += 1;
-                    uring.pending_count -= 1;
                 } else {
                     log::warn!("Received completion for unknown user_data: {}", user_data);
                 }
@@ -223,14 +220,12 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                         io::ErrorKind::WouldBlock,
                         "io_uring submission queue full during retry",
                     ));
-                    uring.pending_count -= 1;
                     continue;
                 }
 
                 unsafe {
                     if sq.push(&read_op.build().user_data(user_data)).is_err() {
                         request.fail(io::Error::other("Failed to push short-read retry to SQ"));
-                        uring.pending_count -= 1;
                         continue;
                     }
                 }
