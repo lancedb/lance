@@ -375,11 +375,17 @@ impl UringCurrentThreadReader {
             }),
         });
 
-        push_request(request.clone()).unwrap();
-
-        Box::pin(super::current_thread_future::UringCurrentThreadFuture::new(
-            request,
-        ))
+        match push_request(request.clone()) {
+            Ok(()) => Box::pin(super::current_thread_future::UringCurrentThreadFuture::new(
+                request,
+            )),
+            Err(e) => Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "io_uring_ct",
+                    source: Box::new(e),
+                })
+            }),
+        }
     }
 }
 
