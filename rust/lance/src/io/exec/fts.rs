@@ -1548,6 +1548,7 @@ pub mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::index::DatasetIndexExt;
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -1557,18 +1558,23 @@ pub mod tests {
     use lance_index::scalar::inverted::InvertedIndex;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
-        PhraseQuery,
+        PhraseQuery, collect_query_tokens, has_query_token,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
+    use tantivy::tokenizer::Language;
 
     use crate::{
+        dataset::transaction::{Operation, TransactionBuilder},
         index::DatasetIndexInternalExt,
         io::exec::PreFilterSource,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
-    use super::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+    use super::{
+        BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+    };
+    use crate::io::exec::utils::IndexMetrics;
 
     #[derive(Default)]
     struct StatsHolder {
@@ -1670,6 +1676,65 @@ pub mod tests {
             .unwrap();
         let metrics = boost_query.metrics().unwrap();
         assert!(metrics.elapsed_compute().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_flat_match_filter_load_tokenizer_uses_on_disk_params_when_details_missing() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["hello", "HELLO"]),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+
+        let params = InvertedIndexParams::new("simple".to_string(), Language::English)
+            .with_position(false)
+            .lower_case(false)
+            .stem(false)
+            .remove_stop_words(false)
+            .ascii_folding(false)
+            .max_token_length(None);
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let index_meta = dataset
+            .load_scalar_index(IndexCriteria::default().for_column("text").supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut legacy_index_meta = index_meta.clone();
+        legacy_index_meta.index_details = None;
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![legacy_index_meta],
+                removed_indices: vec![index_meta],
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let metrics = IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics)
+            .await
+            .unwrap();
+        let query_tokens = collect_query_tokens("hello", &mut tokenizer);
+
+        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics)
+            .await
+            .unwrap();
+        assert!(has_query_token("hello", &mut tokenizer, &query_tokens));
+        assert!(
+            !has_query_token("HELLO", &mut tokenizer, &query_tokens),
+            "legacy FTS indices should continue using on-disk tokenizer params"
+        );
     }
 
     #[tokio::test]

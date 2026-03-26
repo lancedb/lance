@@ -1342,6 +1342,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_index_segment_builder_fts_commits_multi_segment_logical_index() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batch1 = create_text_batch(0, 10);
+        let batch2 = create_text_batch(10, 20);
+        let batch3 = create_text_batch(20, 30);
+
+        let batches = RecordBatchIterator::new(
+            vec![Ok(batch1), Ok(batch2), Ok(batch3)],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 5,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::default();
+        let mut input_segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+                    .name("text_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            input_segments.push(segment);
+        }
+
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_segments(input_segments.clone())
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), input_segments.len());
+
+        for segment in &segments {
+            let metadata_path = dataset
+                .indices_dir()
+                .child(segment.uuid().to_string())
+                .child(lance_index::scalar::inverted::METADATA_FILE);
+            assert!(dataset.object_store().exists(&metadata_path).await.unwrap());
+        }
+
+        dataset
+            .commit_existing_index_segments("text_idx", "text", segments)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(indices.len(), input_segments.len());
+    }
+
+    #[tokio::test]
     async fn test_commit_existing_index_supports_local_hnsw_segments() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
