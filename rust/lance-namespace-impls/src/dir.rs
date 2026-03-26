@@ -16,14 +16,14 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::index::{IndexParams, vector::VectorIndexParams};
+use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
 use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::{
     bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
     sq::builder::SQBuildParams,
 };
-use lance_index::{DatasetIndexExt, IndexType, is_system_index};
+use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::ManifestNamingScheme;
@@ -2554,18 +2554,17 @@ impl LanceNamespace for DirectoryNamespace {
             ));
         }
 
-        let stats =
-            <Dataset as lance_index::DatasetIndexExt>::index_statistics(&dataset, index_name)
-                .await
-                .map_err(|e| {
-                    Error::namespace_source(
-                        format!(
-                            "Failed to describe index statistics for '{}' on table '{}': {}",
-                            index_name, table_uri, e
-                        )
-                        .into(),
+        let stats = <Dataset as DatasetIndexExt>::index_statistics(&dataset, index_name)
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to describe index statistics for '{}' on table '{}': {}",
+                        index_name, table_uri, e
                     )
-                })?;
+                    .into(),
+                )
+            })?;
         let stats: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
             Error::namespace_source(
                 format!(
@@ -2701,7 +2700,7 @@ mod tests {
     use arrow_ipc::reader::StreamReader;
     use lance::dataset::Dataset;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
-    use lance_index::DatasetIndexExt;
+    use lance::index::DatasetIndexExt;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
     };
