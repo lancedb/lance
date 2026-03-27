@@ -569,7 +569,6 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
@@ -664,7 +663,6 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
@@ -2141,6 +2139,7 @@ mod tests {
             dim,
             MetricType::L2,
             &ivf_params,
+            None,
             noop_progress(),
         )
         .await
@@ -2193,6 +2192,7 @@ mod tests {
             dim,
             MetricType::L2,
             &ivf_params,
+            None,
             noop_progress(),
         )
         .await

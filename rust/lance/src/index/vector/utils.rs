@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
 use futures::StreamExt;
 use lance_arrow::DataTypeExt;
@@ -86,6 +86,7 @@ async fn estimate_multivector_vectors_per_row(
     dataset: &Dataset,
     column: &str,
     num_rows: usize,
+    fragments: Option<&[u32]>,
 ) -> Result<usize> {
     if num_rows == 0 {
         return Ok(1030);
@@ -96,7 +97,9 @@ async fn estimate_multivector_vectors_per_row(
     // Try a few random samples first (fast path).
     let sample_batch_size = std::cmp::min(64, num_rows);
     for _ in 0..8 {
-        let batch = dataset.sample(sample_batch_size, &projection, None).await?;
+        let batch = dataset
+            .sample(sample_batch_size, &projection, fragments)
+            .await?;
         let array = get_column_from_batch(&batch, column)?;
         let list_array = array.as_list::<i32>();
         for i in 0..list_array.len() {
@@ -114,6 +117,9 @@ async fn estimate_multivector_vectors_per_row(
     // flakiness when values are extremely sparse.
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
+    if let Some(fragments) = fragments {
+        scanner.with_fragments(resolve_scan_fragments(dataset, fragments)?);
+    }
     let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
     scanner.filter_expr(column_expr.is_not_null());
     scanner.limit(Some(std::cmp::min(num_rows, 1024) as i64), None)?;
@@ -261,8 +267,15 @@ pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,
+    fragment_ids: Option<&[u32]>,
 ) -> Result<FixedSizeListArray> {
-    let num_rows = dataset.count_rows(None).await?;
+    let num_rows = if let Some(fragment_ids) = fragment_ids {
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(resolve_scan_fragments(dataset, fragment_ids)?);
+        scanner.count_rows().await? as usize
+    } else {
+        dataset.count_rows(None).await?
+    };
 
     let vector_field = dataset.schema().field(column).ok_or(Error::index(format!(
         "Sample training data: column {} does not exist in schema",
@@ -291,7 +304,8 @@ pub async fn maybe_sample_training_data(
             // Set a minimum sample size of 128 to avoid too small samples,
             // it's not a problem because 128 multivectors is just about 64 MiB
             let vectors_per_row =
-                estimate_multivector_vectors_per_row(dataset, column, num_rows).await?;
+                estimate_multivector_vectors_per_row(dataset, column, num_rows, fragment_ids)
+                    .await?;
             sample_size_hint.div_ceil(vectors_per_row).max(128)
         }
         _ => sample_size_hint,
@@ -306,11 +320,12 @@ pub async fn maybe_sample_training_data(
             num_rows,
             vector_field,
             is_nullable,
+            fragment_ids,
         )
         .await
     } else {
         // too small to require sampling
-        let batch = scan_all_training_data(dataset, column, is_nullable).await?;
+        let batch = scan_all_training_data(dataset, column, is_nullable, fragment_ids).await?;
         vector_column_to_fsl(&batch, column)
     }
 }
@@ -378,9 +393,13 @@ async fn scan_all_training_data(
     dataset: &Dataset,
     column: &str,
     is_nullable: bool,
+    fragment_ids: Option<&[u32]>,
 ) -> Result<RecordBatch> {
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
+    if let Some(fragment_ids) = fragment_ids {
+        scanner.with_fragments(resolve_scan_fragments(dataset, fragment_ids)?);
+    }
     if is_nullable {
         let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
         scanner.filter_expr(column_expr.is_not_null());
@@ -406,14 +425,38 @@ async fn sample_training_data(
     num_rows: usize,
     vector_field: &lance_core::datatypes::Field,
     is_nullable: bool,
+    fragment_ids: Option<&[u32]>,
 ) -> Result<FixedSizeListArray> {
+    if fragment_ids.is_some() {
+        if !is_nullable {
+            let projection = dataset.schema().project(&[column])?;
+            let batch = dataset
+                .sample(sample_size_hint, &projection, fragment_ids)
+                .await?;
+            return vector_column_to_fsl(&batch, column);
+        }
+
+        let batch = scan_all_training_data(dataset, column, is_nullable, fragment_ids).await?;
+        let training_data = vector_column_to_fsl(&batch, column)?;
+        if training_data.len() <= sample_size_hint {
+            return Ok(training_data);
+        }
+        let indices = UInt32Array::from_iter_values(
+            generate_random_indices(training_data.len(), sample_size_hint)
+                .into_iter()
+                .map(|index| index as u32),
+        );
+        let sampled = arrow_select::take::take(&training_data, &indices, None)?;
+        return Ok(sampled.as_fixed_size_list().clone());
+    }
+
     let byte_width = vector_field
         .data_type()
         .byte_width_opt()
         .unwrap_or(4 * 1024);
 
     match vector_field.data_type() {
-        DataType::FixedSizeList(_, _) if !is_nullable => {
+        DataType::FixedSizeList(_, _) if !is_nullable && fragment_ids.is_none() => {
             sample_fsl_uniform(
                 dataset,
                 column,
@@ -452,6 +495,28 @@ fn sample_training_data_scan(
         Arc::new(dataset.schema().project(&[column])?),
         dataset.object_store().io_parallelism(),
     ))
+}
+
+fn resolve_scan_fragments(
+    dataset: &Dataset,
+    fragment_ids: &[u32],
+) -> Result<Vec<lance_table::format::Fragment>> {
+    let mut ordered_ids = fragment_ids.to_vec();
+    ordered_ids.sort_unstable();
+    let fragments = dataset.get_frags_from_ordered_ids(&ordered_ids);
+    if let Some(missing_id) = fragments
+        .iter()
+        .zip(ordered_ids.iter())
+        .find_map(|(fragment, fragment_id)| fragment.is_none().then_some(*fragment_id))
+    {
+        return Err(Error::invalid_input(format!(
+            "Unknown fragment id {missing_id} in training fragment filter"
+        )));
+    }
+    Ok(fragments
+        .into_iter()
+        .map(|fragment| fragment.unwrap().metadata().clone())
+        .collect())
 }
 
 /// Build a FixedSizeListArray from raw flat value bytes.
@@ -821,7 +886,7 @@ mod tests {
             .await
             .unwrap();
 
-        let training_data = maybe_sample_training_data(&dataset, "mv", 1000)
+        let training_data = maybe_sample_training_data(&dataset, "mv", 1000, None)
             .await
             .unwrap();
         assert_eq!(training_data.len(), 1000);
@@ -897,7 +962,7 @@ mod tests {
             .await
             .unwrap();
 
-        let training_data = maybe_sample_training_data(&dataset, "vec", sample_size)
+        let training_data = maybe_sample_training_data(&dataset, "vec", sample_size, None)
             .await
             .unwrap();
 
@@ -983,7 +1048,7 @@ mod tests {
             .await
             .unwrap();
 
-        let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows)
+        let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows, None)
             .await
             .unwrap();
         assert_eq!(n, 1030);

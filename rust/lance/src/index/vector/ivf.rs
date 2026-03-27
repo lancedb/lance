@@ -1223,6 +1223,7 @@ pub async fn build_ivf_model(
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
@@ -1245,7 +1246,8 @@ pub async fn build_ivf_model(
         "Loading training data for IVF. Sample size: {}",
         sample_size_hint
     );
-    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let training_data =
+        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1302,8 +1304,16 @@ async fn build_ivf_model_and_pq(
     get_vector_type(dataset.schema(), column)?;
     let dim = get_vector_dim(dataset.schema(), column)?;
 
-    let ivf_model =
-        build_ivf_model(dataset, column, dim, metric_type, ivf_params, progress).await?;
+    let ivf_model = build_ivf_model(
+        dataset,
+        column,
+        dim,
+        metric_type,
+        ivf_params,
+        None,
+        progress,
+    )
+    .await?;
 
     let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
         Some(&ivf_model)
@@ -3287,6 +3297,7 @@ mod tests {
             DIM,
             MetricType::L2,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -3322,6 +3333,7 @@ mod tests {
             DIM,
             MetricType::Cosine,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -3881,6 +3893,7 @@ mod tests {
             DIM,
             MetricType::L2,
             &ivf_params,
+            None,
             progress,
         )
         .await

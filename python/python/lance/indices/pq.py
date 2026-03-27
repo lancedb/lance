@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from typing import Dict, Optional
+
 import pyarrow as pa
 
 from lance.file import LanceFileReader, LanceFileWriter
@@ -23,7 +25,7 @@ class PqModel:
         """The dimension of the vectors this model was trained on"""
         return self.codebook.type.list_size
 
-    def save(self, uri: str):
+    def save(self, uri: str, *, storage_options: Optional[Dict[str, str]] = None):
         """
         Save the PQ model to a lance file.
 
@@ -33,6 +35,8 @@ class PqModel:
         uri: str
             The URI to save the model to.  The URI can be a local file path or a
             cloud storage path.
+        storage_options : optional, dict
+            Extra options for the storage backend (e.g. S3 credentials).
         """
         with LanceFileWriter(
             uri,
@@ -40,12 +44,13 @@ class PqModel:
                 [pa.field("codebook", self.codebook.type)],
                 metadata={b"num_subvectors": str(self.num_subvectors).encode()},
             ),
+            storage_options=storage_options,
         ) as writer:
             batch = pa.table([self.codebook], names=["codebook"])
             writer.write_batch(batch)
 
     @classmethod
-    def load(cls, uri: str):
+    def load(cls, uri: str, *, storage_options: Optional[Dict[str, str]] = None):
         """
         Load a PQ model from a lance file.
 
@@ -55,8 +60,10 @@ class PqModel:
         uri: str
             The URI to load the model from.  The URI can be a local file path or a
             cloud storage path.
+        storage_options : optional, dict
+            Extra options for the storage backend (e.g. S3 credentials).
         """
-        reader = LanceFileReader(uri)
+        reader = LanceFileReader(uri, storage_options=storage_options)
         num_rows = reader.metadata().num_rows
         metadata = reader.metadata().schema.metadata
         num_subvectors = int(metadata[b"num_subvectors"].decode())

@@ -184,6 +184,58 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     assert pq.codebook == reloaded.codebook
 
 
+def test_ivf_centroids_fragment_ids(tmpdir):
+    rows_per_fragment = 32
+    vectors = np.concatenate(
+        [
+            np.zeros((rows_per_fragment, DIMENSION), dtype=np.float32),
+            np.full((rows_per_fragment, DIMENSION), 10.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    vectors.shape = -1
+    table = pa.Table.from_arrays(
+        [pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)], names=["vectors"]
+    )
+    ds = lance.write_dataset(
+        table,
+        pathlib.Path(tmpdir) / "fragment_ivf",
+        max_rows_per_file=rows_per_fragment,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+
+    first_ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[0]]
+    )
+    second_ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[1]]
+    )
+
+    first_centroid = first_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
+    second_centroid = second_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
+
+    assert np.allclose(first_centroid, 0.0, atol=1e-4)
+    assert np.allclose(second_centroid, 10.0, atol=1e-4)
+
+
+def test_pq_fragment_ids(rand_dataset):
+    fragment_id = rand_dataset.get_fragments()[0].fragment_id
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        num_partitions=4,
+        sample_rate=16,
+        fragment_ids=[fragment_id],
+    )
+
+    pq = IndicesBuilder(rand_dataset, "vectors").train_pq(
+        ivf,
+        sample_rate=2,
+        fragment_ids=[fragment_id],
+    )
+
+    assert pq.dimension == DIMENSION
+    assert pq.num_subvectors == NUM_SUBVECTORS
+
+
 def test_pq_invalid_sub_vectors(tmpdir, rand_dataset, rand_ivf):
     with pytest.raises(
         ValueError,
