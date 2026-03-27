@@ -118,7 +118,7 @@ impl AzureBlobStoreProvider {
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
             backoff: Default::default(),
-            max_retries: 3,
+            max_retries: storage_options.client_max_retries(),
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 

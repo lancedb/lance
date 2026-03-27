@@ -874,7 +874,7 @@ impl StorageOptions {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
             .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(10)
+            .unwrap_or(3)
     }
 
     /// Seconds of timeout to set in RetryConfig for object store client

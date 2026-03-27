@@ -37,7 +37,7 @@ use object_store::{
 };
 use tokio::sync::Mutex;
 use rand::Rng;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
@@ -83,6 +83,12 @@ pub struct AimdThrottleConfig {
     pub list: AimdConfig,
     /// Maximum tokens that can accumulate for bursts (shared across all categories).
     pub burst_capacity: u32,
+    /// Maximum number of retries for throttle errors within the AIMD layer.
+    pub max_retries: usize,
+    /// Minimum backoff in milliseconds between retry attempts.
+    pub min_backoff_ms: u64,
+    /// Maximum backoff in milliseconds between retry attempts.
+    pub max_backoff_ms: u64,
 }
 
 impl Default for AimdThrottleConfig {
@@ -94,6 +100,9 @@ impl Default for AimdThrottleConfig {
             delete: aimd.clone(),
             list: aimd,
             burst_capacity: 100,
+            max_retries: 3,
+            min_backoff_ms: 100,
+            max_backoff_ms: 300,
         }
     }
 }
@@ -157,6 +166,9 @@ impl AimdThrottleConfig {
     /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
     /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
     /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
+    /// | Max retries          | `lance_aimd_max_retries`         | `LANCE_AIMD_MAX_RETRIES`         | 3       |
+    /// | Min backoff ms       | `lance_aimd_min_backoff_ms`      | `LANCE_AIMD_MIN_BACKOFF_MS`      | 100     |
+    /// | Max backoff ms       | `lance_aimd_max_backoff_ms`      | `LANCE_AIMD_MAX_BACKOFF_MS`      | 300     |
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
     ) -> lance_core::Result<Self> {
@@ -206,6 +218,52 @@ impl AimdThrottleConfig {
             }
         }
 
+        fn resolve_usize(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: usize,
+        ) -> lance_core::Result<usize> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<usize>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<usize>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        fn resolve_u64(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: u64,
+        ) -> lance_core::Result<u64> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<u64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<u64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
         let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
         let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
         let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
@@ -213,6 +271,9 @@ impl AimdThrottleConfig {
         let additive_increment =
             resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
         let burst_capacity = resolve_u32("lance_aimd_burst_capacity", storage_options, 100)?;
+        let max_retries = resolve_usize("lance_aimd_max_retries", storage_options, 3)?;
+        let min_backoff_ms = resolve_u64("lance_aimd_min_backoff_ms", storage_options, 100)?;
+        let max_backoff_ms = resolve_u64("lance_aimd_max_backoff_ms", storage_options, 300)?;
 
         let aimd = AimdConfig::default()
             .with_initial_rate(initial_rate)
@@ -221,9 +282,14 @@ impl AimdThrottleConfig {
             .with_decrease_factor(decrease_factor)
             .with_additive_increment(additive_increment);
 
-        Ok(Self::default()
-            .with_aimd(aimd)
-            .with_burst_capacity(burst_capacity))
+        Ok(Self {
+            max_retries,
+            min_backoff_ms,
+            max_backoff_ms,
+            ..Self::default()
+                .with_aimd(aimd)
+                .with_burst_capacity(burst_capacity)
+        })
     }
 }
 
@@ -238,10 +304,19 @@ struct OperationThrottle {
     controller: AimdController,
     bucket: Mutex<TokenBucketState>,
     burst_capacity: f64,
+    max_retries: usize,
+    min_backoff_ms: u64,
+    max_backoff_ms: u64,
 }
 
 impl OperationThrottle {
-    fn new(aimd_config: AimdConfig, burst_capacity: f64) -> lance_core::Result<Self> {
+    fn new(
+        aimd_config: AimdConfig,
+        burst_capacity: f64,
+        max_retries: usize,
+        min_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) -> lance_core::Result<Self> {
         let initial_rate = aimd_config.initial_rate;
         let controller = AimdController::new(aimd_config)?;
         Ok(Self {
@@ -252,6 +327,9 @@ impl OperationThrottle {
                 rate: initial_rate,
             }),
             burst_capacity,
+            max_retries,
+            min_backoff_ms,
+            max_backoff_ms,
         })
     }
 
@@ -297,48 +375,61 @@ impl OperationThrottle {
         let outcome = match result {
             Ok(_) => RequestOutcome::Success,
             Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected in stream, decreasing rate");
+                debug!("Throttle error detected in stream");
                 RequestOutcome::Throttled
             }
             Err(_) => RequestOutcome::Success,
         };
+        let prev_rate = self.controller.current_rate();
         let new_rate = self.controller.record_outcome(outcome);
+        if new_rate < prev_rate {
+            warn!(
+                previous_rate = format!("{prev_rate:.1}"),
+                new_rate = format!("{new_rate:.1}"),
+                "AIMD throttle: rate reduced due to throttle errors"
+            );
+        }
         if let Ok(mut bucket) = self.bucket.try_lock() {
             bucket.rate = new_rate;
         }
     }
 
-    /// Maximum number of retries for throttle errors within the AIMD layer.
-    const MAX_RETRIES: usize = 3;
-
     /// Execute an operation with throttling: acquire token, run, classify result.
-    /// On throttle errors, retries up to [`MAX_RETRIES`] times with a random
-    /// backoff of 100-300ms between attempts.
+    /// On throttle errors, retries up to `max_retries` times with a random
+    /// backoff between `min_backoff_ms` and `max_backoff_ms` between attempts.
     async fn throttled<T, F, Fut>(&self, f: F) -> OSResult<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = OSResult<T>>,
     {
-        for attempt in 0..=Self::MAX_RETRIES {
+        for attempt in 0..=self.max_retries {
             self.acquire_token().await;
             let result = f().await;
             let outcome = match &result {
                 Ok(_) => RequestOutcome::Success,
                 Err(err) if is_throttle_error(err) => {
-                    debug!("Throttle error detected, decreasing rate");
+                    debug!("Throttle error detected");
                     RequestOutcome::Throttled
                 }
                 Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
             };
+            let prev_rate = self.controller.current_rate();
             let new_rate = self.controller.record_outcome(outcome);
+            if new_rate < prev_rate {
+                warn!(
+                    previous_rate = format!("{prev_rate:.1}"),
+                    new_rate = format!("{new_rate:.1}"),
+                    "AIMD throttle: rate reduced due to throttle errors"
+                );
+            }
             self.update_bucket_rate(new_rate).await;
 
             match &result {
-                Err(err) if is_throttle_error(err) && attempt < Self::MAX_RETRIES => {
-                    let backoff_ms = rand::rng().random_range(100..=300);
+                Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
+                    let backoff_ms = rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
                         attempt = attempt + 1,
-                        max_retries = Self::MAX_RETRIES,
+                        max_retries = self.max_retries,
                         backoff_ms,
                         "Retrying after throttle error"
                     );
@@ -446,12 +537,15 @@ impl AimdThrottledStore {
         config: AimdThrottleConfig,
     ) -> lance_core::Result<Self> {
         let burst = config.burst_capacity as f64;
+        let max_retries = config.max_retries;
+        let min_backoff_ms = config.min_backoff_ms;
+        let max_backoff_ms = config.max_backoff_ms;
         Ok(Self {
             target,
-            read: Arc::new(OperationThrottle::new(config.read, burst)?),
-            write: Arc::new(OperationThrottle::new(config.write, burst)?),
-            delete: Arc::new(OperationThrottle::new(config.delete, burst)?),
-            list: Arc::new(OperationThrottle::new(config.list, burst)?),
+            read: Arc::new(OperationThrottle::new(config.read, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
+            write: Arc::new(OperationThrottle::new(config.write, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
+            delete: Arc::new(OperationThrottle::new(config.delete, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
+            list: Arc::new(OperationThrottle::new(config.list, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
         })
     }
 }
