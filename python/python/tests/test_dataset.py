@@ -329,6 +329,11 @@ def test_version_id(tmp_path: Path):
     assert updated_ds.version == 2
     assert updated_ds.latest_version == 2
 
+    historical_ds = updated_ds.checkout_version(1)
+    assert historical_ds.version == 1
+    assert historical_ds.latest_version == 2
+    assert historical_ds.checkout_version(historical_ds.latest_version).version == 2
+
 
 def test_checkout(tmp_path: Path):
     tab = pa.table({"a": range(3)})

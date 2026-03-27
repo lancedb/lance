@@ -36,9 +36,10 @@ use lance_file::version::LanceFileVersion;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 
+use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
+use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
@@ -1439,6 +1440,118 @@ async fn test_fast_count_rows(
 
 #[rstest]
 #[tokio::test]
+async fn test_sample_with_fragment_ids(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    dataset.delete("i IN (1, 9)").await.unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let sampled = dataset
+        .sample(8, &projection, Some(&[0, 0, 2]))
+        .await
+        .unwrap();
+    let sampled_values = sampled
+        .column_by_name("i")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+
+    assert_eq!(sampled_values, vec![0, 2, 3, 8, 10, 11]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_with_empty_fragment_ids_rejected(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let err = dataset.sample(1, &projection, Some(&[])).await.unwrap_err();
+
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("does not accept an empty fragment_ids list")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_with_unknown_fragment_ids_rejected(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let err = dataset
+        .sample(1, &projection, Some(&[0, 999]))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("not part of the current dataset version")
+    );
+    assert!(err.to_string().contains("999"));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_bfloat16_roundtrip(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
@@ -1614,5 +1727,59 @@ async fn test_dataset_uri_roundtrips() {
     assert_eq!(
         ds2.latest_version_id().await.unwrap(),
         dataset.latest_version_id().await.unwrap()
+    );
+}
+
+/// A commit handler whose resolve_latest_location always returns an IO error.
+/// Used to verify that non-NotFound errors from resolve_latest_location are
+/// propagated as-is rather than being wrapped as DatasetNotFound.
+#[derive(Debug)]
+struct ErroringCommitHandler;
+
+#[async_trait::async_trait]
+impl lance_table::io::commit::CommitHandler for ErroringCommitHandler {
+    async fn resolve_latest_location(
+        &self,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> Result<lance_table::io::commit::ManifestLocation> {
+        Err(Error::io("simulated I/O error".to_string()))
+    }
+
+    async fn commit(
+        &self,
+        _manifest: &mut lance_table::format::Manifest,
+        _indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: lance_table::io::commit::ManifestWriter,
+        _naming_scheme: lance_table::io::commit::ManifestNamingScheme,
+        _transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<
+        lance_table::io::commit::ManifestLocation,
+        lance_table::io::commit::CommitError,
+    > {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn test_open_dataset_non_not_found_error_is_not_masked() {
+    // When resolve_latest_location returns an IO error, it should propagate
+    // as an IO error, not be wrapped as DatasetNotFound.
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let location = url::Url::parse("memory://test").unwrap();
+
+    #[allow(deprecated)]
+    let result = DatasetBuilder::from_uri("memory://test")
+        .with_object_store(store, location, Arc::new(ErroringCommitHandler))
+        .load()
+        .await;
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, Error::IO { .. }),
+        "Expected IO error but got: {:?}",
+        err,
     );
 }

@@ -13,6 +13,7 @@ use arrow::array::BinaryBuilder;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
@@ -288,6 +289,30 @@ impl BitmapIndex {
 
         Ok(Arc::new(bitmap))
     }
+
+    pub(crate) fn value_type(&self) -> &DataType {
+        &self.value_type
+    }
+
+    /// Loads the current bitmap index into an in-memory value-to-row-id map.
+    pub(crate) async fn load_bitmap_index_state(
+        &self,
+    ) -> Result<HashMap<ScalarValue, RowAddrTreeMap>> {
+        let mut state = HashMap::new();
+
+        for key in self.index_map.keys() {
+            let bitmap = self.load_bitmap(key, None).await?;
+            state.insert(key.0.clone(), (*bitmap).clone());
+        }
+
+        if !self.null_map.is_empty() {
+            let existing_null = new_null_array(&self.value_type, 1);
+            let existing_null = ScalarValue::try_from_array(existing_null.as_ref(), 0)?;
+            state.insert(existing_null, (*self.null_map).clone());
+        }
+
+        Ok(state)
+    }
 }
 
 impl DeepSizeOf for BitmapIndex {
@@ -558,34 +583,9 @@ impl ScalarIndex for BitmapIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let mut state = HashMap::new();
-
-        for key in self.index_map.keys() {
-            let bitmap = self.load_bitmap(key, None).await?;
-            let remapped_bitmap =
-                RowAddrTreeMap::from_iter(bitmap.row_addrs().unwrap().filter_map(|addr| {
-                    let addr_as_u64 = u64::from(addr);
-                    mapping
-                        .get(&addr_as_u64)
-                        .copied()
-                        .unwrap_or(Some(addr_as_u64))
-                }));
-            state.insert(key.0.clone(), remapped_bitmap);
-        }
-
-        if !self.null_map.is_empty() {
-            let remapped_null =
-                RowAddrTreeMap::from_iter(self.null_map.row_addrs().unwrap().filter_map(|addr| {
-                    let addr_as_u64 = u64::from(addr);
-                    mapping
-                        .get(&addr_as_u64)
-                        .copied()
-                        .unwrap_or(Some(addr_as_u64))
-                }));
-            state.insert(ScalarValue::try_from(&self.value_type)?, remapped_null);
-        }
-
-        BitmapIndexPlugin::write_bitmap_index(state, dest_store, &self.value_type).await?;
+        let state = self.load_bitmap_index_state().await?;
+        let remapped_state = BitmapIndexPlugin::remap_bitmap_state(state, mapping);
+        BitmapIndexPlugin::write_bitmap_index(remapped_state, dest_store, &self.value_type).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -602,20 +602,7 @@ impl ScalarIndex for BitmapIndex {
         dest_store: &dyn IndexStore,
         _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let mut state = HashMap::new();
-
-        // Initialize builder with existing data
-        for key in self.index_map.keys() {
-            let bitmap = self.load_bitmap(key, None).await?;
-            state.insert(key.0.clone(), (*bitmap).clone());
-        }
-
-        if !self.null_map.is_empty() {
-            let ex_null = new_null_array(&self.value_type, 1);
-            let ex_null = ScalarValue::try_from_array(ex_null.as_ref(), 0)?;
-            state.insert(ex_null, (*self.null_map).clone());
-        }
-
+        let state = self.load_bitmap_index_state().await?;
         BitmapIndexPlugin::do_train_bitmap_index(new_data, state, dest_store).await?;
 
         Ok(CreatedIndex {
@@ -658,6 +645,24 @@ impl BitmapIndexPlugin {
         index_store: &dyn IndexStore,
         value_type: &DataType,
     ) -> Result<()> {
+        Self::write_bitmap_index_with_extras(
+            state,
+            index_store,
+            value_type,
+            HashMap::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Writes a bitmap index and attaches extra metadata and global buffers.
+    pub(crate) async fn write_bitmap_index_with_extras(
+        state: HashMap<ScalarValue, RowAddrTreeMap>,
+        index_store: &dyn IndexStore,
+        value_type: &DataType,
+        mut metadata: HashMap<String, String>,
+        global_buffers: Vec<(String, Bytes)>,
+    ) -> Result<()> {
         let num_bitmaps = state.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("keys", value_type.clone(), true),
@@ -667,6 +672,11 @@ impl BitmapIndexPlugin {
         let mut bitmap_index_file = index_store
             .new_index_file(BITMAP_LOOKUP_NAME, schema)
             .await?;
+
+        for (metadata_key, data) in global_buffers {
+            let buffer_idx = bitmap_index_file.add_global_buffer(data).await?;
+            metadata.insert(metadata_key, buffer_idx.to_string());
+        }
 
         let mut cur_keys = Vec::new();
         let mut cur_bitmaps = Vec::new();
@@ -714,7 +724,6 @@ impl BitmapIndexPlugin {
         // Finish file with metadata that allows lightweight statistics reads
         let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps })
             .map_err(|e| Error::internal(format!("failed to serialize bitmap statistics: {e}")))?;
-        let mut metadata = HashMap::new();
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
 
         bitmap_index_file.finish_with_metadata(metadata).await?;
@@ -722,11 +731,11 @@ impl BitmapIndexPlugin {
         Ok(())
     }
 
-    async fn do_train_bitmap_index(
+    /// Builds bitmap index state from a `(value, row_id)` stream without writing it.
+    pub(crate) async fn build_bitmap_index_state(
         mut data_source: SendableRecordBatchStream,
         mut state: HashMap<ScalarValue, RowAddrTreeMap>,
-        index_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<(HashMap<ScalarValue, RowAddrTreeMap>, DataType)> {
         let value_type = data_source.schema().field(0).data_type().clone();
         while let Some(batch) = data_source.try_next().await? {
             let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
@@ -742,6 +751,15 @@ impl BitmapIndexPlugin {
             }
         }
 
+        Ok((state, value_type))
+    }
+
+    async fn do_train_bitmap_index(
+        data_source: SendableRecordBatchStream,
+        state: HashMap<ScalarValue, RowAddrTreeMap>,
+        index_store: &dyn IndexStore,
+    ) -> Result<()> {
+        let (state, value_type) = Self::build_bitmap_index_state(data_source, state).await?;
         Self::write_bitmap_index(state, index_store, &value_type).await
     }
 
@@ -753,6 +771,27 @@ impl BitmapIndexPlugin {
         let dictionary: HashMap<ScalarValue, RowAddrTreeMap> = HashMap::new();
 
         Self::do_train_bitmap_index(data, dictionary, index_store).await
+    }
+
+    /// Remaps every bitmap in a materialized bitmap-index state using row-id mappings.
+    pub(crate) fn remap_bitmap_state(
+        state: HashMap<ScalarValue, RowAddrTreeMap>,
+        mapping: &HashMap<u64, Option<u64>>,
+    ) -> HashMap<ScalarValue, RowAddrTreeMap> {
+        state
+            .into_iter()
+            .map(|(key, bitmap)| {
+                let remapped_bitmap =
+                    RowAddrTreeMap::from_iter(bitmap.row_addrs().unwrap().filter_map(|addr| {
+                        let addr_as_u64 = u64::from(addr);
+                        mapping
+                            .get(&addr_as_u64)
+                            .copied()
+                            .unwrap_or(Some(addr_as_u64))
+                    }));
+                (key, remapped_bitmap)
+            })
+            .collect()
     }
 }
 

@@ -43,6 +43,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 url = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
+lance-linalg = { workspace = true }
 lance-io = { workspace = true }
 lance-table = { workspace = true }
 object_store = { workspace = true }

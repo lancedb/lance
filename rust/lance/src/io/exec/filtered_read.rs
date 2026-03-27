@@ -2052,6 +2052,7 @@ impl ExecutionPlan for FilteredReadExec {
 mod tests {
     use std::collections::HashSet;
 
+    use crate::index::DatasetIndexExt;
     use arrow::{
         compute::concat_batches,
         datatypes::{Float32Type, UInt32Type, UInt64Type},
@@ -2064,7 +2065,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::{
-        DatasetIndexExt, IndexType,
+        IndexType,
         optimize::OptimizeOptions,
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };

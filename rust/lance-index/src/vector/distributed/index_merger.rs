@@ -602,16 +602,16 @@ async fn read_shard_window_partitions(
     Ok(per_partition_batches)
 }
 
-/// Merge the selected partial-shard auxiliary files into `target_dir`.
+/// Merge the selected segment auxiliary files into `target_dir`.
 ///
-/// This is the storage merge kernel for vector staged segment build. Callers
-/// choose which partial shards belong to one built segment and pass the corresponding
-/// auxiliary files here. The merge writes one unified `auxiliary.idx` into
-/// `target_dir`.
+/// This is the storage merge kernel for vector segment build. Callers choose
+/// which segments belong to one built segment and pass the
+/// corresponding auxiliary files here. The merge writes one unified
+/// `auxiliary.idx` into `target_dir`.
 ///
 /// Supports IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
-/// IVF_HNSW_SQ storage types. For PQ and SQ, this assumes all selected partial
-/// shards share the same quantizer/codebook and distance type; it reuses the
+/// IVF_HNSW_SQ storage types. For PQ and SQ, this assumes all selected source
+/// segments share the same quantizer/codebook and distance type; it reuses the
 /// first encountered metadata.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,

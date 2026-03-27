@@ -166,6 +166,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     acc |= &b;
                     acc
                 });
+            let deleted_old_frags: RoaringBitmap = old_indices
+                .iter()
+                .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
+                .fold(RoaringBitmap::new(), |mut acc, b| {
+                    acc |= &b;
+                    acc
+                });
             frag_bitmap |= &effective_old_frags;
 
             let index = dataset
@@ -223,7 +230,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 } else {
                     // Address-style row IDs encode fragment_id in high 32 bits.
                     // Fragment bitmap filtering is valid and cheaper in this mode.
-                    Some(OldIndexDataFilter::Fragments(effective_old_frags))
+                    Some(OldIndexDataFilter::Fragments {
+                        to_keep: effective_old_frags,
+                        to_remove: deleted_old_frags,
+                    })
                 };
                 index
                     .update(new_data_stream, &new_store, old_data_filter)
@@ -310,6 +320,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 mod tests {
     use super::*;
 
+    use crate::index::DatasetIndexExt;
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -324,7 +335,7 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        DatasetIndexExt, IndexType,
+        IndexType,
         scalar::ScalarIndexParams,
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };

@@ -443,10 +443,7 @@ class SafeLanceDataset(torch.utils.data.Dataset):
         """
         if self._ds is None:
             # Worker-process initialization
-            import os
-
-            self._ds = lance.dataset(self.uri)
-            print(f"Worker {os.getpid()} initialized dataset")
+            self._ds = lance.dataset(self.uri, **self.dataset_options)
 
         # Leverage native batch reading
         batch = self._ds.take(indices)

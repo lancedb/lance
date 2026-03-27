@@ -96,7 +96,7 @@ async fn estimate_multivector_vectors_per_row(
     // Try a few random samples first (fast path).
     let sample_batch_size = std::cmp::min(64, num_rows);
     for _ in 0..8 {
-        let batch = dataset.sample(sample_batch_size, &projection).await?;
+        let batch = dataset.sample(sample_batch_size, &projection, None).await?;
         let array = get_column_from_batch(&batch, column)?;
         let list_array = array.as_list::<i32>();
         for i in 0..list_array.len() {

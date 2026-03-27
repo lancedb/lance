@@ -55,7 +55,7 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexInternalExt, vector::VectorIndexParams};
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -67,7 +67,7 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    DatasetIndexExt, IndexParams, IndexType,
+    IndexParams, IndexType,
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
@@ -327,27 +327,34 @@ impl MergeInsertBuilder {
 #[derive(Clone)]
 pub struct PyIndexSegmentBuilder {
     dataset: Arc<LanceDataset>,
-    staging_index_uuid: String,
-    partial_indices: Vec<IndexMetadata>,
+    segments: Vec<IndexMetadata>,
     target_segment_bytes: Option<u64>,
+}
+
+impl PyIndexSegmentBuilder {
+    fn builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
+        let mut builder = self
+            .dataset
+            .create_index_segment_builder()
+            .with_segments(self.segments.clone());
+        if let Some(target_segment_bytes) = self.target_segment_bytes {
+            builder = builder.with_target_segment_bytes(target_segment_bytes);
+        }
+        builder
+    }
 }
 
 #[pymethods]
 impl PyIndexSegmentBuilder {
-    #[getter]
-    fn staging_index_uuid(&self) -> String {
-        self.staging_index_uuid.clone()
-    }
-
-    fn with_partial_indices<'a>(
+    fn with_segments<'a>(
         mut slf: PyRefMut<'a, Self>,
-        partial_indices: &Bound<'_, PyAny>,
+        segments: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'a, Self>> {
         let mut indices = Vec::new();
-        for item in partial_indices.try_iter()? {
+        for item in segments.try_iter()? {
             indices.push(item?.extract::<PyLance<IndexMetadata>>()?.0);
         }
-        slf.partial_indices = indices;
+        slf.segments = indices;
         Ok(slf)
     }
 
@@ -360,14 +367,9 @@ impl PyIndexSegmentBuilder {
     }
 
     fn plan(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegmentPlan>>> {
-        let mut builder = self
-            .dataset
-            .create_index_segment_builder(self.staging_index_uuid.clone())
-            .with_partial_indices(self.partial_indices.clone());
-        if let Some(target_segment_bytes) = self.target_segment_bytes {
-            builder = builder.with_target_segment_bytes(target_segment_bytes);
-        }
-        let plans = rt().block_on(Some(py), builder.plan())?.infer_error()?;
+        let plans = rt()
+            .block_on(Some(py), self.builder().plan())?
+            .infer_error()?;
         plans
             .into_iter()
             .map(|plan| Py::new(py, PyIndexSegmentPlan::from_inner(plan)))
@@ -376,26 +378,15 @@ impl PyIndexSegmentBuilder {
 
     fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
         let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
-        let builder = self
-            .dataset
-            .create_index_segment_builder(self.staging_index_uuid.clone())
-            .with_partial_indices(self.partial_indices.clone());
         let segment = rt()
-            .block_on(Some(py), builder.build(&plan.inner))?
+            .block_on(Some(py), self.builder().build(&plan.inner))?
             .infer_error()?;
         Py::new(py, PyIndexSegment::from_inner(segment))
     }
 
     fn build_all(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegment>>> {
-        let mut builder = self
-            .dataset
-            .create_index_segment_builder(self.staging_index_uuid.clone())
-            .with_partial_indices(self.partial_indices.clone());
-        if let Some(target_segment_bytes) = self.target_segment_bytes {
-            builder = builder.with_target_segment_bytes(target_segment_bytes);
-        }
         let segments = rt()
-            .block_on(Some(py), builder.build_all())?
+            .block_on(Some(py), self.builder().build_all())?
             .infer_error()?;
         segments
             .into_iter()
@@ -1540,7 +1531,7 @@ impl Dataset {
 
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
-        Ok(self.ds.version().version)
+        Ok(self.ds.version_id())
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
@@ -2100,14 +2091,10 @@ impl Dataset {
         Ok(PyLance(index_metadata))
     }
 
-    fn create_index_segment_builder(
-        &self,
-        staging_index_uuid: String,
-    ) -> PyResult<PyIndexSegmentBuilder> {
+    fn create_index_segment_builder(&self) -> PyResult<PyIndexSegmentBuilder> {
         Ok(PyIndexSegmentBuilder {
             dataset: self.ds.clone(),
-            staging_index_uuid,
-            partial_indices: Vec::new(),
+            segments: Vec::new(),
             target_segment_bytes: None,
         })
     }
@@ -3023,7 +3010,7 @@ impl Dataset {
         } else {
             Ok(Ref::Version(
                 self.ds.manifest.branch.clone(),
-                Some(self.ds.version().version),
+                Some(self.ds.version_id()),
             ))
         }
     }

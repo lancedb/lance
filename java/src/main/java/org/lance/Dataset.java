@@ -790,8 +790,13 @@ public class Dataset implements Closeable {
    * @return the version id of the dataset
    */
   public long version() {
-    return getVersion().getId();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetVersionId();
+    }
   }
+
+  private native long nativeGetVersionId();
 
   /**
    * Gets the currently checked out version of the dataset.
@@ -1018,6 +1023,51 @@ public class Dataset implements Closeable {
 
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
+
+  /**
+   * Build physical vector index segments from previously-created fragment-level index outputs.
+   *
+   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
+   *     fragmentIds are provided
+   * @param targetSegmentBytes optional size target for merged physical segments
+   * @return built physical segment metadata
+   */
+  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
+    Preconditions.checkNotNull(segments, "segments cannot be null");
+    Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildIndexSegments(segments, targetSegmentBytes);
+    }
+  }
+
+  private native List<Index> nativeBuildIndexSegments(
+      List<Index> segments, Optional<Long> targetSegmentBytes);
+
+  /**
+   * Publish one or more existing physical index segments as a logical index.
+   *
+   * @param indexName logical index name
+   * @param column indexed column name
+   * @param segments physical segment metadata to publish
+   * @return committed manifest metadata
+   */
+  public List<Index> commitExistingIndexSegments(
+      String indexName, String column, List<Index> segments) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        column != null && !column.isEmpty(), "column cannot be null or empty");
+    Preconditions.checkNotNull(segments, "segments cannot be null");
+    Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCommitExistingIndexSegments(indexName, column, segments);
+    }
+  }
+
+  private native List<Index> nativeCommitExistingIndexSegments(
+      String indexName, String column, List<Index> segments);
 
   /**
    * Count the number of rows in the dataset.

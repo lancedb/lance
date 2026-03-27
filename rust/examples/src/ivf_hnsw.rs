@@ -11,11 +11,12 @@ use clap::Parser;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::ProjectionRequest;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance_index::IndexType;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 
 #[derive(Parser, Debug)]

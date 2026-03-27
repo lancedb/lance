@@ -161,6 +161,53 @@ async fn test_strict_overwrite() {
         .expect("Unstrict overwrite should succeed when committing to a stale version");
 }
 
+#[tokio::test]
+async fn test_version_id_fast_path() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+
+    let original = Dataset::write(reader, &test_uri, None).await.unwrap();
+    assert_eq!(original.version_id(), 1);
+    assert_eq!(original.version_id(), original.version().version);
+    assert_eq!(original.latest_version_id().await.unwrap(), 1);
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(5..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let updated = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.version_id(), 2);
+    assert_eq!(updated.version_id(), updated.version().version);
+    assert_eq!(updated.latest_version_id().await.unwrap(), 2);
+
+    let historical = updated.checkout_version(1).await.unwrap();
+    assert_eq!(historical.version_id(), 1);
+    assert_eq!(historical.version_id(), historical.version().version);
+    assert_eq!(historical.latest_version_id().await.unwrap(), 2);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_restore(

@@ -11,6 +11,7 @@ use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
+use lance::index::{DatasetIndexExt, IndexSegment, IndexSegmentPlan};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -37,7 +38,7 @@ use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::{DatasetIndexExt, IndexDescription, IndexSegment, IndexSegmentPlan, IndexType};
+use lance_index::{IndexDescription, IndexType};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
@@ -112,23 +113,13 @@ impl PyIndexSegmentPlan {
 #[pymethods]
 impl PyIndexSegmentPlan {
     #[getter]
-    fn staging_index_uuid(&self) -> String {
-        self.inner.staging_index_uuid().to_string()
-    }
-
-    #[getter]
     fn segment(&self) -> PyIndexSegment {
         PyIndexSegment::from_inner(self.inner.segment().clone())
     }
 
     #[getter]
-    fn partial_indices(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner
-            .partial_indices()
-            .iter()
-            .cloned()
-            .map(PyLance)
-            .collect()
+    fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
+        self.inner.segments().iter().cloned().map(PyLance).collect()
     }
 
     #[getter]
@@ -137,9 +128,8 @@ impl PyIndexSegmentPlan {
     }
     fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentPlan(staging_index_uuid={}, partial_indices={}, estimated_bytes={})",
-            self.staging_index_uuid(),
-            self.inner.partial_indices().len(),
+            "IndexSegmentPlan(segments={}, estimated_bytes={})",
+            self.inner.segments().len(),
             self.estimated_bytes()
         )
     }

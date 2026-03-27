@@ -123,6 +123,17 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
     }
 }
 
+fn is_supported_fixed_size_list_child(data_type: &DataType, nested: bool) -> bool {
+    match data_type {
+        DataType::Struct(_) => !nested,
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => false,
+        DataType::FixedSizeList(field, _) => {
+            is_supported_fixed_size_list_child(field.data_type(), true)
+        }
+        _ => true,
+    }
+}
+
 fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
     match unit {
         "s" => Ok(TimeUnit::Second),
@@ -192,6 +203,8 @@ impl TryFrom<&DataType> for LogicalType {
                     // Don't want to directly use `bfloat16`, in case a built-in type is added
                     // that isn't identical to our extension type.
                     format!("fixed_size_list:lance.bfloat16:{}", *len)
+                } else if !is_supported_fixed_size_list_child(field.data_type(), false) {
+                    return Err(Error::schema(format!("Unsupported data type: {:?}", dt)));
                 } else {
                     format!(
                         "fixed_size_list:{}:{}",

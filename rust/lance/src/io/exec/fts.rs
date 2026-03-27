@@ -25,7 +25,9 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, build_prefilter};
+use crate::index::DatasetIndexExt;
 use crate::{Dataset, index::DatasetIndexInternalExt};
+use lance_index::IndexCriteria;
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -37,7 +39,6 @@ use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
 };
-use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use tracing::instrument;
 
@@ -242,7 +243,7 @@ impl ExecutionPlan for MatchQueryExec {
                 .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
-            let pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
@@ -259,6 +260,11 @@ impl ExecutionPlan for MatchQueryExec {
                         column,
                     ))
                 })?;
+            if !inverted_idx.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
+            }
             metrics.record_parts_searched(inverted_idx.partition_count());
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
@@ -872,10 +878,13 @@ impl ExecutionPlan for PhraseQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let column = query.column.ok_or(DataFusionError::Execution(format!(
-                "column not set for PhraseQuery {}",
-                query.terms
-            )))?;
+            let column = query
+                .column
+                .clone()
+                .ok_or(DataFusionError::Execution(format!(
+                    "column not set for PhraseQuery {}",
+                    query.terms
+                )))?;
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
@@ -888,11 +897,11 @@ impl ExecutionPlan for PhraseQueryExec {
                 .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
-            let pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
-                ds,
+                ds.clone(),
                 &[index_meta],
             )?;
 
@@ -905,6 +914,11 @@ impl ExecutionPlan for PhraseQueryExec {
                         column,
                     ))
                 })?;
+            if !index.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(index.deleted_fragments().clone());
+            }
             metrics.record_parts_searched(index.partition_count());
 
             let mut tokenizer = index.tokenizer();
@@ -1384,6 +1398,7 @@ impl ExecutionPlan for BooleanQueryExec {
 pub mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::index::DatasetIndexExt;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -1396,7 +1411,7 @@ pub mod tests {
         PhraseQuery,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
-    use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
+    use lance_index::{IndexCriteria, IndexType};
 
     use crate::{
         index::DatasetIndexInternalExt,

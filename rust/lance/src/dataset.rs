@@ -15,6 +15,7 @@ use futures::{FutureExt, Stream};
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
+use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -30,7 +31,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -54,7 +55,7 @@ use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
@@ -1466,7 +1467,8 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
-        let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
+        let fragments = self.get_fragments();
+        let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 
@@ -1484,14 +1486,74 @@ impl Dataset {
 
     /// Randomly sample `n` rows from the dataset.
     ///
+    /// If `fragment_ids` is provided, sampling is limited to rows from those
+    /// fragments in the current dataset version.
+    ///
     /// The returned rows are in row-id order (not random order), which allows
     /// the underlying take operation to use an efficient sorted code path.
-    pub async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+    pub async fn sample(
+        &self,
+        n: usize,
+        projection: &Schema,
+        fragment_ids: Option<&[u32]>,
+    ) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows(None).await?;
-        let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
-        ids.sort_unstable();
-        self.take(&ids, projection.clone()).await
+
+        match fragment_ids {
+            None => {
+                let num_rows = self.count_rows(None).await?;
+                let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+                ids.sort_unstable();
+                self.take(&ids, projection.clone()).await
+            }
+            Some(fragment_ids) => {
+                if fragment_ids.is_empty() {
+                    return Err(Error::invalid_input(
+                        "Dataset::sample does not accept an empty fragment_ids list".to_string(),
+                    ));
+                }
+
+                let selected_fragment_ids = fragment_ids.iter().copied().collect::<BTreeSet<_>>();
+                let selected_fragments = self
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|fragment| selected_fragment_ids.contains(&(fragment.id() as u32)))
+                    .collect::<Vec<_>>();
+
+                if selected_fragments.len() != selected_fragment_ids.len() {
+                    let present_fragment_ids = selected_fragments
+                        .iter()
+                        .map(|fragment| fragment.id() as u32)
+                        .collect::<HashSet<_>>();
+                    let missing_fragment_ids = selected_fragment_ids
+                        .into_iter()
+                        .filter(|fragment_id| !present_fragment_ids.contains(fragment_id))
+                        .collect::<Vec<_>>();
+                    return Err(Error::invalid_input(format!(
+                        "Dataset::sample received fragment ids that are not part of the current dataset version: {missing_fragment_ids:?}",
+                    )));
+                }
+
+                let num_rows = stream::iter(selected_fragments.iter().cloned())
+                    .map(|fragment| async move { fragment.count_rows(None).await })
+                    .buffer_unordered(16)
+                    .try_fold(0_u64, |acc, rows| async move { Ok(acc + rows as u64) })
+                    .await?;
+
+                let mut offsets = (0..num_rows).choose_multiple(&mut rand::rng(), n);
+                offsets.sort_unstable();
+
+                let row_addrs = row_offsets_to_row_addresses(&selected_fragments, &offsets).await?;
+                let dataset = Arc::new(self.clone());
+                let projection = Arc::new(
+                    ProjectionRequest::from(projection.clone())
+                        .into_projection_plan(dataset.clone())?,
+                );
+                TakeBuilder::try_new_from_addresses(dataset, row_addrs, projection)?
+                    .execute()
+                    .await
+            }
+        }
     }
 
     /// Delete rows based on a predicate.
@@ -1737,6 +1799,18 @@ impl Dataset {
         self.session.clone()
     }
 
+    /// Get the currently checked-out version id.
+    ///
+    /// This is a cheap accessor that reads the id directly from the loaded
+    /// manifest without constructing the full [Version] summary.
+    pub fn version_id(&self) -> u64 {
+        self.manifest.version
+    }
+
+    /// Get the currently checked-out version details.
+    ///
+    /// This constructs a full [Version], including summary metadata derived
+    /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
         Version::from(self.manifest.as_ref())
     }
@@ -2684,7 +2758,7 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
-    /// Merge a staged distributed index into a single root artifact.
+    /// Merge a distributed scalar index into a single root artifact.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
@@ -2713,61 +2787,13 @@ impl Dataset {
                 )
                 .await
             }
-            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
-                let mut partial_indices = self
-                    .object_store()
-                    .read_dir(index_dir.clone())
-                    .await?
-                    .into_iter()
-                    .filter(|name| name.starts_with("partial_"))
-                    .map(|name| {
-                        name.strip_prefix("partial_")
-                            .ok_or_else(|| {
-                                Error::index(format!(
-                                    "Distributed vector shard '{}' does not start with 'partial_'",
-                                    name
-                                ))
-                            })
-                            .and_then(|shard_uuid| {
-                                uuid::Uuid::parse_str(shard_uuid).map_err(|err| {
-                                    Error::index(format!(
-                                        "Distributed vector shard '{}' does not end with a valid UUID: {}",
-                                        name, err
-                                    ))
-                                })
-                            })
-                            .map(|shard_uuid| IndexMetadata {
-                                uuid: shard_uuid,
-                                name: String::new(),
-                                fields: Vec::new(),
-                                dataset_version: self.manifest.version,
-                                fragment_bitmap: Some(RoaringBitmap::new()),
-                                index_details: None,
-                                index_version: index_type.version(),
-                                created_at: None,
-                                base_id: None,
-                                files: Some(Vec::new()),
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                partial_indices.sort_by_key(|index| index.uuid);
-                let segment_plans = crate::index::vector::ivf::plan_staging_segments(
-                    &index_dir,
-                    &partial_indices,
-                    Some(index_type),
-                    None,
-                )
-                .await?;
-                let merged_plan =
-                    crate::index::vector::ivf::collapse_segment_plans(&segment_plans)?;
-                crate::index::vector::ivf::build_staging_segment(
-                    self.object_store(),
-                    &self.indices_dir(),
-                    &merged_plan,
-                )
-                .await
-                .map(|_| ())
+                Err(Error::invalid_input(
+                    "Vector distributed indexing no longer supports merge_index_metadata; \
+                     build segments, use create_index_segment_builder(), \
+                     and commit with commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             _ => Err(Error::invalid_input_source(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

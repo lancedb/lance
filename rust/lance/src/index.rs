@@ -24,6 +24,7 @@ use lance_core::utils::tracing::{
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
+use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
@@ -42,7 +43,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -65,6 +65,7 @@ use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
+mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
@@ -79,6 +80,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+pub use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentPlan};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -86,6 +88,66 @@ use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
+pub use lance_index::IndexDescription;
+
+fn validate_index_segments(index_name: &str, segments: &[IndexSegment]) -> Result<()> {
+    if segments.is_empty() {
+        return Err(Error::invalid_input(
+            "CreateIndex: at least one index segment is required".to_string(),
+        ));
+    }
+
+    let mut seen_segment_ids = HashSet::with_capacity(segments.len());
+    let mut covered_fragments = RoaringBitmap::new();
+    for segment in segments {
+        if !seen_segment_ids.insert(segment.uuid()) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: duplicate segment uuid {} for index '{}'",
+                segment.uuid(),
+                index_name
+            )));
+        }
+        if !covered_fragments.is_disjoint(segment.fragment_bitmap()) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: overlapping fragment coverage in segment set for index '{}'",
+                index_name
+            )));
+        }
+        covered_fragments |= segment.fragment_bitmap().clone();
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn build_index_metadata_from_segments(
+    dataset: &Dataset,
+    index_name: &str,
+    field_id: i32,
+    segments: Vec<IndexSegment>,
+) -> Result<Vec<IndexMetadata>> {
+    validate_index_segments(index_name, &segments)?;
+
+    let mut new_indices = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        let index_dir = dataset.indices_dir().child(uuid.to_string());
+        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        new_indices.push(IndexMetadata {
+            uuid,
+            name: index_name.to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(fragment_bitmap),
+            index_details: Some(index_details),
+            index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(files),
+        });
+    }
+
+    Ok(new_indices)
+}
 
 // Cache keys for different index types
 #[derive(Debug, Clone)]
@@ -594,7 +656,8 @@ impl DatasetIndexExt for Dataset {
     /// Create a scalar BTREE index:
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// let params = ScalarIndexParams::default();
     /// dataset
@@ -608,7 +671,8 @@ impl DatasetIndexExt for Dataset {
     /// Create an empty index that will be populated later:
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// let params = ScalarIndexParams::default();
     /// dataset
@@ -628,11 +692,8 @@ impl DatasetIndexExt for Dataset {
         CreateIndexBuilder::new(self, columns, index_type, params)
     }
 
-    fn create_index_segment_builder<'a>(
-        &'a self,
-        staging_index_uuid: String,
-    ) -> create::IndexSegmentBuilder<'a> {
-        create::IndexSegmentBuilder::new(self, staging_index_uuid)
+    fn create_index_segment_builder<'a>(&'a self) -> create::IndexSegmentBuilder<'a> {
+        create::IndexSegmentBuilder::new(self)
     }
 
     #[instrument(skip_all)]
@@ -800,43 +861,8 @@ impl DatasetIndexExt for Dataset {
             )));
         };
 
-        let mut seen_segment_ids = HashSet::with_capacity(segments.len());
-        let mut covered_fragments = RoaringBitmap::new();
-        for segment in &segments {
-            if !seen_segment_ids.insert(segment.uuid()) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: duplicate segment uuid {} for index '{}'",
-                    segment.uuid(),
-                    index_name
-                )));
-            }
-            if !covered_fragments.is_disjoint(segment.fragment_bitmap()) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: overlapping fragment coverage in segment set for index '{}'",
-                    index_name
-                )));
-            }
-            covered_fragments |= segment.fragment_bitmap().clone();
-        }
-
-        let new_indices = segments
-            .into_iter()
-            .map(|segment| {
-                let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-                IndexMetadata {
-                    uuid,
-                    name: index_name.to_string(),
-                    fields: vec![field.id],
-                    dataset_version: self.manifest.version,
-                    fragment_bitmap: Some(fragment_bitmap),
-                    index_details: Some(index_details),
-                    index_version,
-                    created_at: Some(chrono::Utc::now()),
-                    base_id: None,
-                    files: None, // File info will be populated when index is created
-                }
-            })
-            .collect();
+        let new_indices =
+            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -5233,6 +5259,24 @@ mod tests {
             Arc::new(vector_index_details()),
             IndexType::Vector.version(),
         );
+        let seg0_path = dataset
+            .indices_dir()
+            .child(seg0.uuid().to_string())
+            .child(INDEX_FILE_NAME);
+        let seg1_path = dataset
+            .indices_dir()
+            .child(seg1.uuid().to_string())
+            .child(INDEX_FILE_NAME);
+        dataset
+            .object_store()
+            .put(&seg0_path, b"seg0")
+            .await
+            .unwrap();
+        dataset
+            .object_store()
+            .put(&seg1_path, b"seg1")
+            .await
+            .unwrap();
 
         dataset
             .commit_existing_index_segments(
@@ -5263,6 +5307,12 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([vec![0], vec![1]]),
             "each committed segment should preserve its fragment coverage"
+        );
+        assert!(
+            committed
+                .iter()
+                .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
+            "committed segment metadata should capture on-disk file info"
         );
     }
 

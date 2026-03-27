@@ -124,7 +124,9 @@ public class CommitBuilder {
   }
 
   /**
-   * Set the namespace for managed versioning during URI-based commits.
+   * Set the namespace for managed versioning. When set, commits are routed through the namespace's
+   * {@code createTableVersion} API instead of writing directly to the object store. This is
+   * supported for both dataset-based and URI-based commits.
    *
    * @param namespace the LanceNamespace instance
    * @return this builder instance
@@ -250,7 +252,9 @@ public class CommitBuilder {
               useStableRowIds,
               storageFormat,
               maxRetries,
-              skipAutoCleanup);
+              skipAutoCleanup,
+              namespace,
+              tableId);
       result.setAllocator(dataset.allocator());
       return result;
     }
@@ -285,7 +289,9 @@ public class CommitBuilder {
       Boolean useStableRowIds,
       String storageFormat,
       int maxRetries,
-      boolean skipAutoCleanup);
+      boolean skipAutoCleanup,
+      Object namespace,
+      Object tableId);
 
   private static native Dataset nativeCommitToUri(
       String uri,
