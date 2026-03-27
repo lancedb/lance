@@ -35,8 +35,8 @@ use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use tokio::sync::Mutex;
 use rand::Rng;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 /// Check whether an `object_store::Error` represents a throttle response
@@ -431,7 +431,8 @@ impl OperationThrottle {
 
             match &result {
                 Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
-                    let backoff_ms = rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
+                    let backoff_ms =
+                        rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
@@ -457,11 +458,17 @@ impl Debug for OperationThrottle {
     }
 }
 
-/// A [`MultipartUpload`] wrapper that throttles `put_part` and observes
-/// outcomes from `put_part` and `complete`, feeding them back to the write
-/// AIMD controller.
+/// A [`MultipartUpload`] wrapper that throttles and retries `put_part`,
+/// `complete`, and `abort`, feeding outcomes back to the write AIMD
+/// controller.
+///
+/// Uses a `std::sync::Mutex` (not `tokio::sync::Mutex`) so that aborted
+/// futures cannot cause deadlocks — the guard is always dropped
+/// deterministically. The lock is held only briefly for the sync
+/// `put_part` dispatch; `complete`/`abort` hold it across their await but
+/// are never called concurrently with part uploads.
 struct ThrottledMultipartUpload {
-    target: Box<dyn MultipartUpload>,
+    target: Arc<std::sync::Mutex<Box<dyn MultipartUpload>>>,
     write: Arc<OperationThrottle>,
 }
 
@@ -475,23 +482,66 @@ impl Debug for ThrottledMultipartUpload {
 impl MultipartUpload for ThrottledMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let write = Arc::clone(&self.write);
-        let fut = self.target.put_part(data);
+        let target = Arc::clone(&self.target);
         Box::pin(async move {
-            write.acquire_token().await;
-            let result = fut.await;
-            write.observe_outcome(&result);
-            result
+            write
+                .throttled(|| {
+                    // The let binding is intentional: it ensures the
+                    // MutexGuard is dropped before the future is awaited.
+                    #[allow(clippy::let_and_return)]
+                    let fut = target.lock().unwrap().put_part(data.clone());
+                    fut
+                })
+                .await
         })
     }
 
     async fn complete(&mut self) -> OSResult<PutResult> {
-        let result = self.target.complete().await;
-        self.write.observe_outcome(&result);
-        result
+        // &mut self guarantees no concurrent put_part futures are alive,
+        // so get_mut always succeeds (Arc refcount == 1).
+        let target = Arc::get_mut(&mut self.target)
+            .expect("complete called while put_part futures are still alive")
+            .get_mut()
+            .unwrap();
+        for attempt in 0..=self.write.max_retries {
+            self.write.acquire_token().await;
+            let result = target.complete().await;
+            self.write.observe_outcome(&result);
+
+            match &result {
+                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
+                    let backoff_ms = rand::rng()
+                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                _ => return result,
+            }
+        }
+        unreachable!()
     }
 
     async fn abort(&mut self) -> OSResult<()> {
-        self.target.abort().await
+        let target = Arc::get_mut(&mut self.target)
+            .expect("abort called while put_part futures are still alive")
+            .get_mut()
+            .unwrap();
+        for attempt in 0..=self.write.max_retries {
+            self.write.acquire_token().await;
+            let result = target.abort().await;
+            self.write.observe_outcome(&result);
+
+            match &result {
+                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
+                    let backoff_ms = rand::rng()
+                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                _ => return result,
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -547,10 +597,34 @@ impl AimdThrottledStore {
         let max_backoff_ms = config.max_backoff_ms;
         Ok(Self {
             target,
-            read: Arc::new(OperationThrottle::new(config.read, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
-            write: Arc::new(OperationThrottle::new(config.write, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
-            delete: Arc::new(OperationThrottle::new(config.delete, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
-            list: Arc::new(OperationThrottle::new(config.list, burst, max_retries, min_backoff_ms, max_backoff_ms)?),
+            read: Arc::new(OperationThrottle::new(
+                config.read,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
+            write: Arc::new(OperationThrottle::new(
+                config.write,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
+            delete: Arc::new(OperationThrottle::new(
+                config.delete,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
+            list: Arc::new(OperationThrottle::new(
+                config.list,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
         })
     }
 }
@@ -581,7 +655,7 @@ impl ObjectStore for AimdThrottledStore {
             .throttled(|| self.target.put_multipart(location))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
-            target,
+            target: Arc::new(std::sync::Mutex::new(target)),
             write: Arc::clone(&self.write),
         }))
     }
@@ -596,7 +670,7 @@ impl ObjectStore for AimdThrottledStore {
             .throttled(|| self.target.put_multipart_opts(location, opts.clone()))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
-            target,
+            target: Arc::new(std::sync::Mutex::new(target)),
             write: Arc::clone(&self.write),
         }))
     }
@@ -1438,9 +1512,8 @@ mod tests {
             if should_error {
                 Err(object_store::Error::Generic {
                     store: "RetryTestMock",
-                    source:
-                        "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s"
-                            .into(),
+                    source: "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s"
+                        .into(),
                 })
             } else {
                 self.inner.get(location).await
@@ -1452,11 +1525,7 @@ mod tests {
         async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
             self.inner.get_range(location, range).await
         }
-        async fn get_ranges(
-            &self,
-            location: &Path,
-            ranges: &[Range<u64>],
-        ) -> OSResult<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
         async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
