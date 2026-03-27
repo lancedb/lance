@@ -199,6 +199,7 @@ fn get_ivf_model(py: Python<'_>, dataset: &Dataset, index_name: &str) -> PyResul
     Py::new(py, PyIvfModel { inner: ivf_model })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_train_ivf_model(
     dataset: &Dataset,
     column: &str,
