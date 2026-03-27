@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
+use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
@@ -60,13 +61,13 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::expression::{INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
 use lance_index::vector::{DIST_COL, Query};
-use lance_index::{DatasetIndexExt, scalar::expression::ScalarIndexExpr};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -2718,7 +2719,7 @@ impl Scanner {
             TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
-                    row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                    row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
                 self.u64s_as_take_input(addrs)
             }

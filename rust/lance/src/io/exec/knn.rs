@@ -32,15 +32,15 @@ use datafusion::{
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
 use lance_datafusion::utils::{
-    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, PARTITIONS_RANKED_METRIC,
-    PARTITIONS_SEARCHED_METRIC,
+    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
+    PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{
@@ -68,6 +68,7 @@ pub struct AnnPartitionMetrics {
     index_metrics: IndexMetrics,
     partitions_ranked: Count,
     deltas_searched: Count,
+    find_partitions_elapsed: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -77,6 +78,7 @@ impl AnnPartitionMetrics {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_ranked: metrics.new_count(PARTITIONS_RANKED_METRIC, partition),
             deltas_searched: metrics.new_count(DELTAS_SEARCHED_METRIC, partition),
+            find_partitions_elapsed: metrics.new_time(FIND_PARTITIONS_ELAPSED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -509,9 +511,12 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
-                    let (partitions, dist_q_c) = index.find_partitions(&query).map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to find partitions: {}", e))
-                    })?;
+                    let (partitions, dist_q_c) = {
+                        let _timer = metrics.find_partitions_elapsed.timer();
+                        index.find_partitions(&query).map_err(|e| {
+                            DataFusionError::Execution(format!("Failed to find partitions: {}", e))
+                        })?
+                    };
 
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
                         .with_field(Field::new("item", DataType::UInt32, false));
@@ -1344,6 +1349,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{
@@ -1352,11 +1358,12 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
+    use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
@@ -1731,6 +1738,17 @@ mod tests {
         }
     }
 
+    fn assert_find_partitions_elapsed_recorded(stats: &ExecutionSummaryCounts) {
+        assert!(
+            stats
+                .all_times
+                .get(FIND_PARTITIONS_ELAPSED_METRIC)
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_no_max_nprobes(#[values(1, 20)] num_deltas: usize) {
@@ -1766,6 +1784,7 @@ mod tests {
         if get_num_compute_intensive_cpus() <= 32 {
             assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
         }
+        assert_find_partitions_elapsed_recorded(&stats);
     }
 
     #[rstest]
@@ -1802,6 +1821,7 @@ mod tests {
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(10 * num_deltas)
         );
+        assert_find_partitions_elapsed_recorded(&stats);
     }
 
     #[rstest]
@@ -1841,6 +1861,7 @@ mod tests {
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
                 &(100 * num_deltas)
             );
+            assert_find_partitions_elapsed_recorded(&stats);
         }
     }
 
@@ -1876,6 +1897,7 @@ mod tests {
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(10 * num_deltas)
         );
+        assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 20);
 
         // 15 of the results come from beyond the closest 10 partitions and these will have infinite
@@ -1947,6 +1969,7 @@ mod tests {
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(100 * num_deltas)
         );
+        assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 10000);
     }
 }

@@ -20,6 +20,8 @@ import org.lance.FragmentMetadata;
 import org.lance.ReadOptions;
 import org.lance.Transaction;
 import org.lance.WriteParams;
+import org.lance.namespace.errors.ErrorCode;
+import org.lance.namespace.errors.LanceNamespaceException;
 import org.lance.namespace.model.*;
 import org.lance.namespace.model.DescribeTableVersionRequest;
 import org.lance.namespace.model.DescribeTableVersionResponse;
@@ -176,7 +178,9 @@ public class DirectoryNamespaceTest {
     // Check non-existent namespace
     NamespaceExistsRequest notExistsReq =
         new NamespaceExistsRequest().id(Arrays.asList("nonexistent"));
-    assertThrows(RuntimeException.class, () -> namespace.namespaceExists(notExistsReq));
+    LanceNamespaceException ex =
+        assertThrows(LanceNamespaceException.class, () -> namespace.namespaceExists(notExistsReq));
+    assertEquals(ErrorCode.NAMESPACE_NOT_FOUND, ex.getErrorCode());
   }
 
   @Test
@@ -192,7 +196,7 @@ public class DirectoryNamespaceTest {
 
     // Verify it's gone
     NamespaceExistsRequest existsReq = new NamespaceExistsRequest().id(Arrays.asList("workspace"));
-    assertThrows(RuntimeException.class, () -> namespace.namespaceExists(existsReq));
+    assertThrows(LanceNamespaceException.class, () -> namespace.namespaceExists(existsReq));
   }
 
   @Test
@@ -280,7 +284,7 @@ public class DirectoryNamespaceTest {
     // Check non-existent table
     TableExistsRequest notExistsReq =
         new TableExistsRequest().id(Arrays.asList("workspace", "nonexistent"));
-    assertThrows(RuntimeException.class, () -> namespace.tableExists(notExistsReq));
+    assertThrows(LanceNamespaceException.class, () -> namespace.tableExists(notExistsReq));
   }
 
   @Test
@@ -304,7 +308,7 @@ public class DirectoryNamespaceTest {
     // Verify it's gone
     TableExistsRequest existsReq =
         new TableExistsRequest().id(Arrays.asList("workspace", "test_table"));
-    assertThrows(RuntimeException.class, () -> namespace.tableExists(existsReq));
+    assertThrows(LanceNamespaceException.class, () -> namespace.tableExists(existsReq));
   }
 
   @Test

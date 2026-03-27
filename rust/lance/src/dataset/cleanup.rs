@@ -1180,6 +1180,7 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::index::DatasetIndexExt;
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
@@ -1193,7 +1194,7 @@ mod tests {
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
@@ -2642,8 +2643,9 @@ mod tests {
         // Create a full-text index (Inverted) on the "text" column once.
         // We only create this on main during dataset creation. Branches inherit the index configuration.
         async fn create_text_index(&mut self) -> Result<()> {
+            use crate::index::DatasetIndexExt;
+            use lance_index::IndexType;
             use lance_index::scalar::InvertedIndexParams;
-            use lance_index::{DatasetIndexExt, IndexType};
             let params = InvertedIndexParams::default();
             self.dataset
                 .create_index(&["text"], IndexType::Inverted, None, &params, true)

@@ -16,6 +16,7 @@ package org.lance;
 import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
+import org.lance.namespace.errors.LanceNamespaceException;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateTableRequest;
 import org.lance.namespace.model.CreateTableResponse;
@@ -1548,7 +1549,7 @@ public class NamespaceIntegrationTest {
       assertNotNull(dropResp);
 
       TableExistsRequest existsReq = new TableExistsRequest().id(tableId);
-      assertThrows(RuntimeException.class, () -> namespace.tableExists(existsReq));
+      assertThrows(LanceNamespaceException.class, () -> namespace.tableExists(existsReq));
     } finally {
       namespace.close();
     }

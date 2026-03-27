@@ -44,11 +44,9 @@ use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 ///
 /// If any offsets are beyond the end of the dataset, they will be mapped to a tombstone row address.
 pub(super) async fn row_offsets_to_row_addresses(
-    dataset: &Dataset,
+    fragments: &[FileFragment],
     row_indices: &[u64],
 ) -> Result<Vec<u64>> {
-    let fragments = dataset.get_fragments();
-
     let mut perm = permutation::sort(row_indices);
     let sorted_offsets = perm.apply_slice(row_indices);
 
@@ -115,7 +113,8 @@ pub async fn take(
     }
 
     // First, convert the dataset offsets into row addresses
-    let addrs = row_offsets_to_row_addresses(dataset, offsets).await?;
+    let fragments = dataset.get_fragments();
+    let addrs = row_offsets_to_row_addresses(&fragments, offsets).await?;
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),

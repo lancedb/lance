@@ -962,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_btree_index() {
         use super::super::super::index::{BTreeIndexConfig, IndexStore};
-        use lance_index::DatasetIndexExt;
+        use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let region_id = Uuid::new_v4();
@@ -1060,9 +1060,9 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_ivf_pq_index() {
         use super::super::super::index::{IndexStore, IvfPqIndexConfig};
+        use crate::index::DatasetIndexExt;
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::DatasetIndexExt;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
         use lance_index::vector::pq::PQBuildParams;
@@ -1284,9 +1284,9 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_fts_index() {
         use super::super::super::index::{FtsIndexConfig, IndexStore};
+        use crate::index::DatasetIndexExt;
         use arrow_array::StringArray;
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-        use lance_index::DatasetIndexExt;
         use std::sync::Arc;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;

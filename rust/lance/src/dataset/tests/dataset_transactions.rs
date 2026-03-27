@@ -14,13 +14,13 @@ use crate::{Dataset, Result};
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use crate::index::DatasetIndexExt;
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array};
-use lance_index::DatasetIndexExt;
 
 use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;

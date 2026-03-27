@@ -6,12 +6,12 @@
 
 use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
-use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;

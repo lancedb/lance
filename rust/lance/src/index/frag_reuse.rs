@@ -3,8 +3,8 @@
 
 use crate::Dataset;
 use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
+use crate::index::DatasetIndexExt;
 use lance_core::Error;
-use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
     FragReuseIndexDetails, FragReuseVersion,

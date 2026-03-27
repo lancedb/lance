@@ -41,6 +41,12 @@ from lance_namespace import (
     TableExistsRequest,
     connect,
 )
+from lance_namespace.errors import (
+    InvalidInputError,
+    NamespaceNotEmptyError,
+    NamespaceNotFoundError,
+    TableNotFoundError,
+)
 
 
 def create_test_data():
@@ -116,7 +122,7 @@ class TestCreateTable:
 
         create_req = CreateTableRequest(id=["workspace", "test_table"])
 
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(InvalidInputError) as exc_info:
             memory_namespace.create_table(create_req, b"")
 
         assert "Arrow IPC" in str(exc_info.value) or "required" in str(exc_info.value)
@@ -128,7 +134,7 @@ class TestCreateTable:
 
         # Test with empty ID
         create_req = CreateTableRequest(id=[])
-        with pytest.raises(Exception):
+        with pytest.raises(InvalidInputError):
             memory_namespace.create_table(create_req, ipc_data)
 
     def test_create_table_in_child_namespace(self, memory_namespace):
@@ -233,12 +239,8 @@ class TestDescribeTable:
 
         describe_req = DescribeTableRequest(id=["workspace", "nonexistent"])
 
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(TableNotFoundError):
             memory_namespace.describe_table(describe_req)
-
-        # Check for error message indicating table doesn't exist
-        error_msg = str(exc_info.value).lower()
-        assert "not found" in error_msg or "does not exist" in error_msg
 
 
 class TestTableOperations:
@@ -261,14 +263,14 @@ class TestTableOperations:
         memory_namespace.table_exists(exists_req)
 
     def test_table_not_exists(self, memory_namespace):
-        """Test checking if a non-existent table exists."""
+        """Test checking if a non-existent table exists raises TableNotFoundError."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
         memory_namespace.create_namespace(create_ns_req)
 
         exists_req = TableExistsRequest(id=["workspace", "nonexistent"])
 
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             memory_namespace.table_exists(exists_req)
 
     def test_drop_table(self, memory_namespace):
@@ -290,7 +292,7 @@ class TestTableOperations:
 
         # Verify table no longer exists
         exists_req = TableExistsRequest(id=["workspace", "test_table"])
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             memory_namespace.table_exists(exists_req)
 
     def test_deregister_table(self, temp_namespace):
@@ -384,7 +386,7 @@ class TestTableOperations:
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="s3://bucket/table.lance"
         )
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(InvalidInputError) as exc_info:
             temp_namespace.register_table(register_req)
         assert "Absolute URIs are not allowed" in str(exc_info.value)
 
@@ -398,7 +400,7 @@ class TestTableOperations:
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="/tmp/table.lance"
         )
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(InvalidInputError) as exc_info:
             temp_namespace.register_table(register_req)
         assert "Absolute paths are not allowed" in str(exc_info.value)
 
@@ -412,7 +414,7 @@ class TestTableOperations:
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="../outside/table.lance"
         )
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(InvalidInputError) as exc_info:
             temp_namespace.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
 
@@ -462,7 +464,7 @@ class TestChildNamespaceOperations:
 
         # Verify table no longer exists
         exists_req = TableExistsRequest(id=["test_ns", "table1"])
-        with pytest.raises(Exception):
+        with pytest.raises(TableNotFoundError):
             memory_namespace.table_exists(exists_req)
 
     def test_declared_table_in_child_namespace(self, memory_namespace):
@@ -548,14 +550,8 @@ class TestNamespaceConstraints:
 
         # Try to drop namespace - should fail
         drop_req = DropNamespaceRequest(id=["test_ns"])
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(NamespaceNotEmptyError):
             memory_namespace.drop_namespace(drop_req)
-
-        # Should contain an error message about non-empty namespace
-        assert (
-            "not empty" in str(exc_info.value).lower()
-            or "contains" in str(exc_info.value).lower()
-        )
 
     def test_isolation_between_namespaces(self, memory_namespace):
         """Test that namespaces are isolated from each other."""
@@ -622,6 +618,13 @@ class TestBasicNamespaceOperations:
         # Check it exists (should not raise)
         exists_req = NamespaceExistsRequest(id=["workspace"])
         memory_namespace.namespace_exists(exists_req)
+
+    def test_namespace_not_exists(self, memory_namespace):
+        """Test that a non-existent namespace raises NamespaceNotFoundError."""
+        exists_req = NamespaceExistsRequest(id=["nonexistent"])
+
+        with pytest.raises(NamespaceNotFoundError):
+            memory_namespace.namespace_exists(exists_req)
 
     def test_drop_empty_namespace(self, memory_namespace):
         """Test dropping an empty namespace."""

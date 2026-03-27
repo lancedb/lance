@@ -29,6 +29,7 @@ use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
@@ -94,8 +95,8 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
+use lance_index::IndexCriteria;
 use lance_index::mem_wal::MergedGeneration;
-use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
@@ -3317,7 +3318,7 @@ mod tests {
 
         // Sample 2048 random indices and then paste on a column of 9999999's
         let some_indices = ds
-            .sample(2048, &(&just_index_col).try_into().unwrap())
+            .sample(2048, &(&just_index_col).try_into().unwrap(), None)
             .await
             .unwrap();
         let some_indices = some_indices.column(0).clone();

@@ -288,6 +288,7 @@ mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, UpdateBuilder};
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
@@ -296,7 +297,7 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
-    use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use rstest::rstest;
     use std::collections::HashSet;
     use std::ops::Range;

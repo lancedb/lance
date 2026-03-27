@@ -11,6 +11,7 @@ use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
+use lance::index::{DatasetIndexExt, IndexSegment, IndexSegmentPlan};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -37,7 +38,7 @@ use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::{DatasetIndexExt, IndexDescription, IndexSegment, IndexSegmentPlan, IndexType};
+use lance_index::{IndexDescription, IndexType};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]

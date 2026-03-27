@@ -178,6 +178,7 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         ZonedDateTime time1 = dataset.getVersion().getDataTime();
         assertEquals(1, dataset.version());
+        assertEquals(dataset.getVersion().getId(), dataset.version());
         assertTrue(time1.isEqual(before) || time1.isAfter(before));
         assertTrue(time1.isEqual(ZonedDateTime.now()) || time1.isBefore(ZonedDateTime.now()));
         assertEquals(time1.getZone(), Clock.systemUTC().getZone());
@@ -187,8 +188,10 @@ public class DatasetTest {
         try (Dataset dataset2 = testDataset.write(1, 5)) {
           ZonedDateTime time2 = dataset2.getVersion().getDataTime();
           assertEquals(1, dataset.version());
+          assertEquals(dataset.getVersion().getId(), dataset.version());
           assertEquals(2, dataset.latestVersion());
           assertEquals(2, dataset2.version());
+          assertEquals(dataset2.getVersion().getId(), dataset2.version());
           assertEquals(2, dataset2.latestVersion());
           assertTrue(time2.isEqual(before) || time2.isAfter(before));
           assertTrue(time2.isEqual(time1) || time2.isAfter(time1));
@@ -198,6 +201,7 @@ public class DatasetTest {
           ReadOptions options1 = new ReadOptions.Builder().setVersion(1).build();
           try (Dataset datasetV1 = Dataset.open(allocator, datasetPath, options1)) {
             assertEquals(1, datasetV1.version());
+            assertEquals(datasetV1.getVersion().getId(), datasetV1.version());
             assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(2, datasetV1.latestVersion());
           }
@@ -206,19 +210,23 @@ public class DatasetTest {
           try (Dataset dataset3 = testDataset.write(2, 3)) {
             ZonedDateTime time3 = dataset3.getVersion().getDataTime();
             assertEquals(1, dataset.version());
+            assertEquals(dataset.getVersion().getId(), dataset.version());
             assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
             assertEquals(2, dataset2.version());
+            assertEquals(dataset2.getVersion().getId(), dataset2.version());
             assertTrue(time2.isEqual(dataset2.getVersion().getDataTime()));
             assertEquals(3, dataset2.latestVersion());
             assertTrue(time3.isEqual(before) || time3.isAfter(before));
             assertEquals(3, dataset3.version());
+            assertEquals(dataset3.getVersion().getId(), dataset3.version());
             assertEquals(3, dataset3.latestVersion());
 
             // Open dataset with version 2
             ReadOptions options2 = new ReadOptions.Builder().setVersion(2).build();
             try (Dataset datasetV2 = Dataset.open(allocator, datasetPath, options2)) {
               assertEquals(2, datasetV2.version());
+              assertEquals(datasetV2.getVersion().getId(), datasetV2.version());
               assertTrue(time2.isEqual(datasetV2.getVersion().getDataTime()));
               assertEquals(3, datasetV2.latestVersion());
             }
@@ -226,6 +234,7 @@ public class DatasetTest {
             // Open dataset with latest version (3)
             try (Dataset datasetLatest = Dataset.open(datasetPath, allocator)) {
               assertEquals(3, datasetLatest.version());
+              assertEquals(datasetLatest.getVersion().getId(), datasetLatest.version());
               assertTrue(time3.isEqual(datasetLatest.getVersion().getDataTime()));
               assertEquals(3, datasetLatest.latestVersion());
             }
@@ -242,6 +251,7 @@ public class DatasetTest {
             assertArrayEquals(versions.toArray(), dataset3.listVersions().toArray());
             dataset.checkoutLatest();
             assertEquals(3, dataset.version());
+            assertEquals(dataset.getVersion().getId(), dataset.version());
             assertTrue(time3.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
 

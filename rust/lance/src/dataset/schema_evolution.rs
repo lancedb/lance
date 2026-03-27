@@ -1783,11 +1783,12 @@ mod test {
     ) -> Result<()> {
         // Create a table with 2 scalar columns, 1 vector column
 
+        use crate::index::DatasetIndexExt;
         use arrow::datatypes::{Int32Type, Int64Type};
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 

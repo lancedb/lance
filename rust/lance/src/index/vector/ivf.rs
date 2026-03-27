@@ -64,8 +64,7 @@ use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
-    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexSegment,
-    IndexSegmentPlan, IndexType,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
     optimize::OptimizeOptions,
     vector::{
         Query, VectorIndex,
@@ -102,6 +101,8 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
+
+use crate::index::{IndexSegment, IndexSegmentPlan};
 
 pub mod builder;
 pub mod io;
