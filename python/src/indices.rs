@@ -580,6 +580,24 @@ pub struct PyIndexSegmentDescription {
 }
 
 impl PyIndexSegmentDescription {
+    pub fn from_metadata(segment: &lance_table::format::IndexMetadata) -> Self {
+        let fragment_ids = segment
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let size_bytes = segment.total_size_bytes();
+
+        Self {
+            uuid: segment.uuid.to_string(),
+            dataset_version_at_last_update: segment.dataset_version,
+            fragment_ids,
+            index_version: segment.index_version,
+            created_at: segment.created_at,
+            size_bytes,
+        }
+    }
+
     pub fn __repr__(&self) -> String {
         format!(
             "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?})",
@@ -633,22 +651,7 @@ impl PyIndexDescription {
         let segments = index
             .metadata()
             .iter()
-            .map(|segment| {
-                let fragment_ids = segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
-                    .unwrap_or_default();
-                let size_bytes = segment.total_size_bytes();
-                PyIndexSegmentDescription {
-                    uuid: segment.uuid.to_string(),
-                    dataset_version_at_last_update: segment.dataset_version,
-                    fragment_ids,
-                    index_version: segment.index_version,
-                    created_at: segment.created_at,
-                    size_bytes,
-                }
-            })
+            .map(PyIndexSegmentDescription::from_metadata)
             .collect();
 
         let details = index.details().unwrap_or_else(|_| "{}".to_string());

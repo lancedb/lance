@@ -1257,7 +1257,11 @@ public class Dataset implements Closeable {
   /**
    * Get all indexes with full metadata.
    *
-   * @return list of Index objects with complete metadata including index type and fragment coverage
+   * <p>Each returned {@link Index} is a physical index segment from the manifest. Use {@link
+   * #describeIndices()} for the logical-index view.
+   *
+   * @return list of Index objects with complete segment metadata, including index type and fragment
+   *     coverage
    */
   public List<Index> getIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

@@ -72,6 +72,13 @@ pub trait IndexDescription: Send + Sync {
     /// IndexMetadata for each segment of the index.
     fn metadata(&self) -> &[IndexMetadata];
 
+    /// Returns the physical index segments that make up this logical index.
+    ///
+    /// This is an alias for [`Self::metadata`] with a less ambiguous name.
+    fn segments(&self) -> &[IndexMetadata] {
+        self.metadata()
+    }
+
     /// Returns the index type URL
     ///
     /// This is extracted from the type url of the index details

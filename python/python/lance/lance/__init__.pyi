@@ -62,6 +62,7 @@ from .fragment import (
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
+from .indices import IndexSegmentDescription as IndexSegmentDescription
 from .indices import IndexSegmentPlan as IndexSegmentPlan
 from .lance import PySearchFilter
 from .optimize import (
