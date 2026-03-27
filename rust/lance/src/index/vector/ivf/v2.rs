@@ -2049,7 +2049,10 @@ mod tests {
         if matches!(index_type, IndexType::IvfSq) {
             for (single, split) in ids_single.iter().zip(ids_split.iter()) {
                 assert_eq!(single.len(), split.len());
-                let overlap = single.iter().filter(|row_id| split.contains(row_id)).count();
+                let overlap = single
+                    .iter()
+                    .filter(|row_id| split.contains(row_id))
+                    .count();
                 assert!(
                     overlap >= K / 3,
                     "single vs segmented distributed SQ index returned too little top-k overlap",
