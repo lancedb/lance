@@ -145,6 +145,11 @@ impl AimdThrottleConfig {
         Self { list: aimd, ..self }
     }
 
+    /// Returns `true` when the AIMD throttle layer should be bypassed entirely.
+    pub fn is_disabled(&self) -> bool {
+        self.max_retries == 0
+    }
+
     pub fn with_burst_capacity(self, burst_capacity: u32) -> Self {
         Self {
             burst_capacity,
