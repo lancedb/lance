@@ -36,6 +36,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use tokio::sync::Mutex;
+use rand::Rng;
 use tracing::debug;
 
 /// Check whether an `object_store::Error` represents a throttle response
@@ -307,25 +308,47 @@ impl OperationThrottle {
         }
     }
 
+    /// Maximum number of retries for throttle errors within the AIMD layer.
+    const MAX_RETRIES: usize = 3;
+
     /// Execute an operation with throttling: acquire token, run, classify result.
+    /// On throttle errors, retries up to [`MAX_RETRIES`] times with a random
+    /// backoff of 100-300ms between attempts.
     async fn throttled<T, F, Fut>(&self, f: F) -> OSResult<T>
     where
-        F: FnOnce() -> Fut,
+        F: Fn() -> Fut,
         Fut: std::future::Future<Output = OSResult<T>>,
     {
-        self.acquire_token().await;
-        let result = f().await;
-        let outcome = match &result {
-            Ok(_) => RequestOutcome::Success,
-            Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected, decreasing rate");
-                RequestOutcome::Throttled
+        for attempt in 0..=Self::MAX_RETRIES {
+            self.acquire_token().await;
+            let result = f().await;
+            let outcome = match &result {
+                Ok(_) => RequestOutcome::Success,
+                Err(err) if is_throttle_error(err) => {
+                    debug!("Throttle error detected, decreasing rate");
+                    RequestOutcome::Throttled
+                }
+                Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
+            };
+            let new_rate = self.controller.record_outcome(outcome);
+            self.update_bucket_rate(new_rate).await;
+
+            match &result {
+                Err(err) if is_throttle_error(err) && attempt < Self::MAX_RETRIES => {
+                    let backoff_ms = rand::rng().random_range(100..=300);
+                    debug!(
+                        attempt = attempt + 1,
+                        max_retries = Self::MAX_RETRIES,
+                        backoff_ms,
+                        "Retrying after throttle error"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                _ => return result,
             }
-            Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
-        };
-        let new_rate = self.controller.record_outcome(outcome);
-        self.update_bucket_rate(new_rate).await;
-        result
+        }
+        unreachable!()
     }
 }
 
@@ -438,7 +461,7 @@ impl AimdThrottledStore {
 impl ObjectStore for AimdThrottledStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.write
-            .throttled(|| self.target.put(location, bytes))
+            .throttled(|| self.target.put(location, bytes.clone()))
             .await
     }
 
@@ -449,7 +472,7 @@ impl ObjectStore for AimdThrottledStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.write
-            .throttled(|| self.target.put_opts(location, bytes, opts))
+            .throttled(|| self.target.put_opts(location, bytes.clone(), opts.clone()))
             .await
     }
 
@@ -471,7 +494,7 @@ impl ObjectStore for AimdThrottledStore {
     ) -> OSResult<Box<dyn MultipartUpload>> {
         let target = self
             .write
-            .throttled(|| self.target.put_multipart_opts(location, opts))
+            .throttled(|| self.target.put_multipart_opts(location, opts.clone()))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
             target,
@@ -485,7 +508,7 @@ impl ObjectStore for AimdThrottledStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.read
-            .throttled(|| self.target.get_opts(location, options))
+            .throttled(|| self.target.get_opts(location, options.clone()))
             .await
     }
 
@@ -1217,10 +1240,11 @@ mod tests {
         let throttled = mock.throttle_count.load(Ordering::Relaxed);
         let total_mock = successes + throttled;
 
-        // Reader-side count must match mock-side count.
-        assert_eq!(
-            total_reader_requests, total_mock,
-            "Reader-side count ({total_reader_requests}) != mock-side count ({total_mock})"
+        // Mock-side count >= reader-side count because the AIMD layer retries
+        // throttle errors internally, causing multiple mock calls per reader call.
+        assert!(
+            total_mock >= total_reader_requests,
+            "Mock-side count ({total_mock}) should be >= reader-side count ({total_reader_requests})"
         );
 
         // Mock capacity is 30/100ms = 300 req/s. Over 2s the theoretical max is
@@ -1243,5 +1267,180 @@ mod tests {
             total_mock <= 5000,
             "AIMD should limit total requests, got {total_mock}"
         );
+    }
+
+    /// A mock store that returns a configurable number of throttle errors
+    /// before succeeding on `get` operations. Used to test the retry logic
+    /// inside `OperationThrottle::throttled()`.
+    struct RetryTestMockStore {
+        inner: InMemory,
+        /// Number of throttle errors remaining before success.
+        errors_remaining: std::sync::Mutex<usize>,
+        /// Total number of `get` calls observed.
+        get_call_count: AtomicU64,
+    }
+
+    impl RetryTestMockStore {
+        fn new(errors_before_success: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                errors_remaining: std::sync::Mutex::new(errors_before_success),
+                get_call_count: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl Display for RetryTestMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RetryTestMockStore")
+        }
+    }
+
+    impl Debug for RetryTestMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RetryTestMockStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RetryTestMockStore {
+        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
+            self.inner.put(location, bytes).await
+        }
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get(&self, location: &Path) -> OSResult<GetResult> {
+            self.get_call_count.fetch_add(1, Ordering::Relaxed);
+            let should_error = {
+                let mut remaining = self.errors_remaining.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_error {
+                Err(object_store::Error::Generic {
+                    store: "RetryTestMock",
+                    source:
+                        "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s"
+                            .into(),
+                })
+            } else {
+                self.inner.get(location).await
+            }
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
+            self.inner.get_range(location, range).await
+        }
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+        async fn delete(&self, location: &Path) -> OSResult<()> {
+            self.inner.delete(location).await
+        }
+        fn delete_stream<'a>(
+            &'a self,
+            locations: BoxStream<'a, OSResult<Path>>,
+        ) -> BoxStream<'a, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.rename(from, to).await
+        }
+        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.rename_if_not_exists(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_throttled_retries_on_throttle_error_then_succeeds() {
+        // Mock returns 2 throttle errors then succeeds (within MAX_RETRIES=3)
+        let mock = Arc::new(RetryTestMockStore::new(2));
+        let path = Path::from("test/retry.txt");
+        mock.put(&path, PutPayload::from_static(b"retry data"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        let result = throttled.get(&path).await;
+        assert!(result.is_ok(), "Expected success after retries");
+
+        let bytes = result.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"retry data");
+
+        // Should have called get 3 times total: 2 failures + 1 success
+        assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn test_throttled_fails_after_max_retries_exceeded() {
+        // Mock returns 4 throttle errors (more than MAX_RETRIES=3),
+        // so all 4 attempts (initial + 3 retries) will fail.
+        let mock = Arc::new(RetryTestMockStore::new(10));
+        let path = Path::from("test/fail.txt");
+        mock.put(&path, PutPayload::from_static(b"fail data"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        let result = throttled.get(&path).await;
+        assert!(result.is_err(), "Expected error after max retries");
+        assert!(is_throttle_error(&result.unwrap_err()));
+
+        // Should have called get 4 times: initial attempt + 3 retries
+        assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 4);
     }
 }
