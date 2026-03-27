@@ -25,7 +25,9 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, build_prefilter};
+use crate::index::DatasetIndexExt;
 use crate::{Dataset, index::DatasetIndexInternalExt};
+use lance_index::IndexCriteria;
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -37,7 +39,6 @@ use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
 };
-use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use tracing::instrument;
 
@@ -1397,6 +1398,7 @@ impl ExecutionPlan for BooleanQueryExec {
 pub mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::index::DatasetIndexExt;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -1409,7 +1411,7 @@ pub mod tests {
         PhraseQuery,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
-    use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
+    use lance_index::{IndexCriteria, IndexType};
 
     use crate::{
         index::DatasetIndexInternalExt,

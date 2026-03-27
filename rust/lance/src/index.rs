@@ -24,6 +24,7 @@ use lance_core::utils::tracing::{
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
+use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
@@ -42,7 +43,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -65,6 +65,7 @@ use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
+mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
@@ -79,6 +80,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+pub use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentPlan};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -86,6 +88,7 @@ use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
+pub use lance_index::IndexDescription;
 
 fn validate_index_segments(index_name: &str, segments: &[IndexSegment]) -> Result<()> {
     if segments.is_empty() {
@@ -645,7 +648,8 @@ impl DatasetIndexExt for Dataset {
     /// Create a scalar BTREE index:
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// let params = ScalarIndexParams::default();
     /// dataset
@@ -659,7 +663,8 @@ impl DatasetIndexExt for Dataset {
     /// Create an empty index that will be populated later:
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// let params = ScalarIndexParams::default();
     /// dataset

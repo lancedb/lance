@@ -20,7 +20,7 @@ use crate::{
 use futures::future::{BoxFuture, try_join_all};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexSegment, IndexSegmentPlan, IndexType, scalar::CreatedIndex};
+use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
@@ -31,6 +31,8 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
+
+use super::{IndexSegment, IndexSegmentPlan};
 
 /// Generate default index name from field path.
 ///

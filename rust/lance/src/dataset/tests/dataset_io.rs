@@ -36,9 +36,10 @@ use lance_file::version::LanceFileVersion;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 
+use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
+use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;

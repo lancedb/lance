@@ -19,10 +19,11 @@ use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::{
-    DatasetIndexExt, IndexType,
+    IndexType,
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::MetricType;

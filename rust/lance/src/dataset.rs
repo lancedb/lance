@@ -15,6 +15,7 @@ use futures::{FutureExt, Stream};
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
+use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -30,7 +31,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -1798,6 +1799,18 @@ impl Dataset {
         self.session.clone()
     }
 
+    /// Get the currently checked-out version id.
+    ///
+    /// This is a cheap accessor that reads the id directly from the loaded
+    /// manifest without constructing the full [Version] summary.
+    pub fn version_id(&self) -> u64 {
+        self.manifest.version
+    }
+
+    /// Get the currently checked-out version details.
+    ///
+    /// This constructs a full [Version], including summary metadata derived
+    /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
         Version::from(self.manifest.as_ref())
     }

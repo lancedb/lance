@@ -130,6 +130,7 @@ mod test {
     use super::*;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
@@ -139,7 +140,7 @@ mod test {
     use lance_core::datatypes::Schema;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
-    use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use std::collections::HashMap;
     use std::collections::HashSet;
 

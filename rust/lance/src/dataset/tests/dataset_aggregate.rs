@@ -38,12 +38,13 @@ use tempfile::tempdir;
 
 use crate::Dataset;
 use crate::dataset::scanner::AggregateExpr;
+use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_plan_node_equals};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::InvertedIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 
 /// Helper to create a field reference expression for a column index
