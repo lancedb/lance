@@ -525,7 +525,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use arrow_array::{
         ArrayRef, StringArray,
         builder::{LargeStringBuilder, StringBuilder},

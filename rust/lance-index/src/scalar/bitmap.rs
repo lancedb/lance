@@ -884,7 +884,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::lance_format::LanceIndexStore;

@@ -403,7 +403,7 @@ impl ArrayEncoder for DictionaryEncoder {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use arrow_array::{
         ArrayRef, DictionaryArray, StringArray, UInt8Array,

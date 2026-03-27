@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::{
-    array::AsArray,
-    compute::cast,
-    datatypes::{Float16Type, Float32Type, Float64Type},
-};
-use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray};
+use arrow::compute::cast;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
@@ -109,37 +106,6 @@ impl SimpleIndex {
 }
 
 #[inline]
-#[allow(dead_code)]
-pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
-    match array.data_type() {
-        DataType::FixedSizeList(_, _) => {
-            let array = array.as_fixed_size_list();
-            return prefetch_arrow_array(array.values());
-        }
-        DataType::Float16 => {
-            let array = array.as_primitive::<Float16Type>();
-            do_prefetch(array.values().as_ptr_range())
-        }
-        DataType::Float32 => {
-            let array = array.as_primitive::<Float32Type>();
-            do_prefetch(array.values().as_ptr_range())
-        }
-        DataType::Float64 => {
-            let array = array.as_primitive::<Float64Type>();
-            do_prefetch(array.values().as_ptr_range())
-        }
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "Unsupported data type for prefetch: {}",
-                array.data_type()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-#[inline]
 pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     // TODO use rust intrinsics instead of x86 intrinsics
     // TODO finish this
@@ -207,7 +173,7 @@ impl TryFrom<&FixedSizeListArray> for pb::Tensor {
     fn try_from(array: &FixedSizeListArray) -> Result<Self> {
         let mut tensor = Self::default();
         tensor.data_type = pb::tensor::DataType::try_from(array.value_type())? as i32;
-        tensor.shape = vec![array.len() as u32, array.value_length() as u32];
+        tensor.shape = vec![Array::len(array) as u32, array.value_length() as u32];
         let flat_array = array.values();
         tensor.data = flat_array.into_data().buffers()[0].to_vec();
         Ok(tensor)
@@ -265,17 +231,17 @@ pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
             Some(v) => match v.data_type() {
                 DataType::Float16 => {
                     let v = v.as_primitive::<Float16Type>();
-                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
                 }
                 DataType::Float32 => {
                     let v = v.as_primitive::<Float32Type>();
-                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
                 }
                 DataType::Float64 => {
                     let v = v.as_primitive::<Float64Type>();
-                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
                 }
-                _ => v.null_count() == 0,
+                _ => Array::null_count(&v) == 0,
             },
             None => false,
         })

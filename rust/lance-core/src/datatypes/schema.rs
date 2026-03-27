@@ -85,7 +85,6 @@ struct SchemaFieldIterPreOrder<'a> {
 }
 
 impl<'a> SchemaFieldIterPreOrder<'a> {
-    #[allow(dead_code)]
     fn new(schema: &'a Schema) -> Self {
         let mut field_stack = Vec::with_capacity(schema.fields.len() * 2);
         for field in schema.fields.iter().rev() {
