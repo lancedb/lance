@@ -180,8 +180,9 @@ mod tests {
     use super::*;
     use crate::dataset::WriteParams;
     use crate::index::vector::VectorIndexParams;
+    use crate::index::{DatasetIndexExt, IndexSegment};
     use lance_datagen::{BatchCount, RowCount, array};
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use uuid::Uuid;
 
@@ -241,13 +242,13 @@ mod tests {
         }
 
         let segments = vec![
-            lance_index::IndexSegment::new(
+            IndexSegment::new(
                 first_segment_uuid,
                 [target_fragments[0].id() as u32],
                 built_index.index_details.clone().unwrap(),
                 built_index.index_version,
             ),
-            lance_index::IndexSegment::new(
+            IndexSegment::new(
                 second_segment_uuid,
                 [target_fragments[1].id() as u32],
                 built_index.index_details.clone().unwrap(),
