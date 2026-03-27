@@ -20,7 +20,7 @@ use futures::{FutureExt, TryFutureExt};
 use io_uring::{IoUring, opcode, types};
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::location;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
@@ -318,10 +318,7 @@ impl UringCurrentThreadReader {
 
         let data = tokio::task::spawn_blocking(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
-                ErrorKind::NotFound => Error::NotFound {
-                    uri: path_clone.to_string(),
-                    location: location!(),
-                },
+                ErrorKind::NotFound => Error::not_found(path_clone.to_string()),
                 _ => e.into(),
             })?;
 
