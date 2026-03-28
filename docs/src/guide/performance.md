@@ -189,6 +189,47 @@ use cases. For example, S3 can typically get up to 5000
 req/s and with these settings we should get there in about
 10 seconds.
 
+## Conflict Handling
+
+Lance supports concurrent operations on the same table using optimistic concurrency control. When two
+operations conflict, one of them must be retried. Retries are handled automatically but they repeat
+work that has already been done, which can hurt throughput. Understanding and minimizing conflicts is
+important for maintaining good performance in write-heavy workloads.
+
+Common sources of conflicts include:
+
+- Concurrent compaction and index building, since both need to modify the same indices
+- Update operations that affect the same fragments, since both need to rewrite the same data files
+
+For more details on which operations conflict with each other, see
+[conflict resolution](../format/table/transaction.md#conflict-resolution).
+
+### Fragment Reuse Index
+
+Compaction is one of the most expensive write operations because it rewrites data files and, by
+default, remaps all indices to reflect the new row addresses. When compaction and index building
+run concurrently, they often conflict because both need to modify the same indices. This typically
+causes the compaction to fail and retry, and repeated failures can cause table layout to degrade
+over time.
+
+The Fragment Reuse Index (FRI) solves this by allowing compaction to skip the index remap step.
+Instead of immediately updating indices, compaction records a mapping from old fragment row
+addresses to new ones. When indices are loaded into the cache, the FRI is applied to translate
+the old row addresses to the current ones. This adds a small cost to index load time but does
+not affect query performance once the index is cached.
+
+This decoupling means compaction and index building no longer conflict, which is especially
+valuable for tables that are continuously ingesting data while also maintaining indices.
+
+To enable the FRI, set `defer_index_remap=True` when compacting:
+
+```python
+dataset.optimize.compact_files(defer_index_remap=True)
+```
+
+For details on the index format and usage patterns, see the
+[Fragment Reuse Index specification](../format/table/index/system/frag_reuse.md).
+
 ## Indexes
 
 Training and searching indexes can have unique requirements for compute and memory. This section provides some
