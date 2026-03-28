@@ -104,6 +104,7 @@ prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof.workspace = true
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
 lzma-sys = { version = "0.1" }
 
@@ -138,7 +139,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "asyn
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "geo"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
@@ -157,8 +158,9 @@ gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
 tencent = ["lance-io/tencent"]
-huggingface = ["lance-io/huggingface"]
+goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
+huggingface = ["lance-io/huggingface"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
