@@ -93,37 +93,29 @@ First, multiple workers build segments in parallel:
    or Python `create_index_uncommitted(..., fragment_ids=...)`
 2. each worker writes one segment under `indices/<segment_uuid>/`
 
-### Segment Build
+### Segment Merge
 
-Then the caller turns those existing segments into one or more physical
-segments:
+Then the caller decides whether those existing segments should be committed as-is
+or merged into larger segments:
 
-1. create a builder with `create_index_segment_builder()`
-2. provide segment metadata with `with_segments(...)`
-3. optionally choose a grouping policy with `with_target_segment_bytes(...)`
-4. call `plan()` to get `Vec<IndexSegmentPlan>`
-
-At that point the caller has two execution choices:
-
-- call `build(plan)` for each plan and run those builds in parallel
-- call `build_all()` to let Lance build every planned segment on the current node
-
-After the physical segments are built, publish them with
-`commit_existing_index_segments(...)`.
+1. keep the worker outputs as-is and commit them directly with
+   `commit_existing_index_segments(...)`, or
+2. group one or more existing segments and call
+   `merge_existing_index_segments(...)` for each caller-defined group
+3. commit the final segment list with `commit_existing_index_segments(...)`
 
 Within a single commit, built segments must have disjoint fragment coverage.
 
-## Internal Segmented Finalize Model
+## Internal Finalize Model
 
 Internally, Lance models distributed vector segment build as:
 
-1. **plan** which input segments should become each physical segment
-2. **build** each segment from its selected input segments
-3. **commit** the resulting physical segments as one logical index
+1. **build** one uncommitted segment per worker
+2. **optionally merge** caller-defined groups of existing segments
+3. **commit** the resulting segments as one logical index
 
-The plan step is driven by the segment metadata returned from
-`execute_uncommitted()` and any additional inputs requested by the segment
-build APIs.
+The merge step is driven directly by the `IndexMetadata` returned from
+`execute_uncommitted()`.
 
 This is intentionally a storage-level model:
 
@@ -133,10 +125,10 @@ This is intentionally a storage-level model:
 
 ## Segment Grouping
 
-When Lance builds segments from existing inputs, it may either:
+The caller chooses the final segment grouping:
 
-- keep segment boundaries, so each input segment becomes one physical segment
-- group multiple input segments into a larger physical segment
+- keep segment boundaries, so each worker output is committed directly
+- merge multiple existing segments into a larger segment before commit
 
 The grouping decision is separate from worker build. Workers only build
 segments; Lance applies the segment build policy when it plans

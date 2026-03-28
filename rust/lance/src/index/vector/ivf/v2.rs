@@ -628,9 +628,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::IndexSegment;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::vector::ivf::{build_segment, plan_segments};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -1508,8 +1506,8 @@ mod tests {
 
         let segments =
             build_segments_for_fragment_groups(dataset, fragment_groups, &params, index_name).await;
-        let built_segments = build_distributed_segments(dataset, &segments, None, index_name).await;
-        assert!(!built_segments.is_empty());
+        let committed_segments = build_distributed_segments(dataset, segments, index_name).await;
+        assert!(!committed_segments.is_empty());
     }
 
     fn assert_centroids_equal(reference: &serde_json::Value, candidate: &serde_json::Value) {
@@ -1585,32 +1583,17 @@ mod tests {
         assert_eq!(sizes_a, sizes_b, "aggregated partition sizes mismatch");
     }
 
-    /// Execute the internal segment workflow used by the
-    /// regression tests: plan segment groups from caller-provided segment
-    /// metadata, build each segment, and publish them as one logical index.
+    /// Commit caller-defined segment groups as one logical index.
     async fn build_distributed_segments(
         dataset: &mut Dataset,
-        segments: &[IndexMetadata],
-        target_segment_bytes: Option<u64>,
+        segments: Vec<IndexMetadata>,
         index_name: &str,
-    ) -> Vec<IndexSegment> {
-        let segment_plans = plan_segments(segments, None, target_segment_bytes)
-            .await
-            .unwrap();
-        let mut built_segments = Vec::with_capacity(segment_plans.len());
-        for plan in &segment_plans {
-            built_segments.push(
-                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
-                    .await
-                    .unwrap(),
-            );
-        }
+    ) -> Vec<IndexMetadata> {
         dataset
-            .commit_existing_index_segments(index_name, "vector", built_segments.clone())
+            .commit_existing_index_segments(index_name, "vector", segments.clone())
             .await
             .unwrap();
-
-        built_segments
+        segments
     }
 
     #[tokio::test]
@@ -1812,12 +1795,12 @@ mod tests {
             INDEX_NAME,
         )
         .await;
-        let segments = build_distributed_segments(&mut ds_split, &segments, None, INDEX_NAME).await;
+        let segments = build_distributed_segments(&mut ds_split, segments, INDEX_NAME).await;
         assert_eq!(segments.len(), expected_segment_count);
         for segment in &segments {
             let segment_index = ds_split
                 .indices_dir()
-                .child(segment.uuid().to_string())
+                .child(segment.uuid.to_string())
                 .child(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
@@ -1957,20 +1940,15 @@ mod tests {
         )
         .await;
 
-        let shard_plan = plan_segments(&segments, None, None).await.unwrap();
-        let shard_count = shard_plan.len();
-        assert!(shard_count >= 4);
-        let target_segment_bytes = shard_plan[0].estimated_bytes().saturating_mul(2);
-
-        let grouped_plan = plan_segments(&segments, None, Some(target_segment_bytes))
-            .await
-            .unwrap();
-        assert!(grouped_plan.len() < shard_count);
-        assert!(grouped_plan.iter().any(|plan| plan.segments().len() > 1));
-        let mut expected_fragment_coverage = grouped_plan
+        assert!(segments.len() >= 4);
+        let grouped_inputs = segments
+            .chunks(2)
+            .map(|group| group.to_vec())
+            .collect::<Vec<_>>();
+        let mut expected_fragment_coverage = grouped_inputs
             .iter()
-            .map(|plan| {
-                plan.segments()
+            .map(|group| {
+                group
                     .iter()
                     .flat_map(|partial| {
                         partial
@@ -1985,17 +1963,26 @@ mod tests {
             .collect::<Vec<_>>();
         expected_fragment_coverage.sort();
 
-        let grouped_segments = build_distributed_segments(
-            &mut ds_split,
-            &segments,
-            Some(target_segment_bytes),
-            INDEX_NAME,
+        let grouped_segments = futures::future::try_join_all(
+            grouped_inputs
+                .into_iter()
+                .map(|group| ds_split.merge_existing_index_segments(group)),
         )
-        .await;
-        assert_eq!(grouped_segments.len(), grouped_plan.len());
+        .await
+        .unwrap();
+        let grouped_segments =
+            build_distributed_segments(&mut ds_split, grouped_segments, INDEX_NAME).await;
+        assert_eq!(grouped_segments.len(), expected_fragment_coverage.len());
         let mut actual_fragment_coverage = grouped_segments
             .iter()
-            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .map(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         actual_fragment_coverage.sort();
         assert_eq!(
@@ -2089,7 +2076,10 @@ mod tests {
             segments.push(segment);
         }
 
-        let err = plan_segments(&segments, None, None).await.unwrap_err();
+        let err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
@@ -2120,19 +2110,6 @@ mod tests {
                 .unwrap();
             segments.push(segment);
         }
-
-        let plans = plan_segments(&segments, None, Some(1)).await.unwrap();
-        assert_eq!(plans.len(), fragments.iter().take(2).count());
-
-        let mut segments = Vec::with_capacity(plans.len());
-        for plan in &plans {
-            segments.push(
-                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert_eq!(segments.len(), plans.len());
 
         dataset
             .commit_existing_index_segments("vector_idx", "vector", segments)
