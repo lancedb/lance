@@ -1342,14 +1342,14 @@ public class Dataset implements Closeable {
    *
    * @return true if the dataset was created with stable row IDs enabled
    */
-  public boolean usesStableRowIds() {
+  public boolean hasStableRowIds() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeUsesStableRowIds();
+      return nativeHasStableRowIds();
     }
   }
 
-  private native boolean nativeUsesStableRowIds();
+  private native boolean nativeHasStableRowIds();
 
   /**
    * Get the Lance file format version of this dataset.

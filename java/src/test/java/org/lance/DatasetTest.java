@@ -1293,7 +1293,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testUsesStableRowIds(@TempDir Path tempDir) {
+  void testHasStableRowIds(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("uses_stable_row_ids").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -1301,7 +1301,7 @@ public class DatasetTest {
 
       // Dataset created without stable row IDs
       try (Dataset ds = testDataset.createEmptyDataset()) {
-        assertFalse(ds.usesStableRowIds());
+        assertFalse(ds.hasStableRowIds());
       }
     }
 
@@ -1314,7 +1314,7 @@ public class DatasetTest {
       try (Dataset ds =
           testDataset.createDatasetWithWriteParams(
               new WriteParams.Builder().withEnableStableRowIds(true).build())) {
-        assertTrue(ds.usesStableRowIds());
+        assertTrue(ds.hasStableRowIds());
       }
     }
   }
