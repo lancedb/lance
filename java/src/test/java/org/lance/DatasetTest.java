@@ -1293,6 +1293,33 @@ public class DatasetTest {
   }
 
   @Test
+  void testUsesStableRowIds(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("uses_stable_row_ids").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // Dataset created without stable row IDs
+      try (Dataset ds = testDataset.createEmptyDataset()) {
+        assertFalse(ds.usesStableRowIds());
+      }
+    }
+
+    String datasetPathWithRowIds = tempDir.resolve("uses_stable_row_ids_enabled").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPathWithRowIds);
+
+      // Dataset created with stable row IDs
+      try (Dataset ds =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())) {
+        assertTrue(ds.usesStableRowIds());
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();

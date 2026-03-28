@@ -1335,6 +1335,23 @@ public class Dataset implements Closeable {
   private native Map<String, String> nativeGetConfig();
 
   /**
+   * Check whether the dataset uses stable row IDs.
+   *
+   * <p>Stable row IDs remain constant when rows are moved during compaction. This reads the
+   * manifest feature flag directly rather than the user-facing config map.
+   *
+   * @return true if the dataset was created with stable row IDs enabled
+   */
+  public boolean usesStableRowIds() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeUsesStableRowIds();
+    }
+  }
+
+  private native boolean nativeUsesStableRowIds();
+
+  /**
    * Get the Lance file format version of this dataset.
    *
    * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".

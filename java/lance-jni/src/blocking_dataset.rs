@@ -1968,6 +1968,24 @@ fn inner_get_config<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeUsesStableRowIds(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jboolean {
+    ok_or_throw_with_return!(
+        env,
+        inner_uses_stable_row_ids(&mut env, java_dataset),
+        0u8
+    )
+}
+
+fn inner_uses_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    Ok(dataset_guard.inner.manifest().uses_stable_row_ids() as u8)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceFileFormatVersion<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
