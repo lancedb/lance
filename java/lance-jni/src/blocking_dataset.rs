@@ -631,6 +631,7 @@ fn create_dataset<'local>(
         &storage_options_obj,
         &initial_bases,
         &target_bases,
+        &JObject::null(), // allow_external_blob_outside_bases not used for Dataset.write()
     )?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
