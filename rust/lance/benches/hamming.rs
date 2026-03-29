@@ -26,7 +26,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use lance_arrow::FixedSizeListArrayExt;
 use rand::Rng;
 
-use lance::index::vector::hamming::{hamming_clustering_from_hashes, hamming_clustering_sampled};
+use lance::index::vector::hamming::{hamming_clustering_for_sample, hamming_clustering_from_hashes};
 use lance::{Dataset, dataset::WriteParams};
 use lance_linalg::distance::pairwise_hamming_distance_parallel;
 
@@ -145,7 +145,7 @@ fn bench_dataset_cluster(c: &mut Criterion) {
 
         group.bench_function(format!("external_sample_{}", sample_size), |b| {
             b.to_async(&rt).iter(|| async {
-                hamming_clustering_sampled(&dataset, &hash_column, Some(sample_size), threshold)
+                hamming_clustering_for_sample(&dataset, &hash_column, Some(sample_size), threshold)
                     .await
                     .unwrap()
             });
@@ -167,7 +167,7 @@ fn bench_dataset_cluster(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| {
                     let ds = ds.clone();
                     async move {
-                        hamming_clustering_sampled(&ds, "hash", Some(sample), 10)
+                        hamming_clustering_for_sample(&ds, "hash", Some(sample), 10)
                             .await
                             .unwrap()
                     }

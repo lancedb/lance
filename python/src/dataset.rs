@@ -2799,20 +2799,76 @@ impl Dataset {
     ///     - 'representative': uint64 - The representative row ID for each cluster
     ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     #[pyo3(signature = (column, sample_size, hamming_threshold))]
-    fn hamming_clustering_sampled(
+    fn hamming_clustering_for_sample(
         &self,
         py: Python<'_>,
         column: &str,
         sample_size: Option<usize>,
         hamming_threshold: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        use lance::index::vector::hamming::hamming_clustering_sampled;
+        use lance::index::vector::hamming::hamming_clustering_for_sample;
 
         let ds = self.ds.as_ref();
         let reader = rt()
             .block_on(
                 Some(py),
-                hamming_clustering_sampled(ds, column, sample_size, hamming_threshold),
+                hamming_clustering_for_sample(ds, column, sample_size, hamming_threshold),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Perform pairwise hamming distance clustering on a contiguous range of rows from a fragment.
+    ///
+    /// This function reads a contiguous range of rows from a specific fragment,
+    /// extracts hashes, computes pairwise hamming distances, and clusters the results.
+    /// Unlike sampling, this reads sequential rows which is useful for distributed
+    /// processing where each worker handles a specific range of a fragment.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    /// fragment_id : int
+    ///     The fragment ID to read from
+    /// start_row : int
+    ///     The starting row offset within the fragment
+    /// num_rows : int
+    ///     Number of rows to read from the start position
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, fragment_id, start_row, num_rows, hamming_threshold))]
+    fn hamming_clustering_for_range(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        fragment_id: usize,
+        start_row: usize,
+        num_rows: usize,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_range;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_range(
+                    ds,
+                    column,
+                    fragment_id,
+                    start_row,
+                    num_rows,
+                    hamming_threshold,
+                ),
             )?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 

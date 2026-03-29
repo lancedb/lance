@@ -819,7 +819,7 @@ def get_ivf_partition_info(
     return dataset._ds.get_ivf_partition_info(index_name)
 
 
-def hamming_clustering_sampled(
+def hamming_clustering_for_sample(
     dataset: "LanceDataset",
     column: str,
     sample_size: Optional[int] = None,
@@ -851,6 +851,52 @@ def hamming_clustering_sampled(
         - 'representative': uint64 - The representative row ID for each cluster
         - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     """
-    return dataset._ds.hamming_clustering_sampled(
+    return dataset._ds.hamming_clustering_for_sample(
         column, sample_size, hamming_threshold
+    )
+
+
+def hamming_clustering_for_range(
+    dataset: "LanceDataset",
+    column: str,
+    fragment_id: int,
+    start_row: int,
+    num_rows: int,
+    hamming_threshold: int = 10,
+) -> pa.RecordBatchReader:
+    """
+    Perform pairwise hamming distance clustering on a contiguous range of rows.
+
+    Reads a contiguous range of rows from a specific fragment, computes pairwise
+    hamming distances between all hashes in the range, filters by threshold,
+    and clusters the results using union-find.
+
+    Unlike sampling, this reads sequential rows which is useful for distributed
+    processing where each worker handles a specific range of a fragment.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column.
+    column : str
+        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    fragment_id : int
+        The fragment ID to read from
+    start_row : int
+        The starting row offset within the fragment
+    num_rows : int
+        Number of rows to read from the start position
+    hamming_threshold : int, default 10
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_range(
+        column, fragment_id, start_row, num_rows, hamming_threshold
     )
