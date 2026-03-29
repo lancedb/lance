@@ -1158,6 +1158,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_existing_index_segments_accepts_python_round_tripped_metadata() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&dataset, "vector").await,
+        );
+        let mut input_segments = Vec::new();
+
+        for fragment in fragments.iter().take(2) {
+            let mut segment =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segment.index_details = None;
+            input_segments.push(segment);
+        }
+
+        let merged_segment = dataset
+            .merge_existing_index_segments(input_segments)
+            .await
+            .unwrap();
+        assert!(
+            merged_segment
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.iter().collect::<Vec<_>>() == vec![0, 1])
+        );
+    }
+
+    #[tokio::test]
     async fn test_commit_existing_index_supports_local_hnsw_segments() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());

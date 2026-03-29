@@ -833,10 +833,15 @@ impl DatasetIndexExt for Dataset {
             ));
         }
         if !source_segments.iter().all(|segment| {
-            segment
-                .index_details
-                .as_ref()
-                .is_some_and(|details| type_name_from_uri(&details.type_url) == "Vector")
+            segment.index_details.as_ref().map_or_else(
+                || {
+                    segment
+                        .files
+                        .as_ref()
+                        .is_some_and(|files| files.iter().any(|file| file.path == INDEX_FILE_NAME))
+                },
+                |details| details.type_url.ends_with("VectorIndexDetails"),
+            )
         }) {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments currently only supports vector segments".to_string(),
