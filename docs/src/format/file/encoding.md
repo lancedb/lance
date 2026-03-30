@@ -674,13 +674,18 @@ This is always opt-in and should only be used when all struct fields are typical
 #### Mini-Block Size Tuning
 
 Each mini-block contains at most 4096 values by default. Because an entire mini-block must be fetched to
-read any value within it, workloads that need only a small contiguous slice of each mini-block may experience
-significant read amplification, especially over network-attached or object storage where bandwidth is limited.
+read any value within it, workloads that read only a small contiguous slice of each mini-block may experience
+read amplification.
+
+The default is appropriate for the vast majority of deployments. Local disks and typical cloud object storage
+(where the client and bucket are in the same region) have more than enough bandwidth that the overhead from
+the default mini-block size is negligible. You should only consider changing this setting if you have
+confirmed — through profiling — that mini-block read amplification is saturating your available bandwidth
+(for example, accessing a remote object store over a constrained network link).
 
 The maximum number of values per mini-block can be lowered via an environment variable:
 
 - `LANCE_MINIBLOCK_MAX_VALUES` (default `4096`): upper bound on the number of values in a single mini-block chunk.
 
 Reducing this value produces smaller mini-blocks, which reduces the amount of data fetched per read at the
-cost of more mini-blocks (and slightly more metadata overhead). This is most useful when reading small
-contiguous row ranges from object storage where over-the-wire bandwidth is the bottleneck.
+cost of more mini-blocks and slightly more metadata overhead.

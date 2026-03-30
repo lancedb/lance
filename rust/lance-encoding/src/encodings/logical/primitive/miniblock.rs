@@ -54,7 +54,9 @@ pub struct MiniBlockCompressed {
 /// data (values, repetition, and definition) per mini-block.
 ///
 /// The maximum number of values per chunk can be configured via the
-/// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.
+/// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.  This is only
+/// useful in extremely bandwidth-limited environments; the default is
+/// appropriate for local disks and same-region cloud object storage.
 #[derive(Debug)]
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
