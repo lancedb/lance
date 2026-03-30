@@ -10,9 +10,9 @@ use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
-use lance::index::DatasetIndexExt;
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -449,13 +449,9 @@ async fn do_load_shuffled_vectors(
         base_id: None,
         files: Some(files),
     };
-    ds.commit_existing_index_segments(
-        index_name,
-        column,
-        vec![metadata],
-    )
-    .await
-    .infer_error()?;
+    ds.commit_existing_index_segments(index_name, column, vec![metadata])
+        .await
+        .infer_error()?;
 
     Ok(())
 }

@@ -1095,11 +1095,7 @@ fn inner_merge_existing_index_segments<'local>(
     let merged_segment = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(
-            dataset_guard
-                .inner
-                .merge_existing_index_segments(segments),
-        )?
+        RT.block_on(dataset_guard.inner.merge_existing_index_segments(segments))?
     };
     (&merged_segment).into_java(env)
 }
