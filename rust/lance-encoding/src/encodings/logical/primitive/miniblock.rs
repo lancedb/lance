@@ -20,12 +20,16 @@ pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 
 const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
 
-pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-    std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
+fn parse_max_miniblock_values() -> u64 {
+    let val = std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
         .ok()
-        .and_then(|val| val.parse().ok())
-        .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES)
-});
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES);
+    val.clamp(1, DEFAULT_MAX_MINIBLOCK_VALUES)
+}
+
+pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> =
+    std::sync::LazyLock::new(parse_max_miniblock_values);
 
 /// Page data that has been compressed into a series of chunks put into
 /// a single buffer.
@@ -65,7 +69,7 @@ pub struct MiniBlockChunk {
     // For example, 1 would mean there are 2 values in the chunk and 12 would mean there
     // are 4Ki values in the chunk.
     //
-    // This must be <= 12 (i.e. <= 4096 values)
+    // This must be <= log2(MAX_MINIBLOCK_VALUES) (i.e. <= 12 at the default of 4096)
     pub log_num_values: u8,
 }
 
@@ -97,4 +101,50 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_parse_default() {
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+        assert_eq!(parse_max_miniblock_values(), 4096);
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_custom_value() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "256") };
+        assert_eq!(parse_max_miniblock_values(), 256);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_clamps_zero_to_one() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "0") };
+        assert_eq!(parse_max_miniblock_values(), 1);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_clamps_above_max() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "99999") };
+        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_invalid_falls_back_to_default() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "not_a_number") };
+        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
 }
