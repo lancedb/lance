@@ -62,12 +62,17 @@ def _bf16_to_tensor(arr: pa.Array) -> torch.Tensor:
 
     Reinterprets the raw bytes as uint16 and views as bfloat16,
     since they share the same 2-byte memory layout.
+    Null values are replaced with NaN.
     """
     storage = arr.storage if isinstance(arr.type, pa.ExtensionType) else arr
     buf = storage.buffers()[1]
     offset = storage.offset * 2  # 2 bytes per bf16 value
     np_uint16 = np.frombuffer(buf, dtype=np.uint16, count=len(storage), offset=offset)
-    return torch.from_numpy(np_uint16.copy()).view(torch.bfloat16)
+    tensor = torch.from_numpy(np_uint16.copy()).view(torch.bfloat16)
+    if arr.null_count > 0:
+        null_mask = torch.from_numpy(arr.is_null().to_numpy(zero_copy_only=False))
+        tensor[null_mask] = float("nan")
+    return tensor
 
 
 # Convert an Arrow FSL array into a 2D torch tensor
@@ -136,11 +141,13 @@ def _to_tensor(
             or pa.types.is_boolean(arr.type)
         ):
             tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
+
+            if (
+                uint64_as_int64 and tensor.dtype == torch.uint64
+            ):  # ← inside numeric branch ✓
+                tensor = tensor.to(torch.int64)
         elif _is_bfloat16_type(arr.type):
             tensor = _bf16_to_tensor(arr)
-
-            if uint64_as_int64 and tensor.dtype == torch.uint64:
-                tensor = tensor.to(torch.int64)
         elif hf_converter is not None:
             tensor = hf_converter.to_pytorch(col, arr)
 
