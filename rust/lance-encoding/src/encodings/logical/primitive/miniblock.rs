@@ -17,7 +17,15 @@ use crate::{buffer::LanceBuffer, data::DataBlock, format::pb21::CompressiveEncod
 use lance_core::Result;
 
 pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
-pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
+
+const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
+
+pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES)
+});
 
 /// Page data that has been compressed into a series of chunks put into
 /// a single buffer.
@@ -36,10 +44,13 @@ pub struct MiniBlockCompressed {
 /// Mini-block chunks are designed to be small (just a few disk sectors)
 /// and contain a power-of-two number of values (except for the last chunk)
 ///
-/// To enforce this we limit a chunk to 4Ki values and slightly less than
+/// By default we limit a chunk to 4Ki values and slightly less than
 /// 8KiB of compressed data.  This means that even in the extreme case
 /// where we have 4 bytes of rep/def then we will have at most 24KiB of
 /// data (values, repetition, and definition) per mini-block.
+///
+/// The maximum number of values per chunk can be configured via the
+/// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.
 #[derive(Debug)]
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
