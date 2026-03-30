@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::HashSet;
 use std::future;
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
@@ -23,7 +22,7 @@ use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
 };
 use itertools::Itertools;
-use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt, interleave_batches};
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::ROW_ID;
 use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
@@ -35,7 +34,7 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, pack_codes, unpack_codes};
+use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -88,147 +87,6 @@ use super::{
     ivf::load_precomputed_partitions_if_available,
     utils::{self, get_vector_type},
 };
-
-/// Stably sort a RecordBatch by the ROW_ID column in ascending order.
-///
-/// If the batch has no ROW_ID column or has fewer than 2 rows, it is
-/// returned unchanged. When sorting, the relative order of rows with the
-/// same ROW_ID is preserved.
-fn stable_sort_batch_by_row_id(batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
-    if let Some(row_id_col) = batch.column_by_name(ROW_ID) {
-        let row_ids = row_id_col.as_primitive::<UInt64Type>();
-        if row_ids.len() > 1 {
-            let max_rows_per_take = max_safe_take_rows(batch);
-            if max_rows_per_take == 0 {
-                return Err(Error::invalid_input(
-                    "Cannot sort batch by ROW_ID because a FixedSizeList column has no safe take window"
-                        .to_string(),
-                ));
-            }
-            if row_ids.len() > max_rows_per_take {
-                let mut sorted_runs = Vec::new();
-                for offset in (0..row_ids.len()).step_by(max_rows_per_take) {
-                    let len = (row_ids.len() - offset).min(max_rows_per_take);
-                    let batch_slice = batch.slice(offset, len);
-                    sorted_runs.push(stable_sort_small_batch_by_row_id(&batch_slice)?);
-                }
-                return merge_sorted_batches_by_row_id(sorted_runs, LARGE_ROW_ID_MERGE_BATCH_SIZE);
-            }
-            return Ok(vec![stable_sort_small_batch_by_row_id(batch)?]);
-        }
-    }
-    Ok(vec![batch.clone()])
-}
-
-/// Bound the number of rows we pass to Arrow's `take` when any column contains
-/// a FixedSizeList. Arrow 57 uses 32-bit child offsets in `take_fixed_size_list`,
-/// which overflows once `row_index * value_length > u32::MAX`.
-fn max_safe_take_rows(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .filter_map(|column| max_safe_take_rows_for_type(column.data_type()))
-        .min()
-        .unwrap_or(usize::MAX)
-}
-
-fn max_safe_take_rows_for_type(data_type: &DataType) -> Option<usize> {
-    match data_type {
-        DataType::FixedSizeList(field, value_length) => {
-            let child_limit = max_safe_take_rows_for_type(field.data_type()).unwrap_or(usize::MAX);
-            let value_length = usize::try_from(*value_length).ok()?;
-            let this_limit = if value_length == 0 {
-                usize::MAX
-            } else {
-                (u32::MAX as usize) / value_length
-            };
-            Some(this_limit.min(child_limit))
-        }
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::Map(field, _) => max_safe_take_rows_for_type(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .filter_map(|field| max_safe_take_rows_for_type(field.data_type()))
-            .min(),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .filter_map(|(_, field)| max_safe_take_rows_for_type(field.data_type()))
-            .min(),
-        DataType::Dictionary(_, value_type) => max_safe_take_rows_for_type(value_type),
-        DataType::RunEndEncoded(_, value_field) => {
-            max_safe_take_rows_for_type(value_field.data_type())
-        }
-        _ => None,
-    }
-}
-
-fn stable_sort_small_batch_by_row_id(batch: &RecordBatch) -> Result<RecordBatch> {
-    let row_ids = batch
-        .column_by_name(ROW_ID)
-        .ok_or_else(|| Error::invalid_input("ROW_ID column is missing".to_string()))?
-        .as_primitive::<UInt64Type>();
-
-    let mut order: Vec<usize> = (0..row_ids.len()).collect();
-    // Vec::sort_by is stable, so equal ROW_IDs keep their original relative order.
-    order.sort_by(|&i, &j| row_ids.value(i).cmp(&row_ids.value(j)));
-    let indices = UInt32Array::from_iter_values(order.into_iter().map(|i| i as u32));
-    Ok(batch.take(&indices)?)
-}
-
-const LARGE_ROW_ID_MERGE_BATCH_SIZE: usize = 65_536;
-
-fn merge_sorted_batches_by_row_id(
-    batches: Vec<RecordBatch>,
-    output_batch_size: usize,
-) -> Result<Vec<RecordBatch>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if batches.len() == 1 {
-        return Ok(batches);
-    }
-
-    let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::new();
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-        heap.push(Reverse((row_ids.value(0), batch_idx, 0)));
-    }
-
-    let mut merged_batches = Vec::new();
-    let mut current_indices = Vec::with_capacity(output_batch_size);
-
-    while let Some(Reverse((_, batch_idx, row_idx))) = heap.pop() {
-        current_indices.push((batch_idx, row_idx));
-        if current_indices.len() == output_batch_size {
-            merged_batches.push(interleave_batches(&batches, &current_indices)?);
-            current_indices.clear();
-        }
-
-        let next_row_idx = row_idx + 1;
-        if next_row_idx < batches[batch_idx].num_rows() {
-            let row_ids = batches[batch_idx][ROW_ID].as_primitive::<UInt64Type>();
-            heap.push(Reverse((
-                row_ids.value(next_row_idx),
-                batch_idx,
-                next_row_idx,
-            )));
-        }
-    }
-
-    if !current_indices.is_empty() {
-        merged_batches.push(interleave_batches(&batches, &current_indices)?);
-    }
-
-    Ok(merged_batches)
-}
 
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
@@ -1118,14 +976,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 _ => {}
             }
 
-            // Normalize each batch for this partition to be stably sorted by ROW_ID.
-            for batch in part_batches.iter_mut() {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let sorted_runs = stable_sort_batch_by_row_id(batch)?;
-                batches.extend(sorted_runs);
-            }
+            batches.extend(part_batches);
         }
 
         let mut loss = 0.0;
@@ -1148,9 +999,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .get(LOSS_METADATA_KEY)
                     .map(|s| s.parse::<f64>().unwrap_or(0.0))
                     .unwrap_or(0.0);
-                let batch = batch.drop_column(PART_ID_COLUMN)?;
-                let sorted_runs = stable_sort_batch_by_row_id(&batch)?;
-                batches.extend(sorted_runs);
+                batches.push(batch.drop_column(PART_ID_COLUMN)?);
             }
         }
 
@@ -1219,12 +1068,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             if storage.len() == 0 {
                 storage_ivf.add_partition(0);
             } else {
-                let mut sorted_runs = Vec::new();
-                for mut batch in storage.to_batches()?.collect::<Vec<_>>() {
-                    if is_pq && batch.column_by_name(PQ_CODE_COLUMN).is_some() {
-                        // The PQ storage keeps codes in a transposed layout (bytes grouped
-                        // across all rows). Convert them back to per-row layout so that a
-                        // stable ROW_ID sort moves PQ_CODE_COLUMN together with ROW_ID.
+                for mut batch in storage.to_batches()? {
+                    if is_pq
+                        && !self.transpose_codes
+                        && batch.num_rows() > 0
+                        && batch.column_by_name(PQ_CODE_COLUMN).is_some()
+                    {
                         let codes_fsl = batch
                             .column_by_name(PQ_CODE_COLUMN)
                             .unwrap()
@@ -1240,59 +1089,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         batch = batch.replace_column_by_name(PQ_CODE_COLUMN, original_fsl)?;
                     }
 
-                    if is_rq && batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
-                        // RQ storage batches reaching merge_partitions always come
-                        // from RabitQuantizationStorage, which canonicalizes codes
-                        // into packed layout in try_from_batch/remap. Materialize
-                        // row-major bytes so row-wise sort operates on per-row codes.
-                        let codes_fsl = batch
-                            .column_by_name(RABIT_CODE_COLUMN)
-                            .unwrap()
-                            .as_fixed_size_list();
-                        let unpacked = Arc::new(unpack_codes(codes_fsl));
-                        batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
-                    }
-
-                    // Enforce a stable ROW_ID ordering for all auxiliary batches so that the
-                    // PQ code column moves together with ROW_ID.
-                    sorted_runs.extend(stable_sort_batch_by_row_id(&batch)?);
-                }
-
-                for mut batch in
-                    merge_sorted_batches_by_row_id(sorted_runs, LARGE_ROW_ID_MERGE_BATCH_SIZE)?
-                {
-                    // For PQ storages, optionally convert codes back to transposed layout
-                    // in the unified auxiliary file. This keeps final PQ storage column-major
-                    // when `transpose_pq_codes` is enabled.
-                    if is_pq
-                        && self.transpose_codes
-                        && batch.column_by_name(PQ_CODE_COLUMN).is_some()
-                    {
-                        let codes_fsl = batch
-                            .column_by_name(PQ_CODE_COLUMN)
-                            .unwrap()
-                            .as_fixed_size_list();
-                        let num_rows = batch.num_rows();
-                        let bytes_per_code = codes_fsl.value_length() as usize;
-                        let codes = codes_fsl.values().as_primitive::<datatypes::UInt8Type>();
-                        let transposed_codes = transpose(codes, num_rows, bytes_per_code);
-                        let transposed_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
-                            transposed_codes,
-                            bytes_per_code as i32,
-                        )?);
-                        batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
-                    }
-
                     if is_rq
-                        && self.transpose_codes
+                        && !self.transpose_codes
+                        && batch.num_rows() > 0
                         && batch.column_by_name(RABIT_CODE_COLUMN).is_some()
                     {
                         let codes_fsl = batch
                             .column_by_name(RABIT_CODE_COLUMN)
                             .unwrap()
                             .as_fixed_size_list();
-                        let packed = Arc::new(pack_codes(codes_fsl));
-                        batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, packed)?;
+                        let unpacked = Arc::new(unpack_codes(codes_fsl));
+                        batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
                     }
 
                     storage_writer.write_batch(&batch).await?;
@@ -2282,9 +2089,43 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::types::UInt32Type;
     use arrow_array::{Array, Float32Array, NullArray};
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+
+    struct SingleBatchReader {
+        batch: RecordBatch,
+        partition_id: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ShuffleReader for SingleBatchReader {
+        async fn read_partition(
+            &self,
+            partition_id: usize,
+        ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+            if partition_id != self.partition_id || self.batch.num_rows() == 0 {
+                return Ok(None);
+            }
+
+            let schema = self.batch.schema();
+            let stream = stream::iter(vec![Ok(self.batch.clone())]);
+            Ok(Some(Box::new(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        }
+
+        fn partition_size(&self, partition_id: usize) -> Result<usize> {
+            Ok(if partition_id == self.partition_id {
+                self.batch.num_rows()
+            } else {
+                0
+            })
+        }
+
+        fn total_loss(&self) -> Option<f64> {
+            None
+        }
+    }
 
     #[test]
     fn select_reassign_candidates_skips_deleted_partition() {
@@ -2360,71 +2201,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stable_sort_batch_by_row_id_handles_large_fixed_size_list() {
+    #[tokio::test]
+    async fn take_partition_batches_preserves_partition_order_for_large_fixed_size_list() {
         let value_length = 1_073_741_824i32;
         let num_rows = 5usize;
         let row_ids = UInt64Array::from(vec![4_u64, 3, 2, 1, 0]);
+        let part_ids = UInt32Array::from(vec![0_u32; num_rows]);
         let values = Arc::new(NullArray::new(num_rows * value_length as usize));
         let item_field = Arc::new(Field::new("item", DataType::Null, true));
         let codes = FixedSizeListArray::try_new(item_field, value_length, values, None).unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(arrow_schema::Schema::new(vec![
                 ROW_ID_FIELD.clone(),
+                PART_ID_FIELD.clone(),
                 Field::new(PQ_CODE_COLUMN, codes.data_type().clone(), true),
             ])),
-            vec![Arc::new(row_ids), Arc::new(codes)],
+            vec![Arc::new(row_ids), Arc::new(part_ids), Arc::new(codes)],
         )
         .unwrap();
+        let reader = SingleBatchReader {
+            batch,
+            partition_id: 0,
+        };
 
-        let sorted = stable_sort_batch_by_row_id(&batch).unwrap();
-        assert_eq!(sorted.len(), 1);
-        let sorted_row_ids = sorted[0][ROW_ID].as_primitive::<UInt64Type>();
-        assert_eq!(sorted_row_ids.values(), &[0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn stable_sort_batch_by_row_id_preserves_stability_across_chunks() {
-        let value_length = 1_073_741_824i32;
-        let num_rows = 5usize;
-        let row_ids = UInt64Array::from(vec![2_u64, 1, 1, 1, 0]);
-        let seq = UInt32Array::from(vec![0_u32, 1, 2, 3, 4]);
-        let values = Arc::new(NullArray::new(num_rows * value_length as usize));
-        let item_field = Arc::new(Field::new("item", DataType::Null, true));
-        let codes = FixedSizeListArray::try_new(item_field, value_length, values, None).unwrap();
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema::Schema::new(vec![
-                ROW_ID_FIELD.clone(),
-                Field::new("seq", DataType::UInt32, false),
-                Field::new(PQ_CODE_COLUMN, codes.data_type().clone(), true),
-            ])),
-            vec![Arc::new(row_ids), Arc::new(seq), Arc::new(codes)],
+        let (batches, loss) = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::take_partition_batches(
+            0,
+            &[],
+            Some(&reader),
         )
+        .await
         .unwrap();
 
-        let sorted = stable_sort_batch_by_row_id(&batch).unwrap();
-        let sorted_row_ids = sorted
-            .iter()
-            .flat_map(|batch| {
-                batch[ROW_ID]
-                    .as_primitive::<UInt64Type>()
-                    .values()
-                    .iter()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
-        let sorted_seq = sorted
-            .iter()
-            .flat_map(|batch| {
-                batch["seq"]
-                    .as_primitive::<UInt32Type>()
-                    .values()
-                    .iter()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(sorted_row_ids, vec![0, 1, 1, 1, 2]);
-        assert_eq!(sorted_seq, vec![4, 1, 2, 3, 0]);
+        assert_eq!(loss, 0.0);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].column_by_name(PART_ID_COLUMN).is_none());
+        let row_ids = batches[0][ROW_ID].as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.values(), &[4, 3, 2, 1, 0]);
     }
 }
