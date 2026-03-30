@@ -259,7 +259,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         progress
             .stage_start("train_ivf", max_iters, "iterations")
             .await?;
-        self.with_ivf(self.load_or_build_ivf().await?);
+        self.with_ivf(self.load_or_build_ivf().boxed().await?);
         progress.stage_complete("train_ivf").await?;
 
         progress.stage_start("train_quantizer", None, "").await?;
@@ -270,7 +270,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if self.shuffle_reader.is_none() {
             let num_rows = self.num_rows_to_shuffle().await?;
             progress.stage_start("shuffle", num_rows, "rows").await?;
-            self.shuffle_dataset().await?;
+            self.shuffle_dataset().boxed().await?;
             progress.stage_complete("shuffle").await?;
         }
 
