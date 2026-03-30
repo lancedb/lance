@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
@@ -18,7 +19,7 @@ use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use tokio::sync::Mutex;
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder, row_offsets_to_row_addresses};
 use crate::{Error, Result};
 
 /// Helper function to extract a column from a RecordBatch, supporting nested field paths.
@@ -427,6 +428,11 @@ async fn sample_training_data(
     is_nullable: bool,
     fragment_ids: Option<&[u32]>,
 ) -> Result<FixedSizeListArray> {
+    let byte_width = vector_field
+        .data_type()
+        .byte_width_opt()
+        .unwrap_or(4 * 1024);
+
     if fragment_ids.is_some() {
         if !is_nullable {
             let projection = dataset.schema().project(&[column])?;
@@ -434,6 +440,19 @@ async fn sample_training_data(
                 .sample(sample_size_hint, &projection, fragment_ids)
                 .await?;
             return vector_column_to_fsl(&batch, column);
+        }
+
+        if matches!(vector_field.data_type(), DataType::FixedSizeList(_, _)) {
+            return sample_nullable_fsl_from_fragments(
+                dataset,
+                column,
+                sample_size_hint,
+                num_rows,
+                byte_width,
+                vector_field,
+                fragment_ids.unwrap(),
+            )
+            .await;
         }
 
         let batch = scan_all_training_data(dataset, column, is_nullable, fragment_ids).await?;
@@ -449,11 +468,6 @@ async fn sample_training_data(
         let sampled = arrow_select::take::take(&training_data, &indices, None)?;
         return Ok(sampled.as_fixed_size_list().clone());
     }
-
-    let byte_width = vector_field
-        .data_type()
-        .byte_width_opt()
-        .unwrap_or(4 * 1024);
 
     match vector_field.data_type() {
         DataType::FixedSizeList(_, _) if !is_nullable && fragment_ids.is_none() => {
@@ -597,6 +611,120 @@ async fn sample_nullable_fsl(
 
     info!(
         "Sample training data: retrieved {} rows by sampling after filtering out nulls",
+        num_rows_out
+    );
+
+    fsl_values_to_array(vector_field, values_buf, num_rows_out)
+}
+
+/// Sample nullable FixedSizeList vectors from a fragment-filtered dataset
+/// without materializing all selected rows in memory.
+///
+/// `Dataset::sample` can undershoot after null filtering, while the old
+/// `scan_all_training_data` fallback eagerly loaded every selected row. This
+/// helper keeps sampling bounded chunks from the selected fragments, filtering
+/// nulls batch-by-batch until enough training vectors have been collected.
+async fn sample_nullable_fsl_from_fragments(
+    dataset: &Dataset,
+    column: &str,
+    sample_size_hint: usize,
+    num_rows: usize,
+    byte_width: usize,
+    vector_field: &lance_core::datatypes::Field,
+    fragment_ids: &[u32],
+) -> Result<FixedSizeListArray> {
+    if fragment_ids.is_empty() {
+        return Err(Error::invalid_input(
+            "Training fragment filter must not be empty".to_string(),
+        ));
+    }
+
+    let mut ordered_ids = fragment_ids.to_vec();
+    ordered_ids.sort_unstable();
+    ordered_ids.dedup();
+    let selected_fragments = dataset
+        .get_frags_from_ordered_ids(&ordered_ids)
+        .into_iter()
+        .zip(ordered_ids.iter())
+        .map(|(fragment, fragment_id)| {
+            fragment.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Unknown fragment id {fragment_id} in training fragment filter"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let dataset = Arc::new(dataset.clone());
+    let projection = Arc::new(
+        ProjectionRequest::from(dataset.schema().project(&[column])?)
+            .into_projection_plan(dataset.clone())?,
+    );
+
+    let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
+    let mut num_non_null: usize = 0;
+    let mut seen_offsets = HashSet::with_capacity(sample_size_hint.min(num_rows));
+    let mut rng = SmallRng::from_os_rng();
+
+    const TAKE_CHUNK_SIZE: usize = 8192;
+
+    while num_non_null < sample_size_hint && seen_offsets.len() < num_rows {
+        let remaining_needed = sample_size_hint - num_non_null;
+        let request_size = remaining_needed
+            .saturating_mul(2)
+            .max(remaining_needed)
+            .min(num_rows - seen_offsets.len());
+        let mut sampled_offsets = if num_rows - seen_offsets.len() <= request_size.saturating_mul(4)
+        {
+            let mut unseen_offsets = (0..num_rows as u64)
+                .filter(|offset| !seen_offsets.contains(offset))
+                .collect::<Vec<_>>();
+            unseen_offsets.shuffle(&mut rng);
+            unseen_offsets.truncate(request_size);
+            seen_offsets.extend(unseen_offsets.iter().copied());
+            unseen_offsets
+        } else {
+            let mut sampled_offsets = Vec::with_capacity(request_size);
+            while sampled_offsets.len() < request_size {
+                let offset = rng.random_range(0..num_rows as u64);
+                if seen_offsets.insert(offset) {
+                    sampled_offsets.push(offset);
+                }
+            }
+            sampled_offsets
+        };
+        if sampled_offsets.is_empty() {
+            break;
+        }
+        sampled_offsets.sort_unstable();
+
+        let mut row_addrs =
+            row_offsets_to_row_addresses(&selected_fragments, &sampled_offsets).await?;
+        row_addrs.sort_unstable();
+
+        for chunk in row_addrs.chunks(TAKE_CHUNK_SIZE) {
+            let batch = TakeBuilder::try_new_from_addresses(
+                dataset.clone(),
+                chunk.to_vec(),
+                projection.clone(),
+            )?
+            .execute()
+            .await?;
+            let array = get_column_from_batch(&batch, column)?;
+            if array.logical_null_count() >= array.len() {
+                continue;
+            }
+            accumulate_fsl_values(&mut values_buf, &mut num_non_null, &array, byte_width, true)?;
+            if num_non_null >= sample_size_hint {
+                break;
+            }
+        }
+    }
+
+    let num_rows_out = num_non_null.min(sample_size_hint);
+    values_buf.truncate(num_rows_out * byte_width);
+
+    info!(
+        "Sample training data: retrieved {} rows by fragment-limited sampling after filtering out nulls",
         num_rows_out
     );
 
@@ -834,12 +962,11 @@ fn random_ranges(
 mod tests {
     use super::*;
 
+    use crate::dataset::InsertBuilder;
     use arrow_array::{Float32Array, types::Float32Type};
     use arrow_schema::{DataType, Field};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
-
-    use crate::dataset::InsertBuilder;
 
     #[rstest::rstest]
     #[test]

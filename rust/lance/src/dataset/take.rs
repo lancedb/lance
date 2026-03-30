@@ -43,7 +43,7 @@ use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 /// to the address (1, 10), assuming the second fragment starts with 10 undeleted rows.
 ///
 /// If any offsets are beyond the end of the dataset, they will be mapped to a tombstone row address.
-pub(super) async fn row_offsets_to_row_addresses(
+pub(crate) async fn row_offsets_to_row_addresses(
     fragments: &[FileFragment],
     row_indices: &[u64],
 ) -> Result<Vec<u64>> {

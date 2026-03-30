@@ -60,7 +60,6 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -87,6 +86,8 @@ pub mod udtf;
 pub mod updater;
 mod utils;
 pub mod write;
+
+pub(crate) use take::row_offsets_to_row_addresses;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
