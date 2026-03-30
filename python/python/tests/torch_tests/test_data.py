@@ -326,6 +326,60 @@ def test_blob_api(tmp_path: Path):
     assert first["val"].shape == (4, 100)
 
 
+def test_iter_over_dataset_bfloat16(tmp_path):
+    """Test that bfloat16 vector columns convert to torch.bfloat16 tensors."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from lance.arrow import BFloat16Array
+
+    dim = 32
+    num_rows = 128
+    # Create random bfloat16 vectors via float32 → bfloat16 cast
+    f32_data = np.random.random(num_rows * dim).astype("f")
+    bf16_data = f32_data.astype(ml_dtypes.bfloat16)
+
+    # Build a FixedSizeList<bf16> column
+    inner = BFloat16Array.from_numpy(bf16_data)
+    fsl = pa.FixedSizeListArray.from_arrays(inner, dim)
+    ids = pa.array(range(num_rows), type=pa.int32())
+    tbl = pa.Table.from_arrays([ids, fsl], ["ids", "vec"])
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+
+    torch_ds = LanceDataset(ds, batch_size=16, columns=["ids", "vec"])
+
+    total_rows = 0
+    for batch in torch_ds:
+        assert set(batch.keys()) == {"ids", "vec"}
+        assert batch["vec"].dtype == torch.bfloat16
+        assert batch["vec"].shape[1] == dim
+        assert batch["ids"].dtype == torch.int32
+        total_rows += batch["vec"].shape[0]
+    assert total_rows == num_rows
+
+
+def test_scalar_bfloat16_column(tmp_path):
+    """Test that a scalar bfloat16 column converts to torch.bfloat16 tensor."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from lance.arrow import BFloat16Array
+
+    num_rows = 64
+    f32_data = np.random.random(num_rows).astype("f")
+    bf16_data = f32_data.astype(ml_dtypes.bfloat16)
+
+    arr = BFloat16Array.from_numpy(bf16_data)
+    tbl = pa.Table.from_arrays([arr], ["val"])
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance")
+
+    torch_ds = LanceDataset(ds, batch_size=16, columns=["val"])
+
+    total_rows = 0
+    for batch in torch_ds:
+        assert batch.dtype == torch.bfloat16
+        total_rows += batch.shape[0]
+    assert total_rows == num_rows
+
+
 def test_safe_lance_dataset_worker_uses_dataset_options(tmp_path: Path):
     """Worker processes must reopen the dataset with dataset_options.
 
