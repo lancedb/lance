@@ -2072,3 +2072,132 @@ async fn test_fts_index_incremental_reindex_after_in_place_update() {
         results.num_rows()
     );
 }
+
+/// Regression test for https://github.com/lance-format/lance/issues/6338
+/// Sub-schema merge_insert with binary columns on v2.2 causes data corruption
+/// when the binary values are >= 256 bytes.
+#[tokio::test]
+async fn test_sub_schema_merge_insert_binary_v2_2() {
+    use crate::dataset::write::merge_insert::WhenMatched;
+    use arrow_array::BinaryArray;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("a", DataType::Binary, true),
+        ArrowField::new("b", DataType::Utf8, true),
+    ]));
+
+    let test_uri = TempStrDir::default();
+
+    // Initial write: 2 rows with null binary values
+    let initial_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![0, 1])),
+            Arc::new(BinaryArray::from(vec![None::<&[u8]>, None])),
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+        ],
+    )
+    .unwrap();
+
+    let write_params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let batches = RecordBatchIterator::new(vec![initial_batch].into_iter().map(Ok), schema.clone());
+    Dataset::write(batches, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    let sub_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("a", DataType::Binary, true),
+    ]));
+
+    // Sub-schema merge_insert for row 0 (binary value >= 256 bytes)
+    let data_a: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+    {
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0])),
+                Arc::new(BinaryArray::from(vec![Some(data_a.as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![update_batch].into_iter().map(Ok),
+            sub_schema.clone(),
+        ));
+        MergeInsertBuilder::try_new(dataset.into(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+    }
+
+    // Read back and verify first merge worked
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let table = dataset
+        .scan()
+        .project(&["id", "a"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let table = concat_batches(&table[0].schema(), &table).unwrap();
+    assert_eq!(table.num_rows(), 2);
+
+    // Sub-schema merge_insert for row 1 (binary value >= 256 bytes)
+    let data_b: Vec<u8> = (0..256).map(|i| ((i + 100) % 251) as u8).collect();
+    {
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![Some(data_b.as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![update_batch].into_iter().map(Ok),
+            sub_schema.clone(),
+        ));
+        MergeInsertBuilder::try_new(dataset.into(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+    }
+
+    // Read back and verify - this is where the bug manifests
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let table = dataset
+        .scan()
+        .project(&["id", "a"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let table = concat_batches(&table[0].schema(), &table).unwrap();
+    assert_eq!(table.num_rows(), 2);
+
+    let a_col = table.column_by_name("a").unwrap();
+    let binary_arr = a_col.as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(binary_arr.value(0), data_a.as_slice());
+    assert_eq!(binary_arr.value(1), data_b.as_slice());
+}

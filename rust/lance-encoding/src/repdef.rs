@@ -817,6 +817,10 @@ impl RepDefBuilder {
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
         self.check_validity_len(validity.len());
+        if validity.null_count() == 0 {
+            self.add_no_null(validity.len());
+            return;
+        }
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             num_values: validity.len(),
             validity: Some(validity.into_inner()),
