@@ -52,6 +52,7 @@ pub mod merge_insert;
 mod retry;
 pub mod update;
 
+pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::CommitBuilder;
 pub use delete::{DeleteBuilder, DeleteResult};
 pub use insert::InsertBuilder;
@@ -177,6 +178,13 @@ pub struct WriteParams {
 
     pub progress: Arc<dyn WriteFragmentProgress>,
 
+    /// Optional callback invoked after each batch is written.
+    ///
+    /// Receives cumulative [`WriteStats`] so callers can render a progress bar
+    /// or compute throughput. The callback must be cheap and non-blocking;
+    /// spawn a task if you need async work.
+    pub write_progress: Option<WriteProgressFn>,
+
     /// If present, dataset will use this to update the latest version
     ///
     /// If not set, the default will be based on the object store.  Generally this will
@@ -263,6 +271,7 @@ impl Default for WriteParams {
             mode: WriteMode::Create,
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            write_progress: None,
             commit_handler: None,
             data_storage_version: None,
             enable_stable_row_ids: false,
@@ -430,6 +439,9 @@ pub async fn do_write_fragments(
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
+    let mut bytes_completed: u64 = 0;
+    let mut rows_completed: u64 = 0;
+    let mut files_written: u32 = 0;
     while let Some(batch_chunk) = buffered_reader.next().await {
         let batch_chunk = batch_chunk?;
 
@@ -441,8 +453,17 @@ pub async fn do_write_fragments(
         }
 
         writer.as_mut().unwrap().write(&batch_chunk).await?;
-        for batch in batch_chunk {
+        for batch in &batch_chunk {
             num_rows_in_current_file += batch.num_rows() as u32;
+        }
+
+        if let Some(cb) = &params.write_progress {
+            let current_bytes = writer.as_mut().unwrap().tell().await?;
+            cb.call(WriteStats {
+                bytes_written: bytes_completed + current_bytes,
+                rows_written: rows_completed + num_rows_in_current_file as u64,
+                files_written,
+            });
         }
 
         if num_rows_in_current_file >= params.max_rows_per_file as u32
@@ -451,6 +472,9 @@ pub async fn do_write_fragments(
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
+            bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+            rows_completed += num_rows as u64;
+            files_written += 1;
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
             last_fragment.physical_rows = Some(num_rows as usize);
@@ -463,6 +487,16 @@ pub async fn do_write_fragments(
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+        bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+        rows_completed += num_rows as u64;
+        files_written += 1;
+        if let Some(cb) = &params.write_progress {
+            cb.call(WriteStats {
+                bytes_written: bytes_completed,
+                rows_written: rows_completed,
+                files_written,
+            });
+        }
         let last_fragment = fragments.last_mut().unwrap();
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);

@@ -499,23 +499,43 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
-                dataset.clone(),
-                vector_column.to_owned(),
-                index_dir,
-                distance_type,
-                shuffler,
-                HnswBuildParams::default(),
-                frag_reuse_index,
-                options.clone(),
-            )?
-            .with_ivf(ivf_model.clone())
-            .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
-            .build()
-            .await?
+            if element_type == DataType::UInt8 {
+                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            } else {
+                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            }
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
@@ -1558,11 +1578,22 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
-        (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
+        (SubIndexType::Hnsw, QuantizationType::Flat) => match element_type {
+            DataType::UInt8 => {
+                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
                 .remap(mapping)
                 .await
-        }
+            }
+            _ => {
+                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+        },
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,

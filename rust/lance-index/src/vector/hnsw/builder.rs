@@ -5,7 +5,7 @@
 
 use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Float32Type, UInt32Type};
+use arrow::datatypes::{DataType, Float32Type, UInt32Type};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
@@ -31,7 +31,7 @@ use super::super::graph::beam_search;
 use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
-use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
     BorrowingGraph, DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode,
@@ -101,11 +101,25 @@ impl HnswBuildParams {
     /// - `data`: A FixedSizeList to build the HNSW.
     /// - `distance_type`: The distance type to use.
     pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
-        let vec_store = Arc::new(FlatFloatStorage::new(
-            data.as_fixed_size_list().clone(),
-            distance_type,
-        ));
-        HNSW::index_vectors(vec_store.as_ref(), self)
+        let vectors = data.as_fixed_size_list().clone();
+        match (vectors.value_type(), distance_type) {
+            (DataType::UInt8, DistanceType::Hamming) => {
+                let vec_store = Arc::new(FlatBinStorage::new(vectors, distance_type));
+                HNSW::index_vectors(vec_store.as_ref(), self)
+            }
+            (DataType::UInt8, _) => Err(Error::invalid_input(format!(
+                "HNSW only supports hamming distance for UInt8 vectors, got {}",
+                distance_type
+            ))),
+            (_, DistanceType::Hamming) => Err(Error::invalid_input(format!(
+                "HNSW hamming distance only supports UInt8 vectors, got {}",
+                vectors.value_type()
+            ))),
+            _ => {
+                let vec_store = Arc::new(FlatFloatStorage::new(vectors, distance_type));
+                HNSW::index_vectors(vec_store.as_ref(), self)
+            }
+        }
     }
 }
 
@@ -934,7 +948,7 @@ impl IvfSubIndex for HNSW {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, UInt8Array};
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_file::previous::{
@@ -953,7 +967,7 @@ mod tests {
     use crate::scalar::IndexWriter;
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::FlatFloatStorage,
+        flat::storage::{FlatBinStorage, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{
             HNSW, VECTOR_ID_FIELD,
@@ -979,6 +993,67 @@ mod tests {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("test_builder_write_load");
+        let writer = object_store.create(&path).await.unwrap();
+        let schema = Schema::new(vec![
+            VECTOR_ID_FIELD.clone(),
+            NEIGHBORS_FIELD.clone(),
+            DISTS_FIELD.clone(),
+        ]);
+        let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+            writer,
+            schema,
+            &PreviousFileWriterOptions::default(),
+        )
+        .unwrap();
+        let batch = builder.to_batch().unwrap();
+        let metadata = batch.schema_ref().metadata().clone();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish_with_metadata(&metadata).await.unwrap();
+
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+            .await
+            .unwrap();
+        let batch = reader
+            .read_range(0..reader.len(), reader.schema())
+            .await
+            .unwrap();
+        let loaded_hnsw = HNSW::load(batch).unwrap();
+
+        let query = fsl.value(0);
+        let k = 10;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let builder_results = builder
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
+            .unwrap();
+        let loaded_results = loaded_hnsw
+            .search_basic(query, k, &params, None, store.as_ref())
+            .unwrap();
+        assert_eq!(builder_results, loaded_results);
+    }
+
+    #[tokio::test]
+    async fn test_builder_write_load_binary_hamming() {
+        const DIM: usize = 8;
+        const TOTAL: usize = 256;
+        const NUM_EDGES: usize = 20;
+        let data = UInt8Array::from_iter_values((0..TOTAL * DIM).map(|v| (v % 16) as u8));
+        let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let store = Arc::new(FlatBinStorage::new(fsl.clone(), DistanceType::Hamming));
+        let builder = HnswBuildParams::default()
+            .num_edges(NUM_EDGES)
+            .ef_construction(50)
+            .build(Arc::new(fsl.clone()), DistanceType::Hamming)
+            .await
+            .unwrap();
+
+        let object_store = ObjectStore::memory();
+        let path = Path::from("test_builder_write_load_binary_hamming");
         let writer = object_store.create(&path).await.unwrap();
         let schema = Schema::new(vec![
             VECTOR_ID_FIELD.clone(),

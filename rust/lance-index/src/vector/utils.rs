@@ -15,6 +15,7 @@ use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
+use crate::vector::flat::storage::FlatBinStorage;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::hnsw::HNSW;
 use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
@@ -42,22 +43,34 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
 
 #[derive(Debug)]
 pub struct SimpleIndex {
-    store: FlatFloatStorage,
+    store: SimpleStore,
     index: HNSW,
 }
 
+#[derive(Debug)]
+enum SimpleStore {
+    Float(FlatFloatStorage),
+    Binary(FlatBinStorage),
+}
+
 impl SimpleIndex {
-    pub fn try_new(store: FlatFloatStorage) -> Result<Self> {
-        let hnsw = HNSW::index_vectors(
-            &store,
-            HnswBuildParams::default().ef_construction(15).num_edges(12),
-        )?;
+    fn try_new(store: SimpleStore) -> Result<Self> {
+        let hnsw = match &store {
+            SimpleStore::Float(store) => HNSW::index_vectors(
+                store,
+                HnswBuildParams::default().ef_construction(15).num_edges(12),
+            )?,
+            SimpleStore::Binary(store) => HNSW::index_vectors(
+                store,
+                HnswBuildParams::default().ef_construction(15).num_edges(12),
+            )?,
+        };
         Ok(Self { store, index: hnsw })
     }
 
     // train HNSW over the centroids to speed up finding the nearest clusters,
     // only train if all conditions are met:
-    //  - the centroids are float32s or uint8s
+    //  - the centroids are float16/float32 or uint8 with hamming distance
     //  - `num_centroids * dimension >= 1_000_000`
     //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
     //      so set the threshold to 1_000_000.
@@ -76,31 +89,44 @@ impl SimpleIndex {
             _ => {}
         }
 
-        let f32_centroids = match centroids.data_type() {
-            DataType::Float16 | DataType::Float32 => {
-                cast(&centroids, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?
+        let store = match (centroids.data_type(), distance_type) {
+            (DataType::Float16 | DataType::Float32, _) => {
+                let f32_centroids = cast(&centroids, &DataType::Float32)
+                    .map_err(|e| Error::index(e.to_string()))?;
+                let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
+                SimpleStore::Float(FlatFloatStorage::new(fsl, distance_type))
+            }
+            (DataType::UInt8, DistanceType::Hamming) => {
+                let fsl = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
+                SimpleStore::Binary(FlatBinStorage::new(fsl, distance_type))
             }
             _ => return Ok(None),
         };
-        let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
-        let store = FlatFloatStorage::new(fsl, distance_type);
         Self::try_new(store).map(Some)
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
-        let query = cast(&query, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?;
-        let res = self.index.search_basic(
-            query,
-            1,
-            &HnswQueryParams {
-                ef: 15,
-                lower_bound: None,
-                upper_bound: None,
-                dist_q_c: 0.0,
-            },
-            None,
-            &self.store,
-        )?;
+        let params = HnswQueryParams {
+            ef: 15,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let res = match &self.store {
+            SimpleStore::Float(store) => {
+                let query =
+                    cast(&query, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?;
+                self.index.search_basic(query, 1, &params, None, store)?
+            }
+            SimpleStore::Binary(store) => {
+                let query = if query.data_type() == &DataType::UInt8 {
+                    query
+                } else {
+                    cast(&query, &DataType::UInt8).map_err(|e| Error::index(e.to_string()))?
+                };
+                self.index.search_basic(query, 1, &params, None, store)?
+            }
+        };
         Ok((res[0].id, res[0].dist.0))
     }
 }
@@ -253,7 +279,7 @@ pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
 mod tests {
     use super::*;
 
-    use arrow_array::{Float16Array, Float32Array, Float64Array};
+    use arrow_array::{Float16Array, Float32Array, Float64Array, UInt8Array};
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
@@ -264,7 +290,18 @@ mod tests {
     fn build_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
         let f32_centroids = cast(&centroids, &DataType::Float32).unwrap();
         let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dim as i32).unwrap();
-        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let store = SimpleStore::Float(FlatFloatStorage::new(fsl, DistanceType::L2));
+        SimpleIndex::try_new(store).unwrap()
+    }
+
+    fn build_binary_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
+        let u8_centroids = if centroids.data_type() == &DataType::UInt8 {
+            centroids
+        } else {
+            cast(&centroids, &DataType::UInt8).unwrap()
+        };
+        let fsl = FixedSizeListArray::try_new_from_values(u8_centroids, dim as i32).unwrap();
+        let store = SimpleStore::Binary(FlatBinStorage::new(fsl, DistanceType::Hamming));
         SimpleIndex::try_new(store).unwrap()
     }
 
@@ -283,8 +320,29 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_index_nearest_centroid_binary() {
+        let centroids: ArrayRef = Arc::new(UInt8Array::from(
+            (0..100)
+                .flat_map(|i| std::iter::repeat_n(i as u8, 16))
+                .collect::<Vec<_>>(),
+        ));
+        let index = build_binary_index(centroids, 16);
+        let query: ArrayRef = Arc::new(UInt8Array::from(vec![42u8; 16]));
+        let (id, dist) = index.search(query).unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(dist, 0.0);
+    }
+
+    #[test]
     fn test_simple_index_rejects_f64() {
         let centroids: ArrayRef = Arc::new(Float64Array::from(vec![0.0; 1600]));
+        let result = SimpleIndex::may_train_index(centroids, 16, DistanceType::L2).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_simple_index_rejects_uint8_non_hamming() {
+        let centroids: ArrayRef = Arc::new(UInt8Array::from(vec![0u8; 1600]));
         let result = SimpleIndex::may_train_index(centroids, 16, DistanceType::L2).unwrap();
         assert!(result.is_none());
     }
