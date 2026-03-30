@@ -96,6 +96,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
     }
+
+    fn type_name() -> &'static str {
+        // Using type_name is safe here: the impl is in the same crate as the
+        // types, so the monomorphized pointer is consistent.
+        std::any::type_name::<PartitionEntry<S, Q>>()
+    }
 }
 
 /// IVF Index.

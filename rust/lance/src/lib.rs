@@ -72,7 +72,7 @@
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;
-pub use lance_core::{Error, Result};
+pub use lance_core::{Error, Result, cache};
 use std::sync::LazyLock;
 
 pub mod arrow;

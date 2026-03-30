@@ -31,5 +31,27 @@ The index accumulates a new **reuse version** every time a compaction is execute
 As long as all the scalar and vector indices are created after the specific reuse version,
 the indices are all caught up and the specific reuse version can be trimmed.
 
-It is expected that the user schedules an additional process to trim the index periodically
-to keep the list of reuse versions in control.
+## Impacts
+
+### Conflict Resolution
+
+The presence of the Fragment Reuse Index changes how Lance detects conflicts between concurrent
+operations. Operations that would normally conflict with compaction (such as index building) can
+proceed without conflict when the FRI is in use. For full details on how conflict detection is
+affected, see [conflict resolution](../../transaction.md#conflict-resolution).
+
+### Index Load Cost
+
+When the FRI is present, indices must be remapped at load time. Each time an index is loaded into
+the cache, the FRI is applied to translate old row addresses to current ones. This adds a small
+cost to index loading but does not affect query performance once the index is cached.
+
+### FRI Growth and Cleanup
+
+The FRI grows with each compaction. Every compaction that defers index remapping adds a new reuse
+version to the index. Over time, this can accumulate and increase the cost of index loading since
+more address translations must be applied.
+
+Once all scalar and vector indices have been rebuilt past a given reuse version, that version is no
+longer needed and can be trimmed. Users should schedule a periodic process to trim stale reuse
+versions and keep the FRI size under control.

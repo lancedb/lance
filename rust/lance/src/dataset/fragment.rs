@@ -1879,6 +1879,10 @@ impl CacheKey for FileMetadataCacheKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         "".into()
     }
+
+    fn type_name() -> &'static str {
+        "FileMetadata"
+    }
 }
 
 impl From<FileFragment> for Fragment {
