@@ -9,6 +9,7 @@ use crate::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_arrow::json::{JsonArray, is_arrow_json_field, json_field};
 
+use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::UInt64Array;
 use arrow_array::{Array, FixedSizeListArray};
@@ -24,7 +25,7 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     SCORE_FIELD, query::PhraseQuery, tokenizer::InvertedIndexParams,
 };
-use lance_index::{DatasetIndexExt, IndexType, vector::DIST_COL};
+use lance_index::{IndexType, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;

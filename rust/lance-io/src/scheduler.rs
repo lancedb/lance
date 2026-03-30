@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+use tokio::sync::Notify;
 
 use lance_core::{Error, Result};
 
@@ -32,19 +32,6 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
-// By default, we limit the number of IOPS across the entire process to 128
-//
-// In theory this is enough for ~10GBps on S3 following the guidelines to issue
-// 1 IOP per 80MBps.  In practice, I have noticed slightly better performance going
-// up to 256.
-//
-// However, non-S3 stores (e.g. GCS, Azure) can suffer significantly from too many
-// concurrent IOPS.  For safety, we set the default to 128 and let the user override
-// this if needed.
-//
-// Note: this only limits things that run through the scheduler.  It does not limit
-// IOPS from other sources like writing or commits.
-static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -53,97 +40,6 @@ pub fn iops_counter() -> u64 {
 pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
 }
-
-// There are two structures that control the I/O scheduler concurrency.  First,
-// we have a hard limit on the number of IOPS that can be issued concurrently.
-// This limit is process-wide.
-//
-// Second, we try and limit how many I/O requests can be buffered in memory without
-// being consumed by a decoder of some kind.  This limit is per-scheduler.  We cannot
-// make this limit process wide without introducing deadlock (because the decoder for
-// file 0 might be waiting on IOPS blocked by a queue filled with requests for file 1)
-// and vice-versa.
-//
-// There is also a per-scan limit on the number of IOPS that can be issued concurrently.
-//
-// The process-wide limit exists when users need a hard limit on the number of parallel
-// IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
-// the network.  (Note: a process-wide limit of X will not necessarily limit the number of
-// open TCP connections to exactly X.  The underlying object store may open more connections
-// anyways)
-//
-// However, it can be too tough in some cases, e.g. when some scans are reading from
-// cloud storage and other scans are reading from local disk.  In these cases users don't
-// need to set a process-limit and can rely on the per-scan limits.
-
-// The IopsQuota enforces the first of the above limits, it is the per-process hard cap
-// on the number of IOPS that can be issued concurrently.
-//
-// The per-scan limits are enforced by IoQueue
-struct IopsQuota {
-    // An Option is used here to avoid mutex overhead if no limit is set
-    iops_avail: Option<Semaphore>,
-}
-
-/// A reservation on the global IOPS quota
-///
-/// When the reservation is dropped, the IOPS quota is released unless
-/// [`Self::forget`] is called.
-struct IopsReservation<'a> {
-    value: Option<SemaphorePermit<'a>>,
-}
-
-impl IopsReservation<'_> {
-    // Forget the reservation, so it won't be released on drop
-    fn forget(&mut self) {
-        if let Some(value) = self.value.take() {
-            value.forget();
-        }
-    }
-}
-
-impl IopsQuota {
-    // By default, we throttle the number of scan IOPS across the entire process
-    //
-    // However, the user can disable this by setting the environment variable
-    // LANCE_PROCESS_IO_THREADS_LIMIT to zero (or a negative integer).
-    fn new() -> Self {
-        let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
-            .map(|s| {
-                s.parse::<i32>().unwrap_or_else(|_| {
-                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
-                    DEFAULT_PROCESS_IOPS_LIMIT
-                })
-            })
-            .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT);
-        let iops_avail = if initial_capacity <= 0 {
-            None
-        } else {
-            Some(Semaphore::new(initial_capacity as usize))
-        };
-        Self { iops_avail }
-    }
-
-    // Return a reservation on the global IOPS quota
-    fn release(&self) {
-        if let Some(iops_avail) = self.iops_avail.as_ref() {
-            iops_avail.add_permits(1);
-        }
-    }
-
-    // Acquire a reservation on the global IOPS quota
-    async fn acquire(&self) -> IopsReservation<'_> {
-        if let Some(iops_avail) = self.iops_avail.as_ref() {
-            IopsReservation {
-                value: Some(iops_avail.acquire().await.unwrap()),
-            }
-        } else {
-            IopsReservation { value: None }
-        }
-    }
-}
-
-static IOPS_QUOTA: std::sync::LazyLock<IopsQuota> = std::sync::LazyLock::new(IopsQuota::new);
 
 // We want to allow requests that have a lower priority than any
 // currently in-flight request.  This helps avoid potential deadlocks
@@ -303,17 +199,8 @@ impl IoQueue {
     async fn pop(&self) -> Option<IoTask> {
         loop {
             {
-                // First, grab a reservation on the global IOPS quota
-                // If we then get a task to run, transfer the reservation
-                // to the task.  Otherwise, the reservation will be released
-                // when iop_res is dropped.
-                let mut iop_res = IOPS_QUOTA.acquire().await;
-                // Next, try and grab a reservation from the queue
                 let mut state = self.state.lock().unwrap();
                 if let Some(task) = state.next_task() {
-                    // Reservation successfully acquired, we will release the global
-                    // global reservation after task has run.
-                    iop_res.forget();
                     return Some(task);
                 }
 
@@ -501,7 +388,6 @@ impl IoTask {
             range_end = self.to_read.end,
             "File I/O completed"
         );
-        IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
 }

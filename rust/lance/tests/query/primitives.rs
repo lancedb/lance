@@ -13,8 +13,9 @@ use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 
+use lance::index::DatasetIndexExt;
 use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 
 use super::{test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;

@@ -7,9 +7,10 @@ use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt32Array};
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::{InsertBuilder, WriteParams};
+use lance::index::DatasetIndexExt;
+use lance_index::IndexType;
 use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
-use lance_index::{DatasetIndexExt, IndexType};
 use tantivy::tokenizer::Language;
 
 use super::{strip_score_column, test_fts, test_scan, test_take};

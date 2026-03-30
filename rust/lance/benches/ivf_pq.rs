@@ -9,13 +9,14 @@ use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
 
+use lance::index::DatasetIndexExt;
 use lance::{
     Dataset,
     dataset::{WriteMode, WriteParams},
     index::vector::VectorIndexParams,
 };
 use lance_arrow::*;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;
 #[cfg(target_os = "linux")]

@@ -440,7 +440,12 @@ pub async fn create_credential_vendor_for_location(
 }
 
 /// Parse permission from properties, defaulting to Read
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
     properties
         .get(PERMISSION)
@@ -449,7 +454,12 @@ fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
 }
 
 /// Parse duration from properties using a vendor-specific key, defaulting to DEFAULT_CREDENTIAL_DURATION_MILLIS
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_duration_millis(properties: &HashMap<String, String>, key: &str) -> u64 {
     properties
         .get(key)
@@ -462,13 +472,14 @@ async fn create_aws_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use aws::{AwsCredentialVendor, AwsCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // AWS requires role_arn to be configured
     let role_arn = properties.get(aws_props::ROLE_ARN).ok_or_else(|| {
-        Error::invalid_input_source(
-            "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set".into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message: "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set"
+                .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, aws_props::DURATION_MILLIS);
@@ -516,14 +527,15 @@ fn create_azure_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use azure::{AzureCredentialVendor, AzureCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // Azure requires account_name to be configured
     let account_name = properties.get(azure_props::ACCOUNT_NAME).ok_or_else(|| {
-        Error::invalid_input_source(
-            "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
-                .into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message:
+                "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
+                    .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, azure_props::DURATION_MILLIS);

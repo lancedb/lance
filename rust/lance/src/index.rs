@@ -24,6 +24,7 @@ use lance_core::utils::tracing::{
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
+use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
@@ -42,10 +43,8 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::{
-    DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment, PrewarmOptions,
-};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
+use lance_index::PrewarmOptions;
 use lance_index::{
     IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
@@ -67,6 +66,7 @@ use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
+mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
@@ -81,6 +81,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+pub use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentPlan};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -88,6 +89,7 @@ use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
+pub use lance_index::IndexDescription;
 
 fn validate_index_segments(index_name: &str, segments: &[IndexSegment]) -> Result<()> {
     if segments.is_empty() {
@@ -97,6 +99,7 @@ fn validate_index_segments(index_name: &str, segments: &[IndexSegment]) -> Resul
     }
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
+    let mut covered_fragments = RoaringBitmap::new();
     for segment in segments {
         if !seen_segment_ids.insert(segment.uuid()) {
             return Err(Error::invalid_input(format!(
@@ -105,6 +108,13 @@ fn validate_index_segments(index_name: &str, segments: &[IndexSegment]) -> Resul
                 index_name
             )));
         }
+        if !covered_fragments.is_disjoint(segment.fragment_bitmap()) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: overlapping fragment coverage in segment set for index '{}'",
+                index_name
+            )));
+        }
+        covered_fragments |= segment.fragment_bitmap().clone();
     }
 
     Ok(())
@@ -163,6 +173,10 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
+
+    fn type_name() -> &'static str {
+        "ScalarIndex"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +200,10 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         } else {
             self.uuid.into()
         }
+    }
+
+    fn type_name() -> &'static str {
+        "VectorIndex"
     }
 }
 
@@ -211,6 +229,10 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndex"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +256,10 @@ impl CacheKey for MemWalCacheKey<'_> {
         } else {
             self.uuid.to_string().into()
         }
+    }
+
+    fn type_name() -> &'static str {
+        "MemWalIndex"
     }
 }
 
@@ -647,7 +673,8 @@ impl DatasetIndexExt for Dataset {
     /// Create a scalar BTREE index:
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// let params = ScalarIndexParams::default();
     /// dataset
@@ -661,7 +688,8 @@ impl DatasetIndexExt for Dataset {
     /// Create an empty index that will be populated later:
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// let params = ScalarIndexParams::default();
     /// dataset
@@ -1192,7 +1220,9 @@ async fn index_statistics_scalar(
         "index_type": index_type,
         "name": index_name,
         "num_indices": num_indices,
-        "indices": indices_stats,
+        "num_segments": num_indices,
+        "indices": indices_stats.clone(),
+        "segments": indices_stats,
         "num_indexed_fragments": num_indexed_fragments,
         "num_indexed_rows": num_indexed_rows,
         "num_unindexed_fragments": num_unindexed_fragments,
@@ -2440,8 +2470,13 @@ mod tests {
         fn get_bitmap(meta: &IndexMetadata) -> Vec<u32> {
             meta.fragment_bitmap.as_ref().unwrap().iter().collect()
         }
+        fn assert_segment_aliases(stats: &serde_json::Value) {
+            assert_eq!(stats["num_segments"], stats["num_indices"]);
+            assert_eq!(stats["segments"], stats["indices"]);
+        }
 
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2454,6 +2489,7 @@ mod tests {
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
         dataset.append(reader, None).await.unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2468,6 +2504,7 @@ mod tests {
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2485,6 +2522,7 @@ mod tests {
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2495,6 +2533,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         let stats = get_stats(&dataset, "other_vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
@@ -2511,6 +2550,7 @@ mod tests {
             .unwrap();
 
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
@@ -2525,6 +2565,7 @@ mod tests {
             .await
             .unwrap();
         let stats = get_stats(&dataset, "other_vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
@@ -5405,6 +5446,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_overlapping_fragment_coverage() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![
+                    IndexSegment::new(
+                        Uuid::new_v4(),
+                        [0_u32, 1_u32],
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version(),
+                    ),
+                    IndexSegment::new(
+                        Uuid::new_v4(),
+                        [1_u32],
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
     #[tokio::test]

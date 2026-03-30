@@ -1149,13 +1149,11 @@ async fn new_source_iter(
 
 struct SpillStreamIter {
     receiver: SpillReceiver,
-    #[allow(dead_code)] // Exists to keep the SpillSender alive
-    sender_handle: tokio::task::JoinHandle<SpillSender>,
+    _sender_handle: tokio::task::JoinHandle<SpillSender>,
     // This temp dir is used to store the spilled data. It is kept alive by
     // this struct. When this struct is dropped, the Drop implementation of
     // tempfile::TempDir will delete the temp dir.
-    #[allow(dead_code)] // Exists to keep the temp dir alive
-    tmp_dir: TempDir,
+    _tmp_dir: TempDir,
 }
 
 impl SpillStreamIter {
@@ -1199,8 +1197,8 @@ impl SpillStreamIter {
 
         Ok(Self {
             receiver,
-            tmp_dir,
-            sender_handle,
+            _tmp_dir: tmp_dir,
+            _sender_handle: sender_handle,
         })
     }
 }

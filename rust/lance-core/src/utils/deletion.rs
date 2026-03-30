@@ -32,7 +32,6 @@ impl DeepSizeOf for DeletionVector {
 }
 
 impl DeletionVector {
-    #[allow(dead_code)] // Used in tests
     pub fn len(&self) -> usize {
         match self {
             Self::NoDeletions => 0,

@@ -48,6 +48,7 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -56,7 +57,7 @@ use crate::session::index_caches::IndexMetadataKey;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::{DatasetIndexExt, is_system_index};
+use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::path::Path;
@@ -72,7 +73,7 @@ pub mod namespace_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,

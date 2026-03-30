@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, LazyLock};
 
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
@@ -39,7 +40,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
     lance_format::LanceIndexStore,
 };
-use lance_index::{DatasetIndexExt, IndexCriteria, IndexType};
+use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use tracing::instrument;
@@ -819,9 +820,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_btree() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
 
@@ -925,9 +926,9 @@ mod tests {
     #[tokio::test]
     async fn test_optimize_scalar_index_btree() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
 
@@ -1043,9 +1044,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_bitmap() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::scalar::ScalarIndexParams;
 
         let test_dir = TempStrDir::default();
@@ -1123,8 +1124,8 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_inverted() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use lance_datagen::{BatchCount, ByteCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 
@@ -1262,9 +1263,9 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_scalar_index_zonemap() {
         use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
         use arrow_array::types::Float32Type;
         use lance_datagen::{BatchCount, RowCount, array};
-        use lance_index::DatasetIndexExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::ScalarIndexParams;
         use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;

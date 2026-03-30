@@ -386,7 +386,7 @@ impl FieldEncoder for BlobFieldEncoder {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::{
         collections::HashMap,
         sync::{Arc, LazyLock},

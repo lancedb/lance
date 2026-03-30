@@ -129,6 +129,10 @@ impl CacheKey for BitmapKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("{}", self.value.0).into()
     }
+
+    fn type_name() -> &'static str {
+        "Bitmap"
+    }
 }
 
 impl BitmapIndex {
@@ -884,7 +888,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::lance_format::LanceIndexStore;

@@ -503,6 +503,18 @@ pub async fn build_pq_model(
     params: &PQBuildParams,
     ivf: Option<&IvfModel>,
 ) -> Result<ProductQuantizer> {
+    build_pq_model_in_fragments(dataset, column, dim, metric_type, params, ivf, None).await
+}
+
+pub async fn build_pq_model_in_fragments(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &PQBuildParams,
+    ivf: Option<&IvfModel>,
+    fragment_ids: Option<&[u32]>,
+) -> Result<ProductQuantizer> {
     let num_codes = 2_usize.pow(params.num_bits as u32);
 
     if let Some(codebook) = &params.codebook {
@@ -542,7 +554,7 @@ pub async fn build_pq_model(
     );
     let start = std::time::Instant::now();
     let mut training_data =
-        maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+        maybe_sample_training_data(dataset, column, expected_sample_size, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -712,6 +724,7 @@ mod tests {
             DIM,
             MetricType::Cosine,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await

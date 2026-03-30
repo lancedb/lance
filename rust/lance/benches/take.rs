@@ -376,7 +376,7 @@ fn bench_sample(c: &mut Criterion) {
                     let schema = schema.clone();
                     let dataset = dataset.clone();
                     async move {
-                        dataset.sample(sample_size, &schema).await.unwrap();
+                        dataset.sample(sample_size, &schema, None).await.unwrap();
                     }
                 })
             },

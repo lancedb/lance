@@ -170,6 +170,10 @@ impl CacheKey for NGramPostingListKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("posting-list-{}", self.row_offset).into()
     }
+
+    fn type_name() -> &'static str {
+        "NGramPostingList"
+    }
 }
 
 impl NGramPostingList {

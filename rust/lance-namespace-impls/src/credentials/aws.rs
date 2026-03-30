@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::Client as StsClient;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_io::object_store::uri_to_url;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::models::Identity;
 use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
@@ -167,7 +168,9 @@ impl AwsCredentialVendor {
         let bucket = url
             .host_str()
             .ok_or_else(|| {
-                Error::invalid_input_source(format!("S3 URI '{}' missing bucket", uri).into())
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("S3 URI '{}' missing bucket", uri),
+                })
             })?
             .to_string();
 
@@ -325,9 +328,9 @@ impl AwsCredentialVendor {
         permission: VendedPermission,
     ) -> Result<VendedCredentials> {
         let credentials = credentials.ok_or_else(|| {
-            Error::io_source(Box::new(std::io::Error::other(
-                "STS response missing credentials",
-            )))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "STS response missing credentials".to_string(),
+            })
         })?;
 
         let access_key_id = credentials.access_key_id().to_string();
@@ -391,10 +394,12 @@ impl AwsCredentialVendor {
             .send()
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "AssumeRoleWithWebIdentity failed for role '{}': {}",
-                    self.config.role_arn, e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "AssumeRoleWithWebIdentity failed for role '{}': {}",
+                        self.config.role_arn, e
+                    ),
+                })
             })?;
 
         self.extract_credentials(
@@ -413,9 +418,10 @@ impl AwsCredentialVendor {
         api_key: &str,
     ) -> Result<VendedCredentials> {
         let salt = self.config.api_key_salt.as_ref().ok_or_else(|| {
-            Error::invalid_input_source(
-                "api_key_salt must be configured to use API key authentication".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "api_key_salt must be configured to use API key authentication"
+                    .to_string(),
+            })
         })?;
 
         let key_hash = Self::hash_api_key(api_key, salt);
@@ -431,7 +437,9 @@ impl AwsCredentialVendor {
                     "Invalid API key: hash {} not found in permissions map",
                     &key_hash[..8]
                 );
-                Error::invalid_input_source("Invalid API key".into())
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Invalid API key".to_string(),
+                })
             })?;
 
         let policy = Self::build_policy(bucket, prefix, permission);
@@ -453,10 +461,12 @@ impl AwsCredentialVendor {
             .external_id(&key_hash); // Use hash as external_id
 
         let response = request.send().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "AssumeRole with API key failed for role '{}': {}",
-                self.config.role_arn, e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "AssumeRole with API key failed for role '{}': {}",
+                    self.config.role_arn, e
+                ),
+            })
         })?;
 
         self.extract_credentials(response.credentials(), bucket, prefix, permission)
@@ -496,10 +506,12 @@ impl AwsCredentialVendor {
         }
 
         let response = request.send().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "AssumeRole failed for role '{}': {}",
-                self.config.role_arn, e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "AssumeRole failed for role '{}': {}",
+                    self.config.role_arn, e
+                ),
+            })
         })?;
 
         self.extract_credentials(
@@ -546,9 +558,11 @@ impl CredentialVendor for AwsCredentialVendor {
             }
             Some(_) => {
                 // Identity provided but neither api_key nor auth_token set
-                Err(Error::invalid_input_source(
-                    "Identity provided but neither api_key nor auth_token is set".into(),
-                ))
+                Err(NamespaceError::InvalidInput {
+                    message: "Identity provided but neither api_key nor auth_token is set"
+                        .to_string(),
+                }
+                .into())
             }
             None => {
                 // Use AssumeRole with static configuration

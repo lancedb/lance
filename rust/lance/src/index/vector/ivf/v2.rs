@@ -96,6 +96,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
     }
+
+    fn type_name() -> &'static str {
+        // Using type_name is safe here: the impl is in the same crate as the
+        // types, so the monomorphized pointer is consistent.
+        std::any::type_name::<PartitionEntry<S, Q>>()
+    }
 }
 
 /// IVF Index.
@@ -626,7 +632,9 @@ mod tests {
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
+    use crate::index::IndexSegment;
     use crate::index::vector::ivf::v2::IvfPq;
     use crate::index::vector::ivf::{build_segment, plan_segments};
     use crate::utils::test::copy_test_data_to_tmp;
@@ -644,6 +652,7 @@ mod tests {
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
+    use lance_index::IndexType;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -653,7 +662,6 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -1288,7 +1296,6 @@ mod tests {
         .unwrap();
     }
 
-    #[allow(dead_code)]
     async fn ground_truth(
         dataset: &Dataset,
         column: &str,
@@ -1314,7 +1321,6 @@ mod tests {
             .collect()
     }
 
-    #[allow(dead_code)]
     fn multivec_ground_truth(
         vectors: &ListArray,
         query: &dyn Array,
@@ -1965,6 +1971,23 @@ mod tests {
             .unwrap();
         assert!(grouped_plan.len() < shard_count);
         assert!(grouped_plan.iter().any(|plan| plan.segments().len() > 1));
+        let mut expected_fragment_coverage = grouped_plan
+            .iter()
+            .map(|plan| {
+                plan.segments()
+                    .iter()
+                    .flat_map(|partial| {
+                        partial
+                            .fragment_bitmap
+                            .as_ref()
+                            .expect("partial shard should have fragment coverage")
+                            .iter()
+                    })
+                    .sorted()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        expected_fragment_coverage.sort();
 
         let grouped_segments = build_distributed_segments(
             &mut ds_split,
@@ -1974,6 +1997,15 @@ mod tests {
         )
         .await;
         assert_eq!(grouped_segments.len(), grouped_plan.len());
+        let mut actual_fragment_coverage = grouped_segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        actual_fragment_coverage.sort();
+        assert_eq!(
+            actual_fragment_coverage, expected_fragment_coverage,
+            "built segment coverage should equal the union of its source partial shards",
+        );
 
         async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
             let mut ids_per_query = Vec::with_capacity(queries.len());
@@ -2018,7 +2050,21 @@ mod tests {
 
         let ids_single = collect_row_ids(&ds_single, &queries).await;
         let ids_split = collect_row_ids(&ds_split, &queries).await;
-        assert_eq!(ids_single, ids_split);
+        if matches!(index_type, IndexType::IvfSq) {
+            for (single, split) in ids_single.iter().zip(ids_split.iter()) {
+                assert_eq!(single.len(), split.len());
+                let overlap = single
+                    .iter()
+                    .filter(|row_id| split.contains(row_id))
+                    .count();
+                assert!(
+                    overlap >= K / 3,
+                    "single vs segmented distributed SQ index returned too little top-k overlap",
+                );
+            }
+        } else {
+            assert_eq!(ids_single, ids_split);
+        }
     }
 
     #[tokio::test]

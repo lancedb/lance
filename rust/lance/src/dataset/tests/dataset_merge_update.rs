@@ -9,11 +9,12 @@ use crate::dataset::WriteDestination;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest};
+use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::ROW_ADDR;
+use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use mock_instant::thread_local::MockClock;
 
 use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};

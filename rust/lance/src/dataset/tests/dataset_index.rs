@@ -15,6 +15,7 @@ use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
+use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;

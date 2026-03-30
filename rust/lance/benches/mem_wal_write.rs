@@ -54,12 +54,13 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, RegionWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::DistanceType;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

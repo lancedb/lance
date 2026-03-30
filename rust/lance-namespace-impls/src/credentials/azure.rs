@@ -16,8 +16,9 @@ use azure_storage::prelude::*;
 use azure_storage::shared_access_signature::service_sas::{BlobSharedAccessSignature, SasKey};
 use azure_storage_blobs::prelude::*;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_io::object_store::uri_to_url;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::models::Identity;
 use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
@@ -237,10 +238,9 @@ impl AzureCredentialVendor {
         let credential =
             DefaultAzureCredential::create(azure_identity::TokenCredentialOptions::default())
                 .map_err(|e| {
-                    Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to create Azure credentials: {}",
-                        e
-                    ))))
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to create Azure credentials: {}", e),
+                    })
                 })?;
 
         let credential: Arc<dyn TokenCredential> = Arc::new(credential);
@@ -265,10 +265,12 @@ impl AzureCredentialVendor {
             .get_user_deligation_key(now, key_end_time)
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to get user delegation key for account '{}': {}",
-                    account, e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to get user delegation key for account '{}': {}",
+                        account, e
+                    ),
+                })
             })?;
 
         let permissions = Self::build_sas_permissions(self.config.permission);
@@ -283,20 +285,21 @@ impl AzureCredentialVendor {
             )
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to generate SAS token for container '{}': {}",
-                    container, e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to generate SAS token for container '{}': {}",
+                        container, e
+                    ),
+                })
             })?;
 
         let expires_at_millis =
             (end_time.unix_timestamp() * 1000 + end_time.millisecond() as i64) as u64;
 
         let token = sas_token.token().map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to get SAS token: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to get SAS token: {}", e),
+            })
         })?;
 
         Ok((token, expires_at_millis))
@@ -312,10 +315,9 @@ impl AzureCredentialVendor {
         let credential =
             DefaultAzureCredential::create(azure_identity::TokenCredentialOptions::default())
                 .map_err(|e| {
-                    Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to create Azure credentials: {}",
-                        e
-                    ))))
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to create Azure credentials: {}", e),
+                    })
                 })?;
 
         let credential: Arc<dyn TokenCredential> = Arc::new(credential);
@@ -336,10 +338,12 @@ impl AzureCredentialVendor {
             .get_user_deligation_key(now, key_end_time)
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to get user delegation key for account '{}': {}",
-                    account, e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to get user delegation key for account '{}': {}",
+                        account, e
+                    ),
+                })
             })?;
 
         let permissions = Self::build_sas_permissions(permission);
@@ -352,20 +356,21 @@ impl AzureCredentialVendor {
             )
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to generate SAS token for container '{}': {}",
-                    container, e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to generate SAS token for container '{}': {}",
+                        container, e
+                    ),
+                })
             })?;
 
         let expires_at_millis =
             (end_time.unix_timestamp() * 1000 + end_time.millisecond() as i64) as u64;
 
         let token = sas_token.token().map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to get SAS token: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to get SAS token: {}", e),
+            })
         })?;
 
         Ok((token, expires_at_millis))
@@ -391,10 +396,9 @@ impl AzureCredentialVendor {
         let credential =
             DefaultAzureCredential::create(azure_identity::TokenCredentialOptions::default())
                 .map_err(|e| {
-                    Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to create Azure credentials: {}",
-                        e
-                    ))))
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to create Azure credentials: {}", e),
+                    })
                 })?;
 
         let credential: Arc<dyn TokenCredential> = Arc::new(credential);
@@ -415,10 +419,12 @@ impl AzureCredentialVendor {
             .get_user_deligation_key(now, key_end_time)
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to get user delegation key for account '{}': {}",
-                    account, e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to get user delegation key for account '{}': {}",
+                        account, e
+                    ),
+                })
             })?;
 
         // Normalize path: remove leading/trailing slashes
@@ -448,10 +454,9 @@ impl AzureCredentialVendor {
         .signed_directory_depth(depth as u8);
 
         let token = sas.token().map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to generate directory SAS token: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to generate directory SAS token: {}", e),
+            })
         })?;
 
         let expires_at_millis =
@@ -472,15 +477,16 @@ impl AzureCredentialVendor {
     /// 2. The OIDC token's issuer and subject to match the Federated Credential configuration
     async fn exchange_oidc_for_azure_token(&self, oidc_token: &str) -> Result<String> {
         let tenant_id = self.config.tenant_id.as_ref().ok_or_else(|| {
-            Error::invalid_input_source(
-                "azure_tenant_id must be configured for OIDC token exchange".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "azure_tenant_id must be configured for OIDC token exchange".to_string(),
+            })
         })?;
 
         let client_id = self.config.federated_client_id.as_ref().ok_or_else(|| {
-            Error::invalid_input_source(
-                "azure_federated_client_id must be configured for OIDC token exchange".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "azure_federated_client_id must be configured for OIDC token exchange"
+                    .to_string(),
+            })
         })?;
 
         let token_url = format!(
@@ -506,26 +512,27 @@ impl AzureCredentialVendor {
             .send()
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to exchange OIDC token for Azure AD token: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to exchange OIDC token for Azure AD token: {}", e),
+                })
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
-                "Azure AD token exchange failed with status {}: {}",
-                status, body
-            )))));
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Azure AD token exchange failed with status {}: {}",
+                    status, body
+                ),
+            }
+            .into());
         }
 
         let token_response: serde_json::Value = response.json().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to parse Azure AD token response: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to parse Azure AD token response: {}", e),
+            })
         })?;
 
         token_response
@@ -533,9 +540,9 @@ impl AzureCredentialVendor {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| {
-                Error::io_source(Box::new(std::io::Error::other(
-                    "Azure AD token response missing access_token",
-                )))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: "Azure AD token response missing access_token".to_string(),
+                })
             })
     }
 
@@ -571,10 +578,12 @@ impl AzureCredentialVendor {
             .get_user_deligation_key(now, key_end_time)
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to get user delegation key with federated token: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to get user delegation key with federated token: {}",
+                        e
+                    ),
+                })
             })?;
 
         let permissions = Self::build_sas_permissions(permission);
@@ -594,17 +603,18 @@ impl AzureCredentialVendor {
                 )
                 .await
                 .map_err(|e| {
-                    Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to generate SAS token with federated token: {}",
-                        e
-                    ))))
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to generate SAS token with federated token: {}",
+                            e
+                        ),
+                    })
                 })?;
 
             sas_token.token().map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to get SAS token: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to get SAS token: {}", e),
+                })
             })?
         } else {
             // Directory-scoped SAS
@@ -622,10 +632,12 @@ impl AzureCredentialVendor {
             .signed_directory_depth(depth as u8);
 
             sas.token().map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to generate directory SAS token with federated token: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to generate directory SAS token with federated token: {}",
+                        e
+                    ),
+                })
             })?
         };
 
@@ -694,9 +706,10 @@ impl AzureCredentialVendor {
         api_key: &str,
     ) -> Result<VendedCredentials> {
         let salt = self.config.api_key_salt.as_ref().ok_or_else(|| {
-            Error::invalid_input_source(
-                "api_key_salt must be configured to use API key authentication".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "api_key_salt must be configured to use API key authentication"
+                    .to_string(),
+            })
         })?;
 
         let key_hash = Self::hash_api_key(api_key, salt);
@@ -712,7 +725,9 @@ impl AzureCredentialVendor {
                     "Invalid API key: hash {} not found in permissions map",
                     &key_hash[..8]
                 );
-                Error::invalid_input_source("Invalid API key".into())
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Invalid API key".to_string(),
+                })
             })?;
 
         debug!(
@@ -806,9 +821,9 @@ impl CredentialVendor for AzureCredentialVendor {
         let url = uri_to_url(table_location)?;
 
         let container = url.host_str().ok_or_else(|| {
-            Error::invalid_input_source(
-                format!("Azure URI '{}' missing container", table_location).into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!("Azure URI '{}' missing container", table_location),
+            })
         })?;
 
         // Extract path for directory-scoped SAS
@@ -818,7 +833,7 @@ impl CredentialVendor for AzureCredentialVendor {
             self.config
                 .account_name
                 .as_ref()
-                .ok_or_else(|| Error::invalid_input_source("Azure credential vending requires 'credential_vendor.azure_account_name' to be set in configuration".into()))?;
+                .ok_or_else(|| lance_core::Error::from(NamespaceError::InvalidInput { message: "Azure credential vending requires 'credential_vendor.azure_account_name' to be set in configuration".to_string() }))?;
 
         // Dispatch based on identity
         match identity {
@@ -832,9 +847,10 @@ impl CredentialVendor for AzureCredentialVendor {
                 self.vend_with_api_key(account, container, path, api_key)
                     .await
             }
-            Some(_) => Err(Error::invalid_input_source(
-                "Identity provided but neither auth_token nor api_key is set".into(),
-            )),
+            Some(_) => Err(NamespaceError::InvalidInput {
+                message: "Identity provided but neither auth_token nor api_key is set".to_string(),
+            }
+            .into()),
             None => {
                 // Static credential vending using DefaultAzureCredential
                 // Use directory-scoped SAS when path is provided, container-level otherwise

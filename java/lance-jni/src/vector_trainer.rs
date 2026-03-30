@@ -117,6 +117,7 @@ fn inner_train_ivf_centroids<'local>(
             dim,
             metric_type,
             &ivf_params,
+            None,
             Arc::new(NoopIndexBuildProgress),
         ))?;
 

@@ -790,8 +790,13 @@ public class Dataset implements Closeable {
    * @return the version id of the dataset
    */
   public long version() {
-    return getVersion().getId();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetVersionId();
+    }
   }
+
+  private native long nativeGetVersionId();
 
   /**
    * Gets the currently checked out version of the dataset.
@@ -1252,7 +1257,11 @@ public class Dataset implements Closeable {
   /**
    * Get all indexes with full metadata.
    *
-   * @return list of Index objects with complete metadata including index type and fragment coverage
+   * <p>Each returned {@link Index} is a physical index segment from the manifest. Use {@link
+   * #describeIndices()} for the logical-index view.
+   *
+   * @return list of Index objects with complete segment metadata, including index type and fragment
+   *     coverage
    */
   public List<Index> getIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
+use crate::index::DatasetIndexExt;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_index::DatasetIndexExt;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, RegionSpec};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;

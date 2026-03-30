@@ -4,6 +4,9 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 ## Commands
 
+* Environment: prefer `uv` for local Python environment setup; start with `uv sync --extra tests --extra dev`, and add other extras such as `benchmarks`, `torch`, or `geo` only when needed.
+* Command execution: after initializing the environment with `uv`, either activate the environment or use `uv run ...`; keep `Makefile` targets and CI commands environment-manager agnostic unless CI has been migrated explicitly.
+* Build time expectations: `uv sync` and `uv run maturin develop` build the local `pylance` Rust extension as part of the environment workflow. This can be slow, especially on the first run or after Rust dependency changes; treat that as expected and do not switch to a different environment manager just because the build takes time.
 * Build: `maturin develop` (required after Rust changes)
 * Test: `make test`
 * Run single test: `pytest python/tests/<test_file>.py::<test_name>`
