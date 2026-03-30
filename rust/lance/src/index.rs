@@ -6132,11 +6132,7 @@ mod tests {
             .unwrap();
 
         // Do a full scan to warm up data file metadata
-        let _ = dataset
-            .scan()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let _ = dataset.scan().try_into_batch().await.unwrap();
 
         // Reset IO stats before query
         let _ = dataset.object_store().io_stats_incremental();
