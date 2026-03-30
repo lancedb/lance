@@ -58,10 +58,15 @@ enum SimpleStore {
 
 impl SimpleIndex {
     fn try_new(store: SimpleStore) -> Result<Self> {
-        let params = HnswBuildParams::default().ef_construction(15).num_edges(12);
         let hnsw = match &store {
-            SimpleStore::Float(store) => HNSW::index_vectors(store, params.clone())?,
-            SimpleStore::Binary(store) => HNSW::index_vectors(store, params)?,
+            SimpleStore::Float(store) => HNSW::index_vectors(
+                store,
+                HnswBuildParams::default().ef_construction(15).num_edges(12),
+            )?,
+            SimpleStore::Binary(store) => HNSW::index_vectors(
+                store,
+                HnswBuildParams::default().ef_construction(15).num_edges(12),
+            )?,
         };
         Ok(Self { store, index: hnsw })
     }
