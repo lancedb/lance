@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::utils::AllocTracker;
 use all_asserts::assert_le;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, types::Float32Type};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchIterator, types::Float32Type};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::WriteParams;
