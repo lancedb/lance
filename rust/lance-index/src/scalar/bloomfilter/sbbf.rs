@@ -316,7 +316,6 @@ impl Sbbf {
     }
 
     /// Write the bitset in serialized form to the writer
-    #[allow(dead_code)]
     pub fn write_bitset<W: Write>(&self, mut writer: W) -> Result<()> {
         for block in &self.blocks {
             writer
@@ -336,19 +335,16 @@ impl Sbbf {
     }
 
     /// Get the number of blocks in this filter
-    #[allow(dead_code)]
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
     }
 
     /// Get the size in bytes of this filter
-    #[allow(dead_code)]
     pub fn size_bytes(&self) -> usize {
         self.blocks.len() * 32
     }
 
     /// Return the total in memory size of this bloom filter in bytes
-    #[allow(dead_code)]
     pub fn estimated_memory_size(&self) -> usize {
         self.blocks.capacity() * std::mem::size_of::<Block>()
     }
@@ -456,7 +452,6 @@ impl SbbfBuilder {
     }
 
     /// Set the number of bytes directly
-    #[allow(dead_code)]
     pub fn log2_num_bytes(mut self, log2_num_bytes: u8) -> Self {
         self.log2_num_bytes = Some(log2_num_bytes);
         self

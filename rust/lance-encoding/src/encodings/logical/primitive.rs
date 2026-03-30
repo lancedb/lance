@@ -3416,6 +3416,10 @@ impl CacheKey for FieldDataCacheKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         self.column_index.to_string().into()
     }
+
+    fn type_name() -> &'static str {
+        "FieldData"
+    }
 }
 
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {

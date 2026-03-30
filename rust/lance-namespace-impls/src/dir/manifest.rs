@@ -254,11 +254,8 @@ impl DerefMut for DatasetWriteGuard<'_> {
 pub struct ManifestNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
-    #[allow(dead_code)]
     session: Option<Arc<Session>>,
-    #[allow(dead_code)]
     object_store: Arc<ObjectStore>,
-    #[allow(dead_code)]
     base_path: Path,
     manifest_dataset: DatasetConsistencyWrapper,
     /// Whether directory listing is enabled in dual mode

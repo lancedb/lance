@@ -651,7 +651,6 @@ impl DirectoryNamespaceBuilder {
 pub struct DirectoryNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
-    #[allow(dead_code)]
     session: Option<Arc<Session>>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
