@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
@@ -333,14 +333,14 @@ async fn do_take_rows(
             .as_primitive::<UInt64Type>()
             .values();
 
+        let addr_to_pos: HashMap<u64, u64> = returned_row_addr
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| (*addr, i as u64))
+            .collect();
         let remapping_index: UInt64Array = row_addrs
             .iter()
-            .filter_map(|o| {
-                returned_row_addr
-                    .iter()
-                    .position(|id| id == o)
-                    .map(|pos| pos as u64)
-            })
+            .filter_map(|o| addr_to_pos.get(o).copied())
             .collect();
 
         // remapping_index may be greater than the number of rows in one_batch
@@ -449,7 +449,7 @@ fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
     let first_fragment_id = row_addrs[0] >> 32;
 
     for addr in row_addrs.iter().skip(1) {
-        sorted &= *addr > last_offset;
+        sorted &= *addr >= last_offset;
         contiguous &= *addr == last_offset + 1;
         // Contiguous also requires the fragment ids are all the same
         contiguous &= (*addr >> 32) == first_fragment_id;
