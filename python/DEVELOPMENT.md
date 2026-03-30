@@ -8,6 +8,8 @@ uv sync --extra tests --extra dev
 
 Add extras such as `benchmarks`, `torch`, or `geo` only when you need them. After the environment is initialized, either activate it or use `uv run ...` for commands.
 
+`uv sync` is not just downloading Python packages here. It also builds the local `pylance` Rust extension as part of the editable environment, so the first run, cache misses, or Rust dependency changes can make it noticeably slow. This is expected; let the build finish instead of interrupting it and switching to a different environment setup.
+
 ## Building the project
 
 This project is built with [maturin](https://github.com/PyO3/maturin).
@@ -21,6 +23,8 @@ uv run maturin develop
 This builds the Rust native module in place. You will need to re-run this
 whenever you change the Rust code. But changing the Python code doesn't require
 re-building.
+
+As with `uv sync`, this may take a while because it is compiling Rust code for the local `pylance` extension. Slow builds are expected here, especially after dependency or toolchain changes.
 
 ## Running tests
 
