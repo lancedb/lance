@@ -41,10 +41,6 @@ class BTreeIndex(UpgradeDowngradeTest):
                 "btree": pa.array(range(1000)),
             }
         )
-        print(
-            "Writing dataset with data_storage_version: "
-            f"{safe_data_storage_version(self.compat_version)}"
-        )
         dataset = lance.write_dataset(
             data,
             self.path,
