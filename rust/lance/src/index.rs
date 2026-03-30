@@ -68,6 +68,7 @@ use vector::utils::get_vector_type;
 mod api;
 pub(crate) mod append;
 mod create;
+pub mod distributed_training;
 pub mod frag_reuse;
 pub mod mem_wal;
 pub mod prefilter;

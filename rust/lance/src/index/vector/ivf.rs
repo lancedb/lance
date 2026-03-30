@@ -2363,7 +2363,7 @@ where
 }
 
 /// Train IVF partitions using kmeans.
-async fn train_ivf_model(
+pub(crate) async fn train_ivf_model(
     centroids: Option<Arc<FixedSizeListArray>>,
     data: &FixedSizeListArray,
     distance_type: DistanceType,
