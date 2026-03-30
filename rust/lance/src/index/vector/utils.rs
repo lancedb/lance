@@ -433,11 +433,11 @@ async fn sample_training_data(
         .byte_width_opt()
         .unwrap_or(4 * 1024);
 
-    if fragment_ids.is_some() {
+    if let Some(fragment_ids) = fragment_ids {
         if !is_nullable {
             let projection = dataset.schema().project(&[column])?;
             let batch = dataset
-                .sample(sample_size_hint, &projection, fragment_ids)
+                .sample(sample_size_hint, &projection, Some(fragment_ids))
                 .await?;
             return vector_column_to_fsl(&batch, column);
         }
@@ -450,12 +450,13 @@ async fn sample_training_data(
                 num_rows,
                 byte_width,
                 vector_field,
-                fragment_ids.unwrap(),
+                fragment_ids,
             )
             .await;
         }
 
-        let batch = scan_all_training_data(dataset, column, is_nullable, fragment_ids).await?;
+        let batch =
+            scan_all_training_data(dataset, column, is_nullable, Some(fragment_ids)).await?;
         let training_data = vector_column_to_fsl(&batch, column)?;
         if training_data.len() <= sample_size_hint {
             return Ok(training_data);
