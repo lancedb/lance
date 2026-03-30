@@ -2741,8 +2741,8 @@ def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
     ]
 
     merged_segment = ds.merge_existing_index_segments(segments)
-    assert merged_segment.fragment_bitmap is not None
-    assert sorted(merged_segment.fragment_bitmap) == sorted(
+    assert merged_segment.fragment_ids is not None
+    assert sorted(merged_segment.fragment_ids) == sorted(
         [fragment.fragment_id for fragment in frags[:2]]
     )
     ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged_segment])
