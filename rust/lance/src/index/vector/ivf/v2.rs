@@ -1960,7 +1960,16 @@ mod tests {
         let shard_plan = plan_segments(&segments, None, None).await.unwrap();
         let shard_count = shard_plan.len();
         assert!(shard_count >= 4);
-        let target_segment_bytes = shard_plan[0].estimated_bytes().saturating_mul(2);
+        // Use the max segment size as the base for the target. Segment sizes can
+        // vary slightly because compression is data-dependent and the random
+        // vectors in each fragment compress differently. Segments are sorted by
+        // UUID (random), so shard_plan[0] is not guaranteed to be the largest.
+        let max_shard_bytes = shard_plan
+            .iter()
+            .map(|p| p.estimated_bytes())
+            .max()
+            .unwrap();
+        let target_segment_bytes = max_shard_bytes.saturating_mul(2);
 
         let grouped_plan = plan_segments(&segments, None, Some(target_segment_bytes))
             .await
