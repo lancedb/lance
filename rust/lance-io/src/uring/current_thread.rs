@@ -8,7 +8,7 @@
 //! the need for background threads and MPSC channels.
 
 use super::requests::{IoRequest, RequestState};
-use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM};
+use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
 use crate::uring::DEFAULT_URING_QUEUE_DEPTH;
@@ -21,7 +21,7 @@ use io_uring::{IoUring, opcode, types};
 use lance_core::{Error, Result};
 use object_store::path::Path;
 
-use std::cell::RefCell;
+use std::cell::{LazyCell, RefCell};
 use std::collections::HashMap;
 use std::fs::File;
 use std::future::Future;
@@ -45,16 +45,7 @@ struct ThreadLocalUring {
 }
 
 thread_local! {
-    static URING: RefCell<Option<ThreadLocalUring>> = const { RefCell::new(None) };
-}
-
-/// Ensure the thread-local IoUring instance is initialized
-fn ensure_uring_initialized(
-    opt: &mut Option<ThreadLocalUring>,
-) -> io::Result<&mut ThreadLocalUring> {
-    // Check if exists
-    if opt.is_none() {
-        // Create new IoUring
+    static URING: LazyCell<RefCell<ThreadLocalUring>> = LazyCell::new(|| {
         let queue_depth = std::env::var("LANCE_URING_QUEUE_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -66,28 +57,24 @@ fn ensure_uring_initialized(
             // Enable perf. optimization when there is only one issuer thread
             .setup_single_issuer()
             .build(queue_depth as u32)
-            .map_err(|e| io::Error::other(format!("Failed to create io_uring: {}", e)))?;
+            .expect("Failed to create io_uring");
 
         log::debug!(
             "Created thread-local io_uring with queue depth {}",
             queue_depth
         );
 
-        *opt = Some(ThreadLocalUring {
+        RefCell::new(ThreadLocalUring {
             ring,
             pending: HashMap::new(),
-        });
-    }
-
-    Ok(opt.as_mut().unwrap())
+        })
+    });
 }
 
 /// Push request to thread-local submission queue
 pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
     URING.with(|cell| {
-        let mut opt = cell.borrow_mut();
-
-        let uring = ensure_uring_initialized(&mut opt)?;
+        let mut uring = cell.borrow_mut();
 
         // Generate unique user_data
         let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -138,121 +125,118 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
 /// Process completions from thread-local IoUring
 pub(super) fn process_thread_local_completions() -> io::Result<usize> {
     URING.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if let Some(ref mut uring) = *opt {
-            let mut completed = 0;
-            let mut retries: Vec<Arc<IoRequest>> = Vec::new();
+        let mut uring = cell.borrow_mut();
+        let mut completed = 0;
+        let mut retries: Vec<Arc<IoRequest>> = Vec::new();
 
-            // Process all available completions
-            for cqe in uring.ring.completion() {
-                let user_data = cqe.user_data();
-                let result = cqe.result();
+        // Collect completions first to avoid borrowing ring and pending simultaneously
+        let cqes: Vec<_> = uring
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
+            .collect();
 
-                if let Some(request) = uring.pending.remove(&user_data) {
-                    let mut state = request.state.lock().unwrap();
+        for (user_data, result) in cqes {
+            if let Some(request) = uring.pending.remove(&user_data) {
+                let mut state = request.state.lock().unwrap();
 
-                    if result < 0 {
-                        // Kernel error
-                        state.err = Some(io::Error::from_raw_os_error(-result));
-                        state.completed = true;
-                    } else if result == 0 {
-                        // EOF before full read completed
-                        let br = state.bytes_read;
-                        state.err = Some(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!("unexpected EOF: read {} of {} bytes", br, request.length),
-                        ));
+                if result < 0 {
+                    // Kernel error
+                    state.err = Some(io::Error::from_raw_os_error(-result));
+                    state.completed = true;
+                } else if result == 0 {
+                    // EOF before full read completed
+                    let br = state.bytes_read;
+                    state.err = Some(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("unexpected EOF: read {} of {} bytes", br, request.length),
+                    ));
+                    state.buffer.truncate(br);
+                    state.completed = true;
+                } else {
+                    // Positive result: n bytes read
+                    let n = result as usize;
+                    state.bytes_read += n;
+                    let br = state.bytes_read;
+
+                    if br >= request.length {
+                        // Full read complete
                         state.buffer.truncate(br);
                         state.completed = true;
                     } else {
-                        // Positive result: n bytes read
-                        let n = result as usize;
-                        state.bytes_read += n;
-                        let br = state.bytes_read;
-
-                        if br >= request.length {
-                            // Full read complete
-                            state.buffer.truncate(br);
-                            state.completed = true;
-                        } else {
-                            // Short read — need retry; don't mark completed or wake
-                            drop(state);
-                            retries.push(request);
-
-                            continue;
-                        }
-                    }
-
-                    // Wake waiting future
-                    if let Some(waker) = state.waker.take() {
+                        // Short read — need retry; don't mark completed or wake
                         drop(state);
-                        waker.wake();
-                    }
+                        retries.push(request);
 
-                    completed += 1;
-                } else {
-                    log::warn!("Received completion for unknown user_data: {}", user_data);
-                }
-            }
-
-            // Resubmit short-read retries
-            for request in retries {
-                // Generate unique user_data
-                let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-                let (buffer_ptr, read_offset, read_length) = {
-                    let state = request.state.lock().unwrap();
-                    let br = state.bytes_read;
-                    (
-                        unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
-                        request.offset + br as u64,
-                        (request.length - br) as u32,
-                    )
-                };
-
-                let read_op = opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length)
-                    .offset(read_offset);
-
-                let mut sq = uring.ring.submission();
-                if sq.is_full() {
-                    drop(sq);
-                    request.fail(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "io_uring submission queue full during retry",
-                    ));
-                    continue;
-                }
-
-                unsafe {
-                    if sq.push(&read_op.build().user_data(user_data)).is_err() {
-                        request.fail(io::Error::other("Failed to push short-read retry to SQ"));
                         continue;
                     }
                 }
-                drop(sq);
 
-                uring.pending.insert(user_data, request);
+                // Wake waiting future
+                if let Some(waker) = state.waker.take() {
+                    drop(state);
+                    waker.wake();
+                }
+
+                completed += 1;
+            } else {
+                log::warn!("Received completion for unknown user_data: {}", user_data);
             }
-
-            if completed > 0 {
-                log::trace!("Processed {} completions", completed);
-            }
-
-            Ok(completed)
-        } else {
-            Ok(0)
         }
+
+        // Resubmit short-read retries
+        for request in retries {
+            // Generate unique user_data
+            let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+            let (buffer_ptr, read_offset, read_length) = {
+                let state = request.state.lock().unwrap();
+                let br = state.bytes_read;
+                (
+                    unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                    request.offset + br as u64,
+                    (request.length - br) as u32,
+                )
+            };
+
+            let read_op = opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length)
+                .offset(read_offset);
+
+            let mut sq = uring.ring.submission();
+            if sq.is_full() {
+                drop(sq);
+                request.fail(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "io_uring submission queue full during retry",
+                ));
+                continue;
+            }
+
+            unsafe {
+                if sq.push(&read_op.build().user_data(user_data)).is_err() {
+                    request.fail(io::Error::other("Failed to push short-read retry to SQ"));
+                    continue;
+                }
+            }
+            drop(sq);
+
+            uring.pending.insert(user_data, request);
+        }
+
+        if completed > 0 {
+            log::trace!("Processed {} completions", completed);
+        }
+
+        Ok(completed)
     })
 }
 
 /// Submit all pending requests and wait with timeout 0 (non-blocking)
 pub(super) fn submit_and_wait_thread_local() -> io::Result<()> {
     URING.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if let Some(ref mut uring) = *opt {
-            // Submit with wait=1 (do at least some work)
-            uring.ring.submit_and_wait(1)?;
-        }
+        let uring = cell.borrow_mut();
+        // Submit with wait=1 (do at least some work)
+        uring.ring.submit_and_wait(1)?;
         Ok(())
     })
 }
@@ -293,10 +277,7 @@ impl UringCurrentThreadReader {
         io_tracker: Arc<IOTracker>,
     ) -> Result<Box<dyn Reader>> {
         // Determine block size with environment variable override
-        let block_size = std::env::var("LANCE_URING_BLOCK_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(block_size.max(DEFAULT_URING_BLOCK_SIZE));
+        let block_size = URING_BLOCK_SIZE.unwrap_or(block_size.max(DEFAULT_URING_BLOCK_SIZE));
 
         let cache_key = CacheKey::new(path, block_size);
 

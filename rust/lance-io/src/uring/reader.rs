@@ -6,7 +6,7 @@
 use super::future::UringReadFuture;
 use super::requests::IoRequest;
 use super::thread::{SUBMITTED_COUNTER, THREAD_SELECTOR, URING_THREADS};
-use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM};
+use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
 use crate::uring::requests::RequestState;
@@ -128,10 +128,7 @@ impl UringReader {
         io_tracker: Arc<IOTracker>,
     ) -> Result<Box<dyn Reader>> {
         // Determine block size with environment variable override
-        let block_size = std::env::var("LANCE_URING_BLOCK_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(block_size.max(DEFAULT_URING_BLOCK_SIZE));
+        let block_size = URING_BLOCK_SIZE.unwrap_or(block_size.max(DEFAULT_URING_BLOCK_SIZE));
 
         let cache_key = CacheKey::new(path, block_size);
 

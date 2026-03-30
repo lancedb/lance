@@ -603,7 +603,7 @@ impl ObjectStore {
             "file+uring" => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .map(|v| str_is_truthy(&v))
                     .unwrap_or(false);
 
                 if use_current_thread {
@@ -665,7 +665,7 @@ impl ObjectStore {
             "file+uring" => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .map(|v| str_is_truthy(&v))
                     .unwrap_or(false);
 
                 if use_current_thread {

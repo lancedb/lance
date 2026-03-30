@@ -62,6 +62,8 @@ pub(crate) mod current_thread_future;
 #[cfg(test)]
 mod tests;
 
+use std::sync::LazyLock;
+
 pub(crate) use current_thread::UringCurrentThreadReader;
 pub use reader::UringReader;
 
@@ -73,3 +75,10 @@ pub const DEFAULT_URING_IO_PARALLELISM: usize = 128;
 
 /// Default io_uring queue depth (16K entries)
 pub const DEFAULT_URING_QUEUE_DEPTH: usize = 16 * 1024;
+
+/// Cached `LANCE_URING_BLOCK_SIZE` env var, read once at first access.
+pub(crate) static URING_BLOCK_SIZE: LazyLock<Option<usize>> = LazyLock::new(|| {
+    std::env::var("LANCE_URING_BLOCK_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+});
