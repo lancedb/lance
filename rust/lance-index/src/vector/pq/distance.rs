@@ -4,7 +4,7 @@
 use core::panic;
 use std::cmp::{max, min};
 
-use super::{num_centroids, utils::get_sub_vector_centroids};
+use super::utils::get_sub_vector_centroids;
 use lance_core::assume_eq;
 use lance_linalg::distance::{Dot, L2, dot_distance_batch, l2::L2Prepared, l2_distance_batch};
 use lance_linalg::simd::u8::u8x16;
@@ -306,14 +306,14 @@ fn quantize_distance_table(distance_table: &[f32], qmax: f32) -> (f32, Vec<u8>) 
 /// - C: the tile size of code-book to run at once.
 /// - V: the tile size of PQ code to run at once.
 ///
-#[allow(dead_code)]
+#[cfg(test)]
 fn compute_l2_distance_without_transposing<const C: usize, const V: usize>(
     distance_table: &[f32],
     num_bits: u32,
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
-    let num_centroids = num_centroids(num_bits);
+    let num_centroids = super::num_centroids(num_bits);
     let iter = code.chunks_exact(num_sub_vectors * V);
     let distances = iter.clone().flat_map(|c| {
         let mut sums = [0.0_f32; V];

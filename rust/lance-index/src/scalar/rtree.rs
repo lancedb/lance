@@ -249,6 +249,10 @@ impl CacheKey for RTreeCacheKey {
             Self::Nulls => "nulls".into(),
         }
     }
+
+    fn type_name() -> &'static str {
+        "RTree"
+    }
 }
 
 #[derive(Clone)]

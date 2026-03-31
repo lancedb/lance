@@ -186,7 +186,7 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(
         let new_size =
             existing_bytes + N::from_usize((new_num_values + 1) * N::get_byte_width()).unwrap();
         if new_size.to_i64().unwrap() <= minichunk_size {
-            if new_num_values * 2 > MAX_MINIBLOCK_VALUES as usize {
+            if new_num_values * 2 > *MAX_MINIBLOCK_VALUES as usize {
                 // hit the max number of values limit
                 break;
             }
@@ -525,7 +525,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use arrow_array::{
         ArrayRef, StringArray,
         builder::{LargeStringBuilder, StringBuilder},

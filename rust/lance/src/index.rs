@@ -172,6 +172,10 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
+
+    fn type_name() -> &'static str {
+        "ScalarIndex"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +199,10 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         } else {
             self.uuid.into()
         }
+    }
+
+    fn type_name() -> &'static str {
+        "VectorIndex"
     }
 }
 
@@ -220,6 +228,10 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndex"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +255,10 @@ impl CacheKey for MemWalCacheKey<'_> {
         } else {
             self.uuid.to_string().into()
         }
+    }
+
+    fn type_name() -> &'static str {
+        "MemWalIndex"
     }
 }
 
@@ -1631,17 +1647,34 @@ impl DatasetIndexInternalExt for Dataset {
                         let uri = index_dir.child(uuid).child("index.pb");
                         let file_metadata_cache =
                             self.session.metadata_cache.file_metadata_cache(&uri);
-                        let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
-                            self.object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            &file_metadata_cache,
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        match element_type {
+                            DataType::UInt8 => {
+                                let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
+                                    self.object_store.clone(),
+                                    index_dir,
+                                    uuid.to_owned(),
+                                    frag_reuse_index,
+                                    &file_metadata_cache,
+                                    index_cache,
+                                    file_sizes,
+                                )
+                                .await?;
+                                Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                            }
+                            _ => {
+                                let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
+                                    self.object_store.clone(),
+                                    index_dir,
+                                    uuid.to_owned(),
+                                    frag_reuse_index,
+                                    &file_metadata_cache,
+                                    index_cache,
+                                    file_sizes,
+                                )
+                                .await?;
+                                Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                            }
+                        }
                     }
 
                     "IVF_HNSW_SQ" => {

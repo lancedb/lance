@@ -354,7 +354,7 @@ impl IndexStore for LanceIndexStore {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use std::{collections::HashMap, ops::Bound};
 

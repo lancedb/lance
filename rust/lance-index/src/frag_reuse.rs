@@ -390,7 +390,7 @@ impl Index for FragReuseIndex {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use super::*;
 

@@ -31,6 +31,8 @@ use super::WriteMode;
 use super::WriteParams;
 use super::commit::CommitBuilder;
 use super::resolve_commit_handler;
+use crate::dataset::progress::{WriteProgressFn, WriteStats};
+
 /// Insert or create a new dataset.
 ///
 /// There are different variants of `execute()` methods. Those with the `_stream`
@@ -46,6 +48,7 @@ pub struct InsertBuilder<'a> {
     dest: WriteDestination<'a>,
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
+    write_progress: Option<WriteProgressFn>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -53,11 +56,24 @@ impl<'a> InsertBuilder<'a> {
         Self {
             dest: dest.into(),
             params: None,
+            write_progress: None,
         }
     }
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
+        self
+    }
+
+    /// Register a callback that is invoked after each batch of rows is written.
+    ///
+    /// The callback receives cumulative [`WriteStats`] and can be used to drive
+    /// a progress bar or compute throughput. It must be cheap and non-blocking;
+    /// spawn a task if you need async work.
+    ///
+    /// This overrides any `write_progress` set in [`WriteParams`].
+    pub fn progress(mut self, callback: impl Fn(WriteStats) + Send + Sync + 'static) -> Self {
+        self.write_progress = Some(WriteProgressFn::new(callback));
         self
     }
 
@@ -331,7 +347,10 @@ impl<'a> InsertBuilder<'a> {
     }
 
     async fn resolve_context(&self) -> Result<WriteContext<'a>> {
-        let params = self.params.cloned().unwrap_or_default();
+        let mut params = self.params.cloned().unwrap_or_default();
+        if let Some(cb) = self.write_progress.clone() {
+            params.write_progress = Some(cb);
+        }
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -634,5 +653,59 @@ mod test {
                 Ok(_) => panic!("Expected error"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_write_progress_callback() {
+        use std::sync::Mutex;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        // Three batches of 100 rows each.
+        let batches: Vec<_> = (0..3)
+            .map(|_| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from(vec![0i32; 100]))],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let stats_log: Arc<Mutex<Vec<crate::dataset::WriteStats>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log_clone = stats_log.clone();
+
+        InsertBuilder::new("memory://test_write_progress")
+            .progress(move |stats| {
+                log_clone.lock().unwrap().push(stats);
+            })
+            .execute_stream(RecordBatchIterator::new(
+                batches.into_iter().map(Ok),
+                schema,
+            ))
+            .await
+            .unwrap();
+
+        let log = stats_log.lock().unwrap();
+        assert!(
+            !log.is_empty(),
+            "progress callback must be called at least once"
+        );
+        // bytes_written and rows_written must be monotonically non-decreasing.
+        for window in log.windows(2) {
+            assert!(
+                window[1].bytes_written >= window[0].bytes_written,
+                "bytes_written must not decrease: {:?} -> {:?}",
+                window[0].bytes_written,
+                window[1].bytes_written,
+            );
+            assert!(
+                window[1].rows_written >= window[0].rows_written,
+                "rows_written must not decrease",
+            );
+        }
+        let last = log.last().unwrap();
+        assert!(last.bytes_written > 0, "final bytes_written must be > 0");
+        assert_eq!(last.rows_written, 300, "all 300 rows must be reported");
+        assert_eq!(last.files_written, 1, "a single file should be written");
     }
 }

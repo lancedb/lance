@@ -295,7 +295,7 @@ pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::sync::Arc;
 
     use super::*;

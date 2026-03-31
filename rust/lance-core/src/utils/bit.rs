@@ -110,7 +110,7 @@ pub fn log_2_ceil(val: u32) -> u32 {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use crate::utils::bit::{is_pwr_two, log_2_ceil, pad_bytes, pad_bytes_to, pad_bytes_u64};
 
     #[test]

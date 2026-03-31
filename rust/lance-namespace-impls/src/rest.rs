@@ -747,46 +747,6 @@ impl RestNamespace {
         }
     }
 
-    /// Execute a POST request with JSON body and get binary response.
-    #[allow(dead_code)]
-    async fn post_json_binary<T: Serialize>(
-        &self,
-        path: &str,
-        query: &[(&str, &str)],
-        body: &T,
-        operation: &str,
-        object_id: &str,
-    ) -> Result<Bytes> {
-        let url = format!("{}{}", self.rest_client.base_path(), path);
-        let req_builder = self.rest_client.client().post(&url).query(query).json(body);
-
-        let resp = self
-            .rest_client
-            .execute(req_builder, operation, object_id)
-            .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
-
-        let status = resp.status();
-        if status.is_success() {
-            resp.bytes().await.map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response bytes: {}", e),
-                })
-            })
-        } else {
-            let content = resp.text().await.map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
-                })
-            })?;
-            Err(Self::parse_error_response(status, &content, operation))
-        }
-    }
-
     /// Get the base endpoint URL for this namespace
     pub fn endpoint(&self) -> &str {
         self.rest_client.base_path()
