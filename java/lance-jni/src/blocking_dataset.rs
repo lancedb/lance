@@ -2403,9 +2403,10 @@ fn inner_list_tags<'local>(
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
-                JValue::Object(
-                    &optional_str_to_jobject(env, tag_contents.description.as_deref())?,
-                ),
+                JValue::Object(&optional_str_to_jobject(
+                    env,
+                    tag_contents.description.as_deref(),
+                )?),
             ],
         )?;
         env.call_method(
@@ -2555,9 +2556,10 @@ fn inner_list_branches<'local>(
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),
-                JValue::Object(
-                    &optional_str_to_jobject(env, contents.description.as_deref())?,
-                ),
+                JValue::Object(&optional_str_to_jobject(
+                    env,
+                    contents.description.as_deref(),
+                )?),
             ],
         )?;
         env.call_method(
