@@ -523,6 +523,8 @@ def _write_fragments(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
+    namespace_client: Optional[LanceNamespace],
+    table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
 ): ...
 def _write_fragments_transaction(
@@ -535,6 +537,8 @@ def _write_fragments_transaction(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
+    namespace_client: Optional[LanceNamespace],
+    table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...

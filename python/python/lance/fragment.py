@@ -315,6 +315,8 @@ class LanceFragment(pa.dataset.Fragment):
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -354,6 +356,15 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh. When provided with
+            `table_id`, a storage options provider will be created automatically to
+            refresh credentials via the namespace. Must be provided together with
+            `table_id`. The caller should provide initial/merged storage options via
+            the `storage_options` parameter.
+        table_id : optional, List[str]
+            The table identifier when using a namespace (e.g., ["my_table"]).
+            Must be provided together with `namespace_client`.
 
         See Also
         --------
@@ -369,6 +380,16 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
+        # Validate namespace_client and table_id are provided together
+        if namespace_client is not None and table_id is None:
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+        elif table_id is not None and namespace_client is None:
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+
         if use_legacy_format is not None:
             warnings.warn(
                 "use_legacy_format is deprecated, use data_storage_version instead",
@@ -395,6 +416,8 @@ class LanceFragment(pa.dataset.Fragment):
             mode=mode,
             data_storage_version=data_storage_version,
             storage_options=storage_options,
+            namespace_client=namespace_client,
+            table_id=table_id,
         )
 
     @property
