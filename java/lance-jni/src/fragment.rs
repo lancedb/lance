@@ -262,7 +262,6 @@ fn create_fragment<'a>(
         &data_storage_version,
         None,
         &storage_options_obj,
-        &JObject::null(), // No Java provider - we create Rust provider from namespace
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
     )?;

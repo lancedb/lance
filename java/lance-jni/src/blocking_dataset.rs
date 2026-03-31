@@ -628,7 +628,6 @@ fn create_dataset<'local>(
         &data_storage_version,
         Some(&enable_v2_manifest_paths),
         &storage_options_obj,
-        &JObject::null(), // No Java provider - we create Rust provider from namespace
         &initial_bases,
         &target_bases,
     )?;
