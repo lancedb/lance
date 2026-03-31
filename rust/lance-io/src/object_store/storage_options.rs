@@ -94,7 +94,7 @@ pub trait StorageOptionsProvider: Send + Sync + fmt::Debug {
 
 /// StorageOptionsProvider implementation that fetches options from a LanceNamespace
 pub struct LanceNamespaceStorageOptionsProvider {
-    namespace: Arc<dyn LanceNamespace>,
+    namespace_client: Arc<dyn LanceNamespace>,
     table_id: Vec<String>,
 }
 
@@ -114,11 +114,11 @@ impl LanceNamespaceStorageOptionsProvider {
     /// Create a new LanceNamespaceStorageOptionsProvider
     ///
     /// # Arguments
-    /// * `namespace` - The namespace implementation to fetch storage options from
+    /// * `namespace_client` - The namespace implementation to fetch storage options from
     /// * `table_id` - The table identifier
-    pub fn new(namespace: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
+    pub fn new(namespace_client: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
         Self {
-            namespace,
+            namespace_client,
             table_id,
         }
     }
@@ -132,20 +132,24 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
             ..Default::default()
         };
 
-        let response = self.namespace.describe_table(request).await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to fetch storage options: {}",
-                e
-            ))))
-        })?;
+        let response = self
+            .namespace_client
+            .describe_table(request)
+            .await
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to fetch storage options: {}",
+                    e
+                ))))
+            })?;
 
         Ok(response.storage_options)
     }
 
     fn provider_id(&self) -> String {
         format!(
-            "LanceNamespaceStorageOptionsProvider {{ namespace: {}, table_id: {:?} }}",
-            self.namespace.namespace_id(),
+            "LanceNamespaceStorageOptionsProvider {{ namespace_client: {}, table_id: {:?} }}",
+            self.namespace_client.namespace_id(),
             self.table_id
         )
     }
@@ -333,7 +337,6 @@ impl StorageOptionsAccessor {
         {
             return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
         }
-
         log::debug!(
             "Refreshing storage options from provider: {}",
             provider.provider_id()

@@ -24,7 +24,6 @@ import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
-import org.lance.io.StorageOptionsProvider;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -100,12 +99,12 @@ public class Dataset implements Closeable {
    *     .execute();
    * }</pre>
    *
-   * <p>Example usage with namespace and empty table:
+   * <p>Example usage with namespaceClient and empty table:
    *
    * <pre>{@code
    * Dataset dataset = Dataset.write()
    *     .schema(mySchema)
-   *     .namespace(myNamespace)
+   *     .namespaceClient(myNamespaceClient)
    *     .tableId(Arrays.asList("my_table"))
    *     .mode(WriteMode.CREATE)
    *     .execute();
@@ -169,32 +168,20 @@ public class Dataset implements Closeable {
    *     Dataset.write().allocator(allocator).stream(stream).uri(path)
    *     .mode(WriteMode.CREATE).execute()}
    */
-  @Deprecated
-  public static Dataset create(
-      BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
-    return create(allocator, stream, path, params, null);
-  }
-
   /**
-   * Create a dataset with given stream and storage options provider.
-   *
-   * <p>This method supports credential vending through the StorageOptionsProvider interface, which
-   * allows for dynamic credential refresh during long-running write operations.
+   * Create a dataset with given stream.
    *
    * @param allocator buffer allocator
    * @param stream arrow stream
    * @param path dataset uri
    * @param params write parameters
-   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
    * @return Dataset
+   * @deprecated Use {@link #write()} builder instead.
    */
-  static Dataset create(
-      BufferAllocator allocator,
-      ArrowArrayStream stream,
-      String path,
-      WriteParams params,
-      StorageOptionsProvider storageOptionsProvider) {
-    return create(allocator, stream, path, params, storageOptionsProvider, null, null);
+  @Deprecated
+  public static Dataset create(
+      BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
+    return create(allocator, stream, path, params, null, null, false);
   }
 
   private static native Dataset createWithFfiSchema(
@@ -211,6 +198,26 @@ public class Dataset implements Closeable {
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
+  /**
+   * Creates a dataset from an FFI arrow stream.
+   *
+   * @param arrowStreamMemoryAddress memory address of the arrow stream
+   * @param path dataset uri
+   * @param maxRowsPerFile max rows per file
+   * @param maxRowsPerGroup max rows per group
+   * @param maxBytesPerFile max bytes per file
+   * @param mode write mode
+   * @param enableStableRowIds whether to enable stable row ids
+   * @param dataStorageVersion data storage version
+   * @param enableV2ManifestPaths whether to enable v2 manifest paths
+   * @param storageOptions storage options
+   * @param initialBases initial bases
+   * @param targetBases target bases
+   * @param namespaceClient optional namespace client for managed versioning and credential refresh
+   *     (can be null)
+   * @param tableId optional table identifier within the namespace client (can be null)
+   * @return Dataset
+   */
   private static native Dataset createWithFfiStream(
       long arrowStreamMemoryAddress,
       String path,
@@ -223,38 +230,28 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
-
-  private static native Dataset createWithFfiStreamAndProvider(
-      long arrowStreamMemoryAddress,
-      String path,
-      Optional<Integer> maxRowsPerFile,
-      Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile,
-      Optional<String> mode,
-      Optional<Boolean> enableStableRowIds,
-      Optional<String> dataStorageVersion,
-      Optional<Boolean> enableV2ManifestPaths,
-      Map<String, String> storageOptions,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
-      LanceNamespace namespace,
-      List<String> tableId);
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning);
 
   /**
-   * Creates a dataset with optional namespace support for managed versioning.
+   * Creates a dataset with optional namespace client support for managed versioning.
    *
-   * <p>When a namespace is provided, the commit handler will use the namespace's
-   * create_table_version method for version tracking.
+   * <p>When namespaceClient and tableId are provided, the Rust side will automatically create a
+   * storage options provider for credential refresh. When namespaceClientManagedVersioning is true,
+   * the commit handler will use the namespace client's create_table_version method for version
+   * tracking.
    *
    * @param allocator buffer allocator
    * @param stream arrow stream
    * @param path dataset uri
    * @param params write parameters
-   * @param storageOptionsProvider optional provider for dynamic storage options/credentials
-   * @param namespace optional namespace implementation for managed versioning (can be null)
-   * @param tableId optional table identifier within the namespace (can be null)
+   * @param namespaceClient optional namespace client for managed versioning and credential refresh
+   *     (can be null)
+   * @param tableId optional table identifier within the namespace client (can be null)
+   * @param namespaceClientManagedVersioning whether namespace manages versioning (commits go
+   *     through namespace API)
    * @return Dataset
    */
   static Dataset create(
@@ -262,15 +259,15 @@ public class Dataset implements Closeable {
       ArrowArrayStream stream,
       String path,
       WriteParams params,
-      StorageOptionsProvider storageOptionsProvider,
-      LanceNamespace namespace,
-      List<String> tableId) {
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
     Dataset dataset =
-        createWithFfiStreamAndProvider(
+        createWithFfiStream(
             stream.memoryAddress(),
             path,
             params.getMaxRowsPerFile(),
@@ -281,11 +278,11 @@ public class Dataset implements Closeable {
             params.getDataStorageVersion(),
             params.getEnableV2ManifestPaths(),
             params.getStorageOptions(),
-            Optional.ofNullable(storageOptionsProvider),
             params.getInitialBases(),
             params.getTargetBases(),
-            namespace,
-            tableId);
+            namespaceClient,
+            tableId,
+            namespaceClientManagedVersioning);
     dataset.allocator = allocator;
     return dataset;
   }
@@ -359,16 +356,22 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
-    return open(allocator, selfManagedAllocator, path, options, session, null, null);
+    return open(allocator, selfManagedAllocator, path, options, session, null, null, false);
   }
 
   /**
-   * Open a dataset from the specified path with additional options and namespace commit handler.
+   * Open a dataset from the specified path with additional options and namespace client.
+   *
+   * <p>When namespaceClient and tableId are provided, the Rust side will automatically create a
+   * storage options provider for credential refresh.
    *
    * @param path file path
    * @param options the open options
-   * @param namespace the LanceNamespace to use for managed versioning (null if not using namespace)
-   * @param tableId table identifier (null if not using namespace)
+   * @param namespaceClient the LanceNamespace to use for managed versioning and credential refresh
+   *     (null if not using namespace client)
+   * @param tableId table identifier (null if not using namespace client)
+   * @param namespaceClientManagedVersioning whether namespace manages versioning (commits go
+   *     through namespace API)
    * @return Dataset
    */
   static Dataset open(
@@ -377,8 +380,9 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session,
-      LanceNamespace namespace,
-      List<String> tableId) {
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
@@ -398,10 +402,10 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider(),
             sessionHandle,
-            namespace,
-            tableId);
+            namespaceClient,
+            tableId,
+            namespaceClientManagedVersioning);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     if (effectiveSession != null) {
@@ -421,10 +425,10 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
       long sessionHandle,
-      LanceNamespace namespace,
-      List<String> tableId);
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning);
 
   /**
    * Creates a builder for opening a dataset.
@@ -440,11 +444,11 @@ public class Dataset implements Closeable {
    *     .build();
    * }</pre>
    *
-   * <p>Example usage with namespace:
+   * <p>Example usage with namespaceClient:
    *
    * <pre>{@code
    * Dataset dataset = Dataset.open()
-   *     .namespace(myNamespace)
+   *     .namespaceClient(myNamespaceClient)
    *     .tableId(Arrays.asList("my_table"))
    *     .build();
    * }</pre>

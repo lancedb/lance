@@ -377,6 +377,33 @@ public class RestNamespace implements LanceNamespace, Closeable {
     return nativeRestNamespaceHandle;
   }
 
+  // Operation metrics methods
+
+  /**
+   * Retrieve operation metrics as a map.
+   *
+   * <p>Returns a map where keys are operation names (e.g., "list_tables", "describe_table") and
+   * values are the number of times each operation was called.
+   *
+   * <p>Returns an empty map if {@code ops_metrics_enabled} was false when creating the namespace.
+   *
+   * @return operation name to call count mapping
+   */
+  public Map<String, Long> retrieveOpsMetrics() {
+    ensureInitialized();
+    return retrieveOpsMetricsNative(nativeRestNamespaceHandle);
+  }
+
+  /**
+   * Reset all operation metrics counters to zero.
+   *
+   * <p>Does nothing if {@code ops_metrics_enabled} was false when creating the namespace.
+   */
+  public void resetOpsMetrics() {
+    ensureInitialized();
+    resetOpsMetricsNative(nativeRestNamespaceHandle);
+  }
+
   private void ensureInitialized() {
     if (nativeRestNamespaceHandle == 0) {
       throw new IllegalStateException("RestNamespace not initialized. Call initialize() first.");
@@ -467,6 +494,10 @@ public class RestNamespace implements LanceNamespace, Closeable {
   private native String describeTableVersionNative(long handle, String requestJson);
 
   private native String batchDeleteTableVersionsNative(long handle, String requestJson);
+
+  private native Map<String, Long> retrieveOpsMetricsNative(long handle);
+
+  private native void resetOpsMetricsNative(long handle);
 
   // ==========================================================================
   // Provider loading helpers

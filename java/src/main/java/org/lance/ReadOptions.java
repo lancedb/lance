@@ -13,8 +13,6 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
-
 import com.google.common.base.MoreObjects;
 
 import java.nio.ByteBuffer;
@@ -31,7 +29,6 @@ public class ReadOptions {
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
-  private final Optional<StorageOptionsProvider> storageOptionsProvider;
   private final Optional<Session> session;
 
   private ReadOptions(Builder builder) {
@@ -41,7 +38,6 @@ public class ReadOptions {
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
     this.serializedManifest = builder.serializedManifest;
-    this.storageOptionsProvider = builder.storageOptionsProvider;
     this.session = builder.session;
   }
 
@@ -67,10 +63,6 @@ public class ReadOptions {
 
   public Optional<ByteBuffer> getSerializedManifest() {
     return serializedManifest;
-  }
-
-  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
-    return storageOptionsProvider;
   }
 
   /**
@@ -104,7 +96,6 @@ public class ReadOptions {
     private long metadataCacheSizeBytes = 1024L * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
-    private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
     private Optional<Session> session = Optional.empty();
 
     /**
@@ -208,21 +199,6 @@ public class ReadOptions {
      */
     public Builder setSerializedManifest(ByteBuffer serializedManifest) {
       this.serializedManifest = Optional.of(serializedManifest);
-      return this;
-    }
-
-    /**
-     * Set a custom storage options provider for automatic storage options refresh.
-     *
-     * <p>The storage options provider will be called automatically before storage options expire,
-     * enabling long-running operations on cloud storage without interruption. This is currently
-     * only used for refreshing AWS temporary access credentials.
-     *
-     * @param storageOptionsProvider the storage options provider implementation
-     * @return this builder
-     */
-    public Builder setStorageOptionsProvider(StorageOptionsProvider storageOptionsProvider) {
-      this.storageOptionsProvider = Optional.of(storageOptionsProvider);
       return this;
     }
 

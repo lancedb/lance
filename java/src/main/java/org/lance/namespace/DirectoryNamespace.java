@@ -90,6 +90,16 @@ import java.util.Optional;
  *         <li>credential_vendor.azure_duration_millis (optional): Duration in ms (default: 3600000,
  *             up to 7 days)
  *       </ul>
+ *   <li>Testing properties:
+ *       <ul>
+ *         <li>ops_metrics_enabled (optional): "true" to enable operation metrics tracking. Use
+ *             {@link #retrieveOpsMetrics()} to get call counts.
+ *         <li>vend_input_storage_options (optional): "true" to return input storage options in
+ *             describeTable() when no credential vendor is configured. Useful for testing.
+ *         <li>vend_input_storage_options_refresh_interval_millis (optional): When set with
+ *             vend_input_storage_options, adds expires_at_millis to storage options. Value is
+ *             current_time_millis + this interval.
+ *       </ul>
  * </ul>
  *
  * <p>Example usage (local filesystem):
@@ -452,6 +462,33 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
     return nativeDirectoryNamespaceHandle;
   }
 
+  // Operation metrics methods
+
+  /**
+   * Retrieve operation metrics as a map.
+   *
+   * <p>Returns a map where keys are operation names (e.g., "list_tables", "describe_table") and
+   * values are the number of times each operation was called.
+   *
+   * <p>Returns an empty map if {@code ops_metrics_enabled} was false when creating the namespace.
+   *
+   * @return operation name to call count mapping
+   */
+  public Map<String, Long> retrieveOpsMetrics() {
+    ensureInitialized();
+    return retrieveOpsMetricsNative(nativeDirectoryNamespaceHandle);
+  }
+
+  /**
+   * Reset all operation metrics counters to zero.
+   *
+   * <p>Does nothing if {@code ops_metrics_enabled} was false when creating the namespace.
+   */
+  public void resetOpsMetrics() {
+    ensureInitialized();
+    resetOpsMetricsNative(nativeDirectoryNamespaceHandle);
+  }
+
   private void ensureInitialized() {
     if (nativeDirectoryNamespaceHandle == 0) {
       throw new IllegalStateException(
@@ -541,6 +578,10 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String describeTableVersionNative(long handle, String requestJson);
 
   private native String batchDeleteTableVersionsNative(long handle, String requestJson);
+
+  private native Map<String, Long> retrieveOpsMetricsNative(long handle);
+
+  private native void resetOpsMetricsNative(long handle);
 
   // ==========================================================================
   // Provider loading helpers
