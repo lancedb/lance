@@ -2318,7 +2318,7 @@ async fn write_root_vector_index_from_auxiliary(
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),
-        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ"
+        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ"
     );
 
     if is_hnsw {

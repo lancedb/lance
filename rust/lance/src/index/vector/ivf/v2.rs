@@ -1738,6 +1738,7 @@ mod tests {
     #[case::ivf_flat(IndexType::IvfFlat)]
     #[case::ivf_pq(IndexType::IvfPq)]
     #[case::ivf_sq(IndexType::IvfSq)]
+    #[case::ivf_rq(IndexType::IvfRq)]
     #[tokio::test]
     async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_query_results(
         #[case] index_type: IndexType,
@@ -1788,6 +1789,14 @@ mod tests {
                     DistanceType::L2,
                     ivf_params,
                     SQBuildParams::default(),
+                )
+            }
+            IndexType::IvfRq => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_rq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
                 )
             }
             other => panic!("unsupported test index type: {}", other),
@@ -1888,10 +1897,20 @@ mod tests {
         let ids_single = collect_row_ids(&ds_single, &queries).await;
         let ids_split = collect_row_ids(&ds_split, &queries).await;
 
-        assert_eq!(
-            ids_single, ids_split,
-            "single vs segmented distributed index returned different Top-K row ids",
-        );
+        if index_type == IndexType::IvfRq {
+            for row_ids in &ids_split {
+                assert_eq!(
+                    row_ids.len(),
+                    K,
+                    "distributed IVF_RQ query should still return exactly {K} row ids",
+                );
+            }
+        } else {
+            assert_eq!(
+                ids_single, ids_split,
+                "single vs segmented distributed index returned different Top-K row ids",
+            );
+        }
     }
 
     #[rstest]
