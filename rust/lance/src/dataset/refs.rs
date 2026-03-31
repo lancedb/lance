@@ -212,15 +212,6 @@ impl Tags<'_> {
     }
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
-        self.create_with_description(tag, reference, None).await
-    }
-
-    pub async fn create_with_description(
-        &self,
-        tag: &str,
-        reference: impl Into<Ref>,
-        description: Option<String>,
-    ) -> Result<()> {
         check_valid_tag(tag)?;
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
@@ -230,9 +221,7 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-        let tag_contents = self
-            .build_tag_content_by_ref(reference, description)
-            .await?;
+        let tag_contents = self.build_tag_content_by_ref(reference, None).await?;
 
         self.object_store()
             .put(
@@ -259,14 +248,14 @@ impl Tags<'_> {
     }
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
-        self.update_with_description(tag, reference, None).await
+        self.update_with_metadata(tag, reference, None).await
     }
 
-    pub async fn update_with_description(
+    pub async fn update_with_metadata(
         &self,
         tag: &str,
         reference: impl Into<Ref>,
-        description: Option<String>,
+        metadata: Option<String>,
     ) -> Result<()> {
         check_valid_tag(tag)?;
 
@@ -277,9 +266,7 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let tag_contents = self
-            .build_tag_content_by_ref(reference, description)
-            .await?;
+        let tag_contents = self.build_tag_content_by_ref(reference, metadata).await?;
 
         self.object_store()
             .put(
@@ -293,7 +280,7 @@ impl Tags<'_> {
     async fn build_tag_content_by_ref(
         &self,
         reference: impl Into<Ref>,
-        description: Option<String>,
+        metadata: Option<String>,
     ) -> Result<TagContents> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
@@ -340,7 +327,7 @@ impl Tags<'_> {
             branch,
             version: manifest_file.version,
             manifest_size,
-            description,
+            metadata,
         };
         Ok(tag_contents)
     }
@@ -425,17 +412,6 @@ impl Branches<'_> {
         version_number: u64,
         source_branch: Option<&str>,
     ) -> Result<()> {
-        self.create_with_description(branch_name, version_number, source_branch, None)
-            .await
-    }
-
-    pub(crate) async fn create_with_description(
-        &self,
-        branch_name: &str,
-        version_number: u64,
-        source_branch: Option<&str>,
-        description: Option<String>,
-    ) -> Result<()> {
         check_valid_branch(branch_name)?;
 
         let source_branch = source_branch.and_then(standardize_branch);
@@ -493,8 +469,32 @@ impl Branches<'_> {
             } else {
                 self.object_store().size(&manifest_file.path).await? as usize
             },
-            description,
+            metadata: None,
         };
+
+        self.object_store()
+            .put(
+                &branch_file,
+                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn update_metadata(&self, branch: &str, metadata: Option<String>) -> Result<()> {
+        check_valid_branch(branch)?;
+
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch);
+        if !self.object_store().exists(&branch_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("branch {} does not exist", branch),
+            });
+        }
+
+        let mut branch_contents =
+            BranchContents::from_path(&branch_file, self.object_store()).await?;
+        branch_contents.metadata = metadata;
 
         self.object_store()
             .put(
@@ -694,12 +694,12 @@ pub struct TagContents {
     pub branch: Option<String>,
     pub version: u64,
     pub manifest_size: usize,
-    /// Optional metadata describing the purpose of this tag.
+    /// Optional metadata associated with this tag.
     ///
-    /// - `Some(text)`: the tag has a user-defined description.
-    /// - `None`: no description is stored.
-    #[serde(default)]
-    pub description: Option<String>,
+    /// - `Some(text)`: user-provided metadata (often JSON encoded as string).
+    /// - `None`: no metadata is stored.
+    #[serde(default, alias = "description")]
+    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,12 +711,12 @@ pub struct BranchContents {
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
     pub manifest_size: usize,
-    /// Optional metadata describing the purpose of this branch.
+    /// Optional metadata associated with this branch.
     ///
-    /// - `Some(text)`: the branch has a user-defined description.
-    /// - `None`: no description is stored.
-    #[serde(default)]
-    pub description: Option<String>,
+    /// - `Some(text)`: user-provided metadata (often JSON encoded as string).
+    /// - `None`: no metadata is stored.
+    #[serde(default, alias = "description")]
+    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1124,7 +1124,7 @@ mod tests {
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
-            description: Some("production branch".to_string()),
+            metadata: Some("production branch".to_string()),
         };
 
         // Test serialization
@@ -1133,7 +1133,7 @@ mod tests {
         assert!(json.contains("parentVersion"));
         assert!(json.contains("createAt"));
         assert!(json.contains("manifestSize"));
-        assert!(json.contains("description"));
+        assert!(json.contains("metadata"));
 
         // Test deserialization
         let deserialized: BranchContents = serde_json::from_str(&json).unwrap();
@@ -1141,12 +1141,19 @@ mod tests {
         assert_eq!(deserialized.parent_version, branch_contents.parent_version);
         assert_eq!(deserialized.create_at, branch_contents.create_at);
         assert_eq!(deserialized.manifest_size, branch_contents.manifest_size);
-        assert_eq!(deserialized.description, branch_contents.description);
+        assert_eq!(deserialized.metadata, branch_contents.metadata);
 
-        // Backward compatibility: older serialized content does not include description.
+        // Backward compatibility: older serialized content does not include metadata.
         let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
         let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
-        assert_eq!(legacy_deserialized.description, None);
+        assert_eq!(legacy_deserialized.metadata, None);
+        let legacy_alias_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024,"description":"legacy"}"#;
+        let legacy_alias_deserialized: BranchContents =
+            serde_json::from_str(legacy_alias_json).unwrap();
+        assert_eq!(
+            legacy_alias_deserialized.metadata,
+            Some("legacy".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1155,7 +1162,7 @@ mod tests {
             branch: Some("feature".to_string()),
             version: 10,
             manifest_size: 2048,
-            description: Some("release tag".to_string()),
+            metadata: Some("release tag".to_string()),
         };
 
         // Test serialization
@@ -1163,19 +1170,27 @@ mod tests {
         assert!(json.contains("branch"));
         assert!(json.contains("version"));
         assert!(json.contains("manifestSize"));
-        assert!(json.contains("description"));
+        assert!(json.contains("metadata"));
 
         // Test deserialization
         let deserialized: TagContents = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
-        assert_eq!(deserialized.description, tag_contents.description);
+        assert_eq!(deserialized.metadata, tag_contents.metadata);
 
-        // Backward compatibility: older serialized content does not include description.
+        // Backward compatibility: older serialized content does not include metadata.
         let legacy_json = r#"{"branch":"feature","version":10,"manifestSize":2048}"#;
         let legacy_deserialized: TagContents = serde_json::from_str(legacy_json).unwrap();
-        assert_eq!(legacy_deserialized.description, None);
+        assert_eq!(legacy_deserialized.metadata, None);
+        let legacy_alias_json =
+            r#"{"branch":"feature","version":10,"manifestSize":2048,"description":"legacy"}"#;
+        let legacy_alias_deserialized: TagContents =
+            serde_json::from_str(legacy_alias_json).unwrap();
+        assert_eq!(
+            legacy_alias_deserialized.metadata,
+            Some("legacy".to_string())
+        );
     }
 
     #[rstest]
@@ -1258,7 +1273,7 @@ mod tests {
                 parent_version: parent_ver,
                 create_at: 0,
                 manifest_size: 1,
-                description: None,
+                metadata: None,
             }
         }
         let mut contents = HashMap::new();

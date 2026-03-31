@@ -1542,12 +1542,7 @@ public class Dataset implements Closeable {
    */
   public Dataset createBranch(String branch, Ref ref) {
     Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
-    return innerCreateBranch(branch, ref, Optional.empty(), Optional.empty());
-  }
-
-  public Dataset createBranch(String branch, Ref ref, String description) {
-    Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
-    return innerCreateBranch(branch, ref, Optional.empty(), Optional.ofNullable(description));
+    return innerCreateBranch(branch, ref, Optional.empty());
   }
 
   /**
@@ -1563,27 +1558,14 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
     Preconditions.checkArgument(
         storageOptions != null && !storageOptions.isEmpty(), "storageOptions cannot be null");
-    return innerCreateBranch(branch, ref, Optional.of(storageOptions), Optional.empty());
+    return innerCreateBranch(branch, ref, Optional.of(storageOptions));
   }
 
-  public Dataset createBranch(
-      String branch, Ref ref, Map<String, String> storageOptions, String description) {
-    Preconditions.checkArgument(branch != null && ref != null, "branch and ref cannot be null");
-    Preconditions.checkArgument(
-        storageOptions != null && !storageOptions.isEmpty(), "storageOptions cannot be null");
-    return innerCreateBranch(
-        branch, ref, Optional.of(storageOptions), Optional.ofNullable(description));
-  }
-
-  private Dataset innerCreateBranch(
-      String branch,
-      Ref ref,
-      Optional<Map<String, String>> storageOptions,
-      Optional<String> description) {
+  private Dataset innerCreateBranch(String branch, Ref ref, Optional<Map<String, String>> storageOptions) {
     Preconditions.checkArgument(branch != null, "Branch cannot be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCreateBranch(branch, ref, storageOptions, description);
+      return nativeCreateBranch(branch, ref, storageOptions);
     }
   }
 
@@ -1634,7 +1616,7 @@ public class Dataset implements Closeable {
      */
     public void create(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "versionNumber must be greater than 0");
-      create(tag, Ref.ofMain(versionNumber), null);
+      create(tag, Ref.ofMain(versionNumber));
     }
 
     /**
@@ -1644,15 +1626,11 @@ public class Dataset implements Closeable {
      * @param ref the referenced version to tag
      */
     public void create(String tag, Ref ref) {
-      create(tag, ref, null);
-    }
-
-    public void create(String tag, Ref ref, String description) {
       Preconditions.checkArgument(tag != null, "Tag name cannot be null");
       Preconditions.checkArgument(ref != null, "ref cannot be null");
       try (LockManager.WriteLock readLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeCreateTag(tag, ref, Optional.ofNullable(description));
+        nativeCreateTag(tag, ref);
       }
     }
 
@@ -1665,7 +1643,7 @@ public class Dataset implements Closeable {
      */
     @Deprecated
     public void create(String tag, long versionNumber, String targetBranch) {
-      create(tag, Ref.ofBranch(targetBranch, versionNumber), null);
+      create(tag, Ref.ofBranch(targetBranch, versionNumber));
     }
 
     /**
@@ -1699,15 +1677,19 @@ public class Dataset implements Closeable {
      * @param ref the referenced version to tag
      */
     public void update(String tag, Ref ref) {
-      update(tag, ref, null);
+      update(tag, ref, Optional.empty());
     }
 
-    public void update(String tag, Ref ref, String description) {
+    public void update(String tag, Ref ref, String metadata) {
+      update(tag, ref, Optional.ofNullable(metadata));
+    }
+
+    public void update(String tag, Ref ref, Optional<String> metadata) {
       Preconditions.checkArgument(tag != null, "tag cannot be null");
       Preconditions.checkArgument(ref != null, "ref cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTag(tag, ref, Optional.ofNullable(description));
+        nativeUpdateTag(tag, ref, metadata);
       }
     }
 
@@ -1762,6 +1744,17 @@ public class Dataset implements Closeable {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         return nativeListBranches();
       }
+    }
+
+    public void updateMetadata(String branchName, Optional<String> metadata) {
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeUpdateBranchMetadata(branchName, metadata);
+      }
+    }
+
+    public void updateMetadata(String branchName, String metadata) {
+      updateMetadata(branchName, Optional.ofNullable(metadata));
     }
   }
 
@@ -1842,11 +1835,11 @@ public class Dataset implements Closeable {
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
-  private native void nativeCreateTag(String tag, Ref ref, Optional<String> description);
+  private native void nativeCreateTag(String tag, Ref ref);
 
   private native void nativeDeleteTag(String tag);
 
-  private native void nativeUpdateTag(String tag, Ref ref, Optional<String> description);
+  private native void nativeUpdateTag(String tag, Ref ref, Optional<String> metadata);
 
   private native List<Tag> nativeListTags();
 
@@ -1856,14 +1849,12 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckout(Ref ref);
 
   private native Dataset nativeCreateBranch(
-      String branch,
-      Ref ref,
-      Optional<Map<String, String>> storageOptions,
-      Optional<String> description);
+      String branch, Ref ref, Optional<Map<String, String>> storageOptions);
 
   private native void nativeDeleteBranch(String branch);
 
   private native List<Branch> nativeListBranches();
+  private native void nativeUpdateBranchMetadata(String branch, Optional<String> metadata);
 
   public Dataset shallowClone(String targetPath, Ref ref) {
     return shallowClone(targetPath, ref, null);

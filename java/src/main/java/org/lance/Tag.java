@@ -23,18 +23,18 @@ public class Tag {
   private final Optional<String> branch;
   private final long version;
   private final int manifestSize;
-  private final Optional<String> description;
+  private final Optional<String> metadata;
 
   public Tag(String name, String branch, long version, int manifestSize) {
     this(name, branch, version, manifestSize, null);
   }
 
-  public Tag(String name, String branch, long version, int manifestSize, String description) {
+  public Tag(String name, String branch, long version, int manifestSize, String metadata) {
     this.name = name;
     this.branch = Optional.ofNullable(branch);
     this.version = version;
     this.manifestSize = manifestSize;
-    this.description = Optional.ofNullable(description);
+    this.metadata = Optional.ofNullable(metadata);
   }
 
   public String getName() {
@@ -53,8 +53,8 @@ public class Tag {
     return manifestSize;
   }
 
-  public Optional<String> getDescription() {
-    return description;
+  public Optional<String> getMetadata() {
+    return metadata;
   }
 
   @Override
@@ -64,7 +64,7 @@ public class Tag {
         .add("branch", branch)
         .add("version", version)
         .add("manifestSize", manifestSize)
-        .add("description", description)
+        .add("metadata", metadata)
         .toString();
   }
 
@@ -80,12 +80,12 @@ public class Tag {
     return version == tag.version
         && Objects.equals(branch, tag.branch)
         && manifestSize == tag.manifestSize
-        && Objects.equals(description, tag.description)
+        && Objects.equals(metadata, tag.metadata)
         && Objects.equals(name, tag.name);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, branch, version, manifestSize, description);
+    return Objects.hash(name, branch, version, manifestSize, metadata);
   }
 }

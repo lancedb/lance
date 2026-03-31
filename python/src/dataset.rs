@@ -1682,7 +1682,7 @@ impl Dataset {
             let dict = PyDict::new(py);
             dict.set_item("version", tag_content.version)?;
             dict.set_item("manifest_size", tag_content.manifest_size)?;
-            dict.set_item("description", tag_content.description.clone())?;
+            dict.set_item("metadata", tag_content.metadata.clone())?;
 
             pylist.append((tag_name.as_str(), dict))?;
         }
@@ -1700,7 +1700,7 @@ impl Dataset {
             dict.set_item("branch", v.branch.clone())?;
             dict.set_item("version", v.version)?;
             dict.set_item("manifest_size", v.manifest_size)?;
-            dict.set_item("description", v.description.clone())?;
+            dict.set_item("metadata", v.metadata.clone())?;
             pytags.set_item(k, dict.into_py_any(py)?)?;
         }
         pytags.into_py_any(py)
@@ -1720,21 +1720,10 @@ impl Dataset {
         })
     }
 
-    #[pyo3(signature = (tag, reference=None, description=None))]
-    fn create_tag(
-        &mut self,
-        tag: String,
-        reference: Option<Bound<PyAny>>,
-        description: Option<String>,
-    ) -> PyResult<()> {
+    #[pyo3(signature = (tag, reference=None))]
+    fn create_tag(&mut self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
-        rt().block_on(
-            None,
-            self.ds
-                .as_ref()
-                .tags()
-                .create_with_description(tag.as_str(), reference, description),
-        )?
+        rt().block_on(None, self.ds.as_ref().tags().create(tag.as_str(), reference))?
         .map_err(|err| match err {
             Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
             Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
@@ -1755,12 +1744,12 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (tag, reference=None, description=None))]
+    #[pyo3(signature = (tag, reference=None, metadata=None))]
     fn update_tag(
         &self,
         tag: String,
         reference: Option<Bound<PyAny>>,
-        description: Option<String>,
+        metadata: Option<String>,
     ) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
         rt().block_on(
@@ -1768,7 +1757,7 @@ impl Dataset {
             self.ds
                 .as_ref()
                 .tags()
-                .update_with_description(tag.as_str(), reference, description),
+                .update_with_metadata(tag.as_str(), reference, metadata),
         )?
         .infer_error()?;
         Ok(())
@@ -1787,13 +1776,12 @@ impl Dataset {
     }
 
     /// Create a branch from a specific version reference (version number or tag)
-    #[pyo3(signature = (branch, reference=None, storage_options=None, description=None))]
+    #[pyo3(signature = (branch, reference=None, storage_options=None))]
     fn create_branch(
         &mut self,
         branch: String,
         reference: Option<Bound<PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        description: Option<String>,
     ) -> PyResult<Self> {
         let mut new_self = self.ds.as_ref().clone();
         let reference = self.transform_ref(reference)?;
@@ -1806,12 +1794,7 @@ impl Dataset {
         let created = rt()
             .block_on(
                 None,
-                new_self.create_branch_with_description(
-                    branch.as_str(),
-                    reference,
-                    store_params,
-                    description,
-                ),
+                new_self.create_branch(branch.as_str(), reference, store_params),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         // Update self to reflect any metadata changes; return the new branch dataset
@@ -1847,10 +1830,20 @@ impl Dataset {
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
-            dict.set_item("description", meta.description.clone())?;
+            dict.set_item("metadata", meta.metadata.clone())?;
             pybranches.set_item(name, dict.into_py_any(py)?)?;
         }
         Ok(pybranches.into())
+    }
+
+    #[pyo3(signature = (branch, metadata=None))]
+    fn update_branch_metadata(&self, branch: String, metadata: Option<String>) -> PyResult<()> {
+        rt().block_on(
+            None,
+            self.ds.as_ref().branches().update_metadata(&branch, metadata),
+        )?
+        .infer_error()?;
+        Ok(())
     }
 
     /// List branches ordered by parent_version

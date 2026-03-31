@@ -481,17 +481,6 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        self.create_branch_with_description(branch, version, store_params, None)
-            .await
-    }
-
-    pub async fn create_branch_with_description(
-        &mut self,
-        branch: &str,
-        version: impl Into<refs::Ref>,
-        store_params: Option<ObjectStoreParams>,
-        description: Option<String>,
-    ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let clone_op = Operation::Clone {
@@ -512,12 +501,7 @@ impl Dataset {
 
         // Create BranchContents after shallow_clone
         self.branches()
-            .create_with_description(
-                branch,
-                version_number,
-                source_branch.as_deref(),
-                description,
-            )
+            .create(branch, version_number, source_branch.as_deref())
             .await?;
         Ok(dataset)
     }
