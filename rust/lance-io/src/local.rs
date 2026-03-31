@@ -24,9 +24,10 @@ use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
+use crate::object_reader::stream_local_range;
 use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::object_writer::WriteResult;
-use crate::traits::{Reader, Writer};
+use crate::traits::{ByteStream, Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
@@ -238,6 +239,34 @@ impl Reader for LocalObjectReader {
             }
 
             result
+        })
+    }
+
+    fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        Box::pin(async move {
+            let size = self.size().await?;
+            Ok(stream_local_range(
+                self.file.clone(),
+                self.path.clone(),
+                self.io_tracker.clone(),
+                0..size,
+                self.block_size.max(8 * 1024),
+            ))
+        })
+    }
+
+    fn get_range_stream(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        let file = self.file.clone();
+        let path = self.path.clone();
+        let io_tracker = self.io_tracker.clone();
+        let chunk_size = self.block_size.max(8 * 1024);
+        Box::pin(async move {
+            Ok(stream_local_range(
+                file, path, io_tracker, range, chunk_size,
+            ))
         })
     }
 }

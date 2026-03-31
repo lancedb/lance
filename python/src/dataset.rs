@@ -47,8 +47,8 @@ use lance::dataset::{
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
-    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, WriteMode, WriteParams,
+    ExternalBlobMode, ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched,
+    WhenNotMatched, WhenNotMatchedBySource, WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -3260,6 +3260,11 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             get_dict_opt::<bool>(options, "allow_external_blob_outside_bases")?
         {
             p = p.with_allow_external_blob_outside_bases(allow_external);
+        }
+        if let Some(external_blob_mode) = get_dict_opt::<String>(options, "external_blob_mode")? {
+            p = p.with_external_blob_mode(
+                ExternalBlobMode::try_from(external_blob_mode.as_str()).infer_error()?,
+            );
         }
 
         // Handle properties

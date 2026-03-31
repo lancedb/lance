@@ -129,8 +129,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder, WriteDestination,
-    WriteMode, WriteParams, write_fragments,
+    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, ExternalBlobMode, InsertBuilder,
+    WriteDestination, WriteMode, WriteParams, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
