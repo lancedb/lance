@@ -14,21 +14,25 @@ use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_schema::DataType as ArrowDataType;
+use bytes::Bytes;
 use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, FieldExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell, oneshot};
 use url::Url;
 
 use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
+use bytes::Bytes;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result, utils::address::RowAddress};
 use lance_io::traits::{Reader, WriteExt, Writer};
+use lance_io::utils::CachedFileSize;
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -713,29 +717,222 @@ pub async fn preprocess_blob_batches(
     Ok(out)
 }
 
-/// Current state of the reader.  Held in a mutex for easy sharing
-///
-/// The u64 is the cursor in the file that the reader is currently at
-/// (note that seeks are allowed before the file is opened)
 #[derive(Debug)]
-enum ReaderState {
-    Uninitialized(u64),
-    Open((u64, Arc<dyn Reader>)),
+enum BlobFileState {
+    Open(u64),
     Closed,
+}
+
+/// Shared physical read context for blob handles that resolve to the same object.
+///
+/// Blob descriptors are logical slices over a backing object (data file, packed
+/// sidecar, dedicated sidecar, or external object). Multiple [`BlobFile`] values
+/// can point at different regions of that same object. This struct gives those
+/// handles a single lazy-open scheduler plus a lightweight pending queue so
+/// concurrent reads can be opportunistically grouped before reaching Lance's
+/// existing I/O scheduler.
+#[derive(Debug)]
+struct BlobSource {
+    object_store: Arc<ObjectStore>,
+    path: Path,
+    file_size: CachedFileSize,
+    scheduler: OnceCell<FileScheduler>,
+    pending_reads: Mutex<PendingBlobReads>,
+}
+
+impl BlobSource {
+    fn new(object_store: Arc<ObjectStore>, path: Path) -> Self {
+        Self {
+            object_store,
+            path,
+            file_size: CachedFileSize::unknown(),
+            scheduler: OnceCell::new(),
+            pending_reads: Mutex::new(PendingBlobReads::default()),
+        }
+    }
+
+    async fn read_ranges(self: &Arc<Self>, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let scheduler = self
+            .scheduler
+            .get_or_try_init(|| async {
+                ScanScheduler::new(
+                    self.object_store.clone(),
+                    SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
+                )
+                .open_file(&self.path, &self.file_size)
+                .await
+            })
+            .await?;
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let should_spawn = {
+            let mut pending_reads = self.pending_reads.lock().await;
+            pending_reads.requests.push(PendingBlobRead {
+                ranges,
+                response: response_tx,
+            });
+            if pending_reads.is_draining {
+                false
+            } else {
+                pending_reads.is_draining = true;
+                true
+            }
+        };
+
+        if should_spawn {
+            let source = self.clone();
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                source.drain_pending_reads(scheduler).await;
+            });
+        }
+
+        response_rx.await.map_err(|_| {
+            Error::internal("Blob source read task dropped the response".to_string())
+        })?
+    }
+
+    async fn drain_pending_reads(self: Arc<Self>, scheduler: FileScheduler) {
+        loop {
+            let batch = {
+                let mut pending_reads = self.pending_reads.lock().await;
+                if pending_reads.requests.is_empty() {
+                    pending_reads.is_draining = false;
+                    return;
+                }
+                std::mem::take(&mut pending_reads.requests)
+            };
+            fulfill_pending_blob_reads(&scheduler, batch).await;
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct PendingBlobReads {
+    requests: Vec<PendingBlobRead>,
+    is_draining: bool,
+}
+
+/// Pending logical blob reads waiting to be grouped into one scheduler batch.
+///
+/// This queue exists only to combine overlapping concurrent calls. The actual
+/// coalescing and physical I/O scheduling still happens in [`FileScheduler`].
+#[derive(Debug)]
+struct PendingBlobRead {
+    ranges: Vec<Range<u64>>,
+    response: oneshot::Sender<Result<Vec<Bytes>>>,
+}
+
+async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<PendingBlobRead>) {
+    let total_ranges = batch
+        .iter()
+        .map(|request| request.ranges.len())
+        .sum::<usize>();
+    let mut request_ranges = Vec::with_capacity(total_ranges);
+    let mut response = batch
+        .iter()
+        .map(|request| vec![Bytes::new(); request.ranges.len()])
+        .collect::<Vec<_>>();
+
+    for (request_idx, request) in batch.iter().enumerate() {
+        for (range_idx, range) in request.ranges.iter().enumerate() {
+            if range.is_empty() {
+                continue;
+            }
+            request_ranges.push((range.clone(), request_idx, range_idx));
+        }
+    }
+
+    let result = if request_ranges.is_empty() {
+        Ok(())
+    } else {
+        request_ranges.sort_by_key(|(range, _, _)| (range.start, range.end));
+        let priority = request_ranges[0].0.start;
+        match scheduler
+            .submit_request(
+                request_ranges
+                    .iter()
+                    .map(|(range, _, _)| range.clone())
+                    .collect::<Vec<_>>(),
+                priority,
+            )
+            .await
+        {
+            Ok(bytes_vec) => {
+                for ((_, request_idx, range_idx), bytes) in
+                    request_ranges.into_iter().zip(bytes_vec)
+                {
+                    response[request_idx][range_idx] = bytes;
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            for (request, bytes) in batch.into_iter().zip(response) {
+                let _ = request.response.send(Ok(bytes));
+            }
+        }
+        Err(err) => {
+            let message = format!(
+                "Failed to read blob source {}: {}",
+                scheduler.reader().path(),
+                err
+            );
+            for request in batch {
+                let _ = request.response.send(Err(Error::io(message.clone())));
+            }
+        }
+    }
+}
+
+/// Cache key for sharing one [`BlobSource`] across multiple blob descriptors.
+///
+/// We include the store prefix as well as the path so the same path string in
+/// different object stores is never conflated.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BlobSourceKey {
+    store_prefix: String,
+    path: String,
+}
+
+fn shared_blob_source(
+    source_cache: &mut HashMap<BlobSourceKey, Arc<BlobSource>>,
+    object_store: Arc<ObjectStore>,
+    path: &Path,
+) -> Arc<BlobSource> {
+    let key = BlobSourceKey {
+        store_prefix: object_store.store_prefix.clone(),
+        path: path.to_string(),
+    };
+    source_cache
+        .entry(key)
+        .or_insert_with(|| Arc::new(BlobSource::new(object_store, path.clone())))
+        .clone()
 }
 
 /// A file-like object that represents a blob in a dataset
 #[derive(Debug)]
 pub struct BlobFile {
-    object_store: Arc<ObjectStore>,
-    path: Path,
-    reader: Arc<Mutex<ReaderState>>,
+    source: Arc<BlobSource>,
+    state: Arc<Mutex<BlobFileState>>,
     position: u64,
     size: u64,
     kind: BlobKind,
     uri: Option<String>,
 }
 
+/// Base-aware physical location metadata used while resolving blob reads.
+///
+/// This is cached per fragment so repeated rows from the same fragment do not
+/// recompute the object store, data directory, and data file key.
 #[derive(Clone)]
 struct BlobReadLocation {
     object_store: Arc<ObjectStore>,
@@ -745,22 +942,20 @@ struct BlobReadLocation {
 }
 
 impl BlobFile {
-    fn with_location(
-        object_store: Arc<ObjectStore>,
-        path: Path,
+    fn with_source(
+        source: Arc<BlobSource>,
         position: u64,
         size: u64,
         kind: BlobKind,
         uri: Option<String>,
     ) -> Self {
         Self {
-            object_store,
-            path,
+            source,
             position,
             size,
             kind,
             uri,
-            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
+            state: Arc::new(Mutex::new(BlobFileState::Open(0))),
         }
     }
 
@@ -781,7 +976,13 @@ impl BlobFile {
         position: u64,
         size: u64,
     ) -> Self {
-        Self::with_location(object_store, path, position, size, BlobKind::Inline, None)
+        Self::with_source(
+            Arc::new(BlobSource::new(object_store, path)),
+            position,
+            size,
+            BlobKind::Inline,
+            None,
+        )
     }
 
     /// Create a dedicated blob reader backed by a sidecar `.blob` file.
@@ -795,7 +996,13 @@ impl BlobFile {
     /// * `path` - Full path to the dedicated sidecar blob file.
     /// * `size` - Total byte length to expose from the sidecar file.
     pub fn new_dedicated(object_store: Arc<ObjectStore>, path: Path, size: u64) -> Self {
-        Self::with_location(object_store, path, 0, size, BlobKind::Dedicated, None)
+        Self::with_source(
+            Arc::new(BlobSource::new(object_store, path)),
+            0,
+            size,
+            BlobKind::Dedicated,
+            None,
+        )
     }
 
     /// Create a packed blob reader for a slice inside a shared sidecar `.blob` file.
@@ -815,7 +1022,13 @@ impl BlobFile {
         position: u64,
         size: u64,
     ) -> Self {
-        Self::with_location(object_store, path, position, size, BlobKind::Packed, None)
+        Self::with_source(
+            Arc::new(BlobSource::new(object_store, path)),
+            position,
+            size,
+            BlobKind::Packed,
+            None,
+        )
     }
 
     /// Create an external blob reader backed by a caller-resolved object location.
@@ -838,9 +1051,8 @@ impl BlobFile {
         position: u64,
         size: u64,
     ) -> Self {
-        Self::with_location(
-            object_store,
-            path,
+        Self::with_source(
+            Arc::new(BlobSource::new(object_store, path)),
             position,
             size,
             BlobKind::External,
@@ -850,41 +1062,95 @@ impl BlobFile {
 
     /// Close the blob file, releasing any associated resources
     pub async fn close(&self) -> Result<()> {
-        let mut reader = self.reader.lock().await;
-        *reader = ReaderState::Closed;
+        let mut state = self.state.lock().await;
+        *state = BlobFileState::Closed;
         Ok(())
     }
 
     /// Returns true if the blob file is closed
     pub async fn is_closed(&self) -> bool {
-        matches!(*self.reader.lock().await, ReaderState::Closed)
+        matches!(*self.state.lock().await, BlobFileState::Closed)
     }
 
-    async fn do_with_reader<
-        T,
-        Fut: Future<Output = Result<(u64, T)>>,
-        Func: FnOnce(u64, Arc<dyn Reader>) -> Fut,
-    >(
+    async fn do_with_cursor<T, Fut: Future<Output = Result<(u64, T)>>, Func: FnOnce(u64) -> Fut>(
         &self,
         func: Func,
     ) -> Result<T> {
-        let mut reader = self.reader.lock().await;
-        if let ReaderState::Uninitialized(cursor) = *reader {
-            let opened = self.object_store.open(&self.path).await?;
-            let opened = Arc::<dyn Reader>::from(opened);
-            *reader = ReaderState::Open((cursor, opened.clone()));
-        }
-        match reader.deref_mut() {
-            ReaderState::Open((cursor, reader)) => {
-                let (new_cursor, data) = func(*cursor, reader.clone()).await?;
+        let mut state = self.state.lock().await;
+        match state.deref_mut() {
+            BlobFileState::Open(cursor) => {
+                let (new_cursor, data) = func(*cursor).await?;
                 *cursor = new_cursor;
                 Ok(data)
             }
-            ReaderState::Closed => Err(Error::invalid_input(
+            BlobFileState::Closed => Err(Error::invalid_input(
                 "Blob file is already closed".to_string(),
             )),
-            _ => unreachable!(),
         }
+    }
+
+    async fn ensure_open(&self) -> Result<()> {
+        let state = self.state.lock().await;
+        match *state {
+            BlobFileState::Open(_) => Ok(()),
+            BlobFileState::Closed => Err(Error::invalid_input(
+                "Blob file is already closed".to_string(),
+            )),
+        }
+    }
+
+    fn read_phys_range(&self, range: Range<u64>) -> Result<Range<u64>> {
+        if range.start > range.end {
+            return Err(Error::invalid_input(format!(
+                "Blob range start {} must be <= end {}",
+                range.start, range.end
+            )));
+        }
+        if range.end > self.size {
+            return Err(Error::invalid_input(format!(
+                "Blob range end {} exceeds blob size {}",
+                range.end, self.size
+            )));
+        }
+        let start = self.position.checked_add(range.start).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob range start overflowed physical position: base={} offset={}",
+                self.position, range.start
+            ))
+        })?;
+        let end = self.position.checked_add(range.end).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob range end overflowed physical position: base={} offset={}",
+                self.position, range.end
+            ))
+        })?;
+        Ok(start..end)
+    }
+
+    /// Read a byte range relative to the beginning of this blob without changing the cursor.
+    ///
+    /// The provided range is interpreted in blob-local coordinates, not object
+    /// coordinates. Empty ranges are allowed. This method is intended for random
+    /// access callers that want deterministic range semantics instead of the
+    /// stateful file-like cursor used by [`Self::read`] and [`Self::read_up_to`].
+    pub async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        let mut data = self.read_ranges(&[range]).await?;
+        Ok(data.pop().unwrap_or_default())
+    }
+
+    /// Read multiple ranges relative to the beginning of this blob without changing the cursor.
+    ///
+    /// Empty ranges are allowed and yield empty buffers. The result order always
+    /// matches the input order, even though the underlying physical requests may
+    /// be reordered, coalesced, or split for efficiency.
+    pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.ensure_open().await?;
+        let physical_ranges = ranges
+            .iter()
+            .cloned()
+            .map(|range| self.read_phys_range(range))
+            .collect::<Result<Vec<_>>>()?;
+        self.source.read_ranges(physical_ranges).await
     }
 
     /// Read the entire blob file from the current cursor position
@@ -893,15 +1159,21 @@ impl BlobFile {
     /// After this call the cursor will be pointing to the end of
     /// the file.
     pub async fn read(&self) -> Result<bytes::Bytes> {
-        let position = self.position;
         let size = self.size;
-        self.do_with_reader(|cursor, reader| async move {
-            if cursor >= size {
-                return Ok((size, bytes::Bytes::new()));
+        let source = self.source.clone();
+        let position = self.position;
+        self.do_with_cursor(move |cursor| {
+            let source = source.clone();
+            async move {
+                if cursor >= size {
+                    return Ok((size, Bytes::new()));
+                }
+                let physical = (position + cursor)..(position + size);
+                Ok((
+                    size,
+                    source.read_ranges(vec![physical]).await?.pop().unwrap(),
+                ))
             }
-            let start = position as usize + cursor as usize;
-            let end = (position + size) as usize;
-            Ok((size, reader.get_range(start..end).await?))
         })
         .await
     }
@@ -911,48 +1183,47 @@ impl BlobFile {
     /// After this call the cursor will be pointing to the end of
     /// the read data.
     pub async fn read_up_to(&self, len: usize) -> Result<bytes::Bytes> {
-        let position = self.position;
         let size = self.size;
-        self.do_with_reader(|cursor, reader| async move {
-            if cursor >= size || len == 0 {
-                return Ok((size.min(cursor), bytes::Bytes::new()));
+        let source = self.source.clone();
+        let position = self.position;
+        self.do_with_cursor(move |cursor| {
+            let source = source.clone();
+            async move {
+                if cursor >= size || len == 0 {
+                    return Ok((size.min(cursor), Bytes::new()));
+                }
+                let read_size = len.min((size - cursor) as usize) as u64;
+                let start = position + cursor;
+                let end = start + read_size;
+                let data = source.read_ranges(vec![start..end]).await?.pop().unwrap();
+                Ok((cursor + read_size, data))
             }
-            let start = position as usize + cursor as usize;
-            let read_size = len.min((size - cursor) as usize);
-            let end = start + read_size;
-            let data = reader.get_range(start..end).await?;
-            Ok((end as u64 - position, data))
         })
         .await
     }
 
     /// Seek to a new cursor position in the file
     pub async fn seek(&self, new_cursor: u64) -> Result<()> {
-        let mut reader = self.reader.lock().await;
-        match reader.deref_mut() {
-            ReaderState::Open((cursor, _)) => {
+        let mut state = self.state.lock().await;
+        match state.deref_mut() {
+            BlobFileState::Open(cursor) => {
                 *cursor = new_cursor;
                 Ok(())
             }
-            ReaderState::Closed => Err(Error::invalid_input(
+            BlobFileState::Closed => Err(Error::invalid_input(
                 "Blob file is already closed".to_string(),
             )),
-            ReaderState::Uninitialized(cursor) => {
-                *cursor = new_cursor;
-                Ok(())
-            }
         }
     }
 
     /// Return the current cursor position in the file
     pub async fn tell(&self) -> Result<u64> {
-        let reader = self.reader.lock().await;
-        match *reader {
-            ReaderState::Open((cursor, _)) => Ok(cursor),
-            ReaderState::Closed => Err(Error::invalid_input(
+        let state = self.state.lock().await;
+        match *state {
+            BlobFileState::Open(cursor) => Ok(cursor),
+            BlobFileState::Closed => Err(Error::invalid_input(
                 "Blob file is already closed".to_string(),
             )),
-            ReaderState::Uninitialized(cursor) => Ok(cursor),
         }
     }
 
@@ -966,7 +1237,7 @@ impl BlobFile {
     }
 
     pub fn data_path(&self) -> &Path {
-        &self.path
+        &self.source.path
     }
 
     pub fn kind(&self) -> BlobKind {
@@ -1085,6 +1356,7 @@ fn collect_blob_files_v1(
 ) -> Result<Vec<BlobFile>> {
     let positions = descriptions.column(0).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(1).as_primitive::<UInt64Type>();
+    let mut source_cache = HashMap::<BlobSourceKey, Arc<BlobSource>>::new();
 
     Ok(row_addrs
         .values()
@@ -1101,7 +1373,17 @@ fn collect_blob_files_v1(
             let frag = dataset.get_fragment(frag_id as usize).unwrap();
             let data_file = frag.data_file_for_field(blob_field_id).unwrap();
             let data_file_path = dataset.data_dir().child(data_file.path.as_str());
-            BlobFile::new_inline(dataset.object_store.clone(), data_file_path, position, size)
+            BlobFile::with_source(
+                shared_blob_source(
+                    &mut source_cache,
+                    dataset.object_store.clone(),
+                    &data_file_path,
+                ),
+                position,
+                size,
+                BlobKind::Inline,
+                None,
+            )
         })
         .collect())
 }
@@ -1122,6 +1404,7 @@ async fn collect_blob_files_v2(
     let mut fragment_cache = HashMap::<u32, BlobReadLocation>::new();
     let mut store_cache = HashMap::<u32, Arc<ObjectStore>>::new();
     let mut external_base_path_cache = HashMap::<u32, Path>::new();
+    let mut source_cache = HashMap::<BlobSourceKey, Arc<BlobSource>>::new();
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
         let kind = BlobKind::try_from(kinds.value(idx))?;
 
@@ -1142,11 +1425,17 @@ async fn collect_blob_files_v2(
                     &mut store_cache,
                 )
                 .await?;
-                files.push(BlobFile::new_inline(
+                let source = shared_blob_source(
+                    &mut source_cache,
                     location.object_store,
-                    location.data_file_path,
+                    &location.data_file_path,
+                );
+                files.push(BlobFile::with_source(
+                    source,
                     position,
                     size,
+                    BlobKind::Inline,
+                    None,
                 ));
             }
             BlobKind::Dedicated => {
@@ -1161,7 +1450,14 @@ async fn collect_blob_files_v2(
                 )
                 .await?;
                 let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-                files.push(BlobFile::new_dedicated(location.object_store, path, size));
+                let source = shared_blob_source(&mut source_cache, location.object_store, &path);
+                files.push(BlobFile::with_source(
+                    source,
+                    0,
+                    size,
+                    BlobKind::Dedicated,
+                    None,
+                ));
             }
             BlobKind::Packed => {
                 let blob_id = blob_ids.value(idx);
@@ -1176,11 +1472,13 @@ async fn collect_blob_files_v2(
                 )
                 .await?;
                 let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-                files.push(BlobFile::new_packed(
-                    location.object_store,
-                    path,
+                let source = shared_blob_source(&mut source_cache, location.object_store, &path);
+                files.push(BlobFile::with_source(
+                    source,
                     position,
                     size,
+                    BlobKind::Packed,
+                    None,
                 ));
             }
             BlobKind::External => {
@@ -1225,12 +1523,13 @@ async fn collect_blob_files_v2(
                 } else {
                     object_store.size(&path).await?
                 };
-                files.push(BlobFile::new_external(
-                    object_store,
-                    path,
-                    uri_or_path,
+                let source = shared_blob_source(&mut source_cache, object_store, &path);
+                files.push(BlobFile::with_source(
+                    source,
                     position,
                     size,
+                    BlobKind::External,
+                    Some(uri_or_path),
                 ));
             }
         }
@@ -1321,6 +1620,7 @@ fn data_file_key_from_path(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::sync::Arc;
 
     use arrow::{
@@ -1333,17 +1633,18 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use futures::TryStreamExt;
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     };
+    use chrono::Utc;
+    use futures::{StreamExt, TryStreamExt};
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
     use object_store::{
-        GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+        Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+        ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
     };
     use url::Url;
 
@@ -1354,7 +1655,7 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::version::LanceFileVersion;
 
-    use super::{BlobFile, data_file_key_from_path};
+    use super::{BlobFile, BlobSource, data_file_key_from_path};
     use crate::{
         Dataset,
         blob::{BlobArrayBuilder, blob_field},
@@ -1485,6 +1786,155 @@ mod tests {
             lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
             None,
         ))
+    }
+
+    #[derive(Debug)]
+    struct RecordingRangeObjectStore {
+        data: Bytes,
+        requested_ranges: std::sync::Mutex<Vec<Range<u64>>>,
+    }
+
+    impl RecordingRangeObjectStore {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                requested_ranges: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requested_ranges(&self) -> Vec<Range<u64>> {
+            self.requested_ranges.lock().unwrap().clone()
+        }
+
+        fn object_meta(&self, location: &Path) -> ObjectMeta {
+            ObjectMeta {
+                location: location.clone(),
+                last_modified: Utc::now(),
+                size: self.data.len() as u64,
+                e_tag: None,
+                version: None,
+            }
+        }
+    }
+
+    impl std::fmt::Display for RecordingRangeObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingRangeObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for RecordingRangeObjectStore {
+        async fn put(
+            &self,
+            _location: &Path,
+            _bytes: PutPayload,
+        ) -> object_store::Result<PutResult> {
+            unimplemented!("put is not used by these tests")
+        }
+
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: PutPayload,
+            _opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            unimplemented!("put_opts is not used by these tests")
+        }
+
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            unimplemented!("put_multipart is not used by these tests")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            unimplemented!("put_multipart_opts is not used by these tests")
+        }
+
+        async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
+            self.get_opts(location, GetOptions::default()).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let range = match options.range {
+                Some(GetRange::Bounded(range)) => range,
+                None => 0..self.data.len() as u64,
+                Some(other) => {
+                    return Err(object_store::Error::NotSupported {
+                        source: format!("unsupported range request {other:?}").into(),
+                    });
+                }
+            };
+            self.requested_ranges.lock().unwrap().push(range.clone());
+            let bytes = self.data.slice(range.start as usize..range.end as usize);
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    futures::stream::once(async move { Ok(bytes) }).boxed(),
+                ),
+                meta: self.object_meta(location),
+                range,
+                attributes: Attributes::default(),
+            })
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            Ok(self.object_meta(location))
+        }
+
+        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+            unimplemented!("delete is not used by these tests")
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            unimplemented!("list is not used by these tests")
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            unimplemented!("list_with_delimiter is not used by these tests")
+        }
+
+        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!("copy is not used by these tests")
+        }
+
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!("copy_if_not_exists is not used by these tests")
+        }
+    }
+
+    fn recording_range_store(data: Bytes) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
+        const TEST_RANGE_STORE_SIZE: usize = 128 * 1024;
+        let mut padded = vec![0; TEST_RANGE_STORE_SIZE.max(data.len())];
+        padded[..data.len()].copy_from_slice(data.as_ref());
+        let inner = Arc::new(RecordingRangeObjectStore::new(Bytes::from(padded)));
+        let store = Arc::new(ObjectStore::new(
+            inner.clone() as Arc<dyn object_store::ObjectStore>,
+            Url::parse("mock:///blob-range-tests").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        (store, inner)
     }
 
     impl BlobTestFixture {
@@ -1875,6 +2325,54 @@ mod tests {
         assert!(blob.read().await.unwrap().is_empty());
         assert!(blob.read_up_to(1).await.unwrap().is_empty());
         assert_eq!(blob.tell().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_blob_file_read_range_does_not_change_cursor() {
+        let (store, _) = recording_range_store(Bytes::from_static(b"abcdefgh"));
+        let path = Path::from("blobs/test.bin");
+        let blob = BlobFile::new_packed(store, path, 1, 6);
+
+        let bytes = blob.read_range(2..5).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"def");
+        assert_eq!(blob.tell().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_blob_file_read_ranges_preserves_input_order() {
+        let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
+        let path = Path::from("blobs/test.bin");
+        let blob = BlobFile::new_packed(store, path, 1, 6);
+
+        let chunks = blob.read_ranges(&[4..6, 0..2, 2..4, 2..2]).await.unwrap();
+        assert_eq!(chunks[0].as_ref(), b"fg");
+        assert_eq!(chunks[1].as_ref(), b"bc");
+        assert_eq!(chunks[2].as_ref(), b"de");
+        assert!(chunks[3].is_empty());
+        assert_eq!(inner.requested_ranges(), vec![1..7]);
+    }
+
+    #[tokio::test]
+    async fn test_blob_file_read_range_rejects_out_of_bounds() {
+        let (store, _) = recording_range_store(Bytes::from_static(b"abcdef"));
+        let path = Path::from("blobs/test.bin");
+        let blob = BlobFile::new_packed(store, path, 0, 4);
+
+        let err = blob.read_range(1..5).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds blob size"));
+    }
+
+    #[tokio::test]
+    async fn test_blob_files_share_source_and_coalesce() {
+        let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
+        let blob1 = BlobFile::with_source(source.clone(), 1, 3, BlobKind::Packed, None);
+        let blob2 = BlobFile::with_source(source, 4, 3, BlobKind::Packed, None);
+
+        let (data1, data2) = tokio::join!(blob1.read(), blob2.read());
+        assert_eq!(data1.unwrap().as_ref(), b"bcd");
+        assert_eq!(data2.unwrap().as_ref(), b"efg");
+        assert_eq!(inner.requested_ranges(), vec![1..7]);
     }
 
     #[tokio::test]

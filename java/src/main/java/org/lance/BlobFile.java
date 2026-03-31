@@ -59,6 +59,13 @@ public final class BlobFile implements Closeable {
     return nativeReadUpTo(len);
   }
 
+  /** Read a blob-local range without changing the current cursor. */
+  public byte[] readRange(long offset, int len) throws IOException {
+    if (offset < 0) throw new IllegalArgumentException("offset must be non-negative");
+    if (len < 0) throw new IllegalArgumentException("len must be non-negative");
+    return nativeReadRange(offset, len);
+  }
+
   /** Seek to a new cursor position. */
   public void seek(long newCursor) throws IOException {
     if (newCursor < 0) throw new IllegalArgumentException("newCursor must be non-negative");
