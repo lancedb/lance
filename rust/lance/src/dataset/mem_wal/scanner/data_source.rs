@@ -79,15 +79,15 @@ pub struct FlushedGeneration {
     pub path: String,
 }
 
-/// Snapshot of a region's state at a point in time.
+/// Snapshot of a shard's state at a point in time.
 ///
 /// This is read from the MemWAL index for eventual consistency,
-/// or from region manifests directly for strong consistency.
+/// or from shard manifests directly for strong consistency.
 #[derive(Debug, Clone)]
-pub struct RegionSnapshot {
-    /// Region UUID.
-    pub region_id: Uuid,
-    /// Region spec ID (0 if manual region).
+pub struct ShardSnapshot {
+    /// Shard UUID.
+    pub shard_id: Uuid,
+    /// Shard spec ID (0 if manual shard).
     pub spec_id: u32,
     /// Current generation being written (next flush will be this generation).
     pub current_generation: u64,
@@ -95,11 +95,11 @@ pub struct RegionSnapshot {
     pub flushed_generations: Vec<FlushedGeneration>,
 }
 
-impl RegionSnapshot {
-    /// Create a new region snapshot.
-    pub fn new(region_id: Uuid) -> Self {
+impl ShardSnapshot {
+    /// Create a new shard snapshot.
+    pub fn new(shard_id: Uuid) -> Self {
         Self {
-            region_id,
+            shard_id,
             spec_id: 0,
             current_generation: 1,
             flushed_generations: Vec::new(),
@@ -137,8 +137,8 @@ pub enum LsmDataSource {
     FlushedMemTable {
         /// Absolute path to the flushed MemTable directory.
         path: String,
-        /// Region this MemTable belongs to.
-        region_id: Uuid,
+        /// Shard this MemTable belongs to.
+        shard_id: Uuid,
         /// Generation number (1, 2, 3, ...).
         generation: LsmGeneration,
     },
@@ -150,8 +150,8 @@ pub enum LsmDataSource {
         index_store: Arc<IndexStore>,
         /// Schema of the data.
         schema: SchemaRef,
-        /// Region this MemTable belongs to.
-        region_id: Uuid,
+        /// Shard this MemTable belongs to.
+        shard_id: Uuid,
         /// Generation number.
         generation: LsmGeneration,
     },
@@ -167,12 +167,12 @@ impl LsmDataSource {
         }
     }
 
-    /// Get the region ID if this is a regional source.
-    pub fn region_id(&self) -> Option<Uuid> {
+    /// Get the shard ID if this is a shard source.
+    pub fn shard_id(&self) -> Option<Uuid> {
         match self {
             Self::BaseTable { .. } => None,
-            Self::FlushedMemTable { region_id, .. } => Some(*region_id),
-            Self::ActiveMemTable { region_id, .. } => Some(*region_id),
+            Self::FlushedMemTable { shard_id, .. } => Some(*shard_id),
+            Self::ActiveMemTable { shard_id, .. } => Some(*shard_id),
         }
     }
 
@@ -191,15 +191,15 @@ impl LsmDataSource {
         match self {
             Self::BaseTable { .. } => "base_table".to_string(),
             Self::FlushedMemTable {
-                region_id,
+                shard_id,
                 generation,
                 ..
-            } => format!("flushed[{}:{}]", &region_id.to_string()[..8], generation),
+            } => format!("flushed[{}:{}]", &shard_id.to_string()[..8], generation),
             Self::ActiveMemTable {
-                region_id,
+                shard_id,
                 generation,
                 ..
-            } => format!("memtable[{}:{}]", &region_id.to_string()[..8], generation),
+            } => format!("memtable[{}:{}]", &shard_id.to_string()[..8], generation),
         }
     }
 }
@@ -251,15 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn test_region_snapshot_builder() {
-        let region_id = Uuid::new_v4();
-        let snapshot = RegionSnapshot::new(region_id)
+    fn test_shard_snapshot_builder() {
+        let shard_id = Uuid::new_v4();
+        let snapshot = ShardSnapshot::new(shard_id)
             .with_spec_id(1)
             .with_current_generation(5)
             .with_flushed_generation(1, "abc123_gen_1".to_string())
             .with_flushed_generation(2, "def456_gen_2".to_string());
 
-        assert_eq!(snapshot.region_id, region_id);
+        assert_eq!(snapshot.shard_id, shard_id);
         assert_eq!(snapshot.spec_id, 1);
         assert_eq!(snapshot.current_generation, 5);
         assert_eq!(snapshot.flushed_generations.len(), 2);
