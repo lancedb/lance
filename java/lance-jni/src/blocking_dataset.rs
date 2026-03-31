@@ -319,6 +319,11 @@ impl BlockingDataset {
         Ok(())
     }
 
+    pub fn update_branch_metadata(&mut self, branch: &str, metadata: Option<String>) -> Result<()> {
+        RT.block_on(self.inner.branches().update_metadata(branch, metadata))?;
+        Ok(())
+    }
+
     pub fn get_version(&self, tag: &str) -> Result<u64> {
         let version = RT.block_on(self.inner.tags().get_version(tag))?;
         Ok(version)
@@ -2636,15 +2641,9 @@ fn inner_update_branch_metadata(
 ) -> Result<()> {
     let branch: String = jbranch.extract(env)?;
     let metadata = env.get_optional_string(&jmetadata)?;
-    let dataset_guard =
+    let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(
-        dataset_guard
-            .inner
-            .branches()
-            .update_metadata(&branch, metadata),
-    )?;
-    Ok(())
+    dataset_guard.update_branch_metadata(&branch, metadata)
 }
 
 fn transform_jref_to_ref(jref: JObject, env: &mut JNIEnv) -> Result<Ref> {

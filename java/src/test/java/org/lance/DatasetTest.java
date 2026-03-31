@@ -337,11 +337,28 @@ public class DatasetTest {
         dataset2.tags().updateMetadata("tag2", Optional.of("rollback tag"));
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
-        assertEquals(1, dataset2.tags().list().get(1).getVersion());
+        assertEquals(2, dataset2.tags().list().get(1).getVersion());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
+        assertEquals(2, dataset2.tags().getVersion("tag2"));
+        assertEquals(
+            Optional.of("rollback tag"),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
+        dataset2.tags().update("tag2", Ref.ofMain(1));
         assertEquals(1, dataset2.tags().getVersion("tag2"));
         assertEquals(
             Optional.of("rollback tag"),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
+        dataset2.tags().updateMetadata("tag2", Optional.empty());
+        assertEquals(
+            Optional.empty(),
             dataset2.tags().list().stream()
                 .filter(tag -> tag.getName().equals("tag2"))
                 .findFirst()
@@ -1723,6 +1740,16 @@ public class DatasetTest {
                   assertTrue(branch1Meta.getCreateAt() > 0);
                   assertTrue(branch1Meta.getManifestSize() > 0);
                   assertEquals(Optional.empty(), branch1Meta.getMetadata());
+                  mainV2.branches().updateMetadata("branch1", Optional.of("long-lived branch"));
+                  branches = branch2V4.branches().list();
+                  b1 = branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  assertTrue(b1.isPresent());
+                  assertEquals(Optional.of("long-lived branch"), b1.get().getMetadata());
+                  mainV2.branches().updateMetadata("branch1", Optional.empty());
+                  branches = branch2V4.branches().list();
+                  b1 = branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  assertTrue(b1.isPresent());
+                  assertEquals(Optional.empty(), b1.get().getMetadata());
 
                   assertEquals("branch2", branch2Meta.getName());
                   assertTrue(branch2Meta.getParentBranch().isPresent());

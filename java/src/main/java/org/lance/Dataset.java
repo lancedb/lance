@@ -1748,6 +1748,7 @@ public class Dataset implements Closeable {
     }
 
     public void updateMetadata(String branchName, Optional<String> metadata) {
+      Preconditions.checkArgument(branchName != null, "branchName cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         nativeUpdateBranchMetadata(branchName, metadata);
