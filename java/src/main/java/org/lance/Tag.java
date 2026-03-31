@@ -23,12 +23,18 @@ public class Tag {
   private final Optional<String> branch;
   private final long version;
   private final int manifestSize;
+  private final Optional<String> description;
 
   public Tag(String name, String branch, long version, int manifestSize) {
+    this(name, branch, version, manifestSize, null);
+  }
+
+  public Tag(String name, String branch, long version, int manifestSize, String description) {
     this.name = name;
     this.branch = Optional.ofNullable(branch);
     this.version = version;
     this.manifestSize = manifestSize;
+    this.description = Optional.ofNullable(description);
   }
 
   public String getName() {
@@ -47,6 +53,10 @@ public class Tag {
     return manifestSize;
   }
 
+  public Optional<String> getDescription() {
+    return description;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -54,6 +64,7 @@ public class Tag {
         .add("branch", branch)
         .add("version", version)
         .add("manifestSize", manifestSize)
+        .add("description", description)
         .toString();
   }
 
@@ -69,11 +80,12 @@ public class Tag {
     return version == tag.version
         && Objects.equals(branch, tag.branch)
         && manifestSize == tag.manifestSize
+        && Objects.equals(description, tag.description)
         && Objects.equals(name, tag.name);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, branch, version, manifestSize);
+    return Objects.hash(name, branch, version, manifestSize, description);
   }
 }

@@ -602,6 +602,7 @@ class LanceDataset(pa.dataset.Dataset):
         branch: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        description: Optional[str] = None,
     ) -> "LanceDataset":
         """Create a new branch from a version or tag.
 
@@ -617,6 +618,8 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
+        description: Optional[str]
+            Optional metadata to describe the branch.
 
         Returns
         -------
@@ -625,7 +628,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if storage_options is None:
             storage_options = self._storage_options
-        new_ds = self._ds.create_branch(branch, reference, storage_options)
+        new_ds = self._ds.create_branch(branch, reference, storage_options, description)
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
@@ -4371,6 +4374,7 @@ class Tag(TypedDict):
     branch: Optional[str]
     version: int
     manifest_size: int
+    description: Optional[str]
 
 
 class Branch(TypedDict):
@@ -4378,6 +4382,7 @@ class Branch(TypedDict):
     parent_version: int
     create_at: int
     manifest_size: int
+    description: Optional[str]
 
 
 class Version(TypedDict):
@@ -5769,6 +5774,7 @@ class Tags:
         self,
         tag: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+        description: Optional[str] = None,
     ) -> None:
         """
         Create a tag for a given dataset version.
@@ -5783,8 +5789,10 @@ class Tags:
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
             version_number on the main branch.
+        description: Optional[str]
+            Optional metadata to describe the tag.
         """
-        self._ds.create_tag(tag, reference)
+        self._ds.create_tag(tag, reference, description)
 
     def delete(self, tag: str) -> None:
         """
@@ -5802,6 +5810,7 @@ class Tags:
         self,
         tag: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+        description: Optional[str] = None,
     ) -> None:
         """
         Update tag to a new version.
@@ -5815,8 +5824,10 @@ class Tags:
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
             version_number on the main branch.
+        description: Optional[str]
+            Optional metadata to describe the tag.
         """
-        self._ds.update_tag(tag, reference)
+        self._ds.update_tag(tag, reference, description)
 
 
 class Branches:

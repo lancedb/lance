@@ -299,8 +299,17 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
-    pub fn create_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
-        RT.block_on(self.inner.tags().create(tag, reference))?;
+    pub fn create_tag(
+        &mut self,
+        tag: &str,
+        reference: Ref,
+        description: Option<String>,
+    ) -> Result<()> {
+        RT.block_on(
+            self.inner
+                .tags()
+                .create_with_description(tag, reference, description),
+        )?;
         Ok(())
     }
 
@@ -309,8 +318,17 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn update_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
-        RT.block_on(self.inner.tags().update(tag, reference))?;
+    pub fn update_tag(
+        &mut self,
+        tag: &str,
+        reference: Ref,
+        description: Option<String>,
+    ) -> Result<()> {
+        RT.block_on(
+            self.inner
+                .tags()
+                .update_with_description(tag, reference, description),
+        )?;
         Ok(())
     }
 
@@ -2379,12 +2397,15 @@ fn inner_list_tags<'local>(
         };
         let java_tag = env.new_object(
             "org/lance/Tag",
-            "(Ljava/lang/String;Ljava/lang/String;JI)V",
+            "(Ljava/lang/String;Ljava/lang/String;JILjava/lang/String;)V",
             &[
                 JValue::Object(&env.new_string(tag_name)?.into()),
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
+                JValue::Object(
+                    &optional_str_to_jobject(env, tag_contents.description.as_deref())?,
+                ),
             ],
         )?;
         env.call_method(
@@ -2403,10 +2424,11 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateTag(
     java_dataset: JObject,
     jtag_name: JString,
     jref: JObject,
+    jdescription: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_create_tag(&mut env, java_dataset, jtag_name, jref)
+        inner_create_tag(&mut env, java_dataset, jtag_name, jref, jdescription)
     )
 }
 
@@ -2415,12 +2437,14 @@ fn inner_create_tag(
     java_dataset: JObject,
     jtag_name: JString,
     jref: JObject,
+    jdescription: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
     let reference = transform_jref_to_ref(jref, env)?;
+    let description = env.get_optional_string(&jdescription)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.create_tag(tag.as_str(), reference)?;
+    dataset_guard.create_tag(tag.as_str(), reference, description)?;
     Ok(())
 }
 
@@ -2446,10 +2470,11 @@ pub extern "system" fn Java_org_lance_Dataset_nativeUpdateTag(
     java_dataset: JObject,
     jtag_name: JString,
     jref: JObject,
+    jdescription: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_update_tag(&mut env, java_dataset, jtag_name, jref)
+        inner_update_tag(&mut env, java_dataset, jtag_name, jref, jdescription)
     )
 }
 
@@ -2458,12 +2483,14 @@ fn inner_update_tag(
     java_dataset: JObject,
     jtag_name: JString,
     jref: JObject,
+    jdescription: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
     let reference = transform_jref_to_ref(jref, env)?;
+    let description = env.get_optional_string(&jdescription)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.update_tag(tag.as_str(), reference)
+    dataset_guard.update_tag(tag.as_str(), reference, description)
 }
 
 #[unsafe(no_mangle)]
@@ -2521,13 +2548,16 @@ fn inner_list_branches<'local>(
         };
         let jbranch = env.new_object(
             "org/lance/Branch",
-            "(Ljava/lang/String;Ljava/lang/String;JJI)V",
+            "(Ljava/lang/String;Ljava/lang/String;JJILjava/lang/String;)V",
             &[
                 JValue::Object(&jname),
                 JValue::Object(&jparent),
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),
+                JValue::Object(
+                    &optional_str_to_jobject(env, contents.description.as_deref())?,
+                ),
             ],
         )?;
         env.call_method(
@@ -2547,10 +2577,18 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateBranch<'local>(
     jbranch: JString,
     jref: JObject,
     jstorage_options: JObject, // Optional<String>
+    jdescription: JObject,     // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_create_branch(&mut env, java_dataset, jbranch, jref, jstorage_options)
+        inner_create_branch(
+            &mut env,
+            java_dataset,
+            jbranch,
+            jref,
+            jstorage_options,
+            jdescription,
+        )
     )
 }
 
@@ -2560,18 +2598,21 @@ fn inner_create_branch<'local>(
     jbranch: JString,
     jref: JObject,
     jstorage_options: JObject, // Optional<String>
+    jdescription: JObject,     // Optional<String>
 ) -> Result<JObject<'local>> {
     let branch_name: String = jbranch.extract(env)?;
     let reference = transform_jref_to_ref(jref, env)?;
     let storage_opts = transform_jstorage_options(jstorage_options, env)?;
+    let description = env.get_optional_string(&jdescription)?;
 
     let new_blocking_dataset = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let inner = RT.block_on(dataset_guard.inner.create_branch(
+        let inner = RT.block_on(dataset_guard.inner.create_branch_with_description(
             branch_name.as_str(),
             reference,
             storage_opts,
+            description,
         ))?;
         BlockingDataset { inner }
     };
@@ -2607,6 +2648,16 @@ fn transform_jstorage_options(
             })
         })
         .unwrap_or(None))
+}
+
+fn optional_str_to_jobject<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<&str>,
+) -> Result<JObject<'local>> {
+    Ok(match value {
+        Some(value) => env.new_string(value)?.into(),
+        None => JObject::null(),
+    })
 }
 
 #[unsafe(no_mangle)]

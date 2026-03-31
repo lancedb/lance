@@ -30,14 +30,26 @@ public class Branch {
   private final long parentVersion;
   private final long createAt;
   private final int manifestSize;
+  private final Optional<String> description;
 
   public Branch(
       String name, String parentBranch, long parentVersion, long createAt, int manifestSize) {
+    this(name, parentBranch, parentVersion, createAt, manifestSize, null);
+  }
+
+  public Branch(
+      String name,
+      String parentBranch,
+      long parentVersion,
+      long createAt,
+      int manifestSize,
+      String description) {
     this.name = name;
     this.parentBranch = Optional.ofNullable(parentBranch);
     this.parentVersion = parentVersion;
     this.createAt = createAt;
     this.manifestSize = manifestSize;
+    this.description = Optional.ofNullable(description);
   }
 
   public String getName() {
@@ -60,6 +72,10 @@ public class Branch {
     return manifestSize;
   }
 
+  public Optional<String> getDescription() {
+    return description;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -68,6 +84,7 @@ public class Branch {
         .add("parentVersion", parentVersion)
         .add("createAt", createAt)
         .add("manifestSize", manifestSize)
+        .add("description", description)
         .toString();
   }
 
@@ -80,11 +97,12 @@ public class Branch {
         && createAt == branch.createAt
         && manifestSize == branch.manifestSize
         && Objects.equals(name, branch.name)
-        && Objects.equals(parentBranch, branch.parentBranch);
+        && Objects.equals(parentBranch, branch.parentBranch)
+        && Objects.equals(description, branch.description);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, parentBranch, parentVersion, createAt, manifestSize);
+    return Objects.hash(name, parentBranch, parentVersion, createAt, manifestSize, description);
   }
 }

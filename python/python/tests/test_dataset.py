@@ -470,8 +470,9 @@ def test_tag(tmp_path: Path):
     with pytest.raises(ValueError):
         ds.tags.delete("tag1")
 
-    ds.tags.create("tag1", 1)
+    ds.tags.create("tag1", 1, description="first tag")
     assert len(ds.tags.list()) == 1
+    assert ds.tags.list()["tag1"]["description"] == "first tag"
 
     with pytest.raises(ValueError):
         ds.tags.create("tag1", 1)
@@ -505,13 +506,15 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
-    ds.tags.update("tag1", 2)
+    ds.tags.update("tag1", 2, description="updated tag")
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
+    assert ds.tags.list()["tag1"]["description"] == "updated tag"
 
     ds.tags.update("tag1", 1)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
+    assert ds.tags.list()["tag1"]["description"] is None
 
     version = ds.tags.get_version("tag1")
     assert version == 1
@@ -5212,7 +5215,7 @@ def test_branches(tmp_path: Path):
     main_table = pa.Table.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
     ds_main = lance.write_dataset(main_table, base_dir)
 
-    branch1 = ds_main.create_branch("branch1")
+    branch1 = ds_main.create_branch("branch1", description="branch one")
     assert branch1.version == 1
     branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
     branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
@@ -5262,6 +5265,7 @@ def test_branches(tmp_path: Path):
     assert isinstance(b1_meta["parent_version"], int)
     assert b1_meta["manifest_size"] > 0
     assert "create_at" in b1_meta
+    assert b1_meta["description"] == "branch one"
 
     try:
         ds_main.checkout_version("branch_not_exists")
