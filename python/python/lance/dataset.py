@@ -2358,11 +2358,11 @@ class LanceDataset(pa.dataset.Dataset):
         """
         from lance.file import LanceFileSession
 
-        # TODO: Add namespace_client/table_id support to LanceFileSession
-        # for automatic credential refresh
         return LanceFileSession(
             base_path=self._uri,
             storage_options=self.latest_storage_options(),
+            namespace_client=self._namespace_client,
+            table_id=self._table_id,
         )
 
     def checkout_version(

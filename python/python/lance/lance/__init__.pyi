@@ -28,6 +28,7 @@ from typing import (
 )
 
 import pyarrow as pa
+from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
 from ..commit import CommitLock
@@ -102,7 +103,8 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int],
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
-        storage_options_provider: Optional[StorageOptionsProvider],
+        namespace_client: Optional[LanceNamespace],
+        table_id: Optional[List[str]],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -116,7 +118,8 @@ class LanceFileSession:
         self,
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -140,7 +143,8 @@ class LanceFileReader:
         self,
         path: str,
         storage_options: Optional[Dict[str, str]],
-        storage_options_provider: Optional[StorageOptionsProvider],
+        namespace_client: Optional[LanceNamespace],
+        table_id: Optional[List[str]],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
