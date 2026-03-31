@@ -556,7 +556,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false))]
     fn new(
         py: Python,
         uri: String,
@@ -571,7 +571,6 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
@@ -667,21 +666,13 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        // Handle storage options provider: either explicit or auto-created from namespace
-        if let Some(provider_obj) = storage_options_provider {
-            // Explicit storage options provider takes precedence
-            use crate::storage_options::py_object_to_storage_options_provider;
-            let provider = py_object_to_storage_options_provider(provider_obj)?;
-            builder = builder.with_storage_options_provider(provider);
-        }
-
         // Set up namespace-based features if namespace_client and table_id are provided
         if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
             let ns_client = extract_namespace_arc(py, ns_client)?;
 
-            // Auto-create storage options provider from namespace client if not explicitly provided
-            // and storage_options are present (meaning credentials came from namespace.describe_table)
-            if storage_options_provider.is_none() && initial_storage_options.is_some() {
+            // Auto-create storage options provider from namespace client
+            // when storage_options are present (meaning credentials came from namespace.describe_table)
+            if initial_storage_options.is_some() {
                 let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
                     LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
                 );
@@ -2265,14 +2256,13 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
@@ -2296,7 +2286,6 @@ impl Dataset {
             PyLance(transaction),
             commit_lock,
             storage_options,
-            storage_options_provider,
             enable_v2_manifest_paths,
             detached,
             max_retries,
@@ -2310,13 +2299,12 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
@@ -2325,10 +2313,8 @@ impl Dataset {
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
-        let accessor = crate::storage_options::create_accessor_from_python(
-            storage_options.clone(),
-            storage_options_provider,
-        )?;
+        let accessor =
+            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -2397,21 +2383,18 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch(
         dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let accessor = crate::storage_options::create_accessor_from_python(
-            storage_options.clone(),
-            storage_options_provider,
-        )?;
+        let accessor =
+            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {

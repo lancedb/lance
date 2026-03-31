@@ -26,7 +26,6 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
-from .io import StorageOptionsProvider
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
@@ -84,7 +83,6 @@ __all__ = [
     "set_logger",
     "write_dataset",
     "FFILanceTableProvider",
-    "StorageOptionsProvider",
 ]
 
 

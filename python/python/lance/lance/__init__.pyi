@@ -47,7 +47,6 @@ from ..fragment import (
     DataFile,
     FragmentMetadata,
 )
-from ..io import StorageOptionsProvider
 from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
@@ -402,7 +401,6 @@ class _Dataset:
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
@@ -415,7 +413,6 @@ class _Dataset:
         transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
