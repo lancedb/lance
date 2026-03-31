@@ -72,6 +72,10 @@ public class Branch {
   private final long createAt;
   private final int manifestSize;
 
+  public Branch(String name, String parentBranch, long parentVersion, long createAt, int manifestSize) {
+    this(name, parentBranch, ImmutableList.of(), parentVersion, createAt, manifestSize);
+  }
+
   public Branch(
       String name,
       String parentBranch,
