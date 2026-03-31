@@ -17,6 +17,7 @@ default = []
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait"] }
+lance-arrow = { path = "../../rust/lance-arrow" }
 lance-datafusion = { path = "../../rust/lance-datafusion" }
 lance-encoding = { path = "../../rust/lance-encoding" }
 lance-linalg = { path = "../../rust/lance-linalg" }

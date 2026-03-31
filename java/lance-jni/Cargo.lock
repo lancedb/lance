@@ -3771,6 +3771,7 @@ dependencies = [
  "env_logger",
  "jni",
  "lance",
+ "lance-arrow",
  "lance-core",
  "lance-datafusion",
  "lance-encoding",
