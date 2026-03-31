@@ -22,10 +22,9 @@ import java.util.Optional;
 
 /**
  * Branch metadata aligned with Rust's BranchContents. name is the branch name, parentBranch may be
- * null (indicating main), branchIdentifier is the lineage chain
- * {@code [(version, uuid), ...]}, parentVersion is the version on which the branch was created,
- * createAt is the unix timestamp (seconds), and manifestSize is the size of the referenced manifest
- * file in bytes.
+ * null (indicating main), branchIdentifier is the lineage chain {@code [(version, uuid), ...]},
+ * parentVersion is the version on which the branch was created, createAt is the unix timestamp
+ * (seconds), and manifestSize is the size of the referenced manifest file in bytes.
  */
 public class Branch {
   /** A single lineage hop in the Rust BranchIdentifier.version_mapping vector. */
@@ -143,6 +142,7 @@ public class Branch {
 
   @Override
   public int hashCode() {
-    return Objects.hash(name, parentBranch, branchIdentifier, parentVersion, createAt, manifestSize);
+    return Objects.hash(
+        name, parentBranch, branchIdentifier, parentVersion, createAt, manifestSize);
   }
 }
