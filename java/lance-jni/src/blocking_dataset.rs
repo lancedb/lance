@@ -2587,7 +2587,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateBranch<'local>(
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_create_branch(&mut env, java_dataset, jbranch, jref, jstorage_options,)
+        inner_create_branch(&mut env, java_dataset, jbranch, jref, jstorage_options)
     )
 }
 

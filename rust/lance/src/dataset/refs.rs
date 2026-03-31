@@ -257,11 +257,11 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let current_metadata = TagContents::from_path(&tag_file, self.object_store())
-            .await?
-            .metadata;
-        let mut tag_contents = self.build_tag_content_by_ref(reference).await?;
-        tag_contents.metadata = current_metadata;
+        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let updated_reference = self.build_tag_content_by_ref(reference).await?;
+        tag_contents.branch = updated_reference.branch;
+        tag_contents.version = updated_reference.version;
+        tag_contents.manifest_size = updated_reference.manifest_size;
 
         self.object_store()
             .put(
