@@ -147,7 +147,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
-            StorageOptions(params.storage_options().cloned().unwrap_or_default());
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_azure();
         let download_retry_count = storage_options.download_retry_count();
 

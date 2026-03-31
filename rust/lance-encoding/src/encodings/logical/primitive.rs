@@ -3796,7 +3796,7 @@ impl PrimitiveStructuralEncoder {
         // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
         // ratio tells us how many levels a chunk of that size would need.
         let levels_per_chunk =
-            (num_levels as f64 / num_values as f64) * miniblock::MAX_MINIBLOCK_VALUES as f64;
+            (num_levels as f64 / num_values as f64) * *miniblock::MAX_MINIBLOCK_VALUES as f64;
 
         levels_per_chunk > max_levels_per_chunk as f64
     }

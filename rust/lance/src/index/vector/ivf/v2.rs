@@ -2660,6 +2660,7 @@ mod tests {
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.85)]
+    #[case(4, DistanceType::Hamming, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_flat(
         #[case] nlist: usize,

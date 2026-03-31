@@ -205,7 +205,7 @@ impl RleEncoder {
         let type_size = std::mem::size_of::<T>();
 
         let chunk_start = offset * type_size;
-        let max_by_count = MAX_MINIBLOCK_VALUES as usize;
+        let max_by_count = *MAX_MINIBLOCK_VALUES as usize;
         let max_values = values_remaining.min(max_by_count);
         let chunk_end = chunk_start + max_values * type_size;
 
@@ -239,7 +239,7 @@ impl RleEncoder {
             2 => 7, // 128
             _ => 6, // 64
         };
-        let max_checkpoint_log2 = (values_remaining.min(MAX_MINIBLOCK_VALUES as usize))
+        let max_checkpoint_log2 = (values_remaining.min(*MAX_MINIBLOCK_VALUES as usize))
             .next_power_of_two()
             .ilog2();
         let mut checkpoint_log2 = min_checkpoint_log2;
@@ -718,7 +718,7 @@ mod tests {
                     assert!(chunk.log_num_values > 0);
                     let chunk_values = 1u64 << chunk.log_num_values;
                     assert!(chunk_values.is_power_of_two());
-                    assert!(chunk_values <= MAX_MINIBLOCK_VALUES);
+                    assert!(chunk_values <= *MAX_MINIBLOCK_VALUES);
                 } else {
                     assert_eq!(chunk.log_num_values, 0);
                 }
