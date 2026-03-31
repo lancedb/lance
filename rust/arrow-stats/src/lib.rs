@@ -185,18 +185,53 @@ impl StatisticsAccumulator {
     /// Process items from list entries, updating min/max, nan_count, and item_nulls.
     fn update_items(&mut self, items: impl Iterator<Item = ArrayRef>) -> Result<()> {
         for item_array in items {
-            if item_array.is_empty() {
-                continue;
+            self.update_item(&item_array)?;
+        }
+        Ok(())
+    }
+
+    /// Process a single item array. If it is itself a list type, recurse into
+    /// its non-null entries; otherwise treat it as a leaf and compute min/max.
+    fn update_item(&mut self, item_array: &ArrayRef) -> Result<()> {
+        if item_array.is_empty() {
+            return Ok(());
+        }
+        if let Some(ref mut item_nulls) = self.item_nulls {
+            *item_nulls += item_array.null_count() as u64;
+        }
+        match item_array.data_type() {
+            DataType::List(_) => {
+                let list = item_array.as_list::<i32>();
+                for i in 0..list.len() {
+                    if !list.is_null(i) {
+                        self.update_item(&list.value(i))?;
+                    }
+                }
             }
-            if let Some(ref mut item_nulls) = self.item_nulls {
-                *item_nulls += item_array.null_count() as u64;
+            DataType::LargeList(_) => {
+                let list = item_array.as_list::<i64>();
+                for i in 0..list.len() {
+                    if !list.is_null(i) {
+                        self.update_item(&list.value(i))?;
+                    }
+                }
             }
-            if let Some(ref mut nan_count) = self.nan_count {
-                *nan_count += count_nans(&item_array);
+            DataType::FixedSizeList(_, _) => {
+                let list = item_array.as_fixed_size_list();
+                for i in 0..list.len() {
+                    if !list.is_null(i) {
+                        self.update_item(&list.value(i))?;
+                    }
+                }
             }
-            let (batch_min, batch_max) = find_min_max(&item_array)?;
-            self.update_min(batch_min);
-            self.update_max(batch_max);
+            _ => {
+                if let Some(ref mut nan_count) = self.nan_count {
+                    *nan_count += count_nans(item_array);
+                }
+                let (batch_min, batch_max) = find_min_max(item_array)?;
+                self.update_min(batch_min);
+                self.update_max(batch_max);
+            }
         }
         Ok(())
     }
@@ -972,6 +1007,76 @@ mod tests {
             assert_eq!(format!("{}", stats.max.unwrap()), "10");
             assert_eq!(stats.null_count, 1);
             assert_eq!(stats.item_nulls, Some(1));
+        }
+
+        /// Build a List<List<Int32>> array from nested slices.
+        ///
+        /// Each outer Option represents an outer list entry (None = null outer list).
+        /// Each inner Option<&[Option<i32>]> represents an inner list entry
+        /// (None = null inner list).
+        fn build_nested_list_array(rows: &[Option<&[Option<&[Option<i32>]>]>]) -> ArrayRef {
+            let inner_builder = ListBuilder::new(Int32Builder::new());
+            let mut builder = ListBuilder::new(inner_builder);
+            for row in rows {
+                match row {
+                    Some(inner_lists) => {
+                        let inner_builder = builder.values();
+                        for inner_list in *inner_lists {
+                            match inner_list {
+                                Some(items) => {
+                                    for item in *items {
+                                        match item {
+                                            Some(v) => {
+                                                inner_builder.values().append_value(*v);
+                                            }
+                                            None => {
+                                                inner_builder.values().append_null();
+                                            }
+                                        }
+                                    }
+                                    inner_builder.append(true);
+                                }
+                                None => {
+                                    inner_builder.append(false);
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+
+        fn nested_list_data_type() -> DataType {
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )))
+        }
+
+        #[test]
+        fn test_nested_list() {
+            // [[[1, 2], [3]], null, [[null, 5], null, [6]]]
+            let array = build_nested_list_array(&[
+                Some(&[Some(&[Some(1), Some(2)][..]), Some(&[Some(3)])]),
+                None,
+                Some(&[Some(&[None, Some(5)]), None, Some(&[Some(6)])]),
+            ]);
+
+            let mut acc = StatisticsAccumulator::new(&nested_list_data_type());
+            acc.update(&array).unwrap();
+            let stats = acc.finish();
+
+            // min/max should be computed across all leaf int32 values
+            assert_eq!(format!("{}", stats.min.unwrap()), "1");
+            assert_eq!(format!("{}", stats.max.unwrap()), "6");
+            // null_count: only the one null outer list
+            assert_eq!(stats.null_count, 1);
+            // item_nulls: 1 null int32 + 1 null inner list = 2
+            assert_eq!(stats.item_nulls, Some(2));
         }
     }
 
