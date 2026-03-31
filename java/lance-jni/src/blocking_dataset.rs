@@ -2499,7 +2499,10 @@ fn inner_update_tag_metadata(
     jmetadata: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
-    let metadata = env.get_optional_string(&jmetadata)?;
+    let metadata = env.get_optional(&jmetadata, |env, metadata_obj| {
+        let metadata = JString::from(metadata_obj);
+        Ok(env.get_string(&metadata)?.into())
+    })?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.update_tag_metadata(tag.as_str(), metadata)
@@ -2640,7 +2643,10 @@ fn inner_update_branch_metadata(
     jmetadata: JObject,
 ) -> Result<()> {
     let branch: String = jbranch.extract(env)?;
-    let metadata = env.get_optional_string(&jmetadata)?;
+    let metadata = env.get_optional(&jmetadata, |env, metadata_obj| {
+        let metadata = JString::from(metadata_obj);
+        Ok(env.get_string(&metadata)?.into())
+    })?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.update_branch_metadata(&branch, metadata)
