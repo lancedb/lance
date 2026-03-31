@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-scalar = { workspace = true }
+lance-arrow-scalar = { workspace = true }
 half = { workspace = true }
 
 [dev-dependencies]
