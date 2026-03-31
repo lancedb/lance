@@ -2499,10 +2499,7 @@ fn inner_update_tag_metadata(
     jmetadata: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
-    let metadata = env.get_optional(&jmetadata, |env, metadata_obj| {
-        let metadata = JString::from(metadata_obj);
-        Ok(env.get_string(&metadata)?.into())
-    })?;
+    let metadata = extract_optional_metadata(env, &jmetadata)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.update_tag_metadata(tag.as_str(), metadata)
@@ -2643,13 +2640,17 @@ fn inner_update_branch_metadata(
     jmetadata: JObject,
 ) -> Result<()> {
     let branch: String = jbranch.extract(env)?;
-    let metadata = env.get_optional(&jmetadata, |env, metadata_obj| {
-        let metadata = JString::from(metadata_obj);
-        Ok(env.get_string(&metadata)?.into())
-    })?;
+    let metadata = extract_optional_metadata(env, &jmetadata)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.update_branch_metadata(&branch, metadata)
+}
+
+fn extract_optional_metadata(env: &mut JNIEnv, jmetadata: &JObject) -> Result<Option<String>> {
+    env.get_optional(jmetadata, |env, metadata_obj| {
+        let metadata = JString::from(metadata_obj);
+        Ok(env.get_string(&metadata)?.into())
+    })
 }
 
 fn transform_jref_to_ref(jref: JObject, env: &mut JNIEnv) -> Result<Ref> {
