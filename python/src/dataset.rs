@@ -1720,7 +1720,6 @@ impl Dataset {
         })
     }
 
-    #[pyo3(signature = (tag, reference=None))]
     fn create_tag(&mut self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
         rt().block_on(None, self.ds.as_ref().tags().create(tag.as_str(), reference))?
@@ -1744,7 +1743,6 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (tag, reference=None))]
     fn update_tag(&self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
         rt().block_on(None, self.ds.as_ref().tags().update(tag.as_str(), reference))?

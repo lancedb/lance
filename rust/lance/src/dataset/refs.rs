@@ -221,7 +221,7 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference, None).await?;
+        let tag_contents = self.build_tag_content_by_ref(reference).await?;
 
         self.object_store()
             .put(
@@ -260,9 +260,8 @@ impl Tags<'_> {
         let current_metadata = TagContents::from_path(&tag_file, self.object_store())
             .await?
             .metadata;
-        let tag_contents = self
-            .build_tag_content_by_ref(reference, current_metadata)
-            .await?;
+        let mut tag_contents = self.build_tag_content_by_ref(reference).await?;
+        tag_contents.metadata = current_metadata;
 
         self.object_store()
             .put(
@@ -296,11 +295,7 @@ impl Tags<'_> {
             .map(|_| ())
     }
 
-    async fn build_tag_content_by_ref(
-        &self,
-        reference: impl Into<Ref>,
-        metadata: Option<String>,
-    ) -> Result<TagContents> {
+    async fn build_tag_content_by_ref(&self, reference: impl Into<Ref>) -> Result<TagContents> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
             Version(branch, version_number) => (branch, version_number),
@@ -346,7 +341,7 @@ impl Tags<'_> {
             branch,
             version: manifest_file.version,
             manifest_size,
-            metadata,
+            metadata: None,
         };
         Ok(tag_contents)
     }

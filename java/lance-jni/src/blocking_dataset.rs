@@ -2390,10 +2390,9 @@ fn inner_list_tags<'local>(
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
-                JValue::Object(&optional_str_to_jobject(
-                    env,
-                    tag_contents.metadata.as_deref(),
-                )?),
+                JValue::Object(
+                    &crate::traits::JLance(tag_contents.metadata.as_deref()).into_java(env)?,
+                ),
             ],
         )?;
         env.call_method(
@@ -2563,7 +2562,9 @@ fn inner_list_branches<'local>(
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),
-                JValue::Object(&optional_str_to_jobject(env, contents.metadata.as_deref())?),
+                JValue::Object(
+                    &crate::traits::JLance(contents.metadata.as_deref()).into_java(env)?,
+                ),
             ],
         )?;
         env.call_method(
@@ -2675,16 +2676,6 @@ fn transform_jstorage_options(
             })
         })
         .unwrap_or(None))
-}
-
-fn optional_str_to_jobject<'local>(
-    env: &mut JNIEnv<'local>,
-    value: Option<&str>,
-) -> Result<JObject<'local>> {
-    Ok(match value {
-        Some(value) => env.new_string(value)?.into(),
-        None => JObject::null(),
-    })
 }
 
 #[unsafe(no_mangle)]

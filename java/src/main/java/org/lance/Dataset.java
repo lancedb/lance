@@ -1561,7 +1561,8 @@ public class Dataset implements Closeable {
     return innerCreateBranch(branch, ref, Optional.of(storageOptions));
   }
 
-  private Dataset innerCreateBranch(String branch, Ref ref, Optional<Map<String, String>> storageOptions) {
+  private Dataset innerCreateBranch(
+      String branch, Ref ref, Optional<Map<String, String>> storageOptions) {
     Preconditions.checkArgument(branch != null, "Branch cannot be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -1693,10 +1694,6 @@ public class Dataset implements Closeable {
       }
     }
 
-    public void updateMetadata(String tag, String metadata) {
-      updateMetadata(tag, Optional.ofNullable(metadata));
-    }
-
     /**
      * List all tags of the dataset.
      *
@@ -1757,9 +1754,6 @@ public class Dataset implements Closeable {
       }
     }
 
-    public void updateMetadata(String branchName, String metadata) {
-      updateMetadata(branchName, Optional.ofNullable(metadata));
-    }
   }
 
   /**
