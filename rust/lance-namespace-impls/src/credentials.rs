@@ -440,7 +440,12 @@ pub async fn create_credential_vendor_for_location(
 }
 
 /// Parse permission from properties, defaulting to Read
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
     properties
         .get(PERMISSION)
@@ -449,7 +454,12 @@ fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
 }
 
 /// Parse duration from properties using a vendor-specific key, defaulting to DEFAULT_CREDENTIAL_DURATION_MILLIS
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_duration_millis(properties: &HashMap<String, String>, key: &str) -> u64 {
     properties
         .get(key)

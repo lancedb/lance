@@ -639,7 +639,7 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use crate::constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
     use crate::previous::encoder::{
         ArrayEncodingStrategy, CoreArrayEncodingStrategy, check_dict_encoding,

@@ -96,6 +96,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
     }
+
+    fn type_name() -> &'static str {
+        // Using type_name is safe here: the impl is in the same crate as the
+        // types, so the monomorphized pointer is consistent.
+        std::any::type_name::<PartitionEntry<S, Q>>()
+    }
 }
 
 /// IVF Index.
@@ -1288,7 +1294,6 @@ mod tests {
         .unwrap();
     }
 
-    #[allow(dead_code)]
     async fn ground_truth(
         dataset: &Dataset,
         column: &str,
@@ -1314,7 +1319,6 @@ mod tests {
             .collect()
     }
 
-    #[allow(dead_code)]
     fn multivec_ground_truth(
         vectors: &ListArray,
         query: &dyn Array,
@@ -2633,6 +2637,7 @@ mod tests {
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.85)]
+    #[case(4, DistanceType::Hamming, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_flat(
         #[case] nlist: usize,

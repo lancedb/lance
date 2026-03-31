@@ -2751,7 +2751,6 @@ def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
 
-
 def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     """Ensure distributed IVF_PQ build is invariant to shard build order."""
     ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
@@ -2847,8 +2846,6 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     assert ids_12 == ids_21
     for a, b in zip(dists_12, dists_21):
         assert np.allclose(a, b, atol=1e-6)
-
-
 def test_fts_filter_vector_search(tmp_path):
     # Create dataset with vector and text columns
     ids = list(range(1, 301))

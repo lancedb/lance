@@ -228,7 +228,6 @@ impl Cosine for f32 {
 impl Cosine for f64 {}
 
 /// Fallback non-SIMD implementation
-#[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
 fn cosine_scalar<T: Dot>(x: &[T], x_norm: f32, y: &[T]) -> f32 {
     let y_sq = dot(y, y);

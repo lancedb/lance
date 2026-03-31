@@ -313,7 +313,6 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     }
 }
 
-#[allow(dead_code)]
 impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///

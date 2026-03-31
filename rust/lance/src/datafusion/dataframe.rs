@@ -258,7 +258,7 @@ impl SessionContextExt for SessionContext {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::sync::Arc;
 
     use arrow::{

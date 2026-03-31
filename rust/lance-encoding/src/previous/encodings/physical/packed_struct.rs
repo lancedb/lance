@@ -256,7 +256,7 @@ impl ArrayEncoder for PackedStructEncoder {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use arrow_array::{ArrayRef, Int32Array, StructArray, UInt8Array, UInt64Array};
     use arrow_schema::{DataType, Field, Fields};
