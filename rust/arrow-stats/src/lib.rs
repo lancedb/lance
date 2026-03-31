@@ -54,8 +54,8 @@ mod nan;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, ArrayRef};
-use arrow_scalar::ArrowScalar;
 use arrow_schema::{ArrowError, DataType};
+use lance_arrow_scalar::ArrowScalar;
 
 use nan::count_nans;
 
@@ -264,12 +264,12 @@ impl StatisticsAccumulator {
         }
 
         self.null_count += other.null_count;
-        if let (Some(ref mut a), Some(b)) = (&mut self.nan_count, other.nan_count) {
+        if let (Some(a), Some(b)) = (&mut self.nan_count, other.nan_count) {
             *a += b;
         }
         self.buffer_memory += other.buffer_memory;
 
-        if let (Some(ref mut a), Some(b)) = (&mut self.item_nulls, other.item_nulls) {
+        if let (Some(a), Some(b)) = (&mut self.item_nulls, other.item_nulls) {
             *a += b;
         }
 
@@ -1014,6 +1014,7 @@ mod tests {
         /// Each outer Option represents an outer list entry (None = null outer list).
         /// Each inner Option<&[Option<i32>]> represents an inner list entry
         /// (None = null inner list).
+        #[allow(clippy::type_complexity)]
         fn build_nested_list_array(rows: &[Option<&[Option<&[Option<i32>]>]>]) -> ArrayRef {
             let inner_builder = ListBuilder::new(Int32Builder::new());
             let mut builder = ListBuilder::new(inner_builder);
@@ -1112,7 +1113,7 @@ mod tests {
                         let (orig_min, orig_max) = compute_stats(&array);
 
                         // min <= max when both exist
-                        if let (Some(ref mn), Some(ref mx)) = (&orig_min, &orig_max) {
+                        if let (Some(mn), Some(mx)) = (&orig_min, &orig_max) {
                             prop_assert!(mn <= mx, "min {:?} > max {:?}", mn, mx);
                         }
 
@@ -1140,7 +1141,7 @@ mod tests {
                         let array: ArrayRef = Arc::new(<$array_ty>::from(values));
                         let (orig_min, orig_max) = compute_stats(&array);
 
-                        if let (Some(ref mn), Some(ref mx)) = (&orig_min, &orig_max) {
+                        if let (Some(mn), Some(mx)) = (&orig_min, &orig_max) {
                             prop_assert!(mn <= mx, "min {:?} > max {:?}", mn, mx);
                         }
 
@@ -1210,7 +1211,7 @@ mod tests {
                 let array: ArrayRef = Arc::new(Int32Array::from(values));
                 let (orig_min, orig_max) = compute_stats(&array);
 
-                if let (Some(ref mn), Some(ref mx)) = (&orig_min, &orig_max) {
+                if let (Some(mn), Some(mx)) = (&orig_min, &orig_max) {
                     prop_assert!(mn <= mx);
                 }
 
