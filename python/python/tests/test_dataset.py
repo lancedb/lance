@@ -5237,7 +5237,9 @@ def test_branches(tmp_path: Path):
     assert branch1.tags.list()["main_latest2"]["branch"] is None
     assert branches_with_main["branch_from_main"]["parent_branch"] is None
     assert branches_with_main["branch_from_main"]["branch_identifier"][0][0] == 1
-    assert isinstance(branches_with_main["branch_from_main"]["branch_identifier"][0][1], str)
+    assert isinstance(
+        branches_with_main["branch_from_main"]["branch_identifier"][0][1], str
+    )
     assert branches_with_main["branch_from_main"]["parent_version"] == 1
     assert branch1.checkout_version("main_latest").latest_version == 1
     assert branch1.checkout_version("main_latest2").latest_version == 1

@@ -13,8 +13,8 @@
  */
 package org.lance;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Objects;
@@ -72,7 +72,8 @@ public class Branch {
   private final long createAt;
   private final int manifestSize;
 
-  public Branch(String name, String parentBranch, long parentVersion, long createAt, int manifestSize) {
+  public Branch(
+      String name, String parentBranch, long parentVersion, long createAt, int manifestSize) {
     this(name, parentBranch, ImmutableList.of(), parentVersion, createAt, manifestSize);
   }
 
