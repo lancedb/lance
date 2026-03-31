@@ -3360,7 +3360,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4590,7 +4590,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4686,7 +4686,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4722,7 +4722,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrayref",
  "paste",
@@ -4731,7 +4731,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4771,7 +4771,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4825,7 +4825,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4861,6 +4861,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_xoshiro",
  "rstest",
+ "serial_test",
  "snafu",
  "strum 0.26.3",
  "test-log",
@@ -4872,7 +4873,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4898,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4941,7 +4942,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4955,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "approx",
  "arrow",
@@ -5036,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -5087,7 +5088,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "approx",
  "arrow-array",
@@ -5108,7 +5109,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5123,7 +5124,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5141,7 +5142,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5200,7 +5201,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5246,7 +5247,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5255,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5266,7 +5267,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "4.1.0-beta.3"
+version = "5.0.0-beta.2"
 dependencies = [
  "clap",
  "lance-core",
@@ -7699,6 +7700,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7753,6 +7763,12 @@ dependencies = [
  "salsa20",
  "sha2",
 ]
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "security-framework"
@@ -7915,6 +7931,32 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "serial_test"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "scc",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a7d91949b85b0d2fb687445e448b40d322b6b3e4af6b44a29b21d9a5f33e6d9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
