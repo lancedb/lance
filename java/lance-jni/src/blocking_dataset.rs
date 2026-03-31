@@ -1972,11 +1972,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jboolean {
-    ok_or_throw_with_return!(
-        env,
-        inner_has_stable_row_ids(&mut env, java_dataset),
-        0u8
-    )
+    ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
 }
 
 fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
