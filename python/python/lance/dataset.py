@@ -5748,7 +5748,7 @@ class Tags:
         """
         return self._ds.get_version(tag)
 
-    def list_ordered(self, order: Optional[str] = None) -> list[str, Tag]:
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Tag]]:
         """
         List all dataset tags.
 
@@ -5761,7 +5761,7 @@ class Tags:
 
         Returns
         -------
-        list[str, Tag]
+        List[Tuple[str, Tag]]
             An ordered list of tuples mapping tag names to its `Tag` metadata.
         """
         return self._ds.tags_ordered(order)
