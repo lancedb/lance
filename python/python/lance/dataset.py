@@ -4375,6 +4375,7 @@ class Tag(TypedDict):
 
 class Branch(TypedDict):
     parent_branch: Optional[str]
+    branch_identifier: List[Tuple[int, str]]
     parent_version: int
     create_at: int
     manifest_size: int

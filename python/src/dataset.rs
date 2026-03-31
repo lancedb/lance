@@ -1818,6 +1818,7 @@ impl Dataset {
         for (name, meta) in branches.iter() {
             let dict = PyDict::new(py);
             dict.set_item("parent_branch", meta.parent_branch.clone())?;
+            dict.set_item("branch_identifier", meta.identifier.version_mapping.clone())?;
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
@@ -1852,6 +1853,7 @@ impl Dataset {
         for (name, meta) in ordered.into_iter() {
             let dict = PyDict::new(py);
             dict.set_item("parent_branch", meta.parent_branch.clone())?;
+            dict.set_item("branch_identifier", meta.identifier.version_mapping.clone())?;
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;

@@ -2519,12 +2519,32 @@ fn inner_list_branches<'local>(
         } else {
             JObject::null()
         };
+        let jbranch_identifier = env.new_object(
+            "java/util/ArrayList",
+            "(I)V",
+            &[JValue::Int(contents.identifier.version_mapping.len() as i32)],
+        )?;
+        for (version, uuid) in contents.identifier.version_mapping.iter() {
+            let juuid = env.new_string(uuid)?;
+            let jmapping = env.new_object(
+                "org/lance/Branch$BranchVersionMapping",
+                "(JLjava/lang/String;)V",
+                &[JValue::Long(*version as i64), JValue::Object(&juuid)],
+            )?;
+            env.call_method(
+                &jbranch_identifier,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&jmapping)],
+            )?;
+        }
         let jbranch = env.new_object(
             "org/lance/Branch",
-            "(Ljava/lang/String;Ljava/lang/String;JJI)V",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;JJI)V",
             &[
                 JValue::Object(&jname),
                 JValue::Object(&jparent),
+                JValue::Object(&jbranch_identifier),
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),
