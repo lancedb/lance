@@ -248,15 +248,6 @@ impl Tags<'_> {
     }
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
-        self.update_with_metadata(tag, reference, None).await
-    }
-
-    pub async fn update_with_metadata(
-        &self,
-        tag: &str,
-        reference: impl Into<Ref>,
-        metadata: Option<String>,
-    ) -> Result<()> {
         check_valid_tag(tag)?;
 
         let root_location = self.refs.root()?;
@@ -266,7 +257,35 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference, metadata).await?;
+        let current_metadata = TagContents::from_path(&tag_file, self.object_store())
+            .await?
+            .metadata;
+        let tag_contents = self
+            .build_tag_content_by_ref(reference, current_metadata)
+            .await?;
+
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn update_metadata(&self, tag: &str, metadata: Option<String>) -> Result<()> {
+        check_valid_tag(tag)?;
+
+        let root_location = self.refs.root()?;
+        let tag_file = tag_path(&root_location.path, tag);
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        tag_contents.metadata = metadata;
 
         self.object_store()
             .put(

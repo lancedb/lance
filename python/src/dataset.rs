@@ -1744,22 +1744,18 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (tag, reference=None, metadata=None))]
-    fn update_tag(
-        &self,
-        tag: String,
-        reference: Option<Bound<PyAny>>,
-        metadata: Option<String>,
-    ) -> PyResult<()> {
+    #[pyo3(signature = (tag, reference=None))]
+    fn update_tag(&self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
-        rt().block_on(
-            None,
-            self.ds
-                .as_ref()
-                .tags()
-                .update_with_metadata(tag.as_str(), reference, metadata),
-        )?
+        rt().block_on(None, self.ds.as_ref().tags().update(tag.as_str(), reference))?
         .infer_error()?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (tag, metadata=None))]
+    fn update_tag_metadata(&self, tag: String, metadata: Option<String>) -> PyResult<()> {
+        rt().block_on(None, self.ds.as_ref().tags().update_metadata(&tag, metadata))?
+            .infer_error()?;
         Ok(())
     }
 

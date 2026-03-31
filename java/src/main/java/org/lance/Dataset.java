@@ -1667,7 +1667,7 @@ public class Dataset implements Closeable {
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
-      nativeUpdateTag(tag, Ref.ofMain(versionNumber), Optional.empty());
+      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
     }
 
     /**
@@ -1677,20 +1677,24 @@ public class Dataset implements Closeable {
      * @param ref the referenced version to tag
      */
     public void update(String tag, Ref ref) {
-      update(tag, ref, Optional.empty());
-    }
-
-    public void update(String tag, Ref ref, String metadata) {
-      update(tag, ref, Optional.ofNullable(metadata));
-    }
-
-    public void update(String tag, Ref ref, Optional<String> metadata) {
       Preconditions.checkArgument(tag != null, "tag cannot be null");
       Preconditions.checkArgument(ref != null, "ref cannot be null");
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-        nativeUpdateTag(tag, ref, metadata);
+        nativeUpdateTag(tag, ref);
       }
+    }
+
+    public void updateMetadata(String tag, Optional<String> metadata) {
+      Preconditions.checkArgument(tag != null, "tag cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeUpdateTagMetadata(tag, metadata);
+      }
+    }
+
+    public void updateMetadata(String tag, String metadata) {
+      updateMetadata(tag, Optional.ofNullable(metadata));
     }
 
     /**
@@ -1839,7 +1843,8 @@ public class Dataset implements Closeable {
 
   private native void nativeDeleteTag(String tag);
 
-  private native void nativeUpdateTag(String tag, Ref ref, Optional<String> metadata);
+  private native void nativeUpdateTag(String tag, Ref ref);
+  private native void nativeUpdateTagMetadata(String tag, Optional<String> metadata);
 
   private native List<Tag> nativeListTags();
 

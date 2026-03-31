@@ -309,17 +309,13 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn update_tag(
-        &mut self,
-        tag: &str,
-        reference: Ref,
-        metadata: Option<String>,
-    ) -> Result<()> {
-        RT.block_on(
-            self.inner
-                .tags()
-                .update_with_metadata(tag, reference, metadata),
-        )?;
+    pub fn update_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
+        RT.block_on(self.inner.tags().update(tag, reference))?;
+        Ok(())
+    }
+
+    pub fn update_tag_metadata(&mut self, tag: &str, metadata: Option<String>) -> Result<()> {
+        RT.block_on(self.inner.tags().update_metadata(tag, metadata))?;
         Ok(())
     }
 
@@ -2459,11 +2455,10 @@ pub extern "system" fn Java_org_lance_Dataset_nativeUpdateTag(
     java_dataset: JObject,
     jtag_name: JString,
     jref: JObject,
-    jmetadata: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_update_tag(&mut env, java_dataset, jtag_name, jref, jmetadata)
+        inner_update_tag(&mut env, java_dataset, jtag_name, jref)
     )
 }
 
@@ -2472,14 +2467,38 @@ fn inner_update_tag(
     java_dataset: JObject,
     jtag_name: JString,
     jref: JObject,
-    jmetadata: JObject,
 ) -> Result<()> {
     let tag = jtag_name.extract(env)?;
     let reference = transform_jref_to_ref(jref, env)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.update_tag(tag.as_str(), reference)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeUpdateTagMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jmetadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_update_tag_metadata(&mut env, java_dataset, jtag_name, jmetadata)
+    )
+}
+
+fn inner_update_tag_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jmetadata: JObject,
+) -> Result<()> {
+    let tag = jtag_name.extract(env)?;
     let metadata = env.get_optional_string(&jmetadata)?;
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.update_tag(tag.as_str(), reference, metadata)
+    dataset_guard.update_tag_metadata(tag.as_str(), metadata)
 }
 
 #[unsafe(no_mangle)]

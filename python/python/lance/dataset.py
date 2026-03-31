@@ -5803,7 +5803,6 @@ class Tags:
         self,
         tag: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
-        metadata: Optional[str] = None,
     ) -> None:
         """
         Update tag to a new version.
@@ -5817,10 +5816,14 @@ class Tags:
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
             version_number on the main branch.
-        metadata: Optional[str]
-            Optional metadata to attach to the tag.
         """
-        self._ds.update_tag(tag, reference, metadata)
+        self._ds.update_tag(tag, reference)
+
+    def update_metadata(self, tag: str, metadata: Optional[str] = None) -> None:
+        """
+        Update metadata for an existing tag.
+        """
+        self._ds.update_tag_metadata(tag, metadata)
 
 
 class Branches:

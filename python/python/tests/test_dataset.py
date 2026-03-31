@@ -471,7 +471,7 @@ def test_tag(tmp_path: Path):
         ds.tags.delete("tag1")
 
     ds.tags.create("tag1", 1)
-    ds.tags.update("tag1", 1, metadata="first tag")
+    ds.tags.update_metadata("tag1", metadata="first tag")
     assert len(ds.tags.list()) == 1
     assert ds.tags.list()["tag1"]["metadata"] == "first tag"
 
@@ -507,7 +507,7 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
-    ds.tags.update("tag1", 2, metadata="updated tag")
+    ds.tags.update_metadata("tag1", metadata="updated tag")
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
     assert ds.tags.list()["tag1"]["metadata"] == "updated tag"

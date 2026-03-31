@@ -317,7 +317,7 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         dataset.tags().create("tag1", Ref.ofMain());
-        dataset.tags().update("tag1", Ref.ofMain(), "primary tag");
+        dataset.tags().updateMetadata("tag1", "primary tag");
         assertEquals(1, dataset.tags().list().size());
         assertEquals(1, dataset.tags().list().get(0).getVersion());
         assertEquals(Optional.of("primary tag"), dataset.tags().list().get(0).getMetadata());
@@ -334,7 +334,7 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
         assertEquals(2, dataset2.tags().getVersion("tag2"));
-        dataset2.tags().update("tag2", Ref.ofMain(1), "rollback tag");
+        dataset2.tags().updateMetadata("tag2", "rollback tag");
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
         assertEquals(1, dataset2.tags().list().get(1).getVersion());
@@ -366,7 +366,7 @@ public class DatasetTest {
 
         try (Dataset branch = dataset2.createBranch("branch", Ref.ofMain(2))) {
           branch.tags().create("tag_on_branch", Ref.ofBranch("branch"));
-          branch.tags().update("tag_on_branch", Ref.ofBranch("branch"), "branch tag");
+          branch.tags().updateMetadata("tag_on_branch", "branch tag");
           assertEquals(2, dataset2.tags().getVersion("tag_on_branch"));
           List<Tag> tags = dataset2.tags().list();
           Optional<Tag> tagOptional =
