@@ -254,29 +254,6 @@ def get_declare_call_count(namespace_client) -> int:
     return namespace_client.retrieve_ops_metrics().get("declare_table", 0)
 
 
-class NamespaceStorageOptionsProvider:
-    """A storage options provider that fetches options from a namespace client.
-
-    This is a test helper that implements the StorageOptionsProvider protocol
-    by calling describe_table() on the namespace client.
-    """
-
-    def __init__(self, namespace_client, table_id):
-        self._namespace_client = namespace_client
-        self._table_id = table_id
-
-    def fetch_storage_options(self):
-        """Fetch storage options by calling describe_table on the namespace."""
-        response = self._namespace_client.describe_table(
-            DescribeTableRequest(id=self._table_id, version=None)
-        )
-        return response.storage_options
-
-    def provider_id(self):
-        """Return a unique identifier for this provider."""
-        return f"NamespaceStorageOptionsProvider[table_id={self._table_id}]"
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
 def test_namespace_open_dataset(s3_bucket: str, use_custom: bool):
@@ -678,8 +655,8 @@ def test_namespace_distributed_write(s3_bucket: str, use_custom: bool):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
-def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: bool):
-    """Test LanceFileWriter with storage_options_provider and credential refresh."""
+def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
+    """Test LanceFileWriter with namespace_client and credential refresh."""
     from lance.file import LanceFileReader, LanceFileWriter
 
     storage_options = copy.deepcopy(CONFIG)
@@ -715,10 +692,6 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: b
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    provider = NamespaceStorageOptionsProvider(
-        namespace_client=ns_client, table_id=table_id
-    )
-
     initial_describe_count = get_describe_call_count(inner_ns_client)
 
     file_uri = f"s3://{s3_bucket}/{table_name}_file_test.lance"
@@ -728,7 +701,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: b
         file_uri,
         schema=schema,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
@@ -746,7 +720,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: b
     reader = LanceFileReader(
         file_uri,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
@@ -765,7 +740,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: b
         file_uri2,
         schema=schema,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     batch3 = pa.RecordBatch.from_pydict(
@@ -780,7 +756,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: b
     reader2 = LanceFileReader(
         file_uri2,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
@@ -791,8 +768,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str, use_custom: b
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
-def test_file_reader_with_storage_options_provider(s3_bucket: str, use_custom: bool):
-    """Test LanceFileReader with storage_options_provider and credential refresh."""
+def test_file_reader_with_namespace_client(s3_bucket: str, use_custom: bool):
+    """Test LanceFileReader with namespace_client and credential refresh."""
     from lance.file import LanceFileReader, LanceFileWriter
 
     storage_options = copy.deepcopy(CONFIG)
@@ -824,14 +801,10 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str, use_custom: b
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    provider = NamespaceStorageOptionsProvider(
-        namespace_client=ns_client, table_id=table_id
-    )
-
     file_uri = f"s3://{s3_bucket}/{table_name}_file_reader_test.lance"
     schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
 
-    # Write a file first (without provider to keep it simple)
+    # Write a file first (without namespace_client to keep it simple)
     writer = LanceFileWriter(
         file_uri,
         schema=schema,
@@ -855,7 +828,8 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str, use_custom: b
     reader = LanceFileReader(
         file_uri,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
@@ -885,7 +859,8 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str, use_custom: b
     reader2 = LanceFileReader(
         file_uri2,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
@@ -899,8 +874,8 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str, use_custom: b
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
-def test_file_session_with_storage_options_provider(s3_bucket: str, use_custom: bool):
-    """Test LanceFileSession with storage_options_provider and credential refresh."""
+def test_file_session_with_namespace_client(s3_bucket: str, use_custom: bool):
+    """Test LanceFileSession with namespace_client and credential refresh."""
     from lance.file import LanceFileSession
 
     storage_options = copy.deepcopy(CONFIG)
@@ -932,17 +907,14 @@ def test_file_session_with_storage_options_provider(s3_bucket: str, use_custom: 
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    provider = NamespaceStorageOptionsProvider(
-        namespace_client=ns_client, table_id=table_id
-    )
-
     initial_describe_count = get_describe_call_count(inner_ns_client)
 
-    # Create session with storage_options_provider
+    # Create session with namespace_client
     session = LanceFileSession(
         f"s3://{s3_bucket}/{table_name}_session",
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     # Test contains method
