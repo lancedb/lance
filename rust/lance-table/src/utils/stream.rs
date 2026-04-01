@@ -161,6 +161,59 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     )?)
 }
 
+/// Extract version values for a batch selection using binary search over
+/// RLE run boundaries. For fragments with a single run (the common case),
+/// returns a uniform array in O(1). Otherwise uses O(log(runs)) lookup
+/// per position.
+fn version_values_for_selection(
+    sequence: &crate::rowids::version::RowDatasetVersionSequence,
+    params: &ReadBatchParams,
+    batch_offset: u32,
+    num_rows: u32,
+) -> Vec<u64> {
+    let selection = params
+        .slice(batch_offset as usize, num_rows as usize)
+        .unwrap()
+        .to_ranges()
+        .unwrap();
+
+    // Fast path: single run covers entire sequence (typical for unmodified fragments).
+    // All rows have the same version regardless of selection ranges.
+    if sequence.runs.len() == 1 {
+        return vec![sequence.runs[0].version(); num_rows as usize];
+    }
+
+    let mut versions = Vec::with_capacity(num_rows as usize);
+    // Build a cumulative offset array for O(1) run lookup by position
+    let run_offsets: Vec<usize> = sequence
+        .runs
+        .iter()
+        .scan(0usize, |acc, run| {
+            let start = *acc;
+            *acc += run.len();
+            Some(start)
+        })
+        .collect();
+    let total_len: usize = sequence.runs.iter().map(|r| r.len()).sum();
+
+    for r in &selection {
+        for pos in r.start..r.end {
+            let pos = pos as usize;
+            if pos >= total_len {
+                versions.push(1); // fallback
+                continue;
+            }
+            // Binary search for the run containing this position
+            let run_idx = match run_offsets.binary_search(&pos) {
+                Ok(idx) => idx,
+                Err(idx) => idx - 1,
+            };
+            versions.push(sequence.runs[run_idx].version());
+        }
+    }
+    versions
+}
+
 /// Configuration needed to apply row ids and deletions to a batch
 #[derive(Debug)]
 pub struct RowIdAndDeletesConfig {
@@ -296,24 +349,9 @@ pub fn apply_row_id_and_deletes(
 
         if config.with_row_last_updated_at_version {
             let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
-                // Get the range of rows for this batch
-                let selection = config
-                    .params
-                    .slice(batch_offset as usize, num_rows as usize)
-                    .unwrap()
-                    .to_ranges()
-                    .unwrap();
-                // Extract version values for the selected ranges
-                let versions: Vec<u64> = selection
-                    .iter()
-                    .flat_map(|r| {
-                        sequence
-                            .versions()
-                            .skip(r.start as usize)
-                            .take((r.end - r.start) as usize)
-                    })
-                    .collect();
-                Arc::new(UInt64Array::from(versions))
+                Arc::new(UInt64Array::from(
+                    version_values_for_selection(sequence, &config.params, batch_offset, num_rows),
+                ))
             } else {
                 // Default to version 1 if sequence not provided
                 Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
@@ -324,24 +362,9 @@ pub fn apply_row_id_and_deletes(
 
         if config.with_row_created_at_version {
             let version_arr = if let Some(sequence) = &config.created_at_sequence {
-                // Get the range of rows for this batch
-                let selection = config
-                    .params
-                    .slice(batch_offset as usize, num_rows as usize)
-                    .unwrap()
-                    .to_ranges()
-                    .unwrap();
-                // Extract version values for the selected ranges
-                let versions: Vec<u64> = selection
-                    .iter()
-                    .flat_map(|r| {
-                        sequence
-                            .versions()
-                            .skip(r.start as usize)
-                            .take((r.end - r.start) as usize)
-                    })
-                    .collect();
-                Arc::new(UInt64Array::from(versions))
+                Arc::new(UInt64Array::from(
+                    version_values_for_selection(sequence, &config.params, batch_offset, num_rows),
+                ))
             } else {
                 // Default to version 1 if sequence not provided
                 Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
