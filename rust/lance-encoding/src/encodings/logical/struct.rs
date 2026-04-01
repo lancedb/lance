@@ -493,7 +493,6 @@ pub struct StructFieldEncoder {
 }
 
 impl StructFieldEncoder {
-    #[allow(dead_code)]
     pub fn new(children: Vec<Box<dyn FieldEncoder>>, column_index: u32) -> Self {
         Self {
             children,

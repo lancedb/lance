@@ -20,6 +20,7 @@
 //! let throttled = AimdThrottledStore::new(target, AimdThrottleConfig::default()).unwrap();
 //! ```
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
@@ -34,8 +35,9 @@ use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
+use rand::Rng;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
@@ -81,6 +83,12 @@ pub struct AimdThrottleConfig {
     pub list: AimdConfig,
     /// Maximum tokens that can accumulate for bursts (shared across all categories).
     pub burst_capacity: u32,
+    /// Maximum number of retries for throttle errors within the AIMD layer.
+    pub max_retries: usize,
+    /// Minimum backoff in milliseconds between retry attempts.
+    pub min_backoff_ms: u64,
+    /// Maximum backoff in milliseconds between retry attempts.
+    pub max_backoff_ms: u64,
 }
 
 impl Default for AimdThrottleConfig {
@@ -92,6 +100,9 @@ impl Default for AimdThrottleConfig {
             delete: aimd.clone(),
             list: aimd,
             burst_capacity: 100,
+            max_retries: 3,
+            min_backoff_ms: 100,
+            max_backoff_ms: 300,
         }
     }
 }
@@ -134,11 +145,156 @@ impl AimdThrottleConfig {
         Self { list: aimd, ..self }
     }
 
+    /// Returns `true` when the AIMD throttle layer should be bypassed entirely.
+    pub fn is_disabled(&self) -> bool {
+        self.max_retries == 0
+    }
+
     pub fn with_burst_capacity(self, burst_capacity: u32) -> Self {
         Self {
             burst_capacity,
             ..self
         }
+    }
+
+    /// Build an `AimdThrottleConfig` from storage options and environment variables.
+    ///
+    /// Storage options take precedence over environment variables, which take
+    /// precedence over defaults. A single AIMD config is applied to all four
+    /// operation categories (read/write/delete/list).
+    ///
+    /// | Setting              | Storage Option Key               | Env Var                          | Default |
+    /// |----------------------|----------------------------------|----------------------------------|---------|
+    /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
+    /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
+    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
+    /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
+    /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
+    /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
+    /// | Max retries          | `lance_aimd_max_retries`         | `LANCE_AIMD_MAX_RETRIES`         | 3       |
+    /// | Min backoff ms       | `lance_aimd_min_backoff_ms`      | `LANCE_AIMD_MIN_BACKOFF_MS`      | 100     |
+    /// | Max backoff ms       | `lance_aimd_max_backoff_ms`      | `LANCE_AIMD_MAX_BACKOFF_MS`      | 300     |
+    pub fn from_storage_options(
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> lance_core::Result<Self> {
+        fn resolve_f64(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: f64,
+        ) -> lance_core::Result<f64> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<f64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<f64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        fn resolve_u32(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: u32,
+        ) -> lance_core::Result<u32> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<u32>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<u32>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        fn resolve_usize(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: usize,
+        ) -> lance_core::Result<usize> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<usize>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<usize>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        fn resolve_u64(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: u64,
+        ) -> lance_core::Result<u64> {
+            let env_key = key.to_ascii_uppercase();
+            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
+                val.parse::<u64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{val}'"
+                    ))
+                })
+            } else if let Ok(val) = std::env::var(&env_key) {
+                val.parse::<u64>().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{val}'"
+                    ))
+                })
+            } else {
+                Ok(default)
+            }
+        }
+
+        let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
+        let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
+        let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
+        let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
+        let additive_increment =
+            resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
+        let burst_capacity = resolve_u32("lance_aimd_burst_capacity", storage_options, 100)?;
+        let max_retries = resolve_usize("lance_aimd_max_retries", storage_options, 3)?;
+        let min_backoff_ms = resolve_u64("lance_aimd_min_backoff_ms", storage_options, 100)?;
+        let max_backoff_ms = resolve_u64("lance_aimd_max_backoff_ms", storage_options, 300)?;
+
+        let aimd = AimdConfig::default()
+            .with_initial_rate(initial_rate)
+            .with_min_rate(min_rate)
+            .with_max_rate(max_rate)
+            .with_decrease_factor(decrease_factor)
+            .with_additive_increment(additive_increment);
+
+        Ok(Self {
+            max_retries,
+            min_backoff_ms,
+            max_backoff_ms,
+            ..Self::default()
+                .with_aimd(aimd)
+                .with_burst_capacity(burst_capacity)
+        })
     }
 }
 
@@ -153,10 +309,19 @@ struct OperationThrottle {
     controller: AimdController,
     bucket: Mutex<TokenBucketState>,
     burst_capacity: f64,
+    max_retries: usize,
+    min_backoff_ms: u64,
+    max_backoff_ms: u64,
 }
 
 impl OperationThrottle {
-    fn new(aimd_config: AimdConfig, burst_capacity: f64) -> lance_core::Result<Self> {
+    fn new(
+        aimd_config: AimdConfig,
+        burst_capacity: f64,
+        max_retries: usize,
+        min_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) -> lance_core::Result<Self> {
         let initial_rate = aimd_config.initial_rate;
         let controller = AimdController::new(aimd_config)?;
         Ok(Self {
@@ -167,6 +332,9 @@ impl OperationThrottle {
                 rate: initial_rate,
             }),
             burst_capacity,
+            max_retries,
+            min_backoff_ms,
+            max_backoff_ms,
         })
     }
 
@@ -212,36 +380,72 @@ impl OperationThrottle {
         let outcome = match result {
             Ok(_) => RequestOutcome::Success,
             Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected in stream, decreasing rate");
+                debug!("Throttle error detected in stream");
                 RequestOutcome::Throttled
             }
             Err(_) => RequestOutcome::Success,
         };
+        let prev_rate = self.controller.current_rate();
         let new_rate = self.controller.record_outcome(outcome);
+        if new_rate < prev_rate {
+            warn!(
+                previous_rate = format!("{prev_rate:.1}"),
+                new_rate = format!("{new_rate:.1}"),
+                "AIMD throttle: rate reduced due to throttle errors"
+            );
+        }
         if let Ok(mut bucket) = self.bucket.try_lock() {
             bucket.rate = new_rate;
         }
     }
 
     /// Execute an operation with throttling: acquire token, run, classify result.
+    /// On throttle errors, retries up to `max_retries` times with a random
+    /// backoff between `min_backoff_ms` and `max_backoff_ms` between attempts.
     async fn throttled<T, F, Fut>(&self, f: F) -> OSResult<T>
     where
-        F: FnOnce() -> Fut,
+        F: Fn() -> Fut,
         Fut: std::future::Future<Output = OSResult<T>>,
     {
-        self.acquire_token().await;
-        let result = f().await;
-        let outcome = match &result {
-            Ok(_) => RequestOutcome::Success,
-            Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected, decreasing rate");
-                RequestOutcome::Throttled
+        for attempt in 0..=self.max_retries {
+            self.acquire_token().await;
+            let result = f().await;
+            let outcome = match &result {
+                Ok(_) => RequestOutcome::Success,
+                Err(err) if is_throttle_error(err) => {
+                    debug!("Throttle error detected");
+                    RequestOutcome::Throttled
+                }
+                Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
+            };
+            let prev_rate = self.controller.current_rate();
+            let new_rate = self.controller.record_outcome(outcome);
+            if new_rate < prev_rate {
+                warn!(
+                    previous_rate = format!("{prev_rate:.1}"),
+                    new_rate = format!("{new_rate:.1}"),
+                    "AIMD throttle: rate reduced due to throttle errors"
+                );
             }
-            Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
-        };
-        let new_rate = self.controller.record_outcome(outcome);
-        self.update_bucket_rate(new_rate).await;
-        result
+            self.update_bucket_rate(new_rate).await;
+
+            match &result {
+                Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
+                    let backoff_ms =
+                        rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
+                    debug!(
+                        attempt = attempt + 1,
+                        max_retries = self.max_retries,
+                        backoff_ms,
+                        "Retrying after throttle error"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                _ => return result,
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -254,11 +458,17 @@ impl Debug for OperationThrottle {
     }
 }
 
-/// A [`MultipartUpload`] wrapper that throttles `put_part` and observes
-/// outcomes from `put_part` and `complete`, feeding them back to the write
-/// AIMD controller.
+/// A [`MultipartUpload`] wrapper that throttles and retries `put_part`,
+/// `complete`, and `abort`, feeding outcomes back to the write AIMD
+/// controller.
+///
+/// Uses a `std::sync::Mutex` (not `tokio::sync::Mutex`) so that aborted
+/// futures cannot cause deadlocks — the guard is always dropped
+/// deterministically. The lock is held only briefly for the sync
+/// `put_part` dispatch; `complete`/`abort` hold it across their await but
+/// are never called concurrently with part uploads.
 struct ThrottledMultipartUpload {
-    target: Box<dyn MultipartUpload>,
+    target: Arc<std::sync::Mutex<Box<dyn MultipartUpload>>>,
     write: Arc<OperationThrottle>,
 }
 
@@ -272,23 +482,66 @@ impl Debug for ThrottledMultipartUpload {
 impl MultipartUpload for ThrottledMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let write = Arc::clone(&self.write);
-        let fut = self.target.put_part(data);
+        let target = Arc::clone(&self.target);
         Box::pin(async move {
-            write.acquire_token().await;
-            let result = fut.await;
-            write.observe_outcome(&result);
-            result
+            write
+                .throttled(|| {
+                    // The let binding is intentional: it ensures the
+                    // MutexGuard is dropped before the future is awaited.
+                    #[allow(clippy::let_and_return)]
+                    let fut = target.lock().unwrap().put_part(data.clone());
+                    fut
+                })
+                .await
         })
     }
 
     async fn complete(&mut self) -> OSResult<PutResult> {
-        let result = self.target.complete().await;
-        self.write.observe_outcome(&result);
-        result
+        // &mut self guarantees no concurrent put_part futures are alive,
+        // so get_mut always succeeds (Arc refcount == 1).
+        let target = Arc::get_mut(&mut self.target)
+            .expect("complete called while put_part futures are still alive")
+            .get_mut()
+            .unwrap();
+        for attempt in 0..=self.write.max_retries {
+            self.write.acquire_token().await;
+            let result = target.complete().await;
+            self.write.observe_outcome(&result);
+
+            match &result {
+                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
+                    let backoff_ms = rand::rng()
+                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                _ => return result,
+            }
+        }
+        unreachable!()
     }
 
     async fn abort(&mut self) -> OSResult<()> {
-        self.target.abort().await
+        let target = Arc::get_mut(&mut self.target)
+            .expect("abort called while put_part futures are still alive")
+            .get_mut()
+            .unwrap();
+        for attempt in 0..=self.write.max_retries {
+            self.write.acquire_token().await;
+            let result = target.abort().await;
+            self.write.observe_outcome(&result);
+
+            match &result {
+                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
+                    let backoff_ms = rand::rng()
+                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                _ => return result,
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -339,12 +592,39 @@ impl AimdThrottledStore {
         config: AimdThrottleConfig,
     ) -> lance_core::Result<Self> {
         let burst = config.burst_capacity as f64;
+        let max_retries = config.max_retries;
+        let min_backoff_ms = config.min_backoff_ms;
+        let max_backoff_ms = config.max_backoff_ms;
         Ok(Self {
             target,
-            read: Arc::new(OperationThrottle::new(config.read, burst)?),
-            write: Arc::new(OperationThrottle::new(config.write, burst)?),
-            delete: Arc::new(OperationThrottle::new(config.delete, burst)?),
-            list: Arc::new(OperationThrottle::new(config.list, burst)?),
+            read: Arc::new(OperationThrottle::new(
+                config.read,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
+            write: Arc::new(OperationThrottle::new(
+                config.write,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
+            delete: Arc::new(OperationThrottle::new(
+                config.delete,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
+            list: Arc::new(OperationThrottle::new(
+                config.list,
+                burst,
+                max_retries,
+                min_backoff_ms,
+                max_backoff_ms,
+            )?),
         })
     }
 }
@@ -354,7 +634,7 @@ impl AimdThrottledStore {
 impl ObjectStore for AimdThrottledStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.write
-            .throttled(|| self.target.put(location, bytes))
+            .throttled(|| self.target.put(location, bytes.clone()))
             .await
     }
 
@@ -365,7 +645,7 @@ impl ObjectStore for AimdThrottledStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.write
-            .throttled(|| self.target.put_opts(location, bytes, opts))
+            .throttled(|| self.target.put_opts(location, bytes.clone(), opts.clone()))
             .await
     }
 
@@ -375,7 +655,7 @@ impl ObjectStore for AimdThrottledStore {
             .throttled(|| self.target.put_multipart(location))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
-            target,
+            target: Arc::new(std::sync::Mutex::new(target)),
             write: Arc::clone(&self.write),
         }))
     }
@@ -387,10 +667,10 @@ impl ObjectStore for AimdThrottledStore {
     ) -> OSResult<Box<dyn MultipartUpload>> {
         let target = self
             .write
-            .throttled(|| self.target.put_multipart_opts(location, opts))
+            .throttled(|| self.target.put_multipart_opts(location, opts.clone()))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
-            target,
+            target: Arc::new(std::sync::Mutex::new(target)),
             write: Arc::clone(&self.write),
         }))
     }
@@ -401,7 +681,7 @@ impl ObjectStore for AimdThrottledStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.read
-            .throttled(|| self.target.get_opts(location, options))
+            .throttled(|| self.target.get_opts(location, options.clone()))
             .await
     }
 
@@ -1133,10 +1413,11 @@ mod tests {
         let throttled = mock.throttle_count.load(Ordering::Relaxed);
         let total_mock = successes + throttled;
 
-        // Reader-side count must match mock-side count.
-        assert_eq!(
-            total_reader_requests, total_mock,
-            "Reader-side count ({total_reader_requests}) != mock-side count ({total_mock})"
+        // Mock-side count >= reader-side count because the AIMD layer retries
+        // throttle errors internally, causing multiple mock calls per reader call.
+        assert!(
+            total_mock >= total_reader_requests,
+            "Mock-side count ({total_mock}) should be >= reader-side count ({total_reader_requests})"
         );
 
         // Mock capacity is 30/100ms = 300 req/s. Over 2s the theoretical max is
@@ -1159,5 +1440,175 @@ mod tests {
             total_mock <= 5000,
             "AIMD should limit total requests, got {total_mock}"
         );
+    }
+
+    /// A mock store that returns a configurable number of throttle errors
+    /// before succeeding on `get` operations. Used to test the retry logic
+    /// inside `OperationThrottle::throttled()`.
+    struct RetryTestMockStore {
+        inner: InMemory,
+        /// Number of throttle errors remaining before success.
+        errors_remaining: std::sync::Mutex<usize>,
+        /// Total number of `get` calls observed.
+        get_call_count: AtomicU64,
+    }
+
+    impl RetryTestMockStore {
+        fn new(errors_before_success: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                errors_remaining: std::sync::Mutex::new(errors_before_success),
+                get_call_count: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl Display for RetryTestMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RetryTestMockStore")
+        }
+    }
+
+    impl Debug for RetryTestMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RetryTestMockStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RetryTestMockStore {
+        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
+            self.inner.put(location, bytes).await
+        }
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get(&self, location: &Path) -> OSResult<GetResult> {
+            self.get_call_count.fetch_add(1, Ordering::Relaxed);
+            let should_error = {
+                let mut remaining = self.errors_remaining.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_error {
+                Err(object_store::Error::Generic {
+                    store: "RetryTestMock",
+                    source: "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s"
+                        .into(),
+                })
+            } else {
+                self.inner.get(location).await
+            }
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
+            self.inner.get_range(location, range).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+        async fn delete(&self, location: &Path) -> OSResult<()> {
+            self.inner.delete(location).await
+        }
+        fn delete_stream<'a>(
+            &'a self,
+            locations: BoxStream<'a, OSResult<Path>>,
+        ) -> BoxStream<'a, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.rename(from, to).await
+        }
+        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.rename_if_not_exists(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_throttled_retries_on_throttle_error_then_succeeds() {
+        // Mock returns 2 throttle errors then succeeds (within MAX_RETRIES=3)
+        let mock = Arc::new(RetryTestMockStore::new(2));
+        let path = Path::from("test/retry.txt");
+        mock.put(&path, PutPayload::from_static(b"retry data"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        let result = throttled.get(&path).await;
+        assert!(result.is_ok(), "Expected success after retries");
+
+        let bytes = result.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"retry data");
+
+        // Should have called get 3 times total: 2 failures + 1 success
+        assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn test_throttled_fails_after_max_retries_exceeded() {
+        // Mock returns 4 throttle errors (more than MAX_RETRIES=3),
+        // so all 4 attempts (initial + 3 retries) will fail.
+        let mock = Arc::new(RetryTestMockStore::new(10));
+        let path = Path::from("test/fail.txt");
+        mock.put(&path, PutPayload::from_static(b"fail data"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        let result = throttled.get(&path).await;
+        assert!(result.is_err(), "Expected error after max retries");
+        assert!(is_throttle_error(&result.unwrap_err()));
+
+        // Should have called get 4 times: initial attempt + 3 retries
+        assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 4);
     }
 }

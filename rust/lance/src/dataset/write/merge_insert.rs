@@ -3318,7 +3318,7 @@ mod tests {
 
         // Sample 2048 random indices and then paste on a column of 9999999's
         let some_indices = ds
-            .sample(2048, &(&just_index_col).try_into().unwrap())
+            .sample(2048, &(&just_index_col).try_into().unwrap(), None)
             .await
             .unwrap();
         let some_indices = some_indices.column(0).clone();

@@ -2694,8 +2694,7 @@ where
     let request: Req = serde_json::from_str(&request_str)
         .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
 
-    let response = f(namespace, request)
-        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+    let response = f(namespace, request).map_err(Error::from)?;
 
     let response_json = serde_json::to_string(&response)
         .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))?;
@@ -2719,8 +2718,7 @@ where
     let request: Req = serde_json::from_str(&request_str)
         .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
 
-    f(namespace, request)
-        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+    f(namespace, request).map_err(Error::from)?;
 
     Ok(())
 }
@@ -2738,7 +2736,7 @@ fn call_namespace_count_method(
 
     let count = RT
         .block_on(namespace.inner.count_table_rows(request))
-        .map_err(|e| Error::runtime_error(format!("Count table rows failed: {}", e)))?;
+        .map_err(Error::from)?;
 
     Ok(count)
 }
@@ -2764,8 +2762,7 @@ where
     let data_vec = env.convert_byte_array(request_data)?;
     let data = bytes::Bytes::from(data_vec);
 
-    let response = f(namespace, request, data)
-        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+    let response = f(namespace, request, data).map_err(Error::from)?;
 
     let response_json = serde_json::to_string(&response)
         .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))?;
@@ -2786,7 +2783,7 @@ fn call_namespace_query_method<'local>(
 
     let result_bytes = RT
         .block_on(namespace.inner.query_table(request))
-        .map_err(|e| Error::runtime_error(format!("Query table failed: {}", e)))?;
+        .map_err(Error::from)?;
 
     let byte_array = env.byte_array_from_slice(&result_bytes)?;
     Ok(byte_array)
@@ -2809,8 +2806,7 @@ where
     let request: Req = serde_json::from_str(&request_str)
         .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
 
-    let response = f(namespace, request)
-        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+    let response = f(namespace, request).map_err(Error::from)?;
 
     let response_json = serde_json::to_string(&response)
         .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))?;
@@ -2834,8 +2830,7 @@ where
     let request: Req = serde_json::from_str(&request_str)
         .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
 
-    f(namespace, request)
-        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+    f(namespace, request).map_err(Error::from)?;
 
     Ok(())
 }
@@ -2853,7 +2848,7 @@ fn call_rest_namespace_count_method(
 
     let count = RT
         .block_on(namespace.inner.count_table_rows(request))
-        .map_err(|e| Error::runtime_error(format!("Count table rows failed: {}", e)))?;
+        .map_err(Error::from)?;
 
     Ok(count)
 }
@@ -2879,8 +2874,7 @@ where
     let data_vec = env.convert_byte_array(request_data)?;
     let data = bytes::Bytes::from(data_vec);
 
-    let response = f(namespace, request, data)
-        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+    let response = f(namespace, request, data).map_err(Error::from)?;
 
     let response_json = serde_json::to_string(&response)
         .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))?;
@@ -2901,7 +2895,7 @@ fn call_rest_namespace_query_method<'local>(
 
     let result_bytes = RT
         .block_on(namespace.inner.query_table(request))
-        .map_err(|e| Error::runtime_error(format!("Query table failed: {}", e)))?;
+        .map_err(Error::from)?;
 
     let byte_array = env.byte_array_from_slice(&result_bytes)?;
     Ok(byte_array)

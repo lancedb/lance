@@ -256,7 +256,7 @@ impl FtsQueryUDTFBuilder {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use crate::Dataset;
     use crate::dataset::udtf::FtsQueryUDTFBuilder;
     use crate::index::DatasetIndexExt;

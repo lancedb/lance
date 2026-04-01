@@ -2128,6 +2128,20 @@ impl Dataset {
         })
     }
 
+    fn merge_existing_index_segments(
+        &self,
+        segments: Vec<PyLance<IndexMetadata>>,
+    ) -> PyResult<PyLance<IndexMetadata>> {
+        let merged = rt()
+            .block_on(
+                None,
+                self.ds
+                    .merge_existing_index_segments(segments.into_iter().map(|s| s.0).collect()),
+            )?
+            .infer_error()?;
+        Ok(PyLance(merged))
+    }
+
     fn commit_existing_index_segments(
         &mut self,
         index_name: &str,

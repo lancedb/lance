@@ -8,7 +8,8 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
+        DatasetIndexExt, DatasetIndexInternalExt, api::{IndexSegment, IndexSegmentPlan},
+        build_index_metadata_from_segments,
         scalar::build_scalar_index,
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
@@ -35,8 +36,6 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
-
-use super::{IndexSegment, IndexSegmentPlan};
 
 /// Generate default index name from field path.
 ///

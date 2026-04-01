@@ -569,7 +569,6 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
@@ -595,21 +594,42 @@ pub(crate) async fn build_distributed_vector_index(
                 )));
             };
 
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
-                filtered_dataset,
-                column.to_owned(),
-                index_dir.clone(),
-                params.metric_type,
-                shuffler,
-                Some(ivf_params),
-                Some(()),
-                hnsw_params.clone(),
-                frag_reuse_index,
-            )?
-            .with_fragment_filter(fragment_filter)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            match element_type {
+                DataType::UInt8 => {
+                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                        filtered_dataset,
+                        column.to_owned(),
+                        index_dir.clone(),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_fragment_filter(fragment_filter)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+                _ => {
+                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                        filtered_dataset,
+                        column.to_owned(),
+                        index_dir.clone(),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_fragment_filter(fragment_filter)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+            }
         }
 
         IndexType::IvfHnswPq => {
@@ -664,7 +684,6 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
@@ -683,11 +702,34 @@ pub(crate) async fn build_distributed_vector_index(
         }
 
         IndexType::IvfRq => {
-            return Err(Error::index(format!(
-                "Build Distributed Vector Index: invalid index type: {:?} \
-            is not supported in distributed mode; skipping this shard",
-                index_type
-            )));
+            let StageParams::RQ(rq_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+
+            let ivf_model = make_ivf_model();
+
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir.clone(),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(rq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model)
+            // For distributed shards, keep RQ codes in row-major layout.
+            // A single packing pass is performed in the distributed merge stage.
+            .with_transpose(false)
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
         }
 
         _ => {
@@ -864,20 +906,40 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
-                dataset.clone(),
-                column.to_owned(),
-                dataset.indices_dir().child(uuid),
-                params.metric_type,
-                shuffler,
-                Some(ivf_params),
-                Some(()),
-                hnsw_params.clone(),
-                frag_reuse_index,
-            )?
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            match element_type {
+                DataType::UInt8 => {
+                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+                _ => {
+                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+            }
         }
         IndexType::IvfHnswPq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1125,23 +1187,42 @@ pub(crate) async fn build_vector_index_incremental(
             };
 
             match quantization_type {
-                QuantizationType::Flat => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
-                        dataset.clone(),
-                        column.to_owned(),
-                        index_dir,
-                        params.metric_type,
-                        shuffler,
-                        hnsw_params.clone(),
-                        frag_reuse_index,
-                        OptimizeOptions::append(),
-                    )?
-                    .with_ivf(ivf_model)
-                    .with_quantizer(quantizer.try_into()?)
-                    .with_progress(progress.clone())
-                    .build()
-                    .await?;
-                }
+                QuantizationType::Flat => match element_type {
+                    DataType::UInt8 => {
+                        IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                            dataset.clone(),
+                            column.to_owned(),
+                            index_dir,
+                            params.metric_type,
+                            shuffler,
+                            hnsw_params.clone(),
+                            frag_reuse_index,
+                            OptimizeOptions::append(),
+                        )?
+                        .with_ivf(ivf_model)
+                        .with_quantizer(quantizer.try_into()?)
+                        .with_progress(progress.clone())
+                        .build()
+                        .await?;
+                    }
+                    _ => {
+                        IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                            dataset.clone(),
+                            column.to_owned(),
+                            index_dir,
+                            params.metric_type,
+                            shuffler,
+                            hnsw_params.clone(),
+                            frag_reuse_index,
+                            OptimizeOptions::append(),
+                        )?
+                        .with_ivf(ivf_model)
+                        .with_quantizer(quantizer.try_into()?)
+                        .with_progress(progress.clone())
+                        .build()
+                        .await?;
+                    }
+                },
                 QuantizationType::Product => {
                     IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                         dataset.clone(),
@@ -2141,6 +2222,7 @@ mod tests {
             dim,
             MetricType::L2,
             &ivf_params,
+            None,
             noop_progress(),
         )
         .await
@@ -2193,6 +2275,7 @@ mod tests {
             dim,
             MetricType::L2,
             &ivf_params,
+            None,
             noop_progress(),
         )
         .await

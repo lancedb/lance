@@ -1057,6 +1057,18 @@ public class Dataset implements Closeable {
   private native List<Index> nativeBuildIndexSegments(
       List<Index> segments, int indexType, Optional<Long> targetSegmentBytes);
 
+  /** Merge one caller-defined group of existing uncommitted vector index segments. */
+  public Index mergeExistingIndexSegments(List<Index> segments) {
+    Preconditions.checkNotNull(segments, "segments cannot be null");
+    Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeMergeExistingIndexSegments(segments);
+    }
+  }
+
+  private native Index nativeMergeExistingIndexSegments(List<Index> segments);
+
   /**
    * Publish one or more existing physical index segments as a logical index.
    *

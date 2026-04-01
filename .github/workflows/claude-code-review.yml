@@ -1,7 +1,7 @@
 name: Claude Code Review
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened]
     # Optional: Only run on specific file changes
     # paths:
@@ -14,14 +14,7 @@ jobs:
   claude-review:
     if: |
       github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.author_association == 'COLLABORATOR' ||
-      github.event.pull_request.author_association == 'OWNER' ||
-      github.event.pull_request.author_association == 'CONTRIBUTOR'
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+      github.event.pull_request.author_association == 'OWNER'
 
     runs-on: ubuntu-latest
     permissions:
@@ -37,11 +30,12 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@26ec041249acb0a944c0a47b6c0c13f05dbc5b44 # v1
+        uses: anthropics/claude-code-action@3ac52d0da9f8ec9ca7b4dc23bb477e36ef9c77a9 # v1.0.79
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
         with:
           anthropic_api_key: ${{ secrets.CLAUDE_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          allowed_non_write_users: ${{ github.event.pull_request.user.login }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -68,5 +62,5 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           claude_args: |
-            --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --allowed-tools "Bash(gh pr comment ${{ github.event.pull_request.number }}:*),Bash(gh pr diff ${{ github.event.pull_request.number }}:*),Bash(gh pr view ${{ github.event.pull_request.number }}:*)"
             --model "claude-opus-4-6"

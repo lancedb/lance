@@ -38,7 +38,7 @@ impl ValueEncoder {
         // If the type is so wide that we can't even fit 2 values we shouldn't be here
         assert!(size_bytes < MAX_MINIBLOCK_BYTES);
 
-        while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals <= MAX_MINIBLOCK_VALUES {
+        while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals <= *MAX_MINIBLOCK_VALUES {
             log_num_vals += 1;
             size_bytes *= 2;
             num_vals *= 2;
@@ -749,7 +749,7 @@ impl PerValueCompressor for ValueEncoder {
 
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::{
         collections::HashMap,
         sync::{Arc, LazyLock},

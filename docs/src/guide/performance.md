@@ -163,11 +163,72 @@ In summary, scans could use up to `(2 * io_buffer_size) + (batch_size * num_comp
 Keep in mind that `io_buffer_size` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
 
-The above limits refer to limits per-scan. There is an additional limit on the number of IOPS that is applied
-across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable.
-The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
-with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
-can often lead to issues with excessive retries and timeouts from the object store.
+### Cloud Store Throttling
+
+Cloud object stores (S3, GCS, Azure) are automatically wrapped with an AIMD (Additive Increase / Multiplicative
+Decrease) rate limiter. When the store returns throttle errors (HTTP 429/503), the request rate decreases
+multiplicatively. During sustained success, the rate increases additively. This applies to all operations
+(reads, writes, deletes, lists) and replaces the old `LANCE_PROCESS_IO_THREADS_LIMIT` process-wide cap.
+
+Local and in-memory stores are **not** throttled.
+
+The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
+over environment variables:
+
+| Setting            | Storage Option Key              | Env Var                         | Default |
+| ------------------ | ------------------------------- | ------------------------------- | ------- |
+| Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
+| Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
+| Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
+| Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
+
+These initial settings are balanced and should work for most
+use cases. For example, S3 can typically get up to 5000
+req/s and with these settings we should get there in about
+10 seconds.
+
+## Conflict Handling
+
+Lance supports concurrent operations on the same table using optimistic concurrency control. When two
+operations conflict, one of them must be retried. Retries are handled automatically but they repeat
+work that has already been done, which can hurt throughput. Understanding and minimizing conflicts is
+important for maintaining good performance in write-heavy workloads.
+
+Common sources of conflicts include:
+
+- Concurrent compaction and index building, since both need to modify the same indices
+- Update operations that affect the same fragments, since both need to rewrite the same data files
+
+For more details on which operations conflict with each other, see
+[conflict resolution](../format/table/transaction.md#conflict-resolution).
+
+### Fragment Reuse Index
+
+Compaction is one of the most expensive write operations because it rewrites data files and, by
+default, remaps all indices to reflect the new row addresses. When compaction and index building
+run concurrently, they often conflict because both need to modify the same indices. This typically
+causes the compaction to fail and retry, and repeated failures can cause table layout to degrade
+over time.
+
+The Fragment Reuse Index (FRI) solves this by allowing compaction to skip the index remap step.
+Instead of immediately updating indices, compaction records a mapping from old fragment row
+addresses to new ones. When indices are loaded into the cache, the FRI is applied to translate
+the old row addresses to the current ones. This adds a small cost to index load time but does
+not affect query performance once the index is cached.
+
+This decoupling means compaction and index building no longer conflict, which is especially
+valuable for tables that are continuously ingesting data while also maintaining indices.
+
+To enable the FRI, set `defer_index_remap=True` when compacting:
+
+```python
+dataset.optimize.compact_files(defer_index_remap=True)
+```
+
+For details on the index format and usage patterns, see the
+[Fragment Reuse Index specification](../format/table/index/system/frag_reuse.md).
 
 ## Indexes
 

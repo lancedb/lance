@@ -75,13 +75,15 @@ pub struct ManifestKey<'a> {
 
 impl CacheKey for ManifestKey<'_> {
     type ValueType = Manifest;
-
     fn key(&self) -> Cow<'_, str> {
         if let Some(e_tag) = self.e_tag {
             Cow::Owned(format!("manifest/{}/{}", self.version, e_tag))
         } else {
             Cow::Owned(format!("manifest/{}", self.version))
         }
+    }
+    fn type_name() -> &'static str {
+        "Manifest"
     }
 }
 
@@ -92,9 +94,11 @@ pub struct TransactionKey {
 
 impl CacheKey for TransactionKey {
     type ValueType = Transaction;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("txn/{}", self.version))
+    }
+    fn type_name() -> &'static str {
+        "Transaction"
     }
 }
 
@@ -106,7 +110,6 @@ pub struct DeletionFileKey<'a> {
 
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
             "deletion/{}/{}/{}/{}",
@@ -115,6 +118,9 @@ impl CacheKey for DeletionFileKey<'_> {
             self.deletion_file.id,
             self.deletion_file.file_type.suffix()
         ))
+    }
+    fn type_name() -> &'static str {
+        "DeletionVector"
     }
 }
 
@@ -125,9 +131,11 @@ pub struct RowAddrMaskKey {
 
 impl CacheKey for RowAddrMaskKey {
     type ValueType = RowAddrMask;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_addr_mask/{}", self.version))
+    }
+    fn type_name() -> &'static str {
+        "RowAddrMask"
     }
 }
 
@@ -138,9 +146,11 @@ pub struct RowIdIndexKey {
 
 impl CacheKey for RowIdIndexKey {
     type ValueType = RowIdIndex;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_index/{}", self.version))
+    }
+    fn type_name() -> &'static str {
+        "RowIdIndex"
     }
 }
 
@@ -151,9 +161,11 @@ pub struct RowIdSequenceKey {
 
 impl CacheKey for RowIdSequenceKey {
     type ValueType = RowIdSequence;
-
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
+    }
+    fn type_name() -> &'static str {
+        "RowIdSequence"
     }
 }
 

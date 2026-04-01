@@ -1126,6 +1126,32 @@ fn inner_build_index_segments<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeMergeExistingIndexSegments<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    java_segments: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_merge_existing_index_segments(&mut env, java_dataset, java_segments)
+    )
+}
+
+fn inner_merge_existing_index_segments<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    java_segments: JObject,
+) -> Result<JObject<'local>> {
+    let segments = import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+    let merged_segment = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        RT.block_on(dataset_guard.inner.merge_existing_index_segments(segments))?
+    };
+    (&merged_segment).into_java(env)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeCommitExistingIndexSegments<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,

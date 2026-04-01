@@ -58,7 +58,16 @@ impl BlockingScanner {
     }
 }
 
-fn build_full_text_search_query<'a>(env: &mut JNIEnv<'a>, java_obj: JObject) -> Result<FtsQuery> {
+///////////////////
+// Shared Helpers //
+///////////////////
+
+/// Build FTS query from Java FullTextQuery object
+/// Made pub(crate) to be reused by async_scanner
+pub(crate) fn build_full_text_search_query<'a>(
+    env: &mut JNIEnv<'a>,
+    java_obj: JObject,
+) -> Result<FtsQuery> {
     let type_obj = env
         .call_method(
             &java_obj,
@@ -193,88 +202,40 @@ fn build_full_text_search_query<'a>(env: &mut JNIEnv<'a>, java_obj: JObject) -> 
     }
 }
 
-///////////////////
-// Write Methods //
-///////////////////
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
-    mut env: JNIEnv<'local>,
-    _reader: JObject,
-    jdataset: JObject,
-    fragment_ids_obj: JObject,        // Optional<List<Integer>>
-    columns_obj: JObject,             // Optional<List<String>>
-    substrait_filter_obj: JObject,    // Optional<ByteBuffer>
-    filter_obj: JObject,              // Optional<String>
-    batch_size_obj: JObject,          // Optional<Long>
-    limit_obj: JObject,               // Optional<Integer>
-    offset_obj: JObject,              // Optional<Integer>
-    query_obj: JObject,               // Optional<Query>
-    fts_query_obj: JObject,           // Optional<FullTextQuery>
-    prefilter: jboolean,              // boolean
-    with_row_id: jboolean,            // boolean
-    with_row_address: jboolean,       // boolean
-    batch_readahead: jint,            // int
-    column_orderings: JObject,        // Optional<List<ColumnOrdering>>
-    use_scalar_index: jboolean,       // boolean
-    substrait_aggregate_obj: JObject, // Optional<ByteBuffer>
-) -> JObject<'local> {
-    ok_or_throw!(
-        env,
-        inner_create_scanner(
-            &mut env,
-            jdataset,
-            fragment_ids_obj,
-            columns_obj,
-            substrait_filter_obj,
-            filter_obj,
-            batch_size_obj,
-            limit_obj,
-            offset_obj,
-            query_obj,
-            fts_query_obj,
-            prefilter,
-            with_row_id,
-            with_row_address,
-            batch_readahead,
-            column_orderings,
-            use_scalar_index,
-            substrait_aggregate_obj
-        )
-    )
+/// Scanner options passed from JNI - shared between blocking and async scanners
+pub(crate) struct ScannerOptions<'a> {
+    pub fragment_ids_obj: JObject<'a>,
+    pub columns_obj: JObject<'a>,
+    pub substrait_filter_obj: JObject<'a>,
+    pub filter_obj: JObject<'a>,
+    pub batch_size_obj: JObject<'a>,
+    pub limit_obj: JObject<'a>,
+    pub offset_obj: JObject<'a>,
+    pub query_obj: JObject<'a>,
+    pub fts_query_obj: JObject<'a>,
+    pub prefilter: jboolean,
+    pub with_row_id: jboolean,
+    pub with_row_address: jboolean,
+    pub batch_readahead: jint,
+    pub column_orderings: JObject<'a>,
+    pub use_scalar_index: jboolean,
+    pub substrait_aggregate_obj: JObject<'a>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn inner_create_scanner<'local>(
-    env: &mut JNIEnv<'local>,
-    jdataset: JObject,
-    fragment_ids_obj: JObject,
-    columns_obj: JObject,
-    substrait_filter_obj: JObject,
-    filter_obj: JObject,
-    batch_size_obj: JObject,
-    limit_obj: JObject,
-    offset_obj: JObject,
-    query_obj: JObject,
-    fts_query_obj: JObject,
-    prefilter: jboolean,
-    with_row_id: jboolean,
-    with_row_address: jboolean,
-    batch_readahead: jint,
-    column_orderings: JObject,
-    use_scalar_index: jboolean,
-    substrait_aggregate_obj: JObject,
-) -> Result<JObject<'local>> {
-    let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-
-    let mut scanner = dataset_guard.inner.scan();
+/// Build a scanner with options applied - shared by blocking and async scanners
+pub(crate) fn build_scanner_with_options<'a>(
+    env: &mut JNIEnv<'a>,
+    dataset: &lance::Dataset,
+    options: ScannerOptions<'a>,
+) -> Result<Scanner> {
+    let mut scanner = dataset.scan();
 
     // handle fragment_ids
+    let fragment_ids_opt = env.get_ints_opt(&options.fragment_ids_obj)?;
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
-            let Some(fragment) = dataset_guard.inner.get_fragment(fragment_id as usize) else {
+            let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
                 return Err(Error::input_error(format!(
                     "Fragment {fragment_id} not found"
                 )));
@@ -283,49 +244,48 @@ fn inner_create_scanner<'local>(
         }
         scanner.with_fragments(fragments);
     }
-    drop(dataset_guard);
 
-    let columns_opt = env.get_strings_opt(&columns_obj)?;
+    let columns_opt = env.get_strings_opt(&options.columns_obj)?;
     if let Some(columns) = columns_opt {
         scanner.project(&columns)?;
     };
 
-    let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
+    let substrait_opt = env.get_bytes_opt(&options.substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
         RT.block_on(async { scanner.filter_substrait(substrait) })?;
     }
 
-    let filter_opt = env.get_string_opt(&filter_obj)?;
+    let filter_opt = env.get_string_opt(&options.filter_obj)?;
     if let Some(filter) = filter_opt {
         scanner.filter(filter.as_str())?;
     }
 
-    let batch_size_opt = env.get_long_opt(&batch_size_obj)?;
+    let batch_size_opt = env.get_long_opt(&options.batch_size_obj)?;
     if let Some(batch_size) = batch_size_opt {
         scanner.batch_size(batch_size as usize);
     }
 
-    let limit_opt = env.get_long_opt(&limit_obj)?;
-    let offset_opt = env.get_long_opt(&offset_obj)?;
+    let limit_opt = env.get_long_opt(&options.limit_obj)?;
+    let offset_opt = env.get_long_opt(&options.offset_obj)?;
     scanner
         .limit(limit_opt, offset_opt)
         .map_err(|err| Error::input_error(err.to_string()))?;
 
-    if with_row_id == JNI_TRUE {
+    if options.with_row_id == JNI_TRUE {
         scanner.with_row_id();
     }
 
-    if with_row_address == JNI_TRUE {
+    if options.with_row_address == JNI_TRUE {
         scanner.with_row_address();
     }
 
-    if prefilter == JNI_TRUE {
+    if options.prefilter == JNI_TRUE {
         scanner.prefilter(true);
     }
 
-    scanner.use_scalar_index(use_scalar_index == JNI_TRUE);
+    scanner.use_scalar_index(options.use_scalar_index == JNI_TRUE);
 
-    env.get_optional(&query_obj, |env, java_obj| {
+    env.get_optional(&options.query_obj, |env, java_obj| {
         // Set column and key for nearest search
         let column = env.get_string_from_method(&java_obj, "getColumn")?;
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
@@ -363,16 +323,16 @@ fn inner_create_scanner<'local>(
         Ok(())
     })?;
 
-    env.get_optional(&fts_query_obj, |env, java_obj| {
+    env.get_optional(&options.fts_query_obj, |env, java_obj| {
         let fts_query = build_full_text_search_query(env, java_obj)?;
         let full_text_query = FullTextSearchQuery::new_query(fts_query);
         scanner.full_text_search(full_text_query)?;
         Ok(())
     })?;
 
-    scanner.batch_readahead(batch_readahead as usize);
+    scanner.batch_readahead(options.batch_readahead as usize);
 
-    env.get_optional(&column_orderings, |env, java_obj| {
+    env.get_optional(&options.column_orderings, |env, java_obj| {
         let list = env.get_list(&java_obj)?;
         let mut iter = list.iter(env)?;
         let mut results = Vec::with_capacity(list.size(env)? as usize);
@@ -391,10 +351,110 @@ fn inner_create_scanner<'local>(
         Ok(())
     })?;
 
-    let substrait_aggregate_opt = env.get_bytes_opt(&substrait_aggregate_obj)?;
+    let substrait_aggregate_opt = env.get_bytes_opt(&options.substrait_aggregate_obj)?;
     if let Some(substrait_aggregate) = substrait_aggregate_opt {
         scanner.aggregate(AggregateExpr::substrait(substrait_aggregate))?;
     }
+
+    Ok(scanner)
+}
+
+///////////////////
+// Write Methods //
+///////////////////
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
+    mut env: JNIEnv<'local>,
+    _reader: JObject<'local>,
+    jdataset: JObject<'local>,
+    fragment_ids_obj: JObject<'local>, // Optional<List<Integer>>
+    columns_obj: JObject<'local>,      // Optional<List<String>>
+    substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
+    filter_obj: JObject<'local>,       // Optional<String>
+    batch_size_obj: JObject<'local>,   // Optional<Long>
+    limit_obj: JObject<'local>,        // Optional<Integer>
+    offset_obj: JObject<'local>,       // Optional<Integer>
+    query_obj: JObject<'local>,        // Optional<Query>
+    fts_query_obj: JObject<'local>,    // Optional<FullTextQuery>
+    prefilter: jboolean,               // boolean
+    with_row_id: jboolean,             // boolean
+    with_row_address: jboolean,        // boolean
+    batch_readahead: jint,             // int
+    column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,        // boolean
+    substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_scanner(
+            &mut env,
+            jdataset,
+            fragment_ids_obj,
+            columns_obj,
+            substrait_filter_obj,
+            filter_obj,
+            batch_size_obj,
+            limit_obj,
+            offset_obj,
+            query_obj,
+            fts_query_obj,
+            prefilter,
+            with_row_id,
+            with_row_address,
+            batch_readahead,
+            column_orderings,
+            use_scalar_index,
+            substrait_aggregate_obj
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_create_scanner<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject<'local>,
+    fragment_ids_obj: JObject<'local>,
+    columns_obj: JObject<'local>,
+    substrait_filter_obj: JObject<'local>,
+    filter_obj: JObject<'local>,
+    batch_size_obj: JObject<'local>,
+    limit_obj: JObject<'local>,
+    offset_obj: JObject<'local>,
+    query_obj: JObject<'local>,
+    fts_query_obj: JObject<'local>,
+    prefilter: jboolean,
+    with_row_id: jboolean,
+    with_row_address: jboolean,
+    batch_readahead: jint,
+    column_orderings: JObject<'local>,
+    use_scalar_index: jboolean,
+    substrait_aggregate_obj: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+    let dataset = dataset_guard.inner.clone();
+    drop(dataset_guard);
+
+    let options = ScannerOptions {
+        fragment_ids_obj,
+        columns_obj,
+        substrait_filter_obj,
+        filter_obj,
+        batch_size_obj,
+        limit_obj,
+        offset_obj,
+        query_obj,
+        fts_query_obj,
+        prefilter,
+        with_row_id,
+        with_row_address,
+        batch_readahead,
+        column_orderings,
+        use_scalar_index,
+        substrait_aggregate_obj,
+    };
+
+    let scanner = build_scanner_with_options(env, &dataset, options)?;
 
     let scanner = BlockingScanner::create(scanner);
     scanner.into_java(env)

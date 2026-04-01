@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from typing import Dict, Optional
+
 import pyarrow as pa
 
 from lance.file import LanceFileReader, LanceFileWriter
@@ -24,7 +26,7 @@ class IvfModel:
         """
         return len(self.centroids)
 
-    def save(self, uri: str):
+    def save(self, uri: str, *, storage_options: Optional[Dict[str, str]] = None):
         """
         Save the IVF model to a lance file.
 
@@ -34,6 +36,8 @@ class IvfModel:
         uri: str
             The URI to save the model to.  The URI can be a local file path or a
             cloud storage path.
+        storage_options : optional, dict
+            Extra options for the storage backend (e.g. S3 credentials).
         """
         with LanceFileWriter(
             uri,
@@ -41,12 +45,13 @@ class IvfModel:
                 [pa.field("centroids", self.centroids.type)],
                 metadata={b"distance_type": self.distance_type.encode()},
             ),
+            storage_options=storage_options,
         ) as writer:
             batch = pa.table([self.centroids], names=["centroids"])
             writer.write_batch(batch)
 
     @classmethod
-    def load(cls, uri: str):
+    def load(cls, uri: str, *, storage_options: Optional[Dict[str, str]] = None):
         """
         Load an IVF model from a lance file.
 
@@ -56,8 +61,10 @@ class IvfModel:
         uri: str
             The URI to load the model from.  The URI can be a local file path or a
             cloud storage path.
+        storage_options : optional, dict
+            Extra options for the storage backend (e.g. S3 credentials).
         """
-        reader = LanceFileReader(uri)
+        reader = LanceFileReader(uri, storage_options=storage_options)
         num_rows = reader.metadata().num_rows
         metadata = reader.metadata().schema.metadata
         distance_type = metadata[b"distance_type"].decode()

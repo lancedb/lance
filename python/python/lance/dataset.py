@@ -3565,6 +3565,12 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.create_index_segment_builder()
 
+    def merge_existing_index_segments(self, segments: List[Index]) -> Index:
+        """
+        Merge one caller-defined group of existing uncommitted segments.
+        """
+        return self._ds.merge_existing_index_segments(segments)
+
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[IndexSegment]
     ) -> LanceDataset:

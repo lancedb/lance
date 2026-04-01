@@ -252,6 +252,12 @@ pub trait DatasetIndexExt {
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
+    /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
+    async fn merge_existing_index_segments(
+        &self,
+        source_segments: Vec<IndexMetadata>,
+    ) -> Result<IndexMetadata>;
+
     /// Commit one or more existing physical index segments as a logical index.
     async fn commit_existing_index_segments(
         &mut self,

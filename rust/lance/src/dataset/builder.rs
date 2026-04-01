@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use lance_core::cache::CacheBackend;
+
 use super::refs::{Ref, Refs};
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
@@ -37,6 +39,8 @@ pub struct DatasetBuilder {
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size_bytes: usize,
+    /// Custom index cache backend. If set, overrides `index_cache_size_bytes`.
+    index_cache_backend: Option<Arc<dyn CacheBackend>>,
     /// Optional pre-loaded manifest to avoid loading it again.
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
@@ -73,6 +77,7 @@ impl DatasetBuilder {
         Self {
             index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
+            index_cache_backend: None,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
@@ -174,6 +179,15 @@ impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
     pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
         self.index_cache_size_bytes = cache_size;
+        self
+    }
+
+    /// Use a custom index cache backend.
+    ///
+    /// When set, this overrides `with_index_cache_size_bytes` — the custom
+    /// backend is responsible for its own capacity management.
+    pub fn with_index_cache_backend(mut self, backend: Arc<dyn CacheBackend>) -> Self {
+        self.index_cache_backend = Some(backend);
         self
     }
 
@@ -576,13 +590,21 @@ impl DatasetBuilder {
             }
         }
 
+        let index_cache_backend = self.index_cache_backend.take();
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
-            None => Arc::new(Session::new(
-                self.index_cache_size_bytes,
-                self.metadata_cache_size_bytes,
-                Default::default(),
-            )),
+            None => match index_cache_backend {
+                Some(backend) => Arc::new(Session::with_index_cache_backend(
+                    backend,
+                    self.metadata_cache_size_bytes,
+                    Default::default(),
+                )),
+                None => Arc::new(Session::new(
+                    self.index_cache_size_bytes,
+                    self.metadata_cache_size_bytes,
+                    Default::default(),
+                )),
+            },
         };
 
         let target_ref = self.version.clone();

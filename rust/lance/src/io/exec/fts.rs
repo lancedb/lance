@@ -1519,7 +1519,7 @@ impl ExecutionPlan for BooleanQueryExec {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::index::DatasetIndexExt;

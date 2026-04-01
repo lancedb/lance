@@ -172,3 +172,139 @@ impl LanceIndexStoreExt for LanceIndexStore {
         Ok(store.with_file_sizes(index.file_size_map()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::dataset::WriteParams;
+    use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
+    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::IndexType;
+    use lance_linalg::distance::MetricType;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_remapper_only_touches_segments_with_affected_fragments() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(16.into()),
+            )
+            .into_reader_rows(RowCount::from(40), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 2,
+            "expected at least two fragments for this test"
+        );
+        let target_fragments = fragments.iter().take(2).collect::<Vec<_>>();
+
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let first_segment_uuid = Uuid::new_v4();
+        let second_segment_uuid = Uuid::new_v4();
+        let built_index = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .index_uuid(first_segment_uuid.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let first_segment_dir = dataset.indices_dir().child(first_segment_uuid.to_string());
+        let second_segment_dir = dataset.indices_dir().child(second_segment_uuid.to_string());
+        for file_name in ["index.idx", "auxiliary.idx"] {
+            dataset
+                .object_store()
+                .copy(
+                    &first_segment_dir.child(file_name),
+                    &second_segment_dir.child(file_name),
+                )
+                .await
+                .unwrap();
+        }
+
+        let segments = vec![
+            IndexMetadata {
+                uuid: first_segment_uuid,
+                fragment_bitmap: Some(std::iter::once(target_fragments[0].id() as u32).collect()),
+                ..built_index.clone()
+            },
+            IndexMetadata {
+                uuid: second_segment_uuid,
+                fragment_bitmap: Some(std::iter::once(target_fragments[1].id() as u32).collect()),
+                ..built_index
+            },
+        ];
+
+        let segments = segments
+            .iter()
+            .map(|segment| {
+                crate::index::IndexSegment::new(
+                    segment.uuid,
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .expect("test segment metadata should have fragment coverage")
+                        .iter(),
+                    segment
+                        .index_details
+                        .as_ref()
+                        .expect("test segment metadata should have index details")
+                        .clone(),
+                    segment.index_version,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let committed_ids = committed
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        let unaffected_segment_id = committed
+            .iter()
+            .find(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(target_fragments[1].id() as u32))
+            })
+            .map(|segment| segment.uuid)
+            .expect("expected one committed segment to cover the unaffected fragment");
+
+        let remapper = DatasetIndexRemapperOptions::default()
+            .create_remapper(&dataset)
+            .unwrap();
+        let remapped = remapper
+            .remap_indices(HashMap::new(), &[target_fragments[0].id() as u64])
+            .await
+            .unwrap();
+
+        assert_eq!(remapped.len(), 1);
+        assert!(committed_ids.contains(&remapped[0].old_id));
+        assert_ne!(remapped[0].old_id, unaffected_segment_id);
+        assert_ne!(remapped[0].new_id, unaffected_segment_id);
+    }
+}

@@ -52,7 +52,6 @@ impl TestDatasetGenerator {
     /// Set the seed for the random number generator.
     ///
     /// If not set, a random seed will be generated on each call to [`Self::make_hostile`].
-    #[allow(dead_code)]
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self

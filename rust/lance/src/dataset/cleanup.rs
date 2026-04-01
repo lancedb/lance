@@ -1182,6 +1182,7 @@ mod tests {
     use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::index::DatasetIndexExt;
     use crate::{
+        dataset::transaction::{Operation, Transaction},
         dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
@@ -1202,6 +1203,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use uuid::Uuid;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -1527,6 +1529,59 @@ mod tests {
             let db = self.open().await?;
             let count = db.count_rows(None).await?;
             Ok(count)
+        }
+    }
+
+    async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
+        let index_dir = dataset.indices_dir().child(uuid.to_string());
+        dataset
+            .object_store()
+            .put(&index_dir.child("index.idx"), b"idx")
+            .await?;
+        dataset
+            .object_store()
+            .put(&index_dir.child("auxiliary.idx"), b"aux")
+            .await?;
+        Ok(())
+    }
+
+    async fn write_dummy_staging_partial(
+        dataset: &Dataset,
+        staging_uuid: Uuid,
+        shard_uuid: Uuid,
+    ) -> Result<()> {
+        let shard_dir = dataset
+            .indices_dir()
+            .child(staging_uuid.to_string())
+            .child(format!("partial_{}", shard_uuid));
+        dataset
+            .object_store()
+            .put(&shard_dir.child("index.idx"), b"idx")
+            .await?;
+        dataset
+            .object_store()
+            .put(&shard_dir.child("auxiliary.idx"), b"aux")
+            .await?;
+        Ok(())
+    }
+
+    fn dummy_index_metadata(
+        dataset: &Dataset,
+        field_id: i32,
+        uuid: Uuid,
+        fragment_bitmap: impl IntoIterator<Item = u32>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            name: "some_index".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.version().version,
+            fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
+            index_details: None,
+            index_version: IndexType::Vector.version(),
+            created_at: None,
+            base_id: None,
+            files: None,
         }
     }
 
@@ -2180,6 +2235,149 @@ mod tests {
         let after_count = fixture.count_files().await.unwrap();
 
         assert_eq!(before_count, after_count);
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_replaced_segment_keeps_still_referenced_segments() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+
+        let seg_a = Uuid::new_v4();
+        let seg_b = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, seg_a).await.unwrap();
+        write_dummy_index_artifact(&dataset, seg_b).await.unwrap();
+
+        let index_a = dummy_index_metadata(&dataset, field_id, seg_a, [0_u32]);
+        let index_b = dummy_index_metadata(&dataset, field_id, seg_b, [1_u32]);
+        let initial_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_a.clone(), index_b.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(initial_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let seg_c = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, seg_c).await.unwrap();
+        let index_c = dummy_index_metadata(&dataset, field_id, seg_c, [2_u32]);
+        let replace_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_c.clone()],
+                removed_indices: vec![index_a.clone()],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(replace_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.index_files_removed, 2);
+        assert!(
+            !dataset
+                .object_store()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .child(seg_a.to_string())
+                        .child("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .child(seg_b.to_string())
+                        .child("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .child(seg_c.to_string())
+                        .child("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_uncommitted_index_artifacts() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let dataset = fixture.open().await.unwrap();
+        let staging_uuid = Uuid::new_v4();
+        let shard_uuid = Uuid::new_v4();
+        let built_segment_uuid = Uuid::new_v4();
+
+        write_dummy_staging_partial(&dataset, staging_uuid, shard_uuid)
+            .await
+            .unwrap();
+        write_dummy_index_artifact(&dataset, built_segment_uuid)
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.index_files_removed, 4);
+        assert!(
+            !dataset
+                .object_store()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .child(staging_uuid.to_string())
+                        .child(format!("partial_{}", shard_uuid))
+                        .child("index.idx"),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !dataset
+                .object_store()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .child(built_segment_uuid.to_string())
+                        .child("index.idx"),
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

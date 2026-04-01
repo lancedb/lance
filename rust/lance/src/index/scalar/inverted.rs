@@ -13,7 +13,11 @@ use prost::Message;
 use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
-    index::{DatasetIndexExt, IndexSegment, IndexSegmentPlan, scalar::fetch_index_details},
+    index::{
+        DatasetIndexExt,
+        api::{IndexSegment, IndexSegmentPlan},
+        scalar::fetch_index_details,
+    },
 };
 
 /// Plan physical segments for staged inverted-index outputs.

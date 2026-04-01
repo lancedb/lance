@@ -21,6 +21,7 @@ use url::Url;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
 
@@ -113,12 +114,12 @@ impl AzureBlobStoreProvider {
         base_path: &Url,
         storage_options: &StorageOptions,
     ) -> Result<Arc<dyn OSObjectStore>> {
-        let max_retries = storage_options.client_max_retries();
-        let retry_timeout = storage_options.client_retry_timeout();
+        // Use a low retry count since the AIMD throttle layer handles
+        // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
             backoff: Default::default(),
-            max_retries,
-            retry_timeout: Duration::from_secs(retry_timeout),
+            max_retries: storage_options.client_max_retries(),
+            retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
         let mut builder = MicrosoftAzureBuilder::new()
@@ -146,7 +147,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
-            StorageOptions(params.storage_options().cloned().unwrap_or_default());
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_azure();
         let download_retry_count = storage_options.download_retry_count();
 
@@ -162,6 +163,19 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         } else {
             self.build_microsoft_azure_store(&base_path, &storage_options)
                 .await?
+        };
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let inner = if throttle_config.is_disabled() {
+            inner
+        } else if storage_options.client_max_retries() == 0 {
+            log::warn!(
+                "AIMD throttle disabled: the current implementation relies on the object store \
+                 client surfacing retry errors, which requires client_max_retries > 0. \
+                 No throttle or retry layer will be applied."
+            );
+            inner
+        } else {
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
         };
 
         Ok(ObjectStore {

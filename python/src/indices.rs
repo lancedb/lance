@@ -10,8 +10,9 @@ use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::ivf::builder::write_vector_storage;
-use lance::index::{DatasetIndexExt, IndexSegment, IndexSegmentPlan};
+use lance::index::vector::pq::build_pq_model_in_fragments;
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -20,6 +21,7 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -33,7 +35,7 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::{PyJson, PyLance};
+use crate::utils::PyJson;
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
@@ -56,82 +58,6 @@ impl PyIndexConfig {
             index_type: index_type.to_string(),
             config: config.to_string(),
         })
-    }
-}
-
-#[pyclass(name = "IndexSegment", module = "lance.indices")]
-#[derive(Debug, Clone)]
-pub struct PyIndexSegment {
-    pub(crate) inner: IndexSegment,
-}
-
-impl PyIndexSegment {
-    pub(crate) fn from_inner(inner: IndexSegment) -> Self {
-        Self { inner }
-    }
-}
-
-#[pymethods]
-impl PyIndexSegment {
-    #[getter]
-    fn uuid(&self) -> String {
-        self.inner.uuid().to_string()
-    }
-
-    #[getter]
-    fn fragment_ids(&self) -> HashSet<u32> {
-        self.inner.fragment_bitmap().iter().collect()
-    }
-
-    #[getter]
-    fn index_version(&self) -> i32 {
-        self.inner.index_version()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "IndexSegment(uuid={}, fragment_ids={:?}, index_version={})",
-            self.uuid(),
-            self.fragment_ids(),
-            self.index_version()
-        )
-    }
-}
-
-#[pyclass(name = "IndexSegmentPlan", module = "lance.indices")]
-#[derive(Debug, Clone)]
-pub struct PyIndexSegmentPlan {
-    pub(crate) inner: IndexSegmentPlan,
-}
-
-impl PyIndexSegmentPlan {
-    pub(crate) fn from_inner(inner: IndexSegmentPlan) -> Self {
-        Self { inner }
-    }
-}
-
-#[pymethods]
-impl PyIndexSegmentPlan {
-    #[getter]
-    fn segment(&self) -> PyIndexSegment {
-        PyIndexSegment::from_inner(self.inner.segment().clone())
-    }
-
-    #[getter]
-    fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner.segments().iter().cloned().map(PyLance).collect()
-    }
-
-    #[getter]
-    fn estimated_bytes(&self) -> u64 {
-        self.inner.estimated_bytes()
-    }
-    fn __repr__(&self) -> String {
-        format!(
-            "IndexSegmentPlan(segments={}, estimated_bytes={})",
-            self.inner.segments().len(),
-            self.estimated_bytes()
-        )
     }
 }
 
@@ -198,6 +124,7 @@ fn get_ivf_model(py: Python<'_>, dataset: &Dataset, index_name: &str) -> PyResul
     Py::new(py, PyIvfModel { inner: ivf_model })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_train_ivf_model(
     dataset: &Dataset,
     column: &str,
@@ -206,6 +133,7 @@ async fn do_train_ivf_model(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
     // We verify distance_type earlier so can unwrap here
     let distance_type = DistanceType::try_from(distance_type).unwrap();
@@ -221,6 +149,7 @@ async fn do_train_ivf_model(
         dimension,
         distance_type,
         &params,
+        fragment_ids.as_deref(),
         Arc::new(NoopIndexBuildProgress),
     )
     .await
@@ -231,6 +160,7 @@ async fn do_train_ivf_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature=(dataset, column, dimension, num_partitions, distance_type, sample_rate, max_iters, fragment_ids=None))]
 fn train_ivf_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -240,6 +170,7 @@ fn train_ivf_model<'py>(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let centroids = rt().block_on(
         Some(py),
@@ -251,6 +182,7 @@ fn train_ivf_model<'py>(
             distance_type,
             sample_rate,
             max_iters,
+            fragment_ids,
         ),
     )??;
     centroids.to_pyarrow(py)
@@ -266,6 +198,7 @@ async fn do_train_pq_model(
     sample_rate: u32,
     max_iters: u32,
     ivf_model: IvfModel,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
     // We verify distance_type earlier so can unwrap here
     let distance_type = DistanceType::try_from(distance_type).unwrap();
@@ -276,13 +209,14 @@ async fn do_train_pq_model(
         sample_rate: sample_rate as usize,
         ..Default::default()
     };
-    let pq_model = lance::index::vector::pq::build_pq_model(
+    let pq_model = build_pq_model_in_fragments(
         dataset.ds.as_ref(),
         column,
         dimension,
         distance_type,
         &params,
         Some(&ivf_model),
+        fragment_ids.as_deref(),
     )
     .await
     .infer_error()?;
@@ -291,6 +225,7 @@ async fn do_train_pq_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, sample_rate, max_iters, ivf_centroids, fragment_ids=None))]
 fn train_pq_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -301,6 +236,7 @@ fn train_pq_model<'py>(
     sample_rate: u32,
     max_iters: u32,
     ivf_centroids: PyArrowType<ArrayData>,
+    fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -321,6 +257,7 @@ fn train_pq_model<'py>(
             sample_rate,
             max_iters,
             ivf_model,
+            fragment_ids,
         ),
     )??;
     codebook.to_pyarrow(py)
@@ -493,21 +430,28 @@ async fn do_load_shuffled_vectors(
     .infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    ds.commit_existing_index_segments(
-        index_name,
-        column,
-        vec![IndexSegment::new(
-            index_id,
-            ds.fragments().iter().map(|f| f.id as u32),
-            Arc::new(
-                prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
-                    .unwrap(),
-            ),
-            IndexType::IvfPq.version(),
-        )],
-    )
-    .await
-    .infer_error()?;
+    let index_dir = ds.indices_dir().child(index_id.to_string());
+    let files = list_index_files_with_sizes(ds.object_store(), &index_dir)
+        .await
+        .infer_error()?;
+    let metadata = IndexMetadata {
+        uuid: index_id,
+        name: index_name.to_string(),
+        fields: vec![ds.schema().field(column).unwrap().id],
+        dataset_version: ds.manifest.version,
+        fragment_bitmap: Some(ds.fragments().iter().map(|f| f.id as u32).collect()),
+        index_details: Some(Arc::new(
+            prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
+                .unwrap(),
+        )),
+        index_version: IndexType::IvfPq.version(),
+        created_at: Some(Utc::now()),
+        base_id: None,
+        files: Some(files),
+    };
+    ds.commit_existing_index_segments(index_name, column, vec![metadata])
+        .await
+        .infer_error()?;
 
     Ok(())
 }
@@ -580,6 +524,24 @@ pub struct PyIndexSegmentDescription {
 }
 
 impl PyIndexSegmentDescription {
+    pub fn from_metadata(segment: &lance_table::format::IndexMetadata) -> Self {
+        let fragment_ids = segment
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let size_bytes = segment.total_size_bytes();
+
+        Self {
+            uuid: segment.uuid.to_string(),
+            dataset_version_at_last_update: segment.dataset_version,
+            fragment_ids,
+            index_version: segment.index_version,
+            created_at: segment.created_at,
+            size_bytes,
+        }
+    }
+
     pub fn __repr__(&self) -> String {
         format!(
             "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?})",
@@ -633,22 +595,7 @@ impl PyIndexDescription {
         let segments = index
             .metadata()
             .iter()
-            .map(|segment| {
-                let fragment_ids = segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
-                    .unwrap_or_default();
-                let size_bytes = segment.total_size_bytes();
-                PyIndexSegmentDescription {
-                    uuid: segment.uuid.to_string(),
-                    dataset_version_at_last_update: segment.dataset_version,
-                    fragment_ids,
-                    index_version: segment.index_version,
-                    created_at: segment.created_at,
-                    size_bytes,
-                }
-            })
+            .map(PyIndexSegmentDescription::from_metadata)
             .collect();
 
         let details = index.details().unwrap_or_else(|_| "{}".to_string());
@@ -696,8 +643,6 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
-    indices.add_class::<PyIndexSegment>()?;
-    indices.add_class::<PyIndexSegmentPlan>()?;
     indices.add_class::<PyIndexDescription>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;

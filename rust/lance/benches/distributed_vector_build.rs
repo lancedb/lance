@@ -15,11 +15,11 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::index::vector::VectorIndexParams;
+use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::{
-    DatasetIndexExt, IndexType,
+    IndexType,
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::DistanceType;

@@ -27,11 +27,11 @@ pub enum LanceFileVersion {
     //
     /// The legacy (0.1) format
     Legacy,
-    #[default]
     V2_0,
+    #[default]
+    V2_1,
     /// The latest stable release (also the default version for new datasets)
     Stable,
-    V2_1,
     V2_2,
     /// The latest unstable release
     Next,
@@ -42,7 +42,7 @@ impl LanceFileVersion {
     /// Convert Stable or Next to the actual version
     pub fn resolve(&self) -> Self {
         match self {
-            Self::Stable => Self::V2_0,
+            Self::Stable => Self::default(),
             Self::Next => Self::V2_3,
             _ => *self,
         }

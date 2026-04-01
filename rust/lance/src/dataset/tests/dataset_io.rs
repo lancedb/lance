@@ -1440,6 +1440,118 @@ async fn test_fast_count_rows(
 
 #[rstest]
 #[tokio::test]
+async fn test_sample_with_fragment_ids(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    dataset.delete("i IN (1, 9)").await.unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let sampled = dataset
+        .sample(8, &projection, Some(&[0, 0, 2]))
+        .await
+        .unwrap();
+    let sampled_values = sampled
+        .column_by_name("i")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+
+    assert_eq!(sampled_values, vec![0, 2, 3, 8, 10, 11]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_with_empty_fragment_ids_rejected(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let err = dataset.sample(1, &projection, Some(&[])).await.unwrap_err();
+
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("does not accept an empty fragment_ids list")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_with_unknown_fragment_ids_rejected(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let err = dataset
+        .sample(1, &projection, Some(&[0, 999]))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("not part of the current dataset version")
+    );
+    assert!(err.to_string().contains("999"));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_bfloat16_roundtrip(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
