@@ -534,11 +534,11 @@ impl ObjectStore {
 
     /// Returns true if the object store pointed to a local file system.
     pub fn is_local(&self) -> bool {
-        self.scheme == "file"
+        self.scheme == "file" || self.scheme == "file+uring"
     }
 
     pub fn is_cloud(&self) -> bool {
-        self.scheme != "file" && self.scheme != "memory"
+        !self.is_local() && self.scheme != "memory"
     }
 
     /// Whether this object store prefers the lite scheduler.
