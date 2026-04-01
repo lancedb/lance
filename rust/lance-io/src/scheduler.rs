@@ -505,15 +505,23 @@ pub struct SchedulerConfig {
     /// This controls back pressure.  If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
-    /// Whether to use the new lite scheduler
-    pub use_lite_scheduler: bool,
+    /// Whether to use the lite scheduler.
+    ///
+    /// - `Some(true)` forces the lite scheduler (e.g. from env var or programmatic).
+    /// - `Some(false)` forces the standard scheduler.
+    /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
+    pub use_lite_scheduler: Option<bool>,
 }
 
 impl SchedulerConfig {
     pub fn new(io_buffer_size_bytes: u64) -> Self {
         Self {
             io_buffer_size_bytes,
-            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok(),
+            use_lite_scheduler: if std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok() {
+                Some(true)
+            } else {
+                None
+            },
         }
     }
 
@@ -521,7 +529,7 @@ impl SchedulerConfig {
     pub fn default_for_testing() -> Self {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         }
     }
 
@@ -533,7 +541,7 @@ impl SchedulerConfig {
 
     pub fn with_lite_scheduler(self) -> Self {
         Self {
-            use_lite_scheduler: true,
+            use_lite_scheduler: Some(true),
             ..self
         }
     }
@@ -548,7 +556,10 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
-        let io_queue = if config.use_lite_scheduler {
+        let use_lite = config
+            .use_lite_scheduler
+            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+        let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
                 config.io_buffer_size_bytes,
@@ -1120,7 +1131,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1211,7 +1222,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -1286,7 +1297,7 @@ mod tests {
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1389,7 +1400,7 @@ mod tests {
         // Only one request will be allowed in
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler

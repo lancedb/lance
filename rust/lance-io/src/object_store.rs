@@ -541,6 +541,14 @@ impl ObjectStore {
         self.scheme != "file" && self.scheme != "memory"
     }
 
+    /// Whether this object store prefers the lite scheduler.
+    ///
+    /// The lite scheduler is designed for backends like io_uring where
+    /// tasks should only be polled when the consumer polls them.
+    pub fn prefers_lite_scheduler(&self) -> bool {
+        self.scheme == "file+uring"
+    }
+
     pub fn scheme(&self) -> &str {
         &self.scheme
     }
