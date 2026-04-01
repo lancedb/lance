@@ -157,7 +157,7 @@ def _to_tensor(
             start = arr.offset * arr.type.list_size
             num_vals = len(arr) * arr.type.list_size
             values = values.slice(start, num_vals)
-            tensor = _bf16_to_tensor(values).reshape(-1, arr.type.list_size)
+            tensor = _bf16_to_tensor(values).view(-1, arr.type.list_size)
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
