@@ -8,6 +8,7 @@
 
 pub mod manifest;
 
+use arrow::array::Float32Array;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -18,7 +19,9 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
-use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{
+    BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+};
 use lance_index::vector::{
     bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
     sq::builder::SQBuildParams,
@@ -2954,6 +2957,133 @@ impl LanceNamespace for DirectoryNamespace {
         // Build scanner
         let mut scanner = dataset.scan();
 
+        // Check if this is a vector search query
+        // vector is Box<QueryTableRequestVector>, not Option
+        let has_vector_query = request
+            .vector
+            .single_vector
+            .as_ref()
+            .map(|sv| !sv.is_empty())
+            .unwrap_or(false)
+            || request
+                .vector
+                .multi_vector
+                .as_ref()
+                .map(|mv| !mv.is_empty())
+                .unwrap_or(false);
+
+        // Apply prefilter setting (must be set before nearest)
+        if let Some(prefilter) = request.prefilter {
+            scanner.prefilter(prefilter);
+        }
+
+        // Apply vector search if query vector is provided
+        if has_vector_query {
+            let vector_column = request.vector_column.as_deref().unwrap_or("vector");
+
+            // Get the query vector(s)
+            let query_vector: Vec<f32> = request
+                .vector
+                .single_vector
+                .clone()
+                .or_else(|| {
+                    request
+                        .vector
+                        .multi_vector
+                        .as_ref()
+                        .and_then(|mv| mv.first().cloned())
+                })
+                .unwrap_or_default();
+
+            if !query_vector.is_empty() {
+                let k = if request.k > 0 {
+                    request.k as usize
+                } else {
+                    10
+                };
+                let query_array = Float32Array::from(query_vector);
+                scanner
+                    .nearest(vector_column, &query_array, k)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid vector search: {}", e),
+                    })?;
+
+                // Apply distance type if specified
+                if let Some(ref distance_type) = request.distance_type {
+                    let metric = match distance_type.to_lowercase().as_str() {
+                        "l2" | "euclidean" => MetricType::L2,
+                        "cosine" => MetricType::Cosine,
+                        "dot" | "inner_product" => MetricType::Dot,
+                        "hamming" => MetricType::Hamming,
+                        _ => {
+                            return Err(NamespaceError::InvalidInput {
+                                message: format!("Unknown distance type: {}", distance_type),
+                            }
+                            .into());
+                        }
+                    };
+                    scanner.distance_metric(metric);
+                }
+
+                // Apply nprobes if specified
+                if let Some(nprobes) = request.nprobes {
+                    scanner.nprobes(nprobes as usize);
+                }
+
+                // Apply ef (HNSW search effort) if specified
+                if let Some(ef) = request.ef {
+                    scanner.ef(ef as usize);
+                }
+
+                // Apply refine_factor if specified
+                if let Some(refine_factor) = request.refine_factor {
+                    scanner.refine(refine_factor as u32);
+                }
+
+                // Apply distance bounds if specified
+                if request.lower_bound.is_some() || request.upper_bound.is_some() {
+                    scanner.distance_range(request.lower_bound, request.upper_bound);
+                }
+
+                // Apply use_index (inverse of bypass_vector_index)
+                if let Some(bypass) = request.bypass_vector_index {
+                    scanner.use_index(!bypass);
+                }
+
+                // Apply fast_search if specified
+                if request.fast_search == Some(true) {
+                    scanner.fast_search();
+                }
+            }
+        }
+
+        // Apply full text search if specified
+        if let Some(ref fts_query) = request.full_text_query {
+            // Handle string_query (simple string FTS)
+            if let Some(ref string_query) = fts_query.string_query {
+                let mut fts = FullTextSearchQuery::new(string_query.query.clone());
+
+                // Apply column filter if specified
+                if let Some(ref columns) = string_query.columns
+                    && !columns.is_empty()
+                {
+                    fts = fts
+                        .with_columns(columns)
+                        .map_err(|e| NamespaceError::InvalidInput {
+                            message: format!("Invalid FTS columns: {}", e),
+                        })?;
+                }
+
+                scanner
+                    .full_text_search(fts)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid full text search: {}", e),
+                    })?;
+            }
+            // Note: structured_query would require more complex parsing
+            // For now, we only support string_query
+        }
+
         // Apply column projection if specified
         if let Some(ref columns) = request.columns
             && let Some(ref column_names) = columns.column_names
@@ -2965,6 +3095,8 @@ impl LanceNamespace for DirectoryNamespace {
                     message: format!("Invalid column projection: {}", e),
                 })?;
         }
+        // Note: column_aliases (SQL expressions) would require expression parsing
+        // For now, we only support simple column names
 
         // Apply filter if specified
         if let Some(ref filter) = request.filter
@@ -2977,15 +3109,29 @@ impl LanceNamespace for DirectoryNamespace {
                 })?;
         }
 
+        // Apply with_row_id if requested
+        if request.with_row_id == Some(true) {
+            scanner.with_row_id();
+        }
+
         // Apply limit if specified (k is the number of results to return)
         // k == 0 means no limit
-        if request.k > 0 {
+        // Note: For vector search, limit is already applied via nearest()
+        if !has_vector_query && request.k > 0 {
             let offset = request.offset.map(|o| o as i64);
             scanner.limit(Some(request.k as i64), offset).map_err(|e| {
                 NamespaceError::InvalidInput {
                     message: format!("Invalid limit/offset: {}", e),
                 }
             })?;
+        } else if has_vector_query && request.offset.is_some() {
+            // For vector search, offset is handled separately
+            let offset = request.offset.map(|o| o as i64);
+            scanner
+                .limit(None, offset)
+                .map_err(|e| NamespaceError::InvalidInput {
+                    message: format!("Invalid offset: {}", e),
+                })?;
         }
 
         // Execute the scan and collect results
