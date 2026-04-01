@@ -46,8 +46,8 @@ use lance_namespace::models::{
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse, Identity,
     IndexContent, ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
     ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
-    TableVersion,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, QueryTableRequest,
+    TableExistsRequest, TableVersion,
 };
 
 use lance_core::Result;
@@ -2940,6 +2940,80 @@ impl LanceNamespace for DirectoryNamespace {
             .map(|transaction| transaction.uuid);
 
         Ok(DropTableIndexResponse { transaction_id })
+    }
+
+    async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
+        use arrow::ipc::writer::FileWriter;
+
+        self.record_op("query_table");
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, request.version, "query_table")
+            .await?;
+
+        // Build scanner
+        let mut scanner = dataset.scan();
+
+        // Apply column projection if specified
+        if let Some(ref columns) = request.columns
+            && let Some(ref column_names) = columns.column_names
+            && !column_names.is_empty()
+        {
+            scanner
+                .project(column_names)
+                .map_err(|e| NamespaceError::InvalidInput {
+                    message: format!("Invalid column projection: {}", e),
+                })?;
+        }
+
+        // Apply filter if specified
+        if let Some(ref filter) = request.filter
+            && !filter.is_empty()
+        {
+            scanner
+                .filter(filter)
+                .map_err(|e| NamespaceError::InvalidInput {
+                    message: format!("Invalid filter expression: {}", e),
+                })?;
+        }
+
+        // Apply limit if specified (k is the number of results to return)
+        // k == 0 means no limit
+        if request.k > 0 {
+            let offset = request.offset.map(|o| o as i64);
+            scanner.limit(Some(request.k as i64), offset).map_err(|e| {
+                NamespaceError::InvalidInput {
+                    message: format!("Invalid limit/offset: {}", e),
+                }
+            })?;
+        }
+
+        // Execute the scan and collect results
+        let batch = scanner
+            .try_into_batch()
+            .await
+            .map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to execute query: {}", e),
+            })?;
+
+        // Serialize to Arrow IPC file format
+        let schema = batch.schema();
+        let mut buffer = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
+                NamespaceError::Internal {
+                    message: format!("Failed to create IPC writer: {}", e),
+                }
+            })?;
+            writer.write(&batch).map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to write batch to IPC: {}", e),
+            })?;
+            writer.finish().map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to finish IPC writer: {}", e),
+            })?;
+        }
+
+        Ok(Bytes::from(buffer))
     }
 
     fn namespace_id(&self) -> String {
