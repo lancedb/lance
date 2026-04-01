@@ -84,16 +84,17 @@ pub async fn read_fixed_stride_array(
 /// followed by the message itself.
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
+    let pos = pos as u64;
     if pos > file_size {
         return Err(Error::io("file size is too small".to_string()));
     }
 
-    let range = pos..min(pos + reader.block_size(), file_size);
+    let range = pos..min(pos + reader.block_size() as u64, file_size);
     let buf = reader.get_range(range.clone()).await?;
     let msg_len = LittleEndian::read_u32(&buf) as usize;
 
     if msg_len + 4 > buf.len() {
-        let remaining_range = range.end..min(4 + pos + msg_len, file_size);
+        let remaining_range = range.end..min(4 + pos + msg_len as u64, file_size);
         let remaining_bytes = reader.get_range(remaining_range).await?;
         let buf = [buf, remaining_bytes].concat();
         assert!(buf.len() >= msg_len + 4);
@@ -118,7 +119,7 @@ pub async fn read_struct<
 
 pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
     let file_size = reader.size().await?;
-    let block_size = reader.block_size();
+    let block_size = reader.block_size() as u64;
     let begin = file_size.saturating_sub(block_size);
     reader.get_range(begin..file_size).await
 }

@@ -189,19 +189,21 @@ impl FileReader {
     ) -> Result<Arc<Metadata>> {
         Self::load_from_cache(cache, object_reader.path().to_string(), |_| async {
             let file_size = object_reader.size().await?;
-            let begin = if file_size < object_reader.block_size() {
+            let block_size = object_reader.block_size() as u64;
+            let begin = if file_size < block_size {
                 0
             } else {
-                file_size - object_reader.block_size()
+                file_size - block_size
             };
             let tail_bytes = object_reader.get_range(begin..file_size).await?;
             let metadata_pos = read_metadata_offset(&tail_bytes)?;
 
-            let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
+            let tail_len = tail_bytes.len() as u64;
+            let metadata: Metadata = if (metadata_pos as u64) < file_size - tail_len {
                 // We have not read the metadata bytes yet.
                 read_struct(object_reader, metadata_pos).await?
             } else {
-                let offset = tail_bytes.len() - (file_size - metadata_pos);
+                let offset = tail_bytes.len() - (file_size - metadata_pos as u64) as usize;
                 read_struct_from_buf(&tail_bytes.slice(offset..))?
             };
             Ok(metadata)

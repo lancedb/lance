@@ -209,7 +209,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         let bytes: Bytes = if start >= end {
             Bytes::new()
         } else {
-            self.reader.get_range(start as usize..end as usize).await?
+            self.reader.get_range(start as u64..end as u64).await?
         };
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)

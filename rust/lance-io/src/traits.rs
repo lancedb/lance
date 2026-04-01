@@ -70,13 +70,13 @@ pub trait WriteExt {
         magic: &[u8],
     ) -> Result<()>;
 
-    async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize>;
+    async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<u64>;
 
     async fn copy_range_from_reader(
         &mut self,
         reader: &dyn Reader,
-        range: Range<usize>,
-    ) -> Result<usize>;
+        range: Range<u64>,
+    ) -> Result<u64>;
 }
 
 #[async_trait]
@@ -106,12 +106,12 @@ impl<W: Writer + ?Sized> WriteExt for W {
         Ok(())
     }
 
-    async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize> {
+    async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<u64> {
         let mut stream = reader.get_stream().await?;
-        let mut copied = 0usize;
+        let mut copied = 0u64;
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
-            copied += bytes.len();
+            copied += bytes.len() as u64;
             self.write_all(&bytes).await?;
         }
         Ok(copied)
@@ -120,13 +120,13 @@ impl<W: Writer + ?Sized> WriteExt for W {
     async fn copy_range_from_reader(
         &mut self,
         reader: &dyn Reader,
-        range: Range<usize>,
-    ) -> Result<usize> {
+        range: Range<u64>,
+    ) -> Result<u64> {
         let mut stream = reader.get_range_stream(range).await?;
-        let mut copied = 0usize;
+        let mut copied = 0u64;
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
-            copied += bytes.len();
+            copied += bytes.len() as u64;
             self.write_all(&bytes).await?;
         }
         Ok(copied)
@@ -143,12 +143,12 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn io_parallelism(&self) -> usize;
 
     /// Object/File Size.
-    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>>;
+    fn size(&self) -> BoxFuture<'_, object_store::Result<u64>>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
+    fn get_range(&self, range: Range<u64>) -> BoxFuture<'static, object_store::Result<Bytes>>;
 
     /// Read all bytes from the object.
     ///
@@ -167,7 +167,7 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Read a byte range as a byte stream.
     fn get_range_stream(
         &self,
-        range: Range<usize>,
+        range: Range<u64>,
     ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
         Box::pin(async move {
             let bytes = self.get_range(range).await?;

@@ -79,7 +79,7 @@ pub struct LocalObjectReader {
 
     /// Known size of the file. This is either passed in on construction or
     /// cached on the first metadata call.
-    size: OnceCell<usize>,
+    size: OnceCell<u64>,
 
     /// Block size, in bytes.
     block_size: usize,
@@ -99,7 +99,7 @@ impl LocalObjectReader {
     pub async fn open_local_path(
         path: impl AsRef<std::path::Path>,
         block_size: usize,
-        known_size: Option<usize>,
+        known_size: Option<u64>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.as_ref().to_owned();
         let object_store_path = Path::from_filesystem_path(&path)?;
@@ -113,7 +113,7 @@ impl LocalObjectReader {
     pub async fn open(
         path: &Path,
         block_size: usize,
-        known_size: Option<usize>,
+        known_size: Option<u64>,
     ) -> Result<Box<dyn Reader>> {
         Self::open_with_tracker(path, block_size, known_size, Default::default()).await
     }
@@ -123,7 +123,7 @@ impl LocalObjectReader {
     pub(crate) async fn open_with_tracker(
         path: &Path,
         block_size: usize,
-        known_size: Option<usize>,
+        known_size: Option<u64>,
         io_tracker: Arc<IOTracker>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.clone();
@@ -160,7 +160,7 @@ impl Reader for LocalObjectReader {
     }
 
     /// Returns the file size.
-    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, object_store::Result<u64>> {
         Box::pin(async move {
             let file = self.file.clone();
             self.size
@@ -172,7 +172,7 @@ impl Reader for LocalObjectReader {
                         })
                     })
                     .await??;
-                    Ok(metadata.len() as usize)
+                    Ok(metadata.len())
                 })
                 .await
                 .cloned()
@@ -181,23 +181,32 @@ impl Reader for LocalObjectReader {
 
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
-    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+    fn get_range(&self, range: Range<u64>) -> BoxFuture<'static, object_store::Result<Bytes>> {
         let file = self.file.clone();
         let io_tracker = self.io_tracker.clone();
         let path = self.path.clone();
-        let num_bytes = range.len() as u64;
-        let range_u64 = (range.start as u64)..(range.end as u64);
+        let num_bytes = range.end - range.start;
+        let range_u64 = range.clone();
 
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let mut buf = BytesMut::with_capacity(range.len());
+                let len = usize::try_from(range.end - range.start).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Range {}..{} does not fit into usize",
+                            range.start, range.end
+                        ),
+                    )
+                })?;
+                let mut buf = BytesMut::with_capacity(len);
                 // Safety: `buf` is set with appropriate capacity above. It is
                 // written to below and we check all data is initialized at that point.
-                unsafe { buf.set_len(range.len()) };
+                unsafe { buf.set_len(len) };
                 #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
+                file.read_exact_at(buf.as_mut(), range.start)?;
                 #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
+                read_exact_at(file, buf.as_mut(), range.start)?;
 
                 Ok(buf.freeze())
             })
@@ -257,7 +266,7 @@ impl Reader for LocalObjectReader {
 
     fn get_range_stream(
         &self,
-        range: Range<usize>,
+        range: Range<u64>,
     ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
         let file = self.file.clone();
         let path = self.path.clone();

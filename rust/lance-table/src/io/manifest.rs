@@ -115,9 +115,7 @@ pub async fn read_manifest_indexes(
 ) -> Result<Vec<IndexMetadata>> {
     if let Some(pos) = manifest.index_section.as_ref() {
         let reader = if let Some(size) = location.size {
-            object_store
-                .open_with_size(&location.path, size as usize)
-                .await?
+            object_store.open_with_size(&location.path, size).await?
         } else {
             object_store.open(&location.path).await?
         };

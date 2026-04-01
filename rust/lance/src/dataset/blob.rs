@@ -210,8 +210,8 @@ pub struct BlobPreprocessor {
 /// storage.
 struct ExternalBlobSource {
     reader: Box<dyn Reader>,
-    start: usize,
-    size: usize,
+    start: u64,
+    size: u64,
 }
 
 /// A blob payload source used by packed and dedicated writers.
@@ -225,7 +225,7 @@ enum BlobWriteSource<'a> {
 
 impl ExternalBlobSource {
     /// Return the logical payload size after applying any external slice.
-    fn size(&self) -> usize {
+    fn size(&self) -> u64 {
         self.size
     }
 
@@ -251,7 +251,8 @@ impl BlobWriteSource<'_> {
     fn size(&self) -> usize {
         match self {
             Self::Bytes(data) => data.len(),
-            Self::External(source) => source.size(),
+            Self::External(source) => usize::try_from(source.size())
+                .expect("packed and inline external blobs must fit into usize"),
         }
     }
 
@@ -378,27 +379,15 @@ impl BlobPreprocessor {
         let reader = object_store.open(&path).await?;
         match (position, size) {
             (Some(position), Some(size)) => {
-                let start = usize::try_from(position).map_err(|_| {
+                position.checked_add(size).ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "External blob position {} does not fit into usize",
-                        position
-                    ))
-                })?;
-                let size = usize::try_from(size).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "External blob size {} does not fit into usize",
-                        size
-                    ))
-                })?;
-                start.checked_add(size).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "External blob range overflows usize: position={}, size={}",
+                        "External blob range overflows u64: position={}, size={}",
                         position, size
                     ))
                 })?;
                 Ok(ExternalBlobSource {
                     reader,
-                    start,
+                    start: position,
                     size,
                 })
             }
@@ -547,7 +536,7 @@ impl BlobPreprocessor {
                         let source = self.open_external_source(uri_val, position, size).await?;
                         let data_len = source.size();
 
-                        if data_len > dedicated_threshold {
+                        if data_len > dedicated_threshold as u64 {
                             let blob_id = self.next_blob_id();
                             self.write_dedicated(blob_id, BlobWriteSource::External(&source))
                                 .await?;
@@ -556,12 +545,12 @@ impl BlobPreprocessor {
                             data_builder.append_null();
                             uri_builder.append_null();
                             blob_id_builder.append_value(blob_id);
-                            blob_size_builder.append_value(data_len as u64);
+                            blob_size_builder.append_value(data_len);
                             position_builder.append_null();
                             continue;
                         }
 
-                        if data_len > INLINE_MAX {
+                        if data_len > INLINE_MAX as u64 {
                             let (pack_blob_id, position) = self
                                 .write_packed(BlobWriteSource::External(&source))
                                 .await?;
@@ -570,7 +559,7 @@ impl BlobPreprocessor {
                             data_builder.append_null();
                             uri_builder.append_null();
                             blob_id_builder.append_value(pack_blob_id);
-                            blob_size_builder.append_value(data_len as u64);
+                            blob_size_builder.append_value(data_len);
                             position_builder.append_value(position);
                             continue;
                         }
@@ -882,8 +871,8 @@ impl BlobFile {
             if cursor >= size {
                 return Ok((size, bytes::Bytes::new()));
             }
-            let start = position as usize + cursor as usize;
-            let end = (position + size) as usize;
+            let start = position + cursor;
+            let end = position + size;
             Ok((size, reader.get_range(start..end).await?))
         })
         .await
@@ -900,11 +889,11 @@ impl BlobFile {
             if cursor >= size || len == 0 {
                 return Ok((size.min(cursor), bytes::Bytes::new()));
             }
-            let start = position as usize + cursor as usize;
-            let read_size = len.min((size - cursor) as usize);
+            let start = position + cursor;
+            let read_size = (size - cursor).min(len as u64);
             let end = start + read_size;
             let data = reader.get_range(start..end).await?;
-            Ok((end as u64 - position, data))
+            Ok((end - position, data))
         })
         .await
     }
