@@ -620,7 +620,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                 // Get stats after close to include all WAL flushes
                                 let stats = stats_handle.snapshot();
 
-                                total_duration += put_duration;
+                                total_duration += put_duration + close_duration;
 
                                 // Report stats once (first iteration of first sample only)
                                 if iter == 0 && !stats_printed.swap(true, Ordering::SeqCst) {
