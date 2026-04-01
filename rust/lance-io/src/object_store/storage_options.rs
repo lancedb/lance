@@ -314,14 +314,13 @@ impl StorageOptionsAccessor {
             }
         }
 
-        // If no provider, return initial options or error
+        // If no provider, return initial options or use defaults
         let Some(provider) = &self.provider else {
             return if let Some(initial) = &self.initial_options {
                 Ok(Some(super::StorageOptions(initial.clone())))
             } else {
-                Err(Error::io_source(Box::new(std::io::Error::other(
-                    "No storage options available",
-                ))))
+                // No provider and no initial options - use default credentials
+                Ok(Some(super::StorageOptions(HashMap::new())))
             };
         };
 
@@ -350,13 +349,18 @@ impl StorageOptionsAccessor {
         })?;
 
         let Some(options) = storage_options_map else {
-            // Provider returned None, fall back to initial options
+            // Provider returned None, fall back to initial options or use defaults
             if let Some(initial) = &self.initial_options {
                 return Ok(Some(super::StorageOptions(initial.clone())));
             }
-            return Err(Error::io_source(Box::new(std::io::Error::other(
-                "Provider returned no storage options",
-            ))));
+            // Provider returned None and no initial options - use default credentials
+            // This is valid when namespace doesn't vend credentials (e.g., directory namespace
+            // where environment credentials are used)
+            log::debug!(
+                "Provider {} returned no storage options, using default credentials",
+                provider.provider_id()
+            );
+            return Ok(Some(super::StorageOptions(HashMap::new())));
         };
 
         let expires_at_millis = options
