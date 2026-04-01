@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
@@ -517,11 +518,9 @@ impl SchedulerConfig {
     pub fn new(io_buffer_size_bytes: u64) -> Self {
         Self {
             io_buffer_size_bytes,
-            use_lite_scheduler: if std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok() {
-                Some(true)
-            } else {
-                None
-            },
+            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
+                .ok()
+                .map(|v| str_is_truthy(v.trim())),
         }
     }
 
@@ -753,6 +752,11 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         ScanStats::new(self.stats.as_ref())
+    }
+
+    #[cfg(test)]
+    fn uses_lite_scheduler(&self) -> bool {
+        matches!(self.io_queue, IoQueueType::Lite(_))
     }
 }
 
@@ -1383,6 +1387,55 @@ mod tests {
         assert_eq!(fut1.await.unwrap()[0].len(), 100);
         assert_eq!(fut2.await.unwrap()[0].len(), 100);
         assert_eq!(fut3.await.unwrap()[0].len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_object_store_selects_scheduler() {
+        // A memory:// store should use the standard scheduler when config is None
+        let memory_store = Arc::new(ObjectStore::memory());
+        assert!(!memory_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(memory_store.clone(), config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // A file+uring:// store should use the lite scheduler when config is None
+        let uring_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("file+uring:///tmp").unwrap(),
+            None,
+            None,
+            false,
+            false,
+            8,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        assert!(uring_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(uring_store.clone(), config);
+        assert!(scheduler.uses_lite_scheduler());
+
+        // Explicit Some(false) overrides a file+uring:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(uring_store, config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // Explicit Some(true) overrides a memory:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(true),
+        };
+        let scheduler = ScanScheduler::new(memory_store, config);
+        assert!(scheduler.uses_lite_scheduler());
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
