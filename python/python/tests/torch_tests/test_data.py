@@ -12,7 +12,11 @@ import pytest
 from lance.sampler import ShardedBatchSampler, ShardedFragmentSampler
 
 torch = pytest.importorskip("torch")
-from lance.torch.data import LanceDataset, SafeLanceDataset  # noqa: E402
+from lance.torch.data import (  # noqa: E402
+    LanceDataset,
+    SafeLanceDataset,
+    _bf16_to_tensor,
+)
 
 
 def test_iter_over_dataset_fixed_shape_tensor(tmp_path):
@@ -378,6 +382,37 @@ def test_scalar_bfloat16_column(tmp_path):
         assert batch.dtype == torch.bfloat16
         total_rows += batch.shape[0]
     assert total_rows == num_rows
+
+
+def test_bf16_to_tensor_zero_copy_without_nulls():
+    """Non-null bf16 arrays should alias the Arrow data buffer."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from lance.arrow import BFloat16Array
+
+    values = np.array([1.0, 2.0, 3.0, 4.0], dtype=ml_dtypes.bfloat16)
+    arr = BFloat16Array.from_numpy(values).slice(1, 2)
+
+    tensor = _bf16_to_tensor(arr)
+
+    assert tensor.dtype == torch.bfloat16
+    assert torch.equal(
+        tensor.to(torch.float32),
+        torch.tensor([2.0, 3.0], dtype=torch.float32),
+    )
+    assert tensor.data_ptr() == arr.storage.buffers()[1].address + arr.storage.offset * 2
+
+
+def test_bf16_to_tensor_clones_when_nulls_present():
+    """Null replacement requires a writable tensor, so the Arrow buffer is cloned."""
+    arr = lance.arrow.bfloat16_array([1.0, None, 3.0])
+
+    tensor = _bf16_to_tensor(arr)
+
+    assert tensor.dtype == torch.bfloat16
+    assert tensor.data_ptr() != arr.storage.buffers()[1].address + arr.storage.offset * 2
+    assert tensor[0].to(torch.float32).item() == pytest.approx(1.0)
+    assert torch.isnan(tensor[1])
+    assert tensor[2].to(torch.float32).item() == pytest.approx(3.0)
 
 
 def test_safe_lance_dataset_worker_uses_dataset_options(tmp_path: Path):

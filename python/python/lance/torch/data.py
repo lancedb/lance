@@ -67,9 +67,32 @@ def _bf16_to_tensor(arr: pa.Array) -> torch.Tensor:
     storage = arr.storage if isinstance(arr.type, pa.ExtensionType) else arr
     buf = storage.buffers()[1]
     offset = storage.offset * 2  # 2 bytes per bf16 value
-    np_uint16 = np.frombuffer(buf, dtype=np.uint16, count=len(storage), offset=offset)
-    tensor = torch.from_numpy(np_uint16.copy()).view(torch.bfloat16)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given buffer is not writable",
+                category=UserWarning,
+            )
+            tensor = torch.frombuffer(
+                memoryview(buf),
+                dtype=torch.uint16,
+                count=len(storage),
+                offset=offset,
+            ).view(torch.bfloat16)
+    except (AttributeError, RuntimeError, TypeError):
+        np_uint16 = np.frombuffer(
+            buf, dtype=np.uint16, count=len(storage), offset=offset
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given NumPy array is not writable",
+                category=UserWarning,
+            )
+            tensor = torch.from_numpy(np_uint16).view(torch.bfloat16)
     if arr.null_count > 0:
+        tensor = tensor.clone()
         null_mask = torch.from_numpy(arr.is_null().to_numpy(zero_copy_only=False))
         tensor[null_mask] = float("nan")
     return tensor
@@ -142,9 +165,7 @@ def _to_tensor(
         ):
             tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
 
-            if (
-                uint64_as_int64 and tensor.dtype == torch.uint64
-            ):  # ← inside numeric branch ✓
+            if uint64_as_int64 and tensor.dtype == torch.uint64:
                 tensor = tensor.to(torch.int64)
         elif _is_bfloat16_type(arr.type):
             tensor = _bf16_to_tensor(arr)
