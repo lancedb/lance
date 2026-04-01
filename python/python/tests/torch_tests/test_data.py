@@ -399,7 +399,9 @@ def test_bf16_to_tensor_zero_copy_without_nulls():
         tensor.to(torch.float32),
         torch.tensor([2.0, 3.0], dtype=torch.float32),
     )
-    assert tensor.data_ptr() == arr.storage.buffers()[1].address + arr.storage.offset * 2
+    assert (
+        tensor.data_ptr() == arr.storage.buffers()[1].address + arr.storage.offset * 2
+    )
 
 
 def test_bf16_to_tensor_clones_when_nulls_present():
@@ -409,7 +411,9 @@ def test_bf16_to_tensor_clones_when_nulls_present():
     tensor = _bf16_to_tensor(arr)
 
     assert tensor.dtype == torch.bfloat16
-    assert tensor.data_ptr() != arr.storage.buffers()[1].address + arr.storage.offset * 2
+    assert (
+        tensor.data_ptr() != arr.storage.buffers()[1].address + arr.storage.offset * 2
+    )
     assert tensor[0].to(torch.float32).item() == pytest.approx(1.0)
     assert torch.isnan(tensor[1])
     assert tensor[2].to(torch.float32).item() == pytest.approx(3.0)
