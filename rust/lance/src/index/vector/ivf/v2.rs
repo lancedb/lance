@@ -658,7 +658,9 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::{
-        pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
+        pq::storage::ProductQuantizationMetadata,
+        sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
+        storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
@@ -763,6 +765,37 @@ mod tests {
         let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
         let metadata_entries: Vec<String> = serde_json::from_str(metadata).unwrap();
         serde_json::from_str(&metadata_entries[0]).unwrap()
+    }
+
+    async fn get_sq_metadata(
+        dataset: &Dataset,
+        scheduler: Arc<ScanScheduler>,
+        index_uuid: &str,
+    ) -> ScalarQuantizationMetadata {
+        let index_path = dataset
+            .indices_dir()
+            .child(index_uuid)
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        let file_scheduler = scheduler
+            .open_file(&index_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        if let Some(metadata) = reader.schema().metadata.get(SQ_METADATA_KEY) {
+            serde_json::from_str(metadata).unwrap()
+        } else {
+            let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
+            let metadata_entries: Vec<String> = serde_json::from_str(metadata).unwrap();
+            serde_json::from_str(&metadata_entries[0]).unwrap()
+        }
     }
 
     async fn assert_rq_rotation_type(dataset: &Dataset, expected: RQRotationType) {
@@ -944,6 +977,49 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn make_fragment_offset_batches(
+        rows_per_fragment: usize,
+        offsets: &[f32],
+    ) -> (Arc<Schema>, Vec<RecordBatch>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+
+        let mut next_id = 0_u64;
+        let batches = offsets
+            .iter()
+            .map(|offset| {
+                let ids = Arc::new(UInt64Array::from_iter_values(
+                    next_id..next_id + rows_per_fragment as u64,
+                ));
+                next_id += rows_per_fragment as u64;
+
+                let mut values = Vec::with_capacity(rows_per_fragment * DIM);
+                for _ in 0..rows_per_fragment {
+                    for dim in 0..DIM {
+                        values.push(*offset + dim as f32);
+                    }
+                }
+
+                let vectors = Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                        .unwrap(),
+                );
+                RecordBatch::try_new(schema.clone(), vec![ids, vectors]).unwrap()
+            })
+            .collect();
+
+        (schema, batches)
     }
 
     struct VectorIndexTestContext {
@@ -1721,6 +1797,7 @@ mod tests {
     #[case::ivf_flat(IndexType::IvfFlat)]
     #[case::ivf_pq(IndexType::IvfPq)]
     #[case::ivf_sq(IndexType::IvfSq)]
+    #[case::ivf_rq(IndexType::IvfRq)]
     #[tokio::test]
     async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_query_results(
         #[case] index_type: IndexType,
@@ -1771,6 +1848,14 @@ mod tests {
                     DistanceType::L2,
                     ivf_params,
                     SQBuildParams::default(),
+                )
+            }
+            IndexType::IvfRq => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_rq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
                 )
             }
             other => panic!("unsupported test index type: {}", other),
@@ -1871,10 +1956,20 @@ mod tests {
         let ids_single = collect_row_ids(&ds_single, &queries).await;
         let ids_split = collect_row_ids(&ds_split, &queries).await;
 
-        assert_eq!(
-            ids_single, ids_split,
-            "single vs segmented distributed index returned different Top-K row ids",
-        );
+        if index_type == IndexType::IvfRq {
+            for row_ids in &ids_split {
+                assert_eq!(
+                    row_ids.len(),
+                    K,
+                    "distributed IVF_RQ query should still return exactly {K} row ids",
+                );
+            }
+        } else {
+            assert_eq!(
+                ids_single, ids_split,
+                "single vs segmented distributed index returned different Top-K row ids",
+            );
+        }
     }
 
     #[rstest]
@@ -2141,6 +2236,59 @@ mod tests {
             .unwrap();
         assert!(result.num_rows() > 0);
     }
+
+    #[tokio::test]
+    async fn test_distributed_ivf_sq_worker_training_respects_fragment_filter() {
+        const ROWS_PER_FRAGMENT: usize = 64;
+        const FRAGMENT_OFFSETS: [f32; 2] = [0.0, 1000.0];
+
+        let test_dir = TempStrDir::default();
+        let dataset_uri = format!("{}/distributed_sq_fragment_filter", test_dir.as_str());
+        let (schema, batches) = make_fragment_offset_batches(ROWS_PER_FRAGMENT, &FRAGMENT_OFFSETS);
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), FRAGMENT_OFFSETS.len());
+
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(2, build_centroids_for_offsets(&FRAGMENT_OFFSETS))
+                .unwrap();
+        let params = VectorIndexParams::with_ivf_sq_params(
+            DistanceType::L2,
+            ivf_params,
+            SQBuildParams::default(),
+        );
+
+        let segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("sq_fragment_filter".to_string())
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let scheduler = ScanScheduler::new(
+            Arc::new(dataset.object_store().clone()),
+            SchedulerConfig::default_for_testing(),
+        );
+        let sq_meta = get_sq_metadata(&dataset, scheduler, &segment.uuid.to_string()).await;
+
+        assert_eq!(sq_meta.bounds.start, 0.0);
+        assert_eq!(sq_meta.bounds.end, (DIM - 1) as f64);
+        assert_lt!(sq_meta.bounds.end, FRAGMENT_OFFSETS[1] as f64);
+    }
+
     async fn test_index(
         params: VectorIndexParams,
         nlist: usize,

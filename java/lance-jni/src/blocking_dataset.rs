@@ -1863,6 +1863,20 @@ fn inner_get_config<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jboolean {
+    ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
+}
+
+fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    Ok(dataset_guard.inner.manifest().uses_stable_row_ids() as u8)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceFileFormatVersion<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -2414,12 +2428,32 @@ fn inner_list_branches<'local>(
         } else {
             JObject::null()
         };
+        let jbranch_identifier = env.new_object(
+            "java/util/ArrayList",
+            "(I)V",
+            &[JValue::Int(contents.identifier.version_mapping.len() as i32)],
+        )?;
+        for (version, uuid) in contents.identifier.version_mapping.iter() {
+            let juuid = env.new_string(uuid)?;
+            let jmapping = env.new_object(
+                "org/lance/Branch$BranchVersionMapping",
+                "(JLjava/lang/String;)V",
+                &[JValue::Long(*version as i64), JValue::Object(&juuid)],
+            )?;
+            env.call_method(
+                &jbranch_identifier,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&jmapping)],
+            )?;
+        }
         let jbranch = env.new_object(
             "org/lance/Branch",
-            "(Ljava/lang/String;Ljava/lang/String;JJI)V",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;JJI)V",
             &[
                 JValue::Object(&jname),
                 JValue::Object(&jparent),
+                JValue::Object(&jbranch_identifier),
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),

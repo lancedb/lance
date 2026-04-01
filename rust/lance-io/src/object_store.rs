@@ -32,6 +32,8 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
+#[cfg(target_os = "linux")]
+use crate::uring::{UringCurrentThreadReader, UringReader};
 mod list_retry;
 pub mod providers;
 pub mod storage_options;
@@ -597,6 +599,31 @@ impl ObjectStore {
                 )
                 .await
             }
+            #[cfg(target_os = "linux")]
+            "file+uring" => {
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| str_is_truthy(&v))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -633,6 +660,31 @@ impl ObjectStore {
                     Arc::new(self.io_tracker.clone()),
                 )
                 .await
+            }
+            #[cfg(target_os = "linux")]
+            "file+uring" => {
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| str_is_truthy(&v))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
             }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),

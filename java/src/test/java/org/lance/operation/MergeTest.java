@@ -246,7 +246,7 @@ public class MergeTest extends OperationTestBase {
                   datasetPath,
                   addressRoot,
                   new int[] {addressFieldId, cityFieldId, countryFieldId},
-                  new int[] {0, 1, 2});
+                  new int[] {-1, 0, 1});
 
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
           List<DataFile> dataFiles = fragmentMeta.getFiles();
