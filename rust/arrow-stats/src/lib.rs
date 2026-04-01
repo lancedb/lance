@@ -12,7 +12,7 @@
 //! use std::sync::Arc;
 //! use arrow_array::{ArrayRef, Int32Array};
 //! use arrow_schema::DataType;
-//! use arrow_stats::StatisticsAccumulator;
+//! use lance_arrow_stats::StatisticsAccumulator;
 //!
 //! let mut acc = StatisticsAccumulator::new(&DataType::Int32);
 //! let array: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
