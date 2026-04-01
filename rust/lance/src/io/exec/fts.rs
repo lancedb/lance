@@ -21,7 +21,10 @@ use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{Error, ROW_ID, Result, utils::tracing::StreamTracingExt};
+use lance_core::{
+    Error, ROW_ID, Result,
+    utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
+};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 use lance_table::format::IndexMetadata;
 
@@ -134,6 +137,57 @@ fn build_global_bm25_scorer(
         }
     }
     Ok(base_scorer)
+}
+
+async fn search_segments(
+    indices: &[Arc<InvertedIndex>],
+    tokens: Arc<Tokens>,
+    params: Arc<FtsSearchParams>,
+    operator: lance_index::scalar::inverted::query::Operator,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    base_scorer: Arc<MemBM25Scorer>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let limit = params.limit.unwrap_or(usize::MAX);
+    let mut candidates = std::collections::BinaryHeap::new();
+    let searches = stream::iter(indices.iter().cloned().map(|index| {
+        let tokens = tokens.clone();
+        let params = params.clone();
+        let pre_filter = pre_filter.clone();
+        let metrics = metrics.clone();
+        let base_scorer = base_scorer.clone();
+        async move {
+            index
+                .bm25_search(
+                    tokens,
+                    params,
+                    operator,
+                    pre_filter,
+                    metrics,
+                    Some(base_scorer.as_ref()),
+                )
+                .await
+        }
+    }))
+    .buffer_unordered(get_num_compute_intensive_cpus());
+    let mut searches = searches;
+
+    while let Some((doc_ids, scores)) = searches.try_next().await? {
+        for (row_id, score) in doc_ids.into_iter().zip(scores.into_iter()) {
+            if candidates.len() < limit {
+                candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
+            } else if candidates.peek().unwrap().0.score.0 < score {
+                candidates.pop();
+                candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
+            }
+        }
+    }
+
+    Ok(candidates
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse(doc)| (doc.row_id, doc.score.0))
+        .unzip())
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
@@ -391,33 +445,16 @@ impl ExecutionPlan for MatchQueryExec {
             pre_filter.wait_for_ready().await?;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
-            let limit = params.limit.unwrap_or(usize::MAX);
-            let mut candidates = std::collections::BinaryHeap::new();
-            for index in &indices {
-                let (doc_ids, scores) = index
-                    .bm25_search(
-                        tokens.clone(),
-                        params.clone(),
-                        query.operator,
-                        pre_filter.clone(),
-                        metrics.clone(),
-                        Some(&base_scorer),
-                    )
-                    .await?;
-                for (row_id, score) in doc_ids.into_iter().zip(scores.into_iter()) {
-                    if candidates.len() < limit {
-                        candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-                    } else if candidates.peek().unwrap().0.score.0 < score {
-                        candidates.pop();
-                        candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-                    }
-                }
-            }
-            let (doc_ids, mut scores): (Vec<u64>, Vec<f32>) = candidates
-                .into_sorted_vec()
-                .into_iter()
-                .map(|std::cmp::Reverse(doc)| (doc.row_id, doc.score.0))
-                .unzip();
+            let (doc_ids, mut scores) = search_segments(
+                &indices,
+                tokens,
+                params,
+                query.operator,
+                pre_filter,
+                metrics.clone(),
+                Arc::new(base_scorer),
+            )
+            .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
@@ -1032,33 +1069,16 @@ impl ExecutionPlan for PhraseQueryExec {
             pre_filter.wait_for_ready().await?;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
-            let limit = params.limit.unwrap_or(usize::MAX);
-            let mut candidates = std::collections::BinaryHeap::new();
-            for index in &indices {
-                let (doc_ids, scores) = index
-                    .bm25_search(
-                        tokens.clone(),
-                        params.clone(),
-                        lance_index::scalar::inverted::query::Operator::And,
-                        pre_filter.clone(),
-                        metrics.clone(),
-                        Some(&base_scorer),
-                    )
-                    .await?;
-                for (row_id, score) in doc_ids.into_iter().zip(scores.into_iter()) {
-                    if candidates.len() < limit {
-                        candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-                    } else if candidates.peek().unwrap().0.score.0 < score {
-                        candidates.pop();
-                        candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-                    }
-                }
-            }
-            let (doc_ids, scores): (Vec<u64>, Vec<f32>) = candidates
-                .into_sorted_vec()
-                .into_iter()
-                .map(|std::cmp::Reverse(doc)| (doc.row_id, doc.score.0))
-                .unzip();
+            let (doc_ids, scores) = search_segments(
+                &indices,
+                tokens,
+                params,
+                lance_index::scalar::inverted::query::Operator::And,
+                pre_filter,
+                metrics.clone(),
+                Arc::new(base_scorer),
+            )
+            .await?;
             metrics.baseline_metrics.record_output(doc_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),

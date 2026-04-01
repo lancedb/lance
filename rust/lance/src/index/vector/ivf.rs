@@ -14,7 +14,10 @@ use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
     index::{
-        INDEX_FILE_NAME, api::{IndexSegment, IndexSegmentPlan}, pb, prefilter::PreFilter,
+        INDEX_FILE_NAME,
+        api::{IndexSegment, IndexSegmentPlan},
+        pb,
+        prefilter::PreFilter,
         vector::ivf::io::write_pq_partitions,
     },
 };
@@ -99,7 +102,11 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use std::{any::Any, collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
