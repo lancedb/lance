@@ -466,6 +466,15 @@ impl InvertedIndex {
         MemBM25Scorer::new(scorer.total_tokens(), scorer.num_docs(), token_docs)
     }
 
+    pub fn bm25_stats_for_terms(&self, terms: &[String]) -> (u64, usize, Vec<usize>) {
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let token_docs = terms
+            .iter()
+            .map(|term| scorer.num_docs_containing_token(term))
+            .collect();
+        (scorer.total_tokens(), scorer.num_docs(), token_docs)
+    }
+
     /// Expand fuzzy query tokens against all partitions in this segment.
     pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut expanded_tokens = Vec::new();

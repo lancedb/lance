@@ -86,35 +86,37 @@ async fn open_fts_segments(
     .await
 }
 
-/// Expand fuzzy query tokens across all segments so the shared BM25 scorer sees every term
-/// that any segment-local search may score.
-fn scorer_tokens(
+/// Collect the unique terms needed to build a shared BM25 scorer.
+///
+/// The scorer only needs corpus-level document frequencies, so we keep a deduplicated
+/// term list here instead of constructing a full `Tokens` object with positions.
+fn scorer_terms(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
-) -> Result<Tokens> {
+) -> Result<Vec<String>> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+
     if !matches!(params.fuzziness, Some(n) if n != 0) {
-        return Ok(query_tokens.clone());
+        for token in query_tokens {
+            if seen.insert(token.to_string()) {
+                terms.push(token.to_string());
+            }
+        }
+        return Ok(terms);
     }
 
-    let mut tokens = Vec::new();
-    let mut positions = Vec::new();
-    let mut seen = HashSet::new();
     for index in indices {
         let expanded = index.expand_fuzzy_tokens(query_tokens, params)?;
         for idx in 0..expanded.len() {
             let token = expanded.get_token(idx);
             if seen.insert(token.to_string()) {
-                tokens.push(token.to_string());
-                positions.push(expanded.position(idx));
+                terms.push(token.to_string());
             }
         }
     }
-    Ok(Tokens::with_positions(
-        tokens,
-        positions,
-        query_tokens.token_type().clone(),
-    ))
+    Ok(terms)
 }
 
 /// Build a shared BM25 scorer for a set of committed FTS segments.
@@ -123,20 +125,30 @@ fn build_global_bm25_scorer(
     query_tokens: &Tokens,
     params: &FtsSearchParams,
 ) -> Result<MemBM25Scorer> {
-    let scorer_tokens = scorer_tokens(indices, query_tokens, params)?;
+    let terms = scorer_terms(indices, query_tokens, params)?;
     let first_index = indices.first().ok_or_else(|| {
         Error::invalid_input("FTS index requires at least one segment".to_string())
     })?;
-    let mut base_scorer = first_index.bm25_base_scorer(&scorer_tokens);
+    let (mut total_tokens, mut num_docs, first_token_docs) =
+        first_index.bm25_stats_for_terms(&terms);
+    let mut token_docs = HashMap::with_capacity(terms.len());
+    for (term, count) in terms.iter().cloned().zip(first_token_docs.into_iter()) {
+        token_docs.insert(term, count);
+    }
+
     for index in indices.iter().skip(1) {
-        let segment_scorer = index.bm25_base_scorer(&scorer_tokens);
-        base_scorer.total_tokens += segment_scorer.total_tokens;
-        base_scorer.num_docs += segment_scorer.num_docs;
-        for (token, count) in segment_scorer.token_docs {
-            *base_scorer.token_docs.entry(token).or_insert(0) += count;
+        let (segment_total_tokens, segment_num_docs, segment_token_docs) =
+            index.bm25_stats_for_terms(&terms);
+        total_tokens += segment_total_tokens;
+        num_docs += segment_num_docs;
+        for (term, count) in terms.iter().zip(segment_token_docs.into_iter()) {
+            *token_docs
+                .get_mut(term)
+                .expect("global scorer terms should already be initialized") += count;
         }
     }
-    Ok(base_scorer)
+
+    Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
 }
 
 async fn search_segments(
