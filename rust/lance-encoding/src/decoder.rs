@@ -1704,6 +1704,8 @@ pub struct StructuralBatchDecodeStream {
     // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
     //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
+    /// If set, target this many bytes per batch instead of `rows_per_batch` rows.
+    batch_size_bytes: Option<u64>,
 }
 
 impl StructuralBatchDecodeStream {
@@ -1722,6 +1724,7 @@ impl StructuralBatchDecodeStream {
         num_rows: u64,
         root_decoder: StructuralStructDecoder,
         spawn_batch_decode_tasks: bool,
+        batch_size_bytes: Option<u64>,
     ) -> Self {
         Self {
             context: DecoderContext::new(scheduled),
@@ -1733,6 +1736,7 @@ impl StructuralBatchDecodeStream {
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
             spawn_batch_decode_tasks,
+            batch_size_bytes,
         }
     }
 
@@ -1896,6 +1900,11 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
+    /// If set, target this many bytes per batch instead of using `batch_size` rows.
+    ///
+    /// Only supported for v2.1+ (structural) files. For v2.0 (legacy) files this
+    /// option is ignored and a warning is logged.
+    pub batch_size_bytes: Option<u64>,
 }
 
 fn check_scheduler_on_drop(
@@ -1939,6 +1948,7 @@ pub fn create_decode_stream(
     should_validate: bool,
     spawn_structural_batch_decode_tasks: bool,
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+    batch_size_bytes: Option<u64>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
@@ -1953,9 +1963,15 @@ pub fn create_decode_stream(
             num_rows,
             structural_decoder,
             spawn_structural_batch_decode_tasks,
+            batch_size_bytes,
         )
         .into_stream())
     } else {
+        if batch_size_bytes.is_some() {
+            warn!(
+                "batch_size_bytes is not supported for v2.0 (legacy) files and will be ignored"
+            );
+        }
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
 
@@ -2027,6 +2043,7 @@ fn create_scheduler_decoder(
         config.decoder_config.validate_on_decode,
         spawn_structural_batch_decode_tasks,
         rx,
+        config.batch_size_bytes,
     )?;
 
     let scheduler_handle = tokio::task::spawn(async move {
@@ -2729,6 +2746,7 @@ pub async fn decode_batch(
         should_validate,
         spawn_structural_batch_decode_tasks,
         rx,
+        None,
     )?;
     decode_stream.next().await.unwrap().task.await
 }
