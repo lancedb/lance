@@ -56,11 +56,13 @@ struct EmptyStructDecodeTask {
 }
 
 impl DecodeArrayTask for EmptyStructDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        Ok(Arc::new(StructArray::new_empty_fields(
-            self.num_rows as usize,
-            None,
-        )))
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((
+            Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
+            0,
+        ))
     }
 }
 
@@ -580,7 +582,7 @@ impl CompositeDecodeTask {
         let arrays = self
             .tasks
             .into_iter()
-            .map(|task| task.decode())
+            .map(|task| task.decode().map(|(arr, _)| arr))
             .collect::<Result<Vec<_>>>()?;
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
         // TODO: If this is a primitive column we should be able to avoid this
@@ -599,16 +601,17 @@ struct SimpleStructDecodeTask {
 }
 
 impl DecodeArrayTask for SimpleStructDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let child_arrays = self
             .children
             .into_iter()
             .map(|child| child.decode())
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(StructArray::try_new(
-            self.child_fields,
-            child_arrays,
-            None,
-        )?))
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((
+            Arc::new(StructArray::try_new(self.child_fields, child_arrays, None)?),
+            0,
+        ))
     }
 }
