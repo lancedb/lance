@@ -47,23 +47,34 @@ fn max_conn_reset_retries() -> u16 {
     })
 }
 
-fn initial_upload_size() -> usize {
-    static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
-    *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
-        std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .inspect(|size| {
-                if *size < INITIAL_UPLOAD_STEP {
-                    // Minimum part size in GCS and S3
-                    panic!("LANCE_INITIAL_UPLOAD_SIZE must be at least 5MB");
-                } else if *size > 1024 * 1024 * 1024 * 5 {
-                    // Maximum part size in GCS and S3
-                    panic!("LANCE_INITIAL_UPLOAD_SIZE must be at most 5GB");
-                }
-            })
-            .unwrap_or(INITIAL_UPLOAD_STEP)
-    })
+/// Maximum part size in GCS and S3: 5GB.
+const MAX_UPLOAD_PART_SIZE: usize = 1024 * 1024 * 1024 * 5;
+
+fn initial_upload_size() -> Result<usize> {
+    static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<std::result::Result<usize, String>> =
+        OnceLock::new();
+    LANCE_INITIAL_UPLOAD_SIZE
+        .get_or_init(|| {
+            let size = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(INITIAL_UPLOAD_STEP);
+            if size < INITIAL_UPLOAD_STEP {
+                Err(format!(
+                    "LANCE_INITIAL_UPLOAD_SIZE must be at least 5MB, got {} bytes",
+                    size
+                ))
+            } else if size > MAX_UPLOAD_PART_SIZE {
+                Err(format!(
+                    "LANCE_INITIAL_UPLOAD_SIZE must be at most 5GB, got {} bytes",
+                    size
+                ))
+            } else {
+                Ok(size)
+            }
+        })
+        .clone()
+        .map_err(Error::invalid_input)
 }
 
 /// Writer to an object in an object store.
@@ -79,6 +90,7 @@ pub struct ObjectWriter {
     cursor: usize,
     connection_resets: u16,
     buffer: Vec<u8>,
+    upload_size: usize,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
 }
@@ -157,25 +169,32 @@ impl UploadState {
 
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
+        let upload_size = initial_upload_size()?;
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
             path: Arc::new(path.clone()),
             connection_resets: 0,
-            buffer: Vec::with_capacity(initial_upload_size()),
+            buffer: Vec::with_capacity(upload_size),
+            upload_size,
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
     }
 
     /// Returns the contents of `buffer` as a `Bytes` object and resets `buffer`.
     /// The new capacity of `buffer` is determined by the current part index.
-    fn next_part_buffer(buffer: &mut Vec<u8>, part_idx: u16, constant_upload_size: bool) -> Bytes {
+    fn next_part_buffer(
+        buffer: &mut Vec<u8>,
+        part_idx: u16,
+        constant_upload_size: bool,
+        upload_size: usize,
+    ) -> Bytes {
         let new_capacity = if constant_upload_size {
             // The store does not support variable part sizes, so use the initial size.
-            initial_upload_size()
+            upload_size
         } else {
             // Increase the upload size every 100 parts. This gives maximum part size of 2.5TB.
-            initial_upload_size().max(((part_idx / 100) as usize + 1) * INITIAL_UPLOAD_STEP)
+            upload_size.max(((part_idx / 100) as usize + 1) * INITIAL_UPLOAD_STEP)
         };
         let new_buffer = Vec::with_capacity(new_capacity);
         let part = std::mem::replace(buffer, new_buffer);
@@ -222,6 +241,7 @@ impl ObjectWriter {
                             &mut mut_self.buffer,
                             0,
                             mut_self.use_constant_size_upload_parts,
+                            mut_self.upload_size,
                         );
                         futures.spawn(Self::put_part(upload.as_mut(), data, 0, None));
 
@@ -386,6 +406,7 @@ impl AsyncWrite for ObjectWriter {
                             &mut mut_self.buffer,
                             *part_idx,
                             mut_self.use_constant_size_upload_parts,
+                            mut_self.upload_size,
                         );
                         futures.spawn(
                             Self::put_part(upload.as_mut(), data, *part_idx, None)
