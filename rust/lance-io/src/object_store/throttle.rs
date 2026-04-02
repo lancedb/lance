@@ -1608,9 +1608,8 @@ mod tests {
         let fut_a = upload.put_part(PutPayload::from_static(b"AAAA"));
         let fut_b = upload.put_part(PutPayload::from_static(b"BBBB"));
 
-        // Await in REVERSE order. Because ThrottledMultipartUpload defers the
-        // inner put_part call to the future body, fut_b's data reaches the
-        // inner upload first and is assigned the lower index.
+        // Await in REVERSE order. Part ordering should be determined by
+        // creation order (put_part call order), not by await order.
         fut_b.await.unwrap();
         fut_a.await.unwrap();
 
@@ -1619,14 +1618,10 @@ mod tests {
         let result = store.get(&path).await.unwrap();
         let bytes = result.bytes().await.unwrap();
 
-        // Correct behaviour: the file should be "AAAABBBB" regardless of await
-        // order, because part A was created first.
         assert_eq!(
             bytes.as_ref(),
             b"AAAABBBB",
-            "Parts were reordered! Got {:?} instead of AAAABBBB. \
-                 The throttle wrapper defers inner put_part to the future body, \
-                 so await order determines part order instead of creation order.",
+            "Parts were reordered! Got {:?} instead of AAAABBBB.",
             std::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
         );
     }
