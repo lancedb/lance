@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    ops::{DerefMut, Range},
+    sync::Arc,
+};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -210,8 +215,8 @@ pub struct BlobPreprocessor {
 /// storage.
 struct ExternalBlobSource {
     reader: Box<dyn Reader>,
-    start: usize,
-    size: usize,
+    start: u64,
+    size: u64,
 }
 
 /// A blob payload source used by packed and dedicated writers.
@@ -225,22 +230,44 @@ enum BlobWriteSource<'a> {
 
 impl ExternalBlobSource {
     /// Return the logical payload size after applying any external slice.
-    fn size(&self) -> usize {
+    fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Convert the logical slice into the current reader API's usize-based range.
+    fn reader_range(&self) -> Result<Range<usize>> {
+        let start = usize::try_from(self.start).map_err(|_| {
+            Error::invalid_input(format!(
+                "External blob position {} does not fit into usize",
+                self.start
+            ))
+        })?;
+        let size = usize::try_from(self.size).map_err(|_| {
+            Error::invalid_input(format!(
+                "External blob size {} does not fit into usize",
+                self.size
+            ))
+        })?;
+        let end = start.checked_add(size).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "External blob range overflows usize: position={}, size={}",
+                self.start, self.size
+            ))
+        })?;
+        Ok(start..end)
     }
 
     /// Materialize the slice into memory for the inline blob path.
     async fn read_all(&self) -> Result<bytes::Bytes> {
-        self.reader
-            .get_range(self.start..self.start + self.size)
-            .await
-            .map_err(Into::into)
+        let range = self.reader_range()?;
+        self.reader.get_range(range).await.map_err(Into::into)
     }
 
     /// Stream the slice into a writer for packed or dedicated blob storage.
     async fn copy_to_writer(&self, writer: &mut dyn Writer) -> Result<()> {
+        let range = self.reader_range()?;
         writer
-            .copy_range_from_reader(self.reader.as_ref(), self.start..self.start + self.size)
+            .copy_range_from_reader(self.reader.as_ref(), range)
             .await?;
         Ok(())
     }
@@ -251,7 +278,8 @@ impl BlobWriteSource<'_> {
     fn size(&self) -> usize {
         match self {
             Self::Bytes(data) => data.len(),
-            Self::External(source) => source.size(),
+            Self::External(source) => usize::try_from(source.size())
+                .expect("packed and inline external blobs must fit into usize"),
         }
     }
 
@@ -378,32 +406,20 @@ impl BlobPreprocessor {
         let reader = object_store.open(&path).await?;
         match (position, size) {
             (Some(position), Some(size)) => {
-                let start = usize::try_from(position).map_err(|_| {
+                position.checked_add(size).ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "External blob position {} does not fit into usize",
-                        position
-                    ))
-                })?;
-                let size = usize::try_from(size).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "External blob size {} does not fit into usize",
-                        size
-                    ))
-                })?;
-                start.checked_add(size).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "External blob range overflows usize: position={}, size={}",
+                        "External blob range overflows u64: position={}, size={}",
                         position, size
                     ))
                 })?;
                 Ok(ExternalBlobSource {
                     reader,
-                    start,
+                    start: position,
                     size,
                 })
             }
             (None, None) => {
-                let size = reader.size().await?;
+                let size = reader.size().await? as u64;
                 Ok(ExternalBlobSource {
                     reader,
                     start: 0,
@@ -547,7 +563,7 @@ impl BlobPreprocessor {
                         let source = self.open_external_source(uri_val, position, size).await?;
                         let data_len = source.size();
 
-                        if data_len > dedicated_threshold {
+                        if data_len > dedicated_threshold as u64 {
                             let blob_id = self.next_blob_id();
                             self.write_dedicated(blob_id, BlobWriteSource::External(&source))
                                 .await?;
@@ -556,12 +572,12 @@ impl BlobPreprocessor {
                             data_builder.append_null();
                             uri_builder.append_null();
                             blob_id_builder.append_value(blob_id);
-                            blob_size_builder.append_value(data_len as u64);
+                            blob_size_builder.append_value(data_len);
                             position_builder.append_null();
                             continue;
                         }
 
-                        if data_len > INLINE_MAX {
+                        if data_len > INLINE_MAX as u64 {
                             let (pack_blob_id, position) = self
                                 .write_packed(BlobWriteSource::External(&source))
                                 .await?;
@@ -570,7 +586,7 @@ impl BlobPreprocessor {
                             data_builder.append_null();
                             uri_builder.append_null();
                             blob_id_builder.append_value(pack_blob_id);
-                            blob_size_builder.append_value(data_len as u64);
+                            blob_size_builder.append_value(data_len);
                             position_builder.append_value(position);
                             continue;
                         }

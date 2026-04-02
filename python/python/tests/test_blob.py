@@ -403,12 +403,13 @@ def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp
     blob_path = tmp_path / "external_blob.bin"
     blob_path.write_bytes(b"hello")
     uri = blob_path.as_uri()
+    message = (
+        'allow_external_blob_outside_bases only applies when '
+        'external_blob_mode="reference"'
+    )
 
     table = pa.table({"blob": lance.blob_array([uri])})
-    with pytest.raises(
-        OSError,
-        match='allow_external_blob_outside_bases only applies when external_blob_mode="reference"',
-    ):
+    with pytest.raises(OSError, match=message):
         lance.write_dataset(
             table,
             tmp_path / "test_ds_v2_external_ingest_invalid",
