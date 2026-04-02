@@ -346,9 +346,12 @@ pub fn apply_row_id_and_deletes(
 
         if config.with_row_last_updated_at_version {
             let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
-                Arc::new(UInt64Array::from(
-                    version_values_for_selection(sequence, &config.params, batch_offset, num_rows)?,
-                ))
+                Arc::new(UInt64Array::from(version_values_for_selection(
+                    sequence,
+                    &config.params,
+                    batch_offset,
+                    num_rows,
+                )?))
             } else {
                 // Default to version 1 if sequence not provided
                 Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
@@ -359,9 +362,12 @@ pub fn apply_row_id_and_deletes(
 
         if config.with_row_created_at_version {
             let version_arr = if let Some(sequence) = &config.created_at_sequence {
-                Arc::new(UInt64Array::from(
-                    version_values_for_selection(sequence, &config.params, batch_offset, num_rows)?,
-                ))
+                Arc::new(UInt64Array::from(version_values_for_selection(
+                    sequence,
+                    &config.params,
+                    batch_offset,
+                    num_rows,
+                )?))
             } else {
                 // Default to version 1 if sequence not provided
                 Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
@@ -693,9 +699,9 @@ mod tests {
             with_row_addr: false,
             with_row_last_updated_at_version: false,
             with_row_created_at_version: true,
-            deletion_vector: Some(Arc::new(DeletionVector::Bitmap(
-                RoaringBitmap::from_iter(0..35),
-            ))),
+            deletion_vector: Some(Arc::new(DeletionVector::Bitmap(RoaringBitmap::from_iter(
+                0..35,
+            )))),
             row_id_sequence: None,
             last_updated_at_sequence: None,
             created_at_sequence: Some(seq),
