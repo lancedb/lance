@@ -67,7 +67,6 @@ mod vector_trainer;
 pub use error::Error;
 pub use error::Result;
 pub use ffi::JNIEnvExt;
-pub use storage_options::JavaStorageOptionsProvider;
 
 use env_logger::{Builder, Env};
 use std::env;

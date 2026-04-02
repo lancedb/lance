@@ -15,15 +15,12 @@ package org.lance;
 
 import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
-import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.errors.LanceNamespaceException;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateTableRequest;
 import org.lance.namespace.model.CreateTableResponse;
 import org.lance.namespace.model.DeclareTableRequest;
 import org.lance.namespace.model.DeclareTableResponse;
-import org.lance.namespace.model.DescribeTableRequest;
-import org.lance.namespace.model.DescribeTableResponse;
 import org.lance.namespace.model.DropTableRequest;
 import org.lance.namespace.model.DropTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
@@ -79,15 +76,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Integration tests for Lance with S3 and credential refresh using StorageOptionsProvider.
  *
- * <p>This test simulates a tracking credential provider that returns incrementing credentials and
- * verifies that the credential refresh mechanism works correctly.
+ * <p>This test uses DirectoryNamespace with native ops_metrics and vend_input_storage_options
+ * features to track API calls and test credential refresh mechanisms.
  *
  * <p>These tests require LocalStack to be running. Run with: docker compose up -d
  *
  * <p>Set LANCE_INTEGRATION_TEST=1 environment variable to enable these tests.
  */
 @EnabledIfEnvironmentVariable(named = "LANCE_INTEGRATION_TEST", matches = "1")
-public class NamespaceIntegrationTest {
+public class DirectoryNamespaceIntegrationTest {
 
   private static final String ENDPOINT_URL = "http://localhost:4566";
   private static final String REGION = "us-east-1";
@@ -161,105 +158,108 @@ public class NamespaceIntegrationTest {
   }
 
   /**
-   * Tracking LanceNamespace implementation for testing.
-   *
-   * <p>This implementation wraps DirectoryNamespace and tracks API calls. It returns incrementing
-   * credentials with expiration timestamps to test the credential refresh mechanism.
+   * Result holder for namespace creation that includes both the namespace to use for operations and
+   * the inner DirectoryNamespace for metrics retrieval.
    */
-  static class TrackingNamespace implements LanceNamespace {
-    private final String bucketName;
-    private final Map<String, String> baseStorageOptions;
-    private final int credentialExpiresInSeconds;
-    private final AtomicInteger describeCallCount = new AtomicInteger(0);
-    private final AtomicInteger createCallCount = new AtomicInteger(0);
-    private final DirectoryNamespace inner;
+  protected static class TrackingNamespaceResult {
+    /** The namespace client to use for operations. May be wrapped. */
+    public final LanceNamespace namespaceClient;
 
-    public TrackingNamespace(
-        String bucketName, Map<String, String> storageOptions, int credentialExpiresInSeconds) {
-      this.bucketName = bucketName;
-      this.baseStorageOptions = new HashMap<>(storageOptions);
-      this.credentialExpiresInSeconds = credentialExpiresInSeconds;
+    /** The inner DirectoryNamespace for metrics retrieval. */
+    public final DirectoryNamespace innerNamespaceClient;
 
-      // Create underlying DirectoryNamespace with storage options
-      Map<String, String> dirProps = new HashMap<>();
-      for (Map.Entry<String, String> entry : storageOptions.entrySet()) {
-        dirProps.put("storage." + entry.getKey(), entry.getValue());
-      }
+    public TrackingNamespaceResult(
+        LanceNamespace namespaceClient, DirectoryNamespace innerNamespaceClient) {
+      this.namespaceClient = namespaceClient;
+      this.innerNamespaceClient = innerNamespaceClient;
+    }
+  }
 
-      // Set root based on bucket type
-      if (bucketName.startsWith("/") || bucketName.startsWith("file://")) {
-        dirProps.put("root", bucketName + "/namespace_root");
-      } else {
-        dirProps.put("root", "s3://" + bucketName + "/namespace_root");
-      }
+  /**
+   * Creates a DirectoryNamespace configured for testing with ops metrics and credential vending.
+   *
+   * <p>Uses native DirectoryNamespace features:
+   *
+   * <ul>
+   *   <li>ops_metrics_enabled=true: Tracks API call counts via retrieveOpsMetrics()
+   *   <li>vend_input_storage_options=true: Returns input storage options in responses
+   *   <li>vend_input_storage_options_refresh_interval_millis: Adds expires_at_millis
+   * </ul>
+   *
+   * @param bucketName S3 bucket name or local path
+   * @param storageOptions Storage options to pass through (credentials, endpoint, etc.)
+   * @param credentialExpiresInSeconds Interval in seconds for credential expiration
+   * @return TrackingNamespaceResult containing the namespace and inner DirectoryNamespace
+   */
+  protected TrackingNamespaceResult createTrackingNamespace(
+      String bucketName, Map<String, String> storageOptions, int credentialExpiresInSeconds) {
+    Map<String, String> dirProps = new HashMap<>();
 
-      this.inner = new DirectoryNamespace();
-      try (BufferAllocator allocator = new RootAllocator()) {
-        this.inner.initialize(dirProps, allocator);
-      }
+    // Add refresh_offset_millis to storage options so that credentials are not
+    // considered expired immediately. Set to 1 second (1000ms) so that refresh
+    // checks work correctly with short-lived credentials in tests.
+    Map<String, String> storageOptionsWithRefresh = new HashMap<>(storageOptions);
+    storageOptionsWithRefresh.put("refresh_offset_millis", "1000");
+
+    for (Map.Entry<String, String> entry : storageOptionsWithRefresh.entrySet()) {
+      dirProps.put("storage." + entry.getKey(), entry.getValue());
     }
 
-    public int getDescribeCallCount() {
-      return describeCallCount.get();
+    // Set root based on bucket type
+    if (bucketName.startsWith("/") || bucketName.startsWith("file://")) {
+      dirProps.put("root", bucketName + "/namespace_root");
+    } else {
+      dirProps.put("root", "s3://" + bucketName + "/namespace_root");
     }
 
-    public int getCreateCallCount() {
-      return createCallCount.get();
+    // Enable ops metrics tracking
+    dirProps.put("ops_metrics_enabled", "true");
+    // Enable storage options vending
+    dirProps.put("vend_input_storage_options", "true");
+    // Set refresh interval in milliseconds
+    dirProps.put(
+        "vend_input_storage_options_refresh_interval_millis",
+        String.valueOf(credentialExpiresInSeconds * 1000L));
+
+    DirectoryNamespace innerNamespaceClient = new DirectoryNamespace();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      innerNamespaceClient.initialize(dirProps, allocator);
     }
+    LanceNamespace namespaceClient = wrapNamespace(innerNamespaceClient);
+    return new TrackingNamespaceResult(namespaceClient, innerNamespaceClient);
+  }
 
-    @Override
-    public void initialize(Map<String, String> configProperties, BufferAllocator allocator) {
-      // Already initialized in constructor
-    }
+  /**
+   * Factory method to wrap the DirectoryNamespace. Subclasses can override this to provide a custom
+   * namespace implementation.
+   *
+   * @param inner The DirectoryNamespace to wrap
+   * @return The namespace to use in tests (may be the same as inner or a wrapper)
+   */
+  protected LanceNamespace wrapNamespace(DirectoryNamespace inner) {
+    return inner;
+  }
 
-    @Override
-    public String namespaceId() {
-      return "TrackingNamespace { inner: " + inner.namespaceId() + " }";
-    }
+  /**
+   * Gets the number of describe_table calls made to the namespace.
+   *
+   * @param namespaceClient The DirectoryNamespace to check
+   * @return Number of describe_table calls
+   */
+  protected static int getDescribeCallCount(DirectoryNamespace namespaceClient) {
+    Map<String, Long> metrics = namespaceClient.retrieveOpsMetrics();
+    return metrics.getOrDefault("describe_table", 0L).intValue();
+  }
 
-    /**
-     * Simulates a credential vendor returning only vended credentials.
-     *
-     * <p>Returns only credential keys with expiration metadata. Clients are expected to provide
-     * their own connection config (endpoint, region, allow_http) via storageOptions.
-     *
-     * @param count Call count to use for credential generation
-     * @return Storage options with vended credentials
-     */
-    private Map<String, String> vendStorageOptions(int count) {
-      Map<String, String> options = new HashMap<>();
-
-      options.put("aws_access_key_id", "AKID_" + count);
-      options.put("aws_secret_access_key", "SECRET_" + count);
-      options.put("aws_session_token", "TOKEN_" + count);
-
-      long expiresAtMillis = System.currentTimeMillis() + (credentialExpiresInSeconds * 1000L);
-      options.put("expires_at_millis", String.valueOf(expiresAtMillis));
-      // Set refresh offset to 1 second (1000ms) for short-lived credential tests
-      options.put("refresh_offset_millis", "1000");
-
-      return options;
-    }
-
-    @Override
-    public DeclareTableResponse declareTable(DeclareTableRequest request) {
-      int count = createCallCount.incrementAndGet();
-
-      DeclareTableResponse response = inner.declareTable(request);
-      response.setStorageOptions(vendStorageOptions(count));
-
-      return response;
-    }
-
-    @Override
-    public DescribeTableResponse describeTable(DescribeTableRequest request) {
-      int count = describeCallCount.incrementAndGet();
-
-      DescribeTableResponse response = inner.describeTable(request);
-      response.setStorageOptions(vendStorageOptions(count));
-
-      return response;
-    }
+  /**
+   * Gets the number of declare_table calls made to the namespace.
+   *
+   * @param namespaceClient The DirectoryNamespace to check
+   * @return Number of declare_table calls
+   */
+  protected static int getDeclareCallCount(DirectoryNamespace namespaceClient) {
+    Map<String, Long> metrics = namespaceClient.retrieveOpsMetrics();
+    return metrics.getOrDefault("declare_table", 0L).intValue();
   }
 
   @Test
@@ -274,7 +274,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace with 60-second expiration (long enough to not expire during test)
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       // Create schema and data
@@ -333,12 +335,12 @@ public class NamespaceIntegrationTest {
               }
             };
 
-        // Create dataset through namespace
+        // Create dataset through namespace client
         try (Dataset dataset =
             Dataset.write()
                 .allocator(allocator)
                 .reader(testReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
                 .storageOptions(storageOptions)
@@ -348,22 +350,23 @@ public class NamespaceIntegrationTest {
       }
 
       // Verify declareTable was called
-      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
+      assertEquals(
+          1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
 
-      // Open dataset through namespace WITH refresh enabled
+      // Open dataset through namespace client WITH refresh enabled
       ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
-      int callCountBeforeOpen = namespace.getDescribeCallCount();
+      int callCountBeforeOpen = getDescribeCallCount(innerNamespaceClient);
       try (Dataset dsFromNamespace =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(Arrays.asList(tableName))
               .readOptions(readOptions)
               .build()) {
         // With the fix, describeTable should only be called once during open
         // to get the table location and initial storage options
-        int callCountAfterOpen = namespace.getDescribeCallCount();
+        int callCountAfterOpen = getDescribeCallCount(innerNamespaceClient);
         assertEquals(
             1,
             callCountAfterOpen - callCountBeforeOpen,
@@ -382,7 +385,7 @@ public class NamespaceIntegrationTest {
         assertEquals(1, versions.size());
 
         // With the fix, credentials are cached so no additional calls are made
-        int finalCallCount = namespace.getDescribeCallCount();
+        int finalCallCount = getDescribeCallCount(innerNamespaceClient);
         int totalCalls = finalCallCount - callCountBeforeOpen;
         assertEquals(
             1,
@@ -405,7 +408,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace with 5-second expiration for faster testing
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 5);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 5);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       // Create schema and data
@@ -464,12 +469,12 @@ public class NamespaceIntegrationTest {
               }
             };
 
-        // Create dataset through namespace with refresh enabled
+        // Create dataset through namespace client with refresh enabled
         try (Dataset dataset =
             Dataset.write()
                 .allocator(allocator)
                 .reader(testReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
                 .storageOptions(storageOptions)
@@ -479,21 +484,22 @@ public class NamespaceIntegrationTest {
       }
 
       // Verify declareTable was called
-      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
+      assertEquals(
+          1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
 
-      // Open dataset through namespace with refresh enabled
+      // Open dataset through namespace client with refresh enabled
       ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
-      int callCountBeforeOpen = namespace.getDescribeCallCount();
+      int callCountBeforeOpen = getDescribeCallCount(innerNamespaceClient);
       try (Dataset dsFromNamespace =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(Arrays.asList(tableName))
               .readOptions(readOptions)
               .build()) {
         // With the fix, describeTable should only be called once during open
-        int callCountAfterOpen = namespace.getDescribeCallCount();
+        int callCountAfterOpen = getDescribeCallCount(innerNamespaceClient);
         assertEquals(
             1,
             callCountAfterOpen - callCountBeforeOpen,
@@ -504,7 +510,7 @@ public class NamespaceIntegrationTest {
         assertEquals(2, dsFromNamespace.countRows());
 
         // Record call count after initial reads
-        int callCountAfterInitialReads = namespace.getDescribeCallCount();
+        int callCountAfterInitialReads = getDescribeCallCount(innerNamespaceClient);
         int callsAfterFirstRead = callCountAfterInitialReads - callCountBeforeOpen;
         assertEquals(
             1,
@@ -523,7 +529,7 @@ public class NamespaceIntegrationTest {
         List<Version> versions = dsFromNamespace.listVersions();
         assertEquals(1, versions.size());
 
-        int finalCallCount = namespace.getDescribeCallCount();
+        int finalCallCount = getDescribeCallCount(innerNamespaceClient);
         int totalCallsAfterExpiration = finalCallCount - callCountBeforeOpen;
         assertEquals(
             2,
@@ -547,7 +553,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       // Create schema and data
@@ -606,21 +614,21 @@ public class NamespaceIntegrationTest {
               }
             };
 
-        int callCountBefore = namespace.getCreateCallCount();
+        int callCountBefore = getDeclareCallCount(innerNamespaceClient);
 
-        // Use the write builder to create a dataset through namespace
+        // Use the write builder to create a dataset through namespace client
         try (Dataset dataset =
             Dataset.write()
                 .allocator(allocator)
                 .reader(testReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
                 .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify declareTable was called
-          int callCountAfter = namespace.getCreateCallCount();
+          int callCountAfter = getDeclareCallCount(innerNamespaceClient);
           assertEquals(1, callCountAfter - callCountBefore, "declareTable should be called once");
 
           // Verify dataset was created successfully
@@ -645,12 +653,16 @@ public class NamespaceIntegrationTest {
       // Create tracking namespace with 60-second expiration (long enough that no refresh happens)
       // Credentials expire at T+60s. With a 1s refresh offset, refresh would happen at T+59s.
       // Since writes complete well under 59 seconds, NO credential refresh should occur.
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       // Verify initial call counts
-      assertEquals(0, namespace.getCreateCallCount(), "declareTable should not be called yet");
-      assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
+      assertEquals(
+          0, getDeclareCallCount(innerNamespaceClient), "declareTable should not be called yet");
+      assertEquals(
+          0, getDescribeCallCount(innerNamespaceClient), "describeTable should not be called yet");
 
       // Create schema and data
       Schema schema =
@@ -708,13 +720,13 @@ public class NamespaceIntegrationTest {
               }
             };
 
-        // Use the write builder to create a dataset through namespace
+        // Use the write builder to create a dataset through namespace client
         // Write completes instantly, so NO describeTable call should happen for refresh.
         try (Dataset dataset =
             Dataset.write()
                 .allocator(allocator)
                 .reader(testReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
                 .storageOptions(storageOptions)
@@ -722,14 +734,16 @@ public class NamespaceIntegrationTest {
 
           // Verify declareTable was called exactly ONCE
           assertEquals(
-              1, namespace.getCreateCallCount(), "declareTable should be called exactly once");
+              1,
+              getDeclareCallCount(innerNamespaceClient),
+              "declareTable should be called exactly once");
 
           // Verify describeTable was NOT called during CREATE
           // Initial credentials come from declareTable response, and since credentials
           // don't expire during the fast write, NO refresh (describeTable) is needed
           assertEquals(
               0,
-              namespace.getDescribeCallCount(),
+              getDescribeCallCount(innerNamespaceClient),
               "describeTable should NOT be called during CREATE - "
                   + "initial credentials come from declareTable response and don't expire");
 
@@ -740,19 +754,22 @@ public class NamespaceIntegrationTest {
       }
 
       // Verify counts after dataset is closed
-      assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1 after close");
+      assertEquals(
+          1,
+          getDeclareCallCount(innerNamespaceClient),
+          "declareTable should still be 1 after close");
       assertEquals(
           0,
-          namespace.getDescribeCallCount(),
+          getDescribeCallCount(innerNamespaceClient),
           "describeTable should still be 0 after close (no refresh needed)");
 
-      // Now open the dataset through namespace with long-lived credentials (60s expiration)
+      // Now open the dataset through namespace client with long-lived credentials (60s expiration)
       ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       try (Dataset dsFromNamespace =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(Arrays.asList(tableName))
               .readOptions(readOptions)
               .build()) {
@@ -760,13 +777,13 @@ public class NamespaceIntegrationTest {
         // declareTable should NOT be called during open (only during CREATE)
         assertEquals(
             1,
-            namespace.getCreateCallCount(),
+            getDeclareCallCount(innerNamespaceClient),
             "declareTable should still be 1 (not called during open)");
 
         // describeTable is called exactly ONCE during open to get table location
         assertEquals(
             1,
-            namespace.getDescribeCallCount(),
+            getDescribeCallCount(innerNamespaceClient),
             "describeTable should be called exactly once during open");
 
         // Verify we can read the data multiple times
@@ -778,13 +795,13 @@ public class NamespaceIntegrationTest {
         // (credentials are cached and don't expire during this fast test)
         assertEquals(
             1,
-            namespace.getDescribeCallCount(),
+            getDescribeCallCount(innerNamespaceClient),
             "describeTable should still be 1 after reads (credentials cached, no refresh needed)");
       }
 
       // Final verification
-      assertEquals(1, namespace.getCreateCallCount(), "Final: declareTable = 1");
-      assertEquals(1, namespace.getDescribeCallCount(), "Final: describeTable = 1");
+      assertEquals(1, getDeclareCallCount(innerNamespaceClient), "Final: declareTable = 1");
+      assertEquals(1, getDescribeCallCount(innerNamespaceClient), "Final: describeTable = 1");
     }
   }
 
@@ -800,7 +817,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       Schema schema =
@@ -858,12 +877,12 @@ public class NamespaceIntegrationTest {
               }
             };
 
-        // Create initial dataset through namespace
+        // Create initial dataset through namespace client
         try (Dataset dataset =
             Dataset.write()
                 .allocator(allocator)
                 .reader(testReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
                 .storageOptions(storageOptions)
@@ -871,10 +890,11 @@ public class NamespaceIntegrationTest {
           assertEquals(2, dataset.countRows());
         }
 
-        assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
-        int initialDescribeCount = namespace.getDescribeCallCount();
+        assertEquals(
+            1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
+        int initialDescribeCount = getDescribeCallCount(innerNamespaceClient);
 
-        // Now append data using the write builder with namespace
+        // Now append data using the write builder with namespace client
         ArrowReader appendReader =
             new ArrowReader(allocator) {
               boolean firstRead = true;
@@ -907,19 +927,19 @@ public class NamespaceIntegrationTest {
               }
             };
 
-        // Use the write builder to append to dataset through namespace
+        // Use the write builder to append to dataset through namespace client
         try (Dataset dataset =
             Dataset.write()
                 .allocator(allocator)
                 .reader(appendReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.APPEND)
                 .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify describeTable was called
-          int callCountAfter = namespace.getDescribeCallCount();
+          int callCountAfter = getDescribeCallCount(innerNamespaceClient);
           assertEquals(
               1,
               callCountAfter - initialDescribeCount,
@@ -944,7 +964,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       Schema schema =
@@ -1004,7 +1026,7 @@ public class NamespaceIntegrationTest {
             Dataset.write()
                 .allocator(allocator)
                 .reader(createReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.CREATE)
                 .storageOptions(storageOptions)
@@ -1012,8 +1034,12 @@ public class NamespaceIntegrationTest {
           assertEquals(1, dataset.countRows());
         }
 
-        assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
-        assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
+        assertEquals(
+            1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
+        assertEquals(
+            0,
+            getDescribeCallCount(innerNamespaceClient),
+            "describeTable should not be called yet");
 
         // Now overwrite with 2 rows
         aVector.allocateNew(2);
@@ -1064,15 +1090,16 @@ public class NamespaceIntegrationTest {
             Dataset.write()
                 .allocator(allocator)
                 .reader(overwriteReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .mode(WriteParams.WriteMode.OVERWRITE)
                 .storageOptions(storageOptions)
                 .execute()) {
 
           // Verify describeTable was called for overwrite
-          assertEquals(1, namespace.getCreateCallCount(), "declareTable should still be 1");
-          int describeCountAfterOverwrite = namespace.getDescribeCallCount();
+          assertEquals(
+              1, getDeclareCallCount(innerNamespaceClient), "declareTable should still be 1");
+          int describeCountAfterOverwrite = getDescribeCallCount(innerNamespaceClient);
           assertEquals(
               1, describeCountAfterOverwrite, "describeTable should be called once for overwrite");
 
@@ -1082,11 +1109,11 @@ public class NamespaceIntegrationTest {
               2, dataset.listVersions().size()); // Version 1 (create) + Version 2 (overwrite)
         }
 
-        // Verify we can open and read the dataset through namespace
+        // Verify we can open and read the dataset through namespace client
         try (Dataset ds =
             Dataset.open()
                 .allocator(allocator)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(Arrays.asList(tableName))
                 .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
                 .build()) {
@@ -1109,7 +1136,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       Schema schema =
@@ -1121,10 +1150,12 @@ public class NamespaceIntegrationTest {
       // Step 1: Declare table via namespace
       DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      DeclareTableResponse response = namespace.declareTable(request);
+      DeclareTableResponse response = namespaceClient.declareTable(request);
 
-      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
-      assertEquals(0, namespace.getDescribeCallCount(), "describeTable should not be called yet");
+      assertEquals(
+          1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
+      assertEquals(
+          0, getDescribeCallCount(innerNamespaceClient), "describeTable should not be called yet");
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1135,11 +1166,8 @@ public class NamespaceIntegrationTest {
         mergedOptions.putAll(namespaceStorageOptions);
       }
 
-      // Create storage options provider
-      LanceNamespaceStorageOptionsProvider storageOptionsProvider =
-          new LanceNamespaceStorageOptionsProvider(namespace, Arrays.asList(tableName));
-
       WriteParams writeParams = new WriteParams.Builder().withStorageOptions(mergedOptions).build();
+      List<String> tableId = Arrays.asList(tableName);
 
       // Step 2: Write multiple fragments in parallel (simulated)
       List<FragmentMetadata> allFragments = new ArrayList<>();
@@ -1160,7 +1188,7 @@ public class NamespaceIntegrationTest {
         root.setRowCount(2);
 
         List<FragmentMetadata> fragment1 =
-            Fragment.create(tableUri, allocator, root, writeParams, storageOptionsProvider);
+            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
         allFragments.addAll(fragment1);
       }
 
@@ -1180,7 +1208,7 @@ public class NamespaceIntegrationTest {
         root.setRowCount(2);
 
         List<FragmentMetadata> fragment2 =
-            Fragment.create(tableUri, allocator, root, writeParams, storageOptionsProvider);
+            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
         allFragments.addAll(fragment2);
       }
 
@@ -1198,7 +1226,7 @@ public class NamespaceIntegrationTest {
         root.setRowCount(1);
 
         List<FragmentMetadata> fragment3 =
-            Fragment.create(tableUri, allocator, root, writeParams, storageOptionsProvider);
+            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
         allFragments.addAll(fragment3);
       }
 
@@ -1212,15 +1240,15 @@ public class NamespaceIntegrationTest {
         assertEquals(1, dataset.listVersions().size(), "Should have 1 version after commit");
       }
 
-      // Step 4: Open dataset through namespace and verify
+      // Step 4: Open dataset through namespace client and verify
       try (Dataset dsFromNamespace =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(Arrays.asList(tableName))
               .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
-        assertEquals(5, dsFromNamespace.countRows(), "Should read 5 rows through namespace");
+        assertEquals(5, dsFromNamespace.countRows(), "Should read 5 rows through namespace client");
       }
     }
   }
@@ -1237,7 +1265,9 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace with 60-second expiration
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
+      DirectoryNamespace innerNamespaceClient = nsResult.innerNamespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       Schema schema =
@@ -1249,9 +1279,10 @@ public class NamespaceIntegrationTest {
       // Declare table via namespace
       DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      DeclareTableResponse response = namespace.declareTable(request);
+      DeclareTableResponse response = namespaceClient.declareTable(request);
 
-      assertEquals(1, namespace.getCreateCallCount(), "declareTable should be called once");
+      assertEquals(
+          1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1262,11 +1293,8 @@ public class NamespaceIntegrationTest {
         mergedOptions.putAll(namespaceStorageOptions);
       }
 
-      // Create storage options provider
-      LanceNamespaceStorageOptionsProvider provider =
-          new LanceNamespaceStorageOptionsProvider(namespace, Arrays.asList(tableName));
-
       WriteParams writeParams = new WriteParams.Builder().withStorageOptions(mergedOptions).build();
+      List<String> tableId = Arrays.asList(tableName);
 
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         IntVector idVector = (IntVector) root.getVector("id");
@@ -1287,9 +1315,9 @@ public class NamespaceIntegrationTest {
         valueVector.setValueCount(3);
         root.setRowCount(3);
 
-        // Create fragment with StorageOptionsProvider
+        // Create fragment with namespace client
         List<FragmentMetadata> fragments1 =
-            Fragment.create(tableUri, allocator, root, writeParams, provider);
+            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
 
         assertEquals(1, fragments1.size());
 
@@ -1302,9 +1330,9 @@ public class NamespaceIntegrationTest {
         valueVector.set(2, 600);
         root.setRowCount(3);
 
-        // Create another fragment with the same provider
+        // Create another fragment with the same namespace client
         List<FragmentMetadata> fragments2 =
-            Fragment.create(tableUri, allocator, root, writeParams, provider);
+            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
 
         assertEquals(1, fragments2.size());
 
@@ -1326,11 +1354,11 @@ public class NamespaceIntegrationTest {
         }
       }
 
-      // Verify we can open and read the dataset through namespace
+      // Verify we can open and read the dataset through namespace client
       try (Dataset ds =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(Arrays.asList(tableName))
               .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
@@ -1352,7 +1380,8 @@ public class NamespaceIntegrationTest {
       storageOptions.put("aws_region", REGION);
 
       // Create tracking namespace
-      TrackingNamespace namespace = new TrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      TrackingNamespaceResult nsResult = createTrackingNamespace(BUCKET_NAME, storageOptions, 60);
+      LanceNamespace namespaceClient = nsResult.namespaceClient;
       String tableName = UUID.randomUUID().toString();
 
       Schema schema =
@@ -1364,7 +1393,7 @@ public class NamespaceIntegrationTest {
       // Declare table via namespace
       DeclareTableRequest request = new DeclareTableRequest();
       request.setId(Arrays.asList(tableName));
-      DeclareTableResponse response = namespace.declareTable(request);
+      DeclareTableResponse response = namespaceClient.declareTable(request);
 
       String tableUri = response.getLocation();
       Map<String, String> namespaceStorageOptions = response.getStorageOptions();
@@ -1375,12 +1404,9 @@ public class NamespaceIntegrationTest {
         mergedOptions.putAll(namespaceStorageOptions);
       }
 
-      // Create storage options provider
-      LanceNamespaceStorageOptionsProvider provider =
-          new LanceNamespaceStorageOptionsProvider(namespace, Arrays.asList(tableName));
-
       // First, write some initial data using Fragment.create and commit
       WriteParams writeParams = new WriteParams.Builder().withStorageOptions(mergedOptions).build();
+      List<String> tableId = Arrays.asList(tableName);
 
       List<FragmentMetadata> initialFragments;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
@@ -1400,7 +1426,8 @@ public class NamespaceIntegrationTest {
         nameVector.setValueCount(2);
         root.setRowCount(2);
 
-        initialFragments = Fragment.create(tableUri, allocator, root, writeParams, provider);
+        initialFragments =
+            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
       }
 
       // Commit initial fragments
@@ -1412,15 +1439,17 @@ public class NamespaceIntegrationTest {
         assertEquals(2, dataset.countRows());
       }
 
-      // Now test Transaction.commit with provider
-      // Open dataset with provider using mergedOptions (which has expires_at_millis)
-      ReadOptions readOptions =
-          new ReadOptions.Builder()
-              .setStorageOptions(mergedOptions)
-              .setStorageOptionsProvider(provider)
-              .build();
+      // Now test Transaction.commit with namespace client
+      // Open dataset with namespace client using mergedOptions (which has expires_at_millis)
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(mergedOptions).build();
 
-      try (Dataset datasetWithProvider = Dataset.open(allocator, tableUri, readOptions)) {
+      try (Dataset datasetWithNamespaceClient =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .readOptions(readOptions)
+              .build()) {
         // Create more fragments to append
         List<FragmentMetadata> newFragments;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
@@ -1440,29 +1469,30 @@ public class NamespaceIntegrationTest {
           nameVector.setValueCount(2);
           root.setRowCount(2);
 
-          newFragments = Fragment.create(tableUri, allocator, root, writeParams, provider);
+          newFragments =
+              Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
         }
 
         // Create and commit transaction
         Append appendOp = Append.builder().fragments(newFragments).build();
         try (Transaction transaction =
             new Transaction.Builder()
-                .readVersion(datasetWithProvider.version())
+                .readVersion(datasetWithNamespaceClient.version())
                 .operation(appendOp)
                 .build()) {
           try (Dataset committedDataset =
-              new CommitBuilder(datasetWithProvider).execute(transaction)) {
+              new CommitBuilder(datasetWithNamespaceClient).execute(transaction)) {
             assertEquals(2, committedDataset.version());
             assertEquals(4, committedDataset.countRows());
           }
         }
       }
 
-      // Verify we can open and read the dataset through namespace
+      // Verify we can open and read the dataset through namespace client
       try (Dataset ds =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(Arrays.asList(tableName))
               .readOptions(new ReadOptions.Builder().setStorageOptions(storageOptions).build())
               .build()) {
@@ -1531,8 +1561,8 @@ public class NamespaceIntegrationTest {
 
   @Test
   void testBasicCreateAndDropOnS3() throws Exception {
-    DirectoryNamespace namespace = new DirectoryNamespace();
-    namespace.initialize(createDirectoryNamespaceS3Config(), testAllocator);
+    DirectoryNamespace namespaceClient = new DirectoryNamespace();
+    namespaceClient.initialize(createDirectoryNamespaceS3Config(), testAllocator);
 
     try {
       String tableName = "basic_test_table";
@@ -1540,32 +1570,32 @@ public class NamespaceIntegrationTest {
       byte[] tableData = createTestTableData();
 
       CreateTableRequest createReq = new CreateTableRequest().id(tableId);
-      CreateTableResponse createResp = namespace.createTable(createReq, tableData);
+      CreateTableResponse createResp = namespaceClient.createTable(createReq, tableData);
       assertNotNull(createResp);
       assertNotNull(createResp.getLocation());
 
       DropTableRequest dropReq = new DropTableRequest().id(tableId);
-      DropTableResponse dropResp = namespace.dropTable(dropReq);
+      DropTableResponse dropResp = namespaceClient.dropTable(dropReq);
       assertNotNull(dropResp);
 
       TableExistsRequest existsReq = new TableExistsRequest().id(tableId);
-      assertThrows(LanceNamespaceException.class, () -> namespace.tableExists(existsReq));
+      assertThrows(LanceNamespaceException.class, () -> namespaceClient.tableExists(existsReq));
     } finally {
-      namespace.close();
+      namespaceClient.close();
     }
   }
 
   @Test
   void testConcurrentCreateAndDropWithSingleInstanceOnS3() throws Exception {
-    DirectoryNamespace namespace = new DirectoryNamespace();
-    namespace.initialize(createDirectoryNamespaceS3Config(), testAllocator);
+    DirectoryNamespace namespaceClient = new DirectoryNamespace();
+    namespaceClient.initialize(createDirectoryNamespaceS3Config(), testAllocator);
 
     try {
       // Initialize namespace first - create parent namespace to ensure __manifest table
       // is created before concurrent operations
       CreateNamespaceRequest createNsReq =
           new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
-      namespace.createNamespace(createNsReq);
+      namespaceClient.createNamespace(createNsReq);
 
       int numTables = 10;
       ExecutorService executor = Executors.newFixedThreadPool(numTables);
@@ -1586,10 +1616,10 @@ public class NamespaceIntegrationTest {
                 byte[] tableData = createTestTableData();
 
                 CreateTableRequest createReq = new CreateTableRequest().id(tableId);
-                namespace.createTable(createReq, tableData);
+                namespaceClient.createTable(createReq, tableData);
 
                 DropTableRequest dropReq = new DropTableRequest().id(tableId);
-                namespace.dropTable(dropReq);
+                namespaceClient.dropTable(dropReq);
 
                 successCount.incrementAndGet();
               } catch (Exception e) {
@@ -1609,7 +1639,7 @@ public class NamespaceIntegrationTest {
       assertEquals(numTables, successCount.get(), "All tasks should succeed");
       assertEquals(0, failCount.get(), "No tasks should fail");
     } finally {
-      namespace.close();
+      namespaceClient.close();
     }
   }
 

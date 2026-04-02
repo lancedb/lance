@@ -2148,9 +2148,6 @@ def build_distributed_vector_index(
             )
         )
 
-    segments = (
-        dataset.create_index_segment_builder().with_segments(segments).build_all()
-    )
     return dataset.commit_existing_index_segments(f"{column}_idx", column, segments)
 
 
@@ -2522,7 +2519,6 @@ def test_metadata_merge_pq_success(tmp_path):
             ivf_centroids=pre["ivf_centroids"],
             pq_codebook=pre["pq_codebook"],
         )
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
         ds = _commit_segments_helper(ds, segments, "vector")
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
@@ -2561,7 +2557,6 @@ def test_distributed_workflow_merge_and_search(tmp_path):
             ivf_centroids=pre["ivf_centroids"],
             pq_codebook=pre["pq_codebook"],
         )
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
         ds = _commit_segments_helper(ds, segments, "vector")
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
@@ -2597,7 +2592,6 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
         ivf_centroids=preprocessed["ivf_centroids"],
         pq_codebook=preprocessed["pq_codebook"],
     )
-    segments = ds.create_index_segment_builder().with_segments(segments).build_all()
     ds = _commit_segments_helper(ds, segments, column="vector")
     q = np.random.rand(128).astype(np.float32)
     result = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
@@ -2650,7 +2644,6 @@ def test_distributed_ivf_parameterized(tmp_path, index_type, num_sub_vectors):
             ds.create_index_uncommitted(**kwargs1),
             ds.create_index_uncommitted(**kwargs2),
         ]
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
         ds = _commit_segments_helper(ds, segments, "vector")
 
         q = np.random.rand(128).astype(np.float32)
@@ -2711,20 +2704,16 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
             kwargs2["pq_codebook"] = pre["pq_codebook"]
     segment2 = ds.create_index_uncommitted(**kwargs2)
 
-    segments = (
-        ds.create_index_segment_builder()
-        .with_segments([segment1, segment2])
-        .build_all()
-    )
-    ds = _commit_segments_helper(ds, segments, column="vector")
+    merged_segment = ds.merge_existing_index_segments([segment1, segment2])
+    ds = _commit_segments_helper(ds, [merged_segment], column="vector")
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
 
 
-def test_index_segment_builder_builds_vector_segments(tmp_path):
-    ds = _make_sample_dataset_base(tmp_path, "segment_builder_ds", 2000, 128)
+def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "merge_existing_segments_ds", 2000, 128)
     frags = ds.get_fragments()
     assert len(frags) >= 2
     builder = IndicesBuilder(ds, "vector")
@@ -2750,19 +2739,115 @@ def test_index_segment_builder_builds_vector_segments(tmp_path):
         )
         for fragment in frags[:2]
     ]
+    assert all(segment.index_details is not None for segment in segments)
 
-    segment_builder = ds.create_index_segment_builder().with_segments(segments)
-    plans = segment_builder.plan()
-    assert len(plans) == 2
-    assert all(len(plan.segments) == 1 for plan in plans)
-
-    segments = segment_builder.build_all()
-    assert len(segments) == 2
-    ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
+    merged_segment = ds.merge_existing_index_segments(segments)
+    assert merged_segment.fragment_ids is not None
+    assert sorted(merged_segment.fragment_ids) == sorted(
+        [fragment.fragment_id for fragment in frags[:2]]
+    )
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged_segment])
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
+
+
+def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
+    """Ensure distributed IVF_PQ build is invariant to shard build order."""
+    ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
+
+    # Global IVF+PQ training once; artifacts are reused across shard orders.
+    builder = IndicesBuilder(ds, "vector")
+    pre = builder.prepare_global_ivf_pq(
+        num_partitions=4,
+        num_subvectors=16,
+        distance_type="l2",
+        sample_rate=7,
+    )
+
+    # Copy the dataset twice so index manifests do not clash and we can vary
+    # the shard build order independently on identical data.
+    ds_order_12 = lance.write_dataset(
+        ds.to_table(), tmp_path / "pq_order_node1_node2", max_rows_per_file=500
+    )
+    ds_order_21 = lance.write_dataset(
+        ds.to_table(), tmp_path / "pq_order_node2_node1", max_rows_per_file=500
+    )
+
+    # For each copy, derive two shard groups from its own fragments.
+    frags_12 = ds_order_12.get_fragments()
+    if len(frags_12) < 2:
+        pytest.skip("Need at least 2 fragments for distributed indexing (order_12)")
+    mid_12 = len(frags_12) // 2
+    node1_12 = [f.fragment_id for f in frags_12[:mid_12]]
+    node2_12 = [f.fragment_id for f in frags_12[mid_12:]]
+    if not node1_12 or not node2_12:
+        pytest.skip("Failed to split fragments into two non-empty groups (order_12)")
+
+    frags_21 = ds_order_21.get_fragments()
+    if len(frags_21) < 2:
+        pytest.skip("Need at least 2 fragments for distributed indexing (order_21)")
+    mid_21 = len(frags_21) // 2
+    node1_21 = [f.fragment_id for f in frags_21[:mid_21]]
+    node2_21 = [f.fragment_id for f in frags_21[mid_21:]]
+    if not node1_21 or not node2_21:
+        pytest.skip("Failed to split fragments into two non-empty groups (order_21)")
+
+    def build_distributed_ivf_pq(ds_copy, shard_order):
+        try:
+            segments = _build_segments(
+                ds_copy,
+                "vector",
+                "IVF_PQ",
+                shard_order,
+                index_name="vector_idx",
+                num_partitions=4,
+                num_sub_vectors=16,
+                ivf_centroids=pre["ivf_centroids"],
+                pq_codebook=pre["pq_codebook"],
+            )
+            return _commit_segments_helper(ds_copy, segments, column="vector")
+        except ValueError as e:
+            raise e
+
+    ds_12 = build_distributed_ivf_pq(ds_order_12, [node1_12, node2_12])
+    ds_21 = build_distributed_ivf_pq(ds_order_21, [node2_21, node1_21])
+
+    # Sample queries once from the original dataset and reuse for both index builds
+    # to check order invariance under distributed PQ training and merging.
+    k = 10
+    sample_tbl = ds.sample(10, columns=["vector"])
+    queries = [
+        np.asarray(v, dtype=np.float32) for v in sample_tbl["vector"].to_pylist()
+    ]
+
+    def collect_ids_and_distances(ds_with_index):
+        ids_per_query = []
+        dists_per_query = []
+        for q in queries:
+            tbl = ds_with_index.to_table(
+                columns=["id", "_distance"],
+                nearest={
+                    "column": "vector",
+                    "q": q,
+                    "k": k,
+                    "nprobes": 16,
+                    "refine_factor": 100,
+                },
+            )
+            ids_per_query.append([int(x) for x in tbl["id"].to_pylist()])
+            dists_per_query.append(tbl["_distance"].to_numpy())
+        return ids_per_query, dists_per_query
+
+    ids_12, dists_12 = collect_ids_and_distances(ds_12)
+    ids_21, dists_21 = collect_ids_and_distances(ds_21)
+
+    # TopK ids must match exactly and distances must be numerically stable across
+    # different shard build orders (allow tiny floating error).
+    assert ids_12 == ids_21
+    for a, b in zip(dists_12, dists_21):
+        assert np.allclose(a, b, atol=1e-6)
 
 
 def test_fts_filter_vector_search(tmp_path):

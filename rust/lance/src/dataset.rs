@@ -753,20 +753,20 @@ impl Dataset {
             .await
     }
 
-    /// Write into a namespace-managed table with automatic credential vending.
+    /// Write into a namespace client-managed table with automatic credential vending.
     ///
     /// For CREATE mode, calls declare_table() to initialize the table.
-    /// For other modes, calls describe_table() and opens dataset with namespace credentials.
+    /// For other modes, calls describe_table() and opens dataset with namespace client credentials.
     ///
     /// # Arguments
     ///
     /// * `batches` - The record batches to write
-    /// * `namespace` - The namespace to use for table management
+    /// * `namespace_client` - The namespace client to use for table management
     /// * `table_id` - The table identifier
     /// * `params` - Write parameters
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
-        namespace: Arc<dyn LanceNamespace>,
+        namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
@@ -778,7 +778,7 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response = namespace
+                let response = namespace_client
                     .declare_table(declare_request)
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -792,7 +792,7 @@ impl Dataset {
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
                     let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace.clone(),
+                        namespace_client.clone(),
                         table_id.clone(),
                     );
                     let commit_handler: Arc<dyn CommitHandler> =
@@ -802,13 +802,13 @@ impl Dataset {
                     write_params.commit_handler = Some(commit_handler);
                 }
 
-                // Set initial credentials and provider from namespace
+                // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
-                        LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                        LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
                     );
 
-                    // Merge namespace storage options with any existing options
+                    // Merge namespace client storage options with any existing options
                     let mut merged_options = write_params
                         .store_params
                         .as_ref()
@@ -835,7 +835,7 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response = namespace
+                let response = namespace_client
                     .describe_table(request)
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -849,7 +849,7 @@ impl Dataset {
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
                     let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace.clone(),
+                        namespace_client.clone(),
                         table_id.clone(),
                     );
                     let commit_handler: Arc<dyn CommitHandler> =
@@ -859,15 +859,15 @@ impl Dataset {
                     write_params.commit_handler = Some(commit_handler);
                 }
 
-                // Set initial credentials and provider from namespace
+                // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> =
                         Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace.clone(),
+                            namespace_client.clone(),
                             table_id.clone(),
                         ));
 
-                    // Merge namespace storage options with any existing options
+                    // Merge namespace client storage options with any existing options
                     let mut merged_options = write_params
                         .store_params
                         .as_ref()
@@ -2799,7 +2799,7 @@ impl Dataset {
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \
-                     build segments, use create_index_segment_builder(), \
+                     build segments, optionally merge groups with merge_existing_index_segments(...), \
                      and commit with commit_existing_index_segments(...)"
                         .to_string(),
                 ))

@@ -179,8 +179,8 @@ mod tests {
 
     use super::*;
     use crate::dataset::WriteParams;
+    use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::{DatasetIndexExt, IndexSegment};
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
@@ -242,18 +242,16 @@ mod tests {
         }
 
         let segments = vec![
-            IndexSegment::new(
-                first_segment_uuid,
-                [target_fragments[0].id() as u32],
-                built_index.index_details.clone().unwrap(),
-                built_index.index_version,
-            ),
-            IndexSegment::new(
-                second_segment_uuid,
-                [target_fragments[1].id() as u32],
-                built_index.index_details.clone().unwrap(),
-                built_index.index_version,
-            ),
+            IndexMetadata {
+                uuid: first_segment_uuid,
+                fragment_bitmap: Some(std::iter::once(target_fragments[0].id() as u32).collect()),
+                ..built_index.clone()
+            },
+            IndexMetadata {
+                uuid: second_segment_uuid,
+                fragment_bitmap: Some(std::iter::once(target_fragments[1].id() as u32).collect()),
+                ..built_index
+            },
         ];
 
         dataset

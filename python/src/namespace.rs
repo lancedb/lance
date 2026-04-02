@@ -10,12 +10,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
-    CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, ListTableVersionsRequest, ListTableVersionsResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
-use lance_namespace_impls::{DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo};
+use lance_namespace_impls::{
+    DirectoryNamespace, DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo,
+    RestNamespace,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
@@ -104,7 +108,7 @@ fn dict_to_hashmap(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, String>
 /// Python wrapper for DirectoryNamespace
 #[pyclass(name = "PyDirectoryNamespace", module = "lance.lance")]
 pub struct PyDirectoryNamespace {
-    pub(crate) inner: Arc<dyn lance_namespace::LanceNamespace>,
+    pub(crate) inner: Arc<DirectoryNamespace>,
 }
 
 #[pymethods]
@@ -365,12 +369,31 @@ impl PyDirectoryNamespace {
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
+
+    // Operation metrics methods
+
+    /// Retrieve operation metrics as a dictionary.
+    ///
+    /// Returns a dict where keys are operation names (e.g., "list_tables", "describe_table")
+    /// and values are the number of times each operation was called.
+    ///
+    /// Returns an empty dict if `ops_metrics_enabled` was false when creating the namespace.
+    fn retrieve_ops_metrics(&self) -> HashMap<String, u64> {
+        self.inner.retrieve_ops_metrics()
+    }
+
+    /// Reset all operation metrics counters to zero.
+    ///
+    /// Does nothing if `ops_metrics_enabled` was false when creating the namespace.
+    fn reset_ops_metrics(&self) {
+        self.inner.reset_ops_metrics()
+    }
 }
 
 /// Python wrapper for RestNamespace
 #[pyclass(name = "PyRestNamespace", module = "lance.lance")]
 pub struct PyRestNamespace {
-    pub(crate) inner: Arc<dyn lance_namespace::LanceNamespace>,
+    pub(crate) inner: Arc<RestNamespace>,
 }
 
 #[pymethods]
@@ -640,6 +663,112 @@ impl PyRestNamespace {
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
+
+    // Operation metrics methods
+
+    /// Retrieve operation metrics as a dictionary.
+    ///
+    /// Returns a dict where keys are operation names (e.g., "list_tables", "describe_table")
+    /// and values are the number of times each operation was called.
+    ///
+    /// Returns an empty dict if `ops_metrics_enabled` was false when creating the namespace.
+    fn retrieve_ops_metrics(&self) -> HashMap<String, u64> {
+        self.inner.retrieve_ops_metrics()
+    }
+
+    /// Reset all operation metrics counters to zero.
+    ///
+    /// Does nothing if `ops_metrics_enabled` was false when creating the namespace.
+    fn reset_ops_metrics(&self) {
+        self.inner.reset_ops_metrics()
+    }
+}
+
+/// Get or create the DictWithModelDump class in Python.
+/// This class acts like a dict but also has model_dump() method.
+/// This allows it to work with both:
+/// - depythonize (which expects a dict/Mapping)
+/// - Python code that calls .model_dump() (like DirectoryNamespace wrapper)
+fn get_dict_with_model_dump_class(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    // Use a module-level cache via __builtins__
+    let builtins = py.import("builtins")?;
+    if builtins.hasattr("_DictWithModelDump")? {
+        return builtins.getattr("_DictWithModelDump");
+    }
+
+    // Create the class using exec
+    let locals = PyDict::new(py);
+    py.run(
+        c"class DictWithModelDump(dict):
+    def model_dump(self):
+        return dict(self)",
+        None,
+        Some(&locals),
+    )?;
+    let class = locals.get_item("DictWithModelDump")?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("Failed to create DictWithModelDump class")
+    })?;
+
+    // Cache it
+    builtins.setattr("_DictWithModelDump", &class)?;
+    Ok(class)
+}
+
+/// Helper to call a Python namespace method with JSON serialization.
+/// For methods that take a request and return a response.
+/// Uses DictWithModelDump to pass a dict that also has model_dump() method,
+/// making it compatible with both depythonize and Python wrappers.
+async fn call_py_method<Req, Resp>(
+    py_namespace: Arc<Py<PyAny>>,
+    method_name: &'static str,
+    request: Req,
+) -> lance_core::Result<Resp>
+where
+    Req: serde::Serialize + Send + 'static,
+    Resp: serde::de::DeserializeOwned + Send + 'static,
+{
+    let request_json = serde_json::to_string(&request).map_err(|e| {
+        lance_core::Error::io(format!(
+            "Failed to serialize request for {}: {}",
+            method_name, e
+        ))
+    })?;
+
+    let response_json = tokio::task::spawn_blocking(move || {
+        Python::attach(|py| {
+            let json_module = py.import("json")?;
+            let request_dict = json_module.call_method1("loads", (&request_json,))?;
+
+            // Wrap dict in DictWithModelDump so it works with both depythonize and .model_dump()
+            let dict_class = get_dict_with_model_dump_class(py)?;
+            let request_arg = dict_class.call1((request_dict,))?;
+
+            // Call the Python method
+            let result = py_namespace.call_method1(py, method_name, (request_arg,))?;
+
+            // Convert response to dict, then to JSON
+            // Pydantic models have model_dump() method
+            let result_dict = if result.bind(py).hasattr("model_dump")? {
+                result.call_method0(py, "model_dump")?
+            } else {
+                result
+            };
+            let response_json: String = json_module
+                .call_method1("dumps", (result_dict,))?
+                .extract()?;
+            Ok::<_, PyErr>(response_json)
+        })
+    })
+    .await
+    .map_err(|e| lance_core::Error::io(format!("Task join error for {}: {}", method_name, e)))?
+    .map_err(|e: PyErr| lance_core::Error::io(format!("Python error in {}: {}", method_name, e)))?;
+
+    serde_json::from_str(&response_json).map_err(|e| {
+        lance_core::Error::io(format!(
+            "Failed to deserialize response from {}: {}",
+            method_name, e
+        ))
+    })
 }
 
 /// Wrapper that allows any Python object implementing LanceNamespace protocol
@@ -692,163 +821,32 @@ impl LanceNamespaceTrait for PyLanceNamespace {
         self.namespace_id.clone()
     }
 
+    async fn describe_table(
+        &self,
+        request: DescribeTableRequest,
+    ) -> lance_core::Result<DescribeTableResponse> {
+        call_py_method(self.py_namespace.clone(), "describe_table", request).await
+    }
+
     async fn describe_table_version(
         &self,
         request: DescribeTableVersionRequest,
     ) -> lance_core::Result<DescribeTableVersionResponse> {
-        // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
-        let py_namespace = self.py_namespace.clone();
-        let request_json = serde_json::to_string(&request).map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to serialize request: {}",
-                e
-            ))))
-        })?;
-
-        let response_json = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| {
-                let result =
-                    py_namespace.call_method1(py, "describe_table_version_json", (request_json,));
-
-                match result {
-                    Ok(response_py) => {
-                        let response_str: String = response_py.extract(py).map_err(|e| {
-                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                                "Failed to extract response string: {}",
-                                e
-                            ))))
-                        })?;
-                        Ok(response_str)
-                    }
-                    Err(e) => Err(lance_core::Error::io_source(Box::new(
-                        std::io::Error::other(format!(
-                            "Failed to call describe_table_version_json: {}",
-                            e
-                        )),
-                    ))),
-                }
-            })
-        })
-        .await
-        .map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Task join error: {}",
-                e
-            ))))
-        })??;
-
-        serde_json::from_str(&response_json).map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to deserialize response: {}",
-                e
-            ))))
-        })
+        call_py_method(self.py_namespace.clone(), "describe_table_version", request).await
     }
 
     async fn create_table_version(
         &self,
         request: CreateTableVersionRequest,
     ) -> lance_core::Result<CreateTableVersionResponse> {
-        // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
-        let py_namespace = self.py_namespace.clone();
-        let request_json = serde_json::to_string(&request).map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to serialize request: {}",
-                e
-            ))))
-        })?;
-
-        let response_json = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| {
-                let result =
-                    py_namespace.call_method1(py, "create_table_version_json", (request_json,));
-
-                match result {
-                    Ok(response_py) => {
-                        let response_str: String = response_py.extract(py).map_err(|e| {
-                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                                "Failed to extract response string: {}",
-                                e
-                            ))))
-                        })?;
-                        Ok(response_str)
-                    }
-                    Err(e) => Err(lance_core::Error::io_source(Box::new(
-                        std::io::Error::other(format!(
-                            "Failed to call create_table_version_json: {}",
-                            e
-                        )),
-                    ))),
-                }
-            })
-        })
-        .await
-        .map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Task join error: {}",
-                e
-            ))))
-        })??;
-
-        serde_json::from_str(&response_json).map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to deserialize response: {}",
-                e
-            ))))
-        })
+        call_py_method(self.py_namespace.clone(), "create_table_version", request).await
     }
 
     async fn list_table_versions(
         &self,
         request: ListTableVersionsRequest,
     ) -> lance_core::Result<ListTableVersionsResponse> {
-        // Clone the Arc (doesn't need GIL) to pass to spawn_blocking
-        let py_namespace = self.py_namespace.clone();
-        let request_json = serde_json::to_string(&request).map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to serialize request: {}",
-                e
-            ))))
-        })?;
-
-        let response_json = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| {
-                let result =
-                    py_namespace.call_method1(py, "list_table_versions_json", (request_json,));
-
-                match result {
-                    Ok(response_py) => {
-                        let response_str: String = response_py.extract(py).map_err(|e| {
-                            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                                "Failed to extract response string: {}",
-                                e
-                            ))))
-                        })?;
-                        Ok(response_str)
-                    }
-                    Err(e) => Err(lance_core::Error::io_source(Box::new(
-                        std::io::Error::other(format!(
-                            "Failed to call list_table_versions_json: {}",
-                            e
-                        )),
-                    ))),
-                }
-            })
-        })
-        .await
-        .map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Task join error: {}",
-                e
-            ))))
-        })??;
-
-        serde_json::from_str(&response_json).map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to deserialize response: {}",
-                e
-            ))))
-        })
+        call_py_method(self.py_namespace.clone(), "list_table_versions", request).await
     }
 }
 
@@ -864,37 +862,39 @@ impl LanceNamespaceTrait for PyLanceNamespace {
 /// are wrapped with PyLanceNamespace to call through Python.
 pub fn extract_namespace_arc(
     py: Python<'_>,
-    ns: &Bound<'_, PyAny>,
+    namespace_client: &Bound<'_, PyAny>,
 ) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
     // Direct PyO3 class
-    if let Ok(dir_ns) = ns.downcast::<PyDirectoryNamespace>() {
-        return Ok(dir_ns.borrow().inner.clone());
+    if let Ok(dir_namespace_client) = namespace_client.downcast::<PyDirectoryNamespace>() {
+        return Ok(dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
-    if let Ok(rest_ns) = ns.downcast::<PyRestNamespace>() {
-        return Ok(rest_ns.borrow().inner.clone());
+    if let Ok(rest_namespace_client) = namespace_client.downcast::<PyRestNamespace>() {
+        return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
 
     // Python wrapper class - check if it's the exact wrapper class
-    if let Ok(inner) = ns.getattr("_inner") {
-        let type_name = ns
+    if let Ok(inner) = namespace_client.getattr("_inner") {
+        let type_name = namespace_client
             .get_type()
             .name()
             .map(|n| n.to_string())
             .unwrap_or_default();
 
         if type_name == "DirectoryNamespace" {
-            if let Ok(dir_ns) = inner.downcast::<PyDirectoryNamespace>() {
-                return Ok(dir_ns.borrow().inner.clone());
+            if let Ok(dir_namespace_client) = inner.downcast::<PyDirectoryNamespace>() {
+                return Ok(
+                    dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>
+                );
             }
         } else if type_name == "RestNamespace"
-            && let Ok(rest_ns) = inner.downcast::<PyRestNamespace>()
+            && let Ok(rest_namespace_client) = inner.downcast::<PyRestNamespace>()
         {
-            return Ok(rest_ns.borrow().inner.clone());
+            return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
         }
     }
 
     // Custom Python implementation or subclass - wrap with PyLanceNamespace
-    PyLanceNamespace::create_arc(py, ns)
+    PyLanceNamespace::create_arc(py, namespace_client)
 }
 
 /// Python wrapper for REST adapter server
@@ -911,21 +911,21 @@ impl PyRestAdapter {
     /// Default port is 2333 per REST spec. Use port 0 to let OS assign an ephemeral port.
     /// Use `port` property after `start()` to get the actual port.
     #[new]
-    #[pyo3(signature = (namespace_impl, namespace_properties, session = None, host = None, port = None))]
+    #[pyo3(signature = (namespace_client_impl, namespace_client_properties, session = None, host = None, port = None))]
     fn new(
-        namespace_impl: String,
-        namespace_properties: Option<&Bound<'_, PyDict>>,
+        namespace_client_impl: String,
+        namespace_client_properties: Option<&Bound<'_, PyDict>>,
         session: Option<&Bound<'_, Session>>,
         host: Option<String>,
         port: Option<u16>,
     ) -> PyResult<Self> {
         let mut props = HashMap::new();
 
-        if let Some(dict) = namespace_properties {
+        if let Some(dict) = namespace_client_properties {
             props = dict_to_hashmap(dict)?;
         }
 
-        let mut builder = ConnectBuilder::new(namespace_impl);
+        let mut builder = ConnectBuilder::new(namespace_client_impl);
         for (k, v) in props {
             builder = builder.property(k, v);
         }

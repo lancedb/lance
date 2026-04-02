@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use jni::JNIEnv;
 use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
-use jni::sys::{jbyteArray, jlong, jstring};
+use jni::sys::{jbyteArray, jlong, jobject, jstring};
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::*;
 use lance_namespace_impls::{
-    ConnectBuilder, DirectoryNamespaceBuilder, DynamicContextProvider, OperationInfo, RestAdapter,
-    RestAdapterConfig, RestNamespaceBuilder,
+    ConnectBuilder, DirectoryNamespace, DirectoryNamespaceBuilder, DynamicContextProvider,
+    OperationInfo, RestAdapter, RestAdapterConfig, RestNamespace, RestNamespaceBuilder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -117,14 +117,34 @@ fn convert_java_map_to_hashmap(
     Ok(result)
 }
 
+/// Convert a Rust HashMap<String, u64> to a Java HashMap<String, Long>
+fn rust_hashmap_to_java_map<'local>(
+    env: &mut JNIEnv<'local>,
+    map: &HashMap<String, u64>,
+) -> Result<JObject<'local>> {
+    let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+    for (k, v) in map {
+        let jkey = env.new_string(k)?;
+        // Create a java.lang.Long object from the u64 value
+        let jval = env.new_object("java/lang/Long", "(J)V", &[JValue::Long(*v as i64)])?;
+        env.call_method(
+            &java_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&jkey), JValue::Object(&jval)],
+        )?;
+    }
+    Ok(java_map)
+}
+
 /// Blocking wrapper for DirectoryNamespace
 pub struct BlockingDirectoryNamespace {
-    pub(crate) inner: Arc<dyn LanceNamespaceTrait>,
+    pub(crate) inner: Arc<DirectoryNamespace>,
 }
 
 /// Blocking wrapper for RestNamespace
 pub struct BlockingRestNamespace {
-    pub(crate) inner: Arc<dyn LanceNamespaceTrait>,
+    pub(crate) inner: Arc<RestNamespace>,
 }
 
 // ============================================================================
@@ -1610,8 +1630,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listNamespace
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_namespaces(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_namespaces(req))
         }),
         std::ptr::null_mut()
     )
@@ -1627,8 +1647,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeNames
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_namespace(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_namespace(req))
         }),
         std::ptr::null_mut()
     )
@@ -1644,8 +1664,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createNamespa
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_namespace(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_namespace(req))
         }),
         std::ptr::null_mut()
     )
@@ -1661,8 +1681,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_dropNamespace
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.drop_namespace(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.drop_namespace(req))
         }),
         std::ptr::null_mut()
     )
@@ -1678,8 +1698,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_namespaceExis
 ) {
     ok_or_throw_without_return!(
         env,
-        call_namespace_void_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.namespace_exists(req))
+        call_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.namespace_exists(req))
         })
     )
 }
@@ -1693,8 +1713,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTablesNat
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_tables(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_tables(req))
         }),
         std::ptr::null_mut()
     )
@@ -1710,8 +1730,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTable
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1727,8 +1747,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_registerTable
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.register_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.register_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1744,8 +1764,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_tableExistsNa
 ) {
     ok_or_throw_without_return!(
         env,
-        call_namespace_void_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.table_exists(req))
+        call_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.table_exists(req))
         })
     )
 }
@@ -1759,8 +1779,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_dropTableNati
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.drop_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.drop_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1776,8 +1796,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_deregisterTab
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.deregister_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.deregister_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1813,7 +1833,9 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableNa
             handle,
             request_json,
             request_data,
-            |ns, req, data| { RT.block_on(ns.inner.create_table(req, data)) }
+            |namespace_client, req, data| {
+                RT.block_on(namespace_client.inner.create_table(req, data))
+            }
         ),
         std::ptr::null_mut()
     )
@@ -1829,8 +1851,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_declareTableN
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.declare_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.declare_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1852,7 +1874,9 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_insertIntoTab
             handle,
             request_json,
             request_data,
-            |ns, req, data| { RT.block_on(ns.inner.insert_into_table(req, data)) }
+            |namespace_client, req, data| {
+                RT.block_on(namespace_client.inner.insert_into_table(req, data))
+            }
         ),
         std::ptr::null_mut()
     )
@@ -1874,7 +1898,9 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_mergeInsertIn
             handle,
             request_json,
             request_data,
-            |ns, req, data| { RT.block_on(ns.inner.merge_insert_into_table(req, data)) }
+            |namespace_client, req, data| {
+                RT.block_on(namespace_client.inner.merge_insert_into_table(req, data))
+            }
         ),
         std::ptr::null_mut()
     )
@@ -1890,8 +1916,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_updateTableNa
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.update_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.update_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1907,8 +1933,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_deleteFromTab
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.delete_from_table(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.delete_from_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -1939,8 +1965,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableIn
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_table_index(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_index(req))
         }),
         std::ptr::null_mut()
     )
@@ -1956,8 +1982,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTableIndi
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_table_indices(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_table_indices(req))
         }),
         std::ptr::null_mut()
     )
@@ -1973,8 +1999,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTable
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_table_index_stats(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_table_index_stats(req))
         }),
         std::ptr::null_mut()
     )
@@ -1990,8 +2016,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTrans
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_transaction(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_transaction(req))
         }),
         std::ptr::null_mut()
     )
@@ -2007,8 +2033,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTransact
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.alter_transaction(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_transaction(req))
         }),
         std::ptr::null_mut()
     )
@@ -2024,8 +2050,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTableVers
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_table_versions(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_table_versions(req))
         }),
         std::ptr::null_mut()
     )
@@ -2041,8 +2067,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableVe
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_table_version(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_version(req))
         }),
         std::ptr::null_mut()
     )
@@ -2058,8 +2084,8 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_describeTable
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_table_version(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_table_version(req))
         }),
         std::ptr::null_mut()
     )
@@ -2075,12 +2101,43 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_batchDeleteTa
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.batch_delete_table_versions(req))
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.batch_delete_table_versions(req))
         }),
         std::ptr::null_mut()
     )
     .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_retrieveOpsMetricsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) -> jobject {
+    ok_or_throw_with_return!(
+        env,
+        {
+            let namespace_client = unsafe { &*(handle as *const BlockingDirectoryNamespace) };
+            let metrics = namespace_client.inner.retrieve_ops_metrics();
+            rust_hashmap_to_java_map(&mut env, &metrics)
+        },
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_resetOpsMetricsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) {
+    ok_or_throw_without_return!(env, {
+        let namespace_client = unsafe { &*(handle as *const BlockingDirectoryNamespace) };
+        namespace_client.inner.reset_ops_metrics();
+        Ok::<(), Error>(())
+    });
 }
 
 // ============================================================================
@@ -2183,8 +2240,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_listNamespacesNati
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_namespaces(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_namespaces(req))
         }),
         std::ptr::null_mut()
     )
@@ -2200,8 +2257,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeNamespaceN
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_namespace(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_namespace(req))
         }),
         std::ptr::null_mut()
     )
@@ -2217,8 +2274,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_createNamespaceNat
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_namespace(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_namespace(req))
         }),
         std::ptr::null_mut()
     )
@@ -2234,8 +2291,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_dropNamespaceNativ
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.drop_namespace(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.drop_namespace(req))
         }),
         std::ptr::null_mut()
     )
@@ -2251,8 +2308,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_namespaceExistsNat
 ) {
     ok_or_throw_without_return!(
         env,
-        call_rest_namespace_void_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.namespace_exists(req))
+        call_rest_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.namespace_exists(req))
         })
     )
 }
@@ -2266,8 +2323,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTablesNative(
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_tables(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_tables(req))
         }),
         std::ptr::null_mut()
     )
@@ -2283,8 +2340,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableNativ
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2300,8 +2357,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_registerTableNativ
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.register_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.register_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2317,8 +2374,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_tableExistsNative(
 ) {
     ok_or_throw_without_return!(
         env,
-        call_rest_namespace_void_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.table_exists(req))
+        call_rest_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.table_exists(req))
         })
     )
 }
@@ -2332,8 +2389,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_dropTableNative(
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.drop_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.drop_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2349,8 +2406,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_deregisterTableNat
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.deregister_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.deregister_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2386,7 +2443,9 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableNative(
             handle,
             request_json,
             request_data,
-            |ns, req, data| { RT.block_on(ns.inner.create_table(req, data)) }
+            |namespace_client, req, data| {
+                RT.block_on(namespace_client.inner.create_table(req, data))
+            }
         ),
         std::ptr::null_mut()
     )
@@ -2402,8 +2461,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_declareTableNative
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.declare_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.declare_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2419,8 +2478,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_renameTableNative(
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.rename_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.rename_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2442,7 +2501,9 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_insertIntoTableNat
             handle,
             request_json,
             request_data,
-            |ns, req, data| { RT.block_on(ns.inner.insert_into_table(req, data)) }
+            |namespace_client, req, data| {
+                RT.block_on(namespace_client.inner.insert_into_table(req, data))
+            }
         ),
         std::ptr::null_mut()
     )
@@ -2464,7 +2525,9 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_mergeInsertIntoTab
             handle,
             request_json,
             request_data,
-            |ns, req, data| { RT.block_on(ns.inner.merge_insert_into_table(req, data)) }
+            |namespace_client, req, data| {
+                RT.block_on(namespace_client.inner.merge_insert_into_table(req, data))
+            }
         ),
         std::ptr::null_mut()
     )
@@ -2480,8 +2543,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_updateTableNative(
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.update_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.update_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2497,8 +2560,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_deleteFromTableNat
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.delete_from_table(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.delete_from_table(req))
         }),
         std::ptr::null_mut()
     )
@@ -2529,8 +2592,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableIndexNa
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_table_index(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_index(req))
         }),
         std::ptr::null_mut()
     )
@@ -2546,8 +2609,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTableIndicesNa
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_table_indices(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_table_indices(req))
         }),
         std::ptr::null_mut()
     )
@@ -2563,8 +2626,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableIndex
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_table_index_stats(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_table_index_stats(req))
         }),
         std::ptr::null_mut()
     )
@@ -2580,8 +2643,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTransactio
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_transaction(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_transaction(req))
         }),
         std::ptr::null_mut()
     )
@@ -2597,8 +2660,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTransactionNa
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.alter_transaction(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_transaction(req))
         }),
         std::ptr::null_mut()
     )
@@ -2614,8 +2677,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTableVersionsN
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.list_table_versions(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_table_versions(req))
         }),
         std::ptr::null_mut()
     )
@@ -2631,8 +2694,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableVersion
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.create_table_version(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_version(req))
         }),
         std::ptr::null_mut()
     )
@@ -2648,8 +2711,8 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_describeTableVersi
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.describe_table_version(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.describe_table_version(req))
         }),
         std::ptr::null_mut()
     )
@@ -2665,12 +2728,43 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_batchDeleteTableVe
 ) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
-            RT.block_on(ns.inner.batch_delete_table_versions(req))
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.batch_delete_table_versions(req))
         }),
         std::ptr::null_mut()
     )
     .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_retrieveOpsMetricsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) -> jobject {
+    ok_or_throw_with_return!(
+        env,
+        {
+            let namespace_client = unsafe { &*(handle as *const BlockingRestNamespace) };
+            let metrics = namespace_client.inner.retrieve_ops_metrics();
+            rust_hashmap_to_java_map(&mut env, &metrics)
+        },
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_resetOpsMetricsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) {
+    ok_or_throw_without_return!(env, {
+        let namespace_client = unsafe { &*(handle as *const BlockingRestNamespace) };
+        namespace_client.inner.reset_ops_metrics();
+        Ok::<(), Error>(())
+    });
 }
 
 // ============================================================================
@@ -2915,27 +3009,27 @@ pub struct BlockingRestAdapter {
 pub extern "system" fn Java_org_lance_namespace_RestAdapter_createNative(
     mut env: JNIEnv,
     _obj: JObject,
-    namespace_impl: JString,
+    namespace_client_impl: JString,
     properties_map: JObject,
     host: JString,
     port: JObject,
 ) -> jlong {
     ok_or_throw_with_return!(
         env,
-        create_rest_adapter_internal(&mut env, namespace_impl, properties_map, host, port),
+        create_rest_adapter_internal(&mut env, namespace_client_impl, properties_map, host, port),
         0
     )
 }
 
 fn create_rest_adapter_internal(
     env: &mut JNIEnv,
-    namespace_impl: JString,
+    namespace_client_impl: JString,
     properties_map: JObject,
     host: JString,
     port: JObject,
 ) -> Result<jlong> {
-    // Get namespace implementation type
-    let impl_str: String = env.get_string(&namespace_impl)?.into();
+    // Get namespace client implementation type
+    let impl_str: String = env.get_string(&namespace_client_impl)?.into();
 
     // Convert Java HashMap to Rust HashMap
     let jmap = JMap::from_env(env, &properties_map)?;

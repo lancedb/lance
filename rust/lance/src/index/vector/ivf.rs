@@ -89,20 +89,17 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
-use lance_table::format::IndexMetadata as TableIndexMetadata;
+use lance_table::format::{IndexMetadata as TableIndexMetadata, list_index_files_with_sizes};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
-
-use crate::index::{IndexSegment, IndexSegmentPlan};
 
 pub mod builder;
 pub mod io;
@@ -1906,181 +1903,66 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-/// Distributed vector segment build uses three storage-level concepts:
-///
-/// - A **segment** is a worker output written by `execute_uncommitted()`. It
-///   already lives at its final storage path under `indices/<segment_uuid>/`,
-///   but it is not yet published in the manifest.
-/// - A **physical segment** is an `IndexSegment` that can be committed into the
-///   manifest with `commit_existing_index_segments(...)`.
-/// - A **logical index** is the user-visible index identified by name; it may
-///   contain one or more physical segments.
-///
-/// The segment-build path is therefore:
-///
-/// 1. workers build segments
-/// 2. the caller groups those segments into one or more physical segments
-/// 3. each grouped segment is built from its selected inputs
-/// 4. the resulting physical segments are committed as one logical index
-///
-/// Each plan says:
-/// - which source segments should be consumed together
-/// - what the physical segment metadata should look like
-///
-/// The planner returns a `Vec<IndexSegmentPlan>` so callers can decide whether
-/// to execute the work serially or fan it out externally.
-///
-/// This function does not touch storage. It only:
-/// - validates that the caller-supplied segment contract is self-consistent
-/// - enforces that source fragment coverage is disjoint
-/// - groups source segments into physical segments according to
-///   `target_segment_bytes`
-///
-/// The grouping rule is intentionally simple:
-/// - `target_segment_bytes = None`: keep the existing segment boundary, so each
-///   input segment becomes one physical segment
-/// - `target_segment_bytes = Some(limit)`: greedily pack consecutive source
-///   segments until the next source would exceed `limit`
-pub(crate) async fn plan_segments(
-    segments: &[TableIndexMetadata],
-    requested_index_type: Option<IndexType>,
-    target_segment_bytes: Option<u64>,
-) -> Result<Vec<IndexSegmentPlan>> {
-    if let Some(index_type) = requested_index_type
-        && !matches!(
-            index_type,
-            IndexType::IvfFlat
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfRq
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq
-                | IndexType::Vector
-        )
-    {
-        return Err(Error::invalid_input(format!(
-            "Unsupported distributed vector segment build type: {}",
-            index_type
-        )));
-    }
-
-    if let Some(0) = target_segment_bytes {
-        return Err(Error::invalid_input(
-            "target_segment_bytes must be greater than zero".to_string(),
-        ));
-    }
-
+/// Merge one caller-defined group of source segments into a single segment.
+pub(crate) async fn merge_segments(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
-
-    let mut sorted_segments = segments.to_vec();
-    sorted_segments.sort_by_key(|index| index.uuid);
-    let mut expected_segment_ids = HashSet::with_capacity(sorted_segments.len());
-    for segment in &sorted_segments {
-        if !expected_segment_ids.insert(segment.uuid) {
-            return Err(Error::index(format!(
-                "Distributed vector segment '{}' was provided more than once",
-                segment.uuid
-            )));
-        }
+    if segments.len() == 1 {
+        return Ok(segments.into_iter().next().unwrap());
     }
 
-    let mut covered_fragments = RoaringBitmap::new();
-    for segment in &sorted_segments {
-        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+    let mut merged_segment = segments[0].clone();
+    let mut fragment_bitmap = RoaringBitmap::new();
+    for segment in &segments {
+        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
             Error::index(format!(
                 "Segment '{}' is missing fragment coverage",
                 segment.uuid
             ))
         })?;
-        if covered_fragments.intersection_len(fragment_bitmap) > 0 {
-            return Err(Error::index(
-                "Distributed vector shards have overlapping fragment coverage".to_string(),
-            ));
-        }
-        covered_fragments |= fragment_bitmap.clone();
+        fragment_bitmap |= source_fragment_bitmap.clone();
     }
 
-    if target_segment_bytes.is_none() {
-        return sorted_segments
-            .into_iter()
-            .map(|segment| build_segment_plan(vec![segment], requested_index_type))
-            .collect();
-    }
+    let index_version = infer_source_index_version(&segments)?;
+    let segment_uuid = Uuid::new_v4();
+    let final_dir = indices_dir.child(segment_uuid.to_string());
+    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments).await?;
+    let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
-    let target_segment_bytes = target_segment_bytes.unwrap();
-    let mut plans = Vec::new();
-    let mut current_group = Vec::new();
-    let mut current_bytes = 0_u64;
-
-    for segment in sorted_segments {
-        let source_bytes = estimate_source_index_bytes(&segment);
-        if !current_group.is_empty()
-            && current_bytes.saturating_add(source_bytes) > target_segment_bytes
-        {
-            plans.push(build_segment_plan(
-                std::mem::take(&mut current_group),
-                requested_index_type,
-            )?);
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes.saturating_add(source_bytes);
-        current_group.push(segment);
-    }
-
-    if !current_group.is_empty() {
-        plans.push(build_segment_plan(current_group, requested_index_type)?);
-    }
-
-    Ok(plans)
-}
-
-/// Build one planned segment into its output directory.
-///
-/// Single-source plans are already materialized and return immediately. For
-/// multi-source plans, this function writes a new merged physical segment under
-/// `indices/<segment_uuid>/`.
-pub(crate) async fn build_segment(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
-    segment_plan: &IndexSegmentPlan,
-) -> Result<IndexSegment> {
-    let built_segment = segment_plan.segment().clone();
-    let segments = segment_plan.segments();
-    debug_assert!(
-        !segments.is_empty(),
-        "segment plans must have at least one source segment"
-    );
-
-    if segments.len() == 1 && segments[0].uuid == built_segment.uuid() {
-        return Ok(built_segment);
-    }
-
-    let final_dir = indices_dir.child(built_segment.uuid().to_string());
-    merge_segments_to_dir(object_store, indices_dir, &final_dir, segment_plan).await?;
-
-    Ok(built_segment)
+    merged_segment = TableIndexMetadata {
+        uuid: segment_uuid,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(crate::index::vector_index_details())),
+        index_version,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(files),
+        ..merged_segment
+    };
+    Ok(merged_segment)
 }
 
 /// Merge the selected input segments into `final_dir`.
 ///
-/// Callers must only invoke this helper for multi-source plans. It reads the
-/// selected input segments directly from `indices/<segment_uuid>/` and writes
-/// the merged auxiliary/index files into `final_dir`.
+/// The caller defines the source segment group explicitly. This helper reads
+/// those input segments directly from `indices/<segment_uuid>/` and writes the
+/// merged auxiliary/index files into `final_dir`.
 async fn merge_segments_to_dir(
     object_store: &ObjectStore,
     indices_dir: &Path,
     final_dir: &Path,
-    segment_plan: &IndexSegmentPlan,
+    segments: &[TableIndexMetadata],
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
 
-    let segments = segment_plan.segments();
     debug_assert!(
         segments.len() > 1,
-        "merge helper should only be used for multi-source plans"
+        "merge helper should only be used for multi-source groups"
     );
 
     let aux_paths = segments
@@ -2106,62 +1988,10 @@ async fn merge_segments_to_dir(
         final_dir,
     )
     .await?;
-    write_root_vector_index_from_auxiliary(
-        object_store,
-        final_dir,
-        segment_plan.requested_index_type(),
-        &source_index_paths,
-    )
-    .await?;
+    write_root_vector_index_from_auxiliary(object_store, final_dir, None, &source_index_paths)
+        .await?;
 
     Ok(())
-}
-
-/// Collapse one group of source segments into a single physical-segment plan.
-fn build_segment_plan(
-    group: Vec<TableIndexMetadata>,
-    requested_index_type: Option<IndexType>,
-) -> Result<IndexSegmentPlan> {
-    debug_assert!(!group.is_empty());
-    let first = &group[0];
-    let mut fragment_bitmap = RoaringBitmap::new();
-    let mut estimated_bytes = 0_u64;
-    let mut segments = Vec::with_capacity(group.len());
-
-    for segment in &group {
-        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
-            Error::index(format!(
-                "Segment '{}' is missing fragment coverage",
-                segment.uuid
-            ))
-        })?;
-        fragment_bitmap |= source_fragment_bitmap.clone();
-        estimated_bytes = estimated_bytes.saturating_add(estimate_source_index_bytes(segment));
-        segments.push(segment.clone());
-    }
-
-    let segment_uuid = if group.len() == 1 {
-        first.uuid
-    } else {
-        Uuid::new_v4()
-    };
-    let index_version = match requested_index_type {
-        Some(index_type) => index_type.version(),
-        None => infer_source_index_version(&group)?,
-    };
-    let segment = IndexSegment::new(
-        segment_uuid,
-        fragment_bitmap,
-        Arc::new(crate::index::vector_index_details()),
-        index_version,
-    );
-
-    Ok(IndexSegmentPlan::new(
-        segment,
-        segments,
-        estimated_bytes,
-        requested_index_type,
-    ))
 }
 
 fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
@@ -2173,14 +2003,6 @@ fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
         ));
     }
     Ok(first)
-}
-
-fn estimate_source_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
-    index_metadata
-        .files
-        .as_ref()
-        .map(|files| files.iter().map(|file| file.size_bytes).sum())
-        .unwrap_or(0)
 }
 
 /// Best-effort reset of one target directory before rewriting it.
@@ -2318,7 +2140,7 @@ async fn write_root_vector_index_from_auxiliary(
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),
-        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ"
+        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ"
     );
 
     if is_hnsw {

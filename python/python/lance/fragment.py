@@ -48,6 +48,7 @@ if TYPE_CHECKING:
         Transaction,
     )
     from .lance import LanceSchema
+    from .namespace import LanceNamespace
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
@@ -314,6 +315,8 @@ class LanceFragment(pa.dataset.Fragment):
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -353,6 +356,15 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh. When provided with
+            `table_id`, a storage options provider will be created automatically to
+            refresh credentials via the namespace. Must be provided together with
+            `table_id`. The caller should provide initial/merged storage options via
+            the `storage_options` parameter.
+        table_id : optional, List[str]
+            The table identifier when using a namespace (e.g., ["my_table"]).
+            Must be provided together with `namespace_client`.
 
         See Also
         --------
@@ -368,6 +380,16 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
+        # Validate namespace_client and table_id are provided together
+        if namespace_client is not None and table_id is None:
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+        elif table_id is not None and namespace_client is None:
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+
         if use_legacy_format is not None:
             warnings.warn(
                 "use_legacy_format is deprecated, use data_storage_version instead",
@@ -394,6 +416,8 @@ class LanceFragment(pa.dataset.Fragment):
             mode=mode,
             data_storage_version=data_storage_version,
             storage_options=storage_options,
+            namespace_client=namespace_client,
+            table_id=table_id,
         )
 
     @property
@@ -877,10 +901,11 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider=None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -898,10 +923,11 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider=None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -919,10 +945,11 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    storage_options_provider=None,
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
+    namespace_client: Optional[LanceNamespace] = None,
+    table_id: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -971,10 +998,6 @@ def write_fragments(
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    storage_options_provider : Optional[StorageOptionsProvider]
-        A storage options provider that can fetch and refresh storage options
-        dynamically. This is useful for credentials that expire and need to be
-        refreshed automatically.
     enable_stable_row_ids: bool
         Experimental: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
@@ -1002,6 +1025,15 @@ def write_fragments(
 
         **Only valid in CREATE mode**. Will raise an error if used with
         APPEND/OVERWRITE modes.
+    namespace_client : optional, LanceNamespace
+        A namespace client for automatic credential refresh. When provided with
+        `table_id`, a storage options provider will be created automatically to
+        refresh credentials via the namespace. Must be provided together with
+        `table_id`. The caller should provide initial/merged storage options via
+        the `storage_options` parameter.
+    table_id : optional, List[str]
+        The table identifier when using a namespace (e.g., ["my_table"]).
+        Must be provided together with `namespace_client`.
 
     Returns
     -------
@@ -1018,6 +1050,16 @@ def write_fragments(
 
     """
     from .dataset import LanceDataset
+
+    # Validate namespace_client and table_id are provided together
+    if namespace_client is not None and table_id is None:
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
+    elif table_id is not None and namespace_client is None:
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
 
     reader = _coerce_reader(data, schema)
 
@@ -1050,7 +1092,8 @@ def write_fragments(
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
-        storage_options_provider=storage_options_provider,
+        namespace_client=namespace_client,
+        table_id=table_id,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
         initial_bases=initial_bases,

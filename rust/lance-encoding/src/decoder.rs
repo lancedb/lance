@@ -226,7 +226,7 @@ use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
-use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
 use tokio::sync::mpsc::error::SendError;
@@ -1900,6 +1900,7 @@ fn check_scheduler_on_drop(
     // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
     // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
     // when the stream finishes.
+    let abort_handle = scheduler_handle.abort_handle();
     let mut scheduler_handle = Some(scheduler_handle);
     let check_scheduler = stream::unfold((), move |_| {
         let handle = scheduler_handle.take();
@@ -1910,7 +1911,19 @@ fn check_scheduler_on_drop(
             None
         }
     });
-    stream.chain(check_scheduler).boxed()
+    stream
+        .chain(check_scheduler)
+        .on_drop(move || {
+            // Abort the scheduler task on early drop. The scheduler task holds
+            // a reference to the I/O scheduler (via config.io) which keeps the
+            // ScanScheduler alive. If the scheduler task is stuck waiting for
+            // initialization I/O (which is blocked on backpressure that will
+            // never drain because no one is consuming the stream), we need to
+            // abort it so it releases its I/O reference and allows the
+            // ScanScheduler to drop and cancel pending I/O.
+            abort_handle.abort();
+        })
+        .boxed()
 }
 
 pub fn create_decode_stream(

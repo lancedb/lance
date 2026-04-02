@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
     dataset::transaction::{Operation, Transaction},
@@ -104,17 +105,27 @@ async fn apply_deletions(
 #[derive(Debug, Clone)]
 pub struct DeleteBuilder {
     dataset: Arc<Dataset>,
-    predicate: String,
+    filter: ExprFilter,
     conflict_retries: u32,
     retry_timeout: Duration,
 }
 
 impl DeleteBuilder {
-    /// Create a new DeleteBuilder
+    /// Create a new DeleteBuilder with a SQL predicate string
     pub fn new(dataset: Arc<Dataset>, predicate: impl Into<String>) -> Self {
         Self {
             dataset,
-            predicate: predicate.into(),
+            filter: ExprFilter::Sql(predicate.into()),
+            conflict_retries: 10,
+            retry_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Create a new DeleteBuilder with a DataFusion expression filter
+    pub fn from_expr(dataset: Arc<Dataset>, expr: Expr) -> Self {
+        Self {
+            dataset,
+            filter: ExprFilter::Datafusion(expr),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
         }
@@ -136,7 +147,7 @@ impl DeleteBuilder {
     pub async fn execute(self) -> Result<DeleteResult> {
         let job = DeleteJob {
             dataset: self.dataset.clone(),
-            predicate: self.predicate,
+            filter: self.filter,
         };
 
         let config = RetryConfig {
@@ -152,7 +163,7 @@ impl DeleteBuilder {
 #[derive(Debug, Clone)]
 struct DeleteJob {
     dataset: Arc<Dataset>,
-    predicate: String,
+    filter: ExprFilter,
 }
 
 /// Data returned by delete operation
@@ -170,10 +181,18 @@ impl RetryExecutor for DeleteJob {
     async fn execute_impl(&self) -> Result<Self::Data> {
         // Create a single scanner for the entire dataset
         let mut scanner = self.dataset.scan();
-        scanner
-            .with_row_id()
-            .project(&[ROW_ID])?
-            .filter(&self.predicate)?;
+        scanner.with_row_id().project(&[ROW_ID])?;
+        match &self.filter {
+            ExprFilter::Sql(s) => {
+                scanner.filter(s)?;
+            }
+            ExprFilter::Datafusion(expr) => {
+                scanner.filter_expr(expr.clone());
+            }
+            ExprFilter::Substrait(_) => {
+                unreachable!("Substrait filters are not supported in DeleteBuilder")
+            }
+        }
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) =
@@ -247,10 +266,17 @@ impl RetryExecutor for DeleteJob {
 
     async fn commit(&self, dataset: Arc<Dataset>, data: Self::Data) -> Result<Self::Result> {
         let num_deleted_rows = data.num_deleted_rows;
+        let predicate = match &self.filter {
+            ExprFilter::Sql(s) => s.clone(),
+            ExprFilter::Datafusion(expr) => expr.to_string(),
+            ExprFilter::Substrait(_) => {
+                unreachable!("Substrait filters are not supported in DeleteBuilder")
+            }
+        };
         let operation = Operation::Delete {
             updated_fragments: data.updated_fragments,
             deleted_fragment_ids: data.deleted_fragment_ids,
-            predicate: self.predicate.clone(),
+            predicate,
         };
         let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
@@ -821,7 +847,7 @@ mod tests {
         let dataset_arc = Arc::new(dataset);
         let delete_job = DeleteJob {
             dataset: dataset_arc.clone(),
-            predicate: "true".to_string(),
+            filter: ExprFilter::Sql("true".to_string()),
         };
         let delete_data = delete_job.execute_impl().await.unwrap();
 
@@ -864,5 +890,38 @@ mod tests {
             .unwrap();
         // All rows should be deleted, including the updated ones
         assert_eq!(final_result.new_dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_expr_filter() {
+        use datafusion::prelude::{col, lit};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100u32))],
+        )
+        .unwrap();
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+
+        // Delete rows where i < 10 using an Expr filter
+        let expr = col("i").lt(lit(10u32));
+        let result = DeleteBuilder::from_expr(Arc::new(dataset.clone()), expr)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_deleted_rows, 10);
+
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
     }
 }

@@ -13,7 +13,7 @@ The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from lance_namespace import (
     CreateNamespaceRequest,
@@ -47,7 +47,6 @@ from lance_namespace import (
     TableExistsRequest,
 )
 
-from .io import StorageOptionsProvider
 from .lance import PyDirectoryNamespace  # Low-level Rust binding
 
 try:
@@ -64,7 +63,6 @@ __all__ = [
     "DirectoryNamespace",
     "RestNamespace",
     "RestAdapter",
-    "LanceNamespaceStorageOptionsProvider",
     "DynamicContextProvider",
 ]
 
@@ -265,6 +263,16 @@ class DirectoryNamespace(LanceNamespace):
                 - credential_vendor.azure_duration_millis (optional): Duration in ms
                   (default: 3600000, up to 7 days)
 
+        Testing properties:
+            - ops_metrics_enabled (optional): "true" to enable operation metrics
+              tracking. Use `retrieve_ops_metrics()` to get call counts.
+            - vend_input_storage_options (optional): "true" to return input storage
+              options in describe_table() when no credential vendor is configured.
+              Useful for testing credential refresh.
+            - vend_input_storage_options_refresh_interval_millis (optional): When set
+              with vend_input_storage_options, adds expires_at_millis to storage
+              options. Value is current_time_millis + this interval.
+
     Examples
     --------
     >>> import lance.namespace
@@ -450,6 +458,33 @@ class DirectoryNamespace(LanceNamespace):
             - deleted_versions: List[int] - List of successfully deleted versions
         """
         return self._inner.batch_delete_table_versions(request)
+
+    # Operation metrics methods
+
+    def retrieve_ops_metrics(self) -> Dict[str, int]:
+        """Retrieve operation metrics as a dictionary.
+
+        Returns a dict where keys are operation names (e.g., "list_tables",
+        "describe_table") and values are the number of times each operation
+        was called.
+
+        Returns an empty dict if `ops_metrics_enabled` was false when creating
+        the namespace.
+
+        Returns
+        -------
+        Dict[str, int]
+            Operation name to call count mapping
+        """
+        return self._inner.retrieve_ops_metrics()
+
+    def reset_ops_metrics(self) -> None:
+        """Reset all operation metrics counters to zero.
+
+        Does nothing if `ops_metrics_enabled` was false when creating the
+        namespace.
+        """
+        self._inner.reset_ops_metrics()
 
 
 class RestNamespace(LanceNamespace):
@@ -658,6 +693,33 @@ class RestNamespace(LanceNamespace):
         """
         return self._inner.batch_delete_table_versions(request)
 
+    # Operation metrics methods
+
+    def retrieve_ops_metrics(self) -> Dict[str, int]:
+        """Retrieve operation metrics as a dictionary.
+
+        Returns a dict where keys are operation names (e.g., "list_tables",
+        "describe_table") and values are the number of times each operation
+        was called.
+
+        Returns an empty dict if `ops_metrics_enabled` was false when creating
+        the namespace.
+
+        Returns
+        -------
+        Dict[str, int]
+            Operation name to call count mapping
+        """
+        return self._inner.retrieve_ops_metrics()
+
+    def reset_ops_metrics(self) -> None:
+        """Reset all operation metrics counters to zero.
+
+        Does nothing if `ops_metrics_enabled` was false when creating the
+        namespace.
+        """
+        self._inner.reset_ops_metrics()
+
 
 class RestAdapter:
     """REST adapter server that creates a namespace backend and exposes it via REST.
@@ -669,11 +731,12 @@ class RestAdapter:
 
     Parameters
     ----------
-    namespace_impl : str
-        Namespace implementation type ("dir", "rest", etc.)
-    namespace_properties : dict, optional
-        Configuration properties for the backend namespace.
+    namespace_client_impl : str
+        Namespace client implementation type ("dir", "rest", etc.)
+    namespace_client_properties : dict, optional
+        Configuration properties for the backend namespace client.
         For DirectoryNamespace ("dir"):
+
         - root (required): Root directory path or URI
         - manifest_enabled (optional): Enable manifest tracking (default: "true")
         - dir_listing_enabled (optional): Enable directory listing fallback
@@ -701,8 +764,8 @@ class RestAdapter:
 
     def __init__(
         self,
-        namespace_impl: str,
-        namespace_properties: Dict[str, str] = None,
+        namespace_client_impl: str,
+        namespace_client_properties: Dict[str, str] = None,
         session=None,
         host: str = None,
         port: int = None,
@@ -715,14 +778,18 @@ class RestAdapter:
             )
 
         # Convert to string properties
-        if namespace_properties is None:
-            namespace_properties = {}
-        str_properties = {str(k): str(v) for k, v in namespace_properties.items()}
+        if namespace_client_properties is None:
+            namespace_client_properties = {}
+        str_properties = {
+            str(k): str(v) for k, v in namespace_client_properties.items()
+        }
 
         # Create the underlying Rust adapter
-        self._inner = PyRestAdapter(namespace_impl, str_properties, session, host, port)
+        self._inner = PyRestAdapter(
+            namespace_client_impl, str_properties, session, host, port
+        )
         self.host = host
-        self.namespace_impl = namespace_impl
+        self.namespace_client_impl = namespace_client_impl
 
     @property
     def port(self) -> int:
@@ -752,117 +819,3 @@ class RestAdapter:
 
     def __repr__(self) -> str:
         return f"RestAdapter(host='{self.host}', port={self.port})"
-
-
-class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
-    """Storage options provider that fetches storage options from a LanceNamespace.
-
-    This provider automatically fetches fresh storage options by calling the
-    namespace's describe_table() method, which returns both the table location
-    and time-limited storage options. This is currently only used for refreshing
-    AWS temporary access credentials.
-
-    This is the recommended approach for LanceDB Cloud and other namespace-based
-    deployments, as it handles storage options refresh automatically.
-
-    Parameters
-    ----------
-    namespace : LanceNamespace
-        The namespace instance to fetch storage options from. Use
-        lance.namespace.connect() to create a namespace instance.
-    table_id : List[str]
-        The table identifier (e.g., ["workspace", "table_name"])
-
-    Example
-    -------
-    This example shows how to use the storage options provider with a namespace.
-
-    .. code-block:: python
-
-        import lance
-        import lance.namespace
-
-        # Connect to a namespace
-        namespace = lance.namespace.connect("rest", {"uri": "http://localhost:4099"})
-
-        # Create storage options provider
-        provider = lance.LanceNamespaceStorageOptionsProvider(
-            namespace=namespace,
-            table_id=["workspace", "table_name"]
-        )
-
-        # Use with dataset - storage options auto-refresh!
-        dataset = lance.dataset(
-            "s3://bucket/table.lance",
-            storage_options_provider=provider
-        )
-    """
-
-    def __init__(self, namespace: LanceNamespace, table_id: List[str]):
-        """Initialize with namespace and table ID.
-
-        Parameters
-        ----------
-        namespace : LanceNamespace
-            The namespace instance with a describe_table() method
-        table_id : List[str]
-            The table identifier
-        """
-        self._namespace = namespace
-        self._table_id = table_id
-
-    def fetch_storage_options(self) -> Dict[str, str]:
-        """Fetch storage options from the namespace.
-
-        This calls namespace.describe_table() to get the latest storage options
-        and optionally their expiration time.
-
-        Returns
-        -------
-        Dict[str, str]
-            Flat dictionary of string key-value pairs containing storage options.
-            May optionally include expires_at_millis. If expires_at_millis is not
-            provided, credentials are treated as non-expiring and will not be
-            automatically refreshed.
-
-        Raises
-        ------
-        RuntimeError
-            If the namespace doesn't return storage options
-        """
-        request = DescribeTableRequest(id=self._table_id, version=None)
-        response = self._namespace.describe_table(request)
-        storage_options = response.storage_options
-        if storage_options is None:
-            raise RuntimeError(
-                "Namespace did not return storage_options. "
-                "Ensure the namespace supports storage options providing."
-            )
-
-        # Return the storage_options directly - it's already a flat Map<String, String>
-        # Note: expires_at_millis is optional. If not provided, credentials are treated
-        # as non-expiring and will not be automatically refreshed.
-        return storage_options
-
-    def provider_id(self) -> str:
-        """Return a human-readable unique identifier for this provider instance.
-
-        This creates a semantic ID based on the namespace's ID and the table ID,
-        enabling proper equality comparison and caching.
-
-        Returns
-        -------
-        str
-            A human-readable unique identifier string combining namespace and table info
-        """
-        # Try to call namespace_id() if available (lance-namespace >= 0.0.20)
-        if hasattr(self._namespace, "namespace_id"):
-            namespace_id = self._namespace.namespace_id()
-        else:
-            # Fallback for older namespace versions
-            namespace_id = str(self._namespace)
-
-        return (
-            f"LanceNamespaceStorageOptionsProvider {{ "
-            f"namespace: {namespace_id}, table_id: {self._table_id!r} }}"
-        )

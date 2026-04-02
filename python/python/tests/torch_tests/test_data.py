@@ -12,7 +12,11 @@ import pytest
 from lance.sampler import ShardedBatchSampler, ShardedFragmentSampler
 
 torch = pytest.importorskip("torch")
-from lance.torch.data import LanceDataset, SafeLanceDataset  # noqa: E402
+from lance.torch.data import (  # noqa: E402
+    LanceDataset,
+    SafeLanceDataset,
+    _bf16_to_tensor,
+)
 
 
 def test_iter_over_dataset_fixed_shape_tensor(tmp_path):
@@ -324,6 +328,95 @@ def test_blob_api(tmp_path: Path):
     assert first["int"].shape == (4,)
     assert first["val"].dtype == torch.uint8
     assert first["val"].shape == (4, 100)
+
+
+def test_iter_over_dataset_bfloat16(tmp_path):
+    """Test that bfloat16 vector columns convert to torch.bfloat16 tensors."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from lance.arrow import BFloat16Array
+
+    dim = 32
+    num_rows = 128
+    # Create random bfloat16 vectors via float32 → bfloat16 cast
+    f32_data = np.random.random(num_rows * dim).astype("f")
+    bf16_data = f32_data.astype(ml_dtypes.bfloat16)
+
+    # Build a FixedSizeList<bf16> column
+    inner = BFloat16Array.from_numpy(bf16_data)
+    fsl = pa.FixedSizeListArray.from_arrays(inner, dim)
+    ids = pa.array(range(num_rows), type=pa.int32())
+    tbl = pa.Table.from_arrays([ids, fsl], ["ids", "vec"])
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+
+    torch_ds = LanceDataset(ds, batch_size=16, columns=["ids", "vec"])
+
+    total_rows = 0
+    for batch in torch_ds:
+        assert set(batch.keys()) == {"ids", "vec"}
+        assert batch["vec"].dtype == torch.bfloat16
+        assert batch["vec"].shape[1] == dim
+        assert batch["ids"].dtype == torch.int32
+        total_rows += batch["vec"].shape[0]
+    assert total_rows == num_rows
+
+
+def test_scalar_bfloat16_column(tmp_path):
+    """Test that a scalar bfloat16 column converts to torch.bfloat16 tensor."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from lance.arrow import BFloat16Array
+
+    num_rows = 64
+    f32_data = np.random.random(num_rows).astype("f")
+    bf16_data = f32_data.astype(ml_dtypes.bfloat16)
+
+    arr = BFloat16Array.from_numpy(bf16_data)
+    tbl = pa.Table.from_arrays([arr], ["val"])
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance")
+
+    torch_ds = LanceDataset(ds, batch_size=16, columns=["val"])
+
+    total_rows = 0
+    for batch in torch_ds:
+        assert batch.dtype == torch.bfloat16
+        total_rows += batch.shape[0]
+    assert total_rows == num_rows
+
+
+def test_bf16_to_tensor_zero_copy_without_nulls():
+    """Non-null bf16 arrays should alias the Arrow data buffer."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from lance.arrow import BFloat16Array
+
+    values = np.array([1.0, 2.0, 3.0, 4.0], dtype=ml_dtypes.bfloat16)
+    arr = BFloat16Array.from_numpy(values).slice(1, 2)
+
+    tensor = _bf16_to_tensor(arr)
+
+    assert tensor.dtype == torch.bfloat16
+    assert torch.equal(
+        tensor.to(torch.float32),
+        torch.tensor([2.0, 3.0], dtype=torch.float32),
+    )
+    assert (
+        tensor.data_ptr() == arr.storage.buffers()[1].address + arr.storage.offset * 2
+    )
+
+
+def test_bf16_to_tensor_clones_when_nulls_present():
+    """Null replacement requires a writable tensor, so the Arrow buffer is cloned."""
+    arr = lance.arrow.bfloat16_array([1.0, None, 3.0])
+
+    tensor = _bf16_to_tensor(arr)
+
+    assert tensor.dtype == torch.bfloat16
+    assert (
+        tensor.data_ptr() != arr.storage.buffers()[1].address + arr.storage.offset * 2
+    )
+    assert tensor[0].to(torch.float32).item() == pytest.approx(1.0)
+    assert torch.isnan(tensor[1])
+    assert tensor[2].to(torch.float32).item() == pytest.approx(3.0)
 
 
 def test_safe_lance_dataset_worker_uses_dataset_options(tmp_path: Path):

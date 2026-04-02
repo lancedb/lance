@@ -8,36 +8,53 @@ This module tests the DirectoryNamespace class which provides a directory-based
 namespace implementation for organizing Lance tables and nested namespaces.
 
 These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
+
+Additionally, tests are parameterized to run with both the native DirectoryNamespace
+and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
+custom namespace implementations.
 """
 
 import sys
 import tempfile
 import uuid
 from threading import Lock
+from typing import Dict, Optional
 
 import lance
 import lance.namespace
 import pyarrow as pa
 import pytest
+from lance.namespace import LanceNamespace
 from lance_namespace import (
     CreateNamespaceRequest,
+    CreateNamespaceResponse,
     CreateTableRequest,
+    CreateTableResponse,
     CreateTableVersionRequest,
     CreateTableVersionResponse,
     DeclareTableRequest,
+    DeclareTableResponse,
     DeregisterTableRequest,
+    DeregisterTableResponse,
     DescribeNamespaceRequest,
+    DescribeNamespaceResponse,
     DescribeTableRequest,
+    DescribeTableResponse,
     DescribeTableVersionRequest,
     DescribeTableVersionResponse,
     DropNamespaceRequest,
+    DropNamespaceResponse,
     DropTableRequest,
+    DropTableResponse,
     ListNamespacesRequest,
+    ListNamespacesResponse,
     ListTablesRequest,
+    ListTablesResponse,
     ListTableVersionsRequest,
     ListTableVersionsResponse,
     NamespaceExistsRequest,
     RegisterTableRequest,
+    RegisterTableResponse,
     TableExistsRequest,
     connect,
 )
@@ -47,6 +64,86 @@ from lance_namespace.errors import (
     NamespaceNotFoundError,
     TableNotFoundError,
 )
+
+
+class CustomNamespace(LanceNamespace):
+    """A custom namespace wrapper that delegates to DirectoryNamespace.
+
+    This class verifies that the Python-Rust binding works correctly for
+    custom namespace implementations that wrap the native DirectoryNamespace.
+    All methods simply delegate to the underlying DirectoryNamespace instance.
+    """
+
+    def __init__(self, inner: lance.namespace.DirectoryNamespace):
+        self._inner = inner
+
+    def namespace_id(self) -> str:
+        return f"CustomNamespace[{self._inner.namespace_id()}]"
+
+    def create_namespace(
+        self, request: CreateNamespaceRequest
+    ) -> CreateNamespaceResponse:
+        return self._inner.create_namespace(request)
+
+    def describe_namespace(
+        self, request: DescribeNamespaceRequest
+    ) -> DescribeNamespaceResponse:
+        return self._inner.describe_namespace(request)
+
+    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+        return self._inner.namespace_exists(request)
+
+    def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
+        return self._inner.drop_namespace(request)
+
+    def list_namespaces(self, request: ListNamespacesRequest) -> ListNamespacesResponse:
+        return self._inner.list_namespaces(request)
+
+    def create_table(
+        self, request: CreateTableRequest, data: bytes
+    ) -> CreateTableResponse:
+        return self._inner.create_table(request, data)
+
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        return self._inner.declare_table(request)
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        return self._inner.describe_table(request)
+
+    def table_exists(self, request: TableExistsRequest) -> None:
+        return self._inner.table_exists(request)
+
+    def drop_table(self, request: DropTableRequest) -> DropTableResponse:
+        return self._inner.drop_table(request)
+
+    def list_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        return self._inner.list_tables(request)
+
+    def register_table(self, request: RegisterTableRequest) -> RegisterTableResponse:
+        return self._inner.register_table(request)
+
+    def deregister_table(
+        self, request: DeregisterTableRequest
+    ) -> DeregisterTableResponse:
+        return self._inner.deregister_table(request)
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        return self._inner.list_table_versions(request)
+
+    def describe_table_version(
+        self, request: DescribeTableVersionRequest
+    ) -> DescribeTableVersionResponse:
+        return self._inner.describe_table_version(request)
+
+    def create_table_version(
+        self, request: CreateTableVersionRequest
+    ) -> CreateTableVersionResponse:
+        return self._inner.create_table_version(request)
+
+    def retrieve_ops_metrics(self) -> Optional[Dict[str, int]]:
+        return self._inner.retrieve_ops_metrics()
 
 
 def create_test_data():
@@ -70,42 +167,57 @@ def table_to_ipc_bytes(table):
     return sink.getvalue()
 
 
-@pytest.fixture
-def temp_namespace():
-    """Create a temporary DirectoryNamespace for testing."""
+def _wrap_if_custom(ns_client, use_custom: bool):
+    """Wrap namespace client in CustomNamespace if use_custom is True."""
+    if use_custom:
+        return CustomNamespace(ns_client)
+    return ns_client
+
+
+@pytest.fixture(params=[False, True], ids=["DirectoryNamespace", "CustomNamespace"])
+def temp_ns_client(request):
+    """Create a temporary namespace client for testing.
+
+    Parameterized to test both DirectoryNamespace and CustomNamespace wrapper.
+    """
+    use_custom = request.param
     with tempfile.TemporaryDirectory() as tmpdir:
         # Use lance.namespace.connect() for consistency
         # Use high commit_retries for concurrent operation tests
-        ns = connect(
+        ns_client = connect(
             "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
         )
-        yield ns
+        yield _wrap_if_custom(ns_client, use_custom)
 
 
-@pytest.fixture
-def memory_namespace():
-    """Create a memory-based DirectoryNamespace for testing."""
+@pytest.fixture(params=[False, True], ids=["DirectoryNamespace", "CustomNamespace"])
+def memory_ns_client(request):
+    """Create a memory-based namespace client for testing.
+
+    Parameterized to test both DirectoryNamespace and CustomNamespace wrapper.
+    """
+    use_custom = request.param
     unique_id = uuid.uuid4().hex[:8]
     # Use lance.namespace.connect() for consistency
-    ns = connect("dir", {"root": f"memory://test_{unique_id}"})
-    yield ns
+    ns_client = connect("dir", {"root": f"memory://test_{unique_id}"})
+    yield _wrap_if_custom(ns_client, use_custom)
 
 
 class TestCreateTable:
     """Tests for create_table operation - mirrors Rust test_create_table."""
 
-    def test_create_table(self, memory_namespace):
+    def test_create_table(self, memory_ns_client):
         """Test creating a table with data."""
         # Create parent namespace first
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create table with data
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
 
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        response = memory_namespace.create_table(create_req, ipc_data)
+        response = memory_ns_client.create_table(create_req, ipc_data)
 
         assert response is not None
         assert response.location is not None
@@ -114,20 +226,20 @@ class TestCreateTable:
         assert "test_table" in response.location
         assert response.version == 1
 
-    def test_create_table_without_data(self, memory_namespace):
+    def test_create_table_without_data(self, memory_ns_client):
         """Test creating a table without data should fail."""
         # Create parent namespace first
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         create_req = CreateTableRequest(id=["workspace", "test_table"])
 
         with pytest.raises(InvalidInputError) as exc_info:
-            memory_namespace.create_table(create_req, b"")
+            memory_ns_client.create_table(create_req, b"")
 
         assert "Arrow IPC" in str(exc_info.value) or "required" in str(exc_info.value)
 
-    def test_create_table_with_invalid_id(self, memory_namespace):
+    def test_create_table_with_invalid_id(self, memory_ns_client):
         """Test creating a table with invalid ID should fail."""
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
@@ -135,19 +247,19 @@ class TestCreateTable:
         # Test with empty ID
         create_req = CreateTableRequest(id=[])
         with pytest.raises(InvalidInputError):
-            memory_namespace.create_table(create_req, ipc_data)
+            memory_ns_client.create_table(create_req, ipc_data)
 
-    def test_create_table_in_child_namespace(self, memory_namespace):
+    def test_create_table_in_child_namespace(self, memory_ns_client):
         """Test creating table in child namespace works with manifest enabled."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["test_namespace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create table in the namespace
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["test_namespace", "table"])
-        response = memory_namespace.create_table(create_req, ipc_data)
+        response = memory_ns_client.create_table(create_req, ipc_data)
 
         # Should succeed with manifest enabled
         assert response is not None
@@ -157,52 +269,52 @@ class TestCreateTable:
 class TestListTables:
     """Tests for list_tables operation - mirrors Rust test_list_tables."""
 
-    def test_list_tables_empty(self, memory_namespace):
+    def test_list_tables_empty(self, memory_ns_client):
         """Test listing tables in empty namespace."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Initially, no tables
         list_req = ListTablesRequest(id=["workspace"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
         assert len(response.tables) == 0
 
-    def test_list_tables_with_tables(self, memory_namespace):
+    def test_list_tables_with_tables(self, memory_ns_client):
         """Test listing tables after creating them."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
 
         # Create table1
         create_req = CreateTableRequest(id=["workspace", "table1"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Create table2
         create_req = CreateTableRequest(id=["workspace", "table2"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # List tables should return both
         list_req = ListTablesRequest(id=["workspace"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
         assert len(response.tables) == 2
 
         # List tables returns table names as strings
         assert "table1" in response.tables
         assert "table2" in response.tables
 
-    def test_list_tables_with_namespace_id(self, memory_namespace):
+    def test_list_tables_with_namespace_id(self, memory_ns_client):
         """Test listing tables in a child namespace."""
         # Create child namespace
         create_ns_req = CreateNamespaceRequest(id=["test_namespace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # List tables in the child namespace
         list_req = ListTablesRequest(id=["test_namespace"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
 
         # Should succeed and return empty list (no tables yet)
         assert len(response.tables) == 0
@@ -211,100 +323,100 @@ class TestListTables:
 class TestDescribeTable:
     """Tests for describe_table operation - mirrors Rust test_describe_table."""
 
-    def test_describe_table(self, memory_namespace):
+    def test_describe_table(self, memory_ns_client):
         """Test describing a table."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create a table
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Describe the table
         describe_req = DescribeTableRequest(id=["workspace", "test_table"])
-        response = memory_namespace.describe_table(describe_req)
+        response = memory_ns_client.describe_table(describe_req)
 
         assert response is not None
         assert response.location is not None
         assert "test_table" in response.location
 
-    def test_describe_nonexistent_table(self, memory_namespace):
+    def test_describe_nonexistent_table(self, memory_ns_client):
         """Test describing a table that doesn't exist."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         describe_req = DescribeTableRequest(id=["workspace", "nonexistent"])
 
         with pytest.raises(TableNotFoundError):
-            memory_namespace.describe_table(describe_req)
+            memory_ns_client.describe_table(describe_req)
 
 
 class TestTableOperations:
     """Tests for various table operations."""
 
-    def test_table_exists(self, memory_namespace):
+    def test_table_exists(self, memory_ns_client):
         """Test checking if a table exists."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create a table
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Check it exists (should not raise)
         exists_req = TableExistsRequest(id=["workspace", "test_table"])
-        memory_namespace.table_exists(exists_req)
+        memory_ns_client.table_exists(exists_req)
 
-    def test_table_not_exists(self, memory_namespace):
+    def test_table_not_exists(self, memory_ns_client):
         """Test checking if a non-existent table exists raises TableNotFoundError."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         exists_req = TableExistsRequest(id=["workspace", "nonexistent"])
 
         with pytest.raises(TableNotFoundError):
-            memory_namespace.table_exists(exists_req)
+            memory_ns_client.table_exists(exists_req)
 
-    def test_drop_table(self, memory_namespace):
+    def test_drop_table(self, memory_ns_client):
         """Test dropping a table."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create table
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Drop the table
         drop_req = DropTableRequest(id=["workspace", "test_table"])
-        response = memory_namespace.drop_table(drop_req)
+        response = memory_ns_client.drop_table(drop_req)
         assert response is not None
 
         # Verify table no longer exists
         exists_req = TableExistsRequest(id=["workspace", "test_table"])
         with pytest.raises(TableNotFoundError):
-            memory_namespace.table_exists(exists_req)
+            memory_ns_client.table_exists(exists_req)
 
-    def test_deregister_table(self, temp_namespace):
+    def test_deregister_table(self, temp_ns_client):
         """Test deregistering a table."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_namespace.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         # Create table using lance directly
         table_data = create_test_data()
         # Get root path from namespace
-        ns_id = temp_namespace.namespace_id()
+        ns_id = temp_ns_client.namespace_id()
         import re
 
         match = re.search(r'root: "([^"]+)"', ns_id)
@@ -319,11 +431,11 @@ class TestTableOperations:
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="workspace/physical_table.lance"
         )
-        temp_namespace.register_table(register_req)
+        temp_ns_client.register_table(register_req)
 
         # Deregister it
         deregister_req = DeregisterTableRequest(id=["workspace", "test_table"])
-        response = temp_namespace.deregister_table(deregister_req)
+        response = temp_ns_client.deregister_table(deregister_req)
         assert response is not None
         # Should return full URI to deregistered table
         # (use endswith to handle path canonicalization)
@@ -333,15 +445,15 @@ class TestTableOperations:
         )
         assert response.id == ["workspace", "test_table"]
 
-    def test_register_table(self, temp_namespace):
+    def test_register_table(self, temp_ns_client):
         """Test registering an existing table."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_namespace.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         # Create physical table using lance
         table_data = create_test_data()
-        ns_id = temp_namespace.namespace_id()
+        ns_id = temp_ns_client.namespace_id()
         import re
 
         match = re.search(r'root: "([^"]+)"', ns_id)
@@ -357,17 +469,17 @@ class TestTableOperations:
             id=["workspace", "registered_table"],
             location="workspace/physical_table.lance",
         )
-        response = temp_namespace.register_table(register_req)
+        response = temp_ns_client.register_table(register_req)
         assert response is not None
         assert response.location == "workspace/physical_table.lance"
 
         # Verify table exists
         exists_req = TableExistsRequest(id=["workspace", "registered_table"])
-        temp_namespace.table_exists(exists_req)
+        temp_ns_client.table_exists(exists_req)
 
         # Verify we can read from it
         describe_req = DescribeTableRequest(id=["workspace", "registered_table"])
-        desc_response = temp_namespace.describe_table(describe_req)
+        desc_response = temp_ns_client.describe_table(describe_req)
         assert desc_response is not None
         # Should point to the same physical location
         # (use endswith to handle path canonicalization)
@@ -376,57 +488,57 @@ class TestTableOperations:
             f"got {desc_response.location}"
         )
 
-    def test_register_table_rejects_absolute_uri(self, temp_namespace):
+    def test_register_table_rejects_absolute_uri(self, temp_ns_client):
         """Test that register_table rejects absolute URIs."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_namespace.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         # Try to register with absolute URI - should fail
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="s3://bucket/table.lance"
         )
         with pytest.raises(InvalidInputError) as exc_info:
-            temp_namespace.register_table(register_req)
+            temp_ns_client.register_table(register_req)
         assert "Absolute URIs are not allowed" in str(exc_info.value)
 
-    def test_register_table_rejects_absolute_path(self, temp_namespace):
+    def test_register_table_rejects_absolute_path(self, temp_ns_client):
         """Test that register_table rejects absolute paths."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_namespace.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         # Try to register with absolute path - should fail
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="/tmp/table.lance"
         )
         with pytest.raises(InvalidInputError) as exc_info:
-            temp_namespace.register_table(register_req)
+            temp_ns_client.register_table(register_req)
         assert "Absolute paths are not allowed" in str(exc_info.value)
 
-    def test_register_table_rejects_path_traversal(self, temp_namespace):
+    def test_register_table_rejects_path_traversal(self, temp_ns_client):
         """Test that register_table rejects path traversal attempts."""
         # Create parent namespace
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_namespace.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         # Try to register with path traversal - should fail
         register_req = RegisterTableRequest(
             id=["workspace", "test_table"], location="../outside/table.lance"
         )
         with pytest.raises(InvalidInputError) as exc_info:
-            temp_namespace.register_table(register_req)
+            temp_ns_client.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
 
 
 class TestChildNamespaceOperations:
     """Tests for operations in child namespaces - mirrors Rust tests."""
 
-    def test_create_table_in_child_namespace(self, memory_namespace):
+    def test_create_table_in_child_namespace(self, memory_ns_client):
         """Test creating multiple tables in a child namespace."""
         # Create child namespace
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
@@ -434,11 +546,11 @@ class TestChildNamespaceOperations:
         # Create three tables
         for i in range(1, 4):
             create_req = CreateTableRequest(id=["test_ns", f"table{i}"])
-            memory_namespace.create_table(create_req, ipc_data)
+            memory_ns_client.create_table(create_req, ipc_data)
 
         # List tables
         list_req = ListTablesRequest(id=["test_ns"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
 
         assert len(response.tables) == 3
         # List tables returns table names as strings
@@ -446,40 +558,40 @@ class TestChildNamespaceOperations:
         assert "table2" in response.tables
         assert "table3" in response.tables
 
-    def test_drop_table_in_child_namespace(self, memory_namespace):
+    def test_drop_table_in_child_namespace(self, memory_ns_client):
         """Test dropping a table in a child namespace."""
         # Create child namespace
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create table
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["test_ns", "table1"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Drop table
         drop_req = DropTableRequest(id=["test_ns", "table1"])
-        memory_namespace.drop_table(drop_req)
+        memory_ns_client.drop_table(drop_req)
 
         # Verify table no longer exists
         exists_req = TableExistsRequest(id=["test_ns", "table1"])
         with pytest.raises(TableNotFoundError):
-            memory_namespace.table_exists(exists_req)
+            memory_ns_client.table_exists(exists_req)
 
-    def test_declared_table_in_child_namespace(self, memory_namespace):
+    def test_declared_table_in_child_namespace(self, memory_ns_client):
         """Test declaring a table in a child namespace."""
         # Create child namespace
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Declare table
         declare_req = DeclareTableRequest(id=["test_ns", "declared_table"])
-        memory_namespace.declare_table(declare_req)
+        memory_ns_client.declare_table(declare_req)
 
         # Verify table exists
         exists_req = TableExistsRequest(id=["test_ns", "declared_table"])
-        memory_namespace.table_exists(exists_req)
+        memory_ns_client.table_exists(exists_req)
 
 
 class TestDeeplyNestedNamespaces:
@@ -488,14 +600,14 @@ class TestDeeplyNestedNamespaces:
     Mirrors Rust test_deeply_nested_namespace.
     """
 
-    def test_deeply_nested_namespace(self, memory_namespace):
+    def test_deeply_nested_namespace(self, memory_ns_client):
         """Test creating deeply nested namespace hierarchy."""
         # Create deeply nested namespace hierarchy
-        memory_namespace.create_namespace(CreateNamespaceRequest(id=["level1"]))
-        memory_namespace.create_namespace(
+        memory_ns_client.create_namespace(CreateNamespaceRequest(id=["level1"]))
+        memory_ns_client.create_namespace(
             CreateNamespaceRequest(id=["level1", "level2"])
         )
-        memory_namespace.create_namespace(
+        memory_ns_client.create_namespace(
             CreateNamespaceRequest(id=["level1", "level2", "level3"])
         )
 
@@ -503,17 +615,17 @@ class TestDeeplyNestedNamespaces:
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["level1", "level2", "level3", "table1"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Verify table exists
         exists_req = TableExistsRequest(id=["level1", "level2", "level3", "table1"])
-        memory_namespace.table_exists(exists_req)
+        memory_ns_client.table_exists(exists_req)
 
 
 class TestNamespaceProperties:
     """Tests for namespace properties - mirrors Rust test_namespace_with_properties."""
 
-    def test_namespace_with_properties(self, memory_namespace):
+    def test_namespace_with_properties(self, memory_ns_client):
         """Test creating a namespace with properties."""
         # Create namespace with properties
         properties = {
@@ -522,11 +634,11 @@ class TestNamespaceProperties:
         }
 
         create_req = CreateNamespaceRequest(id=["test_ns"], properties=properties)
-        memory_namespace.create_namespace(create_req)
+        memory_ns_client.create_namespace(create_req)
 
         # Describe namespace and verify properties
         describe_req = DescribeNamespaceRequest(id=["test_ns"])
-        response = memory_namespace.describe_namespace(describe_req)
+        response = memory_ns_client.describe_namespace(describe_req)
 
         assert response.properties is not None
         assert response.properties.get("owner") == "test_user"
@@ -536,121 +648,121 @@ class TestNamespaceProperties:
 class TestNamespaceConstraints:
     """Tests for namespace constraints and isolation."""
 
-    def test_cannot_drop_namespace_with_tables(self, memory_namespace):
+    def test_cannot_drop_namespace_with_tables(self, memory_ns_client):
         """Test that dropping a namespace with tables should fail."""
         # Create namespace
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-        memory_namespace.create_namespace(create_ns_req)
+        memory_ns_client.create_namespace(create_ns_req)
 
         # Create table in namespace
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["test_ns", "table1"])
-        memory_namespace.create_table(create_req, ipc_data)
+        memory_ns_client.create_table(create_req, ipc_data)
 
         # Try to drop namespace - should fail
         drop_req = DropNamespaceRequest(id=["test_ns"])
         with pytest.raises(NamespaceNotEmptyError):
-            memory_namespace.drop_namespace(drop_req)
+            memory_ns_client.drop_namespace(drop_req)
 
-    def test_isolation_between_namespaces(self, memory_namespace):
+    def test_isolation_between_namespaces(self, memory_ns_client):
         """Test that namespaces are isolated from each other."""
         # Create two namespaces
-        memory_namespace.create_namespace(CreateNamespaceRequest(id=["ns1"]))
-        memory_namespace.create_namespace(CreateNamespaceRequest(id=["ns2"]))
+        memory_ns_client.create_namespace(CreateNamespaceRequest(id=["ns1"]))
+        memory_ns_client.create_namespace(CreateNamespaceRequest(id=["ns2"]))
 
         # Create table with same name in both namespaces
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
 
         create_req1 = CreateTableRequest(id=["ns1", "table1"])
-        memory_namespace.create_table(create_req1, ipc_data)
+        memory_ns_client.create_table(create_req1, ipc_data)
 
         create_req2 = CreateTableRequest(id=["ns2", "table1"])
-        memory_namespace.create_table(create_req2, ipc_data)
+        memory_ns_client.create_table(create_req2, ipc_data)
 
         # List tables in each namespace
         list_req = ListTablesRequest(id=["ns1"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
         assert len(response.tables) == 1
         assert "table1" in response.tables
 
         list_req = ListTablesRequest(id=["ns2"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
         assert len(response.tables) == 1
         assert "table1" in response.tables
 
         # Drop table in ns1 shouldn't affect ns2
         drop_req = DropTableRequest(id=["ns1", "table1"])
-        memory_namespace.drop_table(drop_req)
+        memory_ns_client.drop_table(drop_req)
 
         # ns1 should have no tables
         list_req = ListTablesRequest(id=["ns1"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
         assert len(response.tables) == 0
 
         # ns2 should still have the table
         list_req = ListTablesRequest(id=["ns2"])
-        response = memory_namespace.list_tables(list_req)
+        response = memory_ns_client.list_tables(list_req)
         assert len(response.tables) == 1
 
 
 class TestBasicNamespaceOperations:
     """Tests for basic namespace CRUD operations."""
 
-    def test_create_and_describe_namespace(self, memory_namespace):
+    def test_create_and_describe_namespace(self, memory_ns_client):
         """Test creating and describing a namespace."""
         # Create namespace
         create_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_req)
+        memory_ns_client.create_namespace(create_req)
 
         # Describe it
         describe_req = DescribeNamespaceRequest(id=["workspace"])
-        response = memory_namespace.describe_namespace(describe_req)
+        response = memory_ns_client.describe_namespace(describe_req)
         assert response is not None
 
-    def test_namespace_exists(self, memory_namespace):
+    def test_namespace_exists(self, memory_ns_client):
         """Test checking if a namespace exists."""
         # Create namespace
         create_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_req)
+        memory_ns_client.create_namespace(create_req)
 
         # Check it exists (should not raise)
         exists_req = NamespaceExistsRequest(id=["workspace"])
-        memory_namespace.namespace_exists(exists_req)
+        memory_ns_client.namespace_exists(exists_req)
 
-    def test_namespace_not_exists(self, memory_namespace):
+    def test_namespace_not_exists(self, memory_ns_client):
         """Test that a non-existent namespace raises NamespaceNotFoundError."""
         exists_req = NamespaceExistsRequest(id=["nonexistent"])
 
         with pytest.raises(NamespaceNotFoundError):
-            memory_namespace.namespace_exists(exists_req)
+            memory_ns_client.namespace_exists(exists_req)
 
-    def test_drop_empty_namespace(self, memory_namespace):
+    def test_drop_empty_namespace(self, memory_ns_client):
         """Test dropping an empty namespace."""
         # Create namespace
         create_req = CreateNamespaceRequest(id=["workspace"])
-        memory_namespace.create_namespace(create_req)
+        memory_ns_client.create_namespace(create_req)
 
         # Drop it
         drop_req = DropNamespaceRequest(id=["workspace"])
-        response = memory_namespace.drop_namespace(drop_req)
+        response = memory_ns_client.drop_namespace(drop_req)
         assert response is not None
 
-    def test_list_namespaces(self, memory_namespace):
+    def test_list_namespaces(self, memory_ns_client):
         """Test listing namespaces."""
         # Create some child namespaces under a parent
-        memory_namespace.create_namespace(CreateNamespaceRequest(id=["parent"]))
-        memory_namespace.create_namespace(
+        memory_ns_client.create_namespace(CreateNamespaceRequest(id=["parent"]))
+        memory_ns_client.create_namespace(
             CreateNamespaceRequest(id=["parent", "child1"])
         )
-        memory_namespace.create_namespace(
+        memory_ns_client.create_namespace(
             CreateNamespaceRequest(id=["parent", "child2"])
         )
 
         # List namespaces under parent
         list_req = ListNamespacesRequest(id=["parent"])
-        response = memory_namespace.list_namespaces(list_req)
+        response = memory_ns_client.list_namespaces(list_req)
 
         assert response is not None
         # Should find the child namespaces
@@ -660,10 +772,11 @@ class TestBasicNamespaceOperations:
 class TestLanceNamespaceConnect:
     """Tests for lance.namespace.connect integration."""
 
-    def test_connect_with_properties(self):
+    @pytest.mark.parametrize(
+        "use_custom", [False, True], ids=["DirectoryNS", "CustomNS"]
+    )
+    def test_connect_with_properties(self, use_custom):
         """Test creating DirectoryNamespace via lance.namespace.connect()."""
-        import uuid
-
         unique_id = uuid.uuid4().hex[:8]
         properties = {
             "root": f"memory://test_connect_{unique_id}",
@@ -673,29 +786,33 @@ class TestLanceNamespaceConnect:
 
         # Connect via lance.namespace.connect
         # should use lance.namespace.DirectoryNamespace
-        ns = connect("dir", properties)
+        inner_ns_client = connect("dir", properties)
 
         # Verify it's a DirectoryNamespace instance
-        assert isinstance(ns, lance.namespace.DirectoryNamespace)
+        assert isinstance(inner_ns_client, lance.namespace.DirectoryNamespace)
+
+        # Wrap if testing CustomNamespace
+        ns_client = _wrap_if_custom(inner_ns_client, use_custom)
 
         # Verify it works
         create_req = CreateTableRequest(id=["test_table"])
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
-        response = ns.create_table(create_req, ipc_data)
+        response = ns_client.create_table(create_req, ipc_data)
         assert response is not None
 
         # Verify we can list the table
         list_req = ListTablesRequest(id=[])
-        list_response = ns.list_tables(list_req)
+        list_response = ns_client.list_tables(list_req)
         assert len(list_response.tables) == 1
         # tables is a list of strings
         assert list_response.tables[0] == "test_table"
 
-    def test_connect_with_storage_options(self):
+    @pytest.mark.parametrize(
+        "use_custom", [False, True], ids=["DirectoryNS", "CustomNS"]
+    )
+    def test_connect_with_storage_options(self, use_custom):
         """Test creating DirectoryNamespace with storage options via connect()."""
-        import uuid
-
         unique_id = uuid.uuid4().hex[:8]
         properties = {
             "root": f"memory://test_storage_{unique_id}",
@@ -703,98 +820,29 @@ class TestLanceNamespaceConnect:
         }
 
         # This should work without errors
-        ns = connect("dir", properties)
-        assert isinstance(ns, lance.namespace.DirectoryNamespace)
+        inner_ns_client = connect("dir", properties)
+        assert isinstance(inner_ns_client, lance.namespace.DirectoryNamespace)
+
+        # Wrap if testing CustomNamespace
+        ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+
+        # Verify it can be used for basic operations
+        create_ns_req = CreateNamespaceRequest(id=["test_ns"])
+        ns_client.create_namespace(create_ns_req)
 
 
-class TableVersionTrackingNamespace(lance.namespace.DirectoryNamespace):
-    """Namespace wrapper that tracks table version API calls.
-
-    Similar to the Rust TrackingNamespace and Java TableVersionTrackingNamespace,
-    this extends DirectoryNamespace with table_version_tracking_enabled=true and
-    counts create_table_version and describe_table_version calls.
-
-    This class implements the JSON bridge methods that PyLanceNamespace calls,
-    allowing API call tracking to work even when the calls go through Rust.
-
-    Unlike a wrapper approach, this extends DirectoryNamespace directly so that
-    Rust can detect it as a DirectoryNamespace subclass and use the native handle.
-    """
-
-    def __init__(self, root: str):
-        dir_props = {
-            "root": root,
-            "table_version_tracking_enabled": "true",
-            "manifest_enabled": "true",
-        }
-        super().__init__(**dir_props)
-        self.create_table_version_count = 0
-        self.describe_table_version_count = 0
-        self.list_table_versions_count = 0
-        self._lock = Lock()
-
-    def namespace_id(self) -> str:
-        return f"TableVersionTrackingNamespace {{ inner: {super().namespace_id()} }}"
-
-    def create_table_version(
-        self, request: CreateTableVersionRequest
-    ) -> CreateTableVersionResponse:
-        with self._lock:
-            self.create_table_version_count += 1
-        return super().create_table_version(request)
-
-    def describe_table_version(
-        self, request: DescribeTableVersionRequest
-    ) -> DescribeTableVersionResponse:
-        with self._lock:
-            self.describe_table_version_count += 1
-        return super().describe_table_version(request)
-
-    def list_table_versions(
-        self, request: ListTableVersionsRequest
-    ) -> ListTableVersionsResponse:
-        with self._lock:
-            self.list_table_versions_count += 1
-        return super().list_table_versions(request)
-
-    # JSON bridge methods for Rust PyLanceNamespace callbacks
-    # These call the parent's _inner (PyDirectoryNamespace) directly with dict API
-    def describe_table_version_json(self, request_json: str) -> str:
-        """JSON bridge that increments counter before delegating."""
-        import json
-
-        with self._lock:
-            self.describe_table_version_count += 1
-        request_dict = json.loads(request_json)
-        response_dict = self._inner.describe_table_version(request_dict)
-        return json.dumps(response_dict)
-
-    def create_table_version_json(self, request_json: str) -> str:
-        """JSON bridge that increments counter before delegating."""
-        import json
-
-        with self._lock:
-            self.create_table_version_count += 1
-        request_dict = json.loads(request_json)
-        response_dict = self._inner.create_table_version(request_dict)
-        return json.dumps(response_dict)
-
-    def list_table_versions_json(self, request_json: str) -> str:
-        """JSON bridge that increments counter before delegating."""
-        import json
-
-        with self._lock:
-            self.list_table_versions_count += 1
-        request_dict = json.loads(request_json)
-        response_dict = self._inner.list_table_versions(request_dict)
-        return json.dumps(response_dict)
+def _get_ops_metric(ns_client, metric_name: str) -> int:
+    """Helper to get a specific metric count from namespace client ops metrics."""
+    metrics = ns_client.retrieve_ops_metrics()
+    return metrics.get(metric_name, 0)
 
 
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="External manifest store has known issues on Windows",
 )
-def test_external_manifest_store_invokes_namespace_apis():
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_external_manifest_store_invokes_namespace_apis(use_custom):
     """Test that namespace APIs are invoked correctly for managed versioning.
 
     This test mirrors:
@@ -805,72 +853,90 @@ def test_external_manifest_store_invokes_namespace_apis():
     1. list_table_versions is called when opening dataset (latest version)
     2. create_table_version is called exactly once during append
     3. describe_table_version is called when opening specific version
+
+    Uses native ops_metrics_enabled to track API calls instead of custom wrapper.
+    The test is parameterized to verify both DirectoryNamespace and CustomNamespace.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        namespace = TableVersionTrackingNamespace(root=tmpdir)
+        # Use native namespace with ops metrics enabled
+        inner_ns_client = lance.namespace.DirectoryNamespace(
+            root=tmpdir,
+            table_version_tracking_enabled="true",
+            manifest_enabled="true",
+            ops_metrics_enabled="true",
+        )
+        ns_client = _wrap_if_custom(inner_ns_client, use_custom)
 
         # Create parent namespace first (like Rust/Java tests)
-        namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+        ns_client.create_namespace(CreateNamespaceRequest(id=["workspace"]))
 
         table_id = ["workspace", "test_table"]
 
         # Create initial table
         table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
         ds = lance.write_dataset(
-            table1, namespace=namespace, table_id=table_id, mode="create"
+            table1, namespace_client=ns_client, table_id=table_id, mode="create"
         )
         assert ds.count_rows() == 2
         assert len(ds.versions()) == 1
 
         # Verify describe_table returns managed_versioning=True
-        describe_resp = namespace.describe_table(DescribeTableRequest(id=table_id))
+        describe_resp = ns_client.describe_table(DescribeTableRequest(id=table_id))
         assert describe_resp.managed_versioning is True, (
             f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
         )
 
         # Open dataset through namespace - should call list_table_versions for latest
-        initial_list_count = namespace.list_table_versions_count
-        ds_from_namespace = lance.dataset(namespace=namespace, table_id=table_id)
-        assert ds_from_namespace.count_rows() == 2
-        assert ds_from_namespace.version == 1
-        assert namespace.list_table_versions_count == initial_list_count + 1, (
-            "list_table_versions should be called once when opening latest version"
-        )
+        # Use inner_ns_client for metrics since CustomNamespace delegates to it
+        initial_list_count = _get_ops_metric(inner_ns_client, "list_table_versions")
+        ds_from_ns_client = lance.dataset(namespace_client=ns_client, table_id=table_id)
+        assert ds_from_ns_client.count_rows() == 2
+        assert ds_from_ns_client.version == 1
+        assert (
+            _get_ops_metric(inner_ns_client, "list_table_versions")
+            == initial_list_count + 1
+        ), "list_table_versions should be called once when opening latest version"
 
         # Verify create_table_version was called once during CREATE
-        assert namespace.create_table_version_count == 1, (
+        assert _get_ops_metric(inner_ns_client, "create_table_version") == 1, (
             "create_table_version should have been called once during CREATE"
         )
 
         # Append data - should call create_table_version again
         table2 = pa.Table.from_pylist([{"a": 100, "b": 200}, {"a": 1000, "b": 2000}])
         ds = lance.write_dataset(
-            table2, namespace=namespace, table_id=table_id, mode="append"
+            table2, namespace_client=ns_client, table_id=table_id, mode="append"
         )
         assert ds.count_rows() == 4
         assert len(ds.versions()) == 2
 
-        assert namespace.create_table_version_count == 2, (
+        assert _get_ops_metric(inner_ns_client, "create_table_version") == 2, (
             "create_table_version should be called twice (CREATE + APPEND)"
         )
 
         # Open latest version - should call list_table_versions
-        list_count_before_latest = namespace.list_table_versions_count
-        latest_ds = lance.dataset(namespace=namespace, table_id=table_id)
+        list_count_before_latest = _get_ops_metric(
+            inner_ns_client, "list_table_versions"
+        )
+        latest_ds = lance.dataset(namespace_client=ns_client, table_id=table_id)
         assert latest_ds.count_rows() == 4
         assert latest_ds.version == 2
-        assert namespace.list_table_versions_count == list_count_before_latest + 1, (
-            "list_table_versions should be called once when opening latest version"
-        )
+        assert (
+            _get_ops_metric(inner_ns_client, "list_table_versions")
+            == list_count_before_latest + 1
+        ), "list_table_versions should be called once when opening latest version"
 
         # Open specific version (v1) - should call describe_table_version
-        describe_count_before_v1 = namespace.describe_table_version_count
-        v1_ds = lance.dataset(namespace=namespace, table_id=table_id, version=1)
+        describe_count_before_v1 = _get_ops_metric(
+            inner_ns_client, "describe_table_version"
+        )
+        v1_ds = lance.dataset(namespace_client=ns_client, table_id=table_id, version=1)
         assert v1_ds.count_rows() == 2
         assert v1_ds.version == 1
-        assert namespace.describe_table_version_count == describe_count_before_v1 + 1, (
-            "describe_table_version should be called once when opening version 1"
-        )
+        assert (
+            _get_ops_metric(inner_ns_client, "describe_table_version")
+            == describe_count_before_v1 + 1
+        ), "describe_table_version should be called once when opening version 1"
 
 
 @pytest.mark.skipif(
@@ -882,16 +948,18 @@ class TestConcurrentOperations:
 
     These tests mirror the Rust and Java concurrent tests to ensure
     the DirectoryNamespace handles concurrent create/drop operations correctly.
+    Tests are parameterized via temp_ns_client fixture to test both
+    DirectoryNamespace and CustomNamespace.
     """
 
-    def test_concurrent_create_and_drop_single_instance(self, temp_namespace):
+    def test_concurrent_create_and_drop_single_instance(self, temp_ns_client):
         """Test concurrent create/drop with single namespace instance."""
         import concurrent.futures
 
         # Initialize namespace first - create parent namespace to ensure __manifest
         # table is created before concurrent operations
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-        temp_namespace.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         num_tables = 10
         success_count = 0
@@ -908,11 +976,11 @@ class TestConcurrentOperations:
 
                 # Create table
                 create_req = CreateTableRequest(id=table_id)
-                temp_namespace.create_table(create_req, ipc_data)
+                temp_ns_client.create_table(create_req, ipc_data)
 
                 # Drop table
                 drop_req = DropTableRequest(id=table_id)
-                temp_namespace.drop_table(drop_req)
+                temp_ns_client.drop_table(drop_req)
 
                 with lock:
                     success_count += 1
@@ -934,22 +1002,26 @@ class TestConcurrentOperations:
 
         # Verify all tables are dropped
         list_req = ListTablesRequest(id=["test_ns"])
-        response = temp_namespace.list_tables(list_req)
+        response = temp_ns_client.list_tables(list_req)
         assert len(response.tables) == 0, "All tables should be dropped"
 
-    def test_concurrent_create_and_drop_multiple_instances(self):
+    @pytest.mark.parametrize(
+        "use_custom", [False, True], ids=["DirectoryNS", "CustomNS"]
+    )
+    def test_concurrent_create_and_drop_multiple_instances(self, use_custom):
         """Test concurrent create/drop with multiple namespace instances."""
         import concurrent.futures
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Initialize namespace first with a single instance to ensure __manifest
             # table is created and parent namespace exists before concurrent operations
-            init_ns = connect(
+            init_ns_client = connect(
                 "dir",
                 {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
             )
+            init_ns_client = _wrap_if_custom(init_ns_client, use_custom)
             create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-            init_ns.create_namespace(create_ns_req)
+            init_ns_client.create_namespace(create_ns_req)
 
             num_tables = 10
             success_count = 0
@@ -959,12 +1031,13 @@ class TestConcurrentOperations:
             def create_and_drop_table(table_index):
                 nonlocal success_count, fail_count
                 try:
-                    # Each thread creates its own namespace instance
+                    # Each thread creates its own namespace client instance
                     # Use high commit_retries to handle version collisions
-                    ns = connect(
+                    local_ns_client = connect(
                         "dir",
                         {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
                     )
+                    local_ns_client = _wrap_if_custom(local_ns_client, use_custom)
 
                     table_name = f"multi_ns_table_{table_index}"
                     table_id = ["test_ns", table_name]
@@ -973,11 +1046,11 @@ class TestConcurrentOperations:
 
                     # Create table
                     create_req = CreateTableRequest(id=table_id)
-                    ns.create_table(create_req, ipc_data)
+                    local_ns_client.create_table(create_req, ipc_data)
 
                     # Drop table
                     drop_req = DropTableRequest(id=table_id)
-                    ns.drop_table(drop_req)
+                    local_ns_client.drop_table(drop_req)
 
                     with lock:
                         success_count += 1
@@ -999,27 +1072,32 @@ class TestConcurrentOperations:
             )
             assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
-            # Verify with a fresh namespace instance
-            verify_ns = connect(
+            # Verify with a fresh namespace client instance
+            verify_ns_client = connect(
                 "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
             )
+            verify_ns_client = _wrap_if_custom(verify_ns_client, use_custom)
             list_req = ListTablesRequest(id=["test_ns"])
-            response = verify_ns.list_tables(list_req)
+            response = verify_ns_client.list_tables(list_req)
             assert len(response.tables) == 0, "All tables should be dropped"
 
-    def test_concurrent_create_then_drop_from_different_instance(self):
+    @pytest.mark.parametrize(
+        "use_custom", [False, True], ids=["DirectoryNS", "CustomNS"]
+    )
+    def test_concurrent_create_then_drop_from_different_instance(self, use_custom):
         """Test creating from one set of instances, dropping from different ones."""
         import concurrent.futures
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Initialize namespace first with a single instance to ensure __manifest
             # table is created and parent namespace exists before concurrent operations
-            init_ns = connect(
+            init_ns_client = connect(
                 "dir",
                 {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
             )
+            init_ns_client = _wrap_if_custom(init_ns_client, use_custom)
             create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-            init_ns.create_namespace(create_ns_req)
+            init_ns_client.create_namespace(create_ns_req)
 
             num_tables = 10
 
@@ -1032,10 +1110,11 @@ class TestConcurrentOperations:
                 nonlocal create_success_count, create_fail_count
                 try:
                     # Use high commit_retries to handle version collisions
-                    ns = connect(
+                    local_ns_client = connect(
                         "dir",
                         {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
                     )
+                    local_ns_client = _wrap_if_custom(local_ns_client, use_custom)
 
                     table_name = f"cross_instance_table_{table_index}"
                     table_id = ["test_ns", table_name]
@@ -1043,7 +1122,7 @@ class TestConcurrentOperations:
                     ipc_data = table_to_ipc_bytes(table_data)
 
                     create_req = CreateTableRequest(id=table_id)
-                    ns.create_table(create_req, ipc_data)
+                    local_ns_client.create_table(create_req, ipc_data)
 
                     with create_lock:
                         create_success_count += 1
@@ -1071,16 +1150,17 @@ class TestConcurrentOperations:
                 nonlocal drop_success_count, drop_fail_count
                 try:
                     # Use high commit_retries to handle version collisions
-                    ns = connect(
+                    local_ns_client = connect(
                         "dir",
                         {"root": f"file://{tmpdir}", "commit_retries": "2147483647"},
                     )
+                    local_ns_client = _wrap_if_custom(local_ns_client, use_custom)
 
                     table_name = f"cross_instance_table_{table_index}"
                     table_id = ["test_ns", table_name]
 
                     drop_req = DropTableRequest(id=table_id)
-                    ns.drop_table(drop_req)
+                    local_ns_client.drop_table(drop_req)
 
                     with drop_lock:
                         drop_success_count += 1
@@ -1101,9 +1181,10 @@ class TestConcurrentOperations:
             assert drop_fail_count == 0, f"No drops should fail, got {drop_fail_count}"
 
             # Verify all tables are dropped
-            verify_ns = connect(
+            verify_ns_client = connect(
                 "dir", {"root": f"file://{tmpdir}", "commit_retries": "2147483647"}
             )
+            verify_ns_client = _wrap_if_custom(verify_ns_client, use_custom)
             list_req = ListTablesRequest(id=["test_ns"])
-            response = verify_ns.list_tables(list_req)
+            response = verify_ns_client.list_tables(list_req)
             assert len(response.tables) == 0, "All tables should be dropped"
