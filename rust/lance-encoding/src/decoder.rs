@@ -2029,9 +2029,7 @@ pub fn create_decode_stream(
         .into_stream())
     } else {
         if batch_size_bytes.is_some() {
-            warn!(
-                "batch_size_bytes is not supported for v2.0 (legacy) files and will be ignored"
-            );
+            warn!("batch_size_bytes is not supported for v2.0 (legacy) files and will be ignored");
         }
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
@@ -2863,7 +2861,7 @@ mod tests {
         batch_size: u32,
         batch_size_bytes: Option<u64>,
     ) -> Vec<RecordBatch> {
-        use crate::encoder::{default_encoding_strategy, encode_batch, EncodingOptions};
+        use crate::encoder::{EncodingOptions, default_encoding_strategy, encode_batch};
         use crate::version::LanceFileVersion;
 
         let version = LanceFileVersion::V2_1;
@@ -2879,7 +2877,9 @@ mod tests {
 
         let io_scheduler =
             Arc::new(BufferScheduler::new(encoded.data.clone())) as Arc<dyn EncodingsIo>;
-        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024));
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
         let decoder_plugins = Arc::new(DecoderPlugins::default());
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
@@ -2963,11 +2963,9 @@ mod tests {
 
         // Verify roundtrip: concatenate and compare
         let all_batches: Vec<&RecordBatch> = batches.iter().collect();
-        let concatenated = arrow_select::concat::concat_batches(
-            &batches[0].schema(),
-            all_batches.iter().copied(),
-        )
-        .unwrap();
+        let concatenated =
+            arrow_select::concat::concat_batches(&batches[0].schema(), all_batches.iter().copied())
+                .unwrap();
         assert_eq!(concatenated.num_rows(), num_rows as usize);
         for col in 0..4 {
             assert_eq!(
@@ -2999,8 +2997,7 @@ mod tests {
         let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
 
         // batch_size=250, batch_size_bytes=None => 4 batches of 250 rows
-        let batches =
-            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 250, None).await;
+        let batches = decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 250, None).await;
         assert_eq!(batches.len(), 4);
         for (i, batch) in batches.iter().enumerate() {
             assert_eq!(
@@ -3035,17 +3032,18 @@ mod tests {
         // Schema estimate is 64 bytes/row → first batch ~78 rows (overshoot).
         // After feedback kicks in, batches should converge to ~50 rows.
         let target_bytes: u64 = 5000;
-        let batches =
-            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 1024, Some(target_bytes))
-                .await;
+        let batches = decode_batches_with_byte_limit(
+            &input_batch,
+            /*batch_size=*/ 1024,
+            Some(target_bytes),
+        )
+        .await;
 
         // Verify all data round-trips correctly
         let all_batches: Vec<&RecordBatch> = batches.iter().collect();
-        let concatenated = arrow_select::concat::concat_batches(
-            &batches[0].schema(),
-            all_batches.iter().copied(),
-        )
-        .unwrap();
+        let concatenated =
+            arrow_select::concat::concat_batches(&batches[0].schema(), all_batches.iter().copied())
+                .unwrap();
         assert_eq!(concatenated.num_rows(), num_rows as usize);
         assert_eq!(
             concatenated.column(0).as_ref(),
