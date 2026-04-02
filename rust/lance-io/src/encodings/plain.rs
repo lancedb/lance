@@ -246,8 +246,8 @@ impl<'a> PlainDecoder<'a> {
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
-            start: (self.position + byte_range.start) as u64,
-            end: (self.position + byte_range.end) as u64,
+            start: self.position + byte_range.start,
+            end: self.position + byte_range.end,
         };
 
         let data = self.reader.get_range(range).await?;

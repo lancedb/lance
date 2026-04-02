@@ -66,7 +66,7 @@ pub struct CloudObjectReader {
     // File path
     pub path: Path,
     // File size, if known.
-    size: OnceCell<u64>,
+    size: OnceCell<usize>,
 
     block_size: usize,
     download_retry_count: usize,
@@ -85,7 +85,7 @@ impl CloudObjectReader {
         object_store: Arc<dyn ObjectStore>,
         path: Path,
         block_size: usize,
-        known_size: Option<u64>,
+        known_size: Option<usize>,
         download_retry_count: usize,
     ) -> Result<Self> {
         Ok(Self {
@@ -172,12 +172,12 @@ impl Reader for CloudObjectReader {
     }
 
     /// Object/File Size.
-    fn size(&self) -> BoxFuture<'_, object_store::Result<u64>> {
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
                     let meta = do_with_retry(|| self.object_store.head(&self.path)).await?;
-                    Ok(meta.size)
+                    Ok(meta.size as usize)
                 })
                 .await
                 .cloned()
@@ -185,7 +185,7 @@ impl Reader for CloudObjectReader {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn get_range(&self, range: Range<u64>) -> BoxFuture<'static, OSResult<Bytes>> {
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
@@ -235,7 +235,7 @@ impl Reader for CloudObjectReader {
         })
     }
 
-    fn get_range_stream(&self, range: Range<u64>) -> BoxFuture<'_, OSResult<ByteStream>> {
+    fn get_range_stream(&self, range: Range<usize>) -> BoxFuture<'_, OSResult<ByteStream>> {
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
@@ -261,7 +261,7 @@ impl Reader for CloudObjectReader {
 #[derive(Debug)]
 pub struct SmallReaderInner {
     path: Path,
-    size: u64,
+    size: usize,
     state: std::sync::Mutex<SmallReaderState>,
 }
 
@@ -301,7 +301,7 @@ impl SmallReader {
         store: Arc<dyn ObjectStore>,
         path: Path,
         download_retry_count: usize,
-        size: u64,
+        size: usize,
     ) -> Self {
         let path_ref = path.clone();
         let state = SmallReaderState::Loading(
@@ -363,23 +363,17 @@ impl Reader for SmallReader {
     }
 
     /// Object/File Size.
-    fn size(&self) -> BoxFuture<'_, OSResult<u64>> {
+    fn size(&self) -> BoxFuture<'_, OSResult<usize>> {
         let size = self.inner.size;
         Box::pin(async move { Ok(size) })
     }
 
-    fn get_range(&self, range: Range<u64>) -> BoxFuture<'static, OSResult<Bytes>> {
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let inner = self.inner.clone();
         Box::pin(async move {
             let bytes = inner.wait().await?;
-            let start = usize::try_from(range.start).map_err(|_| object_store::Error::Generic {
-                store: "memory",
-                source: format!("Range start {} does not fit into usize", range.start).into(),
-            })?;
-            let end = usize::try_from(range.end).map_err(|_| object_store::Error::Generic {
-                store: "memory",
-                source: format!("Range end {} does not fit into usize", range.end).into(),
-            })?;
+            let start = range.start;
+            let end = range.end;
             if start >= bytes.len() || end > bytes.len() {
                 return Err(object_store::Error::Generic {
                     store: "memory",
@@ -392,7 +386,7 @@ impl Reader for SmallReader {
                     .into(),
                 });
             }
-            Ok(bytes.slice(start..end))
+            Ok(bytes.slice(range))
         })
     }
 
@@ -405,7 +399,7 @@ pub(crate) fn stream_local_range(
     file: Arc<File>,
     path: Path,
     io_tracker: Arc<crate::utils::tracking_store::IOTracker>,
-    range: Range<u64>,
+    range: Range<usize>,
     chunk_size: usize,
 ) -> ByteStream {
     stream::try_unfold(
@@ -416,23 +410,17 @@ pub(crate) fn stream_local_range(
                 return Ok(None);
             }
 
-            let next = (start + chunk_size as u64).min(end);
+            let next = (start + chunk_size).min(end);
             let file_clone = file.clone();
             let path_clone = path.clone();
             let bytes = tokio::task::spawn_blocking(move || {
-                let len = usize::try_from(next - start).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Range {}..{} does not fit into usize", start, next),
-                    )
-                })?;
-                let mut buf = bytes::BytesMut::with_capacity(len);
+                let mut buf = bytes::BytesMut::with_capacity(next - start);
                 // Safety: buffer capacity matches the exact number of bytes we read below.
-                unsafe { buf.set_len(len) };
+                unsafe { buf.set_len(next - start) };
                 #[cfg(unix)]
-                file_clone.read_exact_at(buf.as_mut(), start)?;
+                file_clone.read_exact_at(buf.as_mut(), start as u64)?;
                 #[cfg(windows)]
-                read_exact_at(file_clone, buf.as_mut(), start)?;
+                read_exact_at(file_clone, buf.as_mut(), start as u64)?;
                 Ok::<_, std::io::Error>(buf.freeze())
             })
             .await?
@@ -444,8 +432,8 @@ pub(crate) fn stream_local_range(
             io_tracker.record_read(
                 "get_range_stream",
                 path_clone,
-                next - start,
-                Some(start..next),
+                (next - start) as u64,
+                Some(start as u64..next as u64),
             );
 
             Ok(Some((bytes, (file, path, io_tracker, next, end))))

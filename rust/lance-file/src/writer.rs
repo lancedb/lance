@@ -594,7 +594,7 @@ impl FileWriter {
                 let mut pages = Vec::new();
                 for &(offset, len) in &spill_chunks[col_idx] {
                     let data = reader
-                        .get_range(offset..(offset + len as u64))
+                        .get_range(offset as usize..(offset as usize + len as usize))
                         .await
                         .map_err(|e| Error::io_source(Box::new(e)))?;
                     pages.extend(decode_spilled_chunk(&data)?);

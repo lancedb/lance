@@ -428,7 +428,7 @@ impl FileReader {
     }
 
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
-        let file_size = scheduler.reader().size().await?;
+        let file_size = scheduler.reader().size().await? as u64;
         let begin = if file_size < scheduler.reader().block_size() as u64 {
             0
         } else {

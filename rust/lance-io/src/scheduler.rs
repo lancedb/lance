@@ -368,7 +368,9 @@ impl IoTask {
         let bytes = if self.to_read.start == self.to_read.end {
             Ok(Bytes::new())
         } else {
-            let bytes_fut = self.reader.get_range(self.to_read.start..self.to_read.end);
+            let bytes_fut = self
+                .reader
+                .get_range(self.to_read.start as usize..self.to_read.end as usize);
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
             let num_bytes = self.num_bytes();
             bytes_fut
@@ -606,7 +608,7 @@ impl ScanScheduler {
         };
         let reader = self
             .object_store
-            .open_with_size(path, file_size_bytes)
+            .open_with_size(path, file_size_bytes as usize)
             .await?;
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
@@ -712,7 +714,7 @@ impl ScanScheduler {
                 let queue = io_queue.clone();
                 let run_fn = Box::new(move || {
                     reader
-                        .get_range(task.start..task.end)
+                        .get_range(task.start as usize..task.end as usize)
                         .map_err(Error::from)
                         .boxed()
                 });
@@ -1342,16 +1344,16 @@ mod tests {
             1
         }
 
-        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<u64>> {
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
             Box::pin(async { Ok(1_000_000) })
         }
 
         fn get_range(
             &self,
-            range: Range<u64>,
+            range: Range<usize>,
         ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
             self.get_range_count.fetch_add(1, Ordering::Release);
-            let num_bytes = usize::try_from(range.end - range.start).unwrap();
+            let num_bytes = range.end - range.start;
             Box::pin(async move { Ok(Bytes::from(vec![0u8; num_bytes])) })
         }
 

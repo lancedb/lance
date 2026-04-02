@@ -461,12 +461,11 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     let file_size = reader.size().await?;
     let tail_bytes = read_last_block(reader).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
-    let tail_len = tail_bytes.len() as u64;
-    let proto: pb::Index = if (metadata_pos as u64) < file_size - tail_len {
+    let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
         // We have not read the metadata bytes yet.
         read_message(reader, metadata_pos).await?
     } else {
-        let offset = tail_bytes.len() - (file_size - metadata_pos as u64) as usize;
+        let offset = tail_bytes.len() - (file_size - metadata_pos);
         read_message_from_buf(&tail_bytes.slice(offset..))?
     };
     Ok(proto)

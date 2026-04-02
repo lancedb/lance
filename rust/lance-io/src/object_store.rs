@@ -647,10 +647,10 @@ impl ObjectStore {
     /// This size may either have been retrieved from a list operation or
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
-    pub async fn open_with_size(&self, path: &Path, known_size: u64) -> Result<Box<dyn Reader>> {
+    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
-        if known_size <= self.block_size as u64 {
+        if known_size <= self.block_size {
             return Ok(Box::new(SmallReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -861,7 +861,7 @@ impl ObjectStore {
     ///
     /// If you will be making multiple requests to the path it is more efficient to call [`Self::open`]
     /// and then call [`Reader::get_range`] multiple times.
-    pub async fn read_one_range(&self, path: &Path, range: Range<u64>) -> Result<Bytes> {
+    pub async fn read_one_range(&self, path: &Path, range: Range<usize>) -> Result<Bytes> {
         let reader = self.open(path).await?;
         Ok(reader.get_range(range).await?)
     }

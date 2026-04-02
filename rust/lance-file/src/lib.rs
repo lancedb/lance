@@ -22,10 +22,10 @@ use object_store::path::Path;
 pub async fn determine_file_version(
     store: &ObjectStore,
     path: &Path,
-    known_size: Option<u64>,
+    known_size: Option<usize>,
 ) -> Result<LanceFileVersion> {
     let size = match known_size {
-        None => store.size(path).await.unwrap(),
+        None => store.size(path).await.unwrap() as usize,
         Some(size) => size,
     };
     if size < 8 {

@@ -52,7 +52,8 @@ pub async fn load_frag_reuse_index_details(
 
             // the file content will be cached in the index cache later
             // so we do not put it to the file cache
-            let range = external_file.offset..(external_file.offset + external_file.size as u64);
+            let range = external_file.offset as usize
+                ..(external_file.offset as usize + external_file.size as usize);
             let data = dataset
                 .object_store
                 .open(&file_path)

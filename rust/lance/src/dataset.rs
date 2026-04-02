@@ -588,7 +588,7 @@ impl Dataset {
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
-                .open_with_size(&manifest_location.path, size)
+                .open_with_size(&manifest_location.path, size as usize)
                 .await
         } else {
             object_store.open(&manifest_location.path).await
@@ -611,22 +611,15 @@ impl Dataset {
 
         // If manifest is in the last block, we can decode directly from memory.
         let manifest_size = object_reader.size().await?;
-        let offset = offset as u64;
-        let mut manifest = if manifest_size - offset <= last_block.len() as u64 {
-            let manifest_len = usize::try_from(manifest_size - offset)
-                .map_err(|_| Error::io("manifest length exceeds usize".to_string()))?;
+        let mut manifest = if manifest_size - offset <= last_block.len() {
+            let manifest_len = manifest_size - offset;
             let offset_in_block = last_block.len() - manifest_len;
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
-            read_struct(
-                object_reader.as_ref(),
-                usize::try_from(offset)
-                    .map_err(|_| Error::io("manifest offset exceeds usize".to_string()))?,
-            )
-            .await
+            read_struct(object_reader.as_ref(), offset).await
         }?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
@@ -641,9 +634,9 @@ impl Dataset {
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section
-            && manifest_size - index_offset as u64 <= last_block.len() as u64
+            && manifest_size - index_offset <= last_block.len()
         {
-            let offset_in_block = last_block.len() - (manifest_size - index_offset as u64) as usize;
+            let offset_in_block = last_block.len() - (manifest_size - index_offset);
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
@@ -666,10 +659,9 @@ impl Dataset {
         // If transaction is also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(transaction_offset) = manifest.transaction_section
-            && manifest_size - transaction_offset as u64 <= last_block.len() as u64
+            && manifest_size - transaction_offset <= last_block.len()
         {
-            let offset_in_block =
-                last_block.len() - (manifest_size - transaction_offset as u64) as usize;
+            let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
@@ -1005,7 +997,7 @@ impl Dataset {
         if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
             let reader = if let Some(size) = location.size {
                 self.object_store
-                    .open_with_size(&location.path, size)
+                    .open_with_size(&location.path, size as usize)
                     .await?
             } else {
                 self.object_store.open(&location.path).await?
@@ -1035,7 +1027,7 @@ impl Dataset {
         let transaction = if let Some(pos) = self.manifest.transaction_section {
             let reader = if let Some(size) = self.manifest_location.size {
                 self.object_store
-                    .open_with_size(&self.manifest_location.path, size)
+                    .open_with_size(&self.manifest_location.path, size as usize)
                     .await?
             } else {
                 self.object_store.open(&self.manifest_location.path).await?
