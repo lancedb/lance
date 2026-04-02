@@ -23,11 +23,9 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::storage_options::JavaStorageOptionsProvider;
 
 use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::Query;
-use lance_io::object_store::StorageOptionsProvider;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -51,9 +49,8 @@ pub fn extract_write_params(
     data_storage_version: &JObject,
     enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
-    storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
-    initial_bases: &JObject,                // Optional<BasePath>
-    target_bases: &JObject,                 // Optional<String>
+    initial_bases: &JObject, // Optional<BasePath>
+    target_bases: &JObject,  // Optional<String>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -90,13 +87,6 @@ pub fn extract_write_params(
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 
-    // Extract storage options provider if present
-    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> = env
-        .get_optional(storage_options_provider_obj, |env, provider_obj| {
-            JavaStorageOptionsProvider::new(env, provider_obj)
-        })?
-        .map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
-
     if let Some(initial_bases) =
         env.get_list_opt(initial_bases, |env, elem| elem.extract_object(env))?
     {
@@ -107,18 +97,13 @@ pub fn extract_write_params(
         write_params.target_base_names_or_paths = Some(names);
     }
 
-    // Create storage options accessor from storage_options and provider
-    let accessor = match (storage_options.is_empty(), storage_options_provider) {
-        (false, Some(provider)) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
-        )),
-        (false, None) => Some(Arc::new(
+    // Create storage options accessor from static storage_options
+    let accessor = if storage_options.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
             lance::io::StorageOptionsAccessor::with_static_options(storage_options),
-        )),
-        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
-            provider,
-        ))),
-        (true, None) => None,
+        ))
     };
 
     write_params.store_params = Some(ObjectStoreParams {

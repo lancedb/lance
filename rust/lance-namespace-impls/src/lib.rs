@@ -82,7 +82,9 @@ pub mod rest_adapter;
 // Re-export connect builder
 pub use connect::ConnectBuilder;
 pub use context::{DynamicContextProvider, OperationInfo};
-pub use dir::{DirectoryNamespace, DirectoryNamespaceBuilder, manifest::ManifestNamespace};
+pub use dir::{
+    DirectoryNamespace, DirectoryNamespaceBuilder, OpsMetrics, manifest::ManifestNamespace,
+};
 
 // Re-export credential vending
 pub use credentials::{

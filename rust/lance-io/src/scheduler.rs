@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
@@ -505,15 +506,21 @@ pub struct SchedulerConfig {
     /// This controls back pressure.  If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
-    /// Whether to use the new lite scheduler
-    pub use_lite_scheduler: bool,
+    /// Whether to use the lite scheduler.
+    ///
+    /// - `Some(true)` forces the lite scheduler (e.g. from env var or programmatic).
+    /// - `Some(false)` forces the standard scheduler.
+    /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
+    pub use_lite_scheduler: Option<bool>,
 }
 
 impl SchedulerConfig {
     pub fn new(io_buffer_size_bytes: u64) -> Self {
         Self {
             io_buffer_size_bytes,
-            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok(),
+            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
+                .ok()
+                .map(|v| str_is_truthy(v.trim())),
         }
     }
 
@@ -521,7 +528,7 @@ impl SchedulerConfig {
     pub fn default_for_testing() -> Self {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         }
     }
 
@@ -533,7 +540,7 @@ impl SchedulerConfig {
 
     pub fn with_lite_scheduler(self) -> Self {
         Self {
-            use_lite_scheduler: true,
+            use_lite_scheduler: Some(true),
             ..self
         }
     }
@@ -548,7 +555,10 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
-        let io_queue = if config.use_lite_scheduler {
+        let use_lite = config
+            .use_lite_scheduler
+            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+        let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
                 config.io_buffer_size_bytes,
@@ -742,6 +752,11 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         ScanStats::new(self.stats.as_ref())
+    }
+
+    #[cfg(test)]
+    fn uses_lite_scheduler(&self) -> bool {
+        matches!(self.io_queue, IoQueueType::Lite(_))
     }
 }
 
@@ -1120,7 +1135,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1211,7 +1226,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -1286,7 +1301,7 @@ mod tests {
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1374,6 +1389,55 @@ mod tests {
         assert_eq!(fut3.await.unwrap()[0].len(), 100);
     }
 
+    #[tokio::test]
+    async fn test_object_store_selects_scheduler() {
+        // A memory:// store should use the standard scheduler when config is None
+        let memory_store = Arc::new(ObjectStore::memory());
+        assert!(!memory_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(memory_store.clone(), config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // A file+uring:// store should use the lite scheduler when config is None
+        let uring_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("file+uring:///tmp").unwrap(),
+            None,
+            None,
+            false,
+            false,
+            8,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        assert!(uring_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(uring_store.clone(), config);
+        assert!(scheduler.uses_lite_scheduler());
+
+        // Explicit Some(false) overrides a file+uring:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(uring_store, config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // Explicit Some(true) overrides a memory:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(true),
+        };
+        let scheduler = ScanScheduler::new(memory_store, config);
+        assert!(scheduler.uses_lite_scheduler());
+    }
+
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn stress_backpressure() {
         // This test ensures that the backpressure mechanism works correctly with
@@ -1389,7 +1453,7 @@ mod tests {
         // Only one request will be allowed in
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler

@@ -4,8 +4,11 @@
 """
 Integration tests for Lance Namespace with S3 and credential refresh.
 
-This test simulates a namespace server that returns incrementing credentials
-and verifies that the credential refresh mechanism works correctly.
+This test uses DirectoryNamespace with native ops_metrics and vend_input_storage_options
+features to track API calls and test credential refresh mechanisms.
+
+Tests are parameterized to run with both DirectoryNamespace and a CustomNamespace
+wrapper to verify Python-Rust binding works correctly for custom implementations.
 
 See DEVELOPMENT.md under heading "Integration Tests" for more information.
 """
@@ -14,18 +17,135 @@ import copy
 import time
 import uuid
 from threading import Lock
-from typing import Dict
+from typing import Dict, Optional
 
 import lance
 import pyarrow as pa
 import pytest
 from lance.namespace import (
     DeclareTableRequest,
-    DeclareTableResponse,
     DescribeTableRequest,
-    DescribeTableResponse,
+    DirectoryNamespace,
     LanceNamespace,
 )
+from lance_namespace import (
+    CreateNamespaceRequest,
+    CreateNamespaceResponse,
+    CreateTableRequest,
+    CreateTableResponse,
+    CreateTableVersionRequest,
+    CreateTableVersionResponse,
+    DeclareTableResponse,
+    DeregisterTableRequest,
+    DeregisterTableResponse,
+    DescribeNamespaceRequest,
+    DescribeNamespaceResponse,
+    DescribeTableResponse,
+    DescribeTableVersionRequest,
+    DescribeTableVersionResponse,
+    DropNamespaceRequest,
+    DropNamespaceResponse,
+    DropTableRequest,
+    DropTableResponse,
+    ListNamespacesRequest,
+    ListNamespacesResponse,
+    ListTablesRequest,
+    ListTablesResponse,
+    ListTableVersionsRequest,
+    ListTableVersionsResponse,
+    NamespaceExistsRequest,
+    RegisterTableRequest,
+    RegisterTableResponse,
+    TableExistsRequest,
+)
+
+
+class CustomNamespace(LanceNamespace):
+    """A custom namespace wrapper that delegates to DirectoryNamespace.
+
+    This class verifies that the Python-Rust binding works correctly for
+    custom namespace implementations that wrap the native DirectoryNamespace.
+    All methods simply delegate to the underlying DirectoryNamespace instance.
+    """
+
+    def __init__(self, inner: DirectoryNamespace):
+        self._inner = inner
+
+    def namespace_id(self) -> str:
+        return f"CustomNamespace[{self._inner.namespace_id()}]"
+
+    def create_namespace(
+        self, request: CreateNamespaceRequest
+    ) -> CreateNamespaceResponse:
+        return self._inner.create_namespace(request)
+
+    def describe_namespace(
+        self, request: DescribeNamespaceRequest
+    ) -> DescribeNamespaceResponse:
+        return self._inner.describe_namespace(request)
+
+    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+        return self._inner.namespace_exists(request)
+
+    def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
+        return self._inner.drop_namespace(request)
+
+    def list_namespaces(self, request: ListNamespacesRequest) -> ListNamespacesResponse:
+        return self._inner.list_namespaces(request)
+
+    def create_table(
+        self, request: CreateTableRequest, data: bytes
+    ) -> CreateTableResponse:
+        return self._inner.create_table(request, data)
+
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        return self._inner.declare_table(request)
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        return self._inner.describe_table(request)
+
+    def table_exists(self, request: TableExistsRequest) -> None:
+        return self._inner.table_exists(request)
+
+    def drop_table(self, request: DropTableRequest) -> DropTableResponse:
+        return self._inner.drop_table(request)
+
+    def list_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        return self._inner.list_tables(request)
+
+    def register_table(self, request: RegisterTableRequest) -> RegisterTableResponse:
+        return self._inner.register_table(request)
+
+    def deregister_table(
+        self, request: DeregisterTableRequest
+    ) -> DeregisterTableResponse:
+        return self._inner.deregister_table(request)
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        return self._inner.list_table_versions(request)
+
+    def describe_table_version(
+        self, request: DescribeTableVersionRequest
+    ) -> DescribeTableVersionResponse:
+        return self._inner.describe_table_version(request)
+
+    def create_table_version(
+        self, request: CreateTableVersionRequest
+    ) -> CreateTableVersionResponse:
+        return self._inner.create_table_version(request)
+
+    def retrieve_ops_metrics(self) -> Optional[Dict[str, int]]:
+        return self._inner.retrieve_ops_metrics()
+
+
+def _wrap_if_custom(ns_client: DirectoryNamespace, use_custom: bool):
+    """Wrap namespace client in CustomNamespace if use_custom is True."""
+    if use_custom:
+        return CustomNamespace(ns_client)
+    return ns_client
+
 
 # These are all keys that are accepted by storage_options
 CONFIG = {
@@ -74,263 +194,256 @@ def delete_bucket(s3, bucket_name):
         pass
 
 
-class TrackingNamespace(LanceNamespace):
-    """Mock namespace that wraps DirectoryNamespace and tracks API calls."""
+def create_tracking_namespace(
+    bucket_name: str,
+    storage_options: dict,
+    credential_expires_in_seconds: int = 60,
+    use_custom: bool = False,
+):
+    """Create a DirectoryNamespace with ops metrics and credential vending enabled.
 
-    def __init__(
-        self,
-        bucket_name: str,
-        storage_options: Dict[str, str],
-        credential_expires_in_seconds: int = 60,
-    ):
-        from lance.namespace import DirectoryNamespace
+    Uses native DirectoryNamespace features:
+    - ops_metrics_enabled=true: Tracks API call counts via retrieve_ops_metrics()
+    - vend_input_storage_options=true: Returns input storage options in responses
+    - vend_input_storage_options_refresh_interval_millis: Adds expires_at_millis
 
-        self.bucket_name = bucket_name
-        self.base_storage_options = storage_options
-        self.credential_expires_in_seconds = credential_expires_in_seconds
-        self.describe_call_count = 0
-        self.create_call_count = 0
-        self.lock = Lock()
+    Args:
+        bucket_name: S3 bucket name or local path
+        storage_options: Storage options to pass through (credentials, endpoint, etc.)
+        credential_expires_in_seconds: Interval in seconds for credential expiration
+        use_custom: If True, wrap in CustomNamespace for testing custom implementations
 
-        # Create underlying DirectoryNamespace with storage options
-        dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
+    Returns:
+        Tuple of (namespace_client, inner_namespace_client) where inner is always
+        the DirectoryNamespace (used for metrics retrieval)
+    """
+    # Add refresh_offset_millis to storage options so that credentials are not
+    # considered expired immediately. Set to 1 second (1000ms) so that refresh
+    # checks work correctly with short-lived credentials in tests.
+    storage_options_with_refresh = dict(storage_options)
+    storage_options_with_refresh["refresh_offset_millis"] = "1000"
 
-        if bucket_name.startswith("/") or bucket_name.startswith("file://"):
-            dir_props["root"] = f"{bucket_name}/namespace_root"
-        else:
-            dir_props["root"] = f"s3://{bucket_name}/namespace_root"
+    dir_props = {f"storage.{k}": v for k, v in storage_options_with_refresh.items()}
 
-        self.inner = DirectoryNamespace(**dir_props)
+    if bucket_name.startswith("/") or bucket_name.startswith("file://"):
+        dir_props["root"] = f"{bucket_name}/namespace_root"
+    else:
+        dir_props["root"] = f"s3://{bucket_name}/namespace_root"
 
-    def get_describe_call_count(self) -> int:
-        with self.lock:
-            return self.describe_call_count
+    # Enable ops metrics tracking
+    dir_props["ops_metrics_enabled"] = "true"
+    # Enable storage options vending
+    dir_props["vend_input_storage_options"] = "true"
+    # Set refresh interval in milliseconds
+    dir_props["vend_input_storage_options_refresh_interval_millis"] = str(
+        credential_expires_in_seconds * 1000
+    )
 
-    def get_create_call_count(self) -> int:
-        with self.lock:
-            return self.create_call_count
+    inner_ns_client = DirectoryNamespace(**dir_props)
+    ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+    return ns_client, inner_ns_client
 
-    def namespace_id(self) -> str:
-        return f"TrackingNamespace {{ inner: {self.inner.namespace_id()} }}"
 
-    def _vend_storage_options(self, count: int) -> Dict[str, str]:
-        """Simulate a credential vendor returning only vended credentials.
+def get_describe_call_count(namespace_client) -> int:
+    """Get the number of describe_table calls made to the namespace client."""
+    return namespace_client.retrieve_ops_metrics().get("describe_table", 0)
 
-        Returns only credential keys with expiration metadata, not connection
-        config. Clients are expected to provide their own connection config
-        (endpoint, region, allow_http) via storage_options.
-        """
-        return {
-            "aws_access_key_id": f"AKID_{count}",
-            "aws_secret_access_key": f"SECRET_{count}",
-            "aws_session_token": f"TOKEN_{count}",
-            "expires_at_millis": str(
-                int((time.time() + self.credential_expires_in_seconds) * 1000)
-            ),
-            # Set refresh offset to 1 second (1000ms) for short-lived credential tests
-            "refresh_offset_millis": "1000",
-        }
 
-    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
-        with self.lock:
-            self.create_call_count += 1
-            count = self.create_call_count
-
-        response = self.inner.declare_table(request)
-        response.storage_options = self._vend_storage_options(count)
-
-        return response
-
-    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
-        with self.lock:
-            self.describe_call_count += 1
-            count = self.describe_call_count
-
-        response = self.inner.describe_table(request)
-        response.storage_options = self._vend_storage_options(count)
-
-        return response
+def get_declare_call_count(namespace_client) -> int:
+    """Get the number of declare_table calls made to the namespace client."""
+    return namespace_client.retrieve_ops_metrics().get("declare_table", 0)
 
 
 @pytest.mark.integration
-def test_namespace_open_dataset(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_open_dataset(s3_bucket: str, use_custom: bool):
     """Test creating and opening datasets through namespace with credential tracking."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3600,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert len(ds.versions()) == 1
     assert ds.count_rows() == 2
-    assert namespace.get_create_call_count() == 1
+    assert get_declare_call_count(inner_ns_client) == 1
 
-    ds_from_namespace = lance.dataset(
-        namespace=namespace,
+    ds_from_ns_client = lance.dataset(
+        namespace_client=ns_client,
         table_id=table_id,
         storage_options=storage_options,
     )
 
-    assert namespace.get_describe_call_count() == 1
-    assert ds_from_namespace.count_rows() == 2
-    result = ds_from_namespace.to_table()
+    # 1 describe call from lance.dataset() to get location
+    assert get_describe_call_count(inner_ns_client) == 1
+    assert ds_from_ns_client.count_rows() == 2
+    result = ds_from_ns_client.to_table()
     assert result == table1
 
     # Test credential caching
-    call_count_before_reads = namespace.get_describe_call_count()
+    call_count_before_reads = get_describe_call_count(inner_ns_client)
     for _ in range(3):
-        assert ds_from_namespace.count_rows() == 2
-    assert namespace.get_describe_call_count() == call_count_before_reads
+        assert ds_from_ns_client.count_rows() == 2
+    assert get_describe_call_count(inner_ns_client) == call_count_before_reads
 
 
 @pytest.mark.integration
-def test_namespace_with_refresh(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_with_refresh(s3_bucket: str, use_custom: bool):
     """Test credential refresh when credentials expire."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 2
-    assert namespace.get_create_call_count() == 1
+    assert get_declare_call_count(inner_ns_client) == 1
 
-    ds_from_namespace = lance.dataset(
-        namespace=namespace,
+    ds_from_ns_client = lance.dataset(
+        namespace_client=ns_client,
         table_id=table_id,
         storage_options=storage_options,
     )
 
-    initial_call_count = namespace.get_describe_call_count()
+    # 1 describe call from lance.dataset() to get location
+    initial_call_count = get_describe_call_count(inner_ns_client)
     assert initial_call_count == 1
-    assert ds_from_namespace.count_rows() == 2
-    result = ds_from_namespace.to_table()
+    assert ds_from_ns_client.count_rows() == 2
+    result = ds_from_ns_client.to_table()
     assert result == table1
 
-    call_count_after_initial_reads = namespace.get_describe_call_count()
+    call_count_after_initial_reads = get_describe_call_count(inner_ns_client)
 
     time.sleep(5)
 
-    assert ds_from_namespace.count_rows() == 2
-    result2 = ds_from_namespace.to_table()
+    assert ds_from_ns_client.count_rows() == 2
+    result2 = ds_from_ns_client.to_table()
     assert result2 == table1
 
-    final_call_count = namespace.get_describe_call_count()
+    final_call_count = get_describe_call_count(inner_ns_client)
     assert final_call_count == call_count_after_initial_reads + 1
 
 
 @pytest.mark.integration
-def test_namespace_append_through_namespace(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_append_through_namespace(s3_bucket: str, use_custom: bool):
     """Test appending to dataset through namespace."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3600,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 1
     assert len(ds.versions()) == 1
-    assert namespace.get_create_call_count() == 1
-    initial_describe_count = namespace.get_describe_call_count()
+    assert get_declare_call_count(inner_ns_client) == 1
+    initial_describe_count = get_describe_call_count(inner_ns_client)
 
     table2 = pa.Table.from_pylist([{"a": 10, "b": 20}])
     ds = lance.write_dataset(
         table2,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="append",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 2
     assert len(ds.versions()) == 2
-    assert namespace.get_create_call_count() == 1
-    assert namespace.get_describe_call_count() == initial_describe_count + 1
+    assert get_declare_call_count(inner_ns_client) == 1
+    assert get_describe_call_count(inner_ns_client) == initial_describe_count + 1
 
-    ds_from_namespace = lance.dataset(
-        namespace=namespace,
+    ds_from_ns_client = lance.dataset(
+        namespace_client=ns_client,
         table_id=table_id,
         storage_options=storage_options,
     )
 
-    assert ds_from_namespace.count_rows() == 2
-    assert len(ds_from_namespace.versions()) == 2
-    assert namespace.get_describe_call_count() == initial_describe_count + 2
+    assert ds_from_ns_client.count_rows() == 2
+    assert len(ds_from_ns_client.versions()) == 2
+    # +1 for describe from lance.dataset()
+    assert get_describe_call_count(inner_ns_client) == initial_describe_count + 2
 
 
 @pytest.mark.integration
-def test_namespace_write_create_mode(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_write_create_mode(s3_bucket: str, use_custom: bool):
     """Test writing dataset through namespace in CREATE mode."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3600,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     table_name = uuid.uuid4().hex
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=["test_ns", table_name],
         mode="create",
         storage_options=storage_options,
     )
 
-    assert namespace.get_create_call_count() == 1
+    assert get_declare_call_count(inner_ns_client) == 1
     assert ds.count_rows() == 2
     assert len(ds.versions()) == 1
     result = ds.to_table()
@@ -338,143 +451,143 @@ def test_namespace_write_create_mode(s3_bucket: str):
 
 
 @pytest.mark.integration
-def test_namespace_write_append_mode(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_write_append_mode(s3_bucket: str, use_custom: bool):
     """Test writing dataset through namespace in APPEND mode."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3600,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 1
-    assert namespace.get_create_call_count() == 1
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 1
+    assert get_describe_call_count(inner_ns_client) == 0
 
     table2 = pa.Table.from_pylist([{"a": 10, "b": 20}])
 
     ds = lance.write_dataset(
         table2,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="append",
         storage_options=storage_options,
     )
 
-    assert namespace.get_create_call_count() == 1
-    describe_count_after_append = namespace.get_describe_call_count()
+    assert get_declare_call_count(inner_ns_client) == 1
+    describe_count_after_append = get_describe_call_count(inner_ns_client)
     assert describe_count_after_append == 1
     assert ds.count_rows() == 2
     assert len(ds.versions()) == 2
 
-    call_count_before_reads = namespace.get_describe_call_count()
+    call_count_before_reads = get_describe_call_count(inner_ns_client)
     for _ in range(3):
         assert ds.count_rows() == 2
-    assert namespace.get_describe_call_count() == call_count_before_reads
+    assert get_describe_call_count(inner_ns_client) == call_count_before_reads
 
 
 @pytest.mark.integration
-def test_namespace_write_overwrite_mode(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_write_overwrite_mode(s3_bucket: str, use_custom: bool):
     """Test writing dataset through namespace in OVERWRITE mode."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3600,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 1
-    assert namespace.get_create_call_count() == 1
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 1
+    assert get_describe_call_count(inner_ns_client) == 0
 
     table2 = pa.Table.from_pylist([{"a": 10, "b": 20}, {"a": 100, "b": 200}])
 
     ds = lance.write_dataset(
         table2,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="overwrite",
         storage_options=storage_options,
     )
 
-    assert namespace.get_create_call_count() == 1
-    describe_count_after_overwrite = namespace.get_describe_call_count()
+    assert get_declare_call_count(inner_ns_client) == 1
+    describe_count_after_overwrite = get_describe_call_count(inner_ns_client)
     assert describe_count_after_overwrite == 1
     assert ds.count_rows() == 2
     assert len(ds.versions()) == 2
     result = ds.to_table()
     assert result == table2
 
-    call_count_before_reads = namespace.get_describe_call_count()
+    call_count_before_reads = get_describe_call_count(inner_ns_client)
     for _ in range(3):
         assert ds.count_rows() == 2
-    assert namespace.get_describe_call_count() == call_count_before_reads
+    assert get_describe_call_count(inner_ns_client) == call_count_before_reads
 
 
 @pytest.mark.integration
-def test_namespace_distributed_write(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_distributed_write(s3_bucket: str, use_custom: bool):
     """Test distributed write pattern through namespace."""
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3600,
+        use_custom=use_custom,
     )
 
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
     request = DeclareTableRequest(id=table_id, location=None)
-    response = namespace.declare_table(request)
+    response = ns_client.declare_table(request)
 
-    assert namespace.get_create_call_count() == 1
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 1
+    assert get_describe_call_count(inner_ns_client) == 0
 
     table_uri = response.location
     assert table_uri is not None
 
-    from lance.namespace import LanceNamespaceStorageOptionsProvider
-
-    namespace_storage_options = response.storage_options
-    assert namespace_storage_options is not None
-
-    storage_options_provider = LanceNamespaceStorageOptionsProvider(
-        namespace=namespace, table_id=table_id
-    )
+    ns_client_storage_options = response.storage_options
+    assert ns_client_storage_options is not None
 
     merged_options = dict(storage_options)
-    merged_options.update(namespace_storage_options)
+    merged_options.update(ns_client_storage_options)
 
     from lance.fragment import write_fragments
 
@@ -483,7 +596,8 @@ def test_namespace_distributed_write(s3_bucket: str):
         fragment1_data,
         table_uri,
         storage_options=merged_options,
-        storage_options_provider=storage_options_provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     fragment2_data = pa.Table.from_pylist([{"a": 10, "b": 20}, {"a": 30, "b": 40}])
@@ -491,7 +605,8 @@ def test_namespace_distributed_write(s3_bucket: str):
         fragment2_data,
         table_uri,
         storage_options=merged_options,
-        storage_options_provider=storage_options_provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     fragment3_data = pa.Table.from_pylist([{"a": 100, "b": 200}])
@@ -499,7 +614,8 @@ def test_namespace_distributed_write(s3_bucket: str):
         fragment3_data,
         table_uri,
         storage_options=merged_options,
-        storage_options_provider=storage_options_provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     all_fragments = fragment1 + fragment2 + fragment3
@@ -510,7 +626,8 @@ def test_namespace_distributed_write(s3_bucket: str):
         table_uri,
         operation,
         storage_options=merged_options,
-        storage_options_provider=storage_options_provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     assert ds.count_rows() == 5
@@ -528,57 +645,54 @@ def test_namespace_distributed_write(s3_bucket: str):
     )
     assert result == expected
 
-    ds_from_namespace = lance.dataset(
-        namespace=namespace,
+    ds_from_ns_client = lance.dataset(
+        namespace_client=ns_client,
         table_id=table_id,
         storage_options=storage_options,
     )
-    assert ds_from_namespace.count_rows() == 5
+    assert ds_from_ns_client.count_rows() == 5
 
 
 @pytest.mark.integration
-def test_file_writer_with_storage_options_provider(s3_bucket: str):
-    """Test LanceFileWriter with storage_options_provider and credential refresh."""
-    from lance import LanceNamespaceStorageOptionsProvider
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
+    """Test LanceFileWriter with namespace_client and credential refresh."""
     from lance.file import LanceFileReader, LanceFileWriter
 
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     table_name = uuid.uuid4().hex
     table_id = ["test_ns", table_name]
 
-    assert namespace.get_create_call_count() == 0
-    assert namespace.get_describe_call_count() == 0
+    assert get_declare_call_count(inner_ns_client) == 0
+    assert get_describe_call_count(inner_ns_client) == 0
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 2
-    assert namespace.get_create_call_count() == 1
+    assert get_declare_call_count(inner_ns_client) == 1
 
-    describe_response = namespace.describe_table(
+    describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
     merged_options = dict(storage_options)
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    provider = LanceNamespaceStorageOptionsProvider(
-        namespace=namespace, table_id=table_id
-    )
-
-    initial_describe_count = namespace.get_describe_call_count()
+    initial_describe_count = get_describe_call_count(inner_ns_client)
 
     file_uri = f"s3://{s3_bucket}/{table_name}_file_test.lance"
     schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
@@ -587,7 +701,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
         file_uri,
         schema=schema,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
@@ -599,13 +714,14 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
     writer.write_batch(batch2)
     writer.close()
 
-    describe_count_after_write = namespace.get_describe_call_count()
+    describe_count_after_write = get_describe_call_count(inner_ns_client)
     assert describe_count_after_write == initial_describe_count
 
     reader = LanceFileReader(
         file_uri,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
@@ -624,7 +740,8 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
         file_uri2,
         schema=schema,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     batch3 = pa.RecordBatch.from_pydict(
@@ -633,13 +750,14 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
     writer2.write_batch(batch3)
     writer2.close()
 
-    final_describe_count = namespace.get_describe_call_count()
+    final_describe_count = get_describe_call_count(inner_ns_client)
     assert final_describe_count == describe_count_after_write + 1
 
     reader2 = LanceFileReader(
         file_uri2,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
@@ -649,17 +767,18 @@ def test_file_writer_with_storage_options_provider(s3_bucket: str):
 
 
 @pytest.mark.integration
-def test_file_reader_with_storage_options_provider(s3_bucket: str):
-    """Test LanceFileReader with storage_options_provider and credential refresh."""
-    from lance import LanceNamespaceStorageOptionsProvider
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_file_reader_with_namespace_client(s3_bucket: str, use_custom: bool):
+    """Test LanceFileReader with namespace_client and credential refresh."""
     from lance.file import LanceFileReader, LanceFileWriter
 
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
@@ -668,28 +787,24 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str):
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 2
 
-    describe_response = namespace.describe_table(
+    describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
     merged_options = dict(storage_options)
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    provider = LanceNamespaceStorageOptionsProvider(
-        namespace=namespace, table_id=table_id
-    )
-
     file_uri = f"s3://{s3_bucket}/{table_name}_file_reader_test.lance"
     schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
 
-    # Write a file first (without provider to keep it simple)
+    # Write a file first (without namespace_client to keep it simple)
     writer = LanceFileWriter(
         file_uri,
         schema=schema,
@@ -700,27 +815,28 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str):
     writer.close()
 
     # Get fresh credentials for reading
-    describe_response = namespace.describe_table(
+    describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
     merged_options = dict(storage_options)
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    initial_describe_count = namespace.get_describe_call_count()
+    initial_describe_count = get_describe_call_count(inner_ns_client)
 
     # First read should work without needing refresh
     reader = LanceFileReader(
         file_uri,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
     assert result_table.num_rows == 3
     assert result_table.schema == schema
 
-    describe_count_after_first_read = namespace.get_describe_call_count()
+    describe_count_after_first_read = get_describe_call_count(inner_ns_client)
     assert describe_count_after_first_read == initial_describe_count
 
     # Wait for credentials to expire
@@ -743,7 +859,8 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str):
     reader2 = LanceFileReader(
         file_uri2,
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
@@ -751,22 +868,23 @@ def test_file_reader_with_storage_options_provider(s3_bucket: str):
     expected_table2 = pa.table({"x": [100, 200], "y": [300, 400]}, schema=schema)
     assert result_table2 == expected_table2
 
-    final_describe_count = namespace.get_describe_call_count()
+    final_describe_count = get_describe_call_count(inner_ns_client)
     assert final_describe_count == describe_count_after_first_read + 1
 
 
 @pytest.mark.integration
-def test_file_session_with_storage_options_provider(s3_bucket: str):
-    """Test LanceFileSession with storage_options_provider and credential refresh."""
-    from lance import LanceNamespaceStorageOptionsProvider
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_file_session_with_namespace_client(s3_bucket: str, use_custom: bool):
+    """Test LanceFileSession with namespace_client and credential refresh."""
     from lance.file import LanceFileSession
 
     storage_options = copy.deepcopy(CONFIG)
 
-    namespace = TrackingNamespace(
+    ns_client, inner_ns_client = create_tracking_namespace(
         bucket_name=s3_bucket,
         storage_options=storage_options,
         credential_expires_in_seconds=3,
+        use_custom=use_custom,
     )
 
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
@@ -775,31 +893,28 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
 
     ds = lance.write_dataset(
         table1,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
     )
     assert ds.count_rows() == 2
 
-    describe_response = namespace.describe_table(
+    describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
     merged_options = dict(storage_options)
     if describe_response.storage_options:
         merged_options.update(describe_response.storage_options)
 
-    provider = LanceNamespaceStorageOptionsProvider(
-        namespace=namespace, table_id=table_id
-    )
+    initial_describe_count = get_describe_call_count(inner_ns_client)
 
-    initial_describe_count = namespace.get_describe_call_count()
-
-    # Create session with storage_options_provider
+    # Create session with namespace_client
     session = LanceFileSession(
         f"s3://{s3_bucket}/{table_name}_session",
         storage_options=merged_options,
-        storage_options_provider=provider,
+        namespace_client=ns_client,
+        table_id=table_id,
     )
 
     # Test contains method
@@ -820,7 +935,7 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
     writer.write_batch(batch)
     writer.close()
 
-    describe_count_after_first_write = namespace.get_describe_call_count()
+    describe_count_after_first_write = get_describe_call_count(inner_ns_client)
     assert describe_count_after_first_write == initial_describe_count
 
     # Test contains method after write
@@ -836,7 +951,7 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
     expected_table = pa.table({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
     assert result_table == expected_table
 
-    describe_count_after_first_read = namespace.get_describe_call_count()
+    describe_count_after_first_read = get_describe_call_count(inner_ns_client)
     assert describe_count_after_first_read == describe_count_after_first_write
 
     # Wait for credentials to expire
@@ -853,7 +968,7 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
     writer2.write_batch(batch2)
     writer2.close()
 
-    describe_count_after_second_write = namespace.get_describe_call_count()
+    describe_count_after_second_write = get_describe_call_count(inner_ns_client)
     assert describe_count_after_second_write == describe_count_after_first_read + 1
 
     # Read the second file - should not trigger another refresh since we just refreshed
@@ -864,7 +979,7 @@ def test_file_session_with_storage_options_provider(s3_bucket: str):
     expected_table2 = pa.table({"x": [100, 200], "y": [300, 400]}, schema=schema)
     assert result_table2 == expected_table2
 
-    final_describe_count = namespace.get_describe_call_count()
+    final_describe_count = get_describe_call_count(inner_ns_client)
     assert final_describe_count == describe_count_after_second_write
 
 
@@ -890,22 +1005,18 @@ def table_to_ipc_bytes(table):
 
 
 @pytest.mark.integration
-def test_basic_create_and_drop_on_s3(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_basic_create_and_drop_on_s3(s3_bucket: str, use_custom: bool):
     """Test basic create and drop table operations on S3.
 
     Mirrors Java: testBasicCreateAndDropOnS3
     """
-    from lance.namespace import DirectoryNamespace
-    from lance_namespace import (
-        DropTableRequest,
-        TableExistsRequest,
-    )
-
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
     dir_props = {f"storage.{k}": v for k, v in storage_options.items()}
     dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
-    namespace = DirectoryNamespace(**dir_props)
+    inner_ns_client = DirectoryNamespace(**dir_props)
+    ns_client = _wrap_if_custom(inner_ns_client, use_custom)
 
     table_name = "basic_test_table"
     table_data = create_test_table_data()
@@ -914,7 +1025,7 @@ def test_basic_create_and_drop_on_s3(s3_bucket: str):
     # Create table using lance.write_dataset
     ds = lance.write_dataset(
         table_data,
-        namespace=namespace,
+        namespace_client=ns_client,
         table_id=table_id,
         mode="create",
         storage_options=storage_options,
@@ -924,26 +1035,22 @@ def test_basic_create_and_drop_on_s3(s3_bucket: str):
 
     # Drop table
     drop_req = DropTableRequest(id=table_id)
-    drop_resp = namespace.drop_table(drop_req)
+    drop_resp = ns_client.drop_table(drop_req)
     assert drop_resp is not None
 
     # Verify table no longer exists
     exists_req = TableExistsRequest(id=table_id)
     with pytest.raises(Exception):
-        namespace.table_exists(exists_req)
+        ns_client.table_exists(exists_req)
 
 
 @pytest.mark.integration
-def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_concurrent_create_and_drop_single_instance_on_s3(
+    s3_bucket: str, use_custom: bool
+):
     """Test concurrent create/drop with single namespace instance on S3."""
     import concurrent.futures
-
-    from lance.namespace import DirectoryNamespace
-    from lance_namespace import (
-        CreateNamespaceRequest,
-        CreateTableRequest,
-        DropTableRequest,
-    )
 
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
@@ -951,12 +1058,13 @@ def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
     dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
     # Very high retry count to guarantee all operations succeed
     dir_props["commit_retries"] = "2147483647"
-    namespace = DirectoryNamespace(**dir_props)
+    inner_ns_client = DirectoryNamespace(**dir_props)
+    ns_client = _wrap_if_custom(inner_ns_client, use_custom)
 
     # Initialize namespace first - create parent namespace to ensure __manifest table
     # is created before concurrent operations
     create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-    namespace.create_namespace(create_ns_req)
+    ns_client.create_namespace(create_ns_req)
 
     num_tables = 10
     success_count = 0
@@ -973,11 +1081,11 @@ def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
 
             # Create table using atomic create_table API
             create_req = CreateTableRequest(id=table_id)
-            namespace.create_table(create_req, ipc_data)
+            ns_client.create_table(create_req, ipc_data)
 
             # Drop table
             drop_req = DropTableRequest(id=table_id)
-            namespace.drop_table(drop_req)
+            ns_client.drop_table(drop_req)
 
             with lock:
                 success_count += 1
@@ -998,17 +1106,12 @@ def test_concurrent_create_and_drop_single_instance_on_s3(s3_bucket: str):
 
 
 @pytest.mark.integration
-def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_concurrent_create_and_drop_multiple_instances_on_s3(
+    s3_bucket: str, use_custom: bool
+):
     """Test concurrent create/drop with multiple namespace instances on S3."""
     import concurrent.futures
-
-    from lance.namespace import DirectoryNamespace
-    from lance_namespace import (
-        CreateNamespaceRequest,
-        CreateTableRequest,
-        DropTableRequest,
-        ListTablesRequest,
-    )
 
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
@@ -1019,9 +1122,10 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
 
     # Initialize namespace first with a single instance to ensure __manifest
     # table is created and parent namespace exists before concurrent operations
-    init_ns = DirectoryNamespace(**base_dir_props.copy())
+    inner_init_ns_client = DirectoryNamespace(**base_dir_props.copy())
+    init_ns_client = _wrap_if_custom(inner_init_ns_client, use_custom)
     create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-    init_ns.create_namespace(create_ns_req)
+    init_ns_client.create_namespace(create_ns_req)
 
     num_tables = 10
     success_count = 0
@@ -1031,8 +1135,9 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
     def create_and_drop_table(table_index):
         nonlocal success_count, fail_count
         try:
-            # Each thread creates its own namespace instance
-            ns = DirectoryNamespace(**base_dir_props.copy())
+            # Each thread creates its own namespace client instance
+            inner_local_ns_client = DirectoryNamespace(**base_dir_props.copy())
+            local_ns_client = _wrap_if_custom(inner_local_ns_client, use_custom)
 
             table_name = f"s3_multi_ns_table_{table_index}"
             table_data = create_test_table_data()
@@ -1041,11 +1146,11 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
 
             # Create table using atomic create_table API
             create_req = CreateTableRequest(id=table_id)
-            ns.create_table(create_req, ipc_data)
+            local_ns_client.create_table(create_req, ipc_data)
 
             # Drop table
             drop_req = DropTableRequest(id=table_id)
-            ns.drop_table(drop_req)
+            local_ns_client.drop_table(drop_req)
 
             with lock:
                 success_count += 1
@@ -1065,23 +1170,19 @@ def test_concurrent_create_and_drop_multiple_instances_on_s3(s3_bucket: str):
     assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
     # Verify remaining state is consistent (no corruption)
-    verify_ns = DirectoryNamespace(**base_dir_props)
+    inner_verify_ns_client = DirectoryNamespace(**base_dir_props)
+    verify_ns_client = _wrap_if_custom(inner_verify_ns_client, use_custom)
     list_req = ListTablesRequest(id=["test_ns"])
-    _ = verify_ns.list_tables(list_req)  # Should not error
+    _ = verify_ns_client.list_tables(list_req)  # Should not error
 
 
 @pytest.mark.integration
-def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: str):
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_concurrent_create_then_drop_from_different_instance_on_s3(
+    s3_bucket: str, use_custom: bool
+):
     """Test creating from one set of instances, dropping from different ones on S3."""
     import concurrent.futures
-
-    from lance.namespace import DirectoryNamespace
-    from lance_namespace import (
-        CreateNamespaceRequest,
-        CreateTableRequest,
-        DropTableRequest,
-        ListTablesRequest,
-    )
 
     test_prefix = f"test-{uuid.uuid4().hex[:8]}"
     storage_options = copy.deepcopy(CONFIG)
@@ -1092,13 +1193,14 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
 
     # Initialize namespace first with a single instance to ensure __manifest
     # table is created and parent namespace exists before concurrent operations
-    init_ns = DirectoryNamespace(**base_dir_props.copy())
+    inner_init_ns_client = DirectoryNamespace(**base_dir_props.copy())
+    init_ns_client = _wrap_if_custom(inner_init_ns_client, use_custom)
     create_ns_req = CreateNamespaceRequest(id=["test_ns"])
-    init_ns.create_namespace(create_ns_req)
+    init_ns_client.create_namespace(create_ns_req)
 
     num_tables = 10
 
-    # Phase 1: Create all tables concurrently using separate namespace instances
+    # Phase 1: Create all tables concurrently using separate namespace client instances
     create_success_count = 0
     create_fail_count = 0
     create_lock = Lock()
@@ -1107,7 +1209,8 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
         nonlocal create_success_count, create_fail_count
         table_name = f"s3_cross_instance_table_{table_index}"
         try:
-            ns = DirectoryNamespace(**base_dir_props.copy())
+            inner_local_ns_client = DirectoryNamespace(**base_dir_props.copy())
+            local_ns_client = _wrap_if_custom(inner_local_ns_client, use_custom)
 
             table_data = create_test_table_data()
             table_id = ["test_ns", table_name]
@@ -1115,7 +1218,7 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
 
             # Create table using atomic create_table API
             create_req = CreateTableRequest(id=table_id)
-            ns.create_table(create_req, ipc_data)
+            local_ns_client.create_table(create_req, ipc_data)
 
             with create_lock:
                 create_success_count += 1
@@ -1144,13 +1247,14 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
     def drop_table(table_index):
         nonlocal drop_success_count, drop_fail_count
         try:
-            ns = DirectoryNamespace(**base_dir_props.copy())
+            inner_local_ns_client = DirectoryNamespace(**base_dir_props.copy())
+            local_ns_client = _wrap_if_custom(inner_local_ns_client, use_custom)
 
             table_name = f"s3_cross_instance_table_{table_index}"
             table_id = ["test_ns", table_name]
 
             drop_req = DropTableRequest(id=table_id)
-            ns.drop_table(drop_req)
+            local_ns_client.drop_table(drop_req)
 
             with drop_lock:
                 drop_success_count += 1
@@ -1171,6 +1275,7 @@ def test_concurrent_create_then_drop_from_different_instance_on_s3(s3_bucket: st
     assert drop_fail_count == 0, f"Expected 0 drop failures, got {drop_fail_count}"
 
     # Verify remaining state is consistent (no corruption)
-    verify_ns = DirectoryNamespace(**base_dir_props)
+    inner_verify_ns_client = DirectoryNamespace(**base_dir_props)
+    verify_ns_client = _wrap_if_custom(inner_verify_ns_client, use_custom)
     list_req = ListTablesRequest(id=["test_ns"])
-    _ = verify_ns.list_tables(list_req)  # Should not error
+    _ = verify_ns_client.list_tables(list_req)  # Should not error
