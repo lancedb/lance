@@ -1686,6 +1686,35 @@ impl<T: RootDecoderType> RecordBatchReader for BatchDecodeIterator<T> {
     }
 }
 
+/// Estimate the number of bytes per row for a given Arrow data type.
+///
+/// For fixed-width types this is exact. For variable-width types (strings,
+/// binary, lists) a rough default is used. The estimate is used as a
+/// starting point when `batch_size_bytes` is set; a post-decode feedback
+/// loop corrects it after the first batch.
+fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
+    if let Some(w) = data_type.byte_width_opt() {
+        return w as f64;
+    }
+    match data_type {
+        DataType::Boolean => 1.0,
+        DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => 64.0,
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|f| estimate_bytes_per_row(f.data_type()))
+            .sum(),
+        DataType::List(child) | DataType::LargeList(child) => {
+            5.0 * estimate_bytes_per_row(child.data_type())
+        }
+        DataType::FixedSizeList(child, dim) => {
+            *dim as f64 * estimate_bytes_per_row(child.data_type())
+        }
+        DataType::Dictionary(_, value_type) => estimate_bytes_per_row(value_type),
+        DataType::Map(entries, _) => 5.0 * estimate_bytes_per_row(entries.data_type()),
+        _ => 64.0,
+    }
+}
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
@@ -1706,6 +1735,9 @@ pub struct StructuralBatchDecodeStream {
     spawn_batch_decode_tasks: bool,
     /// If set, target this many bytes per batch instead of `rows_per_batch` rows.
     batch_size_bytes: Option<u64>,
+    /// Schema-based estimate of bytes per row, computed once at construction.
+    /// Only meaningful when `batch_size_bytes` is `Some`.
+    schema_bytes_per_row: f64,
 }
 
 impl StructuralBatchDecodeStream {
@@ -1726,6 +1758,11 @@ impl StructuralBatchDecodeStream {
         spawn_batch_decode_tasks: bool,
         batch_size_bytes: Option<u64>,
     ) -> Self {
+        let schema_bytes_per_row = if batch_size_bytes.is_some() {
+            estimate_bytes_per_row(root_decoder.data_type()).max(1.0)
+        } else {
+            0.0
+        };
         Self {
             context: DecoderContext::new(scheduled),
             root_decoder,
@@ -1737,6 +1774,7 @@ impl StructuralBatchDecodeStream {
             emitted_batch_size_warning: Arc::new(Once::new()),
             spawn_batch_decode_tasks,
             batch_size_bytes,
+            schema_bytes_per_row,
         }
     }
 
@@ -1779,7 +1817,12 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
-        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
+        let mut to_take = if let Some(batch_size_bytes) = self.batch_size_bytes {
+            let rows = (batch_size_bytes as f64 / self.schema_bytes_per_row) as u64;
+            self.rows_remaining.min(rows.max(1))
+        } else {
+            self.rows_remaining.min(self.rows_per_batch as u64)
+        };
         self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
@@ -2775,5 +2818,179 @@ mod tests {
         let indices = vec![1, 2, 3, 5, 6, 7, 9];
         let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
         assert_eq!(ranges, vec![1..4, 5..8, 9..10]);
+    }
+
+    #[test]
+    fn test_estimate_bytes_per_row() {
+        assert_eq!(estimate_bytes_per_row(&DataType::Int32), 4.0);
+        assert_eq!(estimate_bytes_per_row(&DataType::Int64), 8.0);
+        assert_eq!(estimate_bytes_per_row(&DataType::Float32), 4.0);
+        assert_eq!(estimate_bytes_per_row(&DataType::Boolean), 1.0);
+        assert_eq!(estimate_bytes_per_row(&DataType::Utf8), 64.0);
+        assert_eq!(estimate_bytes_per_row(&DataType::Binary), 64.0);
+        // Struct of 4 x Int32 = 16 bytes
+        let struct_type = DataType::Struct(Fields::from(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, false),
+            ArrowField::new("d", DataType::Int32, false),
+        ]));
+        assert_eq!(estimate_bytes_per_row(&struct_type), 16.0);
+    }
+
+    /// Helper: encode a batch, then decode it as a stream with optional
+    /// `batch_size_bytes`, collecting all output batches.
+    async fn decode_batches_with_byte_limit(
+        batch: &RecordBatch,
+        batch_size: u32,
+        batch_size_bytes: Option<u64>,
+    ) -> Vec<RecordBatch> {
+        use crate::encoder::{default_encoding_strategy, encode_batch, EncodingOptions};
+        use crate::version::LanceFileVersion;
+
+        let version = LanceFileVersion::V2_1;
+        let options = EncodingOptions {
+            version,
+            ..Default::default()
+        };
+        let strategy = default_encoding_strategy(version);
+        let schema = Schema::try_from(batch.schema().as_ref()).unwrap();
+        let encoded = encode_batch(batch, Arc::new(schema.clone()), strategy.as_ref(), &options)
+            .await
+            .unwrap();
+
+        let io_scheduler =
+            Arc::new(BufferScheduler::new(encoded.data.clone())) as Arc<dyn EncodingsIo>;
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024));
+        let decoder_plugins = Arc::new(DecoderPlugins::default());
+
+        let mut decode_scheduler = DecodeBatchScheduler::try_new(
+            encoded.schema.as_ref(),
+            &encoded.top_level_columns,
+            &encoded.page_table,
+            &vec![],
+            encoded.num_rows,
+            decoder_plugins,
+            io_scheduler.clone(),
+            cache,
+            &FilterExpression::no_filter(),
+            &DecoderConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let (tx, rx) = unbounded_channel();
+        decode_scheduler.schedule_range(
+            0..encoded.num_rows,
+            &FilterExpression::no_filter(),
+            tx,
+            io_scheduler,
+        );
+
+        let mut decode_stream = create_decode_stream(
+            &encoded.schema,
+            encoded.num_rows,
+            batch_size,
+            /*is_structural=*/ true,
+            /*should_validate=*/ true,
+            /*spawn_structural_batch_decode_tasks=*/ true,
+            rx,
+            batch_size_bytes,
+        )
+        .unwrap();
+
+        let mut batches = Vec::new();
+        while let Some(task) = decode_stream.next().await {
+            batches.push(task.task.await.unwrap());
+        }
+        batches
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_fixed_width() {
+        use arrow_array::Int32Array;
+
+        // 1000 rows x 4 Int32 columns = 16 bytes/row
+        let num_rows = 1000;
+        let arrays: Vec<Arc<dyn arrow_array::Array>> = (0..4)
+            .map(|col| {
+                Arc::new(Int32Array::from_iter_values(
+                    (0..num_rows).map(|row| (row * 10 + col) as i32),
+                )) as _
+            })
+            .collect();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, false),
+            ArrowField::new("d", DataType::Int32, false),
+        ]));
+        let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
+
+        // 16 bytes/row, batch_size_bytes=1600 => 100 rows/batch
+        let batches =
+            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 1024, Some(1600)).await;
+
+        // Should produce 10 batches of 100 rows each
+        assert_eq!(batches.len(), 10);
+        for (i, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                batch.num_rows(),
+                100,
+                "batch {i} should have 100 rows, got {}",
+                batch.num_rows()
+            );
+        }
+
+        // Verify roundtrip: concatenate and compare
+        let all_batches: Vec<&RecordBatch> = batches.iter().collect();
+        let concatenated = arrow_select::concat::concat_batches(
+            &batches[0].schema(),
+            all_batches.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(concatenated.num_rows(), num_rows as usize);
+        for col in 0..4 {
+            assert_eq!(
+                concatenated.column(col).as_ref(),
+                input_batch.column(col).as_ref(),
+                "column {col} roundtrip mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_none_unchanged() {
+        use arrow_array::Int32Array;
+
+        // Without batch_size_bytes, rows_per_batch controls batching
+        let num_rows = 1000;
+        let arrays: Vec<Arc<dyn arrow_array::Array>> = (0..2)
+            .map(|col| {
+                Arc::new(Int32Array::from_iter_values(
+                    (0..num_rows).map(|row| (row * 10 + col) as i32),
+                )) as _
+            })
+            .collect();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, false),
+            ArrowField::new("y", DataType::Int32, false),
+        ]));
+        let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
+
+        // batch_size=250, batch_size_bytes=None => 4 batches of 250 rows
+        let batches =
+            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 250, None).await;
+        assert_eq!(batches.len(), 4);
+        for (i, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                batch.num_rows(),
+                250,
+                "batch {i} should have 250 rows, got {}",
+                batch.num_rows()
+            );
+        }
     }
 }
