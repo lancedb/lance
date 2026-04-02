@@ -1049,9 +1049,18 @@ impl Scanner {
     /// Restrict vector index search to the specified index segments.
     ///
     /// This setting is only supported for vector search.
-    pub fn with_index_segments(&mut self, segments: Vec<Uuid>) -> &mut Self {
+    ///
+    /// If [`Self::with_fragments`] is also set then rows from those fragments that are not covered
+    /// by the selected index segments will still be searched with flat KNN. Otherwise, unindexed
+    /// fragments outside the selected index segments are not searched.
+    pub fn with_index_segments(&mut self, segments: Vec<Uuid>) -> Result<&mut Self> {
+        if segments.is_empty() {
+            return Err(Error::invalid_input(
+                "with_index_segments does not accept an empty segment list".to_string(),
+            ));
+        }
         self.index_segments = Some(segments);
-        self
+        Ok(self)
     }
 
     fn get_batch_size(&self) -> usize {
@@ -2181,12 +2190,7 @@ impl Scanner {
             }
         }
 
-        if let Some(index_segments) = &self.index_segments {
-            if index_segments.is_empty() {
-                return Err(Error::invalid_input(
-                    "with_index_segments does not accept an empty segment list".to_string(),
-                ));
-            }
+        if self.index_segments.is_some() {
             if self.nearest.is_none() {
                 return Err(Error::not_supported(
                     "with_index_segments is only supported for vector search".to_string(),
@@ -3512,12 +3516,10 @@ impl Scanner {
                             if user_metric == index_metric {
                                 true
                             } else {
-                                log::warn!(
-                                    "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
-                                    user_metric,
-                                    index_metric
-                                );
-                                false
+                                return Err(Error::invalid_input(format!(
+                                    "with_index_segments requested metric {:?} but the selected index segments use {:?}",
+                                    user_metric, index_metric
+                                )));
                             }
                         }
                         None => true,
@@ -3679,14 +3681,8 @@ impl Scanner {
         };
 
         if !fallback_fragments.is_empty() {
-            let mut q = q.clone();
-            let metric_type = q.metric_type.ok_or_else(|| {
-                Error::internal(
-                    "vector search missing resolved metric type before combining ANN and flat KNN"
-                        .to_string(),
-                )
-            })?;
-            q.metric_type = Some(metric_type);
+            let q = q.clone();
+            debug_assert!(q.metric_type.is_some());
 
             // If the vector column is not present, we need to take the vector column, so
             // that the distance value is comparable with the flat search ones.
@@ -10519,7 +10515,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         scanner
             .nearest("vec", &query, 420)
             .unwrap()
-            .with_index_segments(vec![segment_ids[0]]);
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         let i_array = batch
             .column_by_name("i")
@@ -10552,7 +10549,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .nearest("vec", &query, 420)
             .unwrap()
             .with_fragments(vec![fragments[0].clone(), fragments[2].clone()])
-            .with_index_segments(vec![segment_ids[0]]);
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         let i_array = batch
             .column_by_name("i")
@@ -10588,11 +10586,62 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .nearest("vec", &query, 10)
             .unwrap()
             .with_index_segments(vec![Uuid::new_v4()])
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap_err();
         assert!(
             err.to_string().contains("unknown index segments"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_rejects_metric_mismatch_for_index_segments() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let segment_ids = test_ds.make_segmented_vector_index().await.unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        let err = test_ds
+            .dataset
+            .scan()
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(DistanceType::Dot)
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("with_index_segments requested metric"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_index_segments_rejects_empty_list() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+
+        let err = match test_ds
+            .dataset
+            .scan()
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .with_index_segments(vec![])
+        {
+            Ok(_) => panic!("expected empty index segments to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("with_index_segments does not accept an empty segment list"),
             "unexpected error: {err}"
         );
     }
@@ -10610,6 +10659,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .project(&["i"])
             .unwrap()
             .with_index_segments(vec![segment_ids[0]])
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap_err();
