@@ -3025,9 +3025,9 @@ impl LanceNamespace for DirectoryNamespace {
                     scanner.distance_metric(metric);
                 }
 
-                // Apply nprobes if specified
+                // Apply nprobes if specified (maps to minimum_nprobes, matching lancedb behavior)
                 if let Some(nprobes) = request.nprobes {
-                    scanner.nprobes(nprobes as usize);
+                    scanner.minimum_nprobes(nprobes as usize);
                 }
 
                 // Apply ef (HNSW search effort) if specified
@@ -3085,18 +3085,35 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Apply column projection if specified
-        if let Some(ref columns) = request.columns
-            && let Some(ref column_names) = columns.column_names
-            && !column_names.is_empty()
-        {
-            scanner
-                .project(column_names)
-                .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid column projection: {}", e),
-                })?;
+        if let Some(ref columns) = request.columns {
+            if let Some(ref column_names) = columns.column_names
+                && !column_names.is_empty()
+            {
+                scanner
+                    .project(column_names)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid column projection: {}", e),
+                    })?;
+            } else if let Some(ref column_aliases) = columns.column_aliases
+                && !column_aliases.is_empty()
+            {
+                // column_aliases is HashMap<String, String> where key is alias, value is SQL expression
+                let transform_pairs: Vec<(String, String)> = column_aliases
+                    .iter()
+                    .map(|(alias, sql)| (alias.clone(), sql.clone()))
+                    .collect();
+                scanner
+                    .project_with_transform(
+                        &transform_pairs
+                            .iter()
+                            .map(|(a, s)| (a.as_str(), s.as_str()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid column alias expression: {}", e),
+                    })?;
+            }
         }
-        // Note: column_aliases (SQL expressions) would require expression parsing
-        // For now, we only support simple column names
 
         // Apply filter if specified
         if let Some(ref filter) = request.filter
