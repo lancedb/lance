@@ -6,7 +6,6 @@ use crate::JNIEnvExt;
 use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
 use crate::error::Result;
-use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
 };
@@ -28,7 +27,7 @@ use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::StorageOptionsProvider;
+use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
@@ -625,6 +624,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     skip_auto_cleanup: jboolean,
     namespace_obj: JObject,
     table_id_obj: JObject,
+    namespace_client_managed_versioning: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -641,6 +641,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             skip_auto_cleanup != 0,
             namespace_obj,
             table_id_obj,
+            namespace_client_managed_versioning != 0,
         )
     )
 }
@@ -659,6 +660,7 @@ fn inner_commit_to_dataset<'local>(
     skip_auto_cleanup: bool,
     namespace_obj: JObject,
     table_id_obj: JObject,
+    namespace_client_managed_versioning: bool,
 ) -> Result<JObject<'local>> {
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
@@ -751,14 +753,18 @@ fn inner_commit_to_dataset<'local>(
         Some(&mut java_blocking_ds),
     )?;
 
-    // Set namespace commit handler if provided
+    // Set namespace commit handler only if namespace_client_managed_versioning is true
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let commit_handler = namespace_info.map(|(ns, tid)| {
-        let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
-        Arc::new(ExternalManifestCommitHandler {
-            external_manifest_store: Arc::new(external_store),
-        }) as Arc<dyn CommitHandler>
-    });
+    let commit_handler = if namespace_client_managed_versioning {
+        namespace_info.map(|(ns, tid)| {
+            let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+            Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            }) as Arc<dyn CommitHandler>
+        })
+    } else {
+        None
+    };
 
     let new_blocking_ds = {
         let mut dataset_guard =
@@ -1366,7 +1372,6 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     java_transaction: JObject,
     detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
-    storage_options_provider_obj: JObject,
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
@@ -1375,6 +1380,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     storage_format_obj: JObject,
     max_retries: jint,
     skip_auto_cleanup: jboolean,
+    namespace_client_managed_versioning: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1384,7 +1390,6 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             java_transaction,
             detached_jbool != 0,
             enable_v2_manifest_paths != 0,
-            storage_options_provider_obj,
             namespace_obj,
             table_id_obj,
             allocator_obj,
@@ -1393,6 +1398,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             storage_format_obj,
             max_retries as u32,
             skip_auto_cleanup != 0,
+            namespace_client_managed_versioning != 0,
         )
     )
 }
@@ -1404,7 +1410,6 @@ fn inner_commit_to_uri<'local>(
     java_transaction: JObject,
     detached: bool,
     enable_v2_manifest_paths: bool,
-    storage_options_provider_obj: JObject,
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
@@ -1413,6 +1418,7 @@ fn inner_commit_to_uri<'local>(
     storage_format_obj: JObject,
     max_retries: u32,
     skip_auto_cleanup: bool,
+    namespace_client_managed_versioning: bool,
 ) -> Result<JObject<'local>> {
     let uri_str: String = uri.extract(env)?;
 
@@ -1442,13 +1448,17 @@ fn inner_commit_to_uri<'local>(
         Some(parse_storage_format(&format_str)?)
     };
 
-    // Build storage options accessor
-    let storage_options_provider: Option<JavaStorageOptionsProvider> = env
-        .get_optional(&storage_options_provider_obj, |env, provider_obj| {
-            JavaStorageOptionsProvider::new(env, provider_obj)
-        })?;
-    let storage_options_provider =
-        storage_options_provider.map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
+    // Extract namespace info and create storage options provider if namespace is provided
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> =
+        if let Some((ref ns, ref tid)) = namespace_info {
+            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                ns.clone(),
+                tid.clone(),
+            )))
+        } else {
+            None
+        };
 
     // Keep a copy of initial options for opening the read dataset.
     let initial_storage_options = write_param.clone();
@@ -1471,9 +1481,8 @@ fn inner_commit_to_uri<'local>(
         ..Default::default()
     };
 
-    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
     let (open_namespace, open_table_id) = match &namespace_info {
-        Some((ns, tid)) => (Some(ns.clone()), Some(tid.clone())),
+        Some((namespace_client, tid)) => (Some(namespace_client.clone()), Some(tid.clone())),
         None => (None, None),
     };
 
@@ -1491,6 +1500,7 @@ fn inner_commit_to_uri<'local>(
         None,
         open_namespace,
         open_table_id,
+        namespace_client_managed_versioning,
     )
     .ok();
 
@@ -1522,9 +1532,9 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_skip_auto_cleanup(true);
     }
 
-    // Set namespace commit handler if provided
-    if let Some((ns, tid)) = namespace_info {
-        let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+    // Set namespace commit handler only if namespace_client_managed_versioning is true
+    if namespace_client_managed_versioning && let Some((namespace_client, tid)) = namespace_info {
+        let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
         let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(external_store),
         });

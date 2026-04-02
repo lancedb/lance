@@ -52,6 +52,52 @@ class ToTensorFn(Protocol):
     ) -> Union[dict[str, torch.Tensor], torch.Tensor]: ...
 
 
+def _is_bfloat16_type(t: pa.DataType) -> bool:
+    """Check if a PyArrow type is the lance bfloat16 extension type."""
+    return isinstance(t, pa.ExtensionType) and t.extension_name == "lance.bfloat16"
+
+
+def _bf16_to_tensor(arr: pa.Array) -> torch.Tensor:
+    """Convert a bfloat16 extension array to a torch.bfloat16 tensor.
+
+    Reinterprets the raw bytes as uint16 and views as bfloat16,
+    since they share the same 2-byte memory layout.
+    Null values are replaced with NaN.
+    """
+    storage = arr.storage if isinstance(arr.type, pa.ExtensionType) else arr
+    buf = storage.buffers()[1]
+    offset = storage.offset * 2  # 2 bytes per bf16 value
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given buffer is not writable",
+                category=UserWarning,
+            )
+            tensor = torch.frombuffer(
+                memoryview(buf),
+                dtype=torch.uint16,
+                count=len(storage),
+                offset=offset,
+            ).view(torch.bfloat16)
+    except (AttributeError, RuntimeError, TypeError):
+        np_uint16 = np.frombuffer(
+            buf, dtype=np.uint16, count=len(storage), offset=offset
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given NumPy array is not writable",
+                category=UserWarning,
+            )
+            tensor = torch.from_numpy(np_uint16).view(torch.bfloat16)
+    if arr.null_count > 0:
+        tensor = tensor.clone()
+        null_mask = torch.from_numpy(arr.is_null().to_numpy(zero_copy_only=False))
+        tensor[null_mask] = float("nan")
+    return tensor
+
+
 # Convert an Arrow FSL array into a 2D torch tensor
 def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
     # Note: FixedSizeListArray.values does not take offset/len into account and
@@ -104,6 +150,14 @@ def _to_tensor(
             or pa.types.is_integer(arr.type.value_type)
         ):
             tensor = _fsl_to_tensor(arr, arr.type.list_size)
+        elif pa.types.is_fixed_size_list(arr.type) and _is_bfloat16_type(
+            arr.type.value_type
+        ):
+            values = arr.values
+            start = arr.offset * arr.type.list_size
+            num_vals = len(arr) * arr.type.list_size
+            values = values.slice(start, num_vals)
+            tensor = _bf16_to_tensor(values).view(-1, arr.type.list_size)
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
@@ -113,13 +167,15 @@ def _to_tensor(
 
             if uint64_as_int64 and tensor.dtype == torch.uint64:
                 tensor = tensor.to(torch.int64)
+        elif _is_bfloat16_type(arr.type):
+            tensor = _bf16_to_tensor(arr)
         elif hf_converter is not None:
             tensor = hf_converter.to_pytorch(col, arr)
 
         if tensor is None:
             raise ValueError(
-                "Only support FixedSizeList<f16/f32/f64> or "
-                + f"numeric values, got: {arr.type}"
+                "Only support FixedSizeList<f16/bf16/f32/f64> or "
+                + f"numeric/bfloat16 values, got: {arr.type}"
             )
 
         del arr

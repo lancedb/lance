@@ -650,18 +650,18 @@ class TestLanceNamespaceConnect:
 
             with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
                 properties = {"uri": f"http://127.0.0.1:{adapter.port}"}
-                ns = connect("rest", properties)
+                ns_client = connect("rest", properties)
 
-                assert isinstance(ns, lance.namespace.RestNamespace)
+                assert isinstance(ns_client, lance.namespace.RestNamespace)
 
                 create_req = CreateTableRequest(id=["test_table"])
                 table_data = create_test_data()
                 ipc_data = table_to_ipc_bytes(table_data)
-                response = ns.create_table(create_req, ipc_data)
+                response = ns_client.create_table(create_req, ipc_data)
                 assert response is not None
 
                 list_req = ListTablesRequest(id=[])
-                list_response = ns.list_tables(list_req)
+                list_response = ns_client.list_tables(list_req)
                 assert len(list_response.tables) == 1
                 assert list_response.tables[0] == "test_table"
 
@@ -675,14 +675,14 @@ class TestLanceNamespaceConnect:
                     "uri": f"http://127.0.0.1:{adapter.port}",
                     "delimiter": "@",
                 }
-                ns = connect("rest", properties)
+                ns_client = connect("rest", properties)
 
-                assert isinstance(ns, lance.namespace.RestNamespace)
+                assert isinstance(ns_client, lance.namespace.RestNamespace)
 
                 create_req = CreateTableRequest(id=["test_table"])
                 table_data = create_test_data()
                 ipc_data = table_to_ipc_bytes(table_data)
-                response = ns.create_table(create_req, ipc_data)
+                response = ns_client.create_table(create_req, ipc_data)
                 assert response is not None
 
 
@@ -705,17 +705,17 @@ class TestDynamicContextProvider:
             backend_config = {"root": tmpdir}
 
             with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
-                ns = lance.namespace.RestNamespace(
+                ns_client = lance.namespace.RestNamespace(
                     uri=f"http://127.0.0.1:{adapter.port}",
                     context_provider=TestProvider(),
                 )
 
                 # Perform operations
                 create_req = CreateNamespaceRequest(id=["workspace"])
-                ns.create_namespace(create_req)
+                ns_client.create_namespace(create_req)
 
                 list_req = ListNamespacesRequest(id=[])
-                ns.list_namespaces(list_req)
+                ns_client.list_namespaces(list_req)
 
                 # Context provider should have been called
                 assert call_count["count"] >= 2
@@ -734,7 +734,7 @@ class TestDynamicContextProvider:
 
             with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
                 # Pass both explicit provider and class path - explicit should win
-                ns = lance.namespace.RestNamespace(
+                ns_client = lance.namespace.RestNamespace(
                     context_provider=ExplicitProvider(),
                     **{
                         "uri": f"http://127.0.0.1:{adapter.port}",
@@ -743,7 +743,7 @@ class TestDynamicContextProvider:
                 )
 
                 create_req = CreateNamespaceRequest(id=["workspace"])
-                ns.create_namespace(create_req)
+                ns_client.create_namespace(create_req)
 
                 # Explicit provider should have been used
                 assert explicit_called["called"]

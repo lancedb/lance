@@ -78,7 +78,9 @@ use lance_index::{
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
+};
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
@@ -482,7 +484,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, namespace=None, table_id=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false))]
     fn new(
         py: Python,
         uri: String,
@@ -497,9 +499,9 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
-        namespace: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -569,6 +571,9 @@ impl Dataset {
                 ));
             };
         }
+        // Save a copy of storage options for potential namespace-based credential refresh
+        let initial_storage_options = storage_options.clone();
+
         if let Some(mut storage_options) = storage_options {
             if let Some(user_agent) = storage_options.get_mut("user_agent") {
                 user_agent.push_str(&format!(" pylance/{}", env!("CARGO_PKG_VERSION")));
@@ -589,21 +594,34 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        // Add storage options provider if provided
-        if let Some(provider_obj) = storage_options_provider {
-            use crate::storage_options::py_object_to_storage_options_provider;
-            let provider = py_object_to_storage_options_provider(provider_obj)?;
-            builder = builder.with_storage_options_provider(provider);
-        }
+        // Set up namespace-based features if namespace_client and table_id are provided
+        if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(py, ns_client)?;
 
-        // Set up namespace commit handler if namespace and table_id are provided
-        if let (Some(ns), Some(tid)) = (namespace, table_id) {
-            let ns_arc = extract_namespace_arc(py, ns)?;
-            let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            builder = builder.with_commit_handler(commit_handler);
+            // Auto-create storage options provider from namespace client
+            // when storage_options are present (meaning credentials came from namespace.describe_table)
+            if initial_storage_options.is_some() {
+                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                    LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
+                );
+                // Create accessor with initial options and provider for credential refresh
+                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                    initial_storage_options.clone().unwrap_or_default(),
+                    provider,
+                ));
+                builder = builder.with_storage_options_accessor(accessor);
+            }
+
+            // Set up commit handler only if namespace manages versioning
+            if namespace_client_managed_versioning {
+                let external_store =
+                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
+                let commit_handler: Arc<dyn CommitHandler> =
+                    Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: Arc::new(external_store),
+                    });
+                builder = builder.with_commit_handler(commit_handler);
+            }
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
@@ -2174,21 +2192,21 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
-        namespace: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2204,37 +2222,35 @@ impl Dataset {
             PyLance(transaction),
             commit_lock,
             storage_options,
-            storage_options_provider,
             enable_v2_manifest_paths,
             detached,
             max_retries,
             enable_stable_row_ids,
-            namespace,
+            namespace_client,
             table_id,
+            namespace_client_managed_versioning,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
         enable_stable_row_ids: Option<bool>,
-        namespace: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
-        let accessor = crate::storage_options::create_accessor_from_python(
-            storage_options.clone(),
-            storage_options_provider,
-        )?;
+        let accessor =
+            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -2245,7 +2261,8 @@ impl Dataset {
             None
         };
 
-        // Create commit_handler: prefer user-provided commit_lock, then namespace-based handler
+        // Create commit_handler: prefer user-provided commit_lock, then namespace client-based handler
+        // (only if namespace_client_managed_versioning is true)
         let commit_handler: Option<Arc<dyn CommitHandler>> =
             if let Some(commit_lock) = commit_lock.as_ref() {
                 // User provided a commit_lock
@@ -2254,10 +2271,13 @@ impl Dataset {
                         .into_py_any(commit_lock.py())
                         .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
                 )
-            } else if let (Some(ns), Some(tid)) = (namespace, table_id) {
-                // Create ExternalManifestCommitHandler from namespace and table_id
-                let ns_arc = extract_namespace_arc(ns.py(), ns)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+            } else if namespace_client_managed_versioning
+                && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
+            {
+                // Create ExternalManifestCommitHandler from namespace client and table_id
+                // only when namespace manages versioning
+                let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_client, tid);
                 Some(Arc::new(ExternalManifestCommitHandler {
                     external_manifest_store: Arc::new(external_store),
                 }) as Arc<dyn CommitHandler>)
@@ -2299,21 +2319,18 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch(
         dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let accessor = crate::storage_options::create_accessor_from_python(
-            storage_options.clone(),
-            storage_options_provider,
-        )?;
+        let accessor =
+            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -3115,20 +3132,35 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
-        let storage_options_provider =
-            get_dict_opt::<Py<PyAny>>(options, "storage_options_provider")?;
 
-        if storage_options.is_some() || storage_options_provider.is_some() {
-            let accessor = crate::storage_options::create_accessor_from_python(
-                storage_options,
-                storage_options_provider
-                    .as_ref()
-                    .map(|py_obj| py_obj.bind(options.py())),
-            )?;
-            p.store_params = Some(ObjectStoreParams {
-                storage_options_accessor: accessor,
-                ..Default::default()
-            });
+        // Extract namespace_client and table_id for storage options provider creation
+        let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
+        let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+
+        if let Some(so) = storage_options.clone() {
+            // If namespace_client and table_id are provided, create storage options provider from them
+            if let (Some(ns_client), Some(table_id)) =
+                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
+            {
+                let ns_client = extract_namespace_arc(options.py(), ns_client)?;
+                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                    LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
+                );
+                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                    so, provider,
+                ));
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                });
+            } else {
+                // No namespace, just use storage options directly
+                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                });
+            }
         }
 
         if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?
@@ -3213,21 +3245,22 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.transaction_properties = Some(Arc::new(new_props));
         }
 
-        // Handle namespace and table_id for managed versioning (external manifest store)
-        // Only set if commit_handler is not already set by user
-        if p.commit_handler.is_none() {
-            let namespace_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace")?;
-            let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
-
-            if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
-                let ns_arc = extract_namespace_arc(options.py(), &ns)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
-                let commit_handler: Arc<dyn CommitHandler> =
-                    Arc::new(ExternalManifestCommitHandler {
-                        external_manifest_store: Arc::new(external_store),
-                    });
-                p.commit_handler = Some(commit_handler);
-            }
+        // Handle namespace_client and table_id for managed versioning (external manifest store)
+        // Only set if commit_handler is not already set by user and namespace_client_managed_versioning is true
+        let namespace_client_managed_versioning =
+            get_dict_opt::<bool>(options, "namespace_client_managed_versioning")?.unwrap_or(false);
+        if p.commit_handler.is_none()
+            && namespace_client_managed_versioning
+            && let (Some(ns_client), Some(table_id)) =
+                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
+        {
+            let ns_client = extract_namespace_arc(options.py(), ns_client)?;
+            let external_store =
+                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            p.commit_handler = Some(commit_handler);
         }
 
         Some(p)

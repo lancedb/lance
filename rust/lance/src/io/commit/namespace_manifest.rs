@@ -16,14 +16,14 @@ use object_store::path::Path;
 
 #[derive(Debug)]
 pub struct LanceNamespaceExternalManifestStore {
-    namespace: Arc<dyn LanceNamespace>,
+    namespace_client: Arc<dyn LanceNamespace>,
     table_id: Vec<String>,
 }
 
 impl LanceNamespaceExternalManifestStore {
-    pub fn new(namespace: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
+    pub fn new(namespace_client: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
         Self {
-            namespace,
+            namespace_client,
             table_id,
         }
     }
@@ -38,7 +38,10 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             ..Default::default()
         };
 
-        let response = self.namespace.describe_table_version(request).await?;
+        let response = self
+            .namespace_client
+            .describe_table_version(request)
+            .await?;
 
         // Namespace returns full path (relative to object store root)
         Ok(response.version.manifest_path)
@@ -52,7 +55,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             ..Default::default()
         };
 
-        let response = self.namespace.list_table_versions(request).await?;
+        let response = self.namespace_client.list_table_versions(request).await?;
 
         if response.versions.is_empty() {
             return Ok(None);
@@ -94,7 +97,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             ..Default::default()
         };
 
-        let response = self.namespace.create_table_version(request).await?;
+        let response = self.namespace_client.create_table_version(request).await?;
 
         // Get version info from response
         let version_info = response.version.ok_or_else(|| {

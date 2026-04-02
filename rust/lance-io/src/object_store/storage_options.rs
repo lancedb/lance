@@ -94,7 +94,7 @@ pub trait StorageOptionsProvider: Send + Sync + fmt::Debug {
 
 /// StorageOptionsProvider implementation that fetches options from a LanceNamespace
 pub struct LanceNamespaceStorageOptionsProvider {
-    namespace: Arc<dyn LanceNamespace>,
+    namespace_client: Arc<dyn LanceNamespace>,
     table_id: Vec<String>,
 }
 
@@ -114,11 +114,11 @@ impl LanceNamespaceStorageOptionsProvider {
     /// Create a new LanceNamespaceStorageOptionsProvider
     ///
     /// # Arguments
-    /// * `namespace` - The namespace implementation to fetch storage options from
+    /// * `namespace_client` - The namespace implementation to fetch storage options from
     /// * `table_id` - The table identifier
-    pub fn new(namespace: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
+    pub fn new(namespace_client: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
         Self {
-            namespace,
+            namespace_client,
             table_id,
         }
     }
@@ -132,20 +132,24 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
             ..Default::default()
         };
 
-        let response = self.namespace.describe_table(request).await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to fetch storage options: {}",
-                e
-            ))))
-        })?;
+        let response = self
+            .namespace_client
+            .describe_table(request)
+            .await
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to fetch storage options: {}",
+                    e
+                ))))
+            })?;
 
         Ok(response.storage_options)
     }
 
     fn provider_id(&self) -> String {
         format!(
-            "LanceNamespaceStorageOptionsProvider {{ namespace: {}, table_id: {:?} }}",
-            self.namespace.namespace_id(),
+            "LanceNamespaceStorageOptionsProvider {{ namespace_client: {}, table_id: {:?} }}",
+            self.namespace_client.namespace_id(),
             self.table_id
         )
     }
@@ -310,14 +314,13 @@ impl StorageOptionsAccessor {
             }
         }
 
-        // If no provider, return initial options or error
+        // If no provider, return initial options or use defaults
         let Some(provider) = &self.provider else {
             return if let Some(initial) = &self.initial_options {
                 Ok(Some(super::StorageOptions(initial.clone())))
             } else {
-                Err(Error::io_source(Box::new(std::io::Error::other(
-                    "No storage options available",
-                ))))
+                // No provider and no initial options - use default credentials
+                Ok(Some(super::StorageOptions(HashMap::new())))
             };
         };
 
@@ -333,7 +336,6 @@ impl StorageOptionsAccessor {
         {
             return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
         }
-
         log::debug!(
             "Refreshing storage options from provider: {}",
             provider.provider_id()
@@ -347,13 +349,18 @@ impl StorageOptionsAccessor {
         })?;
 
         let Some(options) = storage_options_map else {
-            // Provider returned None, fall back to initial options
+            // Provider returned None, fall back to initial options or use defaults
             if let Some(initial) = &self.initial_options {
                 return Ok(Some(super::StorageOptions(initial.clone())));
             }
-            return Err(Error::io_source(Box::new(std::io::Error::other(
-                "Provider returned no storage options",
-            ))));
+            // Provider returned None and no initial options - use default credentials
+            // This is valid when namespace doesn't vend credentials (e.g., directory namespace
+            // where environment credentials are used)
+            log::debug!(
+                "Provider {} returned no storage options, using default credentials",
+                provider.provider_id()
+            );
+            return Ok(Some(super::StorageOptions(HashMap::new())));
         };
 
         let expires_at_millis = options
