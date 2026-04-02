@@ -2190,12 +2190,10 @@ impl Scanner {
             }
         }
 
-        if self.index_segments.is_some() {
-            if self.nearest.is_none() {
-                return Err(Error::not_supported(
-                    "with_index_segments is only supported for vector search".to_string(),
-                ));
-            }
+        if self.index_segments.is_some() && self.nearest.is_none() {
+            return Err(Error::not_supported(
+                "with_index_segments is only supported for vector search".to_string(),
+            ));
         }
 
         Ok(())
@@ -10629,15 +10627,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .unwrap();
         let query: Float32Array = (0..32).map(|v| v as f32).collect();
 
-        let err = match test_ds
+        let Err(err) = test_ds
             .dataset
             .scan()
             .nearest("vec", &query, 10)
             .unwrap()
             .with_index_segments(vec![])
-        {
-            Ok(_) => panic!("expected empty index segments to be rejected"),
-            Err(err) => err,
+        else {
+            panic!("expected empty index segments to be rejected");
         };
         assert!(
             err.to_string()
