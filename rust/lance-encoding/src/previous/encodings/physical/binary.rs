@@ -57,11 +57,7 @@ impl IndicesNormalizer {
         }
     }
 
-    fn extend(
-        &mut self,
-        new_indices: &PrimitiveArray<UInt64Type>,
-        is_start: bool,
-    ) -> Result<()> {
+    fn extend(&mut self, new_indices: &PrimitiveArray<UInt64Type>, is_start: bool) -> Result<()> {
         let mut last = *self.indices.last().unwrap();
         if is_start {
             let (is_valid, val) = self.normalize(new_indices.value(0));
@@ -75,14 +71,12 @@ impl IndicesNormalizer {
             let next = match val.checked_sub(prev) {
                 Some(delta) => delta + last,
                 None => {
-                    return Err(lance_core::Error::invalid_input(
-                        format!(
-                            "corrupt binary page: normalized offset {} is less than previous offset {} \
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "corrupt binary page: normalized offset {} is less than previous offset {} \
                              at index {}, null_adjustment={}, raw values were [{}, {}]. \
                              This usually indicates the file data has been corrupted.",
-                            val, prev, i, self.null_adjustment, w[0], w[1]
-                        ),
-                    ));
+                        val, prev, i, self.null_adjustment, w[0], w[1]
+                    )));
                 }
             };
             self.indices.push(next);
