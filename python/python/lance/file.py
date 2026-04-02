@@ -25,7 +25,7 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
-    from lance_namespace import LanceNamespace
+    from .namespace import LanceNamespace
 
 
 class ReaderResults:
