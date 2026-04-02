@@ -272,7 +272,11 @@ impl Reader for LocalObjectReader {
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: Arc<File>,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
     let expected_len = buf.len();
     while !buf.is_empty() {
         match file.seek_read(buf, offset) {

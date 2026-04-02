@@ -5,10 +5,10 @@ use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(windows)]
+use crate::local::read_exact_at;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 
 use bytes::Bytes;
 use deepsize::DeepSizeOf;

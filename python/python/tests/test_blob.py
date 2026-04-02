@@ -404,7 +404,7 @@ def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp
     blob_path.write_bytes(b"hello")
     uri = blob_path.as_uri()
     message = (
-        'allow_external_blob_outside_bases only applies when '
+        "allow_external_blob_outside_bases only applies when "
         'external_blob_mode="reference"'
     )
 

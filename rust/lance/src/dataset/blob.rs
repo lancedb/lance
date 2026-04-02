@@ -297,6 +297,7 @@ impl BlobWriteSource<'_> {
 }
 
 impl BlobPreprocessor {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         object_store: ObjectStore,
         data_dir: Path,

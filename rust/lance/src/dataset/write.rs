@@ -1110,6 +1110,7 @@ struct WriterGenerator {
 }
 
 impl WriterGenerator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
