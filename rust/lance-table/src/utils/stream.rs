@@ -670,4 +670,59 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_version_column_with_deletions() {
+        use crate::rowids::segment::U64Segment;
+        use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
+
+        let seq = Arc::new(RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..100),
+                version: 42,
+            }],
+        });
+
+        let data = batch_task_stream(
+            lance_datagen::gen_batch()
+                .col("x", lance_datagen::array::rand::<Int32Type>())
+                .into_reader_stream(RowCount::from(10), BatchCount::from(10))
+                .0,
+        );
+
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: true,
+            deletion_vector: Some(Arc::new(DeletionVector::Bitmap(
+                RoaringBitmap::from_iter(0..35),
+            ))),
+            row_id_sequence: None,
+            last_updated_at_sequence: None,
+            created_at_sequence: Some(seq),
+            make_deletions_null: false,
+            total_num_rows: 100,
+        };
+        let stream = super::wrap_with_row_id_and_delete(data, 0, config);
+        let batches: Vec<_> = stream
+            .buffered(1)
+            .try_filter(|b| std::future::ready(b.num_rows() > 0))
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 65);
+
+        for batch in &batches {
+            let versions = batch
+                .column_by_name("_row_created_at_version")
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .values();
+            assert!(versions.iter().all(|&v| v == 42));
+        }
+    }
 }
