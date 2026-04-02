@@ -398,6 +398,7 @@ impl Branches<'_> {
                 let contents = BranchContents::from_path(
                     &branch_contents_path(branch_path, &name),
                     self.object_store(),
+                    &name,
                 )
                 .await?;
                 Ok((name, contents))
@@ -425,7 +426,8 @@ impl Branches<'_> {
             });
         }
 
-        let branch_contents = BranchContents::from_path(&branch_file, self.object_store()).await?;
+        let branch_contents =
+            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
 
         Ok(branch_contents)
     }
@@ -481,7 +483,7 @@ impl Branches<'_> {
         let parent_branch_id = if let Some(ref parent_branch) = source_branch {
             let parent_file = branch_contents_path(&root_location.path, parent_branch);
             if self.object_store().exists(&parent_file).await? {
-                BranchContents::from_path(&parent_file, self.object_store())
+                BranchContents::from_path(&parent_file, self.object_store(), parent_branch)
                     .await?
                     .identifier
             } else {
@@ -771,11 +773,40 @@ impl BranchIdentifier {
         Self { version_mapping }
     }
 
-    /// Creates a branch identifier for legacy branches without explicit lineage.
-    /// Legacy branches have parent_version=0 and are skipped during cleanup.
+    /// Creates a sentinel branch identifier for branch metadata that is missing lineage.
+    ///
+    /// When branch metadata is read from disk, this sentinel is replaced with a deterministic
+    /// synthetic identifier derived from the branch metadata so public branch identifiers remain
+    /// stable across reads.
     pub fn none() -> Self {
         Self {
-            version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
+            version_mapping: vec![(0, Uuid::nil().simple().to_string())],
+        }
+    }
+
+    fn synthetic(
+        branch_name: &str,
+        parent_branch: Option<&str>,
+        parent_version: u64,
+        create_at: u64,
+    ) -> Self {
+        Self {
+            // We synthesize a deterministic UUID for legacy branch files without an explicit
+            // identifier so public branch metadata remains stable across reads. This also makes
+            // lineage and delete-conflict detection for legacy descendants deterministic.
+            version_mapping: vec![(
+                0,
+                Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!(
+                        "branch_name={branch_name}\nparent_branch={}\nparent_version={parent_version}\ncreate_at={create_at}",
+                        parent_branch.unwrap_or("")
+                    )
+                    .as_bytes(),
+                )
+                .simple()
+                .to_string(),
+            )],
         }
     }
 
@@ -896,8 +927,21 @@ impl TagContents {
 }
 
 impl BranchContents {
-    pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
-        from_path(path, object_store).await
+    pub async fn from_path(
+        path: &Path,
+        object_store: &ObjectStore,
+        branch_name: &str,
+    ) -> Result<Self> {
+        let mut contents: Self = from_path(path, object_store).await?;
+        if contents.identifier == BranchIdentifier::none() {
+            contents.identifier = BranchIdentifier::synthetic(
+                branch_name,
+                contents.parent_branch.as_deref(),
+                contents.parent_version,
+                contents.create_at,
+            );
+        }
+        Ok(contents)
     }
 }
 
@@ -1187,6 +1231,36 @@ mod tests {
         let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
         let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
         assert!(legacy_deserialized.metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_branch_synthetic_uuid_is_stable() {
+        let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
+        let store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let first_path = branch_contents_path(&base_path, "legacy_branch");
+        store
+            .put(&first_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+        let second_path = branch_contents_path(&base_path, "legacy_branch_other");
+        store
+            .put(&second_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+
+        let first = BranchContents::from_path(&first_path, &store, "legacy_branch")
+            .await
+            .unwrap();
+        let second = BranchContents::from_path(&first_path, &store, "legacy_branch")
+            .await
+            .unwrap();
+        assert_eq!(first.identifier, second.identifier);
+
+        let other = BranchContents::from_path(&second_path, &store, "legacy_branch_other")
+            .await
+            .unwrap();
+        assert_ne!(first.identifier, other.identifier);
     }
 
     #[tokio::test]
