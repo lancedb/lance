@@ -46,9 +46,10 @@ use lance::dataset::{
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
-    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
-    ExternalBlobMode, ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched,
-    WhenNotMatched, WhenNotMatchedBySource, WriteMode, WriteParams,
+    Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
+    MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
+    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
