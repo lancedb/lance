@@ -8,6 +8,7 @@
 
 pub mod manifest;
 
+use arrow::array::Float32Array;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -18,7 +19,9 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
-use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{
+    BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+};
 use lance_index::vector::{
     bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
     sq::builder::SQBuildParams,
@@ -31,7 +34,7 @@ use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
@@ -46,8 +49,8 @@ use lance_namespace::models::{
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse, Identity,
     IndexContent, ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
     ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
-    TableVersion,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, QueryTableRequest,
+    TableExistsRequest, TableVersion,
 };
 
 use lance_core::Result;
@@ -58,6 +61,36 @@ use lance_namespace::schema::arrow_schema_to_json;
 use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
+
+/// Thread-safe metrics tracker for namespace operations.
+///
+/// Tracks the count of each API operation when `ops_metrics_enabled` is true.
+/// Use `retrieve()` to get a snapshot of all operation counts.
+#[derive(Debug, Default)]
+pub struct OpsMetrics {
+    counters: Mutex<HashMap<String, u64>>,
+}
+
+impl OpsMetrics {
+    /// Increment the counter for an operation.
+    pub fn increment(&self, operation: &str) {
+        if let Ok(mut counters) = self.counters.lock() {
+            *counters.entry(operation.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Get a snapshot of all operation counts.
+    pub fn retrieve(&self) -> HashMap<String, u64> {
+        self.counters.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Reset all counters to zero.
+    pub fn reset(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.clear();
+        }
+    }
+}
 
 /// Result of checking table status atomically.
 ///
@@ -150,6 +183,16 @@ pub struct DirectoryNamespaceBuilder {
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
+    /// When true, returns input storage options in describe_table/declare_table responses
+    /// when no credential vendor is configured. Useful for testing. Default: false.
+    vend_input_storage_options: bool,
+    /// When set, adds expires_at_millis to vended storage options. The value is calculated
+    /// as current_time_millis + this interval. This allows clients to know when to refresh
+    /// credentials by calling describe_table again. Only effective when vend_input_storage_options
+    /// is true.
+    vend_input_storage_options_refresh_interval_millis: Option<u64>,
+    /// When true, tracks operation metrics. Default: false.
+    ops_metrics_enabled: bool,
 }
 
 impl std::fmt::Debug for DirectoryNamespaceBuilder {
@@ -175,6 +218,15 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
             )
+            .field(
+                "vend_input_storage_options",
+                &self.vend_input_storage_options,
+            )
+            .field(
+                "vend_input_storage_options_refresh_interval_millis",
+                &self.vend_input_storage_options_refresh_interval_millis,
+            )
+            .field("ops_metrics_enabled", &self.ops_metrics_enabled)
             .finish()
     }
 }
@@ -198,6 +250,9 @@ impl DirectoryNamespaceBuilder {
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
             commit_retries: None,
+            vend_input_storage_options: false,
+            vend_input_storage_options_refresh_interval_millis: None,
+            ops_metrics_enabled: false,
         }
     }
 
@@ -389,6 +444,23 @@ impl DirectoryNamespaceBuilder {
             .get("commit_retries")
             .and_then(|v| v.parse::<u32>().ok());
 
+        // Extract vend_input_storage_options (default: false)
+        let vend_input_storage_options = properties
+            .get("vend_input_storage_options")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        // Extract vend_input_storage_options_refresh_interval_millis (optional)
+        let vend_input_storage_options_refresh_interval_millis = properties
+            .get("vend_input_storage_options_refresh_interval_millis")
+            .and_then(|v| v.parse::<u64>().ok());
+
+        // Extract ops_metrics_enabled (default: false)
+        let ops_metrics_enabled = properties
+            .get("ops_metrics_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         Ok(Self {
             root: root.trim_end_matches('/').to_string(),
             storage_options,
@@ -401,6 +473,9 @@ impl DirectoryNamespaceBuilder {
             credential_vendor_properties,
             context_provider: None,
             commit_retries,
+            vend_input_storage_options,
+            vend_input_storage_options_refresh_interval_millis,
+            ops_metrics_enabled,
         })
     }
 
@@ -513,6 +588,50 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
+    /// Enable or disable returning input storage options in responses.
+    ///
+    /// When enabled, `describe_table` and `declare_table` will return the storage
+    /// options passed to the builder when no credential vendor is configured.
+    /// This is useful for testing scenarios where you want to pass storage options
+    /// through to clients.
+    ///
+    /// Default is false (storage options are not returned unless credential vending is configured).
+    pub fn vend_input_storage_options(mut self, enabled: bool) -> Self {
+        self.vend_input_storage_options = enabled;
+        self
+    }
+
+    /// Set the refresh interval for vended input storage options.
+    ///
+    /// When set, vended storage options will include an `expires_at_millis` field
+    /// calculated as `current_time_millis + interval_millis`. This allows clients
+    /// to know when to refresh credentials by calling `describe_table` again.
+    ///
+    /// This only has effect when `vend_input_storage_options` is enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval_millis` - The refresh interval in milliseconds
+    pub fn vend_input_storage_options_refresh_interval_millis(
+        mut self,
+        interval_millis: u64,
+    ) -> Self {
+        self.vend_input_storage_options_refresh_interval_millis = Some(interval_millis);
+        self
+    }
+
+    /// Enable or disable operation metrics tracking.
+    ///
+    /// When enabled, the namespace will track how many times each API operation
+    /// is called. Use `retrieve_ops_metrics()` on the built namespace to get
+    /// the current counts.
+    ///
+    /// Default is false.
+    pub fn ops_metrics_enabled(mut self, enabled: bool) -> Self {
+        self.ops_metrics_enabled = enabled;
+        self
+    }
+
     /// Build the DirectoryNamespace.
     ///
     /// # Returns
@@ -575,6 +694,12 @@ impl DirectoryNamespaceBuilder {
             None
         };
 
+        let ops_metrics = if self.ops_metrics_enabled {
+            Some(Arc::new(OpsMetrics::default()))
+        } else {
+            None
+        };
+
         Ok(DirectoryNamespace {
             root: self.root,
             storage_options: self.storage_options,
@@ -587,6 +712,10 @@ impl DirectoryNamespaceBuilder {
             table_version_storage_enabled: self.table_version_storage_enabled,
             credential_vendor,
             context_provider: self.context_provider,
+            vend_input_storage_options: self.vend_input_storage_options,
+            vend_input_storage_options_refresh_interval_millis: self
+                .vend_input_storage_options_refresh_interval_millis,
+            ops_metrics,
         })
     }
 
@@ -668,6 +797,13 @@ pub struct DirectoryNamespace {
     /// Stored but not directly used in operations (available for future extensions).
     #[allow(dead_code)]
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    /// When true, returns input storage options in responses when no credential vendor is configured.
+    vend_input_storage_options: bool,
+    /// Refresh interval in milliseconds for vended input storage options.
+    /// When set, expires_at_millis is added to storage options.
+    vend_input_storage_options_refresh_interval_millis: Option<u64>,
+    /// Operation metrics tracker, created when ops_metrics_enabled is true.
+    ops_metrics: Option<Arc<OpsMetrics>>,
 }
 
 impl std::fmt::Debug for DirectoryNamespace {
@@ -797,13 +933,188 @@ impl DirectoryNamespace {
         describe_req.id = id.clone();
         describe_req.load_detailed_metadata = Some(false);
 
-        let describe_resp = self.describe_table(describe_req).await?;
+        // Use internal impl to avoid counting this as an external API call
+        let describe_resp = self.describe_table_impl(describe_req).await?;
 
         describe_resp.location.ok_or_else(|| {
             lance_core::Error::from(NamespaceError::TableNotFound {
                 message: format!("Table location not found for: {:?}", id),
             })
         })
+    }
+
+    /// Internal describe_table implementation that doesn't record metrics.
+    /// Used by both the public describe_table (which records metrics) and
+    /// internal callers like resolve_table_location (which shouldn't).
+    async fn describe_table_impl(
+        &self,
+        request: DescribeTableRequest,
+    ) -> Result<DescribeTableResponse> {
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            match manifest_ns.describe_table(request.clone()).await {
+                Ok(mut response) => {
+                    if let Some(ref table_uri) = response.table_uri {
+                        // For backwards compatibility, only skip vending credentials when explicitly set to false
+                        let vend = request.vend_credentials.unwrap_or(true);
+                        let identity = request.identity.as_deref();
+                        response.storage_options = self
+                            .get_storage_options_for_table(table_uri, vend, identity)
+                            .await?;
+                    }
+                    // Set managed_versioning flag when table_version_tracking_enabled
+                    if self.table_version_tracking_enabled {
+                        response.managed_versioning = Some(true);
+                    }
+                    return Ok(response);
+                }
+                Err(_)
+                    if self.dir_listing_enabled
+                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
+                {
+                    // Fall through to directory check only for single-level IDs
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let table_name = Self::table_name_from_id(&request.id)?;
+        let table_uri = self.table_full_uri(&table_name);
+
+        // Atomically check table existence and deregistration status
+        let status = self.check_table_status(&table_name).await;
+
+        if !status.exists {
+            return Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into());
+        }
+
+        if status.is_deregistered {
+            return Err(NamespaceError::InvalidTableState {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
+        }
+
+        let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let identity = request.identity.as_deref();
+
+        // If not loading detailed metadata, return minimal response with just location
+        if !load_detailed_metadata {
+            let storage_options = self
+                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                .await?;
+            return Ok(DescribeTableResponse {
+                table: Some(table_name),
+                namespace: request.id.as_ref().map(|id| {
+                    if id.len() > 1 {
+                        id[..id.len() - 1].to_vec()
+                    } else {
+                        vec![]
+                    }
+                }),
+                location: Some(table_uri.clone()),
+                table_uri: Some(table_uri),
+                storage_options,
+                managed_versioning: if self.table_version_tracking_enabled {
+                    Some(true)
+                } else {
+                    None
+                },
+                ..Default::default()
+            });
+        }
+
+        // Try to load the dataset to get real information
+        // Use DatasetBuilder with storage options to support S3 with custom endpoints
+        let mut builder = DatasetBuilder::from_uri(&table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        match builder.load().await {
+            Ok(mut dataset) => {
+                // If a specific version is requested, checkout that version
+                if let Some(requested_version) = request.version {
+                    dataset = dataset.checkout_version(requested_version as u64).await?;
+                }
+
+                let version_info = dataset.version();
+                let lance_schema = dataset.schema();
+                let arrow_schema: arrow_schema::Schema = lance_schema.into();
+                let json_schema = arrow_schema_to_json(&arrow_schema)?;
+                let storage_options = self
+                    .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                    .await?;
+
+                // Convert BTreeMap to HashMap for the response
+                let metadata: std::collections::HashMap<String, String> =
+                    version_info.metadata.into_iter().collect();
+
+                Ok(DescribeTableResponse {
+                    table: Some(table_name),
+                    namespace: request.id.as_ref().map(|id| {
+                        if id.len() > 1 {
+                            id[..id.len() - 1].to_vec()
+                        } else {
+                            vec![]
+                        }
+                    }),
+                    version: Some(version_info.version as i64),
+                    location: Some(table_uri.clone()),
+                    table_uri: Some(table_uri),
+                    schema: Some(Box::new(json_schema)),
+                    storage_options,
+                    metadata: Some(metadata),
+                    managed_versioning: if self.table_version_tracking_enabled {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                })
+            }
+            Err(err) => {
+                // Use the reserved file status from the atomic check
+                if status.has_reserved_file {
+                    let storage_options = self
+                        .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                        .await?;
+                    Ok(DescribeTableResponse {
+                        table: Some(table_name),
+                        namespace: request.id.as_ref().map(|id| {
+                            if id.len() > 1 {
+                                id[..id.len() - 1].to_vec()
+                            } else {
+                                vec![]
+                            }
+                        }),
+                        location: Some(table_uri.clone()),
+                        table_uri: Some(table_uri),
+                        storage_options,
+                        managed_versioning: if self.table_version_tracking_enabled {
+                            Some(true)
+                        } else {
+                            None
+                        },
+                        ..Default::default()
+                    })
+                } else {
+                    Err(NamespaceError::Internal {
+                        message: format!(
+                            "Table directory exists but cannot load dataset {}: {:?}",
+                            table_name, err
+                        ),
+                    }
+                    .into())
+                }
+            }
+        }
     }
 
     async fn load_dataset(
@@ -1302,6 +1613,26 @@ impl DirectoryNamespace {
             let vended = vendor.vend_credentials(table_uri, identity).await?;
             return Ok(Some(vended.storage_options));
         }
+        // When vend_input_storage_options is enabled and no credential vendor is configured,
+        // return the input storage options. This is useful for testing.
+        if self.vend_input_storage_options {
+            let mut options = self.storage_options.clone().unwrap_or_default();
+            // Add expires_at_millis if refresh interval is configured
+            if let Some(refresh_interval_millis) =
+                self.vend_input_storage_options_refresh_interval_millis
+            {
+                let now_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let expires_at_millis = now_millis + refresh_interval_millis;
+                options.insert(
+                    "expires_at_millis".to_string(),
+                    expires_at_millis.to_string(),
+                );
+            }
+            return Ok(Some(options));
+        }
         // When no credential vendor is configured, return None to avoid
         // leaking the namespace's own static credentials to clients.
         Ok(None)
@@ -1441,6 +1772,35 @@ impl DirectoryNamespace {
         }
         Ok(deleted_count)
     }
+
+    /// Retrieve a snapshot of operation metrics.
+    ///
+    /// Returns a HashMap where keys are operation names (e.g., "list_tables", "describe_table")
+    /// and values are the number of times each operation was called.
+    ///
+    /// Returns an empty HashMap if `ops_metrics_enabled` was false when building the namespace.
+    pub fn retrieve_ops_metrics(&self) -> HashMap<String, u64> {
+        self.ops_metrics
+            .as_ref()
+            .map(|m| m.retrieve())
+            .unwrap_or_default()
+    }
+
+    /// Reset all operation metrics counters to zero.
+    ///
+    /// Does nothing if `ops_metrics_enabled` was false when building the namespace.
+    pub fn reset_ops_metrics(&self) {
+        if let Some(ref metrics) = self.ops_metrics {
+            metrics.reset();
+        }
+    }
+
+    /// Increment the counter for an operation.
+    fn record_op(&self, operation: &str) {
+        if let Some(ref metrics) = self.ops_metrics {
+            metrics.increment(operation);
+        }
+    }
 }
 
 #[async_trait]
@@ -1449,6 +1809,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
+        self.record_op("list_namespaces");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.list_namespaces(request).await;
         }
@@ -1461,6 +1822,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
+        self.record_op("describe_namespace");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.describe_namespace(request).await;
         }
@@ -1477,6 +1839,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
+        self.record_op("create_namespace");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.create_namespace(request).await;
         }
@@ -1496,6 +1859,7 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
+        self.record_op("drop_namespace");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.drop_namespace(request).await;
         }
@@ -1515,6 +1879,7 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+        self.record_op("namespace_exists");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.namespace_exists(request).await;
         }
@@ -1531,6 +1896,7 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        self.record_op("list_tables");
         // Validate that namespace ID is provided
         let namespace_id = request.id.as_ref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -1605,174 +1971,12 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            match manifest_ns.describe_table(request.clone()).await {
-                Ok(mut response) => {
-                    if let Some(ref table_uri) = response.table_uri {
-                        // For backwards compatibility, only skip vending credentials when explicitly set to false
-                        let vend = request.vend_credentials.unwrap_or(true);
-                        let identity = request.identity.as_deref();
-                        response.storage_options = self
-                            .get_storage_options_for_table(table_uri, vend, identity)
-                            .await?;
-                    }
-                    // Set managed_versioning flag when table_version_tracking_enabled
-                    if self.table_version_tracking_enabled {
-                        response.managed_versioning = Some(true);
-                    }
-                    return Ok(response);
-                }
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
-                    // Fall through to directory check only for single-level IDs
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
-
-        // Atomically check table existence and deregistration status
-        let status = self.check_table_status(&table_name).await;
-
-        if !status.exists {
-            return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
-            }
-            .into());
-        }
-
-        if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
-            }
-            .into());
-        }
-
-        let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
-        // For backwards compatibility, only skip vending credentials when explicitly set to false
-        let vend_credentials = request.vend_credentials.unwrap_or(true);
-        let identity = request.identity.as_deref();
-
-        // If not loading detailed metadata, return minimal response with just location
-        if !load_detailed_metadata {
-            let storage_options = self
-                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                .await?;
-            return Ok(DescribeTableResponse {
-                table: Some(table_name),
-                namespace: request.id.as_ref().map(|id| {
-                    if id.len() > 1 {
-                        id[..id.len() - 1].to_vec()
-                    } else {
-                        vec![]
-                    }
-                }),
-                location: Some(table_uri.clone()),
-                table_uri: Some(table_uri),
-                storage_options,
-                managed_versioning: if self.table_version_tracking_enabled {
-                    Some(true)
-                } else {
-                    None
-                },
-                ..Default::default()
-            });
-        }
-
-        // Try to load the dataset to get real information
-        // Use DatasetBuilder with storage options to support S3 with custom endpoints
-        let mut builder = DatasetBuilder::from_uri(&table_uri);
-        if let Some(opts) = &self.storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-        if let Some(sess) = &self.session {
-            builder = builder.with_session(sess.clone());
-        }
-        match builder.load().await {
-            Ok(mut dataset) => {
-                // If a specific version is requested, checkout that version
-                if let Some(requested_version) = request.version {
-                    dataset = dataset.checkout_version(requested_version as u64).await?;
-                }
-
-                let version_info = dataset.version();
-                let lance_schema = dataset.schema();
-                let arrow_schema: arrow_schema::Schema = lance_schema.into();
-                let json_schema = arrow_schema_to_json(&arrow_schema)?;
-                let storage_options = self
-                    .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                    .await?;
-
-                // Convert BTreeMap to HashMap for the response
-                let metadata: std::collections::HashMap<String, String> =
-                    version_info.metadata.into_iter().collect();
-
-                Ok(DescribeTableResponse {
-                    table: Some(table_name),
-                    namespace: request.id.as_ref().map(|id| {
-                        if id.len() > 1 {
-                            id[..id.len() - 1].to_vec()
-                        } else {
-                            vec![]
-                        }
-                    }),
-                    version: Some(version_info.version as i64),
-                    location: Some(table_uri.clone()),
-                    table_uri: Some(table_uri),
-                    schema: Some(Box::new(json_schema)),
-                    storage_options,
-                    metadata: Some(metadata),
-                    managed_versioning: if self.table_version_tracking_enabled {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    ..Default::default()
-                })
-            }
-            Err(err) => {
-                // Use the reserved file status from the atomic check
-                if status.has_reserved_file {
-                    let storage_options = self
-                        .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                        .await?;
-                    Ok(DescribeTableResponse {
-                        table: Some(table_name),
-                        namespace: request.id.as_ref().map(|id| {
-                            if id.len() > 1 {
-                                id[..id.len() - 1].to_vec()
-                            } else {
-                                vec![]
-                            }
-                        }),
-                        location: Some(table_uri.clone()),
-                        table_uri: Some(table_uri),
-                        storage_options,
-                        managed_versioning: if self.table_version_tracking_enabled {
-                            Some(true)
-                        } else {
-                            None
-                        },
-                        ..Default::default()
-                    })
-                } else {
-                    Err(NamespaceError::Internal {
-                        message: format!(
-                            "Table directory exists but cannot load dataset {}: {:?}",
-                            table_name, err
-                        ),
-                    }
-                    .into())
-                }
-            }
-        }
+        self.record_op("describe_table");
+        self.describe_table_impl(request).await
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+        self.record_op("table_exists");
         if let Some(ref manifest_ns) = self.manifest_ns {
             match manifest_ns.table_exists(request.clone()).await {
                 Ok(()) => return Ok(()),
@@ -1809,6 +2013,7 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
+        self.record_op("drop_table");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.drop_table(request).await;
         }
@@ -1838,6 +2043,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableRequest,
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
+        self.record_op("create_table");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.create_table(request, request_data).await;
         }
@@ -1911,6 +2117,7 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        self.record_op("declare_table");
         if let Some(ref manifest_ns) = self.manifest_ns {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
             if let Some(ref location) = response.location {
@@ -1997,6 +2204,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: lance_namespace::models::RegisterTableRequest,
     ) -> Result<lance_namespace::models::RegisterTableResponse> {
+        self.record_op("register_table");
         // If manifest is enabled, delegate to manifest namespace
         if let Some(ref manifest_ns) = self.manifest_ns {
             return LanceNamespace::register_table(manifest_ns.as_ref(), request).await;
@@ -2013,6 +2221,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: lance_namespace::models::DeregisterTableRequest,
     ) -> Result<lance_namespace::models::DeregisterTableResponse> {
+        self.record_op("deregister_table");
         // If manifest is enabled, delegate to manifest namespace
         if let Some(ref manifest_ns) = self.manifest_ns {
             return LanceNamespace::deregister_table(manifest_ns.as_ref(), request).await;
@@ -2072,6 +2281,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: ListTableVersionsRequest,
     ) -> Result<ListTableVersionsResponse> {
+        self.record_op("list_table_versions");
         // When table_version_storage_enabled, query from __manifest
         if self.table_version_storage_enabled
             && let Some(ref manifest_ns) = self.manifest_ns
@@ -2169,6 +2379,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateTableVersionRequest,
     ) -> Result<CreateTableVersionResponse> {
+        self.record_op("create_table_version");
         let table_uri = self.resolve_table_location(&request.id).await?;
 
         let staging_manifest_path = &request.manifest_path;
@@ -2303,6 +2514,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: DescribeTableVersionRequest,
     ) -> Result<DescribeTableVersionResponse> {
+        self.record_op("describe_table_version");
         // When table_version_storage_enabled and a specific version is requested,
         // query from __manifest to avoid opening the entire dataset
         if self.table_version_storage_enabled
@@ -2370,6 +2582,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: BatchDeleteTableVersionsRequest,
     ) -> Result<BatchDeleteTableVersionsResponse> {
+        self.record_op("batch_delete_table_versions");
         // Single-table mode: use `id` (from path parameter) + `ranges` to delete
         // versions from one table.
         let ranges: Vec<(i64, i64)> = request
@@ -2452,6 +2665,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateTableIndexRequest,
     ) -> Result<CreateTableIndexResponse> {
+        self.record_op("create_table_index");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
             .load_dataset(&table_uri, None, "create_table_index")
@@ -2500,6 +2714,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: ListTableIndicesRequest,
     ) -> Result<ListTableIndicesResponse> {
+        self.record_op("list_table_indices");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
             .load_dataset(&table_uri, request.version, "list_table_indices")
@@ -2566,6 +2781,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: DescribeTableIndexStatsRequest,
     ) -> Result<DescribeTableIndexStatsResponse> {
+        self.record_op("describe_table_index_stats");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
             .load_dataset(&table_uri, request.version, "describe_table_index_stats")
@@ -2619,6 +2835,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: DescribeTransactionRequest,
     ) -> Result<DescribeTransactionResponse> {
+        self.record_op("describe_transaction");
         let mut request_id = request.id.ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: "Transaction id must include table id and transaction identifier"
@@ -2650,6 +2867,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: CreateTableIndexRequest,
     ) -> Result<CreateTableScalarIndexResponse> {
+        self.record_op("create_table_scalar_index");
         let index_type = Self::parse_index_type(&request.index_type)?;
         if !index_type.is_scalar() {
             return Err(NamespaceError::InvalidInput {
@@ -2671,6 +2889,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: DropTableIndexRequest,
     ) -> Result<DropTableIndexResponse> {
+        self.record_op("drop_table_index");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let index_name = request.index_name.as_deref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -2724,6 +2943,240 @@ impl LanceNamespace for DirectoryNamespace {
             .map(|transaction| transaction.uuid);
 
         Ok(DropTableIndexResponse { transaction_id })
+    }
+
+    async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
+        use arrow::ipc::writer::FileWriter;
+
+        self.record_op("query_table");
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, request.version, "query_table")
+            .await?;
+
+        // Build scanner
+        let mut scanner = dataset.scan();
+
+        // Check if this is a vector search query
+        // vector is Box<QueryTableRequestVector>, not Option
+        let has_vector_query = request
+            .vector
+            .single_vector
+            .as_ref()
+            .map(|sv| !sv.is_empty())
+            .unwrap_or(false)
+            || request
+                .vector
+                .multi_vector
+                .as_ref()
+                .map(|mv| !mv.is_empty())
+                .unwrap_or(false);
+
+        // Apply prefilter setting (must be set before nearest)
+        if let Some(prefilter) = request.prefilter {
+            scanner.prefilter(prefilter);
+        }
+
+        // Apply vector search if query vector is provided
+        if has_vector_query {
+            let vector_column = request.vector_column.as_deref().unwrap_or("vector");
+
+            // Get the query vector(s)
+            let query_vector: Vec<f32> = request
+                .vector
+                .single_vector
+                .clone()
+                .or_else(|| {
+                    request
+                        .vector
+                        .multi_vector
+                        .as_ref()
+                        .and_then(|mv| mv.first().cloned())
+                })
+                .unwrap_or_default();
+
+            if !query_vector.is_empty() {
+                let k = if request.k > 0 {
+                    request.k as usize
+                } else {
+                    10
+                };
+                let query_array = Float32Array::from(query_vector);
+                scanner
+                    .nearest(vector_column, &query_array, k)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid vector search: {}", e),
+                    })?;
+
+                // Apply distance type if specified
+                if let Some(ref distance_type) = request.distance_type {
+                    let metric = match distance_type.to_lowercase().as_str() {
+                        "l2" | "euclidean" => MetricType::L2,
+                        "cosine" => MetricType::Cosine,
+                        "dot" | "inner_product" => MetricType::Dot,
+                        "hamming" => MetricType::Hamming,
+                        _ => {
+                            return Err(NamespaceError::InvalidInput {
+                                message: format!("Unknown distance type: {}", distance_type),
+                            }
+                            .into());
+                        }
+                    };
+                    scanner.distance_metric(metric);
+                }
+
+                // Apply nprobes if specified (maps to minimum_nprobes, matching lancedb behavior)
+                if let Some(nprobes) = request.nprobes {
+                    scanner.minimum_nprobes(nprobes as usize);
+                }
+
+                // Apply ef (HNSW search effort) if specified
+                if let Some(ef) = request.ef {
+                    scanner.ef(ef as usize);
+                }
+
+                // Apply refine_factor if specified
+                if let Some(refine_factor) = request.refine_factor {
+                    scanner.refine(refine_factor as u32);
+                }
+
+                // Apply distance bounds if specified
+                if request.lower_bound.is_some() || request.upper_bound.is_some() {
+                    scanner.distance_range(request.lower_bound, request.upper_bound);
+                }
+
+                // Apply use_index (inverse of bypass_vector_index)
+                if let Some(bypass) = request.bypass_vector_index {
+                    scanner.use_index(!bypass);
+                }
+
+                // Apply fast_search if specified
+                if request.fast_search == Some(true) {
+                    scanner.fast_search();
+                }
+            }
+        }
+
+        // Apply full text search if specified
+        if let Some(ref fts_query) = request.full_text_query {
+            // Handle string_query (simple string FTS)
+            if let Some(ref string_query) = fts_query.string_query {
+                let mut fts = FullTextSearchQuery::new(string_query.query.clone());
+
+                // Apply column filter if specified
+                if let Some(ref columns) = string_query.columns
+                    && !columns.is_empty()
+                {
+                    fts = fts
+                        .with_columns(columns)
+                        .map_err(|e| NamespaceError::InvalidInput {
+                            message: format!("Invalid FTS columns: {}", e),
+                        })?;
+                }
+
+                scanner
+                    .full_text_search(fts)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid full text search: {}", e),
+                    })?;
+            }
+            // Note: structured_query would require more complex parsing
+            // For now, we only support string_query
+        }
+
+        // Apply column projection if specified
+        if let Some(ref columns) = request.columns {
+            if let Some(ref column_names) = columns.column_names
+                && !column_names.is_empty()
+            {
+                scanner
+                    .project(column_names)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid column projection: {}", e),
+                    })?;
+            } else if let Some(ref column_aliases) = columns.column_aliases
+                && !column_aliases.is_empty()
+            {
+                // column_aliases is HashMap<String, String> where key is alias, value is SQL expression
+                let transform_pairs: Vec<(String, String)> = column_aliases
+                    .iter()
+                    .map(|(alias, sql)| (alias.clone(), sql.clone()))
+                    .collect();
+                scanner
+                    .project_with_transform(
+                        &transform_pairs
+                            .iter()
+                            .map(|(a, s)| (a.as_str(), s.as_str()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid column alias expression: {}", e),
+                    })?;
+            }
+        }
+
+        // Apply filter if specified
+        if let Some(ref filter) = request.filter
+            && !filter.is_empty()
+        {
+            scanner
+                .filter(filter)
+                .map_err(|e| NamespaceError::InvalidInput {
+                    message: format!("Invalid filter expression: {}", e),
+                })?;
+        }
+
+        // Apply with_row_id if requested
+        if request.with_row_id == Some(true) {
+            scanner.with_row_id();
+        }
+
+        // Apply limit if specified (k is the number of results to return)
+        // k == 0 means no limit
+        // Note: For vector search, limit is already applied via nearest()
+        if !has_vector_query && request.k > 0 {
+            let offset = request.offset.map(|o| o as i64);
+            scanner.limit(Some(request.k as i64), offset).map_err(|e| {
+                NamespaceError::InvalidInput {
+                    message: format!("Invalid limit/offset: {}", e),
+                }
+            })?;
+        } else if has_vector_query && request.offset.is_some() {
+            // For vector search, offset is handled separately
+            let offset = request.offset.map(|o| o as i64);
+            scanner
+                .limit(None, offset)
+                .map_err(|e| NamespaceError::InvalidInput {
+                    message: format!("Invalid offset: {}", e),
+                })?;
+        }
+
+        // Execute the scan and collect results
+        let batch = scanner
+            .try_into_batch()
+            .await
+            .map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to execute query: {}", e),
+            })?;
+
+        // Serialize to Arrow IPC file format
+        let schema = batch.schema();
+        let mut buffer = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
+                NamespaceError::Internal {
+                    message: format!("Failed to create IPC writer: {}", e),
+                }
+            })?;
+            writer.write(&batch).map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to write batch to IPC: {}", e),
+            })?;
+            writer.finish().map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to finish IPC writer: {}", e),
+            })?;
+        }
+
+        Ok(Bytes::from(buffer))
     }
 
     fn namespace_id(&self) -> String {

@@ -1472,9 +1472,13 @@ impl BatchDecodeStream {
                     // Real decode work happens inside into_batch, which can block the current
                     // thread for a long time. By spawning it as a new task, we allow Tokio's
                     // worker threads to keep making progress.
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
+                    let (batch, _data_size) =
+                        tokio::spawn(
+                            async move { next_task.into_batch(emitted_batch_size_warning) },
+                        )
                         .await
-                        .map_err(|err| Error::wrapped(err.into()))?
+                        .map_err(|err| Error::wrapped(err.into()))??;
+                    Ok(batch)
                 };
                 (task, num_rows)
             });
@@ -1660,7 +1664,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
 
         self.rows_drained += to_take;
 
-        let batch = next_task.into_batch(self.emitted_batch_size_warning.clone())?;
+        let (batch, _data_size) = next_task.into_batch(self.emitted_batch_size_warning.clone())?;
 
         Ok(Some(batch))
     }
@@ -1812,15 +1816,16 @@ impl StructuralBatchDecodeStream {
                 let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
                 let task = async move {
                     let next_task = next_task?;
-                    if spawn_batch_decode_tasks {
+                    let (batch, _data_size) = if spawn_batch_decode_tasks {
                         tokio::spawn(
                             async move { next_task.into_batch(emitted_batch_size_warning) },
                         )
                         .await
-                        .map_err(|err| Error::wrapped(err.into()))?
+                        .map_err(|err| Error::wrapped(err.into()))??
                     } else {
-                        next_task.into_batch(emitted_batch_size_warning)
-                    }
+                        next_task.into_batch(emitted_batch_size_warning)?
+                    };
+                    Ok(batch)
                 };
                 (task, num_rows)
             });
@@ -2516,13 +2521,14 @@ pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
 
 /// A trait for tasks that decode data into an Arrow array
 pub trait DecodeArrayTask: Send {
-    /// Decodes the data into an Arrow array
-    fn decode(self: Box<Self>) -> Result<ArrayRef>;
+    /// Decodes the data into an Arrow array and its data size in bytes
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)>;
 }
 
 impl DecodeArrayTask for Box<dyn StructuralDecodeArrayTask> {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
-        StructuralDecodeArrayTask::decode(*self).map(|decoded_array| decoded_array.array)
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+        StructuralDecodeArrayTask::decode(*self)
+            .map(|decoded_array| (decoded_array.array, decoded_array.data_size))
     }
 }
 
@@ -2543,25 +2549,19 @@ impl NextDecodeTask {
     // If the batch is very large this function will log a warning message
     // suggesting the user try a smaller batch size.
     #[instrument(name = "task_to_batch", level = "debug", skip_all)]
-    fn into_batch(self, emitted_batch_size_warning: Arc<Once>) -> Result<RecordBatch> {
-        let struct_arr = self.task.decode();
-        match struct_arr {
-            Ok(struct_arr) => {
-                let batch = RecordBatch::from(struct_arr.as_struct());
-                let size_bytes = batch.get_array_memory_size() as u64;
-                if size_bytes > BATCH_SIZE_BYTES_WARNING {
-                    emitted_batch_size_warning.call_once(|| {
-                        let size_mb = size_bytes / 1024 / 1024;
-                        debug!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
-                    });
-                }
-                Ok(batch)
-            }
-            Err(e) => {
-                let e = Error::internal(format!("Error decoding batch: {}", e));
-                Err(e)
-            }
+    fn into_batch(self, emitted_batch_size_warning: Arc<Once>) -> Result<(RecordBatch, u64)> {
+        let (struct_arr, data_size) = self
+            .task
+            .decode()
+            .map_err(|e| Error::internal(format!("Error decoding batch: {}", e)))?;
+        let batch = RecordBatch::from(struct_arr.as_struct());
+        if data_size > BATCH_SIZE_BYTES_WARNING {
+            emitted_batch_size_warning.call_once(|| {
+                let size_mb = data_size / 1024 / 1024;
+                debug!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+            });
         }
+        Ok((batch, data_size))
     }
 }
 
@@ -2659,6 +2659,8 @@ pub struct LoadedPageShard {
 pub struct DecodedArray {
     pub array: ArrayRef,
     pub repdef: CompositeRepDefUnraveler,
+    /// The number of bytes of data in this array (excluding Arrow overhead).
+    pub data_size: u64,
 }
 
 pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {

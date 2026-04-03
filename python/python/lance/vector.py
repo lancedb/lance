@@ -270,10 +270,6 @@ def train_ivf_centroids_on_accelerator(
         kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype())
     )
 
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        np.save(f, centroids)
-    LOGGER.info("Saved centroids to %s", f.name)
-
     return centroids, kmeans
 
 

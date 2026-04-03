@@ -84,6 +84,12 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             .getattr("files")?
             .extract::<Option<Vec<PyLance<IndexFile>>>>()?
             .map(|v| v.into_iter().map(|f| f.0).collect());
+        let index_details = match ob.getattr("index_details") {
+            Ok(details) => details
+                .extract::<Option<(String, Vec<u8>)>>()?
+                .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
+            Err(_) => None,
+        };
 
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
@@ -91,7 +97,7 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             fields,
             dataset_version,
             fragment_bitmap,
-            index_details: None,
+            index_details,
             index_version,
             created_at,
             base_id,
@@ -133,6 +139,11 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             .as_ref()
             .map(|f| export_vec(py, f.as_slice()))
             .transpose()?;
+        let index_details = self
+            .0
+            .index_details
+            .as_ref()
+            .map(|details| (details.type_url.clone(), details.value.clone()));
 
         let cls = namespace
             .getattr("Index")
@@ -147,6 +158,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             created_at,
             base_id,
             files,
+            index_details,
         ))
     }
 }

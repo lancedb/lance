@@ -634,9 +634,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::IndexSegment;
     use crate::index::vector::ivf::v2::IvfPq;
-    use crate::index::vector::ivf::{build_segment, plan_segments};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -653,6 +651,7 @@ mod tests {
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
     use lance_index::IndexType;
+    use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -683,6 +682,8 @@ mod tests {
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
+
+    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
@@ -1588,8 +1589,8 @@ mod tests {
 
         let segments =
             build_segments_for_fragment_groups(dataset, fragment_groups, &params, index_name).await;
-        let built_segments = build_distributed_segments(dataset, &segments, None, index_name).await;
-        assert!(!built_segments.is_empty());
+        let committed_segments = build_distributed_segments(dataset, segments, index_name).await;
+        assert!(!committed_segments.is_empty());
     }
 
     fn assert_centroids_equal(reference: &serde_json::Value, candidate: &serde_json::Value) {
@@ -1665,32 +1666,17 @@ mod tests {
         assert_eq!(sizes_a, sizes_b, "aggregated partition sizes mismatch");
     }
 
-    /// Execute the internal segment workflow used by the
-    /// regression tests: plan segment groups from caller-provided segment
-    /// metadata, build each segment, and publish them as one logical index.
+    /// Commit caller-defined segment groups as one logical index.
     async fn build_distributed_segments(
         dataset: &mut Dataset,
-        segments: &[IndexMetadata],
-        target_segment_bytes: Option<u64>,
+        segments: Vec<IndexMetadata>,
         index_name: &str,
-    ) -> Vec<IndexSegment> {
-        let segment_plans = plan_segments(segments, None, target_segment_bytes)
-            .await
-            .unwrap();
-        let mut built_segments = Vec::with_capacity(segment_plans.len());
-        for plan in &segment_plans {
-            built_segments.push(
-                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
-                    .await
-                    .unwrap(),
-            );
-        }
+    ) -> Vec<IndexMetadata> {
         dataset
-            .commit_existing_index_segments(index_name, "vector", built_segments.clone())
+            .commit_existing_index_segments(index_name, "vector", segments.clone())
             .await
             .unwrap();
-
-        built_segments
+        segments
     }
 
     #[tokio::test]
@@ -1901,12 +1887,12 @@ mod tests {
             INDEX_NAME,
         )
         .await;
-        let segments = build_distributed_segments(&mut ds_split, &segments, None, INDEX_NAME).await;
+        let segments = build_distributed_segments(&mut ds_split, segments, INDEX_NAME).await;
         assert_eq!(segments.len(), expected_segment_count);
         for segment in &segments {
             let segment_index = ds_split
                 .indices_dir()
-                .child(segment.uuid().to_string())
+                .child(segment.uuid.to_string())
                 .child(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
@@ -2056,29 +2042,15 @@ mod tests {
         )
         .await;
 
-        let shard_plan = plan_segments(&segments, None, None).await.unwrap();
-        let shard_count = shard_plan.len();
-        assert!(shard_count >= 4);
-        // Use the max segment size as the base for the target. Segment sizes can
-        // vary slightly because compression is data-dependent and the random
-        // vectors in each fragment compress differently. Segments are sorted by
-        // UUID (random), so shard_plan[0] is not guaranteed to be the largest.
-        let max_shard_bytes = shard_plan
+        assert!(segments.len() >= 4);
+        let grouped_inputs = segments
+            .chunks(2)
+            .map(|group| group.to_vec())
+            .collect::<Vec<_>>();
+        let mut expected_fragment_coverage = grouped_inputs
             .iter()
-            .map(|p| p.estimated_bytes())
-            .max()
-            .unwrap();
-        let target_segment_bytes = max_shard_bytes.saturating_mul(2);
-
-        let grouped_plan = plan_segments(&segments, None, Some(target_segment_bytes))
-            .await
-            .unwrap();
-        assert!(grouped_plan.len() < shard_count);
-        assert!(grouped_plan.iter().any(|plan| plan.segments().len() > 1));
-        let mut expected_fragment_coverage = grouped_plan
-            .iter()
-            .map(|plan| {
-                plan.segments()
+            .map(|group| {
+                group
                     .iter()
                     .flat_map(|partial| {
                         partial
@@ -2093,17 +2065,26 @@ mod tests {
             .collect::<Vec<_>>();
         expected_fragment_coverage.sort();
 
-        let grouped_segments = build_distributed_segments(
-            &mut ds_split,
-            &segments,
-            Some(target_segment_bytes),
-            INDEX_NAME,
+        let grouped_segments = futures::future::try_join_all(
+            grouped_inputs
+                .into_iter()
+                .map(|group| ds_split.merge_existing_index_segments(group)),
         )
-        .await;
-        assert_eq!(grouped_segments.len(), grouped_plan.len());
+        .await
+        .unwrap();
+        let grouped_segments =
+            build_distributed_segments(&mut ds_split, grouped_segments, INDEX_NAME).await;
+        assert_eq!(grouped_segments.len(), expected_fragment_coverage.len());
         let mut actual_fragment_coverage = grouped_segments
             .iter()
-            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .map(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         actual_fragment_coverage.sort();
         assert_eq!(
@@ -2197,7 +2178,10 @@ mod tests {
             segments.push(segment);
         }
 
-        let err = plan_segments(&segments, None, None).await.unwrap_err();
+        let err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
@@ -2229,19 +2213,6 @@ mod tests {
             segments.push(segment);
         }
 
-        let plans = plan_segments(&segments, None, Some(1)).await.unwrap();
-        assert_eq!(plans.len(), fragments.iter().take(2).count());
-
-        let mut segments = Vec::with_capacity(plans.len());
-        for plan in &plans {
-            segments.push(
-                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert_eq!(segments.len(), plans.len());
-
         dataset
             .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
@@ -2267,6 +2238,133 @@ mod tests {
             .await
             .unwrap();
         assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_metadata_reports_progress() {
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let dataset_uri = format!("{}/progress", test_dir.as_str());
+        let (schema, batches) = make_two_fragment_batches();
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 2,
+            "expected at least 2 fragments, got {}",
+            fragments.len()
+        );
+        let expected_rows = fragments[0].physical_rows().await.unwrap() as u64
+            + fragments[1].physical_rows().await.unwrap() as u64;
+
+        let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+        let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        let mut segments = Vec::new();
+        for fragment in fragments.iter().take(2) {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name(INDEX_NAME.to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let progress = Arc::new(RecordingProgress::default());
+        let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
+            dataset.object_store(),
+            &dataset.indices_dir(),
+            segments,
+            progress.clone(),
+        )
+        .await
+        .unwrap();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
+            .await
+            .unwrap();
+
+        let events = progress.recorded_events();
+        let tags = events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let merge_total = events
+            .iter()
+            .find_map(|(kind, stage, value)| {
+                if kind == "start" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .expect("missing merge_partitions start total");
+        let merged_rows = events
+            .iter()
+            .filter_map(|(kind, stage, value)| {
+                if kind == "progress" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .next_back()
+            .unwrap_or_default();
+        let read_start = tags
+            .iter()
+            .position(|e| e == "start:read_shard_metadata")
+            .expect("missing read_shard_metadata start");
+        let read_complete = tags
+            .iter()
+            .position(|e| e == "complete:read_shard_metadata")
+            .expect("missing read_shard_metadata complete");
+        let merge_start = tags
+            .iter()
+            .position(|e| e == "start:merge_partitions")
+            .expect("missing merge_partitions start");
+        let merge_complete = tags
+            .iter()
+            .position(|e| e == "complete:merge_partitions")
+            .expect("missing merge_partitions complete");
+        let aux_start = tags
+            .iter()
+            .position(|e| e == "start:write_auxiliary_index")
+            .expect("missing write_auxiliary_index start");
+        let aux_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_auxiliary_index")
+            .expect("missing write_auxiliary_index complete");
+        let root_start = tags
+            .iter()
+            .position(|e| e == "start:write_root_index")
+            .expect("missing write_root_index start");
+        let root_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_root_index")
+            .expect("missing write_root_index complete");
+
+        assert!(read_start < read_complete);
+        assert!(read_complete < merge_start);
+        assert!(merge_start < merge_complete);
+        assert!(merge_complete < aux_start);
+        assert!(aux_start < aux_complete);
+        assert!(aux_complete < root_start);
+        assert!(root_start < root_complete);
+        assert_eq!(
+            merge_total, expected_rows,
+            "expected merge_partitions total rows to match dataset rows"
+        );
+        assert_eq!(
+            merged_rows, expected_rows,
+            "expected merge_partitions completed rows to match dataset rows"
+        );
+        assert!(
+            tags.iter().any(|e| e == "progress:write_root_index"),
+            "expected write_root_index progress callbacks"
+        );
     }
 
     #[tokio::test]

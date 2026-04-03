@@ -169,17 +169,18 @@ impl BinaryArrayDecoder {
 }
 
 impl DecodeArrayTask for BinaryArrayDecoder {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let data_type = self.data_type;
-        let arr = self.inner.decode()?;
-        match data_type {
-            DataType::Binary => Ok(Self::from_list_array::<BinaryType>(arr.as_list::<i32>())),
-            DataType::LargeBinary => Ok(Self::from_list_array::<LargeBinaryType>(
-                arr.as_list::<i64>(),
-            )),
-            DataType::Utf8 => Ok(Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())),
-            DataType::LargeUtf8 => Ok(Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>())),
+        let (arr, _) = self.inner.decode()?;
+        let result = match data_type {
+            DataType::Binary => Self::from_list_array::<BinaryType>(arr.as_list::<i32>()),
+            DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
+            DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>()),
+            DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
             _ => panic!("Binary decoder does not support this data type"),
-        }
+        };
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((result, 0))
     }
 }

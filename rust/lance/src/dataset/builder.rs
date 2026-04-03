@@ -49,7 +49,7 @@ pub struct DatasetBuilder {
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
-    /// Storage options that override user-provided options (e.g., from namespace)
+    /// Storage options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
 }
 
@@ -89,17 +89,17 @@ impl DatasetBuilder {
         }
     }
 
-    /// Create a DatasetBuilder from a LanceNamespace
+    /// Create a DatasetBuilder from a LanceNamespace client
     ///
     /// This will automatically fetch the table location and storage options from the namespace
-    /// via `describe_table()`.
+    /// client via `describe_table()`.
     ///
-    /// Storage options from the namespace will override any user-provided storage options
-    /// set via `.with_storage_options()`. This ensures the namespace is always the source
+    /// Storage options from the namespace client will override any user-provided storage options
+    /// set via `.with_storage_options()`. This ensures the namespace client is always the source
     /// of truth for storage options.
     ///
     /// # Arguments
-    /// * `namespace` - The namespace implementation to fetch table info from
+    /// * `namespace_client` - The namespace client implementation to fetch table info from
     /// * `table_id` - The table identifier (e.g., vec!["my_table"])
     ///
     /// # Example
@@ -108,14 +108,14 @@ impl DatasetBuilder {
     /// use lance::dataset::DatasetBuilder;
     ///
     /// // Connect to a REST namespace
-    /// let namespace = ConnectBuilder::new("rest")
+    /// let namespace_client = ConnectBuilder::new("rest")
     ///     .property("uri", "http://localhost:8080")
     ///     .connect()
     ///     .await?;
     ///
-    /// // Load a dataset using storage options from namespace
+    /// // Load a dataset using storage options from namespace client
     /// let dataset = DatasetBuilder::from_namespace(
-    ///     namespace,
+    ///     namespace_client,
     ///     vec!["my_table".to_string()],
     /// )
     /// .await?
@@ -124,7 +124,7 @@ impl DatasetBuilder {
     /// ```
     #[allow(deprecated)]
     pub async fn from_namespace(
-        namespace: Arc<dyn LanceNamespace>,
+        namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
     ) -> Result<Self> {
         let request = DescribeTableRequest {
@@ -132,7 +132,7 @@ impl DatasetBuilder {
             ..Default::default()
         };
 
-        let response = namespace
+        let response = namespace_client
             .describe_table(request)
             .await
             .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -147,8 +147,10 @@ impl DatasetBuilder {
 
         // Check managed_versioning flag to determine if namespace-managed commits should be used
         if response.managed_versioning == Some(true) {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::new(
+                namespace_client.clone(),
+                table_id.clone(),
+            );
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -162,7 +164,7 @@ impl DatasetBuilder {
 
         if let Some(initial_opts) = namespace_storage_options {
             let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
             );
             builder.options.storage_options_accessor = Some(Arc::new(
                 StorageOptionsAccessor::with_initial_and_provider(initial_opts, provider),
@@ -351,10 +353,10 @@ impl DatasetBuilder {
         self
     }
 
-    /// Enable credential vending from a LanceNamespace
+    /// Enable credential vending from a LanceNamespace client
     ///
-    /// Credentials will be automatically refreshed from the namespace
-    /// before they expire. The namespace should return `expires_at_millis`
+    /// Credentials will be automatically refreshed from the namespace client
+    /// before they expire. The namespace client should return `expires_at_millis`
     /// in the storage_options from `describe_table()`.
     ///
     /// Use `with_s3_credentials_refresh_offset()` to configure how early
@@ -371,14 +373,14 @@ impl DatasetBuilder {
     /// use lance_io::object_store::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider};
     ///
     /// // Connect to a REST namespace
-    /// let namespace = ConnectBuilder::new("rest")
+    /// let namespace_client = ConnectBuilder::new("rest")
     ///     .property("uri", "http://localhost:8080")
     ///     .connect()
     ///     .await?;
     ///
-    /// // Create a storage options provider from namespace
+    /// // Create a storage options provider from namespace client
     /// let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
-    ///     namespace,
+    ///     namespace_client,
     ///     vec!["my_table".to_string()],
     /// ));
     ///
@@ -565,11 +567,11 @@ impl DatasetBuilder {
     }
 
     async fn load_impl(mut self) -> Result<Dataset> {
-        // Apply storage_options_override to merge namespace options with any existing accessor
+        // Apply storage_options_override to merge namespace client options with any existing accessor
         if let Some(override_opts) = self.storage_options_override.take() {
             // Get existing options and merge
             let mut merged_opts = self.options.storage_options().cloned().unwrap_or_default();
-            // Override with namespace storage options - they take precedence
+            // Override with namespace client storage options - they take precedence
             merged_opts.extend(override_opts);
 
             // Update accessor with merged options

@@ -1736,12 +1736,21 @@ public class DatasetTest {
                   assertEquals("branch1", branch1Meta.getName());
                   assertEquals(2, branch1Meta.getParentVersion());
                   assertFalse(branch1Meta.getParentBranch().isPresent());
+                  assertEquals(1, branch1Meta.getBranchIdentifier().size());
+                  assertEquals(2, branch1Meta.getBranchIdentifier().get(0).getVersion());
+                  assertFalse(branch1Meta.getBranchIdentifier().get(0).getUuid().isEmpty());
                   assertTrue(branch1Meta.getCreateAt() > 0);
                   assertTrue(branch1Meta.getManifestSize() > 0);
 
                   assertEquals("branch2", branch2Meta.getName());
                   assertTrue(branch2Meta.getParentBranch().isPresent());
                   assertEquals("branch1", branch2Meta.getParentBranch().get());
+                  assertEquals(2, branch2Meta.getBranchIdentifier().size());
+                  assertEquals(
+                      branch1Meta.getBranchIdentifier().get(0),
+                      branch2Meta.getBranchIdentifier().get(0));
+                  assertEquals(3, branch2Meta.getBranchIdentifier().get(1).getVersion());
+                  assertFalse(branch2Meta.getBranchIdentifier().get(1).getUuid().isEmpty());
                   assertEquals(3, branch2Meta.getParentVersion());
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);

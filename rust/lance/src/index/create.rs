@@ -8,7 +8,7 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
+        DatasetIndexExt, DatasetIndexInternalExt,
         scalar::build_scalar_index,
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
@@ -17,7 +17,7 @@ use crate::{
         vector_index_details,
     },
 };
-use futures::future::{BoxFuture, try_join_all};
+use futures::future::BoxFuture;
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
@@ -31,9 +31,6 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
-
-use super::{IndexSegment, IndexSegmentPlan};
-
 /// Generate default index name from field path.
 ///
 /// Joins field names with `.` to create the base index name.
@@ -476,42 +473,15 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type) {
-            let field_id = *new_idx.fields.first().ok_or_else(|| {
-                Error::internal(format!(
-                    "Index '{}' is missing field ids after build",
-                    new_idx.name
-                ))
-            })?;
-            let segments = self
-                .dataset
-                .create_index_segment_builder()
-                .with_segments(vec![new_idx.clone()])
-                .build_all()
-                .await?;
-            let new_indices =
-                build_index_metadata_from_segments(self.dataset, &new_idx.name, field_id, segments)
-                    .await?;
-            TransactionBuilder::new(
-                new_idx.dataset_version,
-                Operation::CreateIndex {
-                    new_indices,
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build()
-        } else {
-            TransactionBuilder::new(
-                new_idx.dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_idx],
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build()
-        };
+        let transaction = TransactionBuilder::new(
+            new_idx.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices,
+            },
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
 
         self.dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
@@ -533,102 +503,12 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
-fn uses_segment_commit_path(index_type: IndexType) -> bool {
-    matches!(
-        index_type,
-        IndexType::Vector
-            | IndexType::IvfPq
-            | IndexType::IvfSq
-            | IndexType::IvfFlat
-            | IndexType::IvfRq
-            | IndexType::IvfHnswFlat
-            | IndexType::IvfHnswPq
-            | IndexType::IvfHnswSq
-    )
-}
-
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
     type Output = Result<IndexMetadata>;
     type IntoFuture = BoxFuture<'a, Result<IndexMetadata>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
-    }
-}
-
-/// Build physical index segments from previously-written vector segment outputs.
-///
-/// Use [`DatasetIndexExt::create_index_segment_builder`] and then either:
-///
-/// - call [`Self::plan`] and orchestrate individual segment builds externally, or
-/// - call [`Self::build_all`] to build all segments on the current node.
-///
-/// This builder only builds physical segments. Publishing those segments as
-/// a logical index still requires [`DatasetIndexExt::commit_existing_index_segments`].
-/// Together these two APIs form the canonical distributed vector segment build workflow.
-#[derive(Clone)]
-pub struct IndexSegmentBuilder<'a> {
-    dataset: &'a Dataset,
-    segments: Vec<IndexMetadata>,
-    target_segment_bytes: Option<u64>,
-}
-
-impl<'a> IndexSegmentBuilder<'a> {
-    pub(crate) fn new(dataset: &'a Dataset) -> Self {
-        Self {
-            dataset,
-            segments: Vec::new(),
-            target_segment_bytes: None,
-        }
-    }
-
-    /// Provide the segment metadata returned by `execute_uncommitted()`.
-    ///
-    /// These segments must already exist in storage and must not have been
-    /// published into a logical index yet.
-    pub fn with_segments(mut self, segments: Vec<IndexMetadata>) -> Self {
-        self.segments = segments;
-        self
-    }
-
-    /// Set the target size, in bytes, for merged physical segments.
-    ///
-    /// When set, input segments will be grouped into larger physical segments
-    /// up to approximately this size. When unset, each input segment becomes
-    /// one physical segment.
-    pub fn with_target_segment_bytes(mut self, bytes: u64) -> Self {
-        self.target_segment_bytes = Some(bytes);
-        self
-    }
-
-    /// Plan how input segments should be grouped into physical segments.
-    pub async fn plan(&self) -> Result<Vec<IndexSegmentPlan>> {
-        if self.segments.is_empty() {
-            return Err(Error::invalid_input(
-                "IndexSegmentBuilder requires at least one segment; \
-                 call with_segments(...) with execute_uncommitted() outputs"
-                    .to_string(),
-            ));
-        }
-
-        crate::index::vector::ivf::plan_segments(&self.segments, None, self.target_segment_bytes)
-            .await
-    }
-
-    /// Build one segment from a previously-generated plan.
-    pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        crate::index::vector::ivf::build_segment(
-            self.dataset.object_store(),
-            &self.dataset.indices_dir(),
-            plan,
-        )
-        .await
-    }
-
-    /// Plan and build all segments from the provided inputs.
-    pub async fn build_all(&self) -> Result<Vec<IndexSegment>> {
-        let plans = self.plan().await?;
-        try_join_all(plans.iter().map(|plan| self.build(plan))).await
     }
 }
 
@@ -648,6 +528,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -655,6 +536,8 @@ mod tests {
     use lance_linalg::distance::{DistanceType, MetricType};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     #[test]
     fn test_inverted_training_params_include_build_only_fields() {
@@ -1013,18 +896,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_index_metadata() {
-        // Test the complete workflow for merge_index_metadata:
-        // 1. Create multiple fragment indexes using execute_uncommitted
-        // 2. Use merge_index_metadata to merge temporary metadata files
-        // 3. Commit the index using the standard commit process
-        // 4. Verify the final index is properly created and accessible
-
-        // Create temporary directory for dataset
+    async fn test_merge_index_metadata_inverted_reports_progress() {
+        // This exercises the public distributed inverted-index workflow end to end:
+        // 1. build one uncommitted shard per fragment with CreateIndexBuilder.progress(...)
+        // 2. merge those shards with Dataset::merge_index_metadata(...)
+        //
+        // Expected outcomes:
+        // - the build callback should surface public build stages such as load_data,
+        //   tokenize_docs, copy_partitions, and write_metadata
+        // - the merge callback should surface public merge stages such as
+        //   read_partition_metadata, remap_partition_files, and write_merged_metadata
+        // - merge stages should be reported in execution order
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
-        // Create test data with multiple fragments
         let batch1 = create_text_batch(0, 15);
         let batch2 = create_text_batch(15, 30);
         let batch3 = create_text_batch(30, 45);
@@ -1047,58 +932,210 @@ mod tests {
         let params = InvertedIndexParams::default();
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-
-        // Use a shared UUID for distributed indexing
         let shared_uuid = Uuid::new_v4().to_string();
+        let build_progress = Arc::new(RecordingProgress::default());
 
-        // Step 1: Create indexes for each fragment using execute_uncommitted
-        let mut index_metadatas = Vec::new();
         for &fragment_id in &fragment_ids {
             let mut builder =
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("distributed_index".to_string())
                     .fragments(vec![fragment_id])
-                    .index_uuid(shared_uuid.clone());
+                    .index_uuid(shared_uuid.clone())
+                    .progress(build_progress.clone());
 
             let index_metadata = builder.execute_uncommitted().await.unwrap();
-
-            // Verify each fragment's index metadata
             assert_eq!(index_metadata.uuid.to_string(), shared_uuid);
             assert_eq!(index_metadata.name, "distributed_index");
 
             let fragment_bitmap = index_metadata.fragment_bitmap.as_ref().unwrap();
             let indexed_fragments: Vec<u32> = fragment_bitmap.iter().collect();
             assert_eq!(indexed_fragments, vec![fragment_id]);
-
-            index_metadatas.push(index_metadata);
         }
 
-        // Step 2: Merge inverted index metadata
-        // Note: This step would typically be done by calling dataset.merge_index_metadata()
-        // but for this test, we verify that the execute_uncommitted workflow produces correct metadata
+        let merge_progress = Arc::new(RecordingProgress::default());
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::Inverted,
+                None,
+                merge_progress.clone(),
+            )
+            .await
+            .unwrap();
 
-        // Step 3: Verify the metadata from execute_uncommitted contains all necessary information
-        assert_eq!(index_metadatas.len(), fragment_ids.len());
+        let build_tags = build_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        assert!(
+            build_tags.iter().any(|e| e == "start:load_data"),
+            "expected load_data progress during public distributed build"
+        );
+        assert!(
+            build_tags.iter().any(|e| e == "start:tokenize_docs"),
+            "expected tokenize_docs progress during public distributed build"
+        );
+        assert!(
+            build_tags.iter().any(|e| e == "start:copy_partitions"),
+            "expected copy_partitions progress during public distributed build"
+        );
+        assert!(
+            build_tags.iter().any(|e| e == "start:write_metadata"),
+            "expected write_metadata progress during public distributed build"
+        );
 
-        // Verify all metadata have the same UUID (shared UUID for distributed indexing)
-        for metadata in &index_metadatas {
-            assert_eq!(metadata.uuid.to_string(), shared_uuid);
-            assert_eq!(metadata.name, "distributed_index");
-            assert!(metadata.fragment_bitmap.is_some());
-            assert!(metadata.created_at.is_some());
+        let merge_events = merge_progress.recorded_events();
+        let merge_tags = merge_events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let read_start = merge_tags
+            .iter()
+            .position(|e| e == "start:read_partition_metadata")
+            .expect("missing read_partition_metadata start");
+        let read_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:read_partition_metadata")
+            .expect("missing read_partition_metadata complete");
+        let remap_start = merge_tags
+            .iter()
+            .position(|e| e == "start:remap_partition_files")
+            .expect("missing remap_partition_files start");
+        let remap_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:remap_partition_files")
+            .expect("missing remap_partition_files complete");
+        let metadata_start = merge_tags
+            .iter()
+            .position(|e| e == "start:write_merged_metadata")
+            .expect("missing write_merged_metadata start");
+        let metadata_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:write_merged_metadata")
+            .expect("missing write_merged_metadata complete");
+        assert!(read_start < read_complete);
+        assert!(read_complete < remap_start);
+        assert!(remap_start < remap_complete);
+        assert!(remap_complete < metadata_start);
+        assert!(metadata_start < metadata_complete);
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:read_partition_metadata"),
+            "expected read_partition_metadata progress during public merge"
+        );
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:remap_partition_files"),
+            "expected remap_partition_files progress during public merge"
+        );
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:write_merged_metadata"),
+            "expected write_merged_metadata progress during public merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_metadata_btree_reports_progress() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+        let build_progress = Arc::new(RecordingProgress::default());
+
+        for &fragment_id in &fragment_ids {
+            CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                .name("distributed_btree".to_string())
+                .fragments(vec![fragment_id])
+                .index_uuid(shared_uuid.clone())
+                .progress(build_progress.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
         }
 
-        // Verify that each fragment is covered by exactly one metadata
-        let mut all_covered_fragments = Vec::new();
-        for metadata in &index_metadatas {
-            let fragment_bitmap = metadata.fragment_bitmap.as_ref().unwrap();
-            let covered_fragments: Vec<u32> = fragment_bitmap.iter().collect();
-            all_covered_fragments.extend(covered_fragments);
-        }
-        all_covered_fragments.sort();
-        let mut expected_fragments = fragment_ids.clone();
-        expected_fragments.sort();
-        assert_eq!(all_covered_fragments, expected_fragments);
+        let merge_progress = Arc::new(RecordingProgress::default());
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::BTree,
+                Some(1),
+                merge_progress.clone(),
+            )
+            .await
+            .unwrap();
+
+        let build_tags = build_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        assert!(
+            build_tags.iter().any(|e| e == "start:load_data"),
+            "expected load_data progress during public distributed build"
+        );
+
+        let merge_tags = merge_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let pages_start = merge_tags
+            .iter()
+            .position(|e| e == "start:merge_pages")
+            .expect("missing merge_pages start");
+        let pages_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:merge_pages")
+            .expect("missing merge_pages complete");
+        let write_start = merge_tags
+            .iter()
+            .position(|e| e == "start:write_lookup_file")
+            .expect("missing write_lookup_file start");
+        let write_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:write_lookup_file")
+            .expect("missing write_lookup_file complete");
+        assert!(pages_start < pages_complete);
+        assert!(pages_complete < write_start);
+        assert!(write_start < write_complete);
+        assert!(
+            merge_tags.iter().any(|e| e == "progress:merge_pages"),
+            "expected merge_pages progress during public merge"
+        );
+        assert!(
+            merge_tags.iter().any(|e| e == "progress:write_lookup_file"),
+            "expected write_lookup_file progress during public merge"
+        );
+        assert!(
+            !merge_tags.iter().any(|e| e == "start:merge_lookups"),
+            "fragment-based distributed BTREE merge should not use merge_lookups"
+        );
     }
 
     #[tokio::test]
@@ -1152,27 +1189,8 @@ mod tests {
             input_segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_segments(input_segments.clone())
-            .build_all()
-            .await
-            .unwrap();
-        assert_eq!(segments.len(), fragments.len());
-        let mut built_segment_ids = segments
-            .iter()
-            .map(|segment| segment.uuid())
-            .collect::<Vec<_>>();
-        built_segment_ids.sort();
-        let mut input_segment_ids = input_segments
-            .iter()
-            .map(|segment| segment.uuid)
-            .collect::<Vec<_>>();
-        input_segment_ids.sort();
-        assert_eq!(built_segment_ids, input_segment_ids);
-
         dataset
-            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .commit_existing_index_segments("vector_idx", "vector", input_segments)
             .await
             .unwrap();
 
@@ -1202,7 +1220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_vector_commits_multi_segment_logical_index() {
+    async fn test_merge_existing_index_segments_vector_commits_single_logical_index() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -1247,21 +1265,18 @@ mod tests {
             input_segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_segments(input_segments)
-            .build_all()
+        let segment = dataset
+            .merge_existing_index_segments(input_segments)
             .await
             .unwrap();
-        assert_eq!(segments.len(), 2);
 
         dataset
-            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .commit_existing_index_segments("vector_idx", "vector", vec![segment])
             .await
             .unwrap();
 
         let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        assert_eq!(indices.len(), 2);
+        assert_eq!(indices.len(), 1);
         let mut committed_fragment_sets = indices
             .iter()
             .map(|metadata| {
@@ -1274,7 +1289,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         committed_fragment_sets.sort();
-        assert_eq!(committed_fragment_sets, vec![vec![0], vec![1]]);
+        assert_eq!(committed_fragment_sets, vec![vec![0, 1]]);
 
         let query_batch = dataset
             .scan()
@@ -1296,6 +1311,65 @@ mod tests {
             .await
             .unwrap();
         assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_merge_existing_index_segments_accepts_python_round_tripped_metadata() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&dataset, "vector").await,
+        );
+        let mut input_segments = Vec::new();
+
+        for fragment in fragments.iter().take(2) {
+            let mut segment =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segment.index_details = None;
+            input_segments.push(segment);
+        }
+
+        let merged_segment = dataset
+            .merge_existing_index_segments(input_segments)
+            .await
+            .unwrap();
+        assert!(
+            merged_segment
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.iter().collect::<Vec<_>>() == vec![0, 1])
+        );
     }
 
     #[tokio::test]
@@ -1332,24 +1406,17 @@ mod tests {
             HnswBuildParams::default(),
         );
 
-        CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
-            .name("vector_idx".to_string())
-            .index_uuid(uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .index_uuid(uuid.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        assert_eq!(segment.uuid, uuid);
 
         dataset
-            .commit_existing_index_segments(
-                "vector_idx",
-                "vector",
-                vec![IndexSegment::new(
-                    uuid,
-                    dataset.fragment_bitmap.as_ref().clone(),
-                    Arc::new(vector_index_details()),
-                    IndexType::IvfHnswFlat.version(),
-                )],
-            )
+            .commit_existing_index_segments("vector_idx", "vector", vec![segment])
             .await
             .unwrap();
 

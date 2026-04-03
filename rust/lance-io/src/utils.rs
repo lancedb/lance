@@ -307,4 +307,39 @@ mod tests {
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }
+
+    #[tokio::test]
+    async fn test_copy_reader_to_writer() {
+        let store = ObjectStore::memory();
+        let src = Path::from("/src");
+        let dst = Path::from("/dst");
+        store.put(&src, b"abcdef").await.unwrap();
+
+        let reader = store.open(&src).await.unwrap();
+        let mut writer = store.create(&dst).await.unwrap();
+        let copied = writer.copy_from_reader(reader.as_ref()).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(copied, 6);
+        assert_eq!(store.read_one_all(&dst).await.unwrap().as_ref(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn test_copy_reader_range_to_writer() {
+        let store = ObjectStore::memory();
+        let src = Path::from("/src-range");
+        let dst = Path::from("/dst-range");
+        store.put(&src, b"abcdef").await.unwrap();
+
+        let reader = store.open(&src).await.unwrap();
+        let mut writer = store.create(&dst).await.unwrap();
+        let copied = writer
+            .copy_range_from_reader(reader.as_ref(), 2..5)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(copied, 3);
+        assert_eq!(store.read_one_all(&dst).await.unwrap().as_ref(), b"cde");
+    }
 }

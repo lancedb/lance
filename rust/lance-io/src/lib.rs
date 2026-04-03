@@ -21,6 +21,8 @@ pub mod stream;
 #[cfg(test)]
 pub mod testing;
 pub mod traits;
+#[cfg(target_os = "linux")]
+pub mod uring;
 pub mod utils;
 
 pub use scheduler::{bytes_read_counter, iops_counter};

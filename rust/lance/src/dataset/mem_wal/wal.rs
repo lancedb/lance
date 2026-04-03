@@ -587,6 +587,39 @@ mod tests {
         assert!(!watcher.is_durable());
     }
 
+    // Regression test: track_batch must return a watcher wired to the real
+    // WAL watermark, NOT a pre-resolved watcher. A pre-resolved watcher would
+    // cause durable writes to return before the WAL is actually flushed.
+    #[tokio::test]
+    async fn test_track_batch_watcher_blocks_until_flush() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let region_id = Uuid::new_v4();
+        let mut flusher = WalFlusher::new(&base_path, region_id, 1, 1);
+        flusher.set_object_store(store);
+
+        let schema = create_test_schema();
+        let batch_store = BatchStore::with_capacity(10);
+        batch_store.append(create_test_batch(&schema, 10)).unwrap();
+
+        let mut watcher = flusher.track_batch(0);
+
+        // wait() must NOT resolve before the flush happens
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), watcher.wait()).await;
+        assert!(
+            result.is_err(),
+            "watcher resolved before WAL flush — durability guarantee broken"
+        );
+
+        // Flush, then the watcher should resolve
+        flusher
+            .flush_to_with_index_update(&batch_store, batch_store.len(), None)
+            .await
+            .unwrap();
+        watcher.wait().await.unwrap();
+        assert!(watcher.is_durable());
+    }
+
     #[tokio::test]
     async fn test_wal_flusher_flush_to_with_index_update() {
         let (store, base_path, _temp_dir) = create_local_store().await;

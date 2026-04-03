@@ -17,11 +17,17 @@ use lance_io::utils::CachedFileSize;
 use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
+use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::blocking_dataset::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
+use crate::utils::extract_storage_options;
 use crate::{
     RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -83,14 +89,15 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    max_rows_per_file: JObject,            // Optional<Integer>
-    max_rows_per_group: JObject,           // Optional<Integer>
-    max_bytes_per_file: JObject,           // Optional<Long>
-    mode: JObject,                         // Optional<String>
-    enable_stable_row_ids: JObject,        // Optional<Boolean>
-    data_storage_version: JObject,         // Optional<String>
-    storage_options_obj: JObject,          // Map<String, String>
-    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    max_rows_per_file: JObject,     // Optional<Integer>
+    max_rows_per_group: JObject,    // Optional<Integer>
+    max_bytes_per_file: JObject,    // Optional<Long>
+    mode: JObject,                  // Optional<String>
+    enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
+    storage_options_obj: JObject,   // Map<String, String>
+    namespace_obj: JObject,         // LanceNamespace (can be null)
+    table_id_obj: JObject,          // List<String> (can be null)
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -106,7 +113,8 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
-            storage_options_provider_obj,
+            namespace_obj,
+            table_id_obj,
         ),
         JObject::default()
     )
@@ -118,14 +126,15 @@ fn inner_create_with_ffi_array<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    max_rows_per_file: JObject,            // Optional<Integer>
-    max_rows_per_group: JObject,           // Optional<Integer>
-    max_bytes_per_file: JObject,           // Optional<Long>
-    mode: JObject,                         // Optional<String>
-    enable_stable_row_ids: JObject,        // Optional<Boolean>
-    data_storage_version: JObject,         // Optional<String>
-    storage_options_obj: JObject,          // Map<String, String>
-    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    max_rows_per_file: JObject,     // Optional<Integer>
+    max_rows_per_group: JObject,    // Optional<Integer>
+    max_bytes_per_file: JObject,    // Optional<Long>
+    mode: JObject,                  // Optional<String>
+    enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
+    storage_options_obj: JObject,   // Map<String, String>
+    namespace_obj: JObject,         // LanceNamespace (can be null)
+    table_id_obj: JObject,          // List<String> (can be null)
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -150,7 +159,8 @@ fn inner_create_with_ffi_array<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
-        storage_options_provider_obj,
+        namespace_obj,
+        table_id_obj,
         reader,
     )
 }
@@ -161,14 +171,15 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    max_rows_per_file: JObject,            // Optional<Integer>
-    max_rows_per_group: JObject,           // Optional<Integer>
-    max_bytes_per_file: JObject,           // Optional<Long>
-    mode: JObject,                         // Optional<String>
-    enable_stable_row_ids: JObject,        // Optional<Boolean>
-    data_storage_version: JObject,         // Optional<String>
-    storage_options_obj: JObject,          // Map<String, String>
-    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    max_rows_per_file: JObject,     // Optional<Integer>
+    max_rows_per_group: JObject,    // Optional<Integer>
+    max_bytes_per_file: JObject,    // Optional<Long>
+    mode: JObject,                  // Optional<String>
+    enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
+    storage_options_obj: JObject,   // Map<String, String>
+    namespace_obj: JObject,         // LanceNamespace (can be null)
+    table_id_obj: JObject,          // List<String> (can be null)
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -183,7 +194,8 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
-            storage_options_provider_obj,
+            namespace_obj,
+            table_id_obj,
         ),
         JObject::null()
     )
@@ -194,14 +206,15 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    max_rows_per_file: JObject,            // Optional<Integer>
-    max_rows_per_group: JObject,           // Optional<Integer>
-    max_bytes_per_file: JObject,           // Optional<Long>
-    mode: JObject,                         // Optional<String>
-    enable_stable_row_ids: JObject,        // Optional<Boolean>
-    data_storage_version: JObject,         // Optional<String>
-    storage_options_obj: JObject,          // Map<String, String>
-    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    max_rows_per_file: JObject,     // Optional<Integer>
+    max_rows_per_group: JObject,    // Optional<Integer>
+    max_bytes_per_file: JObject,    // Optional<Long>
+    mode: JObject,                  // Optional<String>
+    enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
+    storage_options_obj: JObject,   // Map<String, String>
+    namespace_obj: JObject,         // LanceNamespace (can be null)
+    table_id_obj: JObject,          // List<String> (can be null)
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -216,7 +229,8 @@ fn inner_create_with_ffi_stream<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
-        storage_options_provider_obj,
+        namespace_obj,
+        table_id_obj,
         reader,
     )
 }
@@ -225,19 +239,20 @@ fn inner_create_with_ffi_stream<'local>(
 fn create_fragment<'a>(
     env: &mut JNIEnv<'a>,
     dataset_uri: JString,
-    max_rows_per_file: JObject,            // Optional<Integer>
-    max_rows_per_group: JObject,           // Optional<Integer>
-    max_bytes_per_file: JObject,           // Optional<Long>
-    mode: JObject,                         // Optional<String>
-    enable_stable_row_ids: JObject,        // Optional<Boolean>
-    data_storage_version: JObject,         // Optional<String>
-    storage_options_obj: JObject,          // Map<String, String>
-    storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    max_rows_per_file: JObject,     // Optional<Integer>
+    max_rows_per_group: JObject,    // Optional<Integer>
+    max_bytes_per_file: JObject,    // Optional<Long>
+    mode: JObject,                  // Optional<String>
+    enable_stable_row_ids: JObject, // Optional<Boolean>
+    data_storage_version: JObject,  // Optional<String>
+    storage_options_obj: JObject,   // Map<String, String>
+    namespace_obj: JObject,         // LanceNamespace (can be null)
+    table_id_obj: JObject,          // List<String> (can be null)
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
 
-    let write_params = extract_write_params(
+    let mut write_params = extract_write_params(
         env,
         &max_rows_per_file,
         &max_rows_per_group,
@@ -247,10 +262,35 @@ fn create_fragment<'a>(
         &data_storage_version,
         None,
         &storage_options_obj,
-        &storage_options_provider_obj,
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
     )?;
+
+    // Set up storage options provider if namespace is provided
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    if let Some((namespace, table_id)) = namespace_info {
+        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
+            LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+        );
+
+        let storage_options: HashMap<String, String> =
+            extract_storage_options(env, &storage_options_obj)?;
+
+        let accessor = if storage_options.is_empty() {
+            Arc::new(lance::io::StorageOptionsAccessor::with_provider(provider))
+        } else {
+            Arc::new(
+                lance::io::StorageOptionsAccessor::with_initial_and_provider(
+                    storage_options,
+                    provider,
+                ),
+            )
+        };
+        write_params.store_params = Some(ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..Default::default()
+        });
+    }
 
     let fragments = RT.block_on(FileFragment::create_fragments(
         &path_str,

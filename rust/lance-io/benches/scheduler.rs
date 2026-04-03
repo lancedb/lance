@@ -22,14 +22,14 @@ use pprof::criterion::{Output, PProfProfiler};
 struct FullReadParams {
     io_parallelism: u32,
     page_size: u64,
-    use_lite_scheduler: bool,
+    use_lite_scheduler: Option<bool>,
 }
 
 impl Display for FullReadParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "full_read,parallel={},read_size={},use_lite_scheduler={}",
+            "full_read,parallel={},read_size={},use_lite_scheduler={:?}",
             self.io_parallelism, self.page_size, self.use_lite_scheduler
         )
     }
@@ -74,7 +74,7 @@ fn bench_full_read(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
     let (obj_store, tmp_file) = runtime.block_on(create_data(DATA_SIZE));
 
-    for use_lite_scheduler in [false, true] {
+    for use_lite_scheduler in [Some(false), Some(true)] {
         for io_parallelism in [1, 16] {
             for page_size in [4096, 1024 * 1024] {
                 let params = FullReadParams {
@@ -101,10 +101,10 @@ fn bench_full_read(c: &mut Criterion) {
                             unsafe {
                                 std::env::set_var("IO_THREADS", io_parallelism.to_string());
                             }
-                            let mut config = SchedulerConfig::default_for_testing();
-                            if use_lite_scheduler {
-                                config = config.with_lite_scheduler();
-                            }
+                            let config = SchedulerConfig {
+                                use_lite_scheduler,
+                                ..SchedulerConfig::default_for_testing()
+                            };
                             runtime.block_on(async {
                                 let scheduler = ScanScheduler::new(obj_store, config);
                                 let file_scheduler = scheduler
@@ -142,7 +142,7 @@ struct RandomReadParams {
     io_parallelism: u32,
     item_size: u32,
     indices: Arc<Vec<u32>>,
-    use_lite_scheduler: bool,
+    use_lite_scheduler: Option<bool>,
     noisy_runtime: bool,
 }
 
@@ -150,7 +150,7 @@ impl Display for RandomReadParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "random_read,parallel={},item_size={},use_lite_scheduler={},noisy={}",
+            "random_read,parallel={},item_size={},use_lite_scheduler={:?},noisy={}",
             self.io_parallelism, self.item_size, self.use_lite_scheduler, self.noisy_runtime
         )
     }
@@ -187,7 +187,7 @@ fn bench_random_read(c: &mut Criterion) {
     ));
 
     for noisy_runtime in [false, true] {
-        for use_lite_scheduler in [false, true] {
+        for use_lite_scheduler in [Some(false), Some(true)] {
             for io_parallelism in [1, 16] {
                 for item_size in [4096, 32 * 1024] {
                     let runtime = Runtime::new().unwrap();
@@ -240,10 +240,10 @@ fn bench_random_read(c: &mut Criterion) {
                                         }
                                     }
 
-                                    let mut config = SchedulerConfig::default_for_testing();
-                                    if use_lite_scheduler {
-                                        config = config.with_lite_scheduler();
-                                    }
+                                    let config = SchedulerConfig {
+                                        use_lite_scheduler,
+                                        ..SchedulerConfig::default_for_testing()
+                                    };
                                     let scheduler = ScanScheduler::new(obj_store, config);
                                     let file_scheduler = scheduler
                                         .open_file(&tmp_file, &CachedFileSize::unknown())

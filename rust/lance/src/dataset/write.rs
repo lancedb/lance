@@ -133,6 +133,43 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
+/// The strategy for handling external blob URIs on write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExternalBlobMode {
+    /// Store the URI as an external blob reference.
+    #[default]
+    Reference,
+    /// Read the external bytes during write and store them in Lance-managed storage.
+    Ingest,
+}
+
+impl TryFrom<&str> for ExternalBlobMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            "reference" => Ok(Self::Reference),
+            "ingest" => Ok(Self::Ingest),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid external blob mode: {}",
+                value
+            ))),
+        }
+    }
+}
+
+fn validate_external_blob_write_params(params: &WriteParams) -> Result<()> {
+    if params.external_blob_mode == ExternalBlobMode::Ingest
+        && params.allow_external_blob_outside_bases
+    {
+        return Err(Error::invalid_input(
+            "allow_external_blob_outside_bases only applies when external_blob_mode=\"reference\"",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Auto cleanup parameters
 #[derive(Debug, Clone)]
 pub struct AutoCleanupParams {
@@ -258,6 +295,9 @@ pub struct WriteParams {
     /// Allow writing external blob URIs that cannot be mapped to any registered
     /// non-dataset-root base path. When disabled, such rows are rejected.
     pub allow_external_blob_outside_bases: bool,
+
+    /// The strategy used when writing external blob URIs.
+    pub external_blob_mode: ExternalBlobMode,
 }
 
 impl Default for WriteParams {
@@ -284,6 +324,7 @@ impl Default for WriteParams {
             target_bases: None,
             target_base_names_or_paths: None,
             allow_external_blob_outside_bases: false,
+            external_blob_mode: ExternalBlobMode::Reference,
         }
     }
 }
@@ -370,6 +411,14 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Configure how external blob URIs are handled during writes.
+    pub fn with_external_blob_mode(self, mode: ExternalBlobMode) -> Self {
+        Self {
+            external_blob_mode: mode,
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -426,6 +475,10 @@ pub async fn do_write_fragments(
     } else {
         None
     };
+    let source_store_registry = dataset
+        .map(|ds| ds.session.store_registry())
+        .unwrap_or_else(|| params.store_registry());
+    let source_store_params = params.store_params.clone().unwrap_or_default();
 
     let writer_generator = WriterGenerator::new(
         object_store,
@@ -435,6 +488,9 @@ pub async fn do_write_fragments(
         target_bases_info,
         external_base_resolver,
         params.allow_external_blob_outside_bases,
+        params.external_blob_mode,
+        source_store_registry,
+        source_store_params,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -730,6 +786,7 @@ pub async fn write_fragments_internal(
 
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+    validate_external_blob_write_params(&params)?;
 
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
@@ -939,6 +996,9 @@ struct WriterOptions {
     base_id: Option<u32>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
 }
 
 async fn open_writer_with_options(
@@ -953,6 +1013,9 @@ async fn open_writer_with_options(
         base_id,
         external_base_resolver,
         allow_external_blob_outside_bases,
+        external_blob_mode,
+        source_store_registry,
+        source_store_params,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -997,6 +1060,9 @@ async fn open_writer_with_options(
                 schema,
                 external_base_resolver,
                 allow_external_blob_outside_bases,
+                external_blob_mode,
+                source_store_registry,
+                source_store_params,
             ))
         } else {
             None
@@ -1036,11 +1102,15 @@ struct WriterGenerator {
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
 
 impl WriterGenerator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
@@ -1049,6 +1119,9 @@ impl WriterGenerator {
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
+        external_blob_mode: ExternalBlobMode,
+        source_store_registry: Arc<ObjectStoreRegistry>,
+        source_store_params: ObjectStoreParams,
     ) -> Self {
         Self {
             object_store,
@@ -1058,6 +1131,9 @@ impl WriterGenerator {
             target_bases_info,
             external_base_resolver,
             allow_external_blob_outside_bases,
+            external_blob_mode,
+            source_store_registry,
+            source_store_params,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1088,6 +1164,9 @@ impl WriterGenerator {
                     base_id: Some(base_info.base_id),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                    external_blob_mode: self.external_blob_mode,
+                    source_store_registry: self.source_store_registry.clone(),
+                    source_store_params: self.source_store_params.clone(),
                 },
             )
             .await?
@@ -1102,6 +1181,9 @@ impl WriterGenerator {
                     base_id: None,
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                    external_blob_mode: self.external_blob_mode,
+                    source_store_registry: self.source_store_registry.clone(),
+                    source_store_params: self.source_store_params.clone(),
                 },
             )
             .await?
@@ -1735,6 +1817,9 @@ mod tests {
             Some(target_bases),
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
         );
 
         // Create a writer
@@ -1849,6 +1934,9 @@ mod tests {
             Some(target_bases),
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
         );
 
         // Create test batch
@@ -1944,6 +2032,8 @@ mod tests {
     }
 
     fn validate_write_params(params: &WriteParams) -> Result<()> {
+        validate_external_blob_write_params(params)?;
+
         // Replicate the validation logic from the main write function
         if matches!(params.mode, WriteMode::Create)
             && let Some(target_bases) = &params.target_bases
@@ -1969,6 +2059,21 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_external_blob_mode_validation() {
+        let params = WriteParams {
+            external_blob_mode: ExternalBlobMode::Ingest,
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+
+        let err = validate_write_params(&params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("allow_external_blob_outside_bases only applies")
+        );
     }
 
     #[tokio::test]
