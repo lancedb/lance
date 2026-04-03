@@ -227,6 +227,23 @@ def _is_null_blob_description(description: Any) -> bool:
     return False
 
 
+def _resolve_blob_selection(
+    ids: Optional[Union[List[int], pa.Array]],
+    addresses: Optional[Union[List[int], pa.Array]],
+    indices: Optional[Union[List[int], pa.Array]],
+) -> Tuple[str, Union[List[int], pa.Array]]:
+    if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
+        raise ValueError("Exactly one of ids, indices, or addresses must be specified")
+
+    if ids is not None:
+        return "ids", ids
+    if addresses is not None:
+        return "addresses", addresses
+    if indices is not None:
+        return "indices", indices
+    raise ValueError("Either ids, addresses, or indices must be specified")
+
+
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
         """Executes the merge insert operation
@@ -1910,20 +1927,81 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         blob_files : List[BlobFile]
         """
-        if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
-            raise ValueError(
-                "Exactly one of ids, indices, or addresses must be specified"
-            )
+        selection_kind, selection_values = _resolve_blob_selection(ids, addresses, indices)
 
-        if ids is not None:
-            lance_blob_files = self._ds.take_blobs(ids, blob_column)
-        elif addresses is not None:
-            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
-        elif indices is not None:
-            lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
+        if selection_kind == "ids":
+            lance_blob_files = self._ds.take_blobs(selection_values, blob_column)
+        elif selection_kind == "addresses":
+            lance_blob_files = self._ds.take_blobs_by_addresses(
+                selection_values, blob_column
+            )
         else:
-            raise ValueError("Either ids, addresses, or indices must be specified")
+            lance_blob_files = self._ds.take_blobs_by_indices(
+                selection_values, blob_column
+            )
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+
+    def read_blobs(
+        self,
+        blob_column: str,
+        ids: Optional[Union[List[int], pa.Array]] = None,
+        addresses: Optional[Union[List[int], pa.Array]] = None,
+        indices: Optional[Union[List[int], pa.Array]] = None,
+        *,
+        target_request_bytes: Optional[int] = None,
+        max_gap_bytes: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]:
+        """
+        Read blobs directly into memory using Lance's planned blob reader.
+
+        Unlike :py:meth:`take_blobs`, which returns file-like :py:class:`lance.BlobFile`
+        handles for random access, this API plans and executes batched reads and
+        returns materialized blob payloads.
+
+        Exactly one of ids, addresses, or indices must be specified.
+
+        Parameters
+        ----------
+        blob_column : str
+            The name of the blob column to read.
+        ids : Integer Array or array-like
+            Row IDs to read in the dataset.
+        addresses : Integer Array or array-like
+            The (unstable) row addresses to read in the dataset.
+        indices : Integer Array or array-like
+            The offset / indices of the row in the dataset.
+        target_request_bytes : int, optional
+            Target maximum size of each merged object-store read.
+        max_gap_bytes : int, optional
+            Maximum gap allowed between neighboring blob ranges when merging.
+        max_concurrency : int, optional
+            Maximum number of merged blob read tasks to execute concurrently.
+        preserve_order : bool, optional
+            If False, Lance may reorder reads by physical layout to reduce object
+            store requests.
+
+        Returns
+        -------
+        blobs : List[Tuple[int, bytes]]
+            A list of ``(row_address, blob_bytes)`` pairs.
+        """
+        selection_kind, selection_values = _resolve_blob_selection(ids, addresses, indices)
+
+        kwargs = {
+            "target_request_bytes": target_request_bytes,
+            "max_gap_bytes": max_gap_bytes,
+            "max_concurrency": max_concurrency,
+            "preserve_order": preserve_order,
+        }
+        if selection_kind == "ids":
+            return self._ds.read_blobs(selection_values, blob_column, **kwargs)
+        if selection_kind == "addresses":
+            return self._ds.read_blobs_by_addresses(
+                selection_values, blob_column, **kwargs
+            )
+        return self._ds.read_blobs_by_indices(selection_values, blob_column, **kwargs)
 
     def head(self, num_rows, **kwargs):
         """

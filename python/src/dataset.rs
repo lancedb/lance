@@ -119,6 +119,38 @@ const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
+fn read_blobs_to_python(
+    py: Python<'_>,
+    blobs: Vec<lance::dataset::ReadBlob>,
+) -> Vec<(u64, Py<PyBytes>)> {
+    blobs
+        .into_iter()
+        .map(|blob| (blob.row_address, PyBytes::new(py, &blob.data).unbind()))
+        .collect()
+}
+
+fn configure_read_blobs_builder(
+    mut builder: lance::dataset::ReadBlobsBuilder,
+    target_request_bytes: Option<usize>,
+    max_gap_bytes: Option<usize>,
+    max_concurrency: Option<usize>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobsBuilder {
+    if let Some(bytes) = target_request_bytes {
+        builder = builder.with_target_request_bytes(bytes);
+    }
+    if let Some(bytes) = max_gap_bytes {
+        builder = builder.with_max_gap_bytes(bytes);
+    }
+    if let Some(concurrency) = max_concurrency {
+        builder = builder.with_max_concurrency(concurrency);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
     if reader.is_instance_of::<Scanner>() {
@@ -1245,6 +1277,104 @@ impl Dataset {
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    #[pyo3(signature=(
+        row_ids,
+        blob_column,
+        target_request_bytes=None,
+        max_gap_bytes=None,
+        max_concurrency=None,
+        preserve_order=None
+    ))]
+    fn read_blobs(
+        self_: PyRef<'_, Self>,
+        row_ids: Vec<u64>,
+        blob_column: &str,
+        target_request_bytes: Option<usize>,
+        max_gap_bytes: Option<usize>,
+        max_concurrency: Option<usize>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+        let builder = configure_read_blobs_builder(
+            self_.ds.read_blobs(blob_column).infer_error()?.with_row_ids(row_ids),
+            target_request_bytes,
+            max_gap_bytes,
+            max_concurrency,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blobs_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        row_addresses,
+        blob_column,
+        target_request_bytes=None,
+        max_gap_bytes=None,
+        max_concurrency=None,
+        preserve_order=None
+    ))]
+    fn read_blobs_by_addresses(
+        self_: PyRef<'_, Self>,
+        row_addresses: Vec<u64>,
+        blob_column: &str,
+        target_request_bytes: Option<usize>,
+        max_gap_bytes: Option<usize>,
+        max_concurrency: Option<usize>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+        let builder = configure_read_blobs_builder(
+            self_
+                .ds
+                .read_blobs(blob_column)
+                .infer_error()?
+                .with_row_addresses(row_addresses),
+            target_request_bytes,
+            max_gap_bytes,
+            max_concurrency,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blobs_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        row_indices,
+        blob_column,
+        target_request_bytes=None,
+        max_gap_bytes=None,
+        max_concurrency=None,
+        preserve_order=None
+    ))]
+    fn read_blobs_by_indices(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<u64>,
+        blob_column: &str,
+        target_request_bytes: Option<usize>,
+        max_gap_bytes: Option<usize>,
+        max_concurrency: Option<usize>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+        let builder = configure_read_blobs_builder(
+            self_
+                .ds
+                .read_blobs(blob_column)
+                .infer_error()?
+                .with_row_indices(row_indices),
+            target_request_bytes,
+            max_gap_bytes,
+            max_concurrency,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blobs_to_python(self_.py(), blobs))
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]

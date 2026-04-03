@@ -113,7 +113,7 @@ use crate::io::commit::{
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
-pub use blob::BlobFile;
+pub use blob::{BlobFile, ReadBlob, ReadBlobsBuilder, ReadBlobsStream};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
@@ -1478,6 +1478,38 @@ impl Dataset {
         let fragments = self.get_fragments();
         let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
+    }
+
+    /// Create a planned blob reader for a blob column.
+    ///
+    /// This API complements [`Self::take_blobs`]. `take_blobs` returns
+    /// [`BlobFile`] handles for caller-driven random access, while
+    /// `read_blobs` builds a streaming read plan for sequential or batched blob
+    /// retrieval.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use futures::TryStreamExt;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let blobs = dataset
+    ///     .read_blobs("images")?
+    ///     .with_row_indices(vec![0, 1, 2])
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = blobs;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blobs(self: &Arc<Self>, column: impl AsRef<str>) -> Result<ReadBlobsBuilder> {
+        let column = column.as_ref();
+        let blob_field_id = blob::validate_blob_column(self, column)?;
+        Ok(ReadBlobsBuilder::new(
+            self.clone(),
+            column.to_string(),
+            blob_field_id,
+        ))
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
