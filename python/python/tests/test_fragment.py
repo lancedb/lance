@@ -472,8 +472,15 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
 
     # Pickle and unpickle the fragment metadata
     round_trip = pickle.loads(pickle.dumps(frag_meta))
-
     assert frag_meta == round_trip
+
+    # JSON round-trip
+    json_data = frag_meta.to_json()
+    json_round_trip = FragmentMetadata.from_json(json.dumps(json_data))
+    assert frag_meta.id == json_round_trip.id
+    assert frag_meta.physical_rows == json_round_trip.physical_rows
+    if enable_stable_row_ids:
+        assert json_round_trip.row_id_meta is not None
 
 
 def test_deletion_file_with_base_id_serialization():
