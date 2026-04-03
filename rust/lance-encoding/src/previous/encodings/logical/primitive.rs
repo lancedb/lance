@@ -288,7 +288,7 @@ struct PrimitiveFieldDecodeTask {
 }
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let block = self
             .physical_decoder
             .decode(self.rows_to_skip, self.rows_to_take)?;
@@ -313,10 +313,12 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
                         .data_type(dict.data_type().clone())
                         .build()?,
                 );
-                return Ok(new_array);
+                return Ok((new_array, 0));
             }
         }
-        Ok(array)
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((array, 0))
     }
 }
 

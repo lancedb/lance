@@ -799,12 +799,8 @@ impl SharedWriterState {
     }
 
     /// Track batch for WAL durability.
-    fn track_batch_for_wal(&self, batch_position: usize) -> DurabilityWatcher {
-        let _wal_watcher = self.wal_flusher.track_batch(batch_position);
-        // Return pre-resolved watcher for non-durable case
-        let cell: WatchableOnceCell<DurabilityResult> = WatchableOnceCell::new();
-        cell.write(DurabilityResult::ok());
-        cell.reader()
+    fn track_batch_for_wal(&self, batch_position: usize) -> super::wal::BatchDurableWatcher {
+        self.wal_flusher.track_batch(batch_position)
     }
 
     /// Check if memtable flush is needed and trigger if so.
@@ -1132,7 +1128,7 @@ impl RegionWriter {
         let start = std::time::Instant::now();
 
         // Acquire write lock for entire operation (atomic approach)
-        let (batch_positions, durable_watcher, batch_store, indexes) = {
+        let (batch_positions, mut durable_watcher, batch_store, indexes) = {
             let mut state = self.state.write().await;
 
             // 1. Insert all batches into memtable atomically
@@ -1170,7 +1166,7 @@ impl RegionWriter {
             // Must trigger a flush to ensure durability (flush up to and including all batches)
             self.wal_flusher
                 .trigger_flush(batch_store, indexes, batch_positions.end, None)?;
-            durable_watcher.clone().await_value().await.into_result()?;
+            durable_watcher.wait().await?;
         }
 
         Ok(WriteResult { batch_positions })

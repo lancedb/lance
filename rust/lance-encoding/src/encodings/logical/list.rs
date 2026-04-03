@@ -195,7 +195,11 @@ impl StructuralListDecodeTask {
 
 impl StructuralDecodeArrayTask for StructuralListDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        let DecodedArray { array, mut repdef } = self.child_task.decode()?;
+        let DecodedArray {
+            array,
+            mut repdef,
+            data_size,
+        } = self.child_task.decode()?;
         match &self.data_type {
             DataType::List(child_field) => {
                 let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
@@ -209,6 +213,7 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
                 Ok(DecodedArray {
                     array: Arc::new(list_array),
                     repdef,
+                    data_size,
                 })
             }
             DataType::LargeList(child_field) => {
@@ -218,6 +223,7 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
                 Ok(DecodedArray {
                     array: Arc::new(list_array),
                     repdef,
+                    data_size,
                 })
             }
             _ => panic!("List decoder did not have a list field"),
