@@ -8,7 +8,10 @@ use super::{
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
-use super::{builder::{IvfIndexBuilder, index_type_string}, utils::PartitionLoadLock};
+use super::{
+    builder::{IvfIndexBuilder, index_type_string},
+    utils::PartitionLoadLock,
+};
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -334,10 +337,10 @@ pub(crate) fn select_segment_for_single_rebalance(
             .unwrap_or(i64::MIN);
 
         let split_candidate = (split_partition_count > 0).then(|| SegmentRebalanceCandidate {
-                segment_id: metadata.uuid,
-                score: split_partition_count,
-                created_at_ms,
-            });
+            segment_id: metadata.uuid,
+            score: split_partition_count,
+            created_at_ms,
+        });
         if let Some(candidate) = split_candidate
             && candidate_is_better(candidate, best_split)
         {
