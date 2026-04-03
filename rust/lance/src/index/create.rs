@@ -31,7 +31,6 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
-
 /// Generate default index name from field path.
 ///
 /// Joins field names with `.` to create the base index name.
@@ -529,6 +528,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -536,6 +536,8 @@ mod tests {
     use lance_linalg::distance::{DistanceType, MetricType};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     #[test]
     fn test_inverted_training_params_include_build_only_fields() {
@@ -894,18 +896,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_index_metadata() {
-        // Test the complete workflow for merge_index_metadata:
-        // 1. Create multiple fragment indexes using execute_uncommitted
-        // 2. Use merge_index_metadata to merge temporary metadata files
-        // 3. Commit the index using the standard commit process
-        // 4. Verify the final index is properly created and accessible
-
-        // Create temporary directory for dataset
+    async fn test_merge_index_metadata_inverted_reports_progress() {
+        // This exercises the public distributed inverted-index workflow end to end:
+        // 1. build one uncommitted shard per fragment with CreateIndexBuilder.progress(...)
+        // 2. merge those shards with Dataset::merge_index_metadata(...)
+        //
+        // Expected outcomes:
+        // - the build callback should surface public build stages such as load_data,
+        //   tokenize_docs, copy_partitions, and write_metadata
+        // - the merge callback should surface public merge stages such as
+        //   read_partition_metadata, remap_partition_files, and write_merged_metadata
+        // - merge stages should be reported in execution order
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
-        // Create test data with multiple fragments
         let batch1 = create_text_batch(0, 15);
         let batch2 = create_text_batch(15, 30);
         let batch3 = create_text_batch(30, 45);
@@ -928,58 +932,210 @@ mod tests {
         let params = InvertedIndexParams::default();
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-
-        // Use a shared UUID for distributed indexing
         let shared_uuid = Uuid::new_v4().to_string();
+        let build_progress = Arc::new(RecordingProgress::default());
 
-        // Step 1: Create indexes for each fragment using execute_uncommitted
-        let mut index_metadatas = Vec::new();
         for &fragment_id in &fragment_ids {
             let mut builder =
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("distributed_index".to_string())
                     .fragments(vec![fragment_id])
-                    .index_uuid(shared_uuid.clone());
+                    .index_uuid(shared_uuid.clone())
+                    .progress(build_progress.clone());
 
             let index_metadata = builder.execute_uncommitted().await.unwrap();
-
-            // Verify each fragment's index metadata
             assert_eq!(index_metadata.uuid.to_string(), shared_uuid);
             assert_eq!(index_metadata.name, "distributed_index");
 
             let fragment_bitmap = index_metadata.fragment_bitmap.as_ref().unwrap();
             let indexed_fragments: Vec<u32> = fragment_bitmap.iter().collect();
             assert_eq!(indexed_fragments, vec![fragment_id]);
-
-            index_metadatas.push(index_metadata);
         }
 
-        // Step 2: Merge inverted index metadata
-        // Note: This step would typically be done by calling dataset.merge_index_metadata()
-        // but for this test, we verify that the execute_uncommitted workflow produces correct metadata
+        let merge_progress = Arc::new(RecordingProgress::default());
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::Inverted,
+                None,
+                merge_progress.clone(),
+            )
+            .await
+            .unwrap();
 
-        // Step 3: Verify the metadata from execute_uncommitted contains all necessary information
-        assert_eq!(index_metadatas.len(), fragment_ids.len());
+        let build_tags = build_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        assert!(
+            build_tags.iter().any(|e| e == "start:load_data"),
+            "expected load_data progress during public distributed build"
+        );
+        assert!(
+            build_tags.iter().any(|e| e == "start:tokenize_docs"),
+            "expected tokenize_docs progress during public distributed build"
+        );
+        assert!(
+            build_tags.iter().any(|e| e == "start:copy_partitions"),
+            "expected copy_partitions progress during public distributed build"
+        );
+        assert!(
+            build_tags.iter().any(|e| e == "start:write_metadata"),
+            "expected write_metadata progress during public distributed build"
+        );
 
-        // Verify all metadata have the same UUID (shared UUID for distributed indexing)
-        for metadata in &index_metadatas {
-            assert_eq!(metadata.uuid.to_string(), shared_uuid);
-            assert_eq!(metadata.name, "distributed_index");
-            assert!(metadata.fragment_bitmap.is_some());
-            assert!(metadata.created_at.is_some());
+        let merge_events = merge_progress.recorded_events();
+        let merge_tags = merge_events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let read_start = merge_tags
+            .iter()
+            .position(|e| e == "start:read_partition_metadata")
+            .expect("missing read_partition_metadata start");
+        let read_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:read_partition_metadata")
+            .expect("missing read_partition_metadata complete");
+        let remap_start = merge_tags
+            .iter()
+            .position(|e| e == "start:remap_partition_files")
+            .expect("missing remap_partition_files start");
+        let remap_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:remap_partition_files")
+            .expect("missing remap_partition_files complete");
+        let metadata_start = merge_tags
+            .iter()
+            .position(|e| e == "start:write_merged_metadata")
+            .expect("missing write_merged_metadata start");
+        let metadata_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:write_merged_metadata")
+            .expect("missing write_merged_metadata complete");
+        assert!(read_start < read_complete);
+        assert!(read_complete < remap_start);
+        assert!(remap_start < remap_complete);
+        assert!(remap_complete < metadata_start);
+        assert!(metadata_start < metadata_complete);
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:read_partition_metadata"),
+            "expected read_partition_metadata progress during public merge"
+        );
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:remap_partition_files"),
+            "expected remap_partition_files progress during public merge"
+        );
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:write_merged_metadata"),
+            "expected write_merged_metadata progress during public merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_metadata_btree_reports_progress() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+        let build_progress = Arc::new(RecordingProgress::default());
+
+        for &fragment_id in &fragment_ids {
+            CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                .name("distributed_btree".to_string())
+                .fragments(vec![fragment_id])
+                .index_uuid(shared_uuid.clone())
+                .progress(build_progress.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
         }
 
-        // Verify that each fragment is covered by exactly one metadata
-        let mut all_covered_fragments = Vec::new();
-        for metadata in &index_metadatas {
-            let fragment_bitmap = metadata.fragment_bitmap.as_ref().unwrap();
-            let covered_fragments: Vec<u32> = fragment_bitmap.iter().collect();
-            all_covered_fragments.extend(covered_fragments);
-        }
-        all_covered_fragments.sort();
-        let mut expected_fragments = fragment_ids.clone();
-        expected_fragments.sort();
-        assert_eq!(all_covered_fragments, expected_fragments);
+        let merge_progress = Arc::new(RecordingProgress::default());
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::BTree,
+                Some(1),
+                merge_progress.clone(),
+            )
+            .await
+            .unwrap();
+
+        let build_tags = build_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        assert!(
+            build_tags.iter().any(|e| e == "start:load_data"),
+            "expected load_data progress during public distributed build"
+        );
+
+        let merge_tags = merge_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let pages_start = merge_tags
+            .iter()
+            .position(|e| e == "start:merge_pages")
+            .expect("missing merge_pages start");
+        let pages_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:merge_pages")
+            .expect("missing merge_pages complete");
+        let write_start = merge_tags
+            .iter()
+            .position(|e| e == "start:write_lookup_file")
+            .expect("missing write_lookup_file start");
+        let write_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:write_lookup_file")
+            .expect("missing write_lookup_file complete");
+        assert!(pages_start < pages_complete);
+        assert!(pages_complete < write_start);
+        assert!(write_start < write_complete);
+        assert!(
+            merge_tags.iter().any(|e| e == "progress:merge_pages"),
+            "expected merge_pages progress during public merge"
+        );
+        assert!(
+            merge_tags.iter().any(|e| e == "progress:write_lookup_file"),
+            "expected write_lookup_file progress during public merge"
+        );
+        assert!(
+            !merge_tags.iter().any(|e| e == "start:merge_lookups"),
+            "fragment-based distributed BTREE merge should not use merge_lookups"
+        );
     }
 
     #[tokio::test]

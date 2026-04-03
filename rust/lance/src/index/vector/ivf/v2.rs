@@ -651,6 +651,7 @@ mod tests {
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
     use lance_index::IndexType;
+    use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -681,6 +682,8 @@ mod tests {
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
+
+    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
@@ -2235,6 +2238,133 @@ mod tests {
             .await
             .unwrap();
         assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_metadata_reports_progress() {
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let dataset_uri = format!("{}/progress", test_dir.as_str());
+        let (schema, batches) = make_two_fragment_batches();
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 2,
+            "expected at least 2 fragments, got {}",
+            fragments.len()
+        );
+        let expected_rows = fragments[0].physical_rows().await.unwrap() as u64
+            + fragments[1].physical_rows().await.unwrap() as u64;
+
+        let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+        let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        let mut segments = Vec::new();
+        for fragment in fragments.iter().take(2) {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name(INDEX_NAME.to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let progress = Arc::new(RecordingProgress::default());
+        let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
+            dataset.object_store(),
+            &dataset.indices_dir(),
+            segments,
+            progress.clone(),
+        )
+        .await
+        .unwrap();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
+            .await
+            .unwrap();
+
+        let events = progress.recorded_events();
+        let tags = events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let merge_total = events
+            .iter()
+            .find_map(|(kind, stage, value)| {
+                if kind == "start" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .expect("missing merge_partitions start total");
+        let merged_rows = events
+            .iter()
+            .filter_map(|(kind, stage, value)| {
+                if kind == "progress" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .next_back()
+            .unwrap_or_default();
+        let read_start = tags
+            .iter()
+            .position(|e| e == "start:read_shard_metadata")
+            .expect("missing read_shard_metadata start");
+        let read_complete = tags
+            .iter()
+            .position(|e| e == "complete:read_shard_metadata")
+            .expect("missing read_shard_metadata complete");
+        let merge_start = tags
+            .iter()
+            .position(|e| e == "start:merge_partitions")
+            .expect("missing merge_partitions start");
+        let merge_complete = tags
+            .iter()
+            .position(|e| e == "complete:merge_partitions")
+            .expect("missing merge_partitions complete");
+        let aux_start = tags
+            .iter()
+            .position(|e| e == "start:write_auxiliary_index")
+            .expect("missing write_auxiliary_index start");
+        let aux_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_auxiliary_index")
+            .expect("missing write_auxiliary_index complete");
+        let root_start = tags
+            .iter()
+            .position(|e| e == "start:write_root_index")
+            .expect("missing write_root_index start");
+        let root_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_root_index")
+            .expect("missing write_root_index complete");
+
+        assert!(read_start < read_complete);
+        assert!(read_complete < merge_start);
+        assert!(merge_start < merge_complete);
+        assert!(merge_complete < aux_start);
+        assert!(aux_start < aux_complete);
+        assert!(aux_complete < root_start);
+        assert!(root_start < root_complete);
+        assert_eq!(
+            merge_total, expected_rows,
+            "expected merge_partitions total rows to match dataset rows"
+        );
+        assert_eq!(
+            merged_rows, expected_rows,
+            "expected merge_partitions completed rows to match dataset rows"
+        );
+        assert!(
+            tags.iter().any(|e| e == "progress:write_root_index"),
+            "expected write_root_index progress callbacks"
+        );
     }
 
     #[tokio::test]
