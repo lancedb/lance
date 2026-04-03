@@ -3,11 +3,12 @@
 
 //! IVF - Inverted File index.
 
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
+    LogicalIvfView,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
+use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -276,9 +277,10 @@ pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
+    logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
+    let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -293,7 +295,7 @@ pub(crate) async fn optimize_vector_indices(
             &dataset,
             unindexed,
             vector_column,
-            existing_indices,
+            &existing_indices,
             options,
         )
         .await;
@@ -320,7 +322,7 @@ pub(crate) async fn optimize_vector_indices(
             pq_index,
             vector_column,
             unindexed,
-            existing_indices,
+            &existing_indices,
             options,
             writer,
             dataset.version().version,
@@ -342,7 +344,7 @@ pub(crate) async fn optimize_vector_indices(
             hnsw_sq,
             vector_column,
             unindexed,
-            existing_indices,
+            &existing_indices,
             options,
             writer,
             aux_writer,
@@ -363,7 +365,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
     // Sanity check the indices
@@ -372,11 +374,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
-    let existing_indices = existing_indices
-        .iter()
-        .cloned()
-        .map(|idx| idx.as_vector_index())
-        .collect::<Result<Vec<_>>>()?;
+    let existing_indices = existing_indices.to_vec();
 
     let new_uuid = Uuid::new_v4();
     let index_dir = dataset.indices_dir().child(new_uuid.to_string());
@@ -592,7 +590,7 @@ async fn optimize_ivf_pq_indices(
     pq_index: &PQIndex,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
     mut writer: Box<dyn Writer>,
     dataset_version: u64,
@@ -675,7 +673,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
     writer: Box<dyn Writer>,
     aux_writer: Box<dyn Writer>,

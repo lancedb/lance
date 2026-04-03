@@ -9,12 +9,14 @@ use std::{any::Any, collections::HashMap};
 
 pub mod builder;
 pub mod ivf;
+mod logical_vector;
 pub mod pq;
 pub mod utils;
 
 #[cfg(test)]
 mod fixture_test;
 
+pub use self::logical_vector::{LogicalIvfView, LogicalVectorIndex};
 use self::{ivf::*, pq::PQIndex};
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
