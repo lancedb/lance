@@ -8,7 +8,7 @@ use super::{
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
+use super::{builder::{IvfIndexBuilder, index_type_string}, utils::PartitionLoadLock};
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -297,19 +297,8 @@ fn candidate_is_better(
 }
 
 fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
-    match index.sub_index_type() {
-        (SubIndexType::Flat, QuantizationType::Flat) => Ok(IndexType::IvfFlat),
-        (SubIndexType::Flat, QuantizationType::Product) => Ok(IndexType::IvfPq),
-        (SubIndexType::Flat, QuantizationType::Scalar) => Ok(IndexType::IvfSq),
-        (SubIndexType::Flat, QuantizationType::Rabit) => Ok(IndexType::IvfRq),
-        (SubIndexType::Hnsw, QuantizationType::Flat) => Ok(IndexType::IvfHnswFlat),
-        (SubIndexType::Hnsw, QuantizationType::Product) => Ok(IndexType::IvfHnswPq),
-        (SubIndexType::Hnsw, QuantizationType::Scalar) => Ok(IndexType::IvfHnswSq),
-        (sub_index_type, quantization_type) => Err(Error::index(format!(
-            "unsupported segmented optimize index type: {}, {}",
-            sub_index_type, quantization_type
-        ))),
-    }
+    let (sub_index_type, quantization_type) = index.sub_index_type();
+    IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
 }
 
 pub(crate) fn select_segment_for_single_rebalance(
