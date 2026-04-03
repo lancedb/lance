@@ -255,6 +255,10 @@ impl UpdateJob {
     async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
+        let uses_stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
+        if uses_stable_row_ids {
+            scanner.with_row_address();
+        }
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -332,8 +336,13 @@ impl UpdateJob {
             }
         }
 
-        // Apply deletions
-        let row_id_index = get_row_id_index(&self.dataset).await?;
+        // Apply deletions. When the scanner provides row addresses directly
+        // (stable row IDs mode), we can skip loading the full row ID index.
+        let row_id_index = if removed_row_ids.has_addrs() {
+            None
+        } else {
+            get_row_id_index(&self.dataset).await?
+        };
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
         let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());

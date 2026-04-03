@@ -12,7 +12,7 @@ use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     is_arrow_json_field, is_json_field,
 };
-use lance_core::ROW_ID;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
@@ -23,7 +23,8 @@ fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
     batch: RecordBatch,
     row_id_idx: usize,
-    non_row_id_projection: &[usize],
+    row_addr_idx: Option<usize>,
+    output_projection: &[usize],
 ) -> DFResult<RecordBatch> {
     let row_ids_arr = batch.column(row_id_idx);
     let row_ids_itr = row_ids_arr
@@ -36,8 +37,24 @@ fn extract_row_ids(
             )
         })
         .values();
-    row_ids.capture(row_ids_itr)?;
-    Ok(batch.project(non_row_id_projection)?)
+
+    if let Some(addr_idx) = row_addr_idx {
+        let row_addrs_arr = batch.column(addr_idx);
+        let row_addrs_itr = row_addrs_arr
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Row addrs had an unexpected type: {}",
+                    row_addrs_arr.data_type()
+                )
+            })
+            .values();
+        row_ids.capture_with_addrs(row_ids_itr, row_addrs_itr)?;
+    } else {
+        row_ids.capture(row_ids_itr)?;
+    }
+    Ok(batch.project(output_projection)?)
 }
 
 /// Given a stream that includes a row id column, return a stream that will
@@ -55,14 +72,15 @@ pub fn make_rowid_capture_stream(
     let (row_id_idx, _) = schema
         .column_with_name(ROW_ID)
         .expect("Received a batch without row ids");
-    let non_row_ids_cols = (0..schema.fields.len())
-        .filter(|col| *col != row_id_idx)
+    let row_addr_idx = schema.column_with_name(ROW_ADDR).map(|(idx, _)| idx);
+    let output_cols = (0..schema.fields.len())
+        .filter(|col| *col != row_id_idx && Some(*col) != row_addr_idx)
         .collect::<Vec<_>>();
-    let output_schema = Arc::new(schema.project(&non_row_ids_cols)?);
+    let output_schema = Arc::new(schema.project(&output_cols)?);
 
     let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
         std::task::Poll::Ready(Some(Ok(batch))) => {
-            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, &non_row_ids_cols);
+            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, row_addr_idx, &output_cols);
             std::task::Poll::Ready(Some(res))
         }
         std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
@@ -82,13 +100,22 @@ pub fn make_rowid_capture_stream(
 #[derive(Debug)]
 pub enum CapturedRowIds {
     AddressStyle(RoaringTreemap),
-    SequenceStyle(RowIdSequence),
+    SequenceStyle {
+        sequence: RowIdSequence,
+        /// Row addresses captured alongside stable row IDs (when the scanner
+        /// provides both). Avoids rebuilding the row ID index just to map
+        /// IDs back to addresses for deletions.
+        addrs: Option<RoaringTreemap>,
+    },
 }
 
 impl CapturedRowIds {
     pub fn new(stable_row_ids: bool) -> Self {
         if stable_row_ids {
-            Self::SequenceStyle(RowIdSequence::new())
+            Self::SequenceStyle {
+                sequence: RowIdSequence::new(),
+                addrs: None,
+            }
         } else {
             Self::AddressStyle(RoaringTreemap::new())
         }
@@ -101,16 +128,39 @@ impl CapturedRowIds {
                 ids.append(row_ids.iter().cloned())
                     .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
             }
-            Self::SequenceStyle(sequence) => {
+            Self::SequenceStyle { sequence, .. } => {
                 sequence.extend(row_ids.into());
             }
         }
         Ok(())
     }
 
+    pub fn capture_with_addrs(&mut self, row_ids: &[u64], row_addrs: &[u64]) -> DFResult<()> {
+        match self {
+            Self::SequenceStyle { sequence, addrs } => {
+                sequence.extend(row_ids.into());
+                let treemap = addrs.get_or_insert_with(RoaringTreemap::new);
+                treemap
+                    .append(row_addrs.iter().cloned())
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            }
+            Self::AddressStyle(_) => {
+                panic!("capture_with_addrs called on AddressStyle");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn has_addrs(&self) -> bool {
+        matches!(
+            self,
+            Self::AddressStyle(_) | Self::SequenceStyle { addrs: Some(_), .. }
+        )
+    }
+
     pub fn row_id_sequence(&self) -> Option<&RowIdSequence> {
         match self {
-            Self::SequenceStyle(sequence) => Some(sequence),
+            Self::SequenceStyle { sequence, .. } => Some(sequence),
             _ => None,
         }
     }
@@ -118,10 +168,18 @@ impl CapturedRowIds {
     pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Cow<'_, RoaringTreemap> {
         match self {
             Self::AddressStyle(addrs) => Cow::Borrowed(addrs),
-            Self::SequenceStyle(sequence) => {
+            Self::SequenceStyle {
+                addrs: Some(addrs), ..
+            } => Cow::Borrowed(addrs),
+            Self::SequenceStyle {
+                sequence,
+                addrs: None,
+            } => {
                 let mut treemap = RoaringTreemap::new();
                 let Some(index) = index else {
-                    panic!("RowIdIndex required for sequence style row ids")
+                    panic!(
+                        "RowIdIndex required for sequence style row ids without captured addresses"
+                    )
                 };
                 for row_id in sequence.iter() {
                     treemap.insert(index.get(row_id).expect("row id missing from index").into());
