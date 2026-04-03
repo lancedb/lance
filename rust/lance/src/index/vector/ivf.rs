@@ -327,12 +327,16 @@ pub(crate) fn select_segment_for_single_rebalance(
             continue;
         }
 
-        let mut max_partition_size = 0usize;
-        let mut min_partition_size = usize::MAX;
+        let mut split_partition_count = 0usize;
+        let mut join_partition_count = 0usize;
         for partition_id in 0..num_partitions {
             let partition_size = index.partition_size(partition_id);
-            max_partition_size = max_partition_size.max(partition_size);
-            min_partition_size = min_partition_size.min(partition_size);
+            if partition_size > split_threshold {
+                split_partition_count += 1;
+            }
+            if num_partitions > 1 && partition_size < join_threshold {
+                join_partition_count += 1;
+            }
         }
 
         let created_at_ms = metadata
@@ -340,10 +344,9 @@ pub(crate) fn select_segment_for_single_rebalance(
             .map(|dt| dt.timestamp_millis())
             .unwrap_or(i64::MIN);
 
-        let split_candidate =
-            (max_partition_size > split_threshold).then(|| SegmentRebalanceCandidate {
+        let split_candidate = (split_partition_count > 0).then(|| SegmentRebalanceCandidate {
                 segment_id: metadata.uuid,
-                score: max_partition_size - split_threshold,
+                score: split_partition_count,
                 created_at_ms,
             });
         if let Some(candidate) = split_candidate
@@ -352,14 +355,11 @@ pub(crate) fn select_segment_for_single_rebalance(
             best_split = Some(candidate);
         }
 
-        let join_candidate =
-            (num_partitions > 1 && min_partition_size < join_threshold).then(|| {
-                SegmentRebalanceCandidate {
-                    segment_id: metadata.uuid,
-                    score: join_threshold - min_partition_size,
-                    created_at_ms,
-                }
-            });
+        let join_candidate = (join_partition_count > 0).then(|| SegmentRebalanceCandidate {
+            segment_id: metadata.uuid,
+            score: join_partition_count,
+            created_at_ms,
+        });
         if let Some(candidate) = join_candidate
             && candidate_is_better(candidate, best_join)
         {
