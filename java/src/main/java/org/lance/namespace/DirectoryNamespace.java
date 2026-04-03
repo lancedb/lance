@@ -325,6 +325,14 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public RenameTableResponse renameTable(RenameTableRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = renameTableNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, RenameTableResponse.class);
+  }
+
+  @Override
   public InsertIntoTableResponse insertIntoTable(
       InsertIntoTableRequest request, byte[] requestData) {
     ensureInitialized();
@@ -446,6 +454,135 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public CreateTableScalarIndexResponse createTableScalarIndex(CreateTableIndexRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createTableScalarIndexNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateTableScalarIndexResponse.class);
+  }
+
+  @Override
+  public DropTableIndexResponse dropTableIndex(DropTableIndexRequest request, String indexName) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = dropTableIndexNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, DropTableIndexResponse.class);
+  }
+
+  @Override
+  public ListTablesResponse listAllTables(ListTablesRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = listAllTablesNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, ListTablesResponse.class);
+  }
+
+  @Override
+  public RestoreTableResponse restoreTable(RestoreTableRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = restoreTableNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, RestoreTableResponse.class);
+  }
+
+  @Override
+  public UpdateTableSchemaMetadataResponse updateTableSchemaMetadata(
+      UpdateTableSchemaMetadataRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson =
+        updateTableSchemaMetadataNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, UpdateTableSchemaMetadataResponse.class);
+  }
+
+  @Override
+  public GetTableStatsResponse getTableStats(GetTableStatsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = getTableStatsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, GetTableStatsResponse.class);
+  }
+
+  @Override
+  public String explainTableQueryPlan(ExplainTableQueryPlanRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    return explainTableQueryPlanNative(nativeDirectoryNamespaceHandle, requestJson);
+  }
+
+  @Override
+  public String analyzeTableQueryPlan(AnalyzeTableQueryPlanRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    return analyzeTableQueryPlanNative(nativeDirectoryNamespaceHandle, requestJson);
+  }
+
+  @Override
+  public AlterTableAddColumnsResponse alterTableAddColumns(AlterTableAddColumnsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = alterTableAddColumnsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, AlterTableAddColumnsResponse.class);
+  }
+
+  @Override
+  public AlterTableAlterColumnsResponse alterTableAlterColumns(
+      AlterTableAlterColumnsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = alterTableAlterColumnsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, AlterTableAlterColumnsResponse.class);
+  }
+
+  @Override
+  public AlterTableDropColumnsResponse alterTableDropColumns(AlterTableDropColumnsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = alterTableDropColumnsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, AlterTableDropColumnsResponse.class);
+  }
+
+  @Override
+  public ListTableTagsResponse listTableTags(ListTableTagsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = listTableTagsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, ListTableTagsResponse.class);
+  }
+
+  @Override
+  public GetTableTagVersionResponse getTableTagVersion(GetTableTagVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = getTableTagVersionNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, GetTableTagVersionResponse.class);
+  }
+
+  @Override
+  public CreateTableTagResponse createTableTag(CreateTableTagRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createTableTagNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateTableTagResponse.class);
+  }
+
+  @Override
+  public DeleteTableTagResponse deleteTableTag(DeleteTableTagRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = deleteTableTagNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, DeleteTableTagResponse.class);
+  }
+
+  @Override
+  public UpdateTableTagResponse updateTableTag(UpdateTableTagRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = updateTableTagNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, UpdateTableTagResponse.class);
+  }
+
+  @Override
   public void close() {
     if (nativeDirectoryNamespaceHandle != 0) {
       releaseNative(nativeDirectoryNamespaceHandle);
@@ -550,6 +687,8 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private native String declareTableNative(long handle, String requestJson);
 
+  private native String renameTableNative(long handle, String requestJson);
+
   private native String insertIntoTableNative(long handle, String requestJson, byte[] requestData);
 
   private native String mergeInsertIntoTableNative(
@@ -578,6 +717,38 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String describeTableVersionNative(long handle, String requestJson);
 
   private native String batchDeleteTableVersionsNative(long handle, String requestJson);
+
+  private native String createTableScalarIndexNative(long handle, String requestJson);
+
+  private native String dropTableIndexNative(long handle, String requestJson);
+
+  private native String listAllTablesNative(long handle, String requestJson);
+
+  private native String restoreTableNative(long handle, String requestJson);
+
+  private native String updateTableSchemaMetadataNative(long handle, String requestJson);
+
+  private native String getTableStatsNative(long handle, String requestJson);
+
+  private native String explainTableQueryPlanNative(long handle, String requestJson);
+
+  private native String analyzeTableQueryPlanNative(long handle, String requestJson);
+
+  private native String alterTableAddColumnsNative(long handle, String requestJson);
+
+  private native String alterTableAlterColumnsNative(long handle, String requestJson);
+
+  private native String alterTableDropColumnsNative(long handle, String requestJson);
+
+  private native String listTableTagsNative(long handle, String requestJson);
+
+  private native String getTableTagVersionNative(long handle, String requestJson);
+
+  private native String createTableTagNative(long handle, String requestJson);
+
+  private native String deleteTableTagNative(long handle, String requestJson);
+
+  private native String updateTableTagNative(long handle, String requestJson);
 
   private native Map<String, Long> retrieveOpsMetricsNative(long handle);
 
