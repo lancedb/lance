@@ -30,7 +30,6 @@ use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
-use bytes::Bytes;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result, utils::address::RowAddress};
@@ -2038,11 +2037,12 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use bytes::Bytes;
+    use chrono::Utc;
+    use futures::{StreamExt, TryStreamExt, stream};
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     };
-    use chrono::Utc;
-    use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
