@@ -37,6 +37,7 @@ from .namespace import (
     DescribeTableRequest,
     LanceNamespace,
 )
+from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -81,6 +82,7 @@ __all__ = [
     "set_logger",
     "write_dataset",
     "FFILanceTableProvider",
+    "IndexProgress",
 ]
 
 

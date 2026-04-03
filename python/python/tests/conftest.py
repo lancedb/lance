@@ -1,8 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import sys
+from typing import Optional
 
 import pytest
+
+
+class ProgressRecorder:
+    """Reusable progress callback recorder for index build tests."""
+
+    def __init__(
+        self,
+        fail_after: Optional[int] = None,
+        fail_on_tag: Optional[str] = None,
+    ):
+        self.events = []
+        self.fail_after = fail_after
+        self.fail_on_tag = fail_on_tag
+
+    def __call__(self, event):
+        self.events.append(event)
+        event_tag = f"{event.event}:{event.stage}"
+        if self.fail_on_tag is not None and event_tag == self.fail_on_tag:
+            raise RuntimeError("progress callback failure")
+        if self.fail_after is not None and len(self.events) >= self.fail_after:
+            raise RuntimeError("progress callback failure")
+
+
+def progress_event_tags(events):
+    return [f"{event.event}:{event.stage}" for event in events]
+
+
+def stage_progress_values(events, stage):
+    return [
+        event.completed
+        for event in events
+        if event.event == "progress"
+        and event.stage == stage
+        and event.completed is not None
+    ]
 
 
 @pytest.fixture(params=(True, False))

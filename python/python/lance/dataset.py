@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .lance.indices import IndexDescription
-    from .progress import FragmentWriteProgress
+    from .progress import FragmentWriteProgress, IndexProgress
     from .types import ReaderLike
 
     QueryVectorLike = Union[
@@ -2512,6 +2512,7 @@ class LanceDataset(pa.dataset.Dataset):
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -2613,6 +2614,9 @@ class LanceDataset(pa.dataset.Dataset):
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated. This parameter is
             passed via kwargs internally.
+        progress_callback : callable, optional
+            A callback that receives :class:`lance.progress.IndexProgress` events while
+            the index is being built.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2796,6 +2800,8 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["fragment_ids"] = fragment_ids
         if index_uuid is not None:
             kwargs["index_uuid"] = index_uuid
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
@@ -3200,6 +3206,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -3279,6 +3286,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
+        progress_callback : callable, optional
+            A callback that receives :class:`lance.progress.IndexProgress` events while
+            the index is being built.
         target_partition_size: int, optional
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
@@ -3380,6 +3390,8 @@ class LanceDataset(pa.dataset.Dataset):
           <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
         self._create_index_impl(
             column,
             index_type,
@@ -3526,6 +3538,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: str,
         index_type: str,
         batch_readhead: Optional[int] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ):
         """
         Merge distributed scalar index metadata.
@@ -3553,6 +3566,9 @@ class LanceDataset(pa.dataset.Dataset):
             supported by scalar distributed merge.
         batch_readhead: int, optional
             Prefetch concurrency used by BTREE merge reader. Default: 1.
+        progress_callback: callable, optional
+            A callback that receives :class:`lance.progress.IndexProgress` events while
+            metadata is being merged.
         """
         # Normalize type
         t = index_type.upper()
@@ -3564,7 +3580,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         # Merge physical index files at the index directory
-        self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
+        self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
         return None
 
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
