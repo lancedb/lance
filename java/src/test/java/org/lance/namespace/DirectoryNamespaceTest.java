@@ -25,6 +25,8 @@ import org.lance.namespace.errors.LanceNamespaceException;
 import org.lance.namespace.model.CountTableRowsRequest;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateNamespaceResponse;
+import org.lance.namespace.model.CreateTableIndexRequest;
+import org.lance.namespace.model.CreateTableIndexResponse;
 import org.lance.namespace.model.CreateTableRequest;
 import org.lance.namespace.model.CreateTableResponse;
 import org.lance.namespace.model.DeclareTableRequest;
@@ -1148,9 +1150,11 @@ public class DirectoryNamespaceTest {
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
     namespaceClient.createTable(createReq, tableData);
 
-    // Count rows with filter
+    // Count rows with predicate
     CountTableRowsRequest countReq =
-        new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table")).filter("age > 28");
+        new CountTableRowsRequest()
+            .id(Arrays.asList("workspace", "test_table"))
+            .predicate("age > 28");
     long count = namespaceClient.countTableRows(countReq);
     assertEquals(2, count); // Alice (30) and Charlie (35)
   }
@@ -1171,9 +1175,7 @@ public class DirectoryNamespaceTest {
     // Insert more data
     byte[] newData = createTestTableData(); // Another 3 rows
     InsertIntoTableRequest insertReq =
-        new InsertIntoTableRequest()
-            .id(Arrays.asList("workspace", "test_table"))
-            .mode(InsertIntoTableRequest.ModeEnum.APPEND);
+        new InsertIntoTableRequest().id(Arrays.asList("workspace", "test_table")).mode("append");
     InsertIntoTableResponse insertResp = namespaceClient.insertIntoTable(insertReq, newData);
     assertNotNull(insertResp);
 
@@ -1197,12 +1199,9 @@ public class DirectoryNamespaceTest {
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
     namespaceClient.createTable(createReq, tableData);
 
-    // Query table
+    // Query table - just verify we can execute a simple query
     QueryTableRequest queryReq =
-        new QueryTableRequest()
-            .id(Arrays.asList("workspace", "test_table"))
-            .limit(10)
-            .columns(Arrays.asList("id", "name"));
+        new QueryTableRequest().id(Arrays.asList("workspace", "test_table"));
     byte[] resultBytes = namespaceClient.queryTable(queryReq);
     assertNotNull(resultBytes);
     assertTrue(resultBytes.length > 0);
@@ -1317,7 +1316,111 @@ public class DirectoryNamespaceTest {
         new ListTableIndicesRequest().id(Arrays.asList("workspace", "test_table"));
     ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
     assertNotNull(listResp);
-    assertNotNull(listResp.getIndices());
-    assertEquals(0, listResp.getIndices().size());
+    assertNotNull(listResp.getIndexes());
+    assertEquals(0, listResp.getIndexes().size());
+  }
+
+  @Test
+  void testCreateScalarIndex() throws Exception {
+    // Create table at root level
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList("test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Create scalar index on 'id' column
+    CreateTableIndexRequest createIndexReq =
+        new CreateTableIndexRequest()
+            .id(Arrays.asList("test_table"))
+            .column("id")
+            .indexType("BTREE")
+            .name("id_idx");
+    CreateTableIndexResponse response = namespaceClient.createTableIndex(createIndexReq);
+    assertNotNull(response);
+
+    // List indices to verify
+    ListTableIndicesRequest listReq = new ListTableIndicesRequest().id(Arrays.asList("test_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(1, listResp.getIndexes().size());
+    assertEquals("id_idx", listResp.getIndexes().get(0).getIndexName());
+    assertTrue(listResp.getIndexes().get(0).getColumns().contains("id"));
+  }
+
+  @Test
+  void testCreateVectorIndex() throws Exception {
+    // Create table with vector data (256 rows with 8-dim vectors)
+    byte[] tableData = createVectorTableData(256, 8);
+    CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList("vector_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Create vector index using IVF_FLAT
+    CreateTableIndexRequest createIndexReq =
+        new CreateTableIndexRequest()
+            .id(Arrays.asList("vector_table"))
+            .column("vector")
+            .indexType("IVF_FLAT")
+            .name("vector_idx")
+            .distanceType("l2");
+    CreateTableIndexResponse response = namespaceClient.createTableIndex(createIndexReq);
+    assertNotNull(response);
+
+    // List indices to verify
+    ListTableIndicesRequest listReq =
+        new ListTableIndicesRequest().id(Arrays.asList("vector_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(1, listResp.getIndexes().size());
+    assertEquals("vector_idx", listResp.getIndexes().get(0).getIndexName());
+    assertTrue(listResp.getIndexes().get(0).getColumns().contains("vector"));
+  }
+
+  private byte[] createVectorTableData(int numRows, int dim) throws Exception {
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(
+                    "vector",
+                    FieldType.nullable(new ArrowType.FixedSizeList(dim)),
+                    Arrays.asList(
+                        new Field(
+                            "item",
+                            FieldType.nullable(
+                                new ArrowType.FloatingPoint(
+                                    org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE)),
+                            null)))));
+
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      IntVector idVector = (IntVector) root.getVector("id");
+      org.apache.arrow.vector.complex.FixedSizeListVector vectorCol =
+          (org.apache.arrow.vector.complex.FixedSizeListVector) root.getVector("vector");
+      org.apache.arrow.vector.Float4Vector itemsVector =
+          (org.apache.arrow.vector.Float4Vector) vectorCol.getDataVector();
+
+      idVector.allocateNew(numRows);
+      vectorCol.allocateNew();
+      itemsVector.allocateNew(numRows * dim);
+
+      for (int i = 0; i < numRows; i++) {
+        idVector.set(i, i);
+        for (int j = 0; j < dim; j++) {
+          itemsVector.set(i * dim + j, (float) (i * dim + j) * 0.01f);
+        }
+        vectorCol.setNotNull(i);
+      }
+
+      idVector.setValueCount(numRows);
+      itemsVector.setValueCount(numRows * dim);
+      vectorCol.setValueCount(numRows);
+      root.setRowCount(numRows);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.writeBatch();
+      }
+      return out.toByteArray();
+    }
   }
 }

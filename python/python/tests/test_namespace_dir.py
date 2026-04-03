@@ -29,6 +29,8 @@ from lance_namespace import (
     CountTableRowsRequest,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableIndexRequest,
+    CreateTableIndexResponse,
     CreateTableRequest,
     CreateTableResponse,
     CreateTableVersionRequest,
@@ -52,6 +54,7 @@ from lance_namespace import (
     ListNamespacesRequest,
     ListNamespacesResponse,
     ListTableIndicesRequest,
+    ListTableIndicesResponse,
     ListTablesRequest,
     ListTablesResponse,
     ListTableVersionsRequest,
@@ -146,6 +149,16 @@ class CustomNamespace(LanceNamespace):
         self, request: CreateTableVersionRequest
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
+
+    def create_table_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        return self._inner.create_table_index(request)
+
+    def list_table_indices(
+        self, request: ListTableIndicesRequest
+    ) -> ListTableIndicesResponse:
+        return self._inner.list_table_indices(request)
 
     def retrieve_ops_metrics(self) -> Optional[Dict[str, int]]:
         return self._inner.retrieve_ops_metrics()
@@ -887,9 +900,9 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
 
         # Verify describe_table returns managed_versioning=True
         describe_resp = ns_client.describe_table(DescribeTableRequest(id=table_id))
-        assert describe_resp.managed_versioning is True, (
-            f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
-        )
+        assert (
+            describe_resp.managed_versioning is True
+        ), f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
 
         # Open dataset through namespace - should call list_table_versions for latest
         # Use inner_ns_client for metrics since CustomNamespace delegates to it
@@ -903,9 +916,9 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         ), "list_table_versions should be called once when opening latest version"
 
         # Verify create_table_version was called once during CREATE
-        assert _get_ops_metric(inner_ns_client, "create_table_version") == 1, (
-            "create_table_version should have been called once during CREATE"
-        )
+        assert (
+            _get_ops_metric(inner_ns_client, "create_table_version") == 1
+        ), "create_table_version should have been called once during CREATE"
 
         # Append data - should call create_table_version again
         table2 = pa.Table.from_pylist([{"a": 100, "b": 200}, {"a": 1000, "b": 2000}])
@@ -915,9 +928,9 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         assert ds.count_rows() == 4
         assert len(ds.versions()) == 2
 
-        assert _get_ops_metric(inner_ns_client, "create_table_version") == 2, (
-            "create_table_version should be called twice (CREATE + APPEND)"
-        )
+        assert (
+            _get_ops_metric(inner_ns_client, "create_table_version") == 2
+        ), "create_table_version should be called twice (CREATE + APPEND)"
 
         # Open latest version - should call list_table_versions
         list_count_before_latest = _get_ops_metric(
@@ -1000,9 +1013,9 @@ class TestConcurrentOperations:
             ]
             concurrent.futures.wait(futures)
 
-        assert success_count == num_tables, (
-            f"Expected {num_tables} successes, got {success_count}"
-        )
+        assert (
+            success_count == num_tables
+        ), f"Expected {num_tables} successes, got {success_count}"
         assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
         # Verify all tables are dropped
@@ -1072,9 +1085,9 @@ class TestConcurrentOperations:
                 ]
                 concurrent.futures.wait(futures)
 
-            assert success_count == num_tables, (
-                f"Expected {num_tables} successes, got {success_count}"
-            )
+            assert (
+                success_count == num_tables
+            ), f"Expected {num_tables} successes, got {success_count}"
             assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
             # Verify with a fresh namespace client instance
@@ -1142,9 +1155,9 @@ class TestConcurrentOperations:
                 futures = [executor.submit(create_table, i) for i in range(num_tables)]
                 concurrent.futures.wait(futures)
 
-            assert create_success_count == num_tables, (
-                f"All creates should succeed, got {create_success_count}"
-            )
+            assert (
+                create_success_count == num_tables
+            ), f"All creates should succeed, got {create_success_count}"
 
             # Phase 2: Drop all tables concurrently using NEW namespace instances
             drop_success_count = 0
@@ -1180,9 +1193,9 @@ class TestConcurrentOperations:
                 futures = [executor.submit(drop_table, i) for i in range(num_tables)]
                 concurrent.futures.wait(futures)
 
-            assert drop_success_count == num_tables, (
-                f"All drops should succeed, got {drop_success_count}"
-            )
+            assert (
+                drop_success_count == num_tables
+            ), f"All drops should succeed, got {drop_success_count}"
             assert drop_fail_count == 0, f"No drops should fail, got {drop_fail_count}"
 
             # Verify all tables are dropped
@@ -1376,12 +1389,8 @@ class TestTableVersions:
 class TestIndexOperations:
     """Tests for index operations."""
 
-    def test_create_and_list_indices(self, memory_ns_client):
-        """Test creating and listing indices."""
-        # Create namespace and table with vector column
-        create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
-
+    def test_list_indices_empty(self, temp_ns_client):
+        """Test listing indices on a table with no indices."""
         # Create table with a vector column
         import numpy as np
 
@@ -1394,15 +1403,15 @@ class TestIndexOperations:
             }
         )
         ipc_data = table_to_ipc_bytes(vector_data)
-        create_req = CreateTableRequest(id=["workspace", "vector_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        create_req = CreateTableRequest(id=["vector_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # List indices (should be empty initially)
-        list_req = ListTableIndicesRequest(id=["workspace", "vector_table"])
-        response = memory_ns_client.list_table_indices(list_req)
+        list_req = ListTableIndicesRequest(id=["vector_table"])
+        response = temp_ns_client.list_table_indices(list_req)
         assert response is not None
         # Initially no indices
-        assert len(response.indices) == 0
+        assert len(response.indexes) == 0
 
     def test_describe_table_index_stats(self, memory_ns_client):
         """Test describing index stats (even when no index exists)."""
@@ -1427,3 +1436,65 @@ class TestIndexOperations:
         except Exception:
             # Expected if index doesn't exist
             pass
+
+    def test_create_scalar_index(self, temp_ns_client):
+        """Test creating a scalar index."""
+        # Create table at root level (without namespace)
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Create scalar index on 'id' column
+        create_index_req = CreateTableIndexRequest(
+            id=["test_table"],
+            column="id",
+            index_type="BTREE",
+            name="id_idx",
+        )
+        response = temp_ns_client.create_table_index(create_index_req)
+        assert response is not None
+
+        # List indices to verify
+        list_req = ListTableIndicesRequest(id=["test_table"])
+        list_response = temp_ns_client.list_table_indices(list_req)
+        assert len(list_response.indexes) == 1
+        assert list_response.indexes[0].index_name == "id_idx"
+        assert list_response.indexes[0].columns == ["id"]
+
+    def test_create_vector_index(self, temp_ns_client):
+        """Test creating a vector index."""
+        import numpy as np
+
+        # Create table with 256 rows of 8-dimensional vectors (enough for IVF)
+        num_rows = 256
+        dim = 8
+        vector_data = pa.Table.from_pydict(
+            {
+                "id": list(range(num_rows)),
+                "vector": pa.FixedSizeListArray.from_arrays(
+                    pa.array(np.random.rand(num_rows * dim).astype(np.float32)), dim
+                ),
+            }
+        )
+        ipc_data = table_to_ipc_bytes(vector_data)
+        create_req = CreateTableRequest(id=["vector_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Create vector index using IVF_FLAT
+        create_index_req = CreateTableIndexRequest(
+            id=["vector_table"],
+            column="vector",
+            index_type="IVF_FLAT",
+            name="vector_idx",
+            distance_type="l2",
+        )
+        response = temp_ns_client.create_table_index(create_index_req)
+        assert response is not None
+
+        # List indices to verify
+        list_req = ListTableIndicesRequest(id=["vector_table"])
+        list_response = temp_ns_client.list_table_indices(list_req)
+        assert len(list_response.indexes) == 1
+        assert list_response.indexes[0].index_name == "vector_idx"
+        assert list_response.indexes[0].columns == ["vector"]
