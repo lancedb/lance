@@ -108,7 +108,13 @@ pub async fn merge_indices<'a>(
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
+    Box::pin(merge_indices_with_unindexed_frags(
+        dataset,
+        old_indices,
+        &unindexed,
+        options,
+    ))
+    .await
 }
 
 /// Merge a list of provided unindexed data, with a specific number of previous indices
@@ -215,7 +221,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 vec![(selected_metadata, selected_index)],
             )?;
             let selected_ivf_view = selected_logical_index.as_ivf()?;
-            let (new_uuid, indices_merged) = optimize_vector_indices(
+            let (new_uuid, indices_merged) = Box::pin(optimize_vector_indices(
                 dataset.as_ref().clone(),
                 Option::<
                     lance_io::stream::RecordBatchStreamAdapter<
@@ -225,7 +231,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 &field_path,
                 &selected_ivf_view,
                 options,
-            )
+            ))
             .await?;
             if indices_merged == 0 {
                 return Ok(None);

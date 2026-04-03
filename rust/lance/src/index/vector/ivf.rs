@@ -336,7 +336,7 @@ pub(crate) fn select_segment_for_single_rebalance(
             .map(|dt| dt.timestamp_millis())
             .unwrap_or(i64::MIN);
 
-        let split_candidate = (split_partition_count > 0).then(|| SegmentRebalanceCandidate {
+        let split_candidate = (split_partition_count > 0).then_some(SegmentRebalanceCandidate {
             segment_id: metadata.uuid,
             score: split_partition_count,
             created_at_ms,
@@ -347,7 +347,7 @@ pub(crate) fn select_segment_for_single_rebalance(
             best_split = Some(candidate);
         }
 
-        let join_candidate = (join_partition_count > 0).then(|| SegmentRebalanceCandidate {
+        let join_candidate = (join_partition_count > 0).then_some(SegmentRebalanceCandidate {
             segment_id: metadata.uuid,
             score: join_partition_count,
             created_at_ms,
