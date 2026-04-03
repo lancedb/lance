@@ -790,17 +790,21 @@ impl MergeInsertJob {
         let session_ctx = SessionContext::new_with_config(session_config);
         let schema = source.schema();
         let new_data = session_ctx.read_one_shot(source)?;
+        // Quote column names to preserve case sensitivity — DataFusion's
+        // DataFrame::join() lowercases unquoted identifiers, which breaks
+        // merge_insert when column names contain uppercase letters (e.g. "Stock").
         let join_cols = self
             .params
-            .on // columns to join on
+            .on
             .iter()
-            .map(|c| c.as_str())
-            .collect::<Vec<_>>(); // vector of strings of col names to join
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>();
+        let join_cols = join_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let target_cols = self
             .params
             .on
             .iter()
-            .map(|c| format!("target_{}", c))
+            .map(|c| format!("\"target_{}\"", c))
             .collect::<Vec<_>>();
         let target_cols = target_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
 
