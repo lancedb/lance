@@ -51,6 +51,7 @@ from lance_namespace import (
     DropTableRequest,
     DropTableResponse,
     InsertIntoTableRequest,
+    InsertIntoTableResponse,
     ListNamespacesRequest,
     ListNamespacesResponse,
     ListTableIndicesRequest,
@@ -159,6 +160,20 @@ class CustomNamespace(LanceNamespace):
         self, request: ListTableIndicesRequest
     ) -> ListTableIndicesResponse:
         return self._inner.list_table_indices(request)
+
+    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+        return self._inner.count_table_rows(request)
+
+    def insert_into_table(
+        self, request: InsertIntoTableRequest, request_data: bytes
+    ) -> InsertIntoTableResponse:
+        return self._inner.insert_into_table(request, request_data)
+
+    def query_table(self, request) -> bytes:
+        # Accept both QueryTableRequest and dict, like DirectoryNamespace does
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
+        return self._inner.query_table(request)
 
     def retrieve_ops_metrics(self) -> Optional[Dict[str, int]]:
         return self._inner.retrieve_ops_metrics()
@@ -1211,50 +1226,50 @@ class TestConcurrentOperations:
 class TestDataManipulation:
     """Tests for data manipulation operations."""
 
-    def test_count_table_rows(self, memory_ns_client):
+    def test_count_table_rows(self, temp_ns_client):
         """Test counting rows in a table."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()  # 3 rows
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # Count rows
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
-        count = memory_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req)
         assert count == 3
 
-    def test_count_table_rows_with_filter(self, memory_ns_client):
+    def test_count_table_rows_with_filter(self, temp_ns_client):
         """Test counting rows with a filter predicate."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()  # 3 rows with ages 30, 25, 35
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # Count rows with filter
         count_req = CountTableRowsRequest(
             id=["workspace", "test_table"], filter="age > 28"
         )
-        count = memory_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req)
         assert count == 2  # Alice (30) and Charlie (35)
 
-    def test_insert_into_table(self, memory_ns_client):
+    def test_insert_into_table(self, temp_ns_client):
         """Test inserting data into a table."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()  # 3 rows
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # Insert more data
         new_data = pa.Table.from_pylist(
@@ -1267,30 +1282,28 @@ class TestDataManipulation:
         insert_req = InsertIntoTableRequest(
             id=["workspace", "test_table"], mode="append"
         )
-        response = memory_ns_client.insert_into_table(insert_req, new_ipc_data)
+        response = temp_ns_client.insert_into_table(insert_req, new_ipc_data)
         assert response is not None
 
         # Verify row count increased
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
-        count = memory_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req)
         assert count == 5
 
-    def test_query_table(self, memory_ns_client):
+    def test_query_table(self, temp_ns_client):
         """Test querying a table."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()  # 3 rows
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
-        # Query table
-        query_req = QueryTableRequest(
-            id=["workspace", "test_table"], limit=10, columns=["id", "name"]
-        )
-        result_bytes = memory_ns_client.query_table(query_req.model_dump())
+        # Query table with empty vector (for non-vector queries)
+        query_req = QueryTableRequest(id=["workspace", "test_table"], k=10, vector={})
+        result_bytes = temp_ns_client.query_table(query_req)
         assert result_bytes is not None
         assert len(result_bytes) > 0
 
@@ -1301,22 +1314,22 @@ class TestDataManipulation:
         assert "id" in result_table.column_names
         assert "name" in result_table.column_names
 
-    def test_query_table_with_filter(self, memory_ns_client):
+    def test_query_table_with_filter(self, temp_ns_client):
         """Test querying a table with a filter."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()  # 3 rows
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
-        # Query with filter
+        # Query with filter and empty vector
         query_req = QueryTableRequest(
-            id=["workspace", "test_table"], filter="age >= 30", limit=10
+            id=["workspace", "test_table"], filter="age >= 30", k=10, vector={}
         )
-        result_bytes = memory_ns_client.query_table(query_req.model_dump())
+        result_bytes = temp_ns_client.query_table(query_req)
         reader = pa.ipc.open_file(pa.BufferReader(result_bytes))
         result_table = reader.read_all()
         assert result_table.num_rows == 2  # Alice and Charlie
@@ -1325,52 +1338,52 @@ class TestDataManipulation:
 class TestTableVersions:
     """Tests for table version operations."""
 
-    def test_list_table_versions(self, memory_ns_client):
+    def test_list_table_versions(self, temp_ns_client):
         """Test listing table versions."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # List versions
         list_req = ListTableVersionsRequest(id=["workspace", "test_table"])
-        response = memory_ns_client.list_table_versions(list_req)
+        response = temp_ns_client.list_table_versions(list_req)
         assert response is not None
         assert len(response.versions) >= 1
 
-    def test_describe_table_version(self, memory_ns_client):
+    def test_describe_table_version(self, temp_ns_client):
         """Test describing a specific table version."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # Describe version 1
         describe_req = DescribeTableVersionRequest(
             id=["workspace", "test_table"], version=1
         )
-        response = memory_ns_client.describe_table_version(describe_req.model_dump())
+        response = temp_ns_client.describe_table_version(describe_req)
         assert response is not None
-        assert response.get("version") is not None
+        assert response.version is not None
 
-    def test_multiple_versions_via_insert(self, memory_ns_client):
+    def test_multiple_versions_via_insert(self, temp_ns_client):
         """Test that inserts create new versions."""
         # Create namespace and table
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        memory_ns_client.create_namespace(create_ns_req)
+        temp_ns_client.create_namespace(create_ns_req)
 
         table_data = create_test_data()
         ipc_data = table_to_ipc_bytes(table_data)
         create_req = CreateTableRequest(id=["workspace", "test_table"])
-        memory_ns_client.create_table(create_req, ipc_data)
+        temp_ns_client.create_table(create_req, ipc_data)
 
         # Insert more data to create version 2
         new_data = pa.Table.from_pylist([{"id": 4, "name": "David", "age": 40}])
@@ -1378,11 +1391,11 @@ class TestTableVersions:
         insert_req = InsertIntoTableRequest(
             id=["workspace", "test_table"], mode="append"
         )
-        memory_ns_client.insert_into_table(insert_req, new_ipc_data)
+        temp_ns_client.insert_into_table(insert_req, new_ipc_data)
 
         # List versions - should have at least 2
         list_req = ListTableVersionsRequest(id=["workspace", "test_table"])
-        response = memory_ns_client.list_table_versions(list_req)
+        response = temp_ns_client.list_table_versions(list_req)
         assert len(response.versions) >= 2
 
 
