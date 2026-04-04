@@ -603,12 +603,12 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.delete_from_table(request.model_dump())
         return DeleteFromTableResponse.from_dict(response_dict)
 
-    def query_table(self, request: dict) -> bytes:
+    def query_table(self, request) -> bytes:
         """Query a table and return results as Arrow IPC.
 
         Parameters
         ----------
-        request : dict
+        request : QueryTableRequest or dict
             Query request with table id, optional filter, columns, vector search
             parameters, limit/offset, etc.
 
@@ -617,6 +617,8 @@ class DirectoryNamespace(LanceNamespace):
         bytes
             Arrow IPC file format containing the query results
         """
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
         return self._inner.query_table(request)
 
     # Index operations
@@ -1150,12 +1152,12 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.delete_from_table(request.model_dump())
         return DeleteFromTableResponse.from_dict(response_dict)
 
-    def query_table(self, request: dict) -> bytes:
+    def query_table(self, request) -> bytes:
         """Query a table and return results as Arrow IPC.
 
         Parameters
         ----------
-        request : dict
+        request : QueryTableRequest or dict
             Query request with table id, optional filter, columns, vector search
             parameters, limit/offset, etc.
 
@@ -1164,6 +1166,8 @@ class RestNamespace(LanceNamespace):
         bytes
             Arrow IPC file format containing the query results
         """
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
         return self._inner.query_table(request)
 
     # Index operations

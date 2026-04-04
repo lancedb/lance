@@ -3285,7 +3285,7 @@ impl LanceNamespace for DirectoryNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_ipc::reader::StreamReader;
+    use arrow_ipc::reader::{FileReader, StreamReader};
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
@@ -6803,8 +6803,8 @@ mod tests {
             assert!(result.is_err());
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("Invalid distance type"),
-                "Expected ns_ctx! error context, got: {}",
+                err_msg.contains("Unknown distance type"),
+                "Expected error about unknown distance type, got: {}",
                 err_msg
             );
         }
@@ -7011,7 +7011,7 @@ mod tests {
 
             // Decode IPC and verify
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 3);
@@ -7033,7 +7033,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 2);
@@ -7055,7 +7055,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 2);
@@ -7078,7 +7078,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 3);
@@ -7106,7 +7106,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let schema = reader.schema();
             assert_eq!(schema.fields().len(), 1);
             assert_eq!(schema.field(0).name(), "id");
@@ -7222,7 +7222,7 @@ mod tests {
 
             let bytes = namespace.query_table(request).await.unwrap();
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 3);
@@ -7239,7 +7239,7 @@ mod tests {
 
             let bytes = namespace.query_table(request).await.unwrap();
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 5);
@@ -7336,7 +7336,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 2);
@@ -7365,7 +7365,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 3);
@@ -7393,7 +7393,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert!(total_rows <= 2);
@@ -7424,7 +7424,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 2);
@@ -7466,9 +7466,10 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
-            assert!(batches.is_empty(), "empty table should yield no batches");
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 0, "empty table should yield no rows");
         }
 
         #[tokio::test]
@@ -7490,7 +7491,7 @@ mod tests {
             let bytes = namespace.query_table(request).await.unwrap();
 
             let cursor = Cursor::new(bytes.to_vec());
-            let reader = StreamReader::try_new(cursor, None).unwrap();
+            let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert!(total_rows > 0);
