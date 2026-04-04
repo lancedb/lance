@@ -1253,9 +1253,9 @@ class TestDataManipulation:
         create_req = CreateTableRequest(id=["workspace", "test_table"])
         temp_ns_client.create_table(create_req, ipc_data)
 
-        # Count rows with filter
+        # Count rows with predicate
         count_req = CountTableRowsRequest(
-            id=["workspace", "test_table"], filter="age > 28"
+            id=["workspace", "test_table"], predicate="age > 28"
         )
         count = temp_ns_client.count_table_rows(count_req)
         assert count == 2  # Alice (30) and Charlie (35)
@@ -1370,9 +1370,9 @@ class TestTableVersions:
         describe_req = DescribeTableVersionRequest(
             id=["workspace", "test_table"], version=1
         )
-        response = temp_ns_client.describe_table_version(describe_req)
+        response = temp_ns_client.describe_table_version(describe_req.model_dump())
         assert response is not None
-        assert response.version is not None
+        assert response.get("version") is not None
 
     def test_multiple_versions_via_insert(self, temp_ns_client):
         """Test that inserts create new versions."""
