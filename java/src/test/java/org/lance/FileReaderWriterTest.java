@@ -26,6 +26,7 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -41,6 +42,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -397,6 +399,117 @@ public class FileReaderWriterTest {
         }
       }
     }
+    allocator.close();
+  }
+
+  /**
+   * Write a file with col_a (int64) + col_b (list&lt;int32&gt;), then project only the list column
+   * and verify the data round-trips correctly. This mirrors the Rust test test_project_list_int32
+   * in lance-file/src/reader.rs.
+   */
+  @Test
+  void testProjectListInt32(@TempDir Path tempDir) throws Exception {
+    BufferAllocator allocator = new RootAllocator();
+
+    // Schema: col_a (int64) + col_b (list<int32>)
+    Field itemField = new Field("item", FieldType.nullable(new ArrowType.Int(32, true)), null);
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("col_a", new ArrowType.Int(64, true)),
+                new Field(
+                    "col_b",
+                    FieldType.nullable(new ArrowType.List()),
+                    Collections.singletonList(itemField))));
+
+    int numRows = 20000;
+    int itemsPerRow = 500;
+
+    // Build the batch
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+
+    BigIntVector colA = (BigIntVector) root.getVector("col_a");
+    ListVector colB = (ListVector) root.getVector("col_b");
+
+    colA.allocateNew(numRows);
+    colB.allocateNew();
+
+    org.apache.arrow.vector.IntVector innerVector =
+        (org.apache.arrow.vector.IntVector) colB.getDataVector();
+    int innerIdx = 0;
+    for (int i = 0; i < numRows; i++) {
+      colA.setSafe(i, (long) i);
+      colB.startNewValue(i);
+      for (int j = 0; j < itemsPerRow; j++) {
+        innerVector.setSafe(innerIdx, i * 100 + j);
+        innerIdx++;
+      }
+      colB.endValue(i, itemsPerRow);
+    }
+    colA.setValueCount(numRows);
+    colB.setValueCount(numRows);
+    root.setRowCount(numRows);
+
+    // Write the file
+    String filePath = tempDir.resolve("list_project.lance").toString();
+    try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
+      writer.write(root);
+    }
+    root.close();
+
+    // Read back and verify with different projections
+    LanceFileReader reader = LanceFileReader.open(filePath, allocator);
+    assertEquals(numRows, reader.numRows());
+
+    // Case 1: project only col_b (the list column)
+    try (ArrowReader batches = reader.readAll(Collections.singletonList("col_b"), null, 512)) {
+      long totalRows = 0;
+      while (batches.loadNextBatch()) {
+        VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+        assertEquals(1, batch.getSchema().getFields().size());
+        assertEquals("col_b", batch.getSchema().getFields().get(0).getName());
+
+        ListVector listVec = (ListVector) batch.getVector("col_b");
+        int batchOffset = (int) totalRows;
+        for (int i = 0; i < batch.getRowCount(); i++) {
+          int rowIdx = batchOffset + i;
+          List<?> listVal = listVec.getObject(i);
+          assertEquals(itemsPerRow, listVal.size(), "Row " + rowIdx + " list size mismatch");
+          for (int j = 0; j < itemsPerRow; j++) {
+            int expected = rowIdx * 100 + j;
+            assertEquals(expected, listVal.get(j), "Row " + rowIdx + " item " + j + " mismatch");
+          }
+        }
+        totalRows += batch.getRowCount();
+      }
+      assertEquals(numRows, totalRows);
+    }
+
+    // Case 2: project col_a + col_b
+    try (ArrowReader batches = reader.readAll(Arrays.asList("col_a", "col_b"), null, 512)) {
+      long totalRows = 0;
+      while (batches.loadNextBatch()) {
+        VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+        assertEquals(2, batch.getSchema().getFields().size());
+
+        BigIntVector aVec = (BigIntVector) batch.getVector("col_a");
+        ListVector listVec = (ListVector) batch.getVector("col_b");
+        int batchOffset = (int) totalRows;
+        for (int i = 0; i < batch.getRowCount(); i++) {
+          int rowIdx = batchOffset + i;
+          assertEquals((long) rowIdx, aVec.get(i));
+          List<?> listVal = listVec.getObject(i);
+          assertEquals(itemsPerRow, listVal.size());
+          assertEquals(rowIdx * 100, listVal.get(0));
+          assertEquals(rowIdx * 100 + itemsPerRow - 1, listVal.get(itemsPerRow - 1));
+        }
+        totalRows += batch.getRowCount();
+      }
+      assertEquals(numRows, totalRows);
+    }
+
+    reader.close();
     allocator.close();
   }
 }

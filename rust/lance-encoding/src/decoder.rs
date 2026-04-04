@@ -1654,6 +1654,13 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 let under_scheduled = desired_scheduled - actually_scheduled;
                 to_take -= under_scheduled;
             }
+        } else {
+            // All rows are scheduled but we still need to wait for data to be loaded.
+            // This is important for types with indirect I/O (e.g. List, Binary) where
+            // scheduling completes but item data may not yet be loaded.
+            let loaded_need = self.rows_drained + to_take.min(self.rows_per_batch as u64) - 1;
+            self.root_decoder
+                .wait(loaded_need, &self.wait_for_io_runtime)?;
         }
 
         if to_take == 0 {
