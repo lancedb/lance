@@ -55,6 +55,7 @@ import org.lance.namespace.model.ListTablesRequest;
 import org.lance.namespace.model.ListTablesResponse;
 import org.lance.namespace.model.NamespaceExistsRequest;
 import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableRequestVector;
 import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
@@ -1201,7 +1202,10 @@ public class DirectoryNamespaceTest {
 
     // Query table - just verify we can execute a simple query
     QueryTableRequest queryReq =
-        new QueryTableRequest().id(Arrays.asList("workspace", "test_table"));
+        new QueryTableRequest()
+            .id(Arrays.asList("workspace", "test_table"))
+            .k(10)
+            .vector(new QueryTableRequestVector());
     byte[] resultBytes = namespaceClient.queryTable(queryReq);
     assertNotNull(resultBytes);
     assertTrue(resultBytes.length > 0);
