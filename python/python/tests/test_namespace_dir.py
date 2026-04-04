@@ -1335,6 +1335,10 @@ class TestDataManipulation:
         assert result_table.num_rows == 2  # Alice and Charlie
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Table version listing not supported on Windows",
+)
 class TestTableVersions:
     """Tests for table version operations."""
 
