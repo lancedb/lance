@@ -900,9 +900,9 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
 
         # Verify describe_table returns managed_versioning=True
         describe_resp = ns_client.describe_table(DescribeTableRequest(id=table_id))
-        assert (
-            describe_resp.managed_versioning is True
-        ), f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
+        assert describe_resp.managed_versioning is True, (
+            f"Expected managed_versioning=True, got {describe_resp.managed_versioning}"
+        )
 
         # Open dataset through namespace - should call list_table_versions for latest
         # Use inner_ns_client for metrics since CustomNamespace delegates to it
@@ -916,9 +916,9 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         ), "list_table_versions should be called once when opening latest version"
 
         # Verify create_table_version was called once during CREATE
-        assert (
-            _get_ops_metric(inner_ns_client, "create_table_version") == 1
-        ), "create_table_version should have been called once during CREATE"
+        assert _get_ops_metric(inner_ns_client, "create_table_version") == 1, (
+            "create_table_version should have been called once during CREATE"
+        )
 
         # Append data - should call create_table_version again
         table2 = pa.Table.from_pylist([{"a": 100, "b": 200}, {"a": 1000, "b": 2000}])
@@ -928,9 +928,9 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         assert ds.count_rows() == 4
         assert len(ds.versions()) == 2
 
-        assert (
-            _get_ops_metric(inner_ns_client, "create_table_version") == 2
-        ), "create_table_version should be called twice (CREATE + APPEND)"
+        assert _get_ops_metric(inner_ns_client, "create_table_version") == 2, (
+            "create_table_version should be called twice (CREATE + APPEND)"
+        )
 
         # Open latest version - should call list_table_versions
         list_count_before_latest = _get_ops_metric(
@@ -1013,9 +1013,9 @@ class TestConcurrentOperations:
             ]
             concurrent.futures.wait(futures)
 
-        assert (
-            success_count == num_tables
-        ), f"Expected {num_tables} successes, got {success_count}"
+        assert success_count == num_tables, (
+            f"Expected {num_tables} successes, got {success_count}"
+        )
         assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
         # Verify all tables are dropped
@@ -1085,9 +1085,9 @@ class TestConcurrentOperations:
                 ]
                 concurrent.futures.wait(futures)
 
-            assert (
-                success_count == num_tables
-            ), f"Expected {num_tables} successes, got {success_count}"
+            assert success_count == num_tables, (
+                f"Expected {num_tables} successes, got {success_count}"
+            )
             assert fail_count == 0, f"Expected 0 failures, got {fail_count}"
 
             # Verify with a fresh namespace client instance
@@ -1155,9 +1155,9 @@ class TestConcurrentOperations:
                 futures = [executor.submit(create_table, i) for i in range(num_tables)]
                 concurrent.futures.wait(futures)
 
-            assert (
-                create_success_count == num_tables
-            ), f"All creates should succeed, got {create_success_count}"
+            assert create_success_count == num_tables, (
+                f"All creates should succeed, got {create_success_count}"
+            )
 
             # Phase 2: Drop all tables concurrently using NEW namespace instances
             drop_success_count = 0
@@ -1193,9 +1193,9 @@ class TestConcurrentOperations:
                 futures = [executor.submit(drop_table, i) for i in range(num_tables)]
                 concurrent.futures.wait(futures)
 
-            assert (
-                drop_success_count == num_tables
-            ), f"All drops should succeed, got {drop_success_count}"
+            assert drop_success_count == num_tables, (
+                f"All drops should succeed, got {drop_success_count}"
+            )
             assert drop_fail_count == 0, f"No drops should fail, got {drop_fail_count}"
 
             # Verify all tables are dropped
