@@ -12,7 +12,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::MultipartUpload;
-use object_store::{Error as OSError, ObjectStore, Result as OSResult, path::Path};
+use object_store::{Error as OSError, ObjectStore, ObjectStoreExt as _, Result as OSResult, path::Path};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;

@@ -18,7 +18,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use lance_core::{Error, Result, error::CloneableError};
-use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
+use object_store::{GetOptions, GetResult, ObjectStore, ObjectStoreExt as _, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
@@ -176,7 +176,7 @@ impl Reader for CloudObjectReader {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
-                    let meta = do_with_retry(|| self.object_store.head(&self.path)).await?;
+                    let meta = do_with_retry(|| Box::pin(self.object_store.head(&self.path))).await?;
                     Ok(meta.size as usize)
                 })
                 .await

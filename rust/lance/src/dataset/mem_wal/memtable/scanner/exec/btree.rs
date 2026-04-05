@@ -34,7 +34,7 @@ pub struct BTreeIndexExec {
     max_visible_batch_position: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Column name of the indexed field.
     column: String,
@@ -92,12 +92,12 @@ impl BTreeIndexExec {
             )));
         }
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             batch_store,
@@ -371,7 +371,7 @@ impl ExecutionPlan for BTreeIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

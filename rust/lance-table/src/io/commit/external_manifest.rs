@@ -15,7 +15,9 @@ use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore as OSObjectStore, ObjectStoreExt as _, path::Path,
+};
 use tracing::info;
 
 use super::{

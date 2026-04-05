@@ -63,7 +63,7 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -131,6 +131,208 @@ struct CleanupInspection {
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
 const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
+
+fn is_not_found_err(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::IO { source,.. }
+            if source
+              .downcast_ref::<ObjectStoreError>()
+              .map(|os_err| matches!(os_err, ObjectStoreError::NotFound {.. }))
+              .unwrap_or(false)
+    )
+}
+
+fn path_if_not_referenced(
+    base: &Path,
+    path: Path,
+    maybe_in_progress: bool,
+    inspection: &CleanupInspection,
+) -> Result<Option<Path>> {
+    let relative_path = remove_prefix(&path, base);
+    if relative_path.as_ref().starts_with("_versions/.tmp") {
+        // This is a temporary manifest file.
+        //
+        // If the file is old (or the user has verified there are no writes in progress) then
+        // it must be leftover from a failed tx.
+        if maybe_in_progress {
+            return Ok(None);
+        } else {
+            return Ok(Some(path));
+        }
+    }
+    if relative_path.as_ref().starts_with("_indices") {
+        // Indices are referenced by UUID so we need to examine the UUID
+        // portion of the path.
+        if let Some(uuid) = relative_path.parts().nth(1) {
+            if inspection
+                .referenced_files
+                .index_uuids
+                .contains(uuid.as_ref())
+            {
+                return Ok(None);
+            } else if !maybe_in_progress {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
+                return Ok(Some(path));
+            } else if inspection
+                .verified_files
+                .index_uuids
+                .contains(uuid.as_ref())
+            {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
+                return Ok(Some(path));
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    match path.extension() {
+        Some("lance") => {
+            if relative_path.as_ref().starts_with("data") {
+                if inspection
+                    .referenced_files
+                    .data_paths
+                    .contains(&relative_path)
+                {
+                    Ok(None)
+                } else if !maybe_in_progress {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
+                    Ok(Some(path))
+                } else if inspection
+                    .verified_files
+                    .data_paths
+                    .contains(&relative_path)
+                {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
+                    Ok(Some(path))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                // If a .lance file isn't in the data directory we err on the side of leaving it alone
+                Ok(None)
+            }
+        }
+        Some("blob") => {
+            // Blob v2 sidecar files are keyed by the data file stem:
+            //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
+            //
+            // These files are not referenced directly by the manifest.  Instead, treat them
+            // as referenced if their parent data file is referenced.
+            if !relative_path.as_ref().starts_with("data") {
+                debug!(
+                    path = relative_path.as_ref(),
+                    "Will not garbage collect blob file because it does not follow convention"
+                );
+                return Ok(None);
+            }
+
+            let mut parts = relative_path.parts();
+            let data_dir = parts.next();
+            let data_file_key = parts.next();
+            let blob_file = parts.next();
+            // Be conservative: only handle the expected 3-part layout.
+            if !matches!(data_dir, Some(dir) if dir.as_ref() == "data")
+                || data_file_key.is_none()
+                || blob_file.is_none()
+            {
+                debug!(
+                    path = relative_path.as_ref(),
+                    "Will not garbage collect blob file because it does not follow convention"
+                );
+                return Ok(None);
+            }
+            if parts.next().is_some() {
+                debug!(
+                    path = relative_path.as_ref(),
+                    "Will not garbage collect blob file because it does not follow convention"
+                );
+                return Ok(None);
+            }
+
+            let data_file_key = data_file_key.expect("checked is_some");
+            let Ok(parent_data_path) =
+                Path::parse(format!("data/{}.lance", data_file_key.as_ref()))
+            else {
+                debug!(
+                    path = relative_path.as_ref(),
+                    derived_parent = format!("data/{}.lance", data_file_key.as_ref()),
+                    "Will not garbage collect blob file because derived parent data file path is invalid"
+                );
+                return Ok(None);
+            };
+
+            if inspection
+                .referenced_files
+                .data_paths
+                .contains(&parent_data_path)
+            {
+                Ok(None)
+            } else if !maybe_in_progress {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
+                Ok(Some(path))
+            } else if inspection
+                .verified_files
+                .data_paths
+                .contains(&parent_data_path)
+            {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
+                Ok(Some(path))
+            } else {
+                Ok(None)
+            }
+        }
+        Some("manifest") => {
+            // We already scanned the manifest files
+            Ok(None)
+        }
+        Some("arrow") | Some("bin") => {
+            if relative_path.as_ref().starts_with("_deletions") {
+                if inspection
+                    .referenced_files
+                    .delete_paths
+                    .contains(&relative_path)
+                {
+                    Ok(None)
+                } else if !maybe_in_progress {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
+                    Ok(Some(path))
+                } else if inspection
+                    .verified_files
+                    .delete_paths
+                    .contains(&relative_path)
+                {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
+                    Ok(Some(path))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        Some("txn") => {
+            if relative_path.as_ref().starts_with(TRANSACTIONS_DIR) {
+                if inspection
+                    .referenced_files
+                    .tx_paths
+                    .contains(&relative_path)
+                {
+                    Ok(None)
+                } else if !maybe_in_progress
+                    || inspection.verified_files.tx_paths.contains(&relative_path)
+                {
+                    Ok(Some(path))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
 
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
@@ -320,27 +522,54 @@ impl<'a> CleanupTask<'a> {
         &self,
         inspection: CleanupInspection,
     ) -> Result<RemovalStats> {
-        let removal_stats = Mutex::new(RemovalStats::default());
+        let removal_stats = self.delete_unreferenced_files_inner(inspection).await?;
+
+        let span = Span::current();
+        span.record("bytes_removed", removal_stats.bytes_removed);
+        span.record("data_files_removed", removal_stats.data_files_removed);
+        span.record(
+            "transaction_files_removed",
+            removal_stats.transaction_files_removed,
+        );
+        span.record("index_files_removed", removal_stats.index_files_removed);
+        span.record(
+            "deletion_files_removed",
+            removal_stats.deletion_files_removed,
+        );
+
+        Ok(removal_stats)
+    }
+
+    async fn delete_unreferenced_files_inner(
+        &self,
+        inspection: CleanupInspection,
+    ) -> Result<RemovalStats> {
+        let removal_stats = Arc::new(Mutex::new(RemovalStats::default()));
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
-        let is_not_found_err = |e: &Error| {
-            matches!(
-                e,
-                Error::IO { source,.. }
-                    if source
-                      .downcast_ref::<ObjectStoreError>()
-                      .map(|os_err| matches!(os_err, ObjectStoreError::NotFound {.. }))
-                      .unwrap_or(false)
-            )
-        };
+        let inspection = Arc::new(inspection);
+        let delete_unverified = self.policy.delete_unverified;
+        let base = self.dataset.base.clone();
+        let inner_store = self.dataset.object_store.inner.clone();
+
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path, file_type: Option<RemovedFileType>| {
-            let inspection_ref = &inspection;
-            let removal_stats_ref = &removal_stats;
-            self.dataset
-                .object_store
-                .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
+            let inspection_ref = inspection.clone();
+            let removal_stats_ref = removal_stats.clone();
+            let base_ref = base.clone();
+            let earliest = inspection_ref.earliest_retained_manifest_time;
+            let listing = inner_store
+                .list(Some(&dir))
+                .map_err(|e| lance_core::Error::from(e));
+            let listing: BoxStream<'static, Result<ObjectMeta>> = if let Some(unmodified_since) = earliest {
+                listing
+                    .try_filter(move |file| future::ready(file.last_modified <= unmodified_since))
+                    .boxed()
+            } else {
+                listing.boxed()
+            };
+            listing
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
                     // If the directory doesn't exist then we can just return an empty stream.
@@ -354,12 +583,13 @@ impl<'a> CleanupTask<'a> {
                 .try_filter_map(move |obj_meta| {
                     // If a file is new-ish then it might be part of an ongoing operation and so we only
                     // delete it if we can verify it is part of an old version.
-                    let maybe_in_progress = !self.policy.delete_unverified
+                    let maybe_in_progress = !delete_unverified
                         && obj_meta.last_modified >= verification_threshold;
-                    let path_to_remove = self.path_if_not_referenced(
+                    let path_to_remove = path_if_not_referenced(
+                        &base_ref,
                         obj_meta.location,
                         maybe_in_progress,
-                        inspection_ref,
+                        &inspection_ref,
                     );
                     if matches!(path_to_remove, Ok(Some(..))) {
                         let mut stats = removal_stats_ref.lock().unwrap();
@@ -441,22 +671,12 @@ impl<'a> CleanupTask<'a> {
 
         delete_fut.await?;
 
-        let mut removal_stats = removal_stats.into_inner().unwrap();
+        let mut removal_stats = Arc::try_unwrap(removal_stats)
+            .expect("all streams should be consumed")
+            .into_inner()
+            .unwrap();
         removal_stats.old_versions = num_old_manifests as u64;
         removal_stats.bytes_removed += manifest_bytes_removed?;
-
-        let span = Span::current();
-        span.record("bytes_removed", removal_stats.bytes_removed);
-        span.record("data_files_removed", removal_stats.data_files_removed);
-        span.record(
-            "transaction_files_removed",
-            removal_stats.transaction_files_removed,
-        );
-        span.record("index_files_removed", removal_stats.index_files_removed);
-        span.record(
-            "deletion_files_removed",
-            removal_stats.deletion_files_removed,
-        );
 
         Ok(removal_stats)
     }
@@ -467,189 +687,7 @@ impl<'a> CleanupTask<'a> {
         maybe_in_progress: bool,
         inspection: &CleanupInspection,
     ) -> Result<Option<Path>> {
-        let relative_path = remove_prefix(&path, &self.dataset.base);
-        if relative_path.as_ref().starts_with("_versions/.tmp") {
-            // This is a temporary manifest file.
-            //
-            // If the file is old (or the user has verified there are no writes in progress) then
-            // it must be leftover from a failed tx.
-            if maybe_in_progress {
-                return Ok(None);
-            } else {
-                return Ok(Some(path));
-            }
-        }
-        if relative_path.as_ref().starts_with("_indices") {
-            // Indices are referenced by UUID so we need to examine the UUID
-            // portion of the path.
-            if let Some(uuid) = relative_path.parts().nth(1) {
-                if inspection
-                    .referenced_files
-                    .index_uuids
-                    .contains(uuid.as_ref())
-                {
-                    return Ok(None);
-                } else if !maybe_in_progress {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
-                    return Ok(Some(path));
-                } else if inspection
-                    .verified_files
-                    .index_uuids
-                    .contains(uuid.as_ref())
-                {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
-                    return Ok(Some(path));
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-        match path.extension() {
-            Some("lance") => {
-                if relative_path.as_ref().starts_with("data") {
-                    if inspection
-                        .referenced_files
-                        .data_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(None)
-                    } else if !maybe_in_progress {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                        Ok(Some(path))
-                    } else if inspection
-                        .verified_files
-                        .data_paths
-                        .contains(&relative_path)
-                    {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                        Ok(Some(path))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    // If a .lance file isn't in the data directory we err on the side of leaving it alone
-                    Ok(None)
-                }
-            }
-            Some("blob") => {
-                // Blob v2 sidecar files are keyed by the data file stem:
-                //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
-                //
-                // These files are not referenced directly by the manifest.  Instead, treat them
-                // as referenced if their parent data file is referenced.
-                if !relative_path.as_ref().starts_with("data") {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-
-                let mut parts = relative_path.parts();
-                let data_dir = parts.next();
-                let data_file_key = parts.next();
-                let blob_file = parts.next();
-                // Be conservative: only handle the expected 3-part layout.
-                if !matches!(data_dir, Some(dir) if dir.as_ref() == "data")
-                    || data_file_key.is_none()
-                    || blob_file.is_none()
-                {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-                if parts.next().is_some() {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-
-                let data_file_key = data_file_key.expect("checked is_some");
-                let Ok(parent_data_path) =
-                    Path::parse(format!("data/{}.lance", data_file_key.as_ref()))
-                else {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        derived_parent = format!("data/{}.lance", data_file_key.as_ref()),
-                        "Will not garbage collect blob file because derived parent data file path is invalid"
-                    );
-                    return Ok(None);
-                };
-
-                if inspection
-                    .referenced_files
-                    .data_paths
-                    .contains(&parent_data_path)
-                {
-                    Ok(None)
-                } else if !maybe_in_progress {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                    Ok(Some(path))
-                } else if inspection
-                    .verified_files
-                    .data_paths
-                    .contains(&parent_data_path)
-                {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                    Ok(Some(path))
-                } else {
-                    Ok(None)
-                }
-            }
-            Some("manifest") => {
-                // We already scanned the manifest files
-                Ok(None)
-            }
-            Some("arrow") | Some("bin") => {
-                if relative_path.as_ref().starts_with("_deletions") {
-                    if inspection
-                        .referenced_files
-                        .delete_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(None)
-                    } else if !maybe_in_progress {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-                        Ok(Some(path))
-                    } else if inspection
-                        .verified_files
-                        .delete_paths
-                        .contains(&relative_path)
-                    {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-                        Ok(Some(path))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
-            Some("txn") => {
-                if relative_path.as_ref().starts_with(TRANSACTIONS_DIR) {
-                    if inspection
-                        .referenced_files
-                        .tx_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(None)
-                    } else if !maybe_in_progress
-                        || inspection.verified_files.tx_paths.contains(&relative_path)
-                    {
-                        Ok(Some(path))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
-        }
+        path_if_not_referenced(&self.dataset.base, path, maybe_in_progress, inspection)
     }
 
     async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {

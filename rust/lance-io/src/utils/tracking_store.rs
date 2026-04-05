@@ -18,8 +18,9 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
+    UploadPart,
 };
 
 use crate::object_store::WrappingObjectStore;
@@ -294,12 +295,6 @@ impl IoTrackingStore {
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        let _guard = self.stage_guard();
-        self.record_write("put", location.to_owned(), bytes.content_length() as u64);
-        self.target.put(location, bytes).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -313,19 +308,6 @@ impl ObjectStore for IoTrackingStore {
             bytes.content_length() as u64,
         );
         self.target.put_opts(location, bytes, opts).await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-        let _guard = self.stage_guard();
-        let target = self.target.put_multipart(location).await?;
-        Ok(Box::new(IoTrackingMultipartUpload {
-            target,
-            stats: self.stats.clone(),
-            #[cfg(feature = "test-util")]
-            path: location.to_owned(),
-            #[cfg(feature = "test-util")]
-            _guard,
-        }))
     }
 
     async fn put_multipart_opts(
@@ -345,16 +327,6 @@ impl ObjectStore for IoTrackingStore {
         }))
     }
 
-    async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        let _guard = self.stage_guard();
-        let result = self.target.get(location).await;
-        if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-            self.record_read("get", location.to_owned(), num_bytes, None);
-        }
-        result
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
         let range = match &options.range {
@@ -366,20 +338,6 @@ impl ObjectStore for IoTrackingStore {
             let num_bytes = result.range.end - result.range.start;
 
             self.record_read("get_opts", location.to_owned(), num_bytes, range);
-        }
-        result
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        let _guard = self.stage_guard();
-        let result = self.target.get_range(location, range.clone()).await;
-        if let Ok(result) = &result {
-            self.record_read(
-                "get_range",
-                location.to_owned(),
-                result.len() as u64,
-                Some(range),
-            );
         }
         result
     }
@@ -398,23 +356,17 @@ impl ObjectStore for IoTrackingStore {
         result
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        let _guard = self.stage_guard();
-        self.record_read("head", location.to_owned(), 0, None);
-        self.target.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("delete", location.to_owned(), 0);
-        self.target.delete(location).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, OSResult<Path>>,
-    ) -> BoxStream<'a, OSResult<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
         self.target.delete_stream(locations)
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        let _guard = self.stage_guard();
+        self.record_write("copy_opts", from.to_owned(), 0);
+        self.target.copy_opts(from, to, options).await
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -448,29 +400,6 @@ impl ObjectStore for IoTrackingStore {
         self.target.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("copy", from.to_owned(), 0);
-        self.target.copy(from, to).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("rename", from.to_owned(), 0);
-        self.target.rename(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("rename_if_not_exists", from.to_owned(), 0);
-        self.target.rename_if_not_exists(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("copy_if_not_exists", from.to_owned(), 0);
-        self.target.copy_if_not_exists(from, to).await
-    }
 }
 
 #[derive(Debug)]

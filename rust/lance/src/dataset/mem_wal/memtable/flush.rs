@@ -14,6 +14,7 @@ use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
+use object_store::ObjectStoreExt as _;
 use object_store::path::Path;
 use uuid::Uuid;
 

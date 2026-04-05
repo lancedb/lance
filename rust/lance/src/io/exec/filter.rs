@@ -52,7 +52,7 @@ impl ExecutionPlan for LanceFilterExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.filter.properties()
     }
 

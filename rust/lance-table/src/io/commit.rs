@@ -40,7 +40,10 @@ use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::PutOptions;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore as OSObjectStore, ObjectStoreExt as _,
+    RenameOptions, RenameTargetMode, path::Path,
+};
 use tracing::info;
 use url::Url;
 
@@ -1011,7 +1014,7 @@ impl CommitHandler for RenameCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        // Create a temporary object, then use `rename_if_not_exists` to commit.
+        // Create a temporary object, then use `rename_opts` to commit.
         // If failed, clean up the temporary object.
 
         let path = naming_scheme.manifest_path(base_path, manifest.version);
@@ -1021,7 +1024,14 @@ impl CommitHandler for RenameCommitHandler {
 
         match object_store
             .inner
-            .rename_if_not_exists(&tmp_path, &path)
+            .rename_opts(
+                &tmp_path,
+                &path,
+                RenameOptions {
+                    target_mode: RenameTargetMode::Create,
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(_) => {

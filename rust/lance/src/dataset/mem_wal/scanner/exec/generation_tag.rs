@@ -44,7 +44,7 @@ pub struct MemtableGenTagExec {
     /// Output schema (input schema + _gen column).
     schema: SchemaRef,
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl MemtableGenTagExec {
@@ -62,12 +62,12 @@ impl MemtableGenTagExec {
         let schema = Arc::new(Schema::new(fields));
 
         // Preserve input properties
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             input.output_partitioning().clone(),
             input.pipeline_behavior(),
             input.boundedness(),
-        );
+        ));
 
         Self {
             input,
@@ -108,7 +108,7 @@ impl ExecutionPlan for MemtableGenTagExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

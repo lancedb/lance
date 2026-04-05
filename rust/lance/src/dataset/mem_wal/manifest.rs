@@ -37,9 +37,11 @@ use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
+use object_store::ObjectStoreExt as _;
 use object_store::PutMode;
 use object_store::PutOptions;
 use object_store::path::Path;
+use object_store::{RenameOptions, RenameTargetMode};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -158,7 +160,7 @@ impl ShardManifestStore {
             match self
                 .object_store
                 .inner
-                .rename_if_not_exists(&temp_path, &path)
+                .rename_opts(&temp_path, &path, RenameOptions { target_mode: RenameTargetMode::Create, ..Default::default() })
                 .await
             {
                 Ok(()) => {}

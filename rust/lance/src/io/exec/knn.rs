@@ -118,7 +118,7 @@ pub struct KNNVectorDistanceExec {
     pub distance_type: DistanceType,
 
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -164,10 +164,10 @@ impl KNNVectorDistanceExec {
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
-        let properties = input
+        let properties = Arc::new(Arc::unwrap_or_clone(input
             .properties()
-            .clone()
-            .with_eq_properties(EquivalenceProperties::new(output_schema.clone()));
+            .clone())
+            .with_eq_properties(EquivalenceProperties::new(output_schema.clone())));
 
         Ok(Self {
             input,
@@ -288,7 +288,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -376,7 +376,7 @@ pub struct ANNIvfPartitionExec {
     /// The UUIDs of the indices to search.
     pub index_uuids: Vec<String>,
 
-    pub properties: PlanProperties,
+    pub properties: Arc<PlanProperties>,
 
     pub metrics: ExecutionPlanMetricsSet,
 }
@@ -392,12 +392,12 @@ impl ANNIvfPartitionExec {
         }
 
         let schema = KNN_PARTITION_SCHEMA.clone();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             dataset,
@@ -449,14 +449,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         KNN_PARTITION_SCHEMA.clone()
     }
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Exact(self.query.minimum_nprobes),
-            ..Statistics::new_unknown(self.schema().as_ref())
-        })
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -604,7 +597,7 @@ pub struct ANNIvfSubIndexExec {
     prefilter_source: PreFilterSource,
 
     /// Datafusion Plan Properties
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -623,12 +616,12 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Ok(Self {
             input,
             dataset,
@@ -1113,7 +1106,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1151,17 +1144,17 @@ pub struct MultivectorScoringExec {
     // the inputs are sorted ANN search results
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     query: Query,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl MultivectorScoringExec {
     pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>, query: Query) -> Result<Self> {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             inputs,
@@ -1327,16 +1320,7 @@ impl ExecutionPlan for MultivectorScoringExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Inexact(
-                self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
-            ),
-            ..Statistics::new_unknown(self.schema().as_ref())
-        })
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -737,6 +737,7 @@ impl MergeInsertJob {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNull,
+                false,
             )
             .unwrap(),
         );

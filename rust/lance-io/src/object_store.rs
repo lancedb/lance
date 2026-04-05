@@ -25,7 +25,7 @@ use object_store::Error as ObjectStoreError;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{ObjectMeta, ObjectStore as OSObjectStore, ObjectStoreExt as _, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -827,10 +827,10 @@ impl ObjectStore {
         Ok(())
     }
 
-    pub fn remove_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
+    pub fn remove_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
         self.inner
             .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
             .err_into::<Error>()

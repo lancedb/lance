@@ -83,7 +83,7 @@ pub struct MatchQueryExec {
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
 
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -117,12 +117,12 @@ impl MatchQueryExec {
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             query,
@@ -322,15 +322,11 @@ impl ExecutionPlan for MatchQueryExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&FTS_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -541,11 +537,6 @@ impl ExecutionPlan for FlatMatchFilterExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        #[allow(deprecated)]
-        self.input.statistics()
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
         self.input.partition_statistics(partition)
     }
@@ -554,7 +545,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 
@@ -571,7 +562,7 @@ pub struct FlatMatchQueryExec {
     params: FtsSearchParams,
     unindexed_input: Arc<dyn ExecutionPlan>,
 
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -605,12 +596,12 @@ impl FlatMatchQueryExec {
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             query,
@@ -718,15 +709,11 @@ impl ExecutionPlan for FlatMatchQueryExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&FTS_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -741,7 +728,7 @@ pub struct PhraseQueryExec {
     query: PhraseQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -775,12 +762,12 @@ impl PhraseQueryExec {
         mut params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         params = params.with_phrase_slop(Some(query.slop));
 
         Self {
@@ -951,15 +938,11 @@ impl ExecutionPlan for PhraseQueryExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&FTS_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -975,7 +958,7 @@ pub struct BoostQueryExec {
     positive: Arc<dyn ExecutionPlan>,
     negative: Arc<dyn ExecutionPlan>,
 
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -1007,12 +990,12 @@ impl BoostQueryExec {
         positive: Arc<dyn ExecutionPlan>,
         negative: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             query,
             params,
@@ -1126,15 +1109,11 @@ impl ExecutionPlan for BoostQueryExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&FTS_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1151,7 +1130,7 @@ pub struct BooleanQueryExec {
     must: Option<Arc<dyn ExecutionPlan>>,
     must_not: Arc<dyn ExecutionPlan>,
 
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -1190,12 +1169,12 @@ impl BooleanQueryExec {
         must: Option<Arc<dyn ExecutionPlan>>,
         must_not: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             query,
             params,
@@ -1381,15 +1360,11 @@ impl ExecutionPlan for BooleanQueryExec {
         )))
     }
 
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&FTS_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 }

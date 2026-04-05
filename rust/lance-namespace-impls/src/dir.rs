@@ -31,7 +31,10 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore as OSObjectStore, ObjectStoreExt as _, PutMode,
+    PutOptions,
+};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};

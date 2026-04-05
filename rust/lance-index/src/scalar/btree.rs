@@ -587,6 +587,9 @@ impl Ord for OrderableScalarValue {
             (Union(_, _, _), _) => todo!("Support for union scalars"),
             (Null, Null) => Ordering::Equal,
             (Null, _) => todo!(),
+            (RunEndEncoded(_, _, _), _) => {
+                todo!("Support for RunEndEncoded scalars")
+            }
         }
     }
 }

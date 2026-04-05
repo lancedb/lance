@@ -49,6 +49,7 @@ use lance_table::io::commit::{
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use object_store::ObjectStoreExt as _;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;

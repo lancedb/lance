@@ -18,6 +18,7 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
+use object_store::ObjectStoreExt as _;
 use object_store::path::Path;
 use tokio::sync::{mpsc, watch};
 

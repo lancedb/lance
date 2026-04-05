@@ -3201,6 +3201,7 @@ impl Scanner {
                             None,
                             datafusion_physical_plan::joins::PartitionMode::CollectLeft,
                             NullEquality::NullEqualsNothing,
+                            false,
                         )?) as _);
                     } else {
                         must = Some(plan);
@@ -4159,6 +4160,7 @@ impl Scanner {
                     None,
                     PartitionMode::CollectLeft,
                     NullEquality::NullEqualsNull,
+                    false,
                 )?;
 
                 let schema = join.schema();
