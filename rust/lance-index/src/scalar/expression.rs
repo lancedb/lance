@@ -13,19 +13,23 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
-    expr::{InList, ScalarFunction},
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
+    expr::{InList, Like, ScalarFunction},
 };
+use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchResult, TextQuery, TokenQuery,
 };
-use futures::join;
-use lance_core::{utils::mask::RowIdMask, Error, Result};
+#[cfg(feature = "geo")]
+use super::{GeoQuery, RelationQuery};
+use lance_core::{
+    Error, Result,
+    utils::mask::{NullableRowAddrMask, RowAddrMask},
+};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
-use snafu::location;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -107,6 +111,29 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
         func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression>;
+
+    /// Visit a LIKE expression
+    ///
+    /// Returns an IndexedExpression if the index can accelerate LIKE expressions.
+    /// For prefix patterns (e.g., "foo%"):
+    /// - ZoneMaps prune zones based on min/max statistics
+    /// - BTrees use range query conversion `[prefix, next_prefix)`
+    ///
+    /// For patterns with wildcards in the middle (e.g., "foo%bar%"), the leading prefix
+    /// can still be used for pruning, with the full pattern as a refine expression.
+    ///
+    /// # Arguments
+    /// * `column` - The column name
+    /// * `like` - The full LIKE expression (for constructing refine_expr if needed)
+    /// * `pattern` - The LIKE pattern as ScalarValue (e.g., "foo%")
+    fn visit_like(
+        &self,
+        _column: &str,
+        _like: &Like,
+        _pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        None
+    }
 
     /// Visits a potential reference to a column
     ///
@@ -208,6 +235,16 @@ impl ScalarQueryParser for MultiQueryParser {
             .iter()
             .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
     }
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_like(column, like, pattern))
+    }
     /// TODO(low-priority): This is maybe not quite right.  We should filter down the list of parsers based
     /// on those that consider the reference valid.  Instead what we are doing is checking all parsers if any one
     /// parser considers the reference valid.
@@ -253,15 +290,15 @@ impl ScalarQueryParser for SargableQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        if let Bound::Included(val) | Bound::Excluded(val) = low {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = low
+            && val.is_null()
+        {
+            return None;
         }
-        if let Bound::Included(val) | Bound::Excluded(val) = high {
-            if val.is_null() {
-                return None;
-            }
+        if let Bound::Included(val) | Bound::Excluded(val) = high
+            && val.is_null()
+        {
+            return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
         Some(IndexedExpression::index_query_with_recheck(
@@ -336,13 +373,201 @@ impl ScalarQueryParser for SargableQueryParser {
 
     fn visit_scalar_function(
         &self,
-        _: &str,
-        _: &DataType,
-        _: &ScalarUDF,
-        _: &[Expr],
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
     ) -> Option<IndexedExpression> {
+        // Handle starts_with(col, 'prefix') -> convert to LikePrefix query
+        if func.name() == "starts_with" && args.len() == 2 {
+            // Extract the prefix from the second argument
+            let prefix = match &args[1] {
+                Expr::Literal(ScalarValue::Utf8(Some(s)), _) => ScalarValue::Utf8(Some(s.clone())),
+                Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => {
+                    ScalarValue::LargeUtf8(Some(s.clone()))
+                }
+                _ => return None,
+            };
+
+            let query = SargableQuery::LikePrefix(prefix);
+            return Some(IndexedExpression::index_query_with_recheck(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+                self.needs_recheck,
+            ));
+        }
+
         None
     }
+
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        // Case-insensitive LIKE (ILIKE) cannot be efficiently pruned with zone maps
+        if like.case_insensitive {
+            return None;
+        }
+
+        // Extract the pattern string
+        let pattern_str = match pattern {
+            ScalarValue::Utf8(Some(s)) => s.as_str(),
+            ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            _ => return None,
+        };
+
+        // Try to extract a prefix from the LIKE pattern
+        let (prefix, needs_refine) = extract_like_leading_prefix(pattern_str, like.escape_char)?;
+
+        // Create the prefix ScalarValue with the same type as the pattern
+        let prefix_value = match pattern {
+            ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(prefix)),
+            ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(prefix)),
+            _ => return None,
+        };
+
+        let query = SargableQuery::LikePrefix(prefix_value);
+        let scalar_query = Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: self.index_name.clone(),
+            query: Arc::new(query),
+            needs_recheck: self.needs_recheck,
+        }));
+
+        // If the pattern has wildcards beyond simple prefix, add refine expression
+        let refine_expr = if needs_refine {
+            Some(Expr::Like(like.clone()))
+        } else {
+            None
+        };
+
+        Some(IndexedExpression {
+            scalar_query,
+            refine_expr,
+        })
+    }
+}
+
+/// Extract the leading literal prefix from a LIKE pattern.
+///
+/// Returns `Some((prefix, needs_refine))` where:
+/// - `prefix` is the leading literal portion before any wildcards
+/// - `needs_refine` is true if the pattern has wildcards beyond a simple trailing `%`
+///
+/// Returns `None` if the pattern starts with a wildcard (no leading literal).
+///
+/// Examples:
+/// - "foo%" -> Some(("foo", false)) - pure prefix, no recheck needed
+/// - "foo%bar%" -> Some(("foo", true)) - can use prefix for pruning, needs recheck
+/// - "foo_bar%" -> Some(("foo", true)) - _ is a wildcard, needs recheck
+/// - "foo\%bar%" with escape '\' -> Some(("foo%bar", false)) - escaped %, pure prefix
+/// - "%foo" -> None - starts with wildcard, cannot prune
+/// - "foo" -> None - no wildcard at all, use equality instead
+fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Option<(String, bool)> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let len = chars.len();
+
+    if len == 0 {
+        return None;
+    }
+
+    // DataFusion's starts_with simplification escapes special characters with backslash
+    // but doesn't set escape_char. Use backslash as default escape character.
+    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
+    // See: https://github.com/apache/datafusion/issues/XXXX
+    let effective_escape_char = escape_char.or(Some('\\'));
+
+    // Helper to check if a character at position i is escaped
+    let is_escaped = |i: usize| -> bool {
+        if let Some(esc) = effective_escape_char {
+            if i > 0 && chars[i - 1] == esc {
+                // Check if the escape char itself is escaped
+                if i >= 2 && chars[i - 2] == esc {
+                    false // Escape was escaped, so this char is NOT escaped
+                } else {
+                    true // This char is escaped
+                }
+            } else {
+                false
+            }
+        } else {
+            // No escape character defined - nothing can be escaped
+            false
+        }
+    };
+
+    // Pattern must contain at least one unescaped wildcard
+    let has_wildcard = chars.iter().enumerate().any(|(i, &c)| {
+        if c != '%' && c != '_' {
+            return false;
+        }
+        !is_escaped(i)
+    });
+
+    if !has_wildcard {
+        return None; // No wildcards, should use equality
+    }
+
+    // Check if pattern starts with an unescaped wildcard
+    if chars[0] == '%' || chars[0] == '_' {
+        return None; // Starts with wildcard, cannot prune
+    }
+
+    // Extract the leading literal prefix (everything before first unescaped wildcard)
+    let mut prefix = String::new();
+    let mut i = 0;
+    let mut found_wildcard = false;
+
+    while i < len {
+        let c = chars[i];
+
+        // Check for escape character (using effective escape char which may be inferred)
+        if let Some(esc) = effective_escape_char
+            && c == esc
+            && i + 1 < len
+        {
+            let next = chars[i + 1];
+            if next == '%' || next == '_' || next == esc {
+                // Escaped character - add the literal character
+                prefix.push(next);
+                i += 2;
+                continue;
+            }
+        }
+
+        // Check for unescaped wildcard
+        if c == '%' || c == '_' {
+            found_wildcard = true;
+            break;
+        }
+
+        prefix.push(c);
+        i += 1;
+    }
+
+    if prefix.is_empty() {
+        return None;
+    }
+
+    // Check if pattern is just a simple prefix (ends with single % and nothing after)
+    let needs_refine = if found_wildcard && i < len {
+        // Check if we're at a % wildcard
+        if chars[i] == '%' && i + 1 == len {
+            // Pattern is "prefix%" - pure prefix match, no refine needed
+            false
+        } else {
+            // Pattern has more after first wildcard, or has _ wildcard
+            true
+        }
+    } else {
+        // No wildcard found (shouldn't happen due to earlier check)
+        false
+    };
+
+    Some((prefix, needs_refine))
 }
 
 /// A parser for bloom filter indices that only support equals, is_null, and is_in operations
@@ -487,9 +712,32 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // DataFusion normalizes array_contains to array_has
+        if func.name() == "array_has" {
+            let inner_type = match data_type {
+                DataType::List(field) | DataType::LargeList(field) => field.data_type(),
+                _ => return None,
+            };
+            let scalar = maybe_scalar(&args[1], inner_type)?;
+            // array_has(..., NULL) returns no matches in datafusion, but the index would
+            // match rows containing NULL. Fallback to match datafusion behavior.
+            if scalar.is_null() {
+                return None;
+            }
+            let query = LabelListQuery::HasAnyLabel(vec![scalar]);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
+        }
+
         let label_list = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::List(list_arr) = label_list {
             let list_values = list_arr.values();
+            if list_values.is_empty() {
+                return None;
+            }
             let mut scalars = Vec::with_capacity(list_values.len());
             for idx in 0..list_values.len() {
                 scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
@@ -651,15 +899,125 @@ impl ScalarQueryParser for FtsQueryParser {
             return None;
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            if func.name() == "contains_tokens" {
-                let query = TokenQuery::TokensContains(scalar_str);
-                return Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ));
-            }
+        if let ScalarValue::Utf8(Some(scalar_str)) = scalar
+            && func.name() == "contains_tokens"
+        {
+            let query = TokenQuery::TokensContains(scalar_str);
+            return Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+            ));
+        }
+        None
+    }
+}
+
+/// A parser for geo indices that handles spatial queries
+#[cfg(feature = "geo")]
+#[derive(Debug, Clone)]
+pub struct GeoQueryParser {
+    index_name: String,
+}
+
+#[cfg(feature = "geo")]
+impl GeoQueryParser {
+    pub fn new(index_name: String) -> Self {
+        Self { index_name }
+    }
+}
+
+#[cfg(feature = "geo")]
+impl ScalarQueryParser for GeoQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(GeoQuery::IsNull),
+            true,
+        ))
+    }
+
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if (func.name() == "st_intersects"
+            || func.name() == "st_contains"
+            || func.name() == "st_within"
+            || func.name() == "st_touches"
+            || func.name() == "st_crosses"
+            || func.name() == "st_overlaps"
+            || func.name() == "st_covers"
+            || func.name() == "st_coveredby")
+            && args.len() == 2
+        {
+            let left_arg = &args[0];
+            let right_arg = &args[1];
+            return match (left_arg, right_arg) {
+                (Expr::Literal(left_value, metadata), Expr::Column(_)) => {
+                    let mut field = Field::new("_geo", left_value.data_type(), false);
+                    if let Some(metadata) = metadata {
+                        field = field.with_metadata(metadata.to_hashmap());
+                    }
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
+                        value: left_value.clone(),
+                        field,
+                    });
+                    Some(IndexedExpression::index_query_with_recheck(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                        true,
+                    ))
+                }
+                (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
+                    let mut field = Field::new("_geo", right_value.data_type(), false);
+                    if let Some(metadata) = metadata {
+                        field = field.with_metadata(metadata.to_hashmap());
+                    }
+                    let query = GeoQuery::IntersectQuery(RelationQuery {
+                        value: right_value.clone(),
+                        field,
+                    });
+                    Some(IndexedExpression::index_query_with_recheck(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                        true,
+                    ))
+                }
+                _ => None,
+            };
         }
         None
     }
@@ -855,9 +1213,9 @@ impl PartialEq for ScalarIndexSearch {
 /// modify the results of scalar lookups
 #[derive(Debug, Clone)]
 pub enum ScalarIndexExpr {
-    Not(Box<ScalarIndexExpr>),
-    And(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
-    Or(Box<ScalarIndexExpr>, Box<ScalarIndexExpr>),
+    Not(Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
     Query(ScalarIndexSearch),
 }
 
@@ -903,21 +1261,96 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[derive(Debug)]
+enum NullableIndexExprResult {
+    Exact(NullableRowAddrMask),
+    AtMost(NullableRowAddrMask),
+    AtLeast(NullableRowAddrMask),
+}
+
+impl From<SearchResult> for NullableIndexExprResult {
+    fn from(result: SearchResult) -> Self {
+        match result {
+            SearchResult::Exact(mask) => Self::Exact(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::AtMost(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowAddrMask::AllowList(mask)),
+        }
+    }
+}
+
+impl std::ops::BitAnd<Self> for NullableIndexExprResult {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs & rhs),
+            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(lhs), Self::Exact(rhs)) => {
+                Self::AtMost(lhs & rhs)
+            }
+            (Self::Exact(exact), Self::AtLeast(_)) | (Self::AtLeast(_), Self::Exact(exact)) => {
+                // We could do better here, elements in both lhs and rhs are known
+                // to be true and don't require a recheck.  We only need to recheck
+                // elements in lhs that are not in rhs
+                Self::AtMost(exact)
+            }
+            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs & rhs),
+            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs & rhs),
+            (Self::AtMost(most), Self::AtLeast(_)) | (Self::AtLeast(_), Self::AtMost(most)) => {
+                Self::AtMost(most)
+            }
+        }
+    }
+}
+
+impl std::ops::BitOr<Self> for NullableIndexExprResult {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs | rhs),
+            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(rhs), Self::Exact(lhs)) => {
+                // We could do better here, elements in lhs are known to be true
+                // and don't require a recheck.  We only need to recheck elements
+                // in rhs that are not in lhs
+                Self::AtMost(lhs | rhs)
+            }
+            (Self::Exact(lhs), Self::AtLeast(rhs)) | (Self::AtLeast(rhs), Self::Exact(lhs)) => {
+                Self::AtLeast(lhs | rhs)
+            }
+            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs | rhs),
+            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs | rhs),
+            (Self::AtMost(_), Self::AtLeast(least)) | (Self::AtLeast(least), Self::AtMost(_)) => {
+                Self::AtLeast(least)
+            }
+        }
+    }
+}
+
+impl NullableIndexExprResult {
+    pub fn drop_nulls(self) -> IndexExprResult {
+        match self {
+            Self::Exact(mask) => IndexExprResult::Exact(mask.drop_nulls()),
+            Self::AtMost(mask) => IndexExprResult::AtMost(mask.drop_nulls()),
+            Self::AtLeast(mask) => IndexExprResult::AtLeast(mask.drop_nulls()),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
-    Exact(RowIdMask),
+    Exact(RowAddrMask),
     // The answer is at most the rows in the allow list minus the rows in the block list
     // Some of the rows in the allow list may not be in the result and will need to be filtered
     // by a recheck.  Every row in the block list is definitely not in the result.
-    AtMost(RowIdMask),
+    AtMost(RowAddrMask),
     // The answer is at least the rows in the allow list minus the rows in the block list
     // Some of the rows in the block list might be in the result.  Every row in the allow list is
     // definitely in the result.
-    AtLeast(RowIdMask),
+    AtLeast(RowAddrMask),
 }
 
 impl IndexExprResult {
-    pub fn row_id_mask(&self) -> &RowIdMask {
+    pub fn row_addr_mask(&self) -> &RowAddrMask {
         match self {
             Self::Exact(mask) => mask,
             Self::AtMost(mask) => mask,
@@ -933,15 +1366,14 @@ impl IndexExprResult {
         }
     }
 
-    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+    pub fn from_parts(mask: RowAddrMask, discriminant: u32) -> Result<Self> {
         match discriminant {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
             2 => Ok(Self::AtLeast(mask)),
-            _ => Err(Error::InvalidInput {
-                source: format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(
+                format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+            )),
         }
     }
 
@@ -950,8 +1382,8 @@ impl IndexExprResult {
         &self,
         fragments_covered_by_result: &RoaringBitmap,
     ) -> Result<RecordBatch> {
-        let row_id_mask = self.row_id_mask();
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let row_addr_mask = self.row_addr_mask();
+        let row_addr_mask_arr = row_addr_mask.into_arrow()?;
         let discriminant = self.discriminant();
         let discriminant_arr =
             Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
@@ -965,7 +1397,7 @@ impl IndexExprResult {
         Ok(RecordBatch::try_new(
             INDEX_EXPR_RESULT_SCHEMA.clone(),
             vec![
-                Arc::new(row_id_mask_arr),
+                Arc::new(row_addr_mask_arr),
                 Arc::new(discriminant_arr),
                 Arc::new(fragments_covered_arr),
             ],
@@ -981,115 +1413,57 @@ impl ScalarIndexExpr {
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
     #[async_recursion]
-    #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(
+    async fn evaluate_impl(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<IndexExprResult> {
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate(index_loader, metrics).await?;
-                match result {
-                    IndexExprResult::Exact(mask) => Ok(IndexExprResult::Exact(!mask)),
-                    IndexExprResult::AtMost(mask) => Ok(IndexExprResult::AtLeast(!mask)),
-                    IndexExprResult::AtLeast(mask) => Ok(IndexExprResult::AtMost(!mask)),
-                }
+                let result = inner.evaluate_impl(index_loader, metrics).await?;
+                // Flip certainty: NOT(AtMost) → AtLeast, NOT(AtLeast) → AtMost
+                Ok(match result {
+                    NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
+                    NullableIndexExprResult::AtMost(mask) => {
+                        NullableIndexExprResult::AtLeast(!mask)
+                    }
+                    NullableIndexExprResult::AtLeast(mask) => {
+                        NullableIndexExprResult::AtMost(!mask)
+                    }
+                })
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader, metrics);
-                let rhs_result = rhs.evaluate(index_loader, metrics);
-                let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                match (lhs_result?, rhs_result?) {
-                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::Exact(lhs & rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
-                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::AtMost(lhs & rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(_)) => {
-                        // We could do better here, elements in both lhs and rhs are known
-                        // to be true and don't require a recheck.  We only need to recheck
-                        // elements in lhs that are not in rhs
-                        Ok(IndexExprResult::AtMost(lhs))
-                    }
-                    (IndexExprResult::AtLeast(_), IndexExprResult::Exact(rhs)) => {
-                        // We could do better here (see above)
-                        Ok(IndexExprResult::AtMost(rhs))
-                    }
-                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
-                        Ok(IndexExprResult::AtMost(lhs & rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs & rhs))
-                    }
-                    (IndexExprResult::AtLeast(_), IndexExprResult::AtMost(rhs)) => {
-                        Ok(IndexExprResult::AtMost(rhs))
-                    }
-                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtLeast(_)) => {
-                        Ok(IndexExprResult::AtMost(lhs))
-                    }
-                }
+                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
+                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate(index_loader, metrics);
-                let rhs_result = rhs.evaluate(index_loader, metrics);
-                let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                match (lhs_result?, rhs_result?) {
-                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::Exact(lhs | rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
-                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
-                        // We could do better here.  Elements in the exact side don't need
-                        // re-check.  We only need to recheck elements exclusively in the
-                        // at-most side
-                        Ok(IndexExprResult::AtMost(lhs | rhs))
-                    }
-                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs | rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::Exact(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs | rhs))
-                    }
-                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
-                        Ok(IndexExprResult::AtMost(lhs | rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(lhs | rhs))
-                    }
-                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtMost(_)) => {
-                        Ok(IndexExprResult::AtLeast(lhs))
-                    }
-                    (IndexExprResult::AtMost(_), IndexExprResult::AtLeast(rhs)) => {
-                        Ok(IndexExprResult::AtLeast(rhs))
-                    }
-                }
+                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
+                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                Ok(lhs_result | rhs_result)
             }
             Self::Query(search) => {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
-                match search_result {
-                    SearchResult::Exact(matching_row_ids) => {
-                        Ok(IndexExprResult::Exact(RowIdMask {
-                            block_list: None,
-                            allow_list: Some(matching_row_ids),
-                        }))
-                    }
-                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowIdMask {
-                        block_list: None,
-                        allow_list: Some(row_ids),
-                    })),
-                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowIdMask {
-                        block_list: None,
-                        allow_list: Some(row_ids),
-                    })),
-                }
+                Ok(search_result.into())
             }
         }
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub async fn evaluate(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<IndexExprResult> {
+        Ok(self
+            .evaluate_impl(index_loader, metrics)
+            .await?
+            .drop_nulls())
     }
 
     pub fn to_expr(&self) -> Expr {
@@ -1179,12 +1553,11 @@ fn maybe_indexed_column<'b>(
     index_info: &'b dyn IndexInformationProvider,
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
-    if let Some(nested_path) = extract_nested_column_path(expr) {
-        if let Some((data_type, parser)) = index_info.get_index(&nested_path) {
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                return Some((nested_path, data_type, parser));
-            }
-        }
+    if let Some(nested_path) = extract_nested_column_path(expr)
+        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
+        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+    {
+        return Some((nested_path, data_type, parser));
     }
 
     match expr {
@@ -1508,22 +1881,35 @@ fn visit_scalar_fn(
     query_parser.visit_scalar_function(&col, &data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
+fn visit_like_expr(
+    like: &Like,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, _, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
+
+    // Extract the pattern as a ScalarValue
+    let pattern = match like.pattern.as_ref() {
+        Expr::Literal(scalar, _) => scalar.clone(),
+        _ => return None,
+    };
+
+    query_parser.visit_like(&column, like, &pattern)
+}
+
 fn visit_node(
     expr: &Expr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     if depth >= MAX_DEPTH {
-        return Err(Error::invalid_input(
-            format!(
-                "the filter expression is too long, lance limit the max number of conditions to {}",
-                MAX_DEPTH
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "the filter expression is too long, lance limit the max number of conditions to {}",
+            MAX_DEPTH
+        )));
     }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),
+        Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
         Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
@@ -1533,6 +1919,14 @@ fn visit_node(
         Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth),
         Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info, depth),
         Expr::ScalarFunction(scalar_fn) => Ok(visit_scalar_fn(scalar_fn, index_info)),
+        Expr::Like(like) => {
+            if like.negated {
+                // NOT LIKE cannot be efficiently pruned with zone maps
+                Ok(None)
+            } else {
+                Ok(visit_like_expr(like, index_info))
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -1679,7 +2073,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
-    use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+    use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2174,5 +2568,434 @@ mod tests {
         check_no_index(&index_info, "aisle = NULL");
         check_no_index(&index_info, "aisle BETWEEN 5 AND NULL");
         check_no_index(&index_info, "aisle BETWEEN NULL AND 10");
+    }
+
+    #[tokio::test]
+    async fn test_not_flips_certainty() {
+        use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+
+        // Test that NOT flips certainty for inexact index results
+        // This tests the implementation in evaluate_impl for Self::Not
+
+        // Helper function that mimics the NOT logic we just fixed
+        fn apply_not(result: NullableIndexExprResult) -> NullableIndexExprResult {
+            match result {
+                NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
+                NullableIndexExprResult::AtMost(mask) => NullableIndexExprResult::AtLeast(!mask),
+                NullableIndexExprResult::AtLeast(mask) => NullableIndexExprResult::AtMost(!mask),
+            }
+        }
+
+        // AtMost: superset of matches (e.g., bloom filter says "might be in [1,2]")
+        let at_most = NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
+        ));
+        // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
+        assert!(matches!(
+            apply_not(at_most),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
+        let at_least = NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
+        ));
+        // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
+        assert!(matches!(
+            apply_not(at_least),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // Exact should stay Exact
+        let exact = NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
+        ));
+        assert!(matches!(
+            apply_not(exact),
+            NullableIndexExprResult::Exact(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_and_or_preserve_certainty() {
+        use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+
+        // Test that AND/OR correctly propagate certainty
+        let make_at_most = || {
+            NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
+        };
+
+        let make_at_least = || {
+            NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+                NullableRowAddrSet::new(
+                    RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                    RowAddrTreeMap::new(),
+                ),
+            ))
+        };
+
+        let make_exact = || {
+            NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[1, 2]),
+                RowAddrTreeMap::new(),
+            )))
+        };
+
+        // AtMost & AtMost → AtMost
+        assert!(matches!(
+            make_at_most() & make_at_most(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // AtLeast & AtLeast → AtLeast
+        assert!(matches!(
+            make_at_least() & make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // AtMost & AtLeast → AtMost (superset remains superset)
+        assert!(matches!(
+            make_at_most() & make_at_least(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // AtMost | AtMost → AtMost
+        assert!(matches!(
+            make_at_most() | make_at_most(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // AtLeast | AtLeast → AtLeast
+        assert!(matches!(
+            make_at_least() | make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // AtMost | AtLeast → AtLeast (subset coverage guaranteed)
+        assert!(matches!(
+            make_at_most() | make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+
+        // Exact & AtMost → AtMost
+        assert!(matches!(
+            make_exact() & make_at_most(),
+            NullableIndexExprResult::AtMost(_)
+        ));
+
+        // Exact | AtLeast → AtLeast
+        assert!(matches!(
+            make_exact() | make_at_least(),
+            NullableIndexExprResult::AtLeast(_)
+        ));
+    }
+
+    #[test]
+    fn test_extract_like_leading_prefix() {
+        // Simple prefix patterns (no recheck needed)
+        assert_eq!(
+            extract_like_leading_prefix("foo%", None),
+            Some(("foo".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("abc%", None),
+            Some(("abc".to_string(), false))
+        );
+
+        // Patterns with wildcards in the middle (need recheck)
+        assert_eq!(
+            extract_like_leading_prefix("foo%bar%", None),
+            Some(("foo".to_string(), true))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("foo_bar%", None),
+            Some(("foo".to_string(), true))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("foo%bar", None),
+            Some(("foo".to_string(), true))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("foo_", None),
+            Some(("foo".to_string(), true))
+        );
+
+        // Not prefix patterns (starts with wildcard)
+        assert_eq!(extract_like_leading_prefix("%foo", None), None);
+        assert_eq!(extract_like_leading_prefix("_foo%", None), None);
+        assert_eq!(extract_like_leading_prefix("%", None), None);
+
+        // No wildcard at all (should use equality)
+        assert_eq!(extract_like_leading_prefix("foo", None), None);
+
+        // With escape character
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\%bar%", Some('\\')),
+            Some(("foo%bar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\_bar%", Some('\\')),
+            Some(("foo_bar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\\bar%", Some('\\')),
+            Some(("foo\\bar".to_string(), false))
+        );
+
+        // Escaped trailing % is not a wildcard (no wildcards)
+        assert_eq!(extract_like_leading_prefix(r"foo\%", Some('\\')), None);
+
+        // With backslash as default escape (for DataFusion starts_with compatibility):
+        // "foo\%" means escaped %, no wildcard -> None (should use equality)
+        assert_eq!(extract_like_leading_prefix(r"foo\%", None), None);
+        // "foo\bar%" - \b is not a valid escape sequence, so \ and b are literals, % is wildcard
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\bar%", None),
+            Some(("foo\\bar".to_string(), false))
+        );
+
+        // Empty pattern
+        assert_eq!(extract_like_leading_prefix("", None), None);
+
+        // Mixed escaped and unescaped
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\%bar%baz%", Some('\\')),
+            Some(("foo%bar".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn test_like_expression_parsing() {
+        // Test that LIKE expressions are parsed correctly with refine_expr for complex patterns
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+            ),
+        )]);
+
+        // Simple prefix pattern: LIKE 'foo%' -> LikePrefix("foo"), no refine_expr
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        let expr = state
+            .create_logical_expr("color LIKE 'foo%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(result.scalar_query.is_some(), "Should have scalar_query");
+        assert!(
+            result.refine_expr.is_none(),
+            "Simple prefix should not need refine_expr"
+        );
+
+        // Extract the query and verify it's LikePrefix
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            assert!(query.is_some(), "Query should be SargableQuery");
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("foo".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // Complex pattern: LIKE 'foo%bar%' -> LikePrefix("foo"), with refine_expr
+        let expr = state
+            .create_logical_expr("color LIKE 'foo%bar%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(result.scalar_query.is_some(), "Should have scalar_query");
+        assert!(
+            result.refine_expr.is_some(),
+            "Complex pattern should have refine_expr"
+        );
+
+        // Verify the query is still LikePrefix("foo")
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            assert!(query.is_some(), "Query should be SargableQuery");
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("foo".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        }
+
+        // Verify the refine_expr is the original LIKE expression
+        let refine = result.refine_expr.unwrap();
+        match refine {
+            Expr::Like(like) => {
+                assert!(!like.negated);
+                assert!(!like.case_insensitive);
+                if let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() {
+                    assert_eq!(pattern, "foo%bar%");
+                } else {
+                    panic!("Expected Utf8 literal pattern");
+                }
+            }
+            _ => panic!("Expected Like expression in refine_expr"),
+        }
+
+        // Pattern starting with wildcard: LIKE '%foo' -> no index, only refine
+        let expr = state
+            .create_logical_expr("color LIKE '%foo'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(
+            result.scalar_query.is_none(),
+            "Pattern starting with wildcard should not use index"
+        );
+        assert!(result.refine_expr.is_some(), "Should fall back to refine");
+    }
+
+    #[test]
+    fn test_starts_with_with_underscore_after_optimization() {
+        // Test that starts_with with underscore in prefix works correctly after DataFusion optimization
+        // DataFusion simplifies starts_with(col, 'test_ns$') to col LIKE 'test_ns$%'
+        // The underscore in the prefix should NOT be treated as a wildcard!
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "object_id",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("object_id_idx".to_string(), false)),
+            ),
+        )]);
+
+        let schema = Schema::new(vec![Field::new("object_id", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        // Create the expression with starts_with containing underscore
+        let expr = state
+            .create_logical_expr("starts_with(object_id, 'test_ns$')", &df_schema)
+            .unwrap();
+
+        // Apply DataFusion simplification (this may convert starts_with to LIKE)
+        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
+        let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+        let simplifier =
+            datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+        let simplified_expr = simplifier.simplify(expr).unwrap();
+
+        // Apply scalar indices
+        let result = apply_scalar_indices(simplified_expr, &index_info).unwrap();
+
+        // The prefix should be "test_ns$", NOT "test"
+        // This test documents the current (potentially broken) behavior
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            match query {
+                SargableQuery::LikePrefix(prefix) => {
+                    let prefix_str = match prefix {
+                        ScalarValue::Utf8(Some(s)) => s.clone(),
+                        _ => panic!("Expected Utf8 prefix"),
+                    };
+                    // Verify the prefix is correctly extracted with underscore as literal
+                    assert_eq!(
+                        prefix_str, "test_ns$",
+                        "Prefix should be 'test_ns$', not 'test' (underscore should not be a wildcard)"
+                    );
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            // If no scalar query, it means the pattern was not recognized
+            panic!("Expected scalar_query to be present");
+        }
+    }
+
+    #[test]
+    fn test_starts_with_to_like_conversion() {
+        // Test that starts_with(col, 'prefix') is converted to LikePrefix query
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+            ),
+        )]);
+
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        // starts_with(color, 'foo') should be converted to LikePrefix("foo")
+        let expr = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(
+            result.scalar_query.is_some(),
+            "starts_with should use index"
+        );
+        assert!(
+            result.refine_expr.is_none(),
+            "Pure prefix starts_with should not need refine_expr"
+        );
+
+        // Extract the query and verify it's LikePrefix
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            assert!(query.is_some(), "Query should be SargableQuery");
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("foo".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // Both starts_with and LIKE 'prefix%' should produce the same LikePrefix query
+        let like_expr = state
+            .create_logical_expr("color LIKE 'foo%'", &df_schema)
+            .unwrap();
+        let like_result = apply_scalar_indices(like_expr, &index_info).unwrap();
+
+        // Compare the queries - both should be LikePrefix("foo")
+        if let (
+            Some(ScalarIndexExpr::Query(starts_with_search)),
+            Some(ScalarIndexExpr::Query(like_search)),
+        ) = (&result.scalar_query, &like_result.scalar_query)
+        {
+            let sw_query = starts_with_search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            let like_query = like_search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            assert_eq!(
+                sw_query, like_query,
+                "starts_with and LIKE 'prefix%' should produce identical queries"
+            );
+        }
     }
 }

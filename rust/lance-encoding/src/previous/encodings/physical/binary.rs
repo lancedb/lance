@@ -4,13 +4,13 @@
 use core::panic;
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::ArrayRef;
-use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer, bit_util};
 use futures::TryFutureExt;
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 
 use crate::buffer::LanceBuffer;
 use crate::data::{
@@ -24,8 +24,8 @@ use crate::previous::decoder::LogicalPageDecoder;
 use crate::previous::encoder::{ArrayEncoder, EncodedArray};
 use crate::previous::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::{
-    decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
+    decoder::{PageScheduler, PrimitivePageDecoder},
 };
 
 use arrow_array::{PrimitiveArray, UInt64Array};
@@ -109,7 +109,7 @@ impl BinaryPageScheduler {
             PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows, false);
         let drained_task = primitive_wrapper.drain(num_rows)?;
         let indices_decode_task = drained_task.task;
-        indices_decode_task.decode()
+        indices_decode_task.decode().map(|(arr, _)| arr)
     }
 }
 

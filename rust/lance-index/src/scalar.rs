@@ -4,41 +4,45 @@
 //! Scalar indices for metadata search & filtering
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_array::{ListArray, RecordBatch};
+use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion_common::{scalar::ScalarValue, Column};
+use datafusion_common::{Column, scalar::ScalarValue};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
+use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
-use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::RowAddrTreeMap;
+use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
+pub use lance_table::format::IndexFile;
 
 pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
-pub mod flat;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 pub mod registry;
+#[cfg(feature = "geo")]
+pub mod rtree;
+pub mod zoned;
 pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -60,6 +64,7 @@ pub enum BuiltinIndexType {
     NGram,
     ZoneMap,
     BloomFilter,
+    RTree,
     Inverted,
 }
 
@@ -73,6 +78,7 @@ impl BuiltinIndexType {
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
+            Self::RTree => "rtree",
         }
     }
 }
@@ -89,10 +95,8 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
-            _ => Err(Error::Index {
-                message: "Invalid index type".to_string(),
-                location: location!(),
-            }),
+            IndexType::RTree => Ok(Self::RTree),
+            _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
 }
@@ -170,6 +174,12 @@ pub trait IndexWriter: Send {
     ///
     /// E.g. if this is the third time this is called this method will return 2
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
+    /// Adds a global buffer and returns its index.
+    async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+        Err(Error::not_supported(
+            "global buffers are not supported by this index writer",
+        ))
+    }
     /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
     /// Finishes writing the file and closes the file with additional metadata
@@ -181,6 +191,12 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
+    /// Reads a global buffer by index.
+    async fn read_global_buffer(&self, _index: u32) -> Result<Bytes> {
+        Err(Error::not_supported(
+            "global buffers are not supported by this index reader",
+        ))
+    }
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.
@@ -206,13 +222,14 @@ pub trait IndexReader: Send + Sync {
 #[async_trait]
 pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
+    fn clone_arc(&self) -> Arc<dyn IndexStore>;
 
     /// Suggested I/O parallelism for the store
     fn io_parallelism(&self) -> usize;
 
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
-        -> Result<Box<dyn IndexWriter>>;
+    -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
@@ -227,6 +244,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Delete an index file (used in the tmp spill store to keep tmp size down)
     async fn delete_index_file(&self, name: &str) -> Result<()>;
+
+    /// List all files in the index directory with their sizes.
+    ///
+    /// Returns a list of (relative_path, size_bytes) tuples.
+    /// Used to capture file metadata after index creation/modification.
+    async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>>;
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -358,6 +381,9 @@ pub enum SargableQuery {
     FullTextSearch(FullTextSearchQuery),
     /// Retrieve all row ids where the value is null
     IsNull(),
+    /// Retrieve all row ids where the value matches LIKE 'prefix%' pattern
+    /// This is used for both explicit LIKE expressions and starts_with() function calls
+    LikePrefix(ScalarValue),
 }
 
 impl AnyQuery for SargableQuery {
@@ -405,6 +431,9 @@ impl AnyQuery for SargableQuery {
             }
             Self::Equals(val) => {
                 format!("{} = {}", col, val)
+            }
+            Self::LikePrefix(prefix) => {
+                format!("{} LIKE '{}%'", col, prefix)
             }
         }
     }
@@ -458,6 +487,16 @@ impl AnyQuery for SargableQuery {
             )),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
+            Self::LikePrefix(prefix) => {
+                let pattern = match prefix {
+                    ScalarValue::Utf8(Some(s)) => ScalarValue::Utf8(Some(format!("{}%", s))),
+                    ScalarValue::LargeUtf8(Some(s)) => {
+                        ScalarValue::LargeUtf8(Some(format!("{}%", s)))
+                    }
+                    other => other.clone(),
+                };
+                col_expr.like(Expr::Literal(pattern, None))
+            }
         }
     }
 
@@ -494,7 +533,7 @@ impl AnyQuery for LabelListQuery {
                 let offsets_buffer =
                     OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
                 let labels_list = ListArray::try_new(
-                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), true)),
                     offsets_buffer,
                     labels_arr,
                     None,
@@ -514,7 +553,7 @@ impl AnyQuery for LabelListQuery {
                 let offsets_buffer =
                     OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
                 let labels_list = ListArray::try_new(
-                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), true)),
                     offsets_buffer,
                     labels_arr,
                     None,
@@ -680,24 +719,88 @@ impl AnyQuery for TokenQuery {
     }
 }
 
+#[cfg(feature = "geo")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationQuery {
+    pub value: ScalarValue,
+    pub field: Field,
+}
+
+/// A query that a Geo index can satisfy
+#[cfg(feature = "geo")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeoQuery {
+    IntersectQuery(RelationQuery),
+    IsNull,
+}
+
+#[cfg(feature = "geo")]
+impl AnyQuery for GeoQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::IntersectQuery(query) => {
+                format!("Intersect({} {})", col, query.value)
+            }
+            Self::IsNull => {
+                format!("{} IS NULL", col)
+            }
+        }
+    }
+
+    fn to_expr(&self, _col: String) -> Expr {
+        todo!()
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
 /// The result of a search operation against a scalar index
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
-    Exact(RowAddrTreeMap),
+    Exact(NullableRowAddrSet),
     /// Any row id satisfying the query will be in this set but not every
     /// row id in this set will satisfy the query, a further recheck step
     /// is needed
-    AtMost(RowAddrTreeMap),
+    AtMost(NullableRowAddrSet),
     /// All of the given row ids satisfy the query but there may be more
     ///
     /// No scalar index actually returns this today but it can arise from
     /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
-    AtLeast(RowAddrTreeMap),
+    AtLeast(NullableRowAddrSet),
 }
 
 impl SearchResult {
-    pub fn row_addrs(&self) -> &RowAddrTreeMap {
+    pub fn exact(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::Exact(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn at_most(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::AtMost(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn at_least(row_ids: impl Into<RowAddrTreeMap>) -> Self {
+        Self::AtLeast(NullableRowAddrSet::new(row_ids.into(), Default::default()))
+    }
+
+    pub fn with_nulls(self, nulls: impl Into<RowAddrTreeMap>) -> Self {
+        match self {
+            Self::Exact(row_ids) => Self::Exact(row_ids.with_nulls(nulls.into())),
+            Self::AtMost(row_ids) => Self::AtMost(row_ids.with_nulls(nulls.into())),
+            Self::AtLeast(row_ids) => Self::AtLeast(row_ids.with_nulls(nulls.into())),
+        }
+    }
+
+    pub fn row_addrs(&self) -> &NullableRowAddrSet {
         match self {
             Self::Exact(row_addrs) => row_addrs,
             Self::AtMost(row_addrs) => row_addrs,
@@ -721,6 +824,11 @@ pub struct CreatedIndex {
     ///
     /// This can be used to determine if a reader is able to load the index.
     pub index_version: u32,
+    /// List of files and their sizes for this index
+    ///
+    /// This enables skipping HEAD calls when opening indices and provides
+    /// visibility into index storage size via describe_indices().
+    pub files: Option<Vec<IndexFile>>,
 }
 
 /// The criteria that specifies how to update an index
@@ -731,6 +839,44 @@ pub struct UpdateCriteria {
     pub requires_old_data: bool,
     /// The criteria required for data (both old and new)
     pub data_criteria: TrainingCriteria,
+}
+
+/// Filter used when merging existing scalar-index rows during update.
+///
+/// The caller must pick a filter mode that matches the row-id semantics of the
+/// dataset:
+/// - address-style row IDs: fragment filtering is valid
+/// - stable row IDs: use exact row-id membership instead
+#[derive(Debug, Clone)]
+pub enum OldIndexDataFilter {
+    /// Keeps track of which fragments are still valid and which are no longer valid.
+    ///
+    /// This is valid for address-style row IDs.
+    Fragments {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+    },
+    /// Keep old rows whose row IDs are in this exact allow-list.
+    ///
+    /// This is required for stable row IDs, where row IDs are opaque and
+    /// should not be interpreted as encoded row addresses.
+    RowIds(RowAddrTreeMap),
+}
+
+impl OldIndexDataFilter {
+    /// Build a boolean mask that keeps only row IDs selected by this filter.
+    pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
+        match self {
+            Self::Fragments { to_keep, .. } => row_ids
+                .iter()
+                .map(|id| id.map(|id| to_keep.contains((id >> 32) as u32)))
+                .collect(),
+            Self::RowIds(valid_row_ids) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_row_ids.contains(id)))
+                .collect(),
+        }
+    }
 }
 
 impl UpdateCriteria {
@@ -747,6 +893,62 @@ impl UpdateCriteria {
             data_criteria,
         }
     }
+}
+
+/// Compute the lexicographically next prefix by incrementing the last character's code point.
+/// Returns None if no valid upper bound exists.
+///
+/// This is used for LIKE prefix queries to convert `LIKE 'foo%'` to range `[foo, fop)`.
+///
+/// # UTF-8 and Unicode Handling
+///
+/// This function operates on Unicode code points (characters), not bytes. Since UTF-8
+/// byte ordering is identical to Unicode code point ordering, incrementing a character's
+/// code point produces the correct lexicographic successor for byte-wise string comparison.
+///
+/// If incrementing the last character would overflow or land in the surrogate range
+/// (U+D800-U+DFFF), we try incrementing the previous character, and so on.
+///
+/// Examples:
+/// - `"foo"` → `Some("fop")`
+/// - `"café"` → `Some("cafê")`  (é U+00E9 → ê U+00EA)
+/// - `"abc中"` → `Some("abc丮")` (中 U+4E2D → 丮 U+4E2E)
+/// - `"cafÿ"` → `Some("cafĀ")` (ÿ U+00FF → Ā U+0100)
+pub fn compute_next_prefix(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let chars: Vec<char> = prefix.chars().collect();
+
+    // Try incrementing characters from right to left
+    for i in (0..chars.len()).rev() {
+        if let Some(next_char) = next_unicode_char(chars[i]) {
+            let mut result: String = chars[..i].iter().collect();
+            result.push(next_char);
+            return Some(result);
+        }
+        // This character cannot be incremented (e.g., U+10FFFF), try previous
+    }
+
+    // All characters were at maximum value
+    None
+}
+
+/// Get the next valid Unicode scalar value after the given character.
+/// Skips the surrogate range (U+D800-U+DFFF) which is not valid in UTF-8.
+fn next_unicode_char(c: char) -> Option<char> {
+    let cp = c as u32;
+    let next_cp = cp.checked_add(1)?;
+
+    // Skip surrogate range (U+D800-U+DFFF)
+    let next_cp = if (0xD800..=0xDFFF).contains(&next_cp) {
+        0xE000
+    } else {
+        next_cp
+    };
+
+    char::from_u32(next_cp)
 }
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
@@ -772,10 +974,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<CreatedIndex>;
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    ///
+    /// If `old_data_filter` is provided, old index data will be filtered before
+    /// merge according to the chosen filter mode.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index

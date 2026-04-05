@@ -11,7 +11,7 @@ use std::arch::aarch64::*;
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::{Shuffle, SIMD};
+use super::{SIMD, Shuffle};
 
 /// 16 of 8-bit `u8` values.
 #[allow(non_camel_case_types)]
@@ -42,9 +42,11 @@ impl u8x16 {
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
+            let mut result = self.0;
             for i in 0..16 {
-                self.0[i] &= mask;
+                result[i] &= mask;
             }
+            Self(result)
         }
     }
 

@@ -13,6 +13,10 @@
  */
 package org.lance;
 
+import org.lance.index.IndexOptions;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -35,7 +39,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -534,6 +540,84 @@ public class ScannerTest {
             assertEquals(limit, rowCount, "Total rows should match the limit");
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testUseScalarIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_use_scalar_index").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        // Create a scalar index on the 'id' column
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        IndexOptions options =
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexName("id_btree_index")
+                .replace(true)
+                .build();
+        dataset.createIndex(options);
+
+        // Verify index was created
+        assertTrue(
+            dataset.listIndexes().contains("id_btree_index"),
+            "Expected 'id_btree_index' to be in the list of indexes: " + dataset.listIndexes());
+
+        // Test with useScalarIndex = true (default)
+        List<Integer> resultsWithIndex = new ArrayList<>();
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .filter("id < 50")
+                    .useScalarIndex(true)
+                    .columns(Collections.singletonList("id"))
+                    .build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              IntVector idVector = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                resultsWithIndex.add(idVector.get(i));
+              }
+            }
+          }
+        }
+
+        // Test with useScalarIndex = false
+        List<Integer> resultsWithoutIndex = new ArrayList<>();
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .filter("id < 50")
+                    .useScalarIndex(false)
+                    .columns(Collections.singletonList("id"))
+                    .build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              IntVector idVector = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                resultsWithoutIndex.add(idVector.get(i));
+              }
+            }
+          }
+        }
+
+        // Results should be the same regardless of whether scalar index is used
+        assertEquals(
+            resultsWithIndex.size(),
+            resultsWithoutIndex.size(),
+            "Result count should be the same with or without scalar index");
+        assertEquals(50, resultsWithIndex.size(), "Should return 50 rows (id < 50)");
+        assertEquals(
+            resultsWithIndex,
+            resultsWithoutIndex,
+            "Results should be identical with or without scalar index");
       }
     }
   }

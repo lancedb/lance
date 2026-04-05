@@ -186,10 +186,10 @@ impl<'a, T> Iterator for ExpLinkedListIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(inner_iter) = &mut self.inner_iter {
-            if let Some(v) = inner_iter.next() {
-                return Some(v);
-            }
+        if let Some(inner_iter) = &mut self.inner_iter
+            && let Some(v) = inner_iter.next()
+        {
+            return Some(v);
         }
         if let Some(inner) = self.inner.next() {
             self.inner_iter = Some(inner.iter());
@@ -224,10 +224,10 @@ impl<T> Iterator for ExpLinkedListIntoIter<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(inner_iter) = &mut self.inner_iter {
-            if let Some(v) = inner_iter.next() {
-                return Some(v);
-            }
+        if let Some(inner_iter) = &mut self.inner_iter
+            && let Some(v) = inner_iter.next()
+        {
+            return Some(v);
         }
         if let Some(inner) = self.inner.next() {
             self.inner_iter = Some(inner.into_iter());

@@ -1,9 +1,9 @@
 [package]
 name = "lance-jni"
-version = "1.1.0-beta.0"
-edition = "2021"
+version = "5.0.0-beta.5"
+edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
-rust-version = "1.80"
+rust-version = "1.91"
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
@@ -11,6 +11,9 @@ description = "JNI bindings for Lance Columnar format"
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = []
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait"] }
@@ -23,8 +26,9 @@ lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter"] }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
-arrow = { version = "56.1", features = ["ffi"] }
-arrow-schema = "56.1"
+lance-table = { path = "../../rust/lance-table" }
+arrow = { version = "57.1", features = ["ffi"] }
+arrow-schema = "57.1"
 object_store = { version = "0.12.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
@@ -33,7 +37,7 @@ tokio = { version = "1.23", features = [
     "sync",
 ] }
 async-trait = "0.1"
-snafu = "0.8"
+snafu = "0.9"
 jni = "0.21.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1" }
@@ -41,9 +45,9 @@ bytes = "1.11"
 log = "0.4"
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
-prost = "0.13.5"
-roaring = "0.10.1"
-prost-types = "0.13.5"
+prost = "0.14.1"
+roaring = "0.11"
+prost-types = "0.14.1"
 chrono = "0.4.41"
 
 [profile.dev]
@@ -58,3 +62,6 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[lints.clippy]
+disallowed_macros = "deny"

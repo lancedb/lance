@@ -15,7 +15,7 @@
 use std::sync::mpsc::RecvTimeoutError;
 
 use futures::Future;
-use pyo3::{exceptions::PyRuntimeError, PyResult, Python};
+use pyo3::{PyResult, Python, exceptions::PyRuntimeError};
 
 pub const SIGNAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -56,10 +56,17 @@ impl BackgroundExecutor {
         T::Output: Send + 'static,
     {
         if let Some(py) = py {
-            py.allow_threads(|| self.spawn_impl(task))
+            py.detach(|| self.spawn_impl(task))
         } else {
-            // Python::with_gil is a no-op if the GIL is already held by the thread.
-            Python::with_gil(|py| py.allow_threads(|| self.spawn_impl(task)))
+            let mut task = Some(task);
+            if let Some(result) = Python::try_attach(|py| {
+                let task = task.take().expect("task should not be taken");
+                py.detach(|| self.spawn_impl(task))
+            }) {
+                result
+            } else {
+                self.spawn_impl(task.expect("task should still be available"))
+            }
         }
     }
 
@@ -83,7 +90,13 @@ impl BackgroundExecutor {
 
         loop {
             // Check for keyboard interrupts
-            match Python::with_gil(|py| py.check_signals()) {
+            let signal_check = match Python::try_attach(|py| py.check_signals()) {
+                Some(result) => result,
+                // Python may be finalizing or unavailable. In this state we can't
+                // observe KeyboardInterrupt reliably, but we should not panic.
+                None => Ok(()),
+            };
+            match signal_check {
                 Ok(_) => {}
                 Err(err) => {
                     handle.abort();
@@ -109,16 +122,22 @@ impl BackgroundExecutor {
         T::Output: Send + 'static,
     {
         if let Some(py) = py {
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.runtime.spawn(task);
             })
         } else {
-            // Python::with_gil is a no-op if the GIL is already held by the thread.
-            Python::with_gil(|py| {
-                py.allow_threads(|| {
+            let mut task = Some(task);
+            if Python::try_attach(|py| {
+                let task = task.take().expect("task should not be taken");
+                py.detach(|| {
                     self.runtime.spawn(task);
                 })
             })
+            .is_none()
+            {
+                self.runtime
+                    .spawn(task.expect("task should still be available"));
+            }
         }
     }
 
@@ -139,10 +158,92 @@ impl BackgroundExecutor {
     {
         let future = Self::result_or_interrupt(future);
         if let Some(py) = py {
-            py.allow_threads(move || self.runtime.block_on(future))
+            py.detach(move || self.runtime.block_on(future))
         } else {
-            // Python::with_gil is a no-op if the GIL is already held by the thread.
-            Python::with_gil(|py| py.allow_threads(|| self.runtime.block_on(future)))
+            let mut future = Some(future);
+            if let Some(result) = Python::try_attach(|py| {
+                let future = future.take().expect("future should not be taken");
+                py.detach(|| self.runtime.block_on(future))
+            }) {
+                result
+            } else {
+                self.runtime
+                    .block_on(future.expect("future should still be available"))
+            }
+        }
+    }
+
+    /// Block on a future, periodically draining a caller-provided pump.
+    ///
+    /// This is intended for progress callbacks where the future emits events from
+    /// background tasks and the caller needs to run Python code while waiting for
+    /// the future to complete.
+    ///
+    /// Unlike [`block_on`], this method does **not** wrap the future in
+    /// `result_or_interrupt`, so keyboard interrupts are only checked on the
+    /// main thread between poll intervals (`SIGNAL_CHECK_INTERVAL`).  This is
+    /// acceptable because index operations yield frequently to emit progress
+    /// events.
+    pub fn block_on_pumping<F, P>(
+        &self,
+        py: Option<Python<'_>>,
+        future: F,
+        mut pump: P,
+    ) -> PyResult<F::Output>
+    where
+        F: Future + Send,
+        F::Output: Send,
+        P: FnMut() -> PyResult<()>,
+    {
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            pump()?;
+
+            let signal_check = match Python::try_attach(|py| py.check_signals()) {
+                Some(result) => result,
+                None => Ok(()),
+            };
+            signal_check?;
+
+            let maybe_output = if let Some(py) = py {
+                py.detach(|| {
+                    self.runtime.block_on(async {
+                        tokio::select! {
+                            result = &mut future => Some(result),
+                            _ = tokio::time::sleep(SIGNAL_CHECK_INTERVAL) => None,
+                        }
+                    })
+                })
+            } else if let Some(result) = Python::try_attach(|py| {
+                py.detach(|| {
+                    self.runtime.block_on(async {
+                        tokio::select! {
+                            result = &mut future => Some(result),
+                            _ = tokio::time::sleep(SIGNAL_CHECK_INTERVAL) => None,
+                        }
+                    })
+                })
+            }) {
+                result
+            } else {
+                self.runtime.block_on(async {
+                    tokio::select! {
+                        result = &mut future => Some(result),
+                        _ = tokio::time::sleep(SIGNAL_CHECK_INTERVAL) => None,
+                    }
+                })
+            };
+
+            if let Some(output) = maybe_output {
+                if let Err(err) = pump() {
+                    log::warn!(
+                        "Ignoring progress callback error after operation completed successfully: {}",
+                        err
+                    );
+                }
+                return Ok(output);
+            }
         }
     }
 
@@ -154,7 +255,13 @@ impl BackgroundExecutor {
         let interrupt_future = async {
             loop {
                 // Check for keyboard interrupts
-                match Python::with_gil(|py| py.check_signals()) {
+                let signal_check = match Python::try_attach(|py| py.check_signals()) {
+                    Some(result) => result,
+                    // Python may be finalizing or unavailable. In this state we can't
+                    // observe KeyboardInterrupt reliably, but we should not panic.
+                    None => Ok(()),
+                };
+                match signal_check {
                     Ok(_) => {
                         // Wait for 100ms before checking signals again
                         tokio::time::sleep(SIGNAL_CHECK_INTERVAL).await;

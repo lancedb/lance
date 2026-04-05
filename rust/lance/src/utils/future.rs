@@ -3,7 +3,6 @@
 
 use async_cell::sync::AsyncCell;
 use futures::Future;
-use snafu::location;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -17,20 +16,6 @@ use tracing::Instrument;
 pub struct SharedPrerequisite<T: Clone>(Arc<AsyncCell<std::result::Result<T, String>>>);
 
 impl<T: Clone> SharedPrerequisite<T> {
-    /// Asynchronously get a cloned copy of the output
-    ///
-    /// If the child task failed then a PrerequisiteFailed error is raised.
-    #[allow(dead_code)]
-    pub async fn get_fut(&self) -> crate::Result<T> {
-        self.0
-            .get()
-            .await
-            .map_err(|err| crate::Error::PrerequisiteFailed {
-                message: err,
-                location: location!(),
-            })
-    }
-
     /// Synchronously get a cloned copy of the cached output
     ///
     /// Must be called after a call to `wait_ready`
@@ -51,10 +36,7 @@ impl<T: Clone> SharedPrerequisite<T> {
             .get()
             .await
             .map(|_| ())
-            .map_err(|err| crate::Error::PrerequisiteFailed {
-                message: err,
-                location: location!(),
-            })
+            .map_err(|err| crate::Error::prerequisite_failed(err))
     }
 
     /// Launch a background task (using tokio::spawn) and get a shareable handle to the eventual result
@@ -102,10 +84,7 @@ mod tests {
         }
 
         // On error
-        let fut = future::ready(crate::Result::Err(crate::Error::invalid_input(
-            "xyz",
-            location!(),
-        )));
+        let fut = future::ready(crate::Result::Err(crate::Error::invalid_input("xyz")));
         let prereq = SharedPrerequisite::<u32>::spawn(fut);
 
         let mut tasks = Vec::with_capacity(10);

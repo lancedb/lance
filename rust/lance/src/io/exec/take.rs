@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::AsArray;
-use arrow::compute::{concat_batches, TakeOptions};
+use arrow::compute::{TakeOptions, concat_batches};
 use arrow::datatypes::UInt64Type;
-use arrow_array::{Array, UInt32Array};
+use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
@@ -21,8 +21,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use futures::FutureExt;
+use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
@@ -32,9 +32,9 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use tracing::error;
 
+use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
@@ -157,22 +157,43 @@ impl TakeStream {
         self.do_open_reader(fragment_id).await
     }
 
-    async fn get_row_addrs(&self, batch: &RecordBatch) -> Result<Arc<dyn Array>> {
+    /// Returns the row addresses for the given batch, plus an optional validity
+    /// mask. When stable row IDs are used, some row IDs from stale index results
+    /// (e.g. FTS matches for deleted rows) may no longer exist in the row ID
+    /// index. These are excluded from the returned addresses, and the mask
+    /// indicates which input rows are still valid so the caller can filter the
+    /// batch to match.
+    async fn get_row_addrs(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<(Arc<dyn Array>, Option<BooleanArray>)> {
         if let Some(row_addr_array) = batch.column_by_name(ROW_ADDR) {
-            Ok(row_addr_array.clone())
+            Ok((row_addr_array.clone(), None))
         } else {
             let row_id_array = batch.column_by_name(ROW_ID).expect_ok()?;
 
             if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                let addresses = row_id_array
-                    .values()
-                    .iter()
-                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                    .collect::<Vec<u64>>();
-                Ok(Arc::new(UInt64Array::from(addresses)))
+                let mut addresses = Vec::with_capacity(row_id_array.len());
+                let mut valid = Vec::with_capacity(row_id_array.len());
+
+                for id in row_id_array.values().iter() {
+                    if let Some(address) = row_id_index.get(*id) {
+                        addresses.push(u64::from(address));
+                        valid.push(true);
+                    } else {
+                        valid.push(false);
+                    }
+                }
+
+                let mask = if addresses.len() < row_id_array.len() {
+                    Some(BooleanArray::from(valid))
+                } else {
+                    None
+                };
+                Ok((Arc::new(UInt64Array::from(addresses)), mask))
             } else {
-                Ok(row_id_array.clone())
+                Ok((row_id_array.clone(), None))
             }
         }
     }
@@ -183,7 +204,17 @@ impl TakeStream {
         batch_number: u32,
     ) -> DataFusionResult<RecordBatch> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
-        let row_addrs_arr = self.get_row_addrs(&batch).await?;
+        let (row_addrs_arr, validity_mask) = self.get_row_addrs(&batch).await?;
+
+        // Filter out rows whose row IDs no longer exist (e.g. stale FTS/vector
+        // index entries pointing to deleted rows). Without this, the downstream
+        // merge would fail with a row-count mismatch.
+        let batch = if let Some(mask) = validity_mask {
+            arrow::compute::filter_record_batch(&batch, &mask)?
+        } else {
+            batch
+        };
+
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
         debug_assert!(
@@ -191,13 +222,16 @@ impl TakeStream {
             "{} nulls in row addresses",
             row_addrs.null_count()
         );
-        // Check if the row addresses are already sorted to avoid unnecessary reorders
-        let is_sorted = row_addrs.values().is_sorted();
+
+        // Fast path: check if addresses are already sorted with no duplicates (common case).
+        // This avoids all sorting, dedup, and permutation overhead.
+        let is_sorted_and_unique = row_addrs.values().windows(2).all(|w| w[0] < w[1]);
 
         let sorted_addrs: Arc<dyn Array>;
-        let (sorted_addrs, permutation) = if is_sorted {
-            (row_addrs, None)
+        let (unique_addrs, permutation, sorted_to_unique) = if is_sorted_and_unique {
+            (Cow::Borrowed(row_addrs.values().as_ref()), None, None)
         } else {
+            // Sort and compute inverse permutation to restore original order later
             let permutation = arrow::compute::sort_to_indices(&row_addrs_arr, None, None).unwrap();
             sorted_addrs = arrow::compute::take(
                 &row_addrs_arr,
@@ -207,22 +241,45 @@ impl TakeStream {
                 }),
             )
             .unwrap();
-            // Calculate the inverse permutation to restore the original order
             let mut inverse_permutation = vec![0; permutation.len()];
             for (i, p) in permutation.values().iter().enumerate() {
                 inverse_permutation[*p as usize] = i as u32;
             }
-            (
-                sorted_addrs.as_primitive::<UInt64Type>(),
-                Some(UInt32Array::from(inverse_permutation)),
-            )
+            let sorted_values = sorted_addrs.as_primitive::<UInt64Type>().values();
+
+            // Deduplicate sorted addresses. FTS on List<Utf8> can produce duplicate
+            // row addresses when multiple list elements in the same row match. The
+            // encoding layer requires strictly increasing indices, so we dedup here
+            // and expand the results back afterwards.
+            let has_duplicates = sorted_values.windows(2).any(|w| w[0] == w[1]);
+            if has_duplicates {
+                let mut deduped: Vec<u64> = Vec::with_capacity(sorted_values.len());
+                let mut mapping: Vec<usize> = Vec::with_capacity(sorted_values.len());
+                for &addr in sorted_values.iter() {
+                    if deduped.last() != Some(&addr) {
+                        deduped.push(addr);
+                    }
+                    mapping.push(deduped.len() - 1);
+                }
+                (
+                    Cow::Owned(deduped),
+                    Some(UInt32Array::from(inverse_permutation)),
+                    Some(mapping),
+                )
+            } else {
+                (
+                    Cow::Borrowed(sorted_values.as_ref()),
+                    Some(UInt32Array::from(inverse_permutation)),
+                    None,
+                )
+            }
         };
 
         let mut futures = FuturesOrdered::new();
         let mut current_offsets = Vec::new();
         let mut current_fragment_id = None;
 
-        for row_addr in sorted_addrs.values() {
+        for row_addr in unique_addrs.iter() {
             let addr = RowAddress::new_from_u64(*row_addr);
 
             if Some(addr.fragment_id()) != current_fragment_id {
@@ -267,9 +324,33 @@ impl TakeStream {
         let schema = batches.first().expect_ok()?.schema();
         let mut new_data = concat_batches(&schema, batches.iter())?;
 
-        // Restore previous order (if addresses were out of order originally)
-        if let Some(permutation) = permutation {
-            new_data = arrow_select::take::take_record_batch(&new_data, &permutation).unwrap();
+        // Expand deduplicated rows and restore original order.
+        // When both are needed, combine into a single take to avoid two passes.
+        match (sorted_to_unique, permutation) {
+            (Some(expand_map), Some(inv_perm)) => {
+                // Compose: for each original position, look up its sorted position
+                // via the inverse permutation, then map through the dedup expand.
+                let combined = UInt32Array::from(
+                    inv_perm
+                        .values()
+                        .iter()
+                        .map(|&p| expand_map[p as usize] as u32)
+                        .collect::<Vec<_>>(),
+                );
+                new_data = arrow_select::take::take_record_batch(&new_data, &combined).unwrap();
+            }
+            (None, Some(inv_perm)) => {
+                new_data = arrow_select::take::take_record_batch(&new_data, &inv_perm).unwrap();
+            }
+            (Some(expand_map), None) => {
+                // Sorted and unique was false but no permutation — shouldn't happen,
+                // but handle defensively.
+                let expand_indices =
+                    UInt32Array::from(expand_map.iter().map(|&i| i as u32).collect::<Vec<_>>());
+                new_data =
+                    arrow_select::take::take_record_batch(&new_data, &expand_indices).unwrap();
+            }
+            (None, None) => {}
         }
 
         self.metrics
@@ -536,6 +617,7 @@ impl ExecutionPlan for TakeExec {
         let lazy_take_stream = futures::stream::once(async move {
             let obj_store = dataset.object_store.clone();
             let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
+            // unwrap is safe since SchedulerConfig::max_bandwidth is always valid
             let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
             let take_stream = Arc::new(TakeStream::new(
@@ -589,7 +671,7 @@ mod tests {
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{datatypes::OnMissing, ROW_ID};
+    use lance_core::{ROW_ID, datatypes::OnMissing};
     use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
     use lance_datagen::{BatchCount, RowCount};
     use rstest::rstest;
@@ -818,6 +900,105 @@ mod tests {
         let metrics = take_exec.metrics().unwrap();
         assert_eq!(metrics.output_rows(), Some(15));
         assert_eq!(metrics.find_count("batches_processed").unwrap().value(), 3);
+    }
+
+    /// Regression test: FTS on List<Utf8> can produce duplicate row addresses when
+    /// multiple list elements in the same row match. These duplicates caused
+    /// `indices_to_ranges` in the encoding layer to produce overlapping ranges,
+    /// panicking in BinaryPageScheduler with "attempt to subtract with overflow".
+    #[tokio::test]
+    async fn test_take_with_duplicate_row_addrs() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        // Simulate duplicate row addresses (same row matched twice),
+        // already sorted as they would be within a single fragment.
+        let row_addrs = UInt64Array::from(vec![0u64, 0, 1, 2, 2]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+
+        let row_addr_stream = futures::stream::iter(vec![Ok(batch)]);
+        let row_addr_stream = Box::pin(RecordBatchStreamAdapter::new(schema, row_addr_stream));
+        let input = Arc::new(OneShotExec::new(row_addr_stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+
+        let all_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let s_col = all_data
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Duplicated rows should have identical values
+        assert_eq!(s_col.value(0), s_col.value(1));
+        assert_eq!(s_col.value(3), s_col.value(4));
+    }
+
+    /// Same as above but with unsorted duplicates, exercising the sort+dedup path.
+    #[tokio::test]
+    async fn test_take_with_unsorted_duplicate_row_addrs() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let row_addrs = UInt64Array::from(vec![2u64, 0, 1, 0, 2]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+
+        let row_addr_stream = futures::stream::iter(vec![Ok(batch)]);
+        let row_addr_stream = Box::pin(RecordBatchStreamAdapter::new(schema, row_addr_stream));
+        let input = Arc::new(OneShotExec::new(row_addr_stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+
+        let all_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let s_col = all_data
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Original order was [2, 0, 1, 0, 2] — duplicates should match
+        assert_eq!(s_col.value(0), s_col.value(4)); // both row 2
+        assert_eq!(s_col.value(1), s_col.value(3)); // both row 0
     }
 
     #[tokio::test]

@@ -9,15 +9,15 @@
 //! different abilities to handle concurrent writes, so a trait is provided
 //! to allow for different implementations.
 //!
-//! The trait [CommitHandler] can be implemented to provide different commit
+//! The trait [`CommitHandler`] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
+//! `ConditionalPutCommitHandler`, which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
 //! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
-//! terms of a lock. The trait [CommitLock] can be implemented as a simpler
-//! alternative to [CommitHandler].
+//! terms of a lock. The trait `CommitLock` can be implemented as a simpler
+//! alternative to [`CommitHandler`].
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
@@ -31,53 +31,55 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, DETACHED_VERSION_MASK,
+    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use rand::{rng, Rng};
-use snafu::location;
+use rand::{Rng, rng};
 
 use super::ObjectStore;
+use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult,
+    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
+    write_manifest_file,
 };
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
+use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
-use crate::session::Session;
-use crate::Dataset;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::{is_system_index, DatasetIndexExt};
+use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::path::Path;
 use prost::Message;
 
-mod conflict_resolver;
+pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+pub mod namespace_manifest;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child("_transactions").child(transaction_file);
+    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
@@ -91,7 +93,7 @@ pub(crate) async fn write_transaction_file(
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child("_transactions").child(file_name.as_str());
+    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
@@ -118,6 +120,7 @@ async fn do_commit_new_dataset(
     };
 
     let (mut manifest, indices) = if let Operation::Clone {
+        is_shallow,
         ref_name,
         ref_version,
         ref_path,
@@ -138,37 +141,74 @@ async fn do_commit_new_dataset(
         )
         .await?;
 
-        let new_base_id = source_manifest
-            .base_paths
-            .keys()
-            .max()
-            .map(|id| *id + 1)
-            .unwrap_or(0);
-        let new_manifest = source_manifest.shallow_clone(
-            ref_name.clone(),
-            ref_path.clone(),
-            new_base_id,
-            branch_name.clone(),
-            transaction_file,
-        );
+        if *is_shallow {
+            let new_base_id = source_manifest
+                .base_paths
+                .keys()
+                .max()
+                .map(|id| *id + 1)
+                .unwrap_or(0);
+            let new_manifest = source_manifest.shallow_clone(
+                ref_name.clone(),
+                ref_path.clone(),
+                new_base_id,
+                branch_name.clone(),
+                transaction_file,
+            );
 
-        let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-            let reader = object_store.open(&source_manifest_location.path).await?;
-            let section: pb::IndexSection =
-                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-            section
-                .indices
-                .into_iter()
-                .map(|index_pb| {
-                    let mut index = IndexMetadata::try_from(index_pb)?;
-                    index.base_id = Some(new_base_id);
-                    Ok(index)
-                })
-                .collect::<Result<Vec<_>>>()?
+            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = Some(new_base_id);
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            (new_manifest, updated_indices)
         } else {
-            vec![]
-        };
-        (new_manifest, updated_indices)
+            // Deep clone: build a manifest that references local files (no external bases)
+            let mut new_manifest = source_manifest.clone();
+            new_manifest.base_paths.clear();
+            new_manifest.branch = None;
+            new_manifest.tag = None;
+            new_manifest.index_section = None; // will be rewritten below
+            let mut new_frags = new_manifest.fragments.as_ref().clone();
+            for f in &mut new_frags {
+                for df in &mut f.files {
+                    df.base_id = None;
+                }
+                if let Some(d) = f.deletion_file.as_mut() {
+                    d.base_id = None;
+                }
+            }
+            new_manifest.fragments = Arc::new(new_frags);
+
+            // Indices: keep metadata but normalize base to local
+            let mut updated_indices = Vec::new();
+            if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                updated_indices = section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = None;
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (new_manifest, updated_indices)
+        }
     } else {
         let (manifest, indices) =
             transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
@@ -211,10 +251,9 @@ async fn do_commit_new_dataset(
                 .await;
             Ok((manifest, manifest_location))
         }
-        Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
-            uri: base_path.to_string(),
-            location: location!(),
-        }),
+        Err(CommitError::CommitConflict) => {
+            Err(crate::Error::dataset_already_exists(base_path.to_string()))
+        }
         Err(CommitError::OtherError(err)) => Err(err),
     }
 }
@@ -296,14 +335,11 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
         // match the file version.  As a result, we need to check and see if they are out
         // of sync.
         if let Some(actual_file_version) =
-            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
-                message: format!(
-                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
-                    e
-                ),
-                location: location!(),
-            })? {
-                if actual_file_version > data_storage_version {
+            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::internal(format!(
+                "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
+                e
+            )))?
+                && actual_file_version > data_storage_version {
                     log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
                         data_storage_version,
@@ -311,21 +347,16 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                     );
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
-            }
     } else {
         // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
         // match the data storage version.  This is a sanity assertion to prevent data corruption.
-        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
-            if actual_file_version != data_storage_version {
-                return Err(Error::Internal {
-                    message: format!(
-                        "The operation added files with version {}.  However, the data storage version is {}.",
-                        actual_file_version,
-                        data_storage_version
-                    ),
-                    location: location!(),
-                });
-            }
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)?
+            && actual_file_version != data_storage_version
+        {
+            return Err(Error::internal(format!(
+                "The operation added files with version {}.  However, the data storage version is {}.",
+                actual_file_version, data_storage_version
+            )));
         }
     }
     Ok(())
@@ -379,10 +410,10 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
             .rev()
             .flat_map(|file| file.fields.iter_mut())
         {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id) {
-                if seen_fields.insert(*field_id) {
-                    *field_id = *new_field_id;
-                }
+            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                && seen_fields.insert(*field_id)
+            {
+                *field_id = *new_field_id;
             }
         }
         seen_fields.clear();
@@ -468,9 +499,8 @@ pub(crate) async fn migrate_fragments(
                             object_store
                                 .size(&dataset.base.child("data").child(file.path.clone()))
                                 .map_ok(|size| {
-                                    NonZero::new(size).ok_or_else(|| Error::Internal {
-                                        message: format!("File {} has size 0", file.path),
-                                        location: location!(),
+                                    NonZero::new(size).ok_or_else(|| {
+                                        Error::internal(format!("File {} has size 0", file.path))
                                     })
                                 })
                                 .await?
@@ -535,6 +565,7 @@ fn must_recalculate_fragment_bitmap(
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
+/// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
@@ -542,13 +573,13 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             bad_indices.into_iter().map(|(name, _)| name).collect()
         }
     };
-    for index in indices {
+    for index in indices.iter_mut() {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
         {
             debug_assert_eq!(index.fields.len(), 1);
-            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
+            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
             // We need to calculate the fragments covered by the index
             let idx = dataset
                 .open_generic_index(
@@ -562,7 +593,42 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
         if index.index_details.is_none() {
-            log::debug!("the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.", index.uuid);
+            log::debug!(
+                "the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.",
+                index.uuid
+            );
+        }
+
+        // Migrate file sizes for indices that don't have them.
+        // Use indice_files_dir to handle shallow-cloned indices with base_id.
+        if index.files.is_none() && !is_system_index(index) {
+            let result = async {
+                let index_dir = dataset
+                    .indice_files_dir(index)?
+                    .child(index.uuid.to_string());
+                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+            }
+            .await;
+            match result {
+                Ok(files) => {
+                    log::debug!(
+                        "Migrated file sizes for index {} (uuid: {}): {} files",
+                        index.name,
+                        index.uuid,
+                        files.len()
+                    );
+                    index.files = Some(files);
+                }
+                Err(e) => {
+                    // Log but don't fail - file sizes are optional
+                    log::debug!(
+                        "Could not collect file sizes for index {} (uuid: {}): {}",
+                        index.name,
+                        index.uuid,
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -634,6 +700,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -690,15 +757,14 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    Err(crate::Error::CommitConflict {
-        version: 0,
-        source: format!(
+    Err(crate::Error::commit_conflict_source(
+        0,
+        format!(
             "Failed find unused random u64 after {} retries.",
             commit_config.num_retries
         )
         .into(),
-        location: location!(),
-    })
+    ))
 }
 
 pub(crate) async fn commit_detached_transaction(
@@ -811,7 +877,9 @@ pub(crate) async fn commit_transaction(
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
-            return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
+            return Err(Error::internal(
+                "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
+            ));
         }
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {
@@ -823,6 +891,7 @@ pub(crate) async fn commit_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -934,15 +1003,14 @@ pub(crate) async fn commit_transaction(
         }
     }
 
-    Err(crate::Error::CommitConflict {
-        version: target_version,
-        source: format!(
+    Err(crate::Error::commit_conflict_source(
+        target_version,
+        format!(
             "Failed to commit the transaction after {} retries.",
             commit_config.num_retries
         )
         .into(),
-        location: location!(),
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -956,6 +1024,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -966,10 +1035,10 @@ mod tests {
 
     use super::*;
 
+    use crate::Dataset;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
@@ -1156,11 +1225,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let batches =
-            vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()])
-                    .unwrap(),
-            ];
+        let batches = vec![
+            RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()]).unwrap(),
+        ];
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
@@ -1183,9 +1250,16 @@ mod tests {
             .collect();
 
         let results = join_all(futures).await;
-        for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-        }
+        let success_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Ok(_))))
+            .count();
+        let retryable_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Err(Error::RetryableCommitConflict { .. }))))
+            .count();
+        assert_eq!(success_count, 2, "{results:?}");
+        assert_eq!(retryable_count, 1, "{results:?}");
 
         // Validate that each version has the anticipated number of indexes
         let dataset = dataset.checkout_version(1).await.unwrap();
@@ -1208,12 +1282,7 @@ mod tests {
             assert_eq!(indices[0].fields, vec![0]);
         }
 
-        let dataset = dataset.checkout_version(4).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 2);
-        let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
-        fields.sort();
-        assert_eq!(fields, vec![0, 1]);
+        assert!(dataset.checkout_version(4).await.is_err());
     }
 
     #[tokio::test]
@@ -1257,74 +1326,89 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_writes() {
-        for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
-            // Create an empty table
-            let test_dir = TempStrDir::default();
-            let test_uri = test_dir.as_str();
+        // Test concurrent appends - all should succeed
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::Int32,
-                false,
-            )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
 
-            let dataset = Dataset::write(
-                RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
-                test_uri,
-                None,
-            )
-            .await
-            .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
 
-            // Make some sample data
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-            )
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
 
-            // Write data concurrently in 5 tasks
-            let futures: Vec<_> = (0..5)
-                .map(|_| {
-                    let batch = batch.clone();
-                    let schema = schema.clone();
-                    let uri = test_uri.to_string();
-                    tokio::spawn(async move {
-                        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                        Dataset::write(
-                            reader,
-                            &uri,
-                            Some(WriteParams {
-                                mode: write_mode,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    })
+        let futures: Vec<_> = (0..5)
+            .map(|_| {
+                let batch = batch.clone();
+                let schema = schema.clone();
+                let uri = test_uri.to_string();
+                tokio::spawn(async move {
+                    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    Dataset::write(
+                        reader,
+                        &uri,
+                        Some(WriteParams {
+                            mode: WriteMode::Append,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
                 })
-                .collect();
-            let results = join_all(futures).await;
+            })
+            .collect();
+        let results = join_all(futures).await;
 
-            // Assert all succeeded
-            for result in results {
-                assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-            }
-
-            // Assert final fragments and versions expected
-            let dataset = dataset.checkout_version(6).await.unwrap();
-
-            match write_mode {
-                WriteMode::Append => {
-                    assert_eq!(dataset.get_fragments().len(), 5);
-                }
-                WriteMode::Overwrite => {
-                    assert_eq!(dataset.get_fragments().len(), 1);
-                }
-                _ => unreachable!(),
-            }
-
-            dataset.validate().await.unwrap()
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
         }
+
+        let dataset = dataset.checkout_version(6).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+        dataset.validate().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_restore_does_not_decrease_max_fragment_id() {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Append a few times to advance max_fragment_id and create newer versions.
+        for _ in 0..2 {
+            let reader = gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+            dataset.append(reader, None).await.unwrap();
+        }
+
+        let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
+
+        // Restore an earlier version (version 1) as the latest.
+        let mut dataset_v1 = dataset.checkout_version(1).await.unwrap();
+        dataset_v1.restore().await.unwrap();
+
+        // After restore, max_fragment_id should not decrease compared to the latest value before restore.
+        let restored_max = dataset_v1.manifest.max_fragment_id().unwrap_or(0);
+        assert!(
+            restored_max >= latest_max,
+            "max_fragment_id should not decrease on restore: before={}, after={}",
+            latest_max,
+            restored_max
+        );
     }
 
     async fn get_empty_dataset() -> (TempStrDir, Dataset) {
@@ -1439,7 +1523,7 @@ mod tests {
                     if result.is_err() {
                         first_operation_failed = true;
                         assert!(
-                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            matches!(&result, &Err(Error::IncompatibleTransaction { .. })),
                             "{:?}",
                             result,
                         );
@@ -1449,7 +1533,7 @@ mod tests {
                     true => assert!(result.is_ok(), "{:?}", result),
                     false => {
                         assert!(
-                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            matches!(&result, &Err(Error::IncompatibleTransaction { .. })),
                             "{:?}",
                             result,
                         );

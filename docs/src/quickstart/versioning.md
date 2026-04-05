@@ -1,11 +1,11 @@
 ---
 title: Versioning
-description: Learn how to version your Lance datasets with append, overwrite, and tag features
+description: Learn how to version your Lance datasets with append, overwrite, tags, and branches
 ---
 
 # Versioning Your Datasets with Lance
 
-Lance supports versioning natively, allowing you to track changes over time. 
+Lance supports versioning natively, allowing you to track changes over time.
 
 In this tutorial, you'll learn how to append new data to existing datasets while preserving historical versions and access specific versions using version numbers or meaningful tags. You'll also understand how to implement proper data governance practices with Lance's native versioning capabilities.
 
@@ -75,7 +75,7 @@ lance.dataset('/tmp/test.lance', version=2).to_table().to_pandas()
 
 ## Tag Your Important Versions
 
-Create named tags for important versions, making it easier to reference specific versions by meaningful names. To create tags for relevant versions, do this:
+Create named tags for important versions, making it easier to reference them by meaningful names.
 
 ```python
 dataset.tags.create("stable", 2)
@@ -89,8 +89,25 @@ Tags can be checked out like versions:
 lance.dataset('/tmp/test.lance', version="stable").to_table().to_pandas()
 ```
 
+For advanced tag operations (e.g., tagging versions on specific branches), see [Tags and Branches](../guide/tags_and_branches.md).
+
+## Work with Branches
+
+Branches manage parallel lines of dataset evolution. You can create branches from existing versions or tags, read and write to them independently, and checkout different branches.
+
+```python
+# Create branch from current latest version
+experiment_branch = ds.create_branch("experiment")
+
+# Write to the branch (affects only that branch's history)
+tbl = pa.Table.from_pandas(pd.DataFrame({"a": [42]}))
+lance.write_dataset(tbl, experiment_branch, mode="append")
+```
+
+For more details, see [Tags and Branches](../guide/tags_and_branches.md).
+
 ## Next Steps
 
 Now that you've mastered dataset versioning with Lance, check out **[Vector Indexing and Vector Search With Lance](vector-search.md)**. You can learn how to build high-performance vector search capabilities on top of your Lance tables.
 
-This will teach you how to build fast, scalable search capabilities for your versioned datasets. 
+This will teach you how to build fast, scalable search capabilities for your versioned datasets.

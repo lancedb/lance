@@ -53,6 +53,7 @@ test-log.workspace = true
 criterion = { workspace = true }
 rand_xoshiro = { workspace = true }
 proptest.workspace = true
+serial_test.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
@@ -74,6 +75,10 @@ features = ["protoc"]
 
 [[bench]]
 name = "decoder"
+harness = false
+
+[[bench]]
+name = "encoder"
 harness = false
 
 [[bench]]

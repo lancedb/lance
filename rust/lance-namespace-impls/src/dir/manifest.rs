@@ -6,35 +6,42 @@
 //! This module provides a namespace implementation that uses a manifest table
 //! to track tables and nested namespaces.
 
+use arrow::array::builder::{ListBuilder, StringBuilder};
 use arrow::array::{Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::StreamExt;
-use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::{builder::DatasetBuilder, WriteParams};
+use futures::{FutureExt, stream::StreamExt};
+use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::{
+    DeleteBuilder, MergeInsertBuilder, ReadParams, WhenMatched, WhenNotMatched, WriteParams,
+    builder::DatasetBuilder,
+};
+use lance::index::DatasetIndexExt;
 use lance::session::Session;
-use lance::{dataset::scanner::Scanner, Dataset};
-use lance_core::{box_error, Error, Result};
+use lance::{Dataset, dataset::scanner::Scanner};
+use lance_core::Error as LanceError;
+use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::{Error, Result};
+use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_index::traits::DatasetIndexExt;
-use lance_index::IndexType;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeregisterTableRequest,
-    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableRequest, DropTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest,
-    RegisterTableResponse, TableExistsRequest,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest, CreateTableResponse,
+    DeclareTableRequest, DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableRequest, DropTableResponse, ListNamespacesRequest,
+    ListNamespacesResponse, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
+    NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
+    TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_namespace::LanceNamespace;
 use object_store::path::Path;
-use snafu::location;
 use std::io::Cursor;
 use std::{
     collections::HashMap,
@@ -60,6 +67,7 @@ const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
 pub enum ObjectType {
     Namespace,
     Table,
+    TableVersion,
 }
 
 impl ObjectType {
@@ -67,6 +75,7 @@ impl ObjectType {
         match self {
             Self::Namespace => "namespace",
             Self::Table => "table",
+            Self::TableVersion => "table_version",
         }
     }
 
@@ -74,10 +83,11 @@ impl ObjectType {
         match s {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
-            _ => Err(Error::io(
-                format!("Invalid object type: {}", s),
-                location!(),
-            )),
+            "table_version" => Ok(Self::TableVersion),
+            _ => Err(NamespaceError::Internal {
+                message: format!("Invalid object type: {}", s),
+            }
+            .into()),
         }
     }
 }
@@ -88,6 +98,22 @@ pub struct TableInfo {
     pub namespace: Vec<String>,
     pub name: String,
     pub location: String,
+}
+
+/// An entry to be inserted into the manifest table.
+///
+/// This struct makes the meaning of each field explicit, replacing the
+/// previous tuple-based API `(String, ObjectType, Option<String>, Option<String>)`.
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    /// The unique object identifier (e.g., table name or version object_id)
+    pub object_id: String,
+    /// The type of the object (Namespace, Table, or TableVersion)
+    pub object_type: ObjectType,
+    /// The storage location (e.g., directory name for tables)
+    pub location: Option<String>,
+    /// Additional metadata serialized as JSON
+    pub metadata: Option<String>,
 }
 
 /// Information about a namespace stored in the manifest
@@ -151,16 +177,11 @@ impl DatasetConsistencyWrapper {
             dataset_uri,
             current_version
         );
-        let latest_version = read_guard
-            .latest_version_id()
-            .await
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
-                    "Failed to get latest version: {}",
-                    e
-                ))),
-                location: location!(),
-            })?;
+        let latest_version = read_guard.latest_version_id().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to get latest version: {}", e),
+            })
+        })?;
         log::debug!(
             "Reload got latest_version={} for uri={}, current_version={}",
             latest_version,
@@ -179,24 +200,17 @@ impl DatasetConsistencyWrapper {
         let mut write_guard = self.0.write().await;
 
         // Double-check after acquiring write lock (someone else might have reloaded)
-        let latest_version = write_guard
-            .latest_version_id()
-            .await
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
-                    "Failed to get latest version: {}",
-                    e
-                ))),
-                location: location!(),
-            })?;
+        let latest_version = write_guard.latest_version_id().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to get latest version: {}", e),
+            })
+        })?;
 
         if latest_version != write_guard.version().version {
-            write_guard.checkout_latest().await.map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
-                    "Failed to checkout latest: {}",
-                    e
-                ))),
-                location: location!(),
+            write_guard.checkout_latest().await.map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to checkout latest: {}", e),
+                })
             })?;
         }
 
@@ -237,15 +251,11 @@ impl DerefMut for DatasetWriteGuard<'_> {
 /// Manifest-based namespace implementation
 ///
 /// Uses a special `__manifest` Lance table to track tables and nested namespaces.
-#[derive(Debug)]
 pub struct ManifestNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
-    #[allow(dead_code)]
     session: Option<Arc<Session>>,
-    #[allow(dead_code)]
     object_store: Arc<ObjectStore>,
-    #[allow(dead_code)]
     base_path: Path,
     manifest_dataset: DatasetConsistencyWrapper,
     /// Whether directory listing is enabled in dual mode
@@ -255,10 +265,86 @@ pub struct ManifestNamespace {
     /// Whether to perform inline optimization (compaction and indexing) on the __manifest table
     /// after every write. Defaults to true.
     inline_optimization_enabled: bool,
+    /// Number of retries for commit operations on the manifest table.
+    /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
+    commit_retries: Option<u32>,
+}
+
+impl std::fmt::Debug for ManifestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManifestNamespace")
+            .field("root", &self.root)
+            .field("storage_options", &self.storage_options)
+            .field("dir_listing_enabled", &self.dir_listing_enabled)
+            .field(
+                "inline_optimization_enabled",
+                &self.inline_optimization_enabled,
+            )
+            .finish()
+    }
+}
+
+/// Convert a Lance commit error to an appropriate namespace error.
+///
+/// Maps lance commit errors to namespace errors:
+/// - `CommitConflict`: version collision retries exhausted -> Throttled (safe to retry)
+/// - `TooMuchWriteContention`: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
+/// - `IncompatibleTransaction`: incompatible concurrent change -> ConcurrentModification
+/// - Errors containing "matched/duplicate/already exists": ConcurrentModification (from WhenMatched::Fail)
+/// - Other errors: IO error with the operation description
+fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option<&str>) -> Error {
+    match e {
+        // CommitConflict: version collision retries exhausted -> Throttled (safe to retry)
+        LanceError::CommitConflict { .. } => NamespaceError::Throttled {
+            message: format!("Too many concurrent writes, please retry later: {:?}", e),
+        }
+        .into(),
+        // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
+        // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification
+        LanceError::TooMuchWriteContention { .. } | LanceError::IncompatibleTransaction { .. } => {
+            let message = if let Some(id) = object_id {
+                format!(
+                    "Object '{}' was concurrently modified by another operation: {:?}",
+                    id, e
+                )
+            } else {
+                format!(
+                    "Object was concurrently modified by another operation: {:?}",
+                    e
+                )
+            };
+            NamespaceError::ConcurrentModification { message }.into()
+        }
+        // Other errors: check message for semantic conflicts (matched/duplicate from WhenMatched::Fail)
+        _ => {
+            let error_msg = e.to_string();
+            if error_msg.contains("matched")
+                || error_msg.contains("duplicate")
+                || error_msg.contains("already exists")
+            {
+                let message = if let Some(id) = object_id {
+                    format!(
+                        "Object '{}' was concurrently created by another operation: {:?}",
+                        id, e
+                    )
+                } else {
+                    format!(
+                        "Object was concurrently created by another operation: {:?}",
+                        e
+                    )
+                };
+                return NamespaceError::ConcurrentModification { message }.into();
+            }
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("{}: {:?}", operation, e),
+            })
+        }
+    }
 }
 
 impl ManifestNamespace {
     /// Create a new ManifestNamespace from an existing DirectoryNamespace
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_directory(
         root: String,
         storage_options: Option<HashMap<String, String>>,
@@ -267,9 +353,16 @@ impl ManifestNamespace {
         base_path: Path,
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
+        table_version_storage_enabled: bool,
     ) -> Result<Self> {
-        let manifest_dataset =
-            Self::create_or_get_manifest(&root, &storage_options, session.clone()).await?;
+        let manifest_dataset = Self::ensure_manifest_table_up_to_date(
+            &root,
+            &storage_options,
+            session.clone(),
+            table_version_storage_enabled,
+        )
+        .await?;
 
         Ok(Self {
             root,
@@ -280,6 +373,7 @@ impl ManifestNamespace {
             manifest_dataset,
             dir_listing_enabled,
             inline_optimization_enabled,
+            commit_retries,
         })
     }
 
@@ -310,30 +404,58 @@ impl ManifestNamespace {
         }
     }
 
-    /// Split an object ID (table_id as vec of strings) into namespace and table name
-    fn split_object_id(table_id: &[String]) -> (Vec<String>, String) {
-        if table_id.len() == 1 {
-            (vec![], table_id[0].clone())
+    /// Split an object ID (vec of strings) into namespace and table name
+    pub fn split_object_id(object_id: &[String]) -> (Vec<String>, String) {
+        if object_id.len() == 1 {
+            (vec![], object_id[0].clone())
         } else {
             (
-                table_id[..table_id.len() - 1].to_vec(),
-                table_id[table_id.len() - 1].clone(),
+                object_id[..object_id.len() - 1].to_vec(),
+                object_id[object_id.len() - 1].clone(),
             )
         }
     }
 
-    /// Convert a table ID (vec of strings) to an object_id string
-    fn str_object_id(table_id: &[String]) -> String {
-        table_id.join(DELIMITER)
+    /// Convert an ID (vec of strings) to an object_id string
+    pub fn str_object_id(object_id: &[String]) -> String {
+        object_id.join(DELIMITER)
     }
 
-    /// Generate a new directory name in format: <hash>_<object_id>
+    /// Format a version number as a zero-padded lexicographically sortable string.
+    ///
+    /// Versions are stored as 20-digit zero-padded integers (e.g., `00000000000000000001`
+    /// for version 1) so that string-based range queries and sorting work correctly.
+    pub fn format_table_version(version: i64) -> String {
+        format!("{:020}", version)
+    }
+
+    /// Build the object_id for a table version entry.
+    ///
+    /// Format: `{table_object_id}${zero_padded_version}`
+    pub fn build_version_object_id(table_object_id: &str, version: i64) -> String {
+        format!(
+            "{}{}{}",
+            table_object_id,
+            DELIMITER,
+            Self::format_table_version(version)
+        )
+    }
+
+    /// Parse a version number from the version suffix of a table version object_id.
+    ///
+    /// The object_id is formatted as `{table_id}${zero_padded_version}`.
+    pub fn parse_version_from_object_id(object_id: &str) -> Option<i64> {
+        let (_namespace, name) = Self::parse_object_id(object_id);
+        name.parse::<i64>().ok()
+    }
+
+    /// Generate a new directory name in format: `<hash>_<object_id>`
     /// The hash is used to (1) optimize object store throughput,
     /// (2) have high enough entropy in a short period of time to prevent issues like
     /// failed table creation, delete and create new table of the same name, etc.
     /// The object_id is added after the hash to ensure
     /// dir name uniqueness and make debugging easier.
-    fn generate_dir_name(object_id: &str) -> String {
+    pub fn generate_dir_name(object_id: &str) -> String {
         // Generate a random number for uniqueness
         let random_num: u64 = rand::random();
 
@@ -348,18 +470,25 @@ impl ManifestNamespace {
     }
 
     /// Construct a full URI from root and relative location
-    fn construct_full_uri(&self, relative_location: &str) -> Result<String> {
-        let base_url = lance_io::object_store::uri_to_url(&self.root)?;
-        let full_url = base_url
-            .join(relative_location)
-            .map_err(|e| Error::InvalidInput {
-                source: format!(
-                    "Failed to join URI '{}' with '{}': {}",
-                    self.root, relative_location, e
-                )
-                .into(),
-                location: location!(),
-            })?;
+    pub(crate) fn construct_full_uri(root: &str, relative_location: &str) -> Result<String> {
+        let mut base_url = lance_io::object_store::uri_to_url(root)?;
+
+        // Ensure the base URL has a trailing slash so that URL.join() appends
+        // rather than replaces the last path segment.
+        // Without this fix, "s3://bucket/path/subdir".join("table.lance")
+        // would incorrectly produce "s3://bucket/path/table.lance" (missing subdir).
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
+
+        let full_url = base_url.join(relative_location).map_err(|e| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!(
+                    "Failed to join URI '{}' with '{}': {:?}",
+                    root, relative_location, e
+                ),
+            })
+        })?;
 
         Ok(full_url.to_string())
     }
@@ -411,7 +540,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created BTREE index '{}' on object_id for __manifest table",
@@ -437,7 +569,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created Bitmap index '{}' on object_type for __manifest table",
@@ -463,7 +598,10 @@ impl ManifestNamespace {
                 )
                 .await
             {
-                log::warn!("Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.", e);
+                log::warn!(
+                    "Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.",
+                    e
+                );
             } else {
                 log::info!(
                     "Created LabelList index '{}' on base_objects for __manifest table",
@@ -485,7 +623,10 @@ impl ManifestNamespace {
                 }
             }
             Err(e) => {
-                log::warn!("Failed to compact files for __manifest table: {:?}. Continuing with optimization.", e);
+                log::warn!(
+                    "Failed to compact files for __manifest table: {:?}. Continuing with optimization.",
+                    e
+                );
             }
         }
 
@@ -509,7 +650,15 @@ impl ManifestNamespace {
     /// Get the manifest schema
     fn manifest_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            Field::new("object_id", DataType::Utf8, false),
+            // Set unenforced primary key on object_id for bloom filter conflict detection
+            Field::new("object_id", DataType::Utf8, false).with_metadata(
+                [(
+                    LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+                    "0".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
             Field::new("object_type", DataType::Utf8, false),
             Field::new("location", DataType::Utf8, true),
             Field::new("metadata", DataType::Utf8, true),
@@ -529,22 +678,18 @@ impl ManifestNamespace {
 
     /// Helper to execute a scanner and collect results into a Vec
     async fn execute_scanner(scanner: Scanner) -> Result<Vec<RecordBatch>> {
-        let mut stream = scanner.try_into_stream().await.map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!(
-                "Failed to create stream: {}",
-                e
-            ))),
-            location: location!(),
+        let mut stream = scanner.try_into_stream().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create stream: {}", e),
+            })
         })?;
 
         let mut batches = Vec::new();
         while let Some(batch) = stream.next().await {
-            batches.push(batch.map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
-                    "Failed to read batch: {}",
-                    e
-                ))),
-                location: location!(),
+            batches.push(batch.map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read batch: {}", e),
+                })
             })?);
         }
 
@@ -553,46 +698,48 @@ impl ManifestNamespace {
 
     /// Helper to get a string column from a record batch
     fn get_string_column<'a>(batch: &'a RecordBatch, column_name: &str) -> Result<&'a StringArray> {
-        let column = batch
-            .column_by_name(column_name)
-            .ok_or_else(|| Error::io(format!("Column '{}' not found", column_name), location!()))?;
+        let column = batch.column_by_name(column_name).ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Column '{}' not found", column_name),
+            })
+        })?;
         column
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                Error::io(
-                    format!("Column '{}' is not a string array", column_name),
-                    location!(),
-                )
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Column '{}' is not a string array", column_name),
+                })
             })
     }
 
     /// Check if the manifest contains an object with the given ID
     async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
-        let filter = format!("object_id = '{}'", object_id);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!("object_id = '{}'", escaped_id);
 
         let dataset_guard = self.manifest_dataset.get().await?;
         let mut scanner = dataset_guard.scan();
 
-        scanner.filter(&filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
 
         // Project no columns and enable row IDs for count_rows to work
-        scanner.project::<&str>(&[]).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-            location: location!(),
+        scanner.project::<&str>(&[]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
         })?;
 
         scanner.with_row_id();
 
-        let count = scanner.count_rows().await.map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!(
-                "Failed to count rows: {}",
-                e
-            ))),
-            location: location!(),
+        let count = scanner.count_rows().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to count rows: {}", e),
+            })
         })?;
 
         Ok(count > 0)
@@ -600,18 +747,19 @@ impl ManifestNamespace {
 
     /// Query the manifest for a table with the given object ID
     async fn query_manifest_for_table(&self, object_id: &str) -> Result<Option<TableInfo>> {
-        let filter = format!("object_id = '{}' AND object_type = 'table'", object_id);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!("object_id = '{}' AND object_type = 'table'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
-        scanner
-            .project(&["object_id", "location"])
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-                location: location!(),
-            })?;
+        scanner.project(&["object_id", "location"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
+        })?;
         let batches = Self::execute_scanner(scanner).await?;
 
         let mut found_result: Option<TableInfo> = None;
@@ -624,13 +772,13 @@ impl ManifestNamespace {
 
             total_rows += batch.num_rows();
             if total_rows > 1 {
-                return Err(Error::io(
-                    format!(
+                return Err(NamespaceError::Internal {
+                    message: format!(
                         "Expected exactly 1 table with id '{}', found {}",
                         object_id, total_rows
                     ),
-                    location!(),
-                ));
+                }
+                .into());
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
@@ -652,13 +800,15 @@ impl ManifestNamespace {
     pub async fn list_manifest_table_locations(&self) -> Result<std::collections::HashSet<String>> {
         let filter = "object_type = 'table' AND NOT contains(object_id, '$')";
         let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        scanner.filter(filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
-        scanner.project(&["location"]).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-            location: location!(),
+        scanner.project(&["location"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
         })?;
 
         let batches = Self::execute_scanner(scanner).await?;
@@ -684,24 +834,39 @@ impl ManifestNamespace {
         object_type: ObjectType,
         location: Option<String>,
     ) -> Result<()> {
-        self.insert_into_manifest_with_metadata(object_id, object_type, location, None, None)
-            .await
+        self.insert_into_manifest_with_metadata(
+            vec![ManifestEntry {
+                object_id,
+                object_type,
+                location,
+                metadata: None,
+            }],
+            None,
+        )
+        .await
     }
 
-    /// Insert an entry into the manifest table with metadata and base_objects
-    async fn insert_into_manifest_with_metadata(
+    /// Insert one or more entries into the manifest table with metadata and base_objects.
+    ///
+    /// This is the unified entry point for both single and batch inserts.
+    /// Uses a single MergeInsert operation to insert all entries at once.
+    /// If any entry already exists (matching object_id), the entire batch fails.
+    pub async fn insert_into_manifest_with_metadata(
         &self,
-        object_id: String,
-        object_type: ObjectType,
-        location: Option<String>,
-        metadata: Option<String>,
+        entries: Vec<ManifestEntry>,
         base_objects: Option<Vec<String>>,
     ) -> Result<()> {
-        use arrow::array::builder::{ListBuilder, StringBuilder};
+        if entries.is_empty() {
+            return Ok(());
+        }
 
         let schema = Self::manifest_schema();
 
-        // Create base_objects array from the provided list
+        let mut object_ids = Vec::with_capacity(entries.len());
+        let mut object_types = Vec::with_capacity(entries.len());
+        let mut locations: Vec<Option<String>> = Vec::with_capacity(entries.len());
+        let mut metadatas: Vec<Option<String>> = Vec::with_capacity(entries.len());
+
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(Arc::new(Field::new(
             "object_id",
@@ -709,46 +874,55 @@ impl ManifestNamespace {
             true,
         )));
 
-        match base_objects {
-            Some(objects) => {
-                for obj in objects {
-                    list_builder.values().append_value(obj);
+        for (i, entry) in entries.iter().enumerate() {
+            object_ids.push(entry.object_id.as_str());
+            object_types.push(entry.object_type.as_str());
+            locations.push(entry.location.clone());
+            metadatas.push(entry.metadata.clone());
+
+            // Only the first entry gets the base_objects (for single-entry inserts
+            // with base_objects like view creation); batch entries use null.
+            if i == 0 {
+                match &base_objects {
+                    Some(objects) => {
+                        for obj in objects {
+                            list_builder.values().append_value(obj);
+                        }
+                        list_builder.append(true);
+                    }
+                    None => {
+                        list_builder.append_null();
+                    }
                 }
-                list_builder.append(true);
-            }
-            None => {
+            } else {
                 list_builder.append_null();
             }
         }
 
         let base_objects_array = list_builder.finish();
 
-        // Create arrays with optional values
-        let location_array = match location {
-            Some(loc) => Arc::new(StringArray::from(vec![Some(loc)])),
-            None => Arc::new(StringArray::from(vec![None::<String>])),
-        };
+        let location_array: Arc<dyn Array> = Arc::new(StringArray::from(
+            locations.iter().map(|l| l.as_deref()).collect::<Vec<_>>(),
+        ));
 
-        let metadata_array = match metadata {
-            Some(meta) => Arc::new(StringArray::from(vec![Some(meta)])),
-            None => Arc::new(StringArray::from(vec![None::<String>])),
-        };
+        let metadata_array: Arc<dyn Array> = Arc::new(StringArray::from(
+            metadatas.iter().map(|m| m.as_deref()).collect::<Vec<_>>(),
+        ));
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec![object_id.as_str()])),
-                Arc::new(StringArray::from(vec![object_type.as_str()])),
+                Arc::new(StringArray::from(object_ids)),
+                Arc::new(StringArray::from(object_types.to_vec())),
                 location_array,
                 metadata_array,
                 Arc::new(base_objects_array),
             ],
         )
         .map_err(|e| {
-            Error::io(
-                format!("Failed to create manifest entry: {}", e),
-                location!(),
-            )
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create manifest entries: {}", e),
+            })
         })?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -759,49 +933,41 @@ impl ManifestNamespace {
         drop(dataset_guard); // Drop read guard before merge insert
 
         let mut merge_builder =
-            lance::dataset::MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()])
-                .map_err(|e| Error::IO {
-                    source: box_error(std::io::Error::other(format!(
-                        "Failed to create merge builder: {}",
-                        e
-                    ))),
-                    location: location!(),
-                })?;
-
-        merge_builder.when_matched(lance::dataset::WhenMatched::Fail);
-        merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+            MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()]).map_err(
+                |e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to create merge builder: {}", e),
+                    })
+                },
+            )?;
+        merge_builder.when_matched(WhenMatched::Fail);
+        merge_builder.when_not_matched(WhenNotMatched::InsertAll);
+        // Use conflict_retries to handle cross-process races on manifest mutations.
+        // When two processes concurrently insert the same object_id, the second one
+        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
+        // the full MergeInsert plan against the latest data, where the join detects
+        // the existing row and WhenMatched::Fail fires, producing a clear error.
+        merge_builder.conflict_retries(5);
+        // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
+        // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
+        // results in (Some, None) filter mismatch when rebasing against V2 operations.
+        // Setting use_index=false ensures all operations consistently use V2 path.
+        merge_builder.use_index(false);
+        if let Some(retries) = self.commit_retries {
+            merge_builder.commit_retries(retries);
+        }
 
         let (new_dataset_arc, _merge_stats) = merge_builder
             .try_build()
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
-                    "Failed to build merge: {}",
-                    e
-                ))),
-                location: location!(),
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to build merge: {}", e),
+                })
             })?
             .execute_reader(Box::new(reader))
             .await
             .map_err(|e| {
-                // Check if this is a "matched row" error from WhenMatched::Fail
-                let error_msg = e.to_string();
-                if error_msg.contains("matched")
-                    || error_msg.contains("duplicate")
-                    || error_msg.contains("already exists")
-                {
-                    Error::io(
-                        format!("Object with id '{}' already exists in manifest", object_id),
-                        location!(),
-                    )
-                } else {
-                    Error::IO {
-                        source: box_error(std::io::Error::other(format!(
-                            "Failed to execute merge: {}",
-                            e
-                        ))),
-                        location: location!(),
-                    }
-                }
+                convert_lance_commit_error(&e, "Failed to execute merge insert into manifest", None)
             })?;
 
         let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
@@ -820,19 +986,24 @@ impl ManifestNamespace {
 
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
-        {
-            let predicate = format!("object_id = '{}'", object_id);
-            let mut dataset_guard = self.manifest_dataset.get_mut().await?;
-            dataset_guard
-                .delete(&predicate)
-                .await
-                .map_err(|e| Error::IO {
-                    source: box_error(std::io::Error::other(format!("Failed to delete: {}", e))),
-                    location: location!(),
-                })?;
-        } // Drop the guard here
+        let predicate = format!("object_id = '{}'", object_id);
 
-        self.manifest_dataset.reload().await?;
+        // Get dataset and use DeleteBuilder with configured retries
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset = Arc::new(dataset_guard.clone());
+        drop(dataset_guard); // Drop read guard before delete
+
+        let new_dataset = DeleteBuilder::new(dataset, &predicate)
+            .execute()
+            .await
+            .map_err(|e| convert_lance_commit_error(&e, "Failed to delete", None))?;
+
+        // Update the wrapper with the new dataset
+        self.manifest_dataset
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
+            .await;
 
         // Run inline optimization after delete
         if let Err(e) = self.run_inline_optimization().await {
@@ -845,14 +1016,414 @@ impl ManifestNamespace {
         Ok(())
     }
 
+    /// Query the manifest for all versions of a table, sorted by version.
+    ///
+    /// Returns a list of (version, metadata_json_string) tuples where metadata_json_string
+    /// contains the full metadata JSON stored in the manifest (manifest_path, manifest_size,
+    /// e_tag, naming_scheme).
+    ///
+    /// **Known limitation**: All matching rows are loaded into memory, sorted in Rust,
+    /// and then truncated. For tables with a very large number of versions this may be
+    /// expensive. Pushing sort/limit into the scan is not yet supported by Lance.
+    pub async fn query_table_versions(
+        &self,
+        object_id: &str,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<(i64, String)>> {
+        let escaped_id = object_id.replace('\'', "''");
+        // table_version object_ids are formatted as "{object_id}${zero_padded_version}"
+        let filter = format!(
+            "object_type = 'table_version' AND starts_with(object_id, '{}{}')",
+            escaped_id, DELIMITER
+        );
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
+        })?;
+        scanner.project(&["object_id", "metadata"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+
+        let mut versions: Vec<(i64, String)> = Vec::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let object_id_array = Self::get_string_column(&batch, "object_id")?;
+            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+            for i in 0..batch.num_rows() {
+                let oid = object_id_array.value(i);
+                // Parse version from object_id
+                if let Some(version) = Self::parse_version_from_object_id(oid) {
+                    let metadata_str = metadata_array.value(i).to_string();
+                    versions.push((version, metadata_str));
+                }
+            }
+        }
+
+        if descending {
+            versions.sort_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            versions.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        if let Some(limit) = limit {
+            versions.truncate(limit as usize);
+        }
+
+        Ok(versions)
+    }
+
+    /// Query the manifest for a specific version of a table.
+    ///
+    /// Returns the full metadata JSON string if found, which contains
+    /// manifest_path, manifest_size, e_tag, and naming_scheme.
+    ///
+    pub async fn query_table_version(
+        &self,
+        object_id: &str,
+        version: i64,
+    ) -> Result<Option<String>> {
+        let version_object_id = Self::build_version_object_id(object_id, version);
+        self.query_table_version_by_object_id(&version_object_id)
+            .await
+    }
+
+    /// Query a specific table version by its exact object_id.
+    async fn query_table_version_by_object_id(
+        &self,
+        version_object_id: &str,
+    ) -> Result<Option<String>> {
+        let escaped_id = version_object_id.replace('\'', "''");
+        let filter = format!(
+            "object_id = '{}' AND object_type = 'table_version'",
+            escaped_id
+        );
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
+        })?;
+        scanner.project(&["metadata"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+            return Ok(Some(metadata_array.value(0).to_string()));
+        }
+
+        Ok(None)
+    }
+
+    /// Delete table version entries from the manifest for a given table and version ranges.
+    ///
+    /// Each range is (start_version, end_version) inclusive. Deletes all matching
+    /// `object_type = 'table_version'` entries whose object_id matches
+    /// `{object_id}${zero_padded_version}`.
+    ///
+    /// Builds a single filter expression covering all version ranges and executes
+    /// one bulk delete operation instead of deleting versions one at a time.
+    pub async fn delete_table_versions(
+        &self,
+        object_id: &str,
+        ranges: &[(i64, i64)],
+    ) -> Result<i64> {
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+
+        // Collect all object_ids to delete (both new zero-padded and legacy formats)
+        let mut object_id_conditions: Vec<String> = Vec::new();
+        for (start, end) in ranges {
+            for version in *start..=*end {
+                let oid = Self::build_version_object_id(object_id, version);
+                let escaped = oid.replace('\'', "''");
+                object_id_conditions.push(format!("'{}'", escaped));
+            }
+        }
+
+        if object_id_conditions.is_empty() {
+            return Ok(0);
+        }
+
+        // First, count how many entries exist so we can report the deleted count
+        let in_list = object_id_conditions.join(", ");
+        let filter = format!(
+            "object_type = 'table_version' AND object_id IN ({})",
+            in_list
+        );
+
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
+        })?;
+        scanner.project(&["object_id"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+        let deleted_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        if deleted_count == 0 {
+            return Ok(0);
+        }
+
+        // Execute a single bulk delete with the combined filter
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset = Arc::new(dataset_guard.clone());
+        drop(dataset_guard);
+
+        let new_dataset = DeleteBuilder::new(dataset, &filter)
+            .execute()
+            .await
+            .map_err(|e| {
+                convert_lance_commit_error(&e, "Failed to batch delete table versions", None)
+            })?;
+
+        self.manifest_dataset
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
+            .await;
+
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
+        Ok(deleted_count)
+    }
+
+    /// Atomically delete table version entries from the manifest by their object_ids.
+    ///
+    /// This method supports multi-table transactional deletion: all specified
+    /// object_ids (which may span multiple tables) are deleted in a single atomic
+    /// `DeleteBuilder` operation. Either all entries are removed or none are.
+    ///
+    /// Object IDs are formatted as `{table_id}${version}`.
+    pub async fn batch_delete_table_versions_by_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<i64> {
+        if object_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let in_list: String = object_ids
+            .iter()
+            .map(|oid| {
+                let escaped = oid.replace('\'', "''");
+                format!("'{}'", escaped)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let filter = format!(
+            "object_type = 'table_version' AND object_id IN ({})",
+            in_list
+        );
+
+        // Count how many entries exist so we can report the deleted count
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
+        })?;
+        scanner.project(&["object_id"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
+        })?;
+        let batches = Self::execute_scanner(scanner).await?;
+        let deleted_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        if deleted_count == 0 {
+            return Ok(0);
+        }
+
+        // Execute a single atomic bulk delete covering all tables
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let dataset = Arc::new(dataset_guard.clone());
+        drop(dataset_guard);
+
+        let new_dataset = DeleteBuilder::new(dataset, &filter)
+            .execute()
+            .await
+            .map_err(|e| {
+                convert_lance_commit_error(
+                    &e,
+                    "Failed to batch delete table versions across multiple tables",
+                    None,
+                )
+            })?;
+
+        self.manifest_dataset
+            .set_latest(
+                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
+            )
+            .await;
+
+        if let Err(e) = self.run_inline_optimization().await {
+            log::warn!(
+                "Unexpected failure when running inline optimization: {:?}",
+                e
+            );
+        }
+
+        Ok(deleted_count)
+    }
+
+    /// Set a property flag in the __manifest table's metadata key-value map.
+    ///
+    /// This uses `dataset.update_metadata()` to persist the flag in the
+    /// __manifest dataset's table metadata, rather than inserting a row.
+    /// If the property already exists with the same value, this is a no-op.
+    pub async fn set_property(&self, name: &str, value: &str) -> Result<()> {
+        let dataset_guard = self.manifest_dataset.get().await?;
+        if dataset_guard.metadata().get(name) == Some(&value.to_string()) {
+            return Ok(());
+        }
+        drop(dataset_guard);
+
+        let mut dataset_guard = self.manifest_dataset.get_mut().await?;
+        dataset_guard
+            .update_metadata([(name, value)])
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to set property '{}' in __manifest metadata: {}",
+                        name, e
+                    ),
+                })
+            })?;
+        Ok(())
+    }
+
+    /// Check if a property flag exists in the __manifest table's metadata key-value map.
+    pub async fn has_property(&self, name: &str) -> Result<bool> {
+        let dataset_guard = self.manifest_dataset.get().await?;
+        Ok(dataset_guard.metadata().contains_key(name))
+    }
+
+    /// Parse metadata JSON into a `TableVersion`.
+    ///
+    /// Returns `None` if metadata is invalid or missing required fields.
+    fn parse_table_version(version: i64, metadata_str: &str) -> Option<TableVersion> {
+        let meta: serde_json::Value = match serde_json::from_str(metadata_str) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "Skipping version {} due to invalid metadata JSON: {}",
+                    version,
+                    e
+                );
+                return None;
+            }
+        };
+        let manifest_path = match meta.get("manifest_path").and_then(|v| v.as_str()) {
+            Some(p) => p.to_string(),
+            None => {
+                log::warn!(
+                    "Skipping version {} due to missing 'manifest_path' in metadata — \
+                     this may indicate data corruption",
+                    version
+                );
+                return None;
+            }
+        };
+        let manifest_size = meta.get("manifest_size").and_then(|v| v.as_i64());
+        let e_tag = meta
+            .get("e_tag")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Some(TableVersion {
+            version,
+            manifest_path,
+            manifest_size,
+            e_tag,
+            timestamp_millis: None,
+            metadata: None,
+        })
+    }
+
+    /// List table versions from the __manifest table.
+    ///
+    /// Queries the manifest for all versions of the given table and returns
+    /// them as a `ListTableVersionsResponse`.
+    pub async fn list_table_versions(
+        &self,
+        table_id: &[String],
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<ListTableVersionsResponse> {
+        let object_id = Self::str_object_id(table_id);
+        let manifest_versions = self
+            .query_table_versions(&object_id, descending, limit)
+            .await?;
+
+        let table_versions: Vec<TableVersion> = manifest_versions
+            .into_iter()
+            .filter_map(|(version, metadata_str)| Self::parse_table_version(version, &metadata_str))
+            .collect();
+
+        Ok(ListTableVersionsResponse {
+            versions: table_versions,
+            page_token: None,
+        })
+    }
+
+    /// Describe a specific table version from the __manifest table.
+    ///
+    /// Queries the manifest for a specific version and returns it as a
+    /// `DescribeTableVersionResponse`. Returns an error if the version is not found.
+    pub async fn describe_table_version(
+        &self,
+        table_id: &[String],
+        version: i64,
+    ) -> Result<DescribeTableVersionResponse> {
+        let object_id = Self::str_object_id(table_id);
+        if let Some(metadata_str) = self.query_table_version(&object_id, version).await?
+            && let Some(tv) = Self::parse_table_version(version, &metadata_str)
+        {
+            return Ok(DescribeTableVersionResponse {
+                version: Box::new(tv),
+            });
+        }
+        Err(NamespaceError::TableVersionNotFound {
+            message: format!("version {} for table {:?}", version, table_id),
+        }
+        .into())
+    }
+
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::io(
-                format!("Table '{}' already exists", name),
-                location!(),
-            ));
+            return Err(NamespaceError::Internal {
+                message: format!("Table '{}' already exists", name),
+            }
+            .into());
         }
 
         self.insert_into_manifest(object_id, ObjectType::Table, Some(location))
@@ -865,10 +1436,10 @@ impl ManifestNamespace {
             let partial_path = &namespace_path[..i];
             let object_id = partial_path.join(DELIMITER);
             if !self.manifest_contains_object(&object_id).await? {
-                return Err(Error::Namespace {
-                    source: format!("Parent namespace '{}' does not exist", object_id).into(),
-                    location: location!(),
-                });
+                return Err(NamespaceError::NamespaceNotFound {
+                    message: format!("parent namespace '{}'", object_id),
+                }
+                .into());
             }
         }
         Ok(())
@@ -876,18 +1447,19 @@ impl ManifestNamespace {
 
     /// Query the manifest for a namespace with the given object ID
     async fn query_manifest_for_namespace(&self, object_id: &str) -> Result<Option<NamespaceInfo>> {
-        let filter = format!("object_id = '{}' AND object_type = 'namespace'", object_id);
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!("object_id = '{}' AND object_type = 'namespace'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
-        scanner
-            .project(&["object_id", "metadata"])
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-                location: location!(),
-            })?;
+        scanner.project(&["object_id", "metadata"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
+        })?;
         let batches = Self::execute_scanner(scanner).await?;
 
         let mut found_result: Option<NamespaceInfo> = None;
@@ -900,13 +1472,13 @@ impl ManifestNamespace {
 
             total_rows += batch.num_rows();
             if total_rows > 1 {
-                return Err(Error::io(
-                    format!(
+                return Err(NamespaceError::Internal {
+                    message: format!(
                         "Expected exactly 1 namespace with id '{}', found {}",
                         object_id, total_rows
                     ),
-                    location!(),
-                ));
+                }
+                .into());
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
@@ -918,13 +1490,13 @@ impl ManifestNamespace {
                 match serde_json::from_str::<HashMap<String, String>>(metadata_str) {
                     Ok(map) => Some(map),
                     Err(e) => {
-                        return Err(Error::io(
-                            format!(
+                        return Err(NamespaceError::Internal {
+                            message: format!(
                                 "Failed to deserialize metadata for namespace '{}': {}",
                                 object_id, e
                             ),
-                            location!(),
-                        ));
+                        }
+                        .into());
                     }
                 }
             } else {
@@ -942,26 +1514,90 @@ impl ManifestNamespace {
         Ok(found_result)
     }
 
-    /// Create or get the manifest dataset
-    async fn create_or_get_manifest(
+    /// Create or load the manifest dataset, ensuring it has the latest schema setup.
+    ///
+    /// This function will:
+    /// 1. Try to load an existing manifest table
+    /// 2. If it exists, check and migrate the schema if needed (e.g., add primary key metadata)
+    /// 3. If it doesn't exist, create a new manifest table with the current schema
+    /// 4. Persist feature flags (e.g., table_version_storage_enabled) if requested
+    async fn ensure_manifest_table_up_to_date(
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
+        table_version_storage_enabled: bool,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
-        let mut builder = DatasetBuilder::from_uri(&manifest_path);
+        let store_options = ObjectStoreParams {
+            storage_options_accessor: storage_options.as_ref().map(|opts| {
+                Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        opts.clone(),
+                    ),
+                )
+            }),
+            ..Default::default()
+        };
+        let read_params = ReadParams {
+            session: session.clone(),
+            store_options: Some(store_options.clone()),
+            ..Default::default()
+        };
+        let dataset_result = DatasetBuilder::from_uri(&manifest_path)
+            .with_read_params(read_params)
+            .load()
+            .await;
+        if let Ok(mut dataset) = dataset_result {
+            // Check if the object_id field has primary key metadata, migrate if not
+            let needs_pk_migration = dataset
+                .schema()
+                .field("object_id")
+                .map(|f| {
+                    !f.metadata
+                        .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                })
+                .unwrap_or(false);
 
-        if let Some(sess) = session.clone() {
-            builder = builder.with_session(sess);
-        }
+            if needs_pk_migration {
+                log::info!("Migrating __manifest table to add primary key metadata on object_id");
+                dataset
+                    .update_field_metadata()
+                    .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!("Failed to find object_id field for migration: {}", e),
+                        })
+                    })?
+                    .await
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!("Failed to migrate primary key metadata: {}", e),
+                        })
+                    })?;
+            }
 
-        if let Some(opts) = storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
+            // Persist table_version_storage_enabled flag in __manifest so that once
+            // enabled, it becomes a permanent property of this namespace.
+            if table_version_storage_enabled {
+                let needs_flag = dataset
+                    .metadata()
+                    .get("table_version_storage_enabled")
+                    .map(|v| v != "true")
+                    .unwrap_or(true);
 
-        let dataset_result = builder.load().await;
-        if let Ok(dataset) = dataset_result {
+                if needs_flag
+                    && let Err(e) = dataset
+                        .update_metadata([("table_version_storage_enabled", "true")])
+                        .await
+                {
+                    log::warn!(
+                        "Failed to persist table_version_storage_enabled flag in __manifest: {:?}",
+                        e
+                    );
+                }
+            }
+
             Ok(DatasetConsistencyWrapper::new(dataset))
         } else {
             log::info!("Creating new manifest table at {}", manifest_path);
@@ -969,32 +1605,83 @@ impl ManifestNamespace {
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
 
-            let write_params = WriteParams {
-                session,
-                store_params: storage_options.as_ref().map(|opts| ObjectStoreParams {
-                    storage_options: Some(opts.clone()),
-                    ..Default::default()
+            let store_params = ObjectStoreParams {
+                storage_options_accessor: storage_options.as_ref().map(|opts| {
+                    Arc::new(
+                        lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                            opts.clone(),
+                        ),
+                    )
                 }),
                 ..Default::default()
             };
+            let write_params = WriteParams {
+                session: session.clone(),
+                store_params: Some(store_params),
+                ..Default::default()
+            };
 
-            let dataset = Dataset::write(Box::new(reader), &manifest_path, Some(write_params))
-                .await
-                .map_err(|e| Error::IO {
-                    source: box_error(std::io::Error::other(format!(
-                        "Failed to create manifest dataset: {}",
-                        e
-                    ))),
-                    location: location!(),
-                })?;
+            let dataset =
+                Dataset::write(Box::new(reader), &manifest_path, Some(write_params)).await;
 
-            log::info!(
-                "Successfully created manifest table at {}, version={}, uri={}",
-                manifest_path,
-                dataset.version().version,
-                dataset.uri()
-            );
-            Ok(DatasetConsistencyWrapper::new(dataset))
+            // Handle race condition where another process created the manifest concurrently
+            match dataset {
+                Ok(dataset) => {
+                    log::info!(
+                        "Successfully created manifest table at {}, version={}, uri={}",
+                        manifest_path,
+                        dataset.version().version,
+                        dataset.uri()
+                    );
+                    Ok(DatasetConsistencyWrapper::new(dataset))
+                }
+                Err(ref e)
+                    if matches!(
+                        e,
+                        LanceError::DatasetAlreadyExists { .. }
+                            | LanceError::CommitConflict { .. }
+                            | LanceError::IncompatibleTransaction { .. }
+                            | LanceError::RetryableCommitConflict { .. }
+                    ) =>
+                {
+                    // Another process created the manifest concurrently, try to load it
+                    log::info!(
+                        "Manifest table was created by another process, loading it: {}",
+                        manifest_path
+                    );
+                    let recovery_store_options = ObjectStoreParams {
+                        storage_options_accessor: storage_options.as_ref().map(|opts| {
+                            Arc::new(
+                                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                    opts.clone(),
+                                ),
+                            )
+                        }),
+                        ..Default::default()
+                    };
+                    let recovery_read_params = ReadParams {
+                        session,
+                        store_options: Some(recovery_store_options),
+                        ..Default::default()
+                    };
+                    let dataset = DatasetBuilder::from_uri(&manifest_path)
+                        .with_read_params(recovery_read_params)
+                        .load()
+                        .await
+                        .map_err(|e| {
+                            lance_core::Error::from(NamespaceError::Internal {
+                                message: format!(
+                                    "Failed to load manifest dataset after creation conflict: {}",
+                                    e
+                                ),
+                            })
+                        })?;
+                    Ok(DatasetConsistencyWrapper::new(dataset))
+                }
+                Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to create manifest dataset: {}", e),
+                })),
+            }
         }
     }
 }
@@ -1006,9 +1693,10 @@ impl LanceNamespace for ManifestNamespace {
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: location!(),
+        let namespace_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
         })?;
 
         // Build filter to find tables in this namespace
@@ -1020,18 +1708,22 @@ impl LanceNamespace for ManifestNamespace {
             let prefix = namespace_id.join(DELIMITER);
             format!(
                 "object_type = 'table' AND starts_with(object_id, '{}{}') AND NOT contains(substring(object_id, {}), '$')",
-                prefix, DELIMITER, prefix.len() + 2
+                prefix,
+                DELIMITER,
+                prefix.len() + 2
             )
         };
 
         let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
-        scanner.project(&["object_id"]).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-            location: location!(),
+        scanner.project(&["object_id"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
         })?;
 
         let batches = Self::execute_scanner(scanner).await?;
@@ -1054,25 +1746,56 @@ impl LanceNamespace for ManifestNamespace {
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let object_id = Self::str_object_id(table_id);
-        let table_info = self.query_manifest_for_table(&object_id).await?;
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
+
+        // Extract table name and namespace from table_id
+        let table_name = table_id.last().cloned().unwrap_or_default();
+        let namespace_id: Vec<String> = if table_id.len() > 1 {
+            table_id[..table_id.len() - 1].to_vec()
+        } else {
+            vec![]
+        };
+
+        let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
 
         match table_info {
             Some(info) => {
                 // Construct full URI from relative location
-                let table_uri = self.construct_full_uri(&info.location)?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+
+                let storage_options = if vend_credentials {
+                    self.storage_options.clone()
+                } else {
+                    None
+                };
+
+                // If not loading detailed metadata, return minimal response with just location
+                if !load_detailed_metadata {
+                    return Ok(DescribeTableResponse {
+                        table: Some(table_name),
+                        namespace: Some(namespace_id),
+                        location: Some(table_uri.clone()),
+                        table_uri: Some(table_uri),
+                        storage_options,
+                        ..Default::default()
+                    });
+                }
 
                 // Try to open the dataset to get version and schema
                 match Dataset::open(&table_uri).await {
@@ -1088,43 +1811,48 @@ impl LanceNamespace for ManifestNamespace {
                         let json_schema = arrow_schema_to_json(&arrow_schema)?;
 
                         Ok(DescribeTableResponse {
+                            table: Some(table_name.clone()),
+                            namespace: Some(namespace_id.clone()),
                             version: Some(version as i64),
-                            location: Some(table_uri),
+                            location: Some(table_uri.clone()),
+                            table_uri: Some(table_uri),
                             schema: Some(Box::new(json_schema)),
-                            properties: None,
-                            storage_options: self.storage_options.clone(),
+                            storage_options,
+                            ..Default::default()
                         })
                     }
                     Err(_) => {
                         // If dataset can't be opened (e.g., empty table), return minimal info
                         Ok(DescribeTableResponse {
-                            version: None,
-                            location: Some(table_uri),
-                            schema: None,
-                            properties: None,
-                            storage_options: self.storage_options.clone(),
+                            table: Some(table_name),
+                            namespace: Some(namespace_id),
+                            location: Some(table_uri.clone()),
+                            table_uri: Some(table_uri),
+                            storage_options,
+                            ..Default::default()
                         })
                     }
                 }
             }
-            None => Err(Error::Namespace {
-                source: format!("Table '{}' not found", object_id).into(),
-                location: location!(),
-            }),
+            None => Err(NamespaceError::TableNotFound {
+                message: object_id.to_string(),
+            }
+            .into()),
         }
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let (namespace, table_name) = Self::split_object_id(table_id);
@@ -1133,10 +1861,10 @@ impl LanceNamespace for ManifestNamespace {
         if exists {
             Ok(())
         } else {
-            Err(Error::Namespace {
-                source: format!("Table '{}' not found", table_name).into(),
-                location: location!(),
-            })
+            Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into())
         }
     }
 
@@ -1145,16 +1873,17 @@ impl LanceNamespace for ManifestNamespace {
         request: CreateTableRequest,
         data: Bytes,
     ) -> Result<CreateTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let (namespace, table_name) = Self::split_object_id(table_id);
@@ -1162,10 +1891,10 @@ impl LanceNamespace for ManifestNamespace {
 
         // Check if table already exists in manifest
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::io(
-                format!("Table '{}' already exists", table_name),
-                location!(),
-            ));
+            return Err(NamespaceError::Internal {
+                message: format!("Table '{}' already exists", table_name),
+            }
+            .into());
         }
 
         // Create the physical table location with hash-based naming
@@ -1178,46 +1907,37 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_uri = self.construct_full_uri(&dir_name)?;
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate that request_data is provided
         if data.is_empty() {
-            return Err(Error::Namespace {
-                source: "Request data (Arrow IPC stream) is required for create_table".into(),
-                location: location!(),
-            });
-        }
-
-        // Validate location if provided
-        if let Some(location) = &request.location {
-            let location = location.trim_end_matches('/');
-            if location != table_uri {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_uri
-                    )
-                    .into(),
-                    location: location!(),
-                });
+            return Err(NamespaceError::InvalidInput {
+                message: "Request data (Arrow IPC stream) is required for create_table".to_string(),
             }
+            .into());
         }
 
         // Write the data using Lance Dataset
         let cursor = Cursor::new(data.to_vec());
-        let stream_reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| Error::io(format!("Failed to read IPC stream: {}", e), location!()))?;
+        let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to read IPC stream: {}", e),
+            })
+        })?;
 
-        let batches: Vec<RecordBatch> =
-            stream_reader
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::io(format!("Failed to collect batches: {}", e), location!()))?;
+        let batches: Vec<RecordBatch> = stream_reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to collect batches: {}", e),
+            })
+        })?;
 
         if batches.is_empty() {
-            return Err(Error::io(
-                "No data provided for table creation",
-                location!(),
-            ));
+            return Err(NamespaceError::Internal {
+                message: "No data provided for table creation".to_string(),
+            }
+            .into());
         }
 
         let schema = batches[0].schema();
@@ -1225,15 +1945,27 @@ impl LanceNamespace for ManifestNamespace {
             batches.into_iter().map(Ok).collect();
         let reader = RecordBatchIterator::new(batch_results, schema);
 
-        let write_params = WriteParams::default();
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: self.storage_options.as_ref().map(|opts| {
+                Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        opts.clone(),
+                    ),
+                )
+            }),
+            ..Default::default()
+        };
+        let write_params = WriteParams {
+            session: self.session.clone(),
+            store_params: Some(store_params),
+            ..Default::default()
+        };
         let _dataset = Dataset::write(Box::new(reader), &table_uri, Some(write_params))
             .await
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!(
-                    "Failed to write dataset: {}",
-                    e
-                ))),
-                location: location!(),
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to write dataset: {}", e),
+                })
             })?;
 
         // Register in manifest (store dir_name, not full URI)
@@ -1243,59 +1975,61 @@ impl LanceNamespace for ManifestNamespace {
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
-            properties: None,
             storage_options: self.storage_options.clone(),
+            ..Default::default()
         })
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
         // Query manifest for table location
-        let table_info = self.query_manifest_for_table(&object_id).await?;
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
 
         match table_info {
             Some(info) => {
                 // Delete from manifest first
-                self.delete_from_manifest(&object_id).await?;
+                self.delete_from_manifest(&object_id).boxed().await?;
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.child(info.location.as_str());
-                let table_uri = self.construct_full_uri(&info.location)?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
                 self.object_store
                     .remove_dir_all(table_path)
+                    .boxed()
                     .await
-                    .map_err(|e| Error::Namespace {
-                        source: format!("Failed to delete table directory: {}", e).into(),
-                        location: location!(),
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!("Failed to delete table directory: {}", e),
+                        })
                     })?;
 
                 Ok(DropTableResponse {
                     id: request.id.clone(),
                     location: Some(table_uri),
-                    properties: None,
-                    transaction_id: None,
+                    ..Default::default()
                 })
             }
-            None => Err(Error::Namespace {
-                source: format!("Table '{}' not found", table_name).into(),
-                location: location!(),
-            }),
+            None => Err(NamespaceError::TableNotFound {
+                message: table_name.to_string(),
+            }
+            .into()),
         }
     }
 
@@ -1303,9 +2037,10 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
-        let parent_namespace = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: location!(),
+        let parent_namespace = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
         })?;
 
         // Build filter to find direct child namespaces
@@ -1317,18 +2052,22 @@ impl LanceNamespace for ManifestNamespace {
             let prefix = parent_namespace.join(DELIMITER);
             format!(
                 "object_type = 'namespace' AND starts_with(object_id, '{}{}') AND NOT contains(substring(object_id, {}), '$')",
-                prefix, DELIMITER, prefix.len() + 2
+                prefix,
+                DELIMITER,
+                prefix.len() + 2
             )
         };
 
         let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
-        scanner.project(&["object_id"]).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-            location: location!(),
+        scanner.project(&["object_id"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
         })?;
 
         let batches = Self::execute_scanner(scanner).await?;
@@ -1354,15 +2093,18 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: location!(),
+        let namespace_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
         })?;
 
         // Root namespace always exists
         if namespace_id.is_empty() {
+            #[allow(clippy::needless_update)]
             return Ok(DescribeNamespaceResponse {
                 properties: Some(HashMap::new()),
+                ..Default::default()
             });
         }
 
@@ -1371,13 +2113,15 @@ impl LanceNamespace for ManifestNamespace {
         let namespace_info = self.query_manifest_for_namespace(&object_id).await?;
 
         match namespace_info {
+            #[allow(clippy::needless_update)]
             Some(info) => Ok(DescribeNamespaceResponse {
                 properties: info.metadata,
+                ..Default::default()
             }),
-            None => Err(Error::Namespace {
-                source: format!("Namespace '{}' not found", object_id).into(),
-                location: location!(),
-            }),
+            None => Err(NamespaceError::NamespaceNotFound {
+                message: object_id.to_string(),
+            }
+            .into()),
         }
     }
 
@@ -1385,17 +2129,18 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: location!(),
+        let namespace_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
         })?;
 
         // Root namespace always exists and cannot be created
         if namespace_id.is_empty() {
-            return Err(Error::Namespace {
-                source: "Root namespace already exists and cannot be created".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::NamespaceAlreadyExists {
+                message: "root namespace".to_string(),
+            }
+            .into());
         }
 
         // Validate parent namespaces exist (but not the namespace being created)
@@ -1406,10 +2151,10 @@ impl LanceNamespace for ManifestNamespace {
 
         let object_id = namespace_id.join(DELIMITER);
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::Namespace {
-                source: format!("Namespace '{}' already exists", object_id).into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::NamespaceAlreadyExists {
+                message: object_id.to_string(),
+            }
+            .into());
         }
 
         // Serialize properties if provided
@@ -1422,87 +2167,86 @@ impl LanceNamespace for ManifestNamespace {
         });
 
         self.insert_into_manifest_with_metadata(
-            object_id,
-            ObjectType::Namespace,
-            None,
-            metadata,
+            vec![ManifestEntry {
+                object_id,
+                object_type: ObjectType::Namespace,
+                location: None,
+                metadata,
+            }],
             None,
         )
         .await?;
 
         Ok(CreateNamespaceResponse {
             properties: request.properties,
+            ..Default::default()
         })
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: location!(),
+        let namespace_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
         })?;
 
         // Root namespace always exists and cannot be dropped
         if namespace_id.is_empty() {
-            return Err(Error::Namespace {
-                source: "Root namespace cannot be dropped".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Root namespace cannot be dropped".to_string(),
+            }
+            .into());
         }
 
         let object_id = namespace_id.join(DELIMITER);
 
         // Check if namespace exists
-        if !self.manifest_contains_object(&object_id).await? {
-            return Err(Error::Namespace {
-                source: format!("Namespace '{}' not found", object_id).into(),
-                location: location!(),
-            });
+        if !self.manifest_contains_object(&object_id).boxed().await? {
+            return Err(NamespaceError::NamespaceNotFound {
+                message: object_id.to_string(),
+            }
+            .into());
         }
 
         // Check for child namespaces
-        let prefix = format!("{}{}", object_id, DELIMITER);
+        let escaped_id = object_id.replace('\'', "''");
+        let prefix = format!("{}{}", escaped_id, DELIMITER);
         let filter = format!("starts_with(object_id, '{}')", prefix);
-        let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
-            location: location!(),
+        let mut scanner = self.manifest_scanner().boxed().await?;
+        scanner.filter(&filter).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to filter: {}", e),
+            })
         })?;
-        scanner.project::<&str>(&[]).map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-            location: location!(),
+        scanner.project::<&str>(&[]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project: {}", e),
+            })
         })?;
         scanner.with_row_id();
-        let count = scanner.count_rows().await.map_err(|e| Error::IO {
-            source: box_error(std::io::Error::other(format!(
-                "Failed to count rows: {}",
-                e
-            ))),
-            location: location!(),
+        let count = scanner.count_rows().boxed().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to count rows: {}", e),
+            })
         })?;
 
         if count > 0 {
-            return Err(Error::Namespace {
-                source: format!(
-                    "Namespace '{}' is not empty (contains {} child objects)",
-                    object_id, count
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::NamespaceNotEmpty {
+                message: format!("'{}' (contains {} child objects)", object_id, count),
+            }
+            .into());
         }
 
-        self.delete_from_manifest(&object_id).await?;
+        self.delete_from_manifest(&object_id).boxed().await?;
 
-        Ok(DropNamespaceResponse {
-            properties: None,
-            transaction_id: None,
-        })
+        Ok(DropNamespaceResponse::default())
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Namespace ID is required".into(),
-            location: location!(),
+        let namespace_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Namespace ID is required".to_string(),
+            })
         })?;
 
         // Root namespace always exists
@@ -1514,27 +2258,25 @@ impl LanceNamespace for ManifestNamespace {
         if self.manifest_contains_object(&object_id).await? {
             Ok(())
         } else {
-            Err(Error::Namespace {
-                source: format!("Namespace '{}' not found", object_id).into(),
-                location: location!(),
-            })
+            Err(NamespaceError::NamespaceNotFound {
+                message: object_id.to_string(),
+            }
+            .into())
         }
     }
 
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let (namespace, table_name) = Self::split_object_id(table_id);
@@ -1543,10 +2285,10 @@ impl LanceNamespace for ManifestNamespace {
         // Check if table already exists in manifest
         let existing = self.query_manifest_for_table(&object_id).await?;
         if existing.is_some() {
-            return Err(Error::Namespace {
-                source: format!("Table '{}' already exists", table_name).into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::TableAlreadyExists {
+                message: table_name.to_string(),
+            }
+            .into());
         }
 
         // Create table location path with hash-based naming
@@ -1560,20 +2302,19 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_path = self.base_path.child(dir_name.as_str());
-        let table_uri = self.construct_full_uri(&dir_name)?;
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
         if let Some(req_location) = &request.location {
             let req_location = req_location.trim_end_matches('/');
             if req_location != table_uri {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Cannot create table {} at location {}, must be at location {}",
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Cannot declare table {} at location {}, must be at location {}",
                         table_name, req_location, table_uri
-                    )
-                    .into(),
-                    location: location!(),
-                });
+                    ),
+                }
+                .into());
             }
         }
 
@@ -1583,53 +2324,62 @@ impl LanceNamespace for ManifestNamespace {
         self.object_store
             .create(&reserved_file_path)
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!(
-                    "Failed to create .lance-reserved file for table {}: {}",
-                    table_name, e
-                )
-                .into(),
-                location: location!(),
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to create .lance-reserved file for table {}: {}",
+                        table_name, e
+                    ),
+                })
             })?
             .shutdown()
             .await
-            .map_err(|e| Error::Namespace {
-                source: format!(
-                    "Failed to finalize .lance-reserved file for table {}: {}",
-                    table_name, e
-                )
-                .into(),
-                location: location!(),
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to finalize .lance-reserved file for table {}: {}",
+                        table_name, e
+                    ),
+                })
             })?;
 
-        // Add entry to manifest marking this as an empty table (store dir_name, not full path)
+        // Add entry to manifest marking this as a declared table (store dir_name, not full path)
         self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
             .await?;
 
         log::info!(
-            "Created empty table '{}' in manifest at {}",
+            "Declared table '{}' in manifest at {}",
             table_name,
             table_uri
         );
 
-        Ok(CreateEmptyTableResponse {
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let storage_options = if vend_credentials {
+            self.storage_options.clone()
+        } else {
+            None
+        };
+
+        Ok(DeclareTableResponse {
             location: Some(table_uri),
-            properties: None,
-            storage_options: self.storage_options.clone(),
+            storage_options,
+            ..Default::default()
         })
     }
 
     async fn register_table(&self, request: RegisterTableRequest) -> Result<RegisterTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let location = request.location.clone();
@@ -1637,34 +2387,34 @@ impl LanceNamespace for ManifestNamespace {
         // Validate that location is a relative path within the root directory
         // We don't allow absolute URIs or paths that escape the root
         if location.contains("://") {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "Absolute URIs are not allowed for register_table. Location must be a relative path within the root directory: {}",
                     location
-                ).into(),
-                location: location!(),
-            });
+                ),
+            }
+            .into());
         }
 
         if location.starts_with('/') {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "Absolute paths are not allowed for register_table. Location must be a relative path within the root directory: {}",
                     location
-                ).into(),
-                location: location!(),
-            });
+                ),
+            }
+            .into());
         }
 
         // Check for path traversal attempts
         if location.contains("..") {
-            return Err(Error::InvalidInput {
-                source: format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "Path traversal is not allowed. Location must be a relative path within the root directory: {}",
                     location
-                ).into(),
-                location: location!(),
-            });
+                ),
+            }
+            .into());
         }
 
         let (namespace, table_name) = Self::split_object_id(table_id);
@@ -1677,10 +2427,10 @@ impl LanceNamespace for ManifestNamespace {
 
         // Check if table already exists
         if self.manifest_contains_object(&object_id).await? {
-            return Err(Error::Namespace {
-                source: format!("Table '{}' already exists", object_id).into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::TableAlreadyExists {
+                message: object_id.to_string(),
+            }
+            .into());
         }
 
         // Register the table with its location in the manifest
@@ -1688,8 +2438,8 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(RegisterTableResponse {
-            location,
-            properties: None,
+            location: Some(location),
+            ..Default::default()
         })
     }
 
@@ -1697,16 +2447,17 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
-            source: "Table ID is required".into(),
-            location: location!(),
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
         })?;
 
         if table_id.is_empty() {
-            return Err(Error::InvalidInput {
-                source: "Table ID cannot be empty".into(),
-                location: location!(),
-            });
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let (namespace, table_name) = Self::split_object_id(table_id);
@@ -1718,37 +2469,35 @@ impl LanceNamespace for ManifestNamespace {
         let table_uri = match table_info {
             Some(info) => {
                 // Delete from manifest only (leave physical data intact)
-                self.delete_from_manifest(&object_id).await?;
-
-                // Construct the full URI using helper function
-                self.construct_full_uri(&info.location)?
+                self.delete_from_manifest(&object_id).boxed().await?;
+                Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
-                return Err(Error::Namespace {
-                    source: format!("Table '{}' not found", object_id).into(),
-                    location: location!(),
-                });
+                return Err(NamespaceError::TableNotFound {
+                    message: object_id.to_string(),
+                }
+                .into());
             }
         };
 
         Ok(DeregisterTableResponse {
             id: request.id.clone(),
             location: Some(table_uri),
-            properties: None,
+            ..Default::default()
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::DirectoryNamespaceBuilder;
+    use crate::{DirectoryNamespaceBuilder, ManifestNamespace};
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
-    use lance_namespace::models::{
-        CreateTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
-        TableExistsRequest,
-    };
     use lance_namespace::LanceNamespace;
+    use lance_namespace::models::{
+        CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
+        ListTablesRequest, TableExistsRequest,
+    };
     use rstest::rstest;
 
     fn create_test_ipc_data() -> Vec<u8> {
@@ -2162,6 +2911,7 @@ mod tests {
         // Verify namespace exists
         let exists_req = NamespaceExistsRequest {
             id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.namespace_exists(exists_req).await;
         assert!(result.is_ok(), "Namespace should exist");
@@ -2171,6 +2921,7 @@ mod tests {
             id: Some(vec![]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = dir_namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2215,6 +2966,7 @@ mod tests {
         // Verify nested namespace exists
         let exists_req = NamespaceExistsRequest {
             id: Some(vec!["parent".to_string(), "child".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.namespace_exists(exists_req).await;
         assert!(result.is_ok(), "Nested namespace should exist");
@@ -2224,6 +2976,7 @@ mod tests {
             id: Some(vec!["parent".to_string()]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = dir_namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2291,6 +3044,7 @@ mod tests {
         // Verify namespace no longer exists
         let exists_req = NamespaceExistsRequest {
             id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.namespace_exists(exists_req).await;
         assert!(result.is_err(), "Namespace should not exist after drop");
@@ -2369,6 +3123,7 @@ mod tests {
             id: Some(vec!["ns1".to_string()]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = dir_namespace.list_tables(list_req).await;
         assert!(result.is_ok());
@@ -2405,6 +3160,7 @@ mod tests {
         // Describe the namespace
         let describe_req = DescribeNamespaceRequest {
             id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.describe_namespace(describe_req).await;
         assert!(
@@ -2417,6 +3173,383 @@ mod tests {
         assert_eq!(
             response.properties.unwrap().get("key1"),
             Some(&"value1".to_string())
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_concurrent_create_and_drop_single_instance(#[case] inline_optimization: bool) {
+        use futures::future::join_all;
+        use std::sync::Arc;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .inline_optimization_enabled(inline_optimization)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Initialize namespace first - create parent namespace to ensure __manifest table
+        // is created before concurrent operations
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        dir_namespace
+            .create_namespace(create_ns_request)
+            .await
+            .unwrap();
+
+        let num_tables = 10;
+        let mut handles = Vec::new();
+
+        for i in 0..num_tables {
+            let ns = dir_namespace.clone();
+            let handle = async move {
+                let table_name = format!("concurrent_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+                let buffer = create_test_ipc_data();
+
+                // Create table
+                let mut create_request = CreateTableRequest::new();
+                create_request.id = Some(table_id.clone());
+                ns.create_table(create_request, Bytes::from(buffer))
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create table {}: {}", table_name, e));
+
+                // Drop table
+                let mut drop_request = DropTableRequest::new();
+                drop_request.id = Some(table_id);
+                ns.drop_table(drop_request)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to drop table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        for result in results {
+            assert!(result.is_ok(), "All concurrent operations should succeed");
+        }
+
+        // Verify all tables are dropped
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec!["test_ns".to_string()]);
+        let response = dir_namespace.list_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 0, "All tables should be dropped");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_concurrent_create_and_drop_multiple_instances(#[case] inline_optimization: bool) {
+        use futures::future::join_all;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap().to_string();
+
+        // Initialize namespace first with a single instance to ensure __manifest
+        // table is created and parent namespace exists before concurrent operations
+        let init_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        init_ns.create_namespace(create_ns_request).await.unwrap();
+
+        let num_tables = 10;
+        let mut handles = Vec::new();
+
+        for i in 0..num_tables {
+            let path = temp_path.clone();
+            let handle = async move {
+                // Each task creates its own namespace instance
+                let ns = DirectoryNamespaceBuilder::new(&path)
+                    .inline_optimization_enabled(inline_optimization)
+                    .build()
+                    .await
+                    .unwrap();
+
+                let table_name = format!("multi_ns_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+                let buffer = create_test_ipc_data();
+
+                // Create table
+                let mut create_request = CreateTableRequest::new();
+                create_request.id = Some(table_id.clone());
+                ns.create_table(create_request, Bytes::from(buffer))
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create table {}: {}", table_name, e));
+
+                // Drop table
+                let mut drop_request = DropTableRequest::new();
+                drop_request.id = Some(table_id);
+                ns.drop_table(drop_request)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to drop table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        for result in results {
+            assert!(result.is_ok(), "All concurrent operations should succeed");
+        }
+
+        // Verify with a fresh namespace instance
+        let verify_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec!["test_ns".to_string()]);
+        let response = verify_ns.list_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 0, "All tables should be dropped");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_concurrent_create_then_drop_from_different_instance(
+        #[case] inline_optimization: bool,
+    ) {
+        use futures::future::join_all;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap().to_string();
+
+        // Initialize namespace first with a single instance to ensure __manifest
+        // table is created and parent namespace exists before concurrent operations
+        let init_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_request = CreateNamespaceRequest::new();
+        create_ns_request.id = Some(vec!["test_ns".to_string()]);
+        init_ns.create_namespace(create_ns_request).await.unwrap();
+
+        let num_tables = 10;
+
+        // Phase 1: Create all tables concurrently using separate namespace instances
+        let mut create_handles = Vec::new();
+        for i in 0..num_tables {
+            let path = temp_path.clone();
+            let handle = async move {
+                let ns = DirectoryNamespaceBuilder::new(&path)
+                    .inline_optimization_enabled(inline_optimization)
+                    .build()
+                    .await
+                    .unwrap();
+
+                let table_name = format!("cross_instance_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+                let buffer = create_test_ipc_data();
+
+                let mut create_request = CreateTableRequest::new();
+                create_request.id = Some(table_id);
+                ns.create_table(create_request, Bytes::from(buffer))
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            create_handles.push(handle);
+        }
+
+        let create_results = join_all(create_handles).await;
+        for result in create_results {
+            assert!(result.is_ok(), "All create operations should succeed");
+        }
+
+        // Phase 2: Drop all tables concurrently using NEW namespace instances
+        let mut drop_handles = Vec::new();
+        for i in 0..num_tables {
+            let path = temp_path.clone();
+            let handle = async move {
+                let ns = DirectoryNamespaceBuilder::new(&path)
+                    .inline_optimization_enabled(inline_optimization)
+                    .build()
+                    .await
+                    .unwrap();
+
+                let table_name = format!("cross_instance_table_{}", i);
+                let table_id = vec!["test_ns".to_string(), table_name.clone()];
+
+                let mut drop_request = DropTableRequest::new();
+                drop_request.id = Some(table_id);
+                ns.drop_table(drop_request)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to drop table {}: {}", table_name, e));
+
+                Ok::<_, lance_core::Error>(())
+            };
+            drop_handles.push(handle);
+        }
+
+        let drop_results = join_all(drop_handles).await;
+        for result in drop_results {
+            assert!(result.is_ok(), "All drop operations should succeed");
+        }
+
+        // Verify all tables are dropped
+        let verify_ns = DirectoryNamespaceBuilder::new(&temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = ListTablesRequest::new();
+        request.id = Some(vec!["test_ns".to_string()]);
+        let response = verify_ns.list_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 0, "All tables should be dropped");
+    }
+
+    #[test]
+    fn test_construct_full_uri_with_cloud_urls() {
+        // Test S3-style URL with nested path (no trailing slash)
+        let s3_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            s3_result, "s3://bucket/path/subdir/table.lance",
+            "S3 URL should correctly append table name to nested path"
+        );
+
+        // Test Azure-style URL with nested path (no trailing slash)
+        let az_result =
+            ManifestNamespace::construct_full_uri("az://container/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            az_result, "az://container/path/subdir/table.lance",
+            "Azure URL should correctly append table name to nested path"
+        );
+
+        // Test GCS-style URL with nested path (no trailing slash)
+        let gs_result =
+            ManifestNamespace::construct_full_uri("gs://bucket/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            gs_result, "gs://bucket/path/subdir/table.lance",
+            "GCS URL should correctly append table name to nested path"
+        );
+
+        // Test with deeper nesting
+        let deep_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/a/b/c/d", "my_table.lance").unwrap();
+        assert_eq!(
+            deep_result, "s3://bucket/a/b/c/d/my_table.lance",
+            "Deeply nested path should work correctly"
+        );
+
+        // Test with root-level path (single segment after bucket)
+        let shallow_result =
+            ManifestNamespace::construct_full_uri("s3://bucket", "table.lance").unwrap();
+        assert_eq!(
+            shallow_result, "s3://bucket/table.lance",
+            "Single-level nested path should work correctly"
+        );
+
+        // Test that URLs with trailing slash already work (no regression)
+        let trailing_slash_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path/subdir/", "table.lance")
+                .unwrap();
+        assert_eq!(
+            trailing_slash_result, "s3://bucket/path/subdir/table.lance",
+            "URL with existing trailing slash should still work"
+        );
+    }
+
+    /// Test that concurrent create_table calls for the same table name don't
+    /// create duplicate entries in the manifest. Uses two independent
+    /// ManifestNamespace instances pointing at the same directory to simulate
+    /// two separate OS processes racing on table creation. The conflict_retries
+    /// setting on the MergeInsert ensures the second operation properly detects
+    /// the duplicate via WhenMatched::Fail after retrying against the latest data.
+    #[tokio::test]
+    async fn test_concurrent_create_table_no_duplicates() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Two independent namespace instances = two separate "processes"
+        // sharing the same underlying filesystem directory.
+        let ns1 = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let ns2 = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let buffer = create_test_ipc_data();
+
+        let mut req1 = CreateTableRequest::new();
+        req1.id = Some(vec!["race_table".to_string()]);
+        let mut req2 = CreateTableRequest::new();
+        req2.id = Some(vec!["race_table".to_string()]);
+
+        // Launch both create_table calls concurrently
+        let (result1, result2) = tokio::join!(
+            ns1.create_table(req1, Bytes::from(buffer.clone())),
+            ns2.create_table(req2, Bytes::from(buffer.clone())),
+        );
+
+        // Exactly one should succeed and one should fail
+        let success_count = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+        let failure_count = [&result1, &result2].iter().filter(|r| r.is_err()).count();
+        assert_eq!(
+            success_count, 1,
+            "Exactly one create should succeed, got: result1={:?}, result2={:?}",
+            result1, result2
+        );
+        assert_eq!(
+            failure_count, 1,
+            "Exactly one create should fail, got: result1={:?}, result2={:?}",
+            result1, result2
+        );
+
+        // Verify only one table entry exists in the manifest
+        let ns_check = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let response = ns_check.list_tables(list_request).await.unwrap();
+        assert_eq!(
+            response.tables.len(),
+            1,
+            "Should have exactly 1 table, found: {:?}",
+            response.tables
+        );
+        assert_eq!(response.tables[0], "race_table");
+
+        // Also verify describe_table works (no "found 2" error)
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec!["race_table".to_string()]);
+        let describe_result = ns_check.describe_table(describe_request).await;
+        assert!(
+            describe_result.is_ok(),
+            "describe_table should not fail with duplicate entries: {:?}",
+            describe_result
         );
     }
 }

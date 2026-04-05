@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Optional, TypedDict
+from typing import Literal, Optional, TypedDict
 
 # Re-exported from native module. See src/dataset/optimize.rs for implementation.
 from .lance import Compaction as Compaction
@@ -58,4 +58,34 @@ class CompactionOptions(TypedDict):
     to reduce this if you are running out of memory during compaction.
 
     The default will use the same default from ``scanner``.
+    """
+    compaction_mode: Optional[
+        Literal["reencode", "try_binary_copy", "force_binary_copy"]
+    ]
+    """
+    The compaction mode to use. Valid values:
+
+    - ``"reencode"``: Decode and re-encode data (default).
+    - ``"try_binary_copy"``: Try binary copy if fragments are compatible,
+      fall back to reencode otherwise.
+    - ``"force_binary_copy"``: Use binary copy or fail if fragments are
+      not compatible.
+    """
+    binary_copy_read_batch_bytes: Optional[int]
+    """
+    The batch size in bytes for reading during binary copy operations.
+    Controls how much data is read at once when performing binary copy.
+    (default: 16MB)
+    """
+    defer_index_remap: Optional[bool]
+    """
+    Whether to defer index remapping during compaction (default: False).
+    """
+    max_source_fragments: Optional[int]
+    """
+    Maximum number of source fragments to compact in a single run. Tasks
+    are included until adding the next task would exceed this limit,
+    allowing for incremental compaction (e.g., compact 20 fragments at a
+    time). Fragments are processed oldest first.
+    (default: None, no limit)
     """

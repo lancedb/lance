@@ -13,7 +13,24 @@
  */
 package org.lance.namespace;
 
-import org.lance.namespace.model.*;
+import org.lance.namespace.model.CreateNamespaceRequest;
+import org.lance.namespace.model.CreateNamespaceResponse;
+import org.lance.namespace.model.CreateTableRequest;
+import org.lance.namespace.model.CreateTableResponse;
+import org.lance.namespace.model.DescribeNamespaceRequest;
+import org.lance.namespace.model.DescribeNamespaceResponse;
+import org.lance.namespace.model.DescribeTableRequest;
+import org.lance.namespace.model.DescribeTableResponse;
+import org.lance.namespace.model.DropNamespaceRequest;
+import org.lance.namespace.model.DropNamespaceResponse;
+import org.lance.namespace.model.DropTableRequest;
+import org.lance.namespace.model.DropTableResponse;
+import org.lance.namespace.model.ListNamespacesRequest;
+import org.lance.namespace.model.ListNamespacesResponse;
+import org.lance.namespace.model.ListTablesRequest;
+import org.lance.namespace.model.ListTablesResponse;
+import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.TableExistsRequest;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -310,19 +327,38 @@ public class RestNamespaceTest {
   }
 
   @Test
-  void testCreateEmptyTable() {
+  void testRenameTable() throws Exception {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =
         new CreateNamespaceRequest().id(Arrays.asList("workspace"));
     namespace.createNamespace(createNsReq);
 
-    // Create empty table (metadata-only operation)
-    CreateEmptyTableRequest createReq =
-        new CreateEmptyTableRequest().id(Arrays.asList("workspace", "empty_table"));
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespace.createTable(createReq, tableData);
 
-    CreateEmptyTableResponse createResp = namespace.createEmptyTable(createReq);
+    // TODO: underlying dir namespace doesn't support rename yet...
 
-    assertNotNull(createResp);
-    assertNotNull(createResp.getLocation());
+    // // Rename the table
+    // RenameTableRequest renameReq =
+    //     new RenameTableRequest()
+    //         .id(Arrays.asList("workspace", "test_table"))
+    //         .newNamespaceId(Arrays.asList("workspace"))
+    //         .newTableName("test_table_renamed");
+
+    // RenameTableResponse renameRes = namespace.renameTable(renameReq);
+    // assertNotNull(renameRes);
+
+    // // Verify table with old name no longer exists
+    // TableExistsRequest oldExistsReq =
+    //     new TableExistsRequest().id(Arrays.asList("workspace", "test_table"));
+    // assertThrows(RuntimeException.class, () -> namespace.tableExists(oldExistsReq));
+
+    // // Verify table with new name exists
+    // TableExistsRequest existsReq =
+    //     new TableExistsRequest().id(Arrays.asList("workspace", "test_table_renamed"));
+    // assertDoesNotThrow(() -> namespace.tableExists(existsReq));
   }
 }

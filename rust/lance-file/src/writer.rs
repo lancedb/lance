@@ -3,41 +3,40 @@
 
 use core::panic;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use arrow_array::RecordBatch;
 
 use arrow_data::ArrayData;
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::stream::FuturesOrdered;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
-    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
+    BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
+    FieldEncodingStrategy, OutOfLineBuffers, default_encoding_strategy,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
-use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use log::{debug, warn};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
-use snafu::location;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 use crate::datatypes::FieldsWithMeta;
+use crate::format::MAGIC;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
-use crate::format::MAGIC;
 
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -100,8 +99,113 @@ pub struct FileWriterOptions {
     pub format_version: Option<LanceFileVersion>,
 }
 
+// Total in-memory budget for buffering serialized page metadata before flushing
+// to the spill file. Divided evenly across columns (with a floor of 64 bytes).
+const DEFAULT_SPILL_BUFFER_LIMIT: usize = 256 * 1024;
+
+/// Spills serialized page metadata to a temporary file to bound memory usage.
+///
+/// The spill file is an unstructured sequence of "chunks". Each chunk is a
+/// contiguous run of length-delimited protobuf `Page` messages belonging to a
+/// single column. Chunks from different columns are interleaved in the order
+/// they are flushed (i.e. whenever a column's in-memory buffer exceeds
+/// `per_column_limit`). The `column_chunks` index records the (offset, length)
+/// of every chunk so each column's pages can be read back and reassembled in
+/// order.
+struct PageMetadataSpill {
+    writer: Box<dyn Writer>,
+    object_store: Arc<ObjectStore>,
+    path: Path,
+    /// Current write position in the spill file.
+    position: u64,
+    /// Per-column buffer of serialized (length-delimited protobuf) page metadata
+    /// that has not yet been flushed to the spill file.
+    column_buffers: Vec<Vec<u8>>,
+    /// Per-column list of chunks that have been flushed to the spill file.
+    /// Each entry is (offset, length) pointing into the spill file.
+    column_chunks: Vec<Vec<(u64, u32)>>,
+    /// Maximum bytes to buffer per column before flushing to the spill file.
+    per_column_limit: usize,
+}
+
+impl PageMetadataSpill {
+    async fn new(object_store: Arc<ObjectStore>, path: Path, num_columns: usize) -> Result<Self> {
+        let writer = object_store.create(&path).await?;
+        let per_column_limit = (DEFAULT_SPILL_BUFFER_LIMIT / num_columns.max(1)).max(64);
+        Ok(Self {
+            writer,
+            object_store,
+            path,
+            position: 0,
+            column_buffers: vec![Vec::new(); num_columns],
+            column_chunks: vec![Vec::new(); num_columns],
+            per_column_limit,
+        })
+    }
+
+    async fn append_page(
+        &mut self,
+        column_idx: usize,
+        page: &pbfile::column_metadata::Page,
+    ) -> Result<()> {
+        page.encode_length_delimited(&mut self.column_buffers[column_idx])
+            .map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
+            })?;
+        if self.column_buffers[column_idx].len() >= self.per_column_limit {
+            self.flush_column(column_idx).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_column(&mut self, column_idx: usize) -> Result<()> {
+        let buf = &self.column_buffers[column_idx];
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let len = buf.len();
+        self.writer.write_all(buf).await?;
+        self.column_chunks[column_idx].push((self.position, len as u32));
+        self.position += len as u64;
+        self.column_buffers[column_idx].clear();
+        Ok(())
+    }
+
+    async fn shutdown_writer(&mut self) -> Result<()> {
+        for col_idx in 0..self.column_buffers.len() {
+            self.flush_column(col_idx).await?;
+        }
+        Writer::shutdown(self.writer.as_mut()).await?;
+        Ok(())
+    }
+}
+
+fn decode_spilled_chunk(data: &Bytes) -> Result<Vec<pbfile::column_metadata::Page>> {
+    let mut pages = Vec::new();
+    let mut cursor = data.clone();
+    while cursor.has_remaining() {
+        let page =
+            pbfile::column_metadata::Page::decode_length_delimited(&mut cursor).map_err(|e| {
+                Error::io_source(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
+            })?;
+        pages.push(page);
+    }
+    Ok(pages)
+}
+
+enum PageSpillState {
+    Pending(Arc<ObjectStore>, Path),
+    Active(PageMetadataSpill),
+}
+
 pub struct FileWriter {
-    writer: ObjectWriter,
+    writer: Box<dyn Writer>,
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
@@ -111,6 +215,7 @@ pub struct FileWriter {
     global_buffers: Vec<(u64, u64)>,
     schema_metadata: HashMap<String, String>,
     options: FileWriterOptions,
+    page_spill: Option<PageSpillState>,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -127,7 +232,7 @@ static WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
 impl FileWriter {
     /// Create a new FileWriter with a desired output schema
     pub fn try_new(
-        object_writer: ObjectWriter,
+        object_writer: Box<dyn Writer>,
         schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
@@ -140,20 +245,21 @@ impl FileWriter {
     ///
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
-    pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
-        if let Some(format_version) = options.format_version {
-            if format_version.is_unstable()
-                && WARNED_ON_UNSTABLE_API
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-            {
-                warn!("You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data.");
-            }
+    pub fn new_lazy(object_writer: Box<dyn Writer>, options: FileWriterOptions) -> Self {
+        if let Some(format_version) = options.format_version
+            && format_version.is_unstable()
+            && WARNED_ON_UNSTABLE_API
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            warn!(
+                "You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data."
+            );
         }
         Self {
             writer: object_writer,
@@ -165,8 +271,21 @@ impl FileWriter {
             field_id_to_column_indices: Vec::new(),
             global_buffers: Vec::new(),
             schema_metadata: HashMap::new(),
+            page_spill: None,
             options,
         }
+    }
+
+    /// Spill page metadata to a sidecar file instead of accumulating in memory.
+    ///
+    /// This can dramatically reduce memory usage when many writers are open
+    /// concurrently (e.g. IVF shuffle with thousands of partition writers).
+    /// The sidecar file is created lazily on the first page write. The caller
+    /// is responsible for cleaning up `path` (e.g. by placing it in a temp
+    /// directory that is removed via RAII).
+    pub fn with_page_metadata_spill(mut self, object_store: Arc<ObjectStore>, path: Path) -> Self {
+        self.page_spill = Some(PageSpillState::Pending(object_store, path));
+        self
     }
 
     /// Write a series of record batches to a new file
@@ -187,7 +306,7 @@ impl FileWriter {
         Ok(writer.finish().await? as usize)
     }
 
-    async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+    async fn do_write_buffer(writer: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> Result<()> {
         writer.write_all(buf).await?;
         let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
         writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
@@ -223,9 +342,20 @@ impl FileWriter {
             length: encoded_page.num_rows,
             priority: encoded_page.row_number,
         };
-        self.column_metadata[encoded_page.column_idx as usize]
-            .pages
-            .push(page);
+        let col_idx = encoded_page.column_idx as usize;
+        if matches!(&self.page_spill, Some(PageSpillState::Pending(..))) {
+            let Some(PageSpillState::Pending(store, path)) = self.page_spill.take() else {
+                unreachable!()
+            };
+            self.page_spill = Some(PageSpillState::Active(
+                PageMetadataSpill::new(store, path, self.num_columns as usize).await?,
+            ));
+        }
+        match &mut self.page_spill {
+            Some(PageSpillState::Active(spill)) => spill.append_page(col_idx, &page).await?,
+            None => self.column_metadata[col_idx].pages.push(page),
+            Some(PageSpillState::Pending(..)) => unreachable!(),
+        }
         Ok(())
     }
 
@@ -264,7 +394,10 @@ impl FileWriter {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -319,6 +452,7 @@ impl FileWriter {
             max_page_bytes,
             keep_original_array,
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
+            version: self.version(),
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
@@ -354,16 +488,16 @@ impl FileWriter {
             .iter()
             .zip(self.column_writers.iter_mut())
             .map(|(field, column_writer)| {
-                let array = batch
-                    .column_by_name(&field.name)
-                    .ok_or(Error::InvalidInput {
-                        source: format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                        location: location!(),
-                    })?;
+                let array =
+                    batch
+                        .column_by_name(&field.name)
+                        .ok_or(Error::invalid_input_source(
+                            format!(
+                                "Cannot write batch.  The batch was missing the column `{}`",
+                                field.name
+                            )
+                            .into(),
+                        ))?;
                 let repdef = RepDefBuilder::default();
                 let num_rows = array.len() as u64;
                 column_writer.maybe_encode(
@@ -395,10 +529,9 @@ impl FileWriter {
             return Ok(());
         }
         if num_rows > u32::MAX as u64 {
-            return Err(Error::InvalidInput {
-                source: "cannot write Lance files with more than 2^32 rows".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "cannot write Lance files with more than 2^32 rows".into(),
+            ));
         }
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
@@ -418,7 +551,7 @@ impl FileWriter {
         self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
             Some(rows_written) => rows_written,
             None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into(), location: location!() });
+                return Err(Error::invalid_input_source(format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into()));
             }
         };
 
@@ -439,12 +572,38 @@ impl FileWriter {
     }
 
     async fn write_column_metadatas(&mut self) -> Result<Vec<(u64, u64)>> {
-        let mut metadatas = Vec::new();
-        std::mem::swap(&mut self.column_metadata, &mut metadatas);
+        let metadatas = std::mem::take(&mut self.column_metadata);
+
+        // If spilling, finalize the spill writer and reopen for reading.
+        // The spill file itself is cleaned up by the caller (it lives in a
+        // temp directory managed by the caller's RAII guard).
+        let spill_state = self.page_spill.take();
+        let (spill_chunks, spill_reader) =
+            if let Some(PageSpillState::Active(mut spill)) = spill_state {
+                spill.shutdown_writer().await?;
+                let reader = spill.object_store.open(&spill.path).await?;
+                let chunks = std::mem::take(&mut spill.column_chunks);
+                (chunks, Some(reader))
+            } else {
+                (Vec::new(), None)
+            };
+
         let mut metadata_positions = Vec::with_capacity(metadatas.len());
-        for metadata in metadatas {
+        for (col_idx, mut metadata) in metadatas.into_iter().enumerate() {
+            if let Some(reader) = &spill_reader {
+                let mut pages = Vec::new();
+                for &(offset, len) in &spill_chunks[col_idx] {
+                    let data = reader
+                        .get_range(offset as usize..(offset as usize + len as usize))
+                        .await
+                        .map_err(|e| Error::io_source(Box::new(e)))?;
+                    pages.extend(decode_spilled_chunk(&data)?);
+                }
+                metadata.pages = pages;
+            }
             metadata_positions.push(self.write_column_metadata(metadata).await?);
         }
+
         Ok(metadata_positions)
     }
 
@@ -463,8 +622,17 @@ impl FileWriter {
     }
 
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
-        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
+        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created"))?;
         schema.metadata = std::mem::take(&mut self.schema_metadata);
+        // Use descriptor layout for blob v2 in the footer to avoid exposing logical child fields.
+        //
+        // TODO(xuanwo): this doesn't work on nested struct, need better solution like fields_per_order_mut?
+        schema.fields.iter_mut().for_each(|f| {
+            if f.is_blob_v2() {
+                f.unloaded_mut();
+            }
+        });
+
         let file_descriptor = Self::make_file_descriptor(schema, self.rows_written)?;
         let file_descriptor_bytes = file_descriptor.encode_to_vec();
         let file_descriptor_len = file_descriptor_bytes.len() as u64;
@@ -483,6 +651,26 @@ impl FileWriter {
     /// must be called before `finish` is called.
     pub fn add_schema_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.schema_metadata.insert(key.into(), value.into());
+    }
+
+    /// Prepare the writer when column data and metadata were produced externally.
+    ///
+    /// This is useful for flows that copy already-encoded pages (e.g., binary copy
+    /// during compaction) where the column buffers have been written directly and we
+    /// only need to write the footer and schema metadata. The provided
+    /// `column_metadata` must describe the buffers already persisted by the
+    /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
+    /// of rows in those buffers.
+    pub fn initialize_with_external_metadata(
+        &mut self,
+        schema: lance_core::datatypes::Schema,
+        column_metadata: Vec<pbfile::ColumnMetadata>,
+        rows_written: u64,
+    ) {
+        self.schema = Some(schema);
+        self.num_columns = column_metadata.len() as u32;
+        self.column_metadata = column_metadata;
+        self.rows_written = rows_written;
     }
 
     /// Adds a global buffer to the file
@@ -556,6 +744,7 @@ impl FileWriter {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
             LanceFileVersion::V2_2 => (2, 2),
+            LanceFileVersion::V2_3 => (2, 3),
             _ => panic!("Unsupported version: {}", version),
         }
     }
@@ -585,7 +774,9 @@ impl FileWriter {
             .collect::<FuturesOrdered<_>>();
         self.write_pages(encoding_tasks).await?;
 
-        self.finish_writers().await?;
+        if !self.column_writers.is_empty() {
+            self.finish_writers().await?;
+        }
 
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
@@ -621,12 +812,14 @@ impl FileWriter {
         self.writer.write_all(MAGIC).await?;
 
         // 7. close the writer
-        self.writer.shutdown().await?;
+        Writer::shutdown(self.writer.as_mut()).await?;
+
         Ok(self.rows_written)
     }
 
     pub async fn abort(&mut self) {
-        self.writer.abort().await;
+        // For multipart uploads, ObjectWriter's Drop impl will abort
+        // the upload when the writer is dropped.
     }
 
     pub async fn tell(&mut self) -> Result<u64> {
@@ -772,17 +965,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::reader::{describe_encoding, FileReader, FileReaderOptions};
+    use crate::reader::{FileReader, FileReaderOptions, describe_encoding};
     use crate::testing::FsFixture;
-    use crate::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
+    use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
     use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
     use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{RecordBatchReader, StringArray, types::Float64Type};
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
-    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
@@ -923,7 +1116,9 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
         // 2MiB
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
+        }
 
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
@@ -969,7 +1164,9 @@ mod tests {
             }
         }
 
-        std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        unsafe {
+            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+        }
     }
 
     #[tokio::test]
@@ -1043,6 +1240,7 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                minichunk_size: None,
             },
         );
 
@@ -1276,12 +1474,9 @@ mod tests {
             "off".to_string(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "status",
-            DataType::Int32,
-            false,
-        )
-        .with_metadata(metadata)]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("status", DataType::Int32, false).with_metadata(metadata),
+        ]));
 
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
@@ -1438,5 +1633,85 @@ mod tests {
 
         // Verify first value matches what we wrote
         assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
+    }
+
+    fn spill_config() -> (TempObjFile, Arc<ObjectStore>) {
+        let spill_path = TempObjFile::default();
+        (spill_path, Arc::new(ObjectStore::local()))
+    }
+
+    fn make_batches(num_batches: i32, num_cols: usize, rows_per_batch: i32) -> Vec<RecordBatch> {
+        let fields: Vec<_> = (0..num_cols)
+            .map(|c| ArrowField::new(format!("c{c}"), DataType::Int32, false))
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        (0..num_batches)
+            .map(|i| {
+                let cols: Vec<Arc<dyn arrow_array::Array>> = (0..num_cols)
+                    .map(|c| {
+                        let start = (i * rows_per_batch + c as i32) * 100;
+                        Arc::new(Int32Array::from_iter_values(start..start + rows_per_batch))
+                            as Arc<dyn arrow_array::Array>
+                    })
+                    .collect();
+                RecordBatch::try_new(schema.clone(), cols).unwrap()
+            })
+            .collect()
+    }
+
+    async fn write_and_read_batches(
+        batches: &[RecordBatch],
+        spill: Option<(Arc<ObjectStore>, object_store::path::Path)>,
+    ) -> Vec<RecordBatch> {
+        let fs = FsFixture::default();
+        let lance_schema = LanceSchema::try_from(batches[0].schema().as_ref()).unwrap();
+        let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
+        if let Some((store, path)) = spill {
+            file_writer = file_writer.with_page_metadata_spill(store, path);
+        }
+        for batch in batches {
+            file_writer.write_batch(batch).await.unwrap();
+        }
+        file_writer.add_schema_metadata("foo", "bar");
+        file_writer.finish().await.unwrap();
+
+        crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await
+    }
+
+    #[rstest::rstest]
+    #[case::multi_col(20, 2, 100)]
+    #[case::many_batches(50, 2, 100)]
+    #[tokio::test]
+    async fn test_page_metadata_spill_roundtrip(
+        #[case] num_batches: i32,
+        #[case] num_cols: usize,
+        #[case] rows_per_batch: i32,
+    ) {
+        let batches = make_batches(num_batches, num_cols, rows_per_batch);
+        let baseline = write_and_read_batches(&batches, None).await;
+        let (spill_path, spill_store) = spill_config();
+        let spilled =
+            write_and_read_batches(&batches, Some((spill_store, spill_path.as_ref().clone())))
+                .await;
+        assert_eq!(baseline, spilled);
+    }
+
+    #[tokio::test]
+    async fn test_page_metadata_spill_many_columns() {
+        // Many columns forces small per-column buffer limits, exercising mid-write flushing.
+        let batches = make_batches(10, 500, 100);
+        let baseline = write_and_read_batches(&batches, None).await;
+        let (spill_path, spill_store) = spill_config();
+        let spilled =
+            write_and_read_batches(&batches, Some((spill_store, spill_path.as_ref().clone())))
+                .await;
+        assert_eq!(baseline, spilled);
     }
 }

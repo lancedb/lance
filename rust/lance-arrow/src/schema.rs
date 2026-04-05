@@ -40,6 +40,9 @@ pub trait FieldExt {
 
     /// Check if the field is marked as a blob
     fn is_blob(&self) -> bool;
+
+    /// Check if the field is marked as a blob
+    fn is_blob_v2(&self) -> bool;
 }
 
 impl FieldExt for Field {
@@ -107,6 +110,14 @@ impl FieldExt for Field {
                 .get(ARROW_EXT_NAME_KEY)
                 .map(|value| value == BLOB_V2_EXT_NAME)
                 .unwrap_or(false)
+    }
+
+    fn is_blob_v2(&self) -> bool {
+        let field_metadata = self.metadata();
+        field_metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|value| value == BLOB_V2_EXT_NAME)
+            .unwrap_or(false)
     }
 }
 

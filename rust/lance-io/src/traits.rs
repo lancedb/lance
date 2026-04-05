@@ -6,21 +6,41 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
+use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use lance_core::Result;
 
+use crate::object_writer::WriteResult;
+
 pub trait ProtoStruct {
     type Proto: Message;
 }
+
+pub type ByteStream = BoxStream<'static, object_store::Result<Bytes>>;
 
 /// A trait for writing to a file on local file system or object store.
 #[async_trait]
 pub trait Writer: AsyncWrite + Unpin + Send {
     /// Tell the current offset.
     async fn tell(&mut self) -> Result<usize>;
+
+    /// Flush all buffered data and finalize the write, returning metadata about
+    /// the written object.
+    async fn shutdown(&mut self) -> Result<WriteResult>;
+}
+
+#[async_trait]
+impl Writer for Box<dyn Writer> {
+    async fn tell(&mut self) -> Result<usize> {
+        self.as_mut().tell().await
+    }
+
+    async fn shutdown(&mut self) -> Result<WriteResult> {
+        self.as_mut().shutdown().await
+    }
 }
 
 /// Lance Write Extension.
@@ -49,6 +69,14 @@ pub trait WriteExt {
         minor_version: i16,
         magic: &[u8],
     ) -> Result<()>;
+
+    async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize>;
+
+    async fn copy_range_from_reader(
+        &mut self,
+        reader: &dyn Reader,
+        range: Range<usize>,
+    ) -> Result<usize>;
 }
 
 #[async_trait]
@@ -77,9 +105,34 @@ impl<W: Writer + ?Sized> WriteExt for W {
         self.write_all(magic).await?;
         Ok(())
     }
+
+    async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize> {
+        let mut stream = reader.get_stream().await?;
+        let mut copied = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            copied += bytes.len();
+            self.write_all(&bytes).await?;
+        }
+        Ok(copied)
+    }
+
+    async fn copy_range_from_reader(
+        &mut self,
+        reader: &dyn Reader,
+        range: Range<usize>,
+    ) -> Result<usize> {
+        let mut stream = reader.get_range_stream(range).await?;
+        let mut copied = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            copied += bytes.len();
+            self.write_all(&bytes).await?;
+        }
+        Ok(copied)
+    }
 }
 
-#[async_trait]
 pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn path(&self) -> &Path;
 
@@ -90,16 +143,35 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn io_parallelism(&self) -> usize;
 
     /// Object/File Size.
-    async fn size(&self) -> object_store::Result<usize>;
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
 
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations
     /// may not need the size beforehand.
-    async fn get_all(&self) -> object_store::Result<Bytes>;
+    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>>;
+
+    /// Read the entire object as a byte stream.
+    fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        Box::pin(async move {
+            let bytes = self.get_all().await?;
+            Ok(futures::stream::once(async move { Ok(bytes) }).boxed())
+        })
+    }
+
+    /// Read a byte range as a byte stream.
+    fn get_range_stream(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        Box::pin(async move {
+            let bytes = self.get_range(range).await?;
+            Ok(futures::stream::once(async move { Ok(bytes) }).boxed())
+        })
+    }
 }

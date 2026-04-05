@@ -12,19 +12,23 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::refs::Ref::{Tag, Version};
+use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
-use snafu::location;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 use std::io::ErrorKind;
+use uuid::Uuid;
+
+pub const MAIN_BRANCH: &str = "main";
 
 /// Lance Ref
 #[derive(Debug, Clone)]
 pub enum Ref {
+    // Version number points of the current branch
+    VersionNumber(u64),
     // This is a global version identifier present as (branch_name, version_number)
     // if branch_name is None, it points to the main branch
     // if version_number is None, it points to the latest version
@@ -34,32 +38,32 @@ pub enum Ref {
 }
 
 impl From<u64> for Ref {
-    fn from(ref_: u64) -> Self {
-        Version(None, Some(ref_))
+    fn from(reference: u64) -> Self {
+        VersionNumber(reference)
     }
 }
 
 impl From<&str> for Ref {
-    fn from(ref_: &str) -> Self {
-        Tag(ref_.to_string())
+    fn from(reference: &str) -> Self {
+        Tag(reference.to_string())
     }
 }
 
 impl From<(&str, u64)> for Ref {
-    fn from(_ref: (&str, u64)) -> Self {
-        Version(Some(_ref.0.to_string()), Some(_ref.1))
+    fn from(reference: (&str, u64)) -> Self {
+        Version(standardize_branch(reference.0), Some(reference.1))
     }
 }
 
-impl From<(Option<String>, Option<u64>)> for Ref {
-    fn from(_ref: (Option<String>, Option<u64>)) -> Self {
-        Version(_ref.0, _ref.1)
+impl From<(Option<&str>, Option<u64>)> for Ref {
+    fn from(reference: (Option<&str>, Option<u64>)) -> Self {
+        Version(reference.0.and_then(standardize_branch), reference.1)
     }
 }
 
 impl From<(&str, Option<u64>)> for Ref {
-    fn from(_ref: (&str, Option<u64>)) -> Self {
-        Version(Some(_ref.0.to_string()), _ref.1)
+    fn from(reference: (&str, Option<u64>)) -> Self {
+        Version(standardize_branch(reference.0), reference.1)
     }
 }
 
@@ -67,12 +71,12 @@ impl fmt::Display for Ref {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Version(branch, version_number) => {
-                let branch_name = branch.as_deref().unwrap_or("main");
                 let version_str = version_number
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "latest".to_string());
-                write!(f, "{}:{}", branch_name, version_str)
+                write!(f, "{}:{}", normalize_branch(branch.as_deref()), version_str)
             }
+            VersionNumber(version_number) => write!(f, "{}", version_number),
             Tag(tag_name) => write!(f, "{}", tag_name),
         }
     }
@@ -204,24 +208,12 @@ impl Tags<'_> {
         }
 
         let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-
         Ok(tag_contents)
     }
 
-    pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
-        self.create_on_branch(tag, version, None).await
-    }
-
-    pub async fn create_on_branch(
-        &self,
-        tag: &str,
-        version_number: u64,
-        branch: Option<&str>,
-    ) -> Result<()> {
+    pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
-
         let root_location = self.refs.root()?;
-        let branch = branch.map(String::from);
         let tag_file = tag_path(&root_location.path, tag);
 
         if self.object_store().exists(&tag_file).await? {
@@ -229,39 +221,7 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-
-        let branch_location = self.refs.base_location.find_branch(branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(
-                &branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
-            )
-            .await?;
-
-        if !self.object_store().exists(&manifest_file.path).await? {
-            return Err(Error::VersionNotFound {
-                message: format!(
-                    "version {}::{} does not exist",
-                    branch.unwrap_or("Main".to_string()),
-                    version_number
-                ),
-            });
-        }
-
-        let manifest_size = if let Some(size) = manifest_file.size {
-            size as usize
-        } else {
-            self.object_store().size(&manifest_file.path).await? as usize
-        };
-
-        let tag_contents = TagContents {
-            branch,
-            version: version_number,
-            manifest_size,
-        };
+        let tag_contents = self.build_tag_content_by_ref(reference).await?;
 
         self.object_store()
             .put(
@@ -287,43 +247,60 @@ impl Tags<'_> {
         self.object_store().delete(&tag_file).await
     }
 
-    pub async fn update(&self, tag: &str, version: u64) -> Result<()> {
-        self.update_on_branch(tag, version, None).await
-    }
-
-    /// Update a tag to a branch::version
-    pub async fn update_on_branch(
-        &self,
-        tag: &str,
-        version_number: u64,
-        branch: Option<&str>,
-    ) -> Result<()> {
+    pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
 
-        let branch = branch.map(String::from);
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
-
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
+        let tag_contents = self.build_tag_content_by_ref(reference).await?;
 
-        let target_branch_location = self.refs.base_location.find_branch(branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(
-                &target_branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
             )
-            .await?;
+            .await
+            .map(|_| ())
+    }
+
+    async fn build_tag_content_by_ref(&self, reference: impl Into<Ref>) -> Result<TagContents> {
+        let reference = reference.into();
+        let (branch, version_number) = match reference {
+            Version(branch, version_number) => (branch, version_number),
+            VersionNumber(version_number) => {
+                (self.refs.base_location.branch.clone(), Some(version_number))
+            }
+            Tag(tag_name) => {
+                let tag_content = self.get(tag_name.as_str()).await?;
+                (tag_content.branch, Some(tag_content.version))
+            }
+        };
+
+        let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
+        let manifest_file = if let Some(version_number) = version_number {
+            self.refs
+                .commit_handler
+                .resolve_version_location(
+                    &branch_location.path,
+                    version_number,
+                    &self.refs.object_store.inner,
+                )
+                .await?
+        } else {
+            self.refs
+                .commit_handler
+                .resolve_latest_location(&branch_location.path, &self.refs.object_store)
+                .await?
+        };
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("version {} does not exist", version_number),
+                message: format!("version {} does not exist", Version(branch, version_number)),
             });
         }
 
@@ -335,21 +312,18 @@ impl Tags<'_> {
 
         let tag_contents = TagContents {
             branch,
-            version: version_number,
+            version: manifest_file.version,
             manifest_size,
         };
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        Ok(tag_contents)
     }
 }
 
 impl Branches<'_> {
+    pub(crate) fn is_main_branch(branch: Option<&str>) -> bool {
+        branch == Some(MAIN_BRANCH)
+    }
+
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_branches_contents_path(&root_location.path);
@@ -408,7 +382,17 @@ impl Branches<'_> {
         Ok(branch_contents)
     }
 
-    pub async fn create(
+    pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
+        if let Some(branch_name) = branch {
+            let branch_contents = self.get(branch_name).await?;
+            Ok(branch_contents.identifier)
+        } else {
+            Ok(BranchIdentifier::main())
+        }
+    }
+
+    // Only create branch metadata
+    pub(crate) async fn create(
         &self,
         branch_name: &str,
         version_number: u64,
@@ -416,7 +400,7 @@ impl Branches<'_> {
     ) -> Result<()> {
         check_valid_branch(branch_name)?;
 
-        let source_branch = source_branch.map(String::from);
+        let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
         if self.object_store().exists(&branch_file).await? {
@@ -425,7 +409,10 @@ impl Branches<'_> {
             });
         }
 
-        let branch_location = self.refs.base_location.find_branch(source_branch.clone())?;
+        let branch_location = self
+            .refs
+            .base_location
+            .find_branch(source_branch.as_deref())?;
         // Verify the source version exists
         let manifest_file = self
             .refs
@@ -443,8 +430,24 @@ impl Branches<'_> {
             });
         };
 
+        let parent_branch_id = if let Some(ref parent_branch) = source_branch {
+            let parent_file = branch_contents_path(&root_location.path, parent_branch);
+            if self.object_store().exists(&parent_file).await? {
+                BranchContents::from_path(&parent_file, self.object_store())
+                    .await?
+                    .identifier
+            } else {
+                return Err(Error::RefNotFound {
+                    message: format!("Parent branch {} does not exist", branch_name),
+                });
+            }
+        } else {
+            BranchIdentifier::main()
+        };
+
         let branch_contents = BranchContents {
             parent_branch: source_branch,
+            identifier: BranchIdentifier::new(&parent_branch_id, version_number),
             parent_version: version_number,
             create_at: chrono::Utc::now().timestamp() as u64,
             manifest_size: if let Some(size) = manifest_file.size {
@@ -470,16 +473,32 @@ impl Branches<'_> {
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        let all_branches = self.list().await?;
+        let branch_id = all_branches
+            .get(branch)
+            .map(|contents| contents.identifier.clone());
+        if let Some(branch_id) = branch_id {
+            let referenced_versions = branch_id.collect_referenced_versions(&all_branches);
+            if !referenced_versions.is_empty() {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "Branch {} is referenced by {:?} versions, can not delete",
+                        branch, referenced_versions
+                    ),
+                });
+            }
+        } else if !force {
+            return Err(Error::RefNotFound {
+                message: format!("Branch {} does not exist", branch),
+            });
+        } else {
+            log::warn!("BranchContents of {} does not exist", branch);
+        }
+
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
             self.object_store().delete(&branch_file).await?;
-        } else if force {
-            log::warn!("BranchContents of {} does not exist", branch);
-        } else {
-            return Err(Error::RefNotFound {
-                message: format!("Branch {} does not exist", branch),
-            });
         }
 
         // Clean up branch directories
@@ -510,22 +529,21 @@ impl Branches<'_> {
 
         if let Some(delete_path) =
             Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?
+            && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
         {
-            if let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await {
-                match &e {
-                    Error::IO { source, .. } => {
-                        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                            if io_err.kind() == ErrorKind::NotFound {
-                                log::debug!("Branch directory already deleted: {}", io_err);
-                            } else {
-                                return Err(e);
-                            }
+            match &e {
+                Error::IO { source, .. } => {
+                    if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == ErrorKind::NotFound {
+                            log::debug!("Branch directory already deleted: {}", io_err);
                         } else {
                             return Err(e);
                         }
+                    } else {
+                        return Err(e);
                     }
-                    _ => return Err(e),
                 }
+                _ => return Err(e),
             }
         }
         Ok(())
@@ -536,35 +554,97 @@ impl Branches<'_> {
         remaining_branches: &[&str],
         base_location: &BranchLocation,
     ) -> Result<Option<Path>> {
-        let mut longest_used_length = 0;
-        for &candidate in remaining_branches {
-            let common_len = branch
-                .chars()
-                .zip(candidate.chars())
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            if common_len > longest_used_length {
-                longest_used_length = common_len;
+        let deleted_branch = BranchRelativePath::new(branch);
+        let mut related_branches = Vec::new();
+        let mut relative_dir = branch.to_string();
+        for branch in remaining_branches {
+            let branch = BranchRelativePath::new(branch);
+            if branch.is_parent(&deleted_branch) || branch.is_child(&deleted_branch) {
+                related_branches.push(branch);
+            } else if let Some(common_prefix) = deleted_branch.find_common_prefix(&branch) {
+                related_branches.push(common_prefix);
             }
         }
-        // Means this branch path is used as a prefix of other branches
-        if longest_used_length == branch.len() {
-            return Ok(None);
+
+        related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
+        if let Some(branch) = related_branches.first() {
+            if branch.is_child(&deleted_branch) || branch == &deleted_branch {
+                // There are children of the deleted branch, we can't delete any directory for now
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a/b/c/d"], we need to delete nothing
+                return Ok(None);
+            } else {
+                // We pick the longest common directory between the deleted branch and the remaining branches
+                // Then delete the first child of this common directory
+                // Example: deleted_branch = "a/b/c", remaining_branches = ["a"], we need to delete "a/b"
+                relative_dir = format!(
+                    "{}/{}",
+                    branch.segments.join("/"),
+                    deleted_branch.segments[branch.segments.len()]
+                );
+            }
+        } else if !deleted_branch.segments.is_empty() {
+            // There are no common directories between the deleted branch and the remaining branches
+            // We need to delete the entire directory
+            // Example: deleted_branch = "a/b/c", remaining_branches = [], we need to delete "a"
+            relative_dir = deleted_branch.segments[0].to_string();
         }
 
-        let mut used_relative_path = &branch[..longest_used_length];
-        if let Some(last_slash_index) = used_relative_path.rfind('/') {
-            used_relative_path = &used_relative_path[..last_slash_index];
+        let absolute_dir = base_location.find_branch(Some(relative_dir.as_str()))?;
+        Ok(Some(absolute_dir.path))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct BranchRelativePath<'a> {
+    segments: Vec<&'a str>,
+}
+
+impl<'a> BranchRelativePath<'a> {
+    fn new(branch_name: &'a str) -> Self {
+        let segments = branch_name.split('/').collect_vec();
+        Self { segments }
+    }
+
+    fn find_common_prefix(&self, other: &Self) -> Option<Self> {
+        let mut common_segments = Vec::new();
+        for (i, segment) in self.segments.iter().enumerate() {
+            if i >= other.segments.len() || other.segments[i] != *segment {
+                break;
+            }
+            common_segments.push(*segment);
         }
-        let unused_dir = &branch[used_relative_path.len()..].trim_start_matches('/');
-        if let Some(sub_dir) = unused_dir.split('/').next() {
-            let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
-            // Use base_location to generate the cleanup path
-            let absolute_dir = base_location.find_branch(Some(relative_dir))?;
-            Ok(Some(absolute_dir.path))
+        if !common_segments.is_empty() {
+            Some(BranchRelativePath {
+                segments: common_segments,
+            })
         } else {
-            Ok(None)
+            None
+        }
+    }
+
+    fn is_parent(&self, other: &Self) -> bool {
+        if other.segments.len() <= self.segments.len() {
+            false
+        } else {
+            for (i, segment) in self.segments.iter().enumerate() {
+                if other.segments[i] != *segment {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    fn is_child(&self, other: &Self) -> bool {
+        if other.segments.len() >= self.segments.len() {
+            false
+        } else {
+            for (i, segment) in other.segments.iter().enumerate() {
+                if self.segments[i] != *segment {
+                    return false;
+                }
+            }
+            true
         }
     }
 }
@@ -581,9 +661,94 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
+    #[serde(default = "BranchIdentifier::none")]
+    pub identifier: BranchIdentifier,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
     pub manifest_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BranchIdentifier {
+    pub version_mapping: Vec<(u64, String)>,
+}
+
+impl BranchIdentifier {
+    pub fn new(parent: &Self, parent_version: u64) -> Self {
+        let mut version_mapping = parent.version_mapping.clone();
+        version_mapping.push((parent_version, Uuid::new_v4().simple().to_string()));
+        Self { version_mapping }
+    }
+
+    /// Creates a branch identifier for legacy branches without explicit lineage.
+    /// Legacy branches have parent_version=0 and are skipped during cleanup.
+    pub fn none() -> Self {
+        Self {
+            version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
+        }
+    }
+
+    pub fn main() -> Self {
+        Self {
+            version_mapping: vec![],
+        }
+    }
+
+    pub fn parse(identifier: &str) -> Result<Self> {
+        let parts: Vec<&str> = identifier.split(':').collect();
+        if !parts.len().is_multiple_of(2) {
+            return Err(Error::InvalidRef {
+                message: format!(
+                    "Invalid branch identifier: {}, format should be 'ver1:uuid1:ver2:uuid2:...:final_uuid'",
+                    parts.len()
+                ),
+            });
+        }
+
+        let version_mapping = parts
+            .chunks_exact(2)
+            .map(|chunk| {
+                let version = chunk[0].parse::<u64>().map_err(|e| Error::InvalidRef {
+                    message: format!("Invalid version number '{}': {}", chunk[0], e),
+                })?;
+                let uuid = chunk[1].to_string();
+                Ok((version, uuid))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self { version_mapping })
+    }
+
+    pub fn find_referenced_version(&self, referenced_branch: &Self) -> Option<u64> {
+        let ref_mapping = &referenced_branch.version_mapping;
+        let next_idx = ref_mapping.len();
+
+        (self.version_mapping.len() > next_idx && self.version_mapping[..next_idx] == *ref_mapping)
+            .then(|| self.version_mapping[next_idx].0)
+            .filter(|&version| version > 0)
+    }
+
+    /// Collects all branches that reference this branch, returning (branch_name, version) tuples.
+    /// Results are in post-order traversal (deepest branches first).
+    pub fn collect_referenced_versions(
+        &self,
+        branches: &HashMap<String, BranchContents>,
+    ) -> Vec<(String, u64)> {
+        let mut branch_ids = branches
+            .iter()
+            .map(|(name, branch)| (branch.identifier.clone(), name.clone()))
+            .collect::<Vec<_>>();
+        // Sort by BranchIdentifier desc to implement post-order traversal.
+        branch_ids.sort_by(|a, b| b.cmp(a));
+        branch_ids
+            .into_iter()
+            .filter_map(|(branch_id, name)| {
+                branch_id
+                    .find_referenced_version(self)
+                    .map(|version| (name, version))
+            })
+            .collect()
+    }
 }
 
 pub fn base_tags_path(base_path: &Path) -> Path {
@@ -603,6 +768,20 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
 }
 
+pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
+    match branch {
+        None => MAIN_BRANCH.to_string(),
+        Some(name) => name.to_string(),
+    }
+}
+
+pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
+    match branch {
+        MAIN_BRANCH => None,
+        name => Some(name.to_string()),
+    }
+}
+
 async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
 where
     T: DeserializeOwned,
@@ -615,7 +794,7 @@ where
         })
         .await?;
     let json_str = String::from_utf8(tag_bytes.to_vec())
-        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string(), location!()))?;
+        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string()))?;
     Ok(serde_json::from_str(&json_str)?)
 }
 
@@ -670,7 +849,10 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
         {
             return Err(Error::InvalidRef {
-                message: format!("Branch segment '{}' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.", segment),
+                message: format!(
+                    "Branch segment '{}' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.",
+                    segment
+                ),
             });
         }
     }
@@ -859,9 +1041,8 @@ mod tests {
         // Test From<u64> for Ref
         let version_ref: Ref = 42u64.into();
         match version_ref {
-            Version(branch, v) => {
-                assert_eq!(v, Some(42));
-                assert_eq!(branch, None)
+            VersionNumber(version_number) => {
+                assert_eq!(version_number, 42);
             }
             _ => panic!("Expected Version variant"),
         }
@@ -888,6 +1069,7 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
+            identifier: BranchIdentifier::none(),
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
@@ -930,21 +1112,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
-    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
-    #[case("a/b/c", &["a/b/d", "a/e"], Some("a/b/c"))]
     #[case("feature/auth", &["feature/auth/sub"], None)]
     #[case("feature", &["feature/sub1", "feature/sub2"], None)]
-    #[case("a/b", &["a/b/c", "a/b/d"], None)]
+    #[case("a/b", &["a/b/c", "b/c/d"], None)]
     #[case("main", &[], Some("main"))]
     #[case("a", &["a"], None)]
-    #[case("single", &["other"], Some("single"))]
-    #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth"))]
-    #[case("feature/user-auth", &["feature/user-signup"], Some("feature/user-auth"))]
-    #[case("release/2024.01", &["release/2024.02"], Some("release/2024.01"))]
-    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
-    #[case("feature", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
     #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
+    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
+    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
+    #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],
@@ -969,7 +1147,7 @@ mod tests {
                     branch_to_delete
                 );
                 let expected_full_path = base_location
-                    .find_branch(Some(expected_relative.to_string()))
+                    .find_branch(Some(expected_relative))
                     .unwrap()
                     .path;
                 assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());
@@ -983,5 +1161,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build a reusable mocked BranchContents map mirroring cleanup::lineage_tests::build_lineage_datasets.
+    ///
+    /// Structure:
+    ///    main:v1 ──▶ branch1:v1 ──▶ dev/branch2:v2 ──▶ feature/nathan/branch3:v3
+    ///        │
+    ///    (main:v2) ──▶ branch4:v2
+    ///
+    /// Notes:
+    /// - The "main" root is virtual (no BranchContents entry).
+    /// - Version numbers are representative and monotonically increasing along the chain.
+    /// - Tests reuse this builder to ensure consistent lineage and deterministic assertions.
+    fn build_mock_branch_contents() -> HashMap<String, BranchContents> {
+        fn build(
+            parent_name: Option<&str>,
+            parent_branch: Option<&BranchContents>,
+            parent_ver: u64,
+        ) -> BranchContents {
+            let parent_branch_id = if let Some(parent_branch) = parent_branch {
+                parent_branch.identifier.clone()
+            } else {
+                BranchIdentifier::main()
+            };
+            BranchContents {
+                parent_branch: parent_name.map(String::from),
+                identifier: BranchIdentifier::new(&parent_branch_id, parent_ver),
+                parent_version: parent_ver,
+                create_at: 0,
+                manifest_size: 1,
+            }
+        }
+        let mut contents = HashMap::new();
+        contents.insert("branch1".to_string(), build(None, None, 1));
+        contents.insert(
+            "dev/branch2".to_string(),
+            build(Some("branch1"), contents.get("branch1"), 2),
+        );
+        contents.insert(
+            "feature/nathan/branch3".to_string(),
+            build(Some("dev/branch2"), contents.get("dev/branch2"), 3),
+        );
+        contents.insert("branch4".to_string(), build(None, None, 5));
+        contents
+    }
+
+    #[test]
+    fn test_collect_children_for_branch3() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = all_branches
+            .get("feature/nathan/branch3")
+            .unwrap()
+            .identifier
+            .clone();
+        assert!(
+            root_id
+                .collect_referenced_versions(&all_branches)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_collect_children_for_branch2() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = all_branches.get("dev/branch2").unwrap().identifier.clone();
+        let children = root_id.collect_referenced_versions(&all_branches);
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[0].1, 3);
+    }
+
+    #[test]
+    fn test_collect_children_for_branch1() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = all_branches.get("branch1").unwrap().identifier.clone();
+        let children = root_id.collect_referenced_versions(&all_branches);
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[1].0.as_str(), "dev/branch2");
+        assert_eq!(children[0].1, 2);
+        assert_eq!(children[1].1, 2);
+    }
+
+    #[test]
+    fn test_collect_children_for_main() {
+        let all_branches = build_mock_branch_contents();
+        let root_id = BranchIdentifier::main();
+        let children = root_id.collect_referenced_versions(&all_branches);
+
+        assert_eq!(children.len(), 4);
+        assert_eq!(children[0].0.as_str(), "branch4");
+        assert_eq!(children[1].0.as_str(), "feature/nathan/branch3");
+        assert_eq!(children[2].0.as_str(), "dev/branch2");
+        assert_eq!(children[3].0.as_str(), "branch1");
+        assert_eq!(children[0].1, 5);
+        assert_eq!(children[1].1, 1);
+        assert_eq!(children[2].1, 1);
+        assert_eq!(children[3].1, 1);
     }
 }

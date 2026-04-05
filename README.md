@@ -46,7 +46,7 @@ The key features of Lance include:
 
 * **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
 
-* **Zero-copy versioning:** ACID transactions, time travel, and automatic versioning without needing extra infrastructure.
+* **Zero-copy versioning:** Automatic versioning with ACID transactions, time travel, tags, and branches—no extra infrastructure needed.
 
 * **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
 
@@ -68,9 +68,6 @@ To install a preview release:
 ```shell
 pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance
 ```
-
-> [!NOTE]
-> For versions prior to 1.0.0-beta.4, you can find them at https://pypi.fury.io/lancedb/pylance
 
 > [!TIP]
 > Preview releases are released more often than full releases and contain the

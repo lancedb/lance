@@ -17,9 +17,9 @@ import lance.namespace
 import pyarrow as pa
 import pytest
 from lance_namespace import (
-    CreateEmptyTableRequest,
     CreateNamespaceRequest,
     CreateTableRequest,
+    DeclareTableRequest,
     DeregisterTableRequest,
     DescribeNamespaceRequest,
     DescribeTableRequest,
@@ -268,32 +268,6 @@ class TestTableOperations:
         with pytest.raises(Exception):
             rest_namespace.table_exists(exists_req)
 
-    def test_create_empty_table(self, rest_namespace):
-        """Test creating an empty table."""
-        # Create parent namespace
-        create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        rest_namespace.create_namespace(create_ns_req)
-
-        # Create empty table with schema
-        schema = pa.schema(
-            [
-                pa.field("id", pa.int64()),
-                pa.field("name", pa.string()),
-            ]
-        )
-
-        create_req = CreateEmptyTableRequest(
-            id=["workspace", "empty_table"], schema=schema
-        )
-        response = rest_namespace.create_empty_table(create_req)
-
-        assert response is not None
-        assert response.location is not None
-
-        # Verify table exists
-        exists_req = TableExistsRequest(id=["workspace", "empty_table"])
-        rest_namespace.table_exists(exists_req)
-
     def test_deregister_table(self, rest_namespace):
         """Test deregistering a table."""
         # Create parent namespace
@@ -405,6 +379,39 @@ class TestTableOperations:
             rest_namespace.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
 
+    def test_rename_table(self, rest_namespace):
+        """Test renaming a table."""
+        # Create parent namespace
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        rest_namespace.create_namespace(create_ns_req)
+
+        # Create table
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        rest_namespace.create_table(create_req, ipc_data)
+
+        # TODO: underlying dir namespace doesn't support rename yet...
+
+        # # Rename the table
+        # rename_req = RenameTableRequest(
+        #     id=["workspace", "test_table"],
+        #     new_namespace_id=["workspace"],
+        #     new_table_name="test_table_renamed",
+        # )
+
+        # response = rest_namespace.rename_table(rename_req)
+        # assert response is not None
+
+        # # Verify table with old name no longer exists
+        # exists_req = TableExistsRequest(id=["workspace", "test_table"])
+        # with pytest.raises(Exception):
+        #     rest_namespace.table_exists(exists_req)
+
+        # # Verify table with new name exists
+        # exists_req = TableExistsRequest(id=["workspace", "test_table_renamed"])
+        # rest_namespace.table_exists(exists_req)
+
 
 class TestChildNamespaceOperations:
     """Tests for operations in child namespaces - mirrors DirectoryNamespace tests."""
@@ -453,21 +460,18 @@ class TestChildNamespaceOperations:
         with pytest.raises(Exception):
             rest_namespace.table_exists(exists_req)
 
-    def test_empty_table_in_child_namespace(self, rest_namespace):
-        """Test creating an empty table in a child namespace."""
+    def test_declared_table_in_child_namespace(self, rest_namespace):
+        """Test declaring a table in a child namespace."""
         # Create child namespace
         create_ns_req = CreateNamespaceRequest(id=["test_ns"])
         rest_namespace.create_namespace(create_ns_req)
 
-        # Create empty table
-        schema = pa.schema([pa.field("id", pa.int64())])
-        create_req = CreateEmptyTableRequest(
-            id=["test_ns", "empty_table"], schema=schema
-        )
-        rest_namespace.create_empty_table(create_req)
+        # Declare table
+        declare_req = DeclareTableRequest(id=["test_ns", "declared_table"])
+        rest_namespace.declare_table(declare_req)
 
         # Verify table exists
-        exists_req = TableExistsRequest(id=["test_ns", "empty_table"])
+        exists_req = TableExistsRequest(id=["test_ns", "declared_table"])
         rest_namespace.table_exists(exists_req)
 
 
@@ -646,18 +650,18 @@ class TestLanceNamespaceConnect:
 
             with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
                 properties = {"uri": f"http://127.0.0.1:{adapter.port}"}
-                ns = connect("rest", properties)
+                ns_client = connect("rest", properties)
 
-                assert isinstance(ns, lance.namespace.RestNamespace)
+                assert isinstance(ns_client, lance.namespace.RestNamespace)
 
                 create_req = CreateTableRequest(id=["test_table"])
                 table_data = create_test_data()
                 ipc_data = table_to_ipc_bytes(table_data)
-                response = ns.create_table(create_req, ipc_data)
+                response = ns_client.create_table(create_req, ipc_data)
                 assert response is not None
 
                 list_req = ListTablesRequest(id=[])
-                list_response = ns.list_tables(list_req)
+                list_response = ns_client.list_tables(list_req)
                 assert len(list_response.tables) == 1
                 assert list_response.tables[0] == "test_table"
 
@@ -671,12 +675,75 @@ class TestLanceNamespaceConnect:
                     "uri": f"http://127.0.0.1:{adapter.port}",
                     "delimiter": "@",
                 }
-                ns = connect("rest", properties)
+                ns_client = connect("rest", properties)
 
-                assert isinstance(ns, lance.namespace.RestNamespace)
+                assert isinstance(ns_client, lance.namespace.RestNamespace)
 
                 create_req = CreateTableRequest(id=["test_table"])
                 table_data = create_test_data()
                 ipc_data = table_to_ipc_bytes(table_data)
-                response = ns.create_table(create_req, ipc_data)
+                response = ns_client.create_table(create_req, ipc_data)
                 assert response is not None
+
+
+class TestDynamicContextProvider:
+    """Tests for DynamicContextProvider with RestNamespace."""
+
+    def test_rest_namespace_with_explicit_provider(self):
+        """Test RestNamespace with an explicit context provider."""
+        call_count = {"count": 0}
+
+        class TestProvider(lance.namespace.DynamicContextProvider):
+            def provide_context(self, info):
+                call_count["count"] += 1
+                return {
+                    "headers.Authorization": "Bearer test-token",
+                    "headers.X-Request-Id": f"req-{info.get('operation', 'unknown')}",
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                ns_client = lance.namespace.RestNamespace(
+                    uri=f"http://127.0.0.1:{adapter.port}",
+                    context_provider=TestProvider(),
+                )
+
+                # Perform operations
+                create_req = CreateNamespaceRequest(id=["workspace"])
+                ns_client.create_namespace(create_req)
+
+                list_req = ListNamespacesRequest(id=[])
+                ns_client.list_namespaces(list_req)
+
+                # Context provider should have been called
+                assert call_count["count"] >= 2
+
+    def test_explicit_provider_takes_precedence(self):
+        """Test that explicit provider takes precedence over class path."""
+        explicit_called = {"called": False}
+
+        class ExplicitProvider(lance.namespace.DynamicContextProvider):
+            def provide_context(self, info):
+                explicit_called["called"] = True
+                return {"headers.Authorization": "Bearer explicit"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                # Pass both explicit provider and class path - explicit should win
+                ns_client = lance.namespace.RestNamespace(
+                    context_provider=ExplicitProvider(),
+                    **{
+                        "uri": f"http://127.0.0.1:{adapter.port}",
+                        "dynamic_context_provider.impl": "nonexistent.Provider",
+                    },
+                )
+
+                create_req = CreateNamespaceRequest(id=["workspace"])
+                ns_client.create_namespace(create_req)
+
+                # Explicit provider should have been used
+                assert explicit_called["called"]

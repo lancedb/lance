@@ -39,28 +39,34 @@ macro_rules! ok_or_throw_with_return {
     };
 }
 
+mod async_scanner;
 mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
+mod delta;
+mod dispatcher;
 pub mod error;
 pub mod ffi;
 mod file_reader;
 mod file_writer;
 mod fragment;
+mod index;
 mod merge_insert;
 mod namespace;
 mod optimize;
 mod schema;
+mod session;
 mod sql;
 mod storage_options;
+mod task_tracker;
 pub mod traits;
 mod transaction;
 pub mod utils;
+mod vector_trainer;
 
 pub use error::Error;
 pub use error::Result;
 pub use ffi::JNIEnvExt;
-pub use storage_options::JavaStorageOptionsProvider;
 
 use env_logger::{Builder, Env};
 use std::env;
@@ -108,14 +114,14 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
         let path = Path::new(&log_file_path);
 
         // Create parent directories if they don't exist
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                println!(
-                    "Failed to create parent directories for log file '{}': {}, using stderr",
-                    log_file_path, e
-                );
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            println!(
+                "Failed to create parent directories for log file '{}': {}, using stderr",
+                log_file_path, e
+            );
+            return;
         }
 
         // Try to open/create the log file
@@ -133,7 +139,7 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_JniLoader_initLanceLogger() {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
@@ -146,4 +152,24 @@ pub extern "system" fn Java_org_lance_JniLoader_initLanceLogger() {
     log::set_boxed_logger(Box::new(logger.clone())).unwrap();
     log::set_max_level(max_level);
     // todo: add tracing
+}
+
+/// JNI_OnLoad - Called when the JVM loads the native library
+/// Initializes the global dispatcher for async operations
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(
+    vm: jni::JavaVM,
+    _reserved: *mut std::ffi::c_void,
+) -> jni::sys::jint {
+    let jvm_arc = Arc::new(vm);
+
+    // Initialize global dispatcher with persistent thread
+    let dispatcher = dispatcher::Dispatcher::initialize(jvm_arc);
+
+    // Set the global DISPATCHER (will panic if called more than once)
+    dispatcher::DISPATCHER
+        .set(dispatcher)
+        .expect("Dispatcher already initialized");
+
+    jni::sys::JNI_VERSION_1_8
 }

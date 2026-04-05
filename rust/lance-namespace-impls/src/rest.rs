@@ -4,32 +4,141 @@
 //! REST implementation of Lance Namespace
 
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use crate::OpsMetrics;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use reqwest::header::{HeaderName, HeaderValue};
 
-use lance_namespace::apis::{
-    configuration::Configuration, namespace_api, table_api, transaction_api,
-};
+use crate::context::{DynamicContextProvider, OperationInfo};
+
+use lance_namespace::apis::urlencode;
 use lance_namespace::models::{
-    AlterTransactionRequest, AlterTransactionResponse, CountTableRowsRequest,
-    CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeregisterTableRequest,
-    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTransactionRequest, DescribeTransactionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableRequest, DropTableResponse,
-    InsertIntoTableRequest, InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTablesRequest, ListTablesResponse,
+    AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
+    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
+    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
+    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
+    InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
+    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse,
+    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
+use serde::{Serialize, de::DeserializeOwned};
 
-use lance_core::{box_error, Error, Result};
+use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
+
+/// HTTP client wrapper that supports per-request header injection.
+///
+/// This client wraps a single `reqwest::Client` and applies dynamic headers
+/// to each request without recreating the client. This is more efficient than
+/// creating a new client per request when using a `DynamicContextProvider`.
+///
+/// The design follows lancedb's `RestfulLanceDbClient` pattern where headers
+/// are applied to the built request using `headers_mut()` before execution.
+#[derive(Clone)]
+struct RestClient {
+    client: reqwest::Client,
+    base_path: String,
+    base_headers: HashMap<String, String>,
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
+}
+
+impl std::fmt::Debug for RestClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestClient")
+            .field("base_path", &self.base_path)
+            .field("base_headers", &self.base_headers)
+            .field(
+                "context_provider",
+                &self.context_provider.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
+}
+
+impl RestClient {
+    /// Apply base headers and dynamic context headers to a request.
+    ///
+    /// This method mutates the request's headers directly, which is more efficient
+    /// than creating a new client with default_headers for each request.
+    fn apply_headers(&self, request: &mut reqwest::Request, operation: &str, object_id: &str) {
+        let request_headers = request.headers_mut();
+
+        // First apply base headers
+        for (key, value) in &self.base_headers {
+            if let (Ok(header_name), Ok(header_value)) =
+                (HeaderName::from_str(key), HeaderValue::from_str(value))
+            {
+                request_headers.insert(header_name, header_value);
+            }
+        }
+
+        // Then apply context headers (override base headers if conflict)
+        if let Some(provider) = &self.context_provider {
+            let info = OperationInfo::new(operation, object_id);
+            let context = provider.provide_context(&info);
+
+            const HEADERS_PREFIX: &str = "headers.";
+            for (key, value) in context {
+                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX)
+                    && let (Ok(header_name), Ok(header_value)) = (
+                        HeaderName::from_str(header_name),
+                        HeaderValue::from_str(&value),
+                    )
+                {
+                    request_headers.insert(header_name, header_value);
+                }
+            }
+        }
+    }
+
+    /// Execute a request with dynamic headers applied.
+    ///
+    /// This method builds the request, applies headers, and executes it.
+    async fn execute(
+        &self,
+        req_builder: reqwest::RequestBuilder,
+        operation: &str,
+        object_id: &str,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let mut request = req_builder.build()?;
+        self.apply_headers(&mut request, operation, object_id);
+        self.client.execute(request).await
+    }
+
+    /// Get the base path URL
+    fn base_path(&self) -> &str {
+        &self.base_path
+    }
+
+    /// Get a reference to the underlying reqwest client
+    fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+}
 
 /// Builder for creating a RestNamespace.
 ///
@@ -49,7 +158,7 @@ use lance_namespace::LanceNamespace;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RestNamespaceBuilder {
     uri: String,
     delimiter: String,
@@ -58,6 +167,28 @@ pub struct RestNamespaceBuilder {
     key_file: Option<String>,
     ssl_ca_cert: Option<String>,
     assert_hostname: bool,
+    context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    /// When true, tracks operation metrics. Default: false.
+    ops_metrics_enabled: bool,
+}
+
+impl std::fmt::Debug for RestNamespaceBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestNamespaceBuilder")
+            .field("uri", &self.uri)
+            .field("delimiter", &self.delimiter)
+            .field("headers", &self.headers)
+            .field("cert_file", &self.cert_file)
+            .field("key_file", &self.key_file)
+            .field("ssl_ca_cert", &self.ssl_ca_cert)
+            .field("assert_hostname", &self.assert_hostname)
+            .field(
+                "context_provider",
+                &self.context_provider.as_ref().map(|_| "Some(...)"),
+            )
+            .field("ops_metrics_enabled", &self.ops_metrics_enabled)
+            .finish()
+    }
 }
 
 impl RestNamespaceBuilder {
@@ -78,6 +209,8 @@ impl RestNamespaceBuilder {
             key_file: None,
             ssl_ca_cert: None,
             assert_hostname: true,
+            context_provider: None,
+            ops_metrics_enabled: false,
         }
     }
 
@@ -87,7 +220,7 @@ impl RestNamespaceBuilder {
     /// It expects:
     /// - `uri`: The base URI for the REST API (required)
     /// - `delimiter`: Delimiter for object identifiers (optional, defaults to ".")
-    /// - `header.*`: Additional headers (optional, prefix will be stripped)
+    /// - `header.*` / `headers.*`: Additional headers (optional, prefix will be stripped)
     /// - `tls.cert_file`: Path to client certificate file (optional)
     /// - `tls.key_file`: Path to client private key file (optional)
     /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
@@ -123,13 +256,11 @@ impl RestNamespaceBuilder {
     /// ```
     pub fn from_properties(properties: HashMap<String, String>) -> Result<Self> {
         // Extract URI (required)
-        let uri = properties
-            .get("uri")
-            .cloned()
-            .ok_or_else(|| Error::Namespace {
-                source: "Missing required property 'uri' for REST namespace".into(),
-                location: snafu::location!(),
-            })?;
+        let uri = properties.get("uri").cloned().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Missing required property 'uri' for REST namespace".to_string(),
+            })
+        })?;
 
         // Extract delimiter (optional)
         let delimiter = properties
@@ -137,10 +268,13 @@ impl RestNamespaceBuilder {
             .cloned()
             .unwrap_or_else(|| Self::DEFAULT_DELIMITER.to_string());
 
-        // Extract headers (properties prefixed with "header.")
+        // Extract headers (properties prefixed with "header." or "headers.")
         let mut headers = HashMap::new();
         for (key, value) in &properties {
-            if let Some(header_name) = key.strip_prefix("header.") {
+            if let Some(header_name) = key
+                .strip_prefix("header.")
+                .or_else(|| key.strip_prefix("headers."))
+            {
                 headers.insert(header_name.to_string(), value.clone());
             }
         }
@@ -154,6 +288,12 @@ impl RestNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
+        // Extract ops_metrics_enabled (default: false)
+        let ops_metrics_enabled = properties
+            .get("ops_metrics_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         Ok(Self {
             uri,
             delimiter,
@@ -162,6 +302,8 @@ impl RestNamespaceBuilder {
             key_file,
             ssl_ca_cert,
             assert_hostname,
+            context_provider: None,
+            ops_metrics_enabled,
         })
     }
 
@@ -236,6 +378,56 @@ impl RestNamespaceBuilder {
         self
     }
 
+    /// Set a dynamic context provider for per-request context.
+    ///
+    /// The provider will be called before each HTTP request to generate
+    /// additional context. Context keys that start with `headers.` are converted
+    /// to HTTP headers by stripping the prefix. For example, `headers.Authorization`
+    /// becomes the `Authorization` header. Keys without the `headers.` prefix are ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The context provider implementation
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use lance_namespace_impls::{RestNamespaceBuilder, DynamicContextProvider, OperationInfo};
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    ///
+    /// #[derive(Debug)]
+    /// struct MyProvider;
+    ///
+    /// impl DynamicContextProvider for MyProvider {
+    ///     fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String> {
+    ///         let mut ctx = HashMap::new();
+    ///         ctx.insert("auth-token".to_string(), "my-token".to_string());
+    ///         ctx
+    ///     }
+    /// }
+    ///
+    /// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
+    ///     .context_provider(Arc::new(MyProvider))
+    ///     .build();
+    /// ```
+    pub fn context_provider(mut self, provider: Arc<dyn DynamicContextProvider>) -> Self {
+        self.context_provider = Some(provider);
+        self
+    }
+
+    /// Enable or disable operation metrics tracking.
+    ///
+    /// When enabled, the namespace will track how many times each API operation
+    /// is called. Use `retrieve_ops_metrics()` on the built namespace to get
+    /// the current counts.
+    ///
+    /// Default is false.
+    pub fn ops_metrics_enabled(mut self, enabled: bool) -> Self {
+        self.ops_metrics_enabled = enabled;
+        self
+    }
+
     /// Build the RestNamespace.
     ///
     /// # Returns
@@ -251,33 +443,10 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
     match id {
         Some(id_parts) if !id_parts.is_empty() => Ok(id_parts.join(delimiter)),
         Some(_) => Ok(delimiter.to_string()),
-        None => Err(Error::Namespace {
-            source: "Object ID is required".into(),
-            location: snafu::location!(),
-        }),
-    }
-}
-
-/// Convert API error to lance core error
-fn convert_api_error<T: std::fmt::Debug>(err: lance_namespace::apis::Error<T>) -> Error {
-    use lance_namespace::apis::Error as ApiError;
-    match err {
-        ApiError::Reqwest(e) => Error::IO {
-            source: box_error(e),
-            location: snafu::location!(),
-        },
-        ApiError::Serde(e) => Error::Namespace {
-            source: format!("Serialization error: {}", e).into(),
-            location: snafu::location!(),
-        },
-        ApiError::Io(e) => Error::IO {
-            source: box_error(e),
-            location: snafu::location!(),
-        },
-        ApiError::ResponseError(e) => Error::Namespace {
-            source: format!("Response error: {:?}", e).into(),
-            location: snafu::location!(),
-        },
+        None => Err(NamespaceError::InvalidInput {
+            message: "Object ID is required".to_string(),
+        }
+        .into()),
     }
 }
 
@@ -297,7 +466,10 @@ fn convert_api_error<T: std::fmt::Debug>(err: lance_namespace::apis::Error<T>) -
 #[derive(Clone)]
 pub struct RestNamespace {
     delimiter: String,
-    reqwest_config: Configuration,
+    /// REST client that handles per-request header injection efficiently.
+    rest_client: RestClient,
+    /// Operation metrics tracker, created when ops_metrics_enabled is true.
+    ops_metrics: Option<Arc<OpsMetrics>>,
 }
 
 impl std::fmt::Debug for RestNamespace {
@@ -315,39 +487,23 @@ impl std::fmt::Display for RestNamespace {
 impl RestNamespace {
     /// Create a new REST namespace from builder
     pub(crate) fn from_builder(builder: RestNamespaceBuilder) -> Self {
-        // Build reqwest client with custom headers if provided
+        // Build reqwest client WITHOUT default headers - we'll apply headers per-request
         let mut client_builder = reqwest::Client::builder();
 
-        // Add custom headers to the client
-        if !builder.headers.is_empty() {
-            let mut headers = reqwest::header::HeaderMap::new();
-            for (key, value) in &builder.headers {
-                if let (Ok(header_name), Ok(header_value)) = (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(value),
-                ) {
-                    headers.insert(header_name, header_value);
-                }
-            }
-            client_builder = client_builder.default_headers(headers);
-        }
-
         // Configure mTLS if certificate and key files are provided
-        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file) {
-            if let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file)) {
-                if let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat()) {
-                    client_builder = client_builder.identity(identity);
-                }
-            }
+        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file)
+            && let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file))
+            && let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat())
+        {
+            client_builder = client_builder.identity(identity);
         }
 
         // Load CA certificate for server verification
-        if let Some(ca_cert_file) = &builder.ssl_ca_cert {
-            if let Ok(ca_cert) = std::fs::read(ca_cert_file) {
-                if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert) {
-                    client_builder = client_builder.add_root_certificate(ca_cert);
-                }
-            }
+        if let Some(ca_cert_file) = &builder.ssl_ca_cert
+            && let Ok(ca_cert) = std::fs::read(ca_cert_file)
+            && let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert)
+        {
+            client_builder = client_builder.add_root_certificate(ca_cert);
         }
 
         // Configure hostname verification
@@ -357,28 +513,306 @@ impl RestNamespace {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        let mut reqwest_config = Configuration::new();
-        reqwest_config.client = client;
-        reqwest_config.base_path = builder.uri;
+        // Create the RestClient that handles per-request header injection
+        let rest_client = RestClient {
+            client,
+            base_path: builder.uri,
+            base_headers: builder.headers,
+            context_provider: builder.context_provider,
+        };
+
+        let ops_metrics = if builder.ops_metrics_enabled {
+            Some(Arc::new(OpsMetrics::default()))
+        } else {
+            None
+        };
 
         Self {
             delimiter: builder.delimiter,
-            reqwest_config,
+            rest_client,
+            ops_metrics,
         }
     }
 
-    /// Create a new REST namespace with custom configuration (for testing)
-    #[cfg(test)]
-    pub fn with_configuration(delimiter: String, reqwest_config: Configuration) -> Self {
-        Self {
-            delimiter,
-            reqwest_config,
+    /// Parse an error response body and return the appropriate NamespaceError.
+    ///
+    /// Attempts to parse a JSON body with `{"error": {"code": N, "message": "..."}}`.
+    /// Falls back to mapping the HTTP status code (using the operation to disambiguate)
+    /// if the JSON body doesn't contain an error code.
+    fn parse_error_response(
+        status: reqwest::StatusCode,
+        content: &str,
+        operation: &str,
+    ) -> lance_core::Error {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
+            && let Some(error_obj) = json.get("error")
+        {
+            let code = error_obj
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as u32);
+            let message = error_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(content);
+
+            if let Some(code) = code {
+                return NamespaceError::from_code(code, message).into();
+            }
+        }
+
+        let message = format!("Response error: status={}, content={}", status, content);
+        Self::error_from_status(status, operation, message).into()
+    }
+
+    /// Map an HTTP status code to a NamespaceError variant.
+    ///
+    /// For unambiguous status codes (401, 403, 429, 501, 503) the mapping is direct.
+    /// For 404 and 409 the `operation` string is used to select the appropriate
+    /// "not found" or "already exists" variant.
+    fn error_from_status(
+        status: reqwest::StatusCode,
+        operation: &str,
+        message: String,
+    ) -> NamespaceError {
+        match status.as_u16() {
+            400 => NamespaceError::InvalidInput { message },
+            401 => NamespaceError::Unauthenticated { message },
+            403 => NamespaceError::PermissionDenied { message },
+            404 => Self::not_found_for_operation(operation, message),
+            409 => Self::already_exists_for_operation(operation, message),
+            429 => NamespaceError::Throttled { message },
+            501 => NamespaceError::Unsupported { message },
+            503 => NamespaceError::ServiceUnavailable { message },
+            _ => NamespaceError::Internal { message },
+        }
+    }
+
+    /// Pick the appropriate "not found" variant based on the operation.
+    fn not_found_for_operation(operation: &str, message: String) -> NamespaceError {
+        if operation.contains("namespace") {
+            NamespaceError::NamespaceNotFound { message }
+        } else if operation.contains("index") {
+            NamespaceError::TableIndexNotFound { message }
+        } else if operation.contains("tag") {
+            NamespaceError::TableTagNotFound { message }
+        } else if operation.contains("transaction") {
+            NamespaceError::TransactionNotFound { message }
+        } else if operation.contains("version") {
+            NamespaceError::TableVersionNotFound { message }
+        } else if operation.contains("column") {
+            NamespaceError::TableColumnNotFound { message }
+        } else if operation.contains("table") {
+            NamespaceError::TableNotFound { message }
+        } else {
+            NamespaceError::Internal { message }
+        }
+    }
+
+    /// Pick the appropriate "already exists" variant based on the operation.
+    fn already_exists_for_operation(operation: &str, message: String) -> NamespaceError {
+        if operation.contains("namespace") {
+            NamespaceError::NamespaceAlreadyExists { message }
+        } else if operation.contains("index") {
+            NamespaceError::TableIndexAlreadyExists { message }
+        } else if operation.contains("tag") {
+            NamespaceError::TableTagAlreadyExists { message }
+        } else if operation.contains("table") {
+            NamespaceError::TableAlreadyExists { message }
+        } else {
+            NamespaceError::Internal { message }
+        }
+    }
+
+    /// Execute a GET request and parse JSON response.
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        operation: &str,
+        object_id: &str,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self.rest_client.client().get(&url).query(query);
+
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, object_id)
+            .await
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
+
+        let status = resp.status();
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {}", e),
+            })
+        })?;
+
+        if status.is_success() {
+            serde_json::from_str(&content).map_err(|e| {
+                NamespaceError::Internal {
+                    message: format!("Failed to parse response: {}", e),
+                }
+                .into()
+            })
+        } else {
+            Err(Self::parse_error_response(status, &content, operation))
+        }
+    }
+
+    /// Execute a POST request with JSON body and parse JSON response.
+    async fn post_json<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &T,
+        operation: &str,
+        object_id: &str,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self.rest_client.client().post(&url).query(query).json(body);
+
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, object_id)
+            .await
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
+
+        let status = resp.status();
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {}", e),
+            })
+        })?;
+
+        if status.is_success() {
+            serde_json::from_str(&content).map_err(|e| {
+                NamespaceError::Internal {
+                    message: format!("Failed to parse response: {}", e),
+                }
+                .into()
+            })
+        } else {
+            Err(Self::parse_error_response(status, &content, operation))
+        }
+    }
+
+    /// Execute a POST request that returns nothing (204 No Content expected).
+    async fn post_json_no_content<T: Serialize>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &T,
+        operation: &str,
+        object_id: &str,
+    ) -> Result<()> {
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self.rest_client.client().post(&url).query(query).json(body);
+
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, object_id)
+            .await
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let content = resp.text().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response body: {}", e),
+                })
+            })?;
+            Err(Self::parse_error_response(status, &content, operation))
+        }
+    }
+
+    /// Execute a POST request with binary body and parse JSON response.
+    async fn post_binary_json<R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+        operation: &str,
+        object_id: &str,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self.rest_client.client().post(&url).query(query).body(body);
+
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, object_id)
+            .await
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
+
+        let status = resp.status();
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {}", e),
+            })
+        })?;
+
+        if status.is_success() {
+            serde_json::from_str(&content).map_err(|e| {
+                NamespaceError::Internal {
+                    message: format!("Failed to parse response: {}", e),
+                }
+                .into()
+            })
+        } else {
+            Err(Self::parse_error_response(status, &content, operation))
         }
     }
 
     /// Get the base endpoint URL for this namespace
     pub fn endpoint(&self) -> &str {
-        &self.reqwest_config.base_path
+        self.rest_client.base_path()
+    }
+
+    /// Retrieve a snapshot of operation metrics.
+    ///
+    /// Returns a HashMap where keys are operation names (e.g., "list_tables", "describe_table")
+    /// and values are the number of times each operation was called.
+    ///
+    /// Returns an empty HashMap if `ops_metrics_enabled` was false when building the namespace.
+    pub fn retrieve_ops_metrics(&self) -> HashMap<String, u64> {
+        self.ops_metrics
+            .as_ref()
+            .map(|m| m.retrieve())
+            .unwrap_or_default()
+    }
+
+    /// Reset all operation metrics counters to zero.
+    ///
+    /// Does nothing if `ops_metrics_enabled` was false when building the namespace.
+    pub fn reset_ops_metrics(&self) {
+        if let Some(ref metrics) = self.ops_metrics {
+            metrics.reset();
+        }
+    }
+
+    /// Increment the counter for an operation.
+    fn record_op(&self, operation: &str) {
+        if let Some(ref metrics) = self.ops_metrics {
+            metrics.increment(operation);
+        }
     }
 }
 
@@ -388,120 +822,159 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
+        self.record_op("list_namespaces");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        namespace_api::list_namespaces(
-            &self.reqwest_config,
-            &id,
-            Some(&self.delimiter),
-            request.page_token.as_deref(),
-            request.limit,
-        )
-        .await
-        .map_err(convert_api_error)
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/namespace/{}/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.get_json(&path, &query, "list_namespaces", &id).await
     }
 
     async fn describe_namespace(
         &self,
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
+        self.record_op("describe_namespace");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        namespace_api::describe_namespace(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/namespace/{}/describe", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "describe_namespace", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn create_namespace(
         &self,
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
+        self.record_op("create_namespace");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        namespace_api::create_namespace(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/namespace/{}/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_namespace", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
+        self.record_op("drop_namespace");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        namespace_api::drop_namespace(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/namespace/{}/drop", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "drop_namespace", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+        self.record_op("namespace_exists");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        namespace_api::namespace_exists(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/namespace/{}/exists", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json_no_content(&path, &query, &request, "namespace_exists", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        self.record_op("list_tables");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::list_tables(
-            &self.reqwest_config,
-            &id,
-            Some(&self.delimiter),
-            request.page_token.as_deref(),
-            request.limit,
-        )
-        .await
-        .map_err(convert_api_error)
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/namespace/{}/table/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.get_json(&path, &query, "list_tables", &id).await
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
+        self.record_op("describe_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::describe_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/describe", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let with_uri_str;
+        if let Some(with_uri) = request.with_table_uri {
+            with_uri_str = with_uri.to_string();
+            query.push(("with_table_uri", with_uri_str.as_str()));
+        }
+        let detailed_str;
+        if let Some(detailed) = request.load_detailed_metadata {
+            detailed_str = detailed.to_string();
+            query.push(("load_detailed_metadata", detailed_str.as_str()));
+        }
+        self.post_json(&path, &query, &request, "describe_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn register_table(&self, request: RegisterTableRequest) -> Result<RegisterTableResponse> {
+        self.record_op("register_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::register_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/register", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "register_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+        self.record_op("table_exists");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::table_exists(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/exists", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json_no_content(&path, &query, &request, "table_exists", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
+        self.record_op("drop_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::drop_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/drop", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "drop_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn deregister_table(
         &self,
         request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
+        self.record_op("deregister_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::deregister_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/deregister", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "deregister_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
+        self.record_op("count_table_rows");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::count_table_rows(&self.reqwest_config, &id, request, Some(&self.delimiter))
-            .await
-            .map_err(convert_api_error)
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/count_rows", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.get_json(&path, &query, "count_table_rows", &id).await
     }
 
     async fn create_table(
@@ -509,42 +982,28 @@ impl LanceNamespace for RestNamespace {
         request: CreateTableRequest,
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
+        self.record_op("create_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        let properties_json = request
-            .properties
-            .as_ref()
-            .map(|props| serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string()));
-
-        use lance_namespace::models::create_table_request::Mode;
-        let mode = request.mode.as_ref().map(|m| match m {
-            Mode::Create => "create",
-            Mode::ExistOk => "exist_ok",
-            Mode::Overwrite => "overwrite",
-        });
-
-        table_api::create_table(
-            &self.reqwest_config,
-            &id,
-            request_data.to_vec(),
-            Some(&self.delimiter),
-            mode,
-            request.location.as_deref(),
-            properties_json.as_deref(),
-        )
-        .await
-        .map_err(convert_api_error)
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/create", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let mode_str;
+        if let Some(ref mode) = request.mode {
+            mode_str = mode.clone();
+            query.push(("mode", mode_str.as_str()));
+        }
+        self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
+            .await
     }
 
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        self.record_op("declare_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::create_empty_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/declare", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "declare_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn insert_into_table(
@@ -552,23 +1011,24 @@ impl LanceNamespace for RestNamespace {
         request: InsertIntoTableRequest,
         request_data: Bytes,
     ) -> Result<InsertIntoTableResponse> {
+        self.record_op("insert_into_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        use lance_namespace::models::insert_into_table_request::Mode;
-        let mode = request.mode.as_ref().map(|m| match m {
-            Mode::Append => "append",
-            Mode::Overwrite => "overwrite",
-        });
-
-        table_api::insert_into_table(
-            &self.reqwest_config,
-            &id,
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/insert", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let mode_str;
+        if let Some(ref mode) = request.mode {
+            mode_str = mode.clone();
+            query.push(("mode", mode_str.as_str()));
+        }
+        self.post_binary_json(
+            &path,
+            &query,
             request_data.to_vec(),
-            Some(&self.delimiter),
-            mode,
+            "insert_into_table",
+            &id,
         )
         .await
-        .map_err(convert_api_error)
     }
 
     async fn merge_insert_into_table(
@@ -576,144 +1036,521 @@ impl LanceNamespace for RestNamespace {
         request: MergeInsertIntoTableRequest,
         request_data: Bytes,
     ) -> Result<MergeInsertIntoTableResponse> {
+        self.record_op("merge_insert_into_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
 
-        let on = request.on.as_deref().ok_or_else(|| Error::Namespace {
-            source: "'on' field is required for merge insert".into(),
-            location: snafu::location!(),
+        let on = request.on.as_deref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "'on' field is required for merge insert".to_string(),
+            })
         })?;
 
-        table_api::merge_insert_into_table(
-            &self.reqwest_config,
-            &id,
-            on,
+        let path = format!("/v1/table/{}/merge_insert", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str()), ("on", on)];
+
+        let when_matched_update_all_str;
+        if let Some(v) = request.when_matched_update_all {
+            when_matched_update_all_str = v.to_string();
+            query.push((
+                "when_matched_update_all",
+                when_matched_update_all_str.as_str(),
+            ));
+        }
+        if let Some(ref v) = request.when_matched_update_all_filt {
+            query.push(("when_matched_update_all_filt", v.as_str()));
+        }
+        let when_not_matched_insert_all_str;
+        if let Some(v) = request.when_not_matched_insert_all {
+            when_not_matched_insert_all_str = v.to_string();
+            query.push((
+                "when_not_matched_insert_all",
+                when_not_matched_insert_all_str.as_str(),
+            ));
+        }
+        let when_not_matched_by_source_delete_str;
+        if let Some(v) = request.when_not_matched_by_source_delete {
+            when_not_matched_by_source_delete_str = v.to_string();
+            query.push((
+                "when_not_matched_by_source_delete",
+                when_not_matched_by_source_delete_str.as_str(),
+            ));
+        }
+        if let Some(ref v) = request.when_not_matched_by_source_delete_filt {
+            query.push(("when_not_matched_by_source_delete_filt", v.as_str()));
+        }
+        if let Some(ref v) = request.timeout {
+            query.push(("timeout", v.as_str()));
+        }
+        let use_index_str;
+        if let Some(v) = request.use_index {
+            use_index_str = v.to_string();
+            query.push(("use_index", use_index_str.as_str()));
+        }
+
+        self.post_binary_json(
+            &path,
+            &query,
             request_data.to_vec(),
-            Some(&self.delimiter),
-            request.when_matched_update_all,
-            request.when_matched_update_all_filt.as_deref(),
-            request.when_not_matched_insert_all,
-            request.when_not_matched_by_source_delete,
-            request.when_not_matched_by_source_delete_filt.as_deref(),
+            "merge_insert_into_table",
+            &id,
         )
         .await
-        .map_err(convert_api_error)
     }
 
     async fn update_table(&self, request: UpdateTableRequest) -> Result<UpdateTableResponse> {
+        self.record_op("update_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::update_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/update", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "update_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn delete_from_table(
         &self,
         request: DeleteFromTableRequest,
     ) -> Result<DeleteFromTableResponse> {
+        self.record_op("delete_from_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::delete_from_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/delete", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "delete_from_table", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
+        self.record_op("query_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/query", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        let operation = "query_table";
 
-        let response =
-            table_api::query_table(&self.reqwest_config, &id, request, Some(&self.delimiter))
-                .await
-                .map_err(convert_api_error)?;
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self
+            .rest_client
+            .client()
+            .post(&url)
+            .query(&query)
+            .json(&request);
 
-        // Convert response to bytes
-        let bytes = response.bytes().await.map_err(|e| Error::IO {
-            source: box_error(e),
-            location: snafu::location!(),
-        })?;
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, &id)
+            .await
+            .map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to execute request: {}", e),
+                })
+            })?;
 
-        Ok(bytes)
+        let status = resp.status();
+        if status.is_success() {
+            resp.bytes().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response bytes: {}", e),
+                })
+            })
+        } else {
+            let content = resp.text().await.map_err(|e| {
+                Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read response body: {}", e),
+                })
+            })?;
+            Err(Self::parse_error_response(status, &content, operation))
+        }
     }
 
     async fn create_table_index(
         &self,
         request: CreateTableIndexRequest,
     ) -> Result<CreateTableIndexResponse> {
+        self.record_op("create_table_index");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::create_table_index(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/create_index", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_index", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn list_table_indices(
         &self,
         request: ListTableIndicesRequest,
     ) -> Result<ListTableIndicesResponse> {
+        self.record_op("list_table_indices");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        table_api::list_table_indices(&self.reqwest_config, &id, request, Some(&self.delimiter))
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/index/list", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "list_table_indices", &id)
             .await
-            .map_err(convert_api_error)
     }
 
     async fn describe_table_index_stats(
         &self,
         request: DescribeTableIndexStatsRequest,
     ) -> Result<DescribeTableIndexStatsResponse> {
+        self.record_op("describe_table_index_stats");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        // Note: The index_name parameter seems to be missing from the request structure
-        // This might need to be adjusted based on the actual API
-        let index_name = ""; // This should come from somewhere in the request
-
-        table_api::describe_table_index_stats(
-            &self.reqwest_config,
-            &id,
-            index_name,
-            request,
-            Some(&self.delimiter),
-        )
-        .await
-        .map_err(convert_api_error)
+        let encoded_id = urlencode(&id);
+        let index_name = request.index_name.as_deref().unwrap_or("");
+        let path = format!(
+            "/v1/table/{}/index/{}/stats",
+            encoded_id,
+            urlencode(index_name)
+        );
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "describe_table_index_stats", &id)
+            .await
     }
 
     async fn describe_transaction(
         &self,
         request: DescribeTransactionRequest,
     ) -> Result<DescribeTransactionResponse> {
+        self.record_op("describe_transaction");
         let id = object_id_str(&request.id, &self.delimiter)?;
-
-        transaction_api::describe_transaction(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(&self.delimiter),
-        )
-        .await
-        .map_err(convert_api_error)
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/transaction/{}/describe", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "describe_transaction", &id)
+            .await
     }
 
     async fn alter_transaction(
         &self,
         request: AlterTransactionRequest,
     ) -> Result<AlterTransactionResponse> {
+        self.record_op("alter_transaction");
         let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/transaction/{}/alter", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_transaction", &id)
+            .await
+    }
 
-        transaction_api::alter_transaction(
-            &self.reqwest_config,
-            &id,
-            request,
-            Some(&self.delimiter),
-        )
-        .await
-        .map_err(convert_api_error)
+    async fn create_table_scalar_index(
+        &self,
+        request: CreateTableIndexRequest,
+    ) -> Result<CreateTableScalarIndexResponse> {
+        self.record_op("create_table_scalar_index");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/create_scalar_index", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_scalar_index", &id)
+            .await
+    }
+
+    async fn drop_table_index(
+        &self,
+        request: DropTableIndexRequest,
+    ) -> Result<DropTableIndexResponse> {
+        self.record_op("drop_table_index");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let index_name = request.index_name.as_deref().unwrap_or("");
+        let path = format!(
+            "/v1/table/{}/index/{}/drop",
+            encoded_id,
+            urlencode(index_name)
+        );
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "drop_table_index", &id)
+            .await
+    }
+
+    async fn list_all_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        self.record_op("list_all_tables");
+        let path = "/v1/table";
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.get_json(path, &query, "list_all_tables", "").await
+    }
+
+    async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
+        self.record_op("restore_table");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/restore", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "restore_table", &id)
+            .await
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        self.record_op("rename_table");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/rename", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "rename_table", &id)
+            .await
+    }
+
+    async fn list_table_versions(
+        &self,
+        request: ListTableVersionsRequest,
+    ) -> Result<ListTableVersionsResponse> {
+        self.record_op("list_table_versions");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/version/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        let descending_str;
+        if let Some(descending) = request.descending {
+            descending_str = descending.to_string();
+            query.push(("descending", descending_str.as_str()));
+        }
+        self.post_json(&path, &query, &(), "list_table_versions", &id)
+            .await
+    }
+
+    async fn create_table_version(
+        &self,
+        request: CreateTableVersionRequest,
+    ) -> Result<CreateTableVersionResponse> {
+        self.record_op("create_table_version");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/version/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_version", &id)
+            .await
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> Result<DescribeTableVersionResponse> {
+        self.record_op("describe_table_version");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/version/describe", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "describe_table_version", &id)
+            .await
+    }
+
+    async fn batch_delete_table_versions(
+        &self,
+        request: BatchDeleteTableVersionsRequest,
+    ) -> Result<BatchDeleteTableVersionsResponse> {
+        self.record_op("batch_delete_table_versions");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/version/delete", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "batch_delete_table_versions", &id)
+            .await
+    }
+
+    async fn update_table_schema_metadata(
+        &self,
+        request: UpdateTableSchemaMetadataRequest,
+    ) -> Result<UpdateTableSchemaMetadataResponse> {
+        self.record_op("update_table_schema_metadata");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/schema_metadata/update", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        let metadata = request.metadata.unwrap_or_default();
+        let result: HashMap<String, String> = self
+            .post_json(
+                &path,
+                &query,
+                &metadata,
+                "update_table_schema_metadata",
+                &id,
+            )
+            .await?;
+        Ok(UpdateTableSchemaMetadataResponse {
+            metadata: Some(result),
+            ..Default::default()
+        })
+    }
+
+    async fn get_table_stats(
+        &self,
+        request: GetTableStatsRequest,
+    ) -> Result<GetTableStatsResponse> {
+        self.record_op("get_table_stats");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/stats", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "get_table_stats", &id)
+            .await
+    }
+
+    async fn explain_table_query_plan(
+        &self,
+        request: ExplainTableQueryPlanRequest,
+    ) -> Result<String> {
+        self.record_op("explain_table_query_plan");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/explain_plan", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "explain_table_query_plan", &id)
+            .await
+    }
+
+    async fn analyze_table_query_plan(
+        &self,
+        request: AnalyzeTableQueryPlanRequest,
+    ) -> Result<String> {
+        self.record_op("analyze_table_query_plan");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/analyze_plan", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "analyze_table_query_plan", &id)
+            .await
+    }
+
+    async fn alter_table_add_columns(
+        &self,
+        request: AlterTableAddColumnsRequest,
+    ) -> Result<AlterTableAddColumnsResponse> {
+        self.record_op("alter_table_add_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/add_columns", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_add_columns", &id)
+            .await
+    }
+
+    async fn alter_table_alter_columns(
+        &self,
+        request: AlterTableAlterColumnsRequest,
+    ) -> Result<AlterTableAlterColumnsResponse> {
+        self.record_op("alter_table_alter_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/alter_columns", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_alter_columns", &id)
+            .await
+    }
+
+    async fn alter_table_drop_columns(
+        &self,
+        request: AlterTableDropColumnsRequest,
+    ) -> Result<AlterTableDropColumnsResponse> {
+        self.record_op("alter_table_drop_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/drop_columns", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_drop_columns", &id)
+            .await
+    }
+
+    async fn list_table_tags(
+        &self,
+        request: ListTableTagsRequest,
+    ) -> Result<ListTableTagsResponse> {
+        self.record_op("list_table_tags");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/tags/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.get_json(&path, &query, "list_table_tags", &id).await
+    }
+
+    async fn get_table_tag_version(
+        &self,
+        request: GetTableTagVersionRequest,
+    ) -> Result<GetTableTagVersionResponse> {
+        self.record_op("get_table_tag_version");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/tags/version", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "get_table_tag_version", &id)
+            .await
+    }
+
+    async fn create_table_tag(
+        &self,
+        request: CreateTableTagRequest,
+    ) -> Result<CreateTableTagResponse> {
+        self.record_op("create_table_tag");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/tags/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_tag", &id)
+            .await
+    }
+
+    async fn delete_table_tag(
+        &self,
+        request: DeleteTableTagRequest,
+    ) -> Result<DeleteTableTagResponse> {
+        self.record_op("delete_table_tag");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/tags/delete", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "delete_table_tag", &id)
+            .await
+    }
+
+    async fn update_table_tag(
+        &self,
+        request: UpdateTableTagRequest,
+    ) -> Result<UpdateTableTagResponse> {
+        self.record_op("update_table_tag");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/tags/update", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "update_table_tag", &id)
+            .await
     }
 
     fn namespace_id(&self) -> String {
         format!(
             "RestNamespace {{ endpoint: {:?}, delimiter: {:?} }}",
-            self.reqwest_config.base_path, self.delimiter
+            self.rest_client.base_path(),
+            self.delimiter
         )
     }
 }
@@ -722,7 +1559,6 @@ impl LanceNamespace for RestNamespace {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use lance_namespace::models::{create_table_request, insert_into_table_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -742,6 +1578,21 @@ mod tests {
             .build();
 
         // Successfully created the namespace - test passes if no panic
+    }
+
+    #[test]
+    fn test_rest_namespace_creation_with_headers_prefix() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "http://example.com".to_string());
+        properties.insert(
+            "headers.Authorization".to_string(),
+            "Bearer token".to_string(),
+        );
+        properties.insert("headers.X-Custom".to_string(), "value".to_string());
+
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
     }
 
     #[tokio::test]
@@ -784,8 +1635,7 @@ mod tests {
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
-            page_token: None,
-            limit: None,
+            ..Default::default()
         };
 
         let result = namespace.list_namespaces(request).await;
@@ -900,15 +1750,12 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut reqwest_config = Configuration::new();
-        reqwest_config.base_path = mock_server.uri();
-
-        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
-            page_token: None,
             limit: Some(10),
+            ..Default::default()
         };
 
         let result = namespace.list_namespaces(request).await;
@@ -939,15 +1786,12 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut reqwest_config = Configuration::new();
-        reqwest_config.base_path = mock_server.uri();
-
-        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
-            page_token: None,
             limit: Some(10),
+            ..Default::default()
         };
 
         let result = namespace.list_namespaces(request).await;
@@ -975,15 +1819,11 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut reqwest_config = Configuration::new();
-        reqwest_config.base_path = mock_server.uri();
-
-        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
-            properties: None,
-            mode: None,
+            ..Default::default()
         };
 
         let result = namespace.create_namespace(request).await;
@@ -1012,10 +1852,7 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let mut reqwest_config = Configuration::new();
-        reqwest_config.base_path = mock_server.uri();
-
-        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -1023,9 +1860,8 @@ mod tests {
                 "namespace".to_string(),
                 "table".to_string(),
             ]),
-            location: None,
-            mode: Some(create_table_request::Mode::Create),
-            properties: None,
+            mode: Some("Create".to_string()),
+            ..Default::default()
         };
 
         let data = Bytes::from("arrow data here");
@@ -1045,16 +1881,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "version": 2
+                "transaction_id": "txn-123"
             })))
             .mount(&mock_server)
             .await;
 
         // Create namespace with mock server URL
-        let mut reqwest_config = Configuration::new();
-        reqwest_config.base_path = mock_server.uri();
-
-        let namespace = RestNamespace::with_configuration("$".to_string(), reqwest_config);
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
 
         let request = InsertIntoTableRequest {
             id: Some(vec![
@@ -1062,7 +1895,8 @@ mod tests {
                 "namespace".to_string(),
                 "table".to_string(),
             ]),
-            mode: Some(insert_into_table_request::Mode::Append),
+            mode: Some("Append".to_string()),
+            ..Default::default()
         };
 
         let data = Bytes::from("arrow data here");
@@ -1071,6 +1905,178 @@ mod tests {
         // Should succeed with mock server
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response.version, Some(2));
+        assert_eq!(response.transaction_id, Some("txn-123".to_string()));
+    }
+
+    // Integration tests for DynamicContextProvider
+
+    #[derive(Debug)]
+    struct TestContextProvider {
+        headers: HashMap<String, String>,
+    }
+
+    impl DynamicContextProvider for TestContextProvider {
+        fn provide_context(&self, _info: &OperationInfo) -> HashMap<String, String> {
+            self.headers.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_provider_headers_sent() {
+        let mock_server = MockServer::start().await;
+
+        // Mock expects the context header
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .and(wiremock::matchers::header(
+                "X-Context-Token",
+                "dynamic-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "namespaces": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create context provider
+        let mut context_headers = HashMap::new();
+        context_headers.insert(
+            "headers.X-Context-Token".to_string(),
+            "dynamic-token".to_string(),
+        );
+        let provider = Arc::new(TestContextProvider {
+            headers: context_headers,
+        });
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .context_provider(provider)
+            .build();
+
+        let request = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+
+        let result = namespace.list_namespaces(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_base_headers_merged_with_context_headers() {
+        let mock_server = MockServer::start().await;
+
+        // Mock expects BOTH base header AND context header
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer base-token",
+            ))
+            .and(wiremock::matchers::header(
+                "X-Context-Token",
+                "dynamic-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "namespaces": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create context provider
+        let mut context_headers = HashMap::new();
+        context_headers.insert(
+            "headers.X-Context-Token".to_string(),
+            "dynamic-token".to_string(),
+        );
+        let provider = Arc::new(TestContextProvider {
+            headers: context_headers,
+        });
+
+        // Create namespace with base header AND context provider
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .header("Authorization", "Bearer base-token")
+            .context_provider(provider)
+            .build();
+
+        let request = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+
+        let result = namespace.list_namespaces(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_context_headers_override_base_headers() {
+        let mock_server = MockServer::start().await;
+
+        // Mock expects the CONTEXT header value (not base)
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer context-override-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "namespaces": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Context provider that overrides Authorization header
+        let mut context_headers = HashMap::new();
+        context_headers.insert(
+            "headers.Authorization".to_string(),
+            "Bearer context-override-token".to_string(),
+        );
+        let provider = Arc::new(TestContextProvider {
+            headers: context_headers,
+        });
+
+        // Create namespace with base header that will be overridden
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .header("Authorization", "Bearer base-token")
+            .context_provider(provider)
+            .build();
+
+        let request = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+
+        let result = namespace.list_namespaces(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_no_context_provider_uses_base_headers_only() {
+        let mock_server = MockServer::start().await;
+
+        // Mock expects only the base header
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer base-only",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "namespaces": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create namespace WITHOUT context provider, only base headers
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .header("Authorization", "Bearer base-only")
+            .build();
+
+        let request = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+
+        let result = namespace.list_namespaces(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
     }
 }

@@ -41,7 +41,10 @@ public class Compaction {
         compactionOptions.getMaterializeDeletionsThreshold(),
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap());
+        compactionOptions.getDeferIndexRemap(),
+        compactionOptions.getCompactionMode(),
+        compactionOptions.getBinaryCopyReadBatchBytes(),
+        compactionOptions.getMaxSourceFragments());
   }
 
   public static CompactionMetrics commitCompaction(
@@ -59,7 +62,10 @@ public class Compaction {
         compactionOptions.getMaterializeDeletionsThreshold(),
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap());
+        compactionOptions.getDeferIndexRemap(),
+        compactionOptions.getCompactionMode(),
+        compactionOptions.getBinaryCopyReadBatchBytes(),
+        compactionOptions.getMaxSourceFragments());
   }
 
   public static native CompactionMetrics nativeCommitCompaction(
@@ -72,7 +78,10 @@ public class Compaction {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
-      Optional<Boolean> deferIndexRemap);
+      Optional<Boolean> deferIndexRemap,
+      Optional<String> compactionMode,
+      Optional<Long> binaryCopyReadBatchBytes,
+      Optional<Long> maxSourceFragments);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -83,5 +92,8 @@ public class Compaction {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
-      Optional<Boolean> deferIndexRemap);
+      Optional<Boolean> deferIndexRemap,
+      Optional<String> compactionMode,
+      Optional<Long> binaryCopyReadBatchBytes,
+      Optional<Long> maxSourceFragments);
 }

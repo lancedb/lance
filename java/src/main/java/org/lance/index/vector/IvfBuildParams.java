@@ -29,6 +29,7 @@ public class IvfBuildParams {
   private final int shufflePartitionBatches;
   private final int shufflePartitionConcurrency;
   private final boolean useResidual;
+  private final float[] centroids;
 
   private IvfBuildParams(Builder builder) {
     this.numPartitions = builder.numPartitions;
@@ -37,6 +38,7 @@ public class IvfBuildParams {
     this.shufflePartitionBatches = builder.shufflePartitionBatches;
     this.shufflePartitionConcurrency = builder.shufflePartitionConcurrency;
     this.useResidual = builder.useResidual;
+    this.centroids = builder.centroids;
   }
 
   public static class Builder {
@@ -46,6 +48,7 @@ public class IvfBuildParams {
     private int shufflePartitionBatches = 1024 * 10;
     private int shufflePartitionConcurrency = 2;
     private boolean useResidual = true;
+    private float[] centroids = null;
 
     /**
      * Parameters for building an IVF index. Train IVF centroids for the given vector column. This
@@ -125,6 +128,19 @@ public class IvfBuildParams {
       return this;
     }
 
+    /**
+     * Set pre-trained IVF centroids.
+     *
+     * <p>The centroids are flattened as [numPartitions][dimension].
+     *
+     * @param centroids pre-trained IVF centroids
+     * @return Builder
+     */
+    public Builder setCentroids(float[] centroids) {
+      this.centroids = centroids;
+      return this;
+    }
+
     public IvfBuildParams build() {
       return new IvfBuildParams(this);
     }
@@ -154,6 +170,10 @@ public class IvfBuildParams {
     return useResidual;
   }
 
+  public float[] getCentroids() {
+    return centroids;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -163,6 +183,7 @@ public class IvfBuildParams {
         .add("shufflePartitionBatches", shufflePartitionBatches)
         .add("shufflePartitionConcurrency", shufflePartitionConcurrency)
         .add("useResidual", useResidual)
+        .add("hasCentroids", centroids != null)
         .toString();
   }
 }

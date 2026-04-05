@@ -13,8 +13,6 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
-
 import com.google.common.base.MoreObjects;
 
 import java.nio.ByteBuffer;
@@ -25,14 +23,13 @@ import java.util.Optional;
 /** Read options for reading from a dataset. */
 public class ReadOptions {
 
-  private final Optional<Integer> version;
+  private final Optional<Long> version;
   private final Optional<Integer> blockSize;
   private final long indexCacheSizeBytes;
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
-  private final Optional<StorageOptionsProvider> storageOptionsProvider;
-  private final Optional<Long> s3CredentialsRefreshOffsetSeconds;
+  private final Optional<Session> session;
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
@@ -41,11 +38,10 @@ public class ReadOptions {
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
     this.serializedManifest = builder.serializedManifest;
-    this.storageOptionsProvider = builder.storageOptionsProvider;
-    this.s3CredentialsRefreshOffsetSeconds = builder.s3CredentialsRefreshOffsetSeconds;
+    this.session = builder.session;
   }
 
-  public Optional<Integer> getVersion() {
+  public Optional<Long> getVersion() {
     return version;
   }
 
@@ -69,12 +65,13 @@ public class ReadOptions {
     return serializedManifest;
   }
 
-  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
-    return storageOptionsProvider;
-  }
-
-  public Optional<Long> getS3CredentialsRefreshOffsetSeconds() {
-    return s3CredentialsRefreshOffsetSeconds;
+  /**
+   * Get the session to use for opening the dataset.
+   *
+   * @return the session, or empty if no session was specified
+   */
+  public Optional<Session> getSession() {
+    return session;
   }
 
   @Override
@@ -93,14 +90,13 @@ public class ReadOptions {
 
   public static class Builder {
 
-    private Optional<Integer> version = Optional.empty();
+    private Optional<Long> version = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
-    private long indexCacheSizeBytes = 6 * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
-    private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
+    private long indexCacheSizeBytes = 6L * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
+    private long metadataCacheSizeBytes = 1024L * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
-    private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
-    private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
+    private Optional<Session> session = Optional.empty();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
@@ -108,7 +104,7 @@ public class ReadOptions {
      * @param version the version of the dataset
      * @return this builder
      */
-    public Builder setVersion(int version) {
+    public Builder setVersion(long version) {
       this.version = Optional.of(version);
       return this;
     }
@@ -207,33 +203,20 @@ public class ReadOptions {
     }
 
     /**
-     * Set a custom storage options provider for automatic storage options refresh.
+     * Set a session to share caches between multiple datasets.
      *
-     * <p>The storage options provider will be called automatically before storage options expire,
-     * enabling long-running operations on cloud storage without interruption. This is currently
-     * only used for refreshing AWS temporary access credentials.
+     * <p>When a session is provided, the index and metadata caches from the session will be used
+     * instead of creating new caches. This can improve cache hit rates when opening multiple
+     * related datasets.
      *
-     * @param storageOptionsProvider the storage options provider implementation
+     * <p>Note: When a session is provided, the indexCacheSizeBytes and metadataCacheSizeBytes
+     * settings are ignored because the session's caches are used instead.
+     *
+     * @param session the session to use
      * @return this builder
      */
-    public Builder setStorageOptionsProvider(StorageOptionsProvider storageOptionsProvider) {
-      this.storageOptionsProvider = Optional.of(storageOptionsProvider);
-      return this;
-    }
-
-    /**
-     * Set the number of seconds before credential expiration to trigger a refresh.
-     *
-     * <p>Default is 60 seconds. Only applicable when using AWS S3 with temporary credentials. For
-     * example, if set to 60, credentials will be refreshed when they have less than 60 seconds
-     * remaining before expiration. This should be set shorter than the credential lifetime to avoid
-     * using expired credentials.
-     *
-     * @param s3CredentialsRefreshOffsetSeconds the refresh offset in seconds
-     * @return this builder
-     */
-    public Builder setS3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
-      this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
+    public Builder setSession(Session session) {
+      this.session = Optional.of(session);
       return this;
     }
 

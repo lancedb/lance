@@ -11,23 +11,23 @@ use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
     physical_plan::{
+        SendableRecordBatchStream,
         metrics::{
             Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet, Time,
         },
         stream::RecordBatchStreamAdapter,
-        SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::Result;
+use lance_core::datatypes::Schema;
 use tokio::task::spawn;
 
 pub mod background_iterator;
 
-/// A trait for [BatchRecord] iterators, readers and streams
-/// that can be converted to a concrete stream type [SendableRecordBatchStream].
+/// A trait for [`RecordBatch`] iterators, readers and streams
+/// that can be converted to a concrete stream type [`SendableRecordBatchStream`].
 ///
 /// This also cam read the schema from the first batch
 /// and then update the schema to reflect the dictionary columns.
@@ -155,6 +155,7 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
 pub trait MetricsExt {
     fn find_count(&self, name: &str) -> Option<Count>;
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)>;
+    fn iter_times(&self) -> impl Iterator<Item = (impl AsRef<str>, &Time)>;
     fn iter_gauges(&self) -> impl Iterator<Item = (impl AsRef<str>, &Gauge)>;
 }
 
@@ -175,6 +176,13 @@ impl MetricsExt for MetricsSet {
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)> {
         self.iter().filter_map(|m| match m.value() {
             MetricValue::Count { name, count } => Some((name, count)),
+            _ => None,
+        })
+    }
+
+    fn iter_times(&self) -> impl Iterator<Item = (impl AsRef<str>, &Time)> {
+        self.iter().filter_map(|m| match m.value() {
+            MetricValue::Time { name, time } => Some((name, time)),
             _ => None,
         })
     }
@@ -242,5 +250,6 @@ pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
 pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";
 pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
 pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";
+pub const FIND_PARTITIONS_ELAPSED_METRIC: &str = "find_partitions_elapsed";
 pub const SCALAR_INDEX_SEARCH_TIME_METRIC: &str = "search_time";
 pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "ser_time";

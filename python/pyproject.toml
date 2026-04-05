@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.2.1"]
+dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.6.1"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -35,6 +35,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering",
 ]
@@ -60,11 +61,11 @@ tests = [
     # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
-    "datafusion>=50.1",
+    "datafusion>=52,<53; python_version >= '3.10'",
 ]
-dev = ["ruff==0.4.1", "pyright"]
+dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
-torch = ["torch"]
+torch = ["torch>=2.0"]
 geo = [
     "geoarrow-rust-core",
     "geoarrow-rust-io",
@@ -108,11 +109,21 @@ markers = [
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
+    # TensorFlow import can emit NumPy deprecation FutureWarnings in some environments.
+    # We keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
+    'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
-    # Pytorch 2.2 on Python 2.12
+    # Pytorch 2.2 on Python 3.12
     'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
     'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
+    # Pytorch inductor uses deprecated load_module() in its code cache
+    'ignore:.*the load_module\(\) method is deprecated.*:DeprecationWarning',
+    # Pytorch uses deprecated jit.script_method internally (torch/utils/mkldnn.py)
+    'ignore:.*torch\.jit\.script_method.*is deprecated.*:DeprecationWarning',
+    # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
+    # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
+    'ignore:.*np\.object.*:FutureWarning',
 ]

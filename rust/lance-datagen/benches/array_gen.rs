@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, Int8Type};
+use arrow_array::types::{Float32Type, Int8Type, Int16Type, Int32Type, Int64Type};
 use criterion::{
-    criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup, Criterion,
-    Throughput,
+    BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main,
+    measurement::Measurement,
 };
 
 use lance_datagen::{
-    generator::ArrayGenerator, ArrayGeneratorExt, BatchCount, ByteCount, Dimension,
-    RoundingBehavior,
+    ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RoundingBehavior,
+    generator::ArrayGenerator,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

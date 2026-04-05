@@ -22,12 +22,12 @@ runs:
         Add-Content $env:GITHUB_PATH "C:\protoc\bin"
       shell: powershell
     - name: Build wheel
-      uses: PyO3/maturin-action@v1
+      uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
       with:
         command: build
         args: ${{ inputs.args }}
         working-directory: python
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: windows-wheels
         path: python\target\wheels

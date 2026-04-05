@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
 import org.lance.TestUtils;
@@ -34,7 +35,7 @@ import java.util.UUID;
 public class OperationTestBase {
 
   public static final int TEST_FILE_FORMAT_MAJOR_VERSION = 2;
-  public static final int TEST_FILE_FORMAT_MINOR_VERSION = 0;
+  public static final int TEST_FILE_FORMAT_MINOR_VERSION = 1;
   protected Dataset dataset;
 
   @BeforeAll
@@ -53,12 +54,13 @@ public class OperationTestBase {
     dataset = suite.createEmptyDataset();
     FragmentMetadata fragmentMeta = suite.createNewFragment(rowCount);
 
-    Transaction appendTxn =
-        dataset
-            .newTransactionBuilder()
+    try (Transaction txn =
+        new Transaction.Builder()
+            .readVersion(dataset.version())
             .operation(Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
-            .build();
-    return appendTxn.commit();
+            .build()) {
+      return new CommitBuilder(dataset).execute(txn);
+    }
   }
 
   /**

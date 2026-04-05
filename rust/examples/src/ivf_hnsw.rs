@@ -5,17 +5,18 @@
 //!
 //! run with `cargo run --release --example hnsw`
 #![allow(clippy::print_stdout)]
-use arrow::array::types::Float32Type;
 use arrow::array::AsArray;
+use arrow::array::types::Float32Type;
 use clap::Parser;
 use futures::TryStreamExt;
-use lance::dataset::ProjectionRequest;
-use lance::index::vector::VectorIndexParams;
 use lance::Dataset;
+use lance::dataset::ProjectionRequest;
+use lance::index::DatasetIndexExt;
+use lance::index::vector::VectorIndexParams;
+use lance_index::IndexType;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 
 #[derive(Parser, Debug)]

@@ -37,6 +37,9 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> numThreads;
   private Optional<Long> batchSize;
   private Optional<Boolean> deferIndexRemap;
+  private Optional<CompactionMode> compactionMode;
+  private Optional<Long> binaryCopyReadBatchBytes;
+  private Optional<Long> maxSourceFragments;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -46,7 +49,10 @@ public class CompactionOptions implements Serializable {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
-      Optional<Boolean> deferIndexRemap) {
+      Optional<Boolean> deferIndexRemap,
+      Optional<CompactionMode> compactionMode,
+      Optional<Long> binaryCopyReadBatchBytes,
+      Optional<Long> maxSourceFragments) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -55,10 +61,26 @@ public class CompactionOptions implements Serializable {
     this.numThreads = numThreads;
     this.batchSize = batchSize;
     this.deferIndexRemap = deferIndexRemap;
+    this.compactionMode = compactionMode;
+    this.binaryCopyReadBatchBytes = binaryCopyReadBatchBytes;
+    this.maxSourceFragments = maxSourceFragments;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
     return deferIndexRemap;
+  }
+
+  /** Returns the compaction mode as its string value for the native layer. */
+  public Optional<String> getCompactionMode() {
+    return compactionMode.map(CompactionMode::getValue);
+  }
+
+  public Optional<Long> getBinaryCopyReadBatchBytes() {
+    return binaryCopyReadBatchBytes;
+  }
+
+  public Optional<Long> getMaxSourceFragments() {
+    return maxSourceFragments;
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -104,6 +126,9 @@ public class CompactionOptions implements Serializable {
         .add("numThreads", numThreads.orElse(null))
         .add("batchSize", batchSize.orElse(null))
         .add("deferIndexRemap", deferIndexRemap.orElse(null))
+        .add("compactionMode", compactionMode.orElse(null))
+        .add("binaryCopyReadBatchBytes", binaryCopyReadBatchBytes.orElse(null))
+        .add("maxSourceFragments", maxSourceFragments.orElse(null))
         .toString();
   }
 
@@ -116,6 +141,9 @@ public class CompactionOptions implements Serializable {
     output.writeObject(numThreads.orElse(null));
     output.writeObject(batchSize.orElse(null));
     output.writeObject(deferIndexRemap.orElse(null));
+    output.writeObject(compactionMode.map(CompactionMode::getValue).orElse(null));
+    output.writeObject(binaryCopyReadBatchBytes.orElse(null));
+    output.writeObject(maxSourceFragments.orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -127,6 +155,18 @@ public class CompactionOptions implements Serializable {
     this.numThreads = Optional.ofNullable((Long) input.readObject());
     this.batchSize = Optional.ofNullable((Long) input.readObject());
     this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
+    String modeStr = (String) input.readObject();
+    this.compactionMode = Optional.empty();
+    if (modeStr != null) {
+      for (CompactionMode m : CompactionMode.values()) {
+        if (m.getValue().equals(modeStr)) {
+          this.compactionMode = Optional.of(m);
+          break;
+        }
+      }
+    }
+    this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());
+    this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());
   }
 
   /** Builder for CompactionOptions. */
@@ -139,6 +179,9 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> numThreads = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
     private Optional<Boolean> deferIndexRemap = Optional.empty();
+    private Optional<CompactionMode> compactionMode = Optional.empty();
+    private Optional<Long> binaryCopyReadBatchBytes = Optional.empty();
+    private Optional<Long> maxSourceFragments = Optional.empty();
 
     private Builder() {}
 
@@ -182,6 +225,26 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    public Builder withCompactionMode(CompactionMode compactionMode) {
+      this.compactionMode = Optional.of(compactionMode);
+      return this;
+    }
+
+    public Builder withBinaryCopyReadBatchBytes(long binaryCopyReadBatchBytes) {
+      this.binaryCopyReadBatchBytes = Optional.of(binaryCopyReadBatchBytes);
+      return this;
+    }
+
+    /**
+     * Maximum number of source fragments to compact in a single run. Tasks are included until
+     * adding the next task would exceed this limit, allowing for incremental compaction. Fragments
+     * are processed oldest first.
+     */
+    public Builder withMaxSourceFragments(long maxSourceFragments) {
+      this.maxSourceFragments = Optional.of(maxSourceFragments);
+      return this;
+    }
+
     public CompactionOptions build() {
       return new CompactionOptions(
           targetRowsPerFragment,
@@ -191,7 +254,10 @@ public class CompactionOptions implements Serializable {
           materializeDeletionsThreshold,
           numThreads,
           batchSize,
-          deferIndexRemap);
+          deferIndexRemap,
+          compactionMode,
+          binaryCopyReadBatchBytes,
+          maxSourceFragments);
     }
   }
 }

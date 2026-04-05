@@ -3,20 +3,20 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::cache::LanceCache;
 use lance_core::ROW_ADDR;
+use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
     ZoneMapIndexBuilder, ZoneMapIndexBuilderParams, ZoneMapIndexPlugin,
 };
-use lance_index::scalar::{registry::ScalarIndexPlugin, SargableQuery};
+use lance_index::scalar::{SargableQuery, registry::ScalarIndexPlugin};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]

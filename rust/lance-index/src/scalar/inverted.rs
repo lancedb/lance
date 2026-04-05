@@ -6,7 +6,6 @@ mod encoding;
 mod index;
 mod iter;
 pub mod json;
-mod merger;
 pub mod parser;
 pub mod query;
 mod scorer;
@@ -20,20 +19,21 @@ use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
-use lance_core::{cache::LanceCache, Result};
+use lance_core::{Result, cache::LanceCache};
+pub use scorer::MemBM25Scorer;
 use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
 use lance_core::Error;
-use snafu::location;
 
 use crate::pbold;
+use crate::progress::IndexBuildProgress;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
+        CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
-        CreatedIndex, ScalarIndex,
     },
 };
 
@@ -48,6 +48,7 @@ impl InvertedIndexPlugin {
         index_store: &dyn IndexStore,
         params: InvertedIndexParams,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
             if !frag_ids.is_empty() {
@@ -62,11 +63,13 @@ impl InvertedIndexPlugin {
 
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
-            InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask);
-        inverted_index.update(data, index_store).await?;
+            InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
+                .with_progress(progress);
+        inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: INVERTED_INDEX_VERSION,
+            index_version: current_fts_format_version().index_version(),
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -119,14 +122,11 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
             DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
 
-            _ => return Err(Error::InvalidInput {
-                source: format!(
-                    "A inverted index can only be created on a Utf8 or LargeUtf8 field/list or LargeBinary field. Column has type {:?}",
-                    field.data_type()
-                )
-                    .into(),
-                location: location!(),
-            })
+            _ => return Err(Error::invalid_input_source(format!(
+                "A inverted index can only be created on a Utf8 or LargeUtf8 field/list or LargeBinary field. Column has type {:?}",
+                field.data_type()
+            )
+                .into()))
         }
 
         let params = serde_json::from_str::<InvertedIndexParams>(params)?;
@@ -138,7 +138,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        INVERTED_INDEX_VERSION
+        max_supported_fts_format_version().index_version()
     }
 
     fn new_query_parser(
@@ -173,15 +173,23 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<InvertedIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
             })?;
-        Self::train_inverted_index(data, index_store, request.parameters.clone(), fragment_ids)
-            .await
+        Self::train_inverted_index(
+            data,
+            index_store,
+            request.parameters.clone(),
+            fragment_ids,
+            progress,
+        )
+        .await
     }
 
     /// Load an index from storage
@@ -205,5 +213,19 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
         let index_params = InvertedIndexParams::try_from(&index_details)?;
         Ok(serde_json::json!(&index_params))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plugin_version_tracks_max_supported_format() {
+        let plugin = InvertedIndexPlugin;
+        assert_eq!(
+            plugin.version(),
+            max_supported_fts_format_version().index_version()
+        );
     }
 }

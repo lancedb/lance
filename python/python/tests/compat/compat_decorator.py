@@ -10,11 +10,13 @@ for testing forward and backward compatibility across Lance versions.
 
 import inspect
 import json
+import os
 import subprocess
 import sys
 import urllib.request
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import List
+from typing import Dict, List, Optional
 
 import pytest
 from packaging.version import Version
@@ -146,6 +148,42 @@ class UpgradeDowngradeTest:
 
     def check_write(self):
         pass
+
+    def skip_read_after_current_write(self, version: str) -> bool:
+        """Return True to skip the old-version read after current-version writes."""
+        return False
+
+    def skip_downgrade(self, version: str) -> bool:
+        """Return True to skip the current-write -> old-read downgrade test."""
+        return False
+
+    def current_env(self, method_name: str) -> Dict[str, str]:
+        """Return environment overrides for methods executed in the current runtime."""
+        return {}
+
+    def compat_env(self, version: str, method_name: str) -> Dict[str, str]:
+        """Return environment overrides for methods executed in a compat venv."""
+        return {}
+
+
+@contextmanager
+def _temporary_env(overrides: Optional[Dict[str, str]]):
+    if not overrides:
+        yield
+        return
+
+    sentinel = object()
+    old_values = {key: os.environ.get(key, sentinel) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in old_values.items():
+            if value is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def compat_test(min_version: str = "0.16.0"):
@@ -285,12 +323,18 @@ def test_func({sig_params}):
     """Test that old Lance version can read data written by current version."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
+    obj.compat_version = version
+    if obj.skip_downgrade(version):
+        pytest.skip(
+            "downgrade compatibility is intentionally unsupported for this test"
+        )
     # Current version: create data
-    obj.create()
+    with _temporary_env(obj.current_env("create")):
+        obj.create()
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
-    venv.execute_method(obj, "check_read")
-    venv.execute_method(obj, "check_write")
+    venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
     else:  # upgrade_downgrade
         func_body = f'''
@@ -298,18 +342,21 @@ def test_func({sig_params}):
     """Test round-trip compatibility: old -> current -> old."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
+    obj.compat_version = version
     venv = venv_factory.get_venv(version)
     # Old version: create data
-    venv.execute_method(obj, "create")
+    venv.execute_method(obj, "create", obj.compat_env(version, "create"))
     # Current version: read and write
-    obj.check_read()
-    obj.check_write()
+    with _temporary_env(obj.current_env("check_read")):
+        obj.check_read()
+    with _temporary_env(obj.current_env("check_write")):
+        obj.check_write()
     # Old version: verify can still read
-    venv.execute_method(obj, "check_read")
-    venv.execute_method(obj, "check_write")
+    venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
 
     # Execute to create the function
-    namespace = {"cls": cls}
+    namespace = {"cls": cls, "_temporary_env": _temporary_env, "pytest": pytest}
     exec(func_body, namespace)
     return namespace["test_func"]

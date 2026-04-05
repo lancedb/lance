@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use arrow_array::StringArray;
-use fsst::fsst::{compress, decompress, FSST_SYMBOL_TABLE_SIZE};
+use fsst::fsst::{FSST_SYMBOL_TABLE_SIZE, compress, decompress};
 use rand::Rng;
 
 const TEST_NUM: usize = 20;

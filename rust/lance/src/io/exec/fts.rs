@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::AsArray;
+use arrow::array::{AsArray, BooleanBuilder};
 use arrow::datatypes::{Float32Type, UInt64Type};
-use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, BooleanArray, Float32Array, OffsetSizeTrait, RecordBatch, UInt64Array};
+use arrow_schema::DataType;
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -15,31 +16,35 @@ use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
-use datafusion_physical_plan::metrics::BaselineMetrics;
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
+use lance_core::{ROW_ID, utils::tracing::StreamTracingExt};
+use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 
-use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use super::PreFilterSource;
-use crate::{index::DatasetIndexInternalExt, Dataset};
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter, build_prefilter};
+use crate::index::DatasetIndexExt;
+use crate::{Dataset, index::DatasetIndexInternalExt};
+use lance_index::IndexCriteria;
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
-    collect_query_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+    BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, Tokens, collect_query_tokens,
+    has_query_token,
 };
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
+    FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_index::{DatasetIndexExt, IndexCriteria};
 use tracing::instrument;
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
+    partitions_searched: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -47,8 +52,13 @@ impl FtsIndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
+            partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
+    }
+
+    pub fn record_parts_searched(&self, num_parts: usize) {
+        self.partitions_searched.add(num_parts);
     }
 }
 
@@ -233,7 +243,7 @@ impl ExecutionPlan for MatchQueryExec {
                 .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
-            let pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
@@ -250,6 +260,12 @@ impl ExecutionPlan for MatchQueryExec {
                         column,
                     ))
                 })?;
+            if !inverted_idx.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
+            }
+            metrics.record_parts_searched(inverted_idx.partition_count());
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let params = params
@@ -272,7 +288,7 @@ impl ExecutionPlan for MatchQueryExec {
                     }
                 }
             };
-            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
@@ -320,6 +336,230 @@ impl ExecutionPlan for MatchQueryExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+}
+
+/// Filters the input, removing rows that do not share tokens with the query
+#[derive(Debug)]
+pub struct FlatMatchFilterExec {
+    dataset: Arc<Dataset>,
+    input: Arc<dyn ExecutionPlan>,
+    query: MatchQuery,
+    params: FtsSearchParams,
+
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DisplayAs for FlatMatchFilterExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "FlatMatchFilter: column={}, query={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "FlatMatchFilter\ncolumn={}\nquery={}",
+                    self.query.column.as_deref().unwrap_or_default(),
+                    self.query.terms
+                )
+            }
+        }
+    }
+}
+
+impl FlatMatchFilterExec {
+    async fn load_tokenizer(
+        dataset: &Dataset,
+        column: &str,
+        metrics: &IndexMetrics,
+    ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
+        let index_meta = dataset
+            .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
+            .await?;
+
+        if let Some(index_meta) = index_meta {
+            let uuid = index_meta.uuid.to_string();
+            let index = dataset.open_generic_index(column, &uuid, metrics).await?;
+            if let Some(index) = index.as_any().downcast_ref::<InvertedIndex>() {
+                return Ok(index.tokenizer());
+            } else {
+                return Err(DataFusionError::Execution(format!(
+                    "Index for column {} is not an inverted index",
+                    column,
+                )));
+            }
+        } // Else, no index, use text tokenzier
+
+        Ok(Box::new(TextTokenizer::new(
+            tantivy::tokenizer::TextAnalyzer::builder(
+                tantivy::tokenizer::SimpleTokenizer::default(),
+            )
+            .build(),
+        )))
+    }
+
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+    ) -> Self {
+        Self {
+            dataset,
+            input,
+            query,
+            params,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    fn find_matches<O: OffsetSizeTrait>(
+        text_col: &dyn Array,
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        query_tokens: &Tokens,
+    ) -> BooleanArray {
+        let text_col = text_col.as_string::<O>();
+        let mut predicate = BooleanBuilder::with_capacity(text_col.len());
+        for idx in 0..text_col.len() {
+            let value = text_col.value(idx);
+            predicate.append_value(has_query_token(value, tokenizer, query_tokens));
+        }
+        predicate.finish()
+    }
+
+    async fn do_filter(
+        input: SendableRecordBatchStream,
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        metrics: Arc<FtsIndexMetrics>,
+    ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>> + Send> {
+        let column = query
+            .column
+            .as_ref()
+            .ok_or(DataFusionError::Execution(format!(
+                "column not set for MatchQuery {}",
+                query.terms
+            )))?;
+        let mut tokenizer = Self::load_tokenizer(&dataset, column, &metrics.index_metrics).await?;
+        let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
+        let column = column.clone();
+
+        Ok(input.map(move |batch| -> DataFusionResult<_> {
+            let batch = batch?;
+            let text_column = batch.column_by_name(&column).ok_or_else(|| {
+                DataFusionError::Execution(format!("Column {} not found in batch", column,))
+            })?;
+            let predicate = match text_column.data_type() {
+                DataType::Utf8 => {
+                    Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
+                }
+                DataType::LargeUtf8 => {
+                    Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
+                }
+                _ => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Column {} is not a string",
+                        column,
+                    )));
+                }
+            };
+            DataFusionResult::Ok(arrow::compute::filter_record_batch(&batch, &predicate)?)
+        }))
+    }
+}
+
+impl ExecutionPlan for FlatMatchFilterExec {
+    fn name(&self) -> &str {
+        "FlatMatchFilterExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "Unexpected number of children".to_string(),
+            ));
+        }
+        let input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("Unexpected number of children".to_string())
+        })?;
+
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            input,
+            query: self.query.clone(),
+            params: self.params.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    #[instrument(name = "flat_match_filter_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
+
+        let dataset = self.dataset.clone();
+        let input = self.input.execute(partition, context)?;
+
+        let stream =
+            stream::once(async move { Self::do_filter(input, dataset, query, metrics).await })
+                .try_flatten()
+                .map(move |batch| {
+                    if let Ok(batch) = &batch {
+                        metrics_clone
+                            .baseline_metrics
+                            .record_output(batch.num_rows());
+                    }
+                    batch
+                });
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+            partition,
+            &self.metrics,
+        )))
+    }
+
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        #[allow(deprecated)]
+        self.input.statistics()
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
     }
 }
 
@@ -425,6 +665,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
+        let target_batch_size = context.session_config().batch_size();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -447,15 +688,20 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 }
                 None => None,
             };
+            if let Some(index) = inverted_idx.as_ref() {
+                metrics.record_parts_searched(index.partition_count());
+            }
 
-            Ok::<_, DataFusionError>(flat_bm25_search_stream(
+            flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
                 &inverted_idx,
-            ))
+                target_batch_size,
+            )
+            .await
         })
-        .try_flatten_unordered(None)
+        .try_flatten()
         .map(move |batch| {
             if let Ok(batch) = &batch {
                 metrics_clone
@@ -632,10 +878,13 @@ impl ExecutionPlan for PhraseQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let column = query.column.ok_or(DataFusionError::Execution(format!(
-                "column not set for PhraseQuery {}",
-                query.terms
-            )))?;
+            let column = query
+                .column
+                .clone()
+                .ok_or(DataFusionError::Execution(format!(
+                    "column not set for PhraseQuery {}",
+                    query.terms
+                )))?;
             let index_meta = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
@@ -648,11 +897,11 @@ impl ExecutionPlan for PhraseQueryExec {
                 .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
 
-            let pre_filter = build_prefilter(
+            let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
-                ds,
+                ds.clone(),
                 &[index_meta],
             )?;
 
@@ -665,9 +914,15 @@ impl ExecutionPlan for PhraseQueryExec {
                         column,
                     ))
                 })?;
+            if !index.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(index.deleted_fragments().clone());
+            }
+            metrics.record_parts_searched(index.partition_count());
 
             let mut tokenizer = index.tokenizer();
-            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
@@ -1035,6 +1290,9 @@ impl ExecutionPlan for BooleanQueryExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let params = self.params.clone();
+        let should_plan = self.should.clone();
+        let must_plan = self.must.clone();
+        let must_not_plan = self.must_not.clone();
         let must = self
             .must
             .as_ref()
@@ -1084,6 +1342,22 @@ impl ExecutionPlan for BooleanQueryExec {
                 }
             }
 
+            let mut partitions_searched = 0;
+            for plan in [Some(&should_plan), must_plan.as_ref(), Some(&must_not_plan)] {
+                let Some(plan) = plan else {
+                    continue;
+                };
+                let Some(metrics) = plan.metrics() else {
+                    continue;
+                };
+                for (metric_name, count) in metrics.iter_counts() {
+                    if metric_name.as_ref() == PARTITIONS_SEARCHED_METRIC {
+                        partitions_searched += count.value();
+                    }
+                }
+            }
+            metrics.record_parts_searched(partitions_searched);
+
             // sort the results and take the top k
             let _timer = elapsed_time.timer();
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
@@ -1121,19 +1395,49 @@ impl ExecutionPlan for BooleanQueryExec {
 }
 
 #[cfg(test)]
-pub mod tests {
-    use std::sync::Arc;
+mod tests {
+    use std::sync::{Arc, Mutex};
 
+    use crate::index::DatasetIndexExt;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::inverted::InvertedIndex;
     use lance_index::scalar::inverted::query::{
-        BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+        BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
+        PhraseQuery,
+    };
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
+    use lance_index::{IndexCriteria, IndexType};
+
+    use crate::{
+        index::DatasetIndexInternalExt,
+        io::exec::PreFilterSource,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
-    use crate::{io::exec::PreFilterSource, utils::test::NoContextTestFixture};
-
     use super::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+
+    #[derive(Default)]
+    struct StatsHolder {
+        collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
+    }
+
+    impl StatsHolder {
+        fn get_setter(&self) -> ExecutionStatsCallback {
+            let collected_stats = self.collected_stats.clone();
+            Arc::new(move |stats| {
+                *collected_stats.lock().unwrap() = Some(stats.clone());
+            })
+        }
+
+        fn consume(self) -> ExecutionSummaryCounts {
+            self.collected_stats.lock().unwrap().take().unwrap()
+        }
+    }
 
     #[test]
     fn execute_without_context() {
@@ -1217,5 +1521,136 @@ pub mod tests {
             .unwrap();
         let metrics = boost_query.metrics().unwrap();
         assert!(metrics.elapsed_compute().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_parts_searched_metrics() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["hello", "lance", "search"]),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index_meta = dataset
+            .load_scalar_index(IndexCriteria::default().for_column("text").supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = dataset
+            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let expected_parts = inverted_index.partition_count();
+
+        let stats_holder = StatsHolder::default();
+        let mut scanner = dataset.scan();
+        scanner
+            .scan_stats_callback(stats_holder.get_setter())
+            .project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+            .unwrap();
+        let _ = scanner.try_into_batch().await.unwrap();
+        let stats = stats_holder.consume();
+        let parts_searched = stats
+            .all_counts
+            .get(PARTITIONS_SEARCHED_METRIC)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(parts_searched, expected_parts);
+
+        let mut analyze_scanner = dataset.scan();
+        analyze_scanner
+            .project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+            .unwrap();
+        let analysis = analyze_scanner.analyze_plan().await.unwrap();
+        assert!(analysis.contains(PARTITIONS_SEARCHED_METRIC));
+    }
+
+    #[tokio::test]
+    async fn test_boolean_query_parts_searched_metrics() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["hello", "lance", "search"]),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index_meta = dataset
+            .load_scalar_index(IndexCriteria::default().for_column("text").supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = dataset
+            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let expected_parts = inverted_index.partition_count();
+
+        let query = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("hello".to_string())
+                    .with_operator(Operator::And)
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("lance".to_string())
+                    .with_operator(Operator::And)
+                    .into(),
+            ),
+        ]);
+        let expected_total = expected_parts * 2;
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let boolean_line = analysis
+            .lines()
+            .find(|line| line.contains("BooleanQuery"))
+            .unwrap();
+        assert!(
+            boolean_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
+            "BooleanQuery metrics missing partitions_searched: {boolean_line}"
+        );
     }
 }

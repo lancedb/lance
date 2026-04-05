@@ -36,6 +36,7 @@ public class Index {
   private final int indexVersion;
   private final Instant createdAt;
   private final Integer baseId;
+  private final IndexType indexType;
 
   private Index(
       UUID uuid,
@@ -46,7 +47,8 @@ public class Index {
       byte[] indexDetails,
       int indexVersion,
       Instant createdAt,
-      Integer baseId) {
+      Integer baseId,
+      IndexType indexType) {
     this.uuid = uuid;
     this.fields = fields;
     this.name = name;
@@ -56,6 +58,7 @@ public class Index {
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
     this.baseId = baseId;
+    this.indexType = indexType;
   }
 
   public UUID uuid() {
@@ -119,6 +122,15 @@ public class Index {
     return Optional.ofNullable(createdAt);
   }
 
+  /**
+   * Get the type of the index (e.g., BTREE, BITMAP, VECTOR).
+   *
+   * @return the index type, or null if unknown
+   */
+  public IndexType indexType() {
+    return indexType;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -132,14 +144,23 @@ public class Index {
         && Objects.equals(fragments, index.fragments)
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
-        && Objects.equals(baseId, index.baseId);
+        && Objects.equals(baseId, index.baseId)
+        && indexType == index.indexType;
   }
 
   @Override
   public int hashCode() {
     int result =
         Objects.hash(
-            uuid, fields, name, datasetVersion, indexVersion, createdAt, baseId, fragments);
+            uuid,
+            fields,
+            name,
+            datasetVersion,
+            indexVersion,
+            createdAt,
+            baseId,
+            fragments,
+            indexType);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -152,6 +173,7 @@ public class Index {
         .add("name", name)
         .add("datasetVersion", datasetVersion)
         .add("indexVersion", indexVersion)
+        .add("indexType", indexType)
         .add("createdAt", createdAt)
         .add("baseId", baseId)
         .toString();
@@ -177,6 +199,7 @@ public class Index {
     private int indexVersion;
     private Instant createdAt;
     private Integer baseId;
+    private IndexType indexType;
 
     private Builder() {}
 
@@ -225,6 +248,11 @@ public class Index {
       return this;
     }
 
+    public Builder indexType(IndexType indexType) {
+      this.indexType = indexType;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -235,7 +263,8 @@ public class Index {
           indexDetails,
           indexVersion,
           createdAt,
-          baseId);
+          baseId,
+          indexType);
     }
   }
 }

@@ -3,7 +3,7 @@
 
 use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
-use crate::utils::{class_name, export_vec, extract_vec, PyLance};
+use crate::utils::{PyLance, class_name, export_vec, extract_vec};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
@@ -11,17 +11,53 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
-use pyo3::{intern, prelude::*};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
+use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// Add Index bindings
+// IndexFile bindings
+impl FromPyObject<'_> for PyLance<IndexFile> {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let path = ob.getattr("path")?.extract()?;
+        let size_bytes = ob.getattr("size_bytes")?.extract()?;
+        Ok(Self(IndexFile { path, size_bytes }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&IndexFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .expect("Failed to import lance module");
+
+        let cls = namespace
+            .getattr("IndexFile")
+            .expect("Failed to get IndexFile class");
+        cls.call1((self.0.path.clone(), self.0.size_bytes))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<IndexFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
+    }
+}
+
+// IndexMetadata bindings
 impl FromPyObject<'_> for PyLance<IndexMetadata> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let uuid = ob.getattr("uuid")?.to_string();
@@ -44,16 +80,28 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             .extract::<Option<i64>>()?
             .map(|id| id as u32);
 
+        let files: Option<Vec<IndexFile>> = ob
+            .getattr("files")?
+            .extract::<Option<Vec<PyLance<IndexFile>>>>()?
+            .map(|v| v.into_iter().map(|f| f.0).collect());
+        let index_details = match ob.getattr("index_details") {
+            Ok(details) => details
+                .extract::<Option<(String, Vec<u8>)>>()?
+                .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
+            Err(_) => None,
+        };
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
             dataset_version,
             fragment_bitmap,
-            index_details: None,
+            index_details,
             index_version,
             created_at,
             base_id,
+            files,
         }))
     }
 }
@@ -85,6 +133,17 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         );
         let created_at = self.0.created_at;
         let base_id = self.0.base_id.map(|id| id as i64);
+        let files = self
+            .0
+            .files
+            .as_ref()
+            .map(|f| export_vec(py, f.as_slice()))
+            .transpose()?;
+        let index_details = self
+            .0
+            .index_details
+            .as_ref()
+            .map(|details| (details.type_url.clone(), details.value.clone()));
 
         let cls = namespace
             .getattr("Index")
@@ -98,6 +157,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             index_version,
             created_at,
             base_id,
+            files,
+            index_details,
         ))
     }
 }
@@ -132,8 +193,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
             .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .expect("Failed to import LanceOperation namespace");
 
-        let fragment_id = self.0 .0;
-        let new_file = PyLance(&self.0 .1).into_pyobject(py)?;
+        let fragment_id = self.0.0;
+        let new_file = PyLance(&self.0.1).into_pyobject(py)?;
 
         let cls = namespace
             .getattr("DataReplacementGroup")
@@ -229,9 +290,10 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    mem_wal_to_merge: None,
+                    merged_generations: vec![],
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    inserted_rows_filter: None,
                 };
                 Ok(Self(op))
             }
@@ -299,17 +361,17 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let field_metadata_updates_py = ob.getattr("field_metadata_updates")?;
                 let mut field_metadata_updates = HashMap::new();
 
-                if !field_metadata_updates_py.is_none() {
-                    if let Ok(items) = field_metadata_updates_py.call_method0("items") {
-                        for item in items.try_iter()? {
-                            let item = item?;
-                            // Extract as a tuple and then get individual elements
-                            let tuple = item.downcast::<pyo3::types::PyTuple>()?;
-                            let field_id = tuple.get_item(0)?.extract::<i32>()?;
-                            let update_map = tuple.get_item(1)?;
-                            if let Some(map) = extract_update_map(&update_map)? {
-                                field_metadata_updates.insert(field_id, map);
-                            }
+                if !field_metadata_updates_py.is_none()
+                    && let Ok(items) = field_metadata_updates_py.call_method0("items")
+                {
+                    for item in items.try_iter()? {
+                        let item = item?;
+                        // Extract as a tuple and then get individual elements
+                        let tuple = item.downcast::<pyo3::types::PyTuple>()?;
+                        let field_id = tuple.get_item(0)?.extract::<i32>()?;
+                        let update_map = tuple.get_item(1)?;
+                        if let Some(map) = extract_update_map(&update_map)? {
+                            field_metadata_updates.insert(field_id, map);
                         }
                     }
                 }
@@ -341,7 +403,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             .expect("Failed to import LanceOperation namespace");
 
         match self.0 {
-            Operation::Append { ref fragments } => {
+            Operation::Append { fragments } => {
                 let fragments = export_vec(py, fragments.as_slice())?;
                 let cls = namespace
                     .getattr("Append")
@@ -349,9 +411,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((fragments,))
             }
             Operation::Overwrite {
-                ref fragments,
-                ref schema,
-                ref initial_bases,
+                fragments,
+                schema,
+                initial_bases,
                 ..
             } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
@@ -431,10 +493,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Delete class");
                 cls.call1((updated_fragments, deleted_fragment_ids, predicate))
             }
-            Operation::Merge {
-                ref fragments,
-                ref schema,
-            } => {
+            Operation::Merge { fragments, schema } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
@@ -449,8 +508,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((version,))
             }
             Operation::Rewrite {
-                ref groups,
-                ref rewritten_indices,
+                groups,
+                rewritten_indices,
                 ..
             } => {
                 let groups_py = export_vec(py, groups.as_slice())?;
@@ -461,8 +520,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((groups_py, rewritten_indices_py))
             }
             Operation::CreateIndex {
-                ref new_indices,
-                ref removed_indices,
+                new_indices,
+                removed_indices,
             } => {
                 let new_indices_py = export_vec(py, new_indices.as_slice())?;
                 let removed_indices_py = export_vec(py, removed_indices.as_slice())?;
@@ -472,7 +531,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get CreateIndex class");
                 cls.call1((new_indices_py, removed_indices_py))
             }
-            Operation::Project { ref schema } => {
+            Operation::Project { schema } => {
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Project")
@@ -488,10 +547,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 }
             }
             Operation::UpdateConfig {
-                ref config_updates,
-                ref table_metadata_updates,
-                ref schema_metadata_updates,
-                ref field_metadata_updates,
+                config_updates,
+                table_metadata_updates,
+                schema_metadata_updates,
+                field_metadata_updates,
             } => {
                 if let Ok(cls) = namespace.getattr("UpdateConfig") {
                     let config = export_update_map(py, config_updates)?;
@@ -516,7 +575,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            Operation::UpdateBases { ref new_bases } => {
+            Operation::UpdateBases { new_bases } => {
                 if let Ok(cls) = namespace.getattr("UpdateBases") {
                     use crate::dataset::DatasetBasePath;
                     let new_bases_py: Vec<DatasetBasePath> = new_bases
@@ -641,6 +700,7 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
                 value: new_details_value,
             },
             new_index_version,
+            new_index_files: None,
         }))
     }
 }
@@ -689,7 +749,7 @@ fn extract_update_map(ob: &Bound<'_, PyAny>) -> PyResult<Option<UpdateMap>> {
     }))
 }
 
-fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<PyObject> {
+fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<Py<PyAny>> {
     match update_map {
         None => Ok(py.None()),
         Some(map) => {

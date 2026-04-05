@@ -12,6 +12,9 @@ logging subscriber that logs to stderr.
 The Python/Java logger can be configured with several environment variables:
 
 - `LANCE_LOG`: Controls log filtering based on log level and target. See the [env_logger](https://docs.rs/env_logger/latest/env_logger/) docs for more details. The `LANCE_LOG` environment variable replaces the `RUST_LOG` environment variable.
+- `LANCE_TRACING`: Controls tracing filtering based on log level. Key tracing events described below are emitted at
+  the `info` level. However, additional spans and events are available at the `debug` level which may be useful for
+  debugging performance issues. The default tracing level is `info`.
 - `LANCE_LOG_STYLE`: Controls whether colors are used in the log messages. Valid values are `auto`, `always`, `never`.
 - `LANCE_LOG_TS_PRECISION`: The precision of the timestamp in the log messages. Valid values are `ns`, `us`, `ms`, `s`.
 - `LANCE_LOG_FILE`: Redirects Rust log messages to the specified file path instead of stderr. When set, Lance will create the file and any necessary parent directories. If the file cannot be created (e.g., due to permission issues), Lance will fall back to logging to stderr.
@@ -61,7 +64,7 @@ debugging query performance.
 Lance is designed to be thread-safe and performant. Lance APIs can be called concurrently unless
 explicitly stated otherwise. Users may create multiple tables and share tables between threads.
 Operations may run in parallel on the same table, but some operations may lead to conflicts. For
-details see [conflict resolution](../format/index.md#conflict-resolution).
+details see [conflict resolution](../format/table/transaction/#conflict-resolution).
 
 Most Lance operations will use multiple threads to perform work in parallel. There are two thread
 pools in lance: the IO thread pool and the compute thread pool. The IO thread pool is used for
@@ -160,8 +163,232 @@ In summary, scans could use up to `(2 * io_buffer_size) + (batch_size * num_comp
 Keep in mind that `io_buffer_size` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
 
-The above limits refer to limits per-scan. There is an additional limit on the number of IOPS that is applied
-across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable.
-The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
-with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
-can often lead to issues with excessive retries and timeouts from the object store.
+### Cloud Store Throttling
+
+Cloud object stores (S3, GCS, Azure) are automatically wrapped with an AIMD (Additive Increase / Multiplicative
+Decrease) rate limiter. When the store returns throttle errors (HTTP 429/503), the request rate decreases
+multiplicatively. During sustained success, the rate increases additively. This applies to all operations
+(reads, writes, deletes, lists) and replaces the old `LANCE_PROCESS_IO_THREADS_LIMIT` process-wide cap.
+
+Local and in-memory stores are **not** throttled.
+
+The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
+over environment variables:
+
+| Setting            | Storage Option Key              | Env Var                         | Default |
+| ------------------ | ------------------------------- | ------------------------------- | ------- |
+| Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
+| Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
+| Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
+| Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
+
+These initial settings are balanced and should work for most
+use cases. For example, S3 can typically get up to 5000
+req/s and with these settings we should get there in about
+10 seconds.
+
+## Conflict Handling
+
+Lance supports concurrent operations on the same table using optimistic concurrency control. When two
+operations conflict, one of them must be retried. Retries are handled automatically but they repeat
+work that has already been done, which can hurt throughput. Understanding and minimizing conflicts is
+important for maintaining good performance in write-heavy workloads.
+
+Common sources of conflicts include:
+
+- Concurrent compaction and index building, since both need to modify the same indices
+- Update operations that affect the same fragments, since both need to rewrite the same data files
+
+For more details on which operations conflict with each other, see
+[conflict resolution](../format/table/transaction.md#conflict-resolution).
+
+### Fragment Reuse Index
+
+Compaction is one of the most expensive write operations because it rewrites data files and, by
+default, remaps all indices to reflect the new row addresses. When compaction and index building
+run concurrently, they often conflict because both need to modify the same indices. This typically
+causes the compaction to fail and retry, and repeated failures can cause table layout to degrade
+over time.
+
+The Fragment Reuse Index (FRI) solves this by allowing compaction to skip the index remap step.
+Instead of immediately updating indices, compaction records a mapping from old fragment row
+addresses to new ones. When indices are loaded into the cache, the FRI is applied to translate
+the old row addresses to the current ones. This adds a small cost to index load time but does
+not affect query performance once the index is cached.
+
+This decoupling means compaction and index building no longer conflict, which is especially
+valuable for tables that are continuously ingesting data while also maintaining indices.
+
+To enable the FRI, set `defer_index_remap=True` when compacting:
+
+```python
+dataset.optimize.compact_files(defer_index_remap=True)
+```
+
+For details on the index format and usage patterns, see the
+[Fragment Reuse Index specification](../format/table/index/system/frag_reuse.md).
+
+## Indexes
+
+Training and searching indexes can have unique requirements for compute and memory. This section provides some
+guidance on what can be expected for different index types.
+
+### BTree Index
+
+The BTree index is a two-level structure that provides efficient range queries and sorted access.
+It strikes a balance between an expensive memory structure containing all values and an expensive disk
+structure that can't be efficiently searched.
+
+Training a BTree index is done by sorting the column. This is done using an [external sort](https://en.wikipedia.org/wiki/External_sorting) to constrain the total memory usage to a reasonable amount. Updating a BTree index does not
+require re-sorting the entire column. The new values are sorted and the existing values are merged into the new sorted
+values in linear time.
+
+#### Storage Requirements
+
+The BTree index is essentially a sorted copy of a column. The storage requirements are therefore the same as the column
+but an additional 4 bytes per value is required to store the row ID and there is a small lookup structure which
+should be roughly 0.001% of the size of the column.
+
+#### Memory Requirements
+
+Training a BTree index requires some RAM but the current implementation spills to disk rather aggressively and so the
+total memory usage is fairly low.
+
+When searching a BTree index, the index is loaded into the index cache in pages. Each page contains 4096 values.
+
+#### Performance
+
+The sort stage is the most expensive step in training a BTree index. The time complexity is O(n log n) where n is the number of rows in the column. At very large scales this can be a bottleneck and a distributed sort may be necessary. Lance currently does
+not have anything builtin for this but work is underway to add this functionality. Training an index in parts as the data grows
+may be slightly more efficient than training the entire index at once if you have the flexibility to do so.
+
+When the BTree index is fully loaded into the index cache, the search time scales linearly with the number of rows that match the
+query. When the BTree index is not fully loaded into the index cache, the search time will be controlled by the number of pages
+that need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+pages were loaded from disk to satisfy a query.
+
+### Bitmap Index
+
+The Bitmap index is an inverted lookup table that stores a bitmap for each possible value in the column. These bitmaps are compressed and serialized as a [Roaring Bitmap](https://roaringbitmap.org/).
+
+A bitmap index is currently trained by accumulating the column into a hash map from value to a vector of row ids. Each value
+is then serialized into a bitmap and stored in a file.
+
+### Storage Requirements
+
+The size of a bitmap index is difficult to calculate precisely but will generally scale with the number of unique values in the
+column since a unique bitmap is required for each value and a single bitmap with all rows will compress more efficiently than
+many bitmaps with a small number of rows.
+
+#### Memory Requirements
+
+Since training a bitmap index requires collecting the values into a hash map you will need at least 8 bytes of memory per row.
+In addition, if you have many unique values, then you will need additional memory for the keys of the hash map. Training large
+bitmaps with many unique values at scale can be memory intensive.
+
+When a bitmap index is searched, bitmaps are loaded into the session cache individually. The size of the bitmap will depend on
+the number of rows that match the token.
+
+### Performance
+
+When the bitmap index is fully loaded into the index cache, the search time scales linearly with the number of values that the
+query requires. This makes the bitmap very fast for equality queries or very small ranges. Queries against large ranges are
+currently extremely slow and the btree index is much faster for large range queries.
+
+When a bitmap index is not fully loaded into the index cache, the search time will be controlled by the number of bitmaps that
+need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+bitmaps were loaded from disk to satisfy a query.
+
+### Vector Index
+
+Vector indexes (IVF_PQ, IVF_HNSW_SQ, etc.) are built in multiple phases, each with different memory requirements.
+
+#### IVF Training
+
+The IVF (Inverted File) phase clusters vectors into partitions using KMeans. To train the KMeans model, a sample of the
+dataset is loaded into memory. The size of this sample is determined by:
+
+```
+training_data = num_partitions * sample_rate * dimension * sizeof(data_type)
+```
+
+The default `sample_rate` is 256. For example, with 1024 partitions, 768-dimensional float32 vectors, and the default
+sample rate:
+
+```
+1024 * 256 * 768 * 4 bytes = 768 MiB
+```
+
+In addition to the training data, each KMeans iteration allocates membership and distance vectors proportional to the
+number of training vectors (8 bytes per vector). The centroids themselves require `num_partitions * dimension *
+sizeof(data_type)` bytes. In practice, the training data dominates and these additional allocations are small in
+comparison.
+
+If the dataset has fewer rows than `num_partitions * sample_rate`, the entire dataset is used for training instead.
+
+#### Quantizer Training
+
+After IVF training, a quantizer (e.g. PQ, SQ) is trained to compress vectors. This phase may sample some of the
+dataset, but the sample size is tied to properties of the quantizer and the vector dimension rather than the size of the
+dataset. As a result, quantizer training typically requires very little RAM compared to the IVF phase.
+
+#### Shuffling
+
+The final phase scans the entire vector column, transforms each vector (assigning it to an IVF partition and quantizing
+it), and writes the results into per-partition files on disk. This is a streaming operation — data is not accumulated in
+memory.
+
+The input scan uses a 2 GiB I/O readahead buffer by default (configurable via `LANCE_DEFAULT_IO_BUFFER_SIZE`) and reads
+batches of 8,192 rows. Incoming batches are transformed in parallel, with `num_cpus - 2` batches in flight at a time
+(configurable via `LANCE_CPU_THREADS`). Each batch is sorted by partition ID and the slices are written directly to the
+corresponding partition file. The in-flight memory during this phase is roughly:
+
+```
+io_readahead_buffer + num_cpu_threads * batch_size * (raw_vector_size + transformed_vector_size)
+```
+
+Each partition has an open file writer with roughly 8 MiB of accumulation buffer. In practice there shouldn't be that
+much data accumulated in a single partition anyways. Instead, the max accumulation will be roughly the final size of
+the partitions which comes out to `num_rows * (num_sub_vectors + 8) bytes`. For example, 100M rows with a 1536-dimensional
+vector will have 96 sub-vectors and so the max accumulation will be ~10GB. The additional 8 bytes per row is for the row ID.
+
+#### Storage Requirements
+
+The on-disk size of a vector index consists of the IVF centroids and the quantized vectors.
+
+The centroids require:
+
+```
+num_partitions * dimension * sizeof(data_type)
+```
+
+This is typically small. For example, 10K partitions with 768-dimensional float32 vectors is only 30 MiB.
+
+The quantized vectors make up the bulk of the index. Each row stores a quantized code plus an 8-byte row ID. The
+exact size depends on the quantizer:
+
+**PQ (Product Quantization):** Each sub-vector is quantized to a single byte, so each row requires
+`num_sub_vectors + 8` bytes. For example, 100M rows with 96 sub-vectors:
+
+```
+100M * (96 + 8) = ~9.7 GiB
+```
+
+**SQ (Scalar Quantization):** Each dimension is independently quantized to a single byte, so each row requires
+`dimension + 8` bytes. SQ preserves more information than PQ but requires more storage. For example, 100M rows with
+768-dimensional vectors:
+
+```
+100M * (768 + 8) = ~72.3 GiB
+```
+
+**RQ (RaBitQ):** Vectors are quantized to binary codes with a configurable number of bits per
+dimension. Each row also stores per-row scale and offset factors (4 bytes each) used for distance correction. Each
+row requires `dimension * num_bits / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For
+example, 100M rows with 768 dimensions and 1 bit per dimension:
+
+```
+100M * (768 * 1 / 8 + 16) = ~10.8 GiB
+```

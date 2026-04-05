@@ -1,0 +1,10 @@
+[project]
+name = "dbpedia-openai"
+version = "0.1.0"
+description = "Benchmarks for huggingface dpbedia dataset with OpenAI embeddings"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = ["pylance", "datasets"]
+
+[dependency-groups]
+dev = ["ruff"]

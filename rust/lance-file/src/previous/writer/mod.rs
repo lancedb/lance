@@ -19,13 +19,11 @@ use lance_arrow::*;
 use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::{Error, Result};
 use lance_io::encodings::{
-    binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder, Encoder,
+    Encoder, binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder,
 };
 use lance_io::object_store::ObjectStore;
-use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -47,10 +45,8 @@ pub trait ManifestProvider {
     ///
     /// Note: the dictionaries have already been written by this point and the schema should
     /// be populated with the dictionary lengths/offsets
-    async fn store_schema(
-        object_writer: &mut ObjectWriter,
-        schema: &Schema,
-    ) -> Result<Option<usize>>;
+    async fn store_schema(object_writer: &mut dyn Writer, schema: &Schema)
+    -> Result<Option<usize>>;
 }
 
 /// Implementation of ManifestProvider that does not store the schema
@@ -60,7 +56,7 @@ pub(crate) struct NotSelfDescribing {}
 #[cfg(test)]
 #[async_trait]
 impl ManifestProvider for NotSelfDescribing {
-    async fn store_schema(_: &mut ObjectWriter, _: &Schema) -> Result<Option<usize>> {
+    async fn store_schema(_: &mut dyn Writer, _: &Schema) -> Result<Option<usize>> {
         Ok(None)
     }
 }
@@ -79,7 +75,7 @@ impl ManifestProvider for NotSelfDescribing {
 /// file_writer.shutdown();
 /// ```
 pub struct FileWriter<M: ManifestProvider + Send + Sync> {
-    pub object_writer: ObjectWriter,
+    pub object_writer: Box<dyn Writer>,
     schema: Schema,
     batch_id: i32,
     page_table: PageTable,
@@ -109,7 +105,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     }
 
     pub fn with_object_writer(
-        object_writer: ObjectWriter,
+        object_writer: Box<dyn Writer>,
         schema: Schema,
         options: &FileWriterOptions,
     ) -> Result<Self> {
@@ -145,7 +141,10 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
         }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
@@ -204,16 +203,16 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 .iter()
                 .map(|batch| {
                     batch.column_by_name(&field.name).ok_or_else(|| {
-                        Error::io(
-                            format!("FileWriter::write: Field '{}' not found", field.name),
-                            location!(),
-                        )
+                        Error::invalid_input(format!(
+                            "FileWriter::write: Field '{}' not found",
+                            field.name
+                        ))
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
 
             Self::write_array(
-                &mut self.object_writer,
+                self.object_writer.as_mut(),
                 field,
                 &arrs,
                 self.batch_id,
@@ -253,7 +252,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     pub async fn finish(&mut self) -> Result<usize> {
         self.write_footer().await?;
-        self.object_writer.shutdown().await?;
+        Writer::shutdown(self.object_writer.as_mut()).await?;
         let num_rows = self
             .metadata
             .batch_offsets
@@ -284,7 +283,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     #[async_recursion]
     async fn write_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&ArrayRef],
         batch_id: i32,
@@ -377,15 +376,14 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 )
                 .await
             }
-            _ => Err(Error::Schema {
-                message: format!("FileWriter::write: unsupported data type: {data_type}"),
-                location: location!(),
-            }),
+            _ => Err(Error::schema(format!(
+                "FileWriter::write: unsupported data type: {data_type}"
+            ))),
         }
     }
 
     async fn write_null_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&dyn Array],
         batch_id: i32,
@@ -399,7 +397,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
     async fn write_fixed_stride_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&dyn Array],
         batch_id: i32,
@@ -419,7 +417,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     /// Write var-length binary arrays.
     async fn write_binary_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&dyn Array],
         batch_id: i32,
@@ -435,7 +433,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     }
 
     async fn write_dictionary_arr(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&dyn Array],
         key_type: &DataType,
@@ -455,7 +453,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
     #[async_recursion]
     async fn write_struct_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrays: &[&StructArray],
         batch_id: i32,
@@ -470,14 +468,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             for struct_array in arrays {
                 let arr = struct_array
                     .column_by_name(&child.name)
-                    .ok_or(Error::Schema {
-                        message: format!(
-                            "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
-                            child.name,
-                            struct_array.data_type()
-                        ),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::schema(format!(
+                        "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
+                        child.name,
+                        struct_array.data_type()
+                    )))?;
                 arrs.push(arr);
             }
             Self::write_array(object_writer, child, arrs.as_slice(), batch_id, page_table).await?;
@@ -486,7 +481,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     }
 
     async fn write_list_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&dyn Array],
         batch_id: i32,
@@ -534,7 +529,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     }
 
     async fn write_large_list_array(
-        object_writer: &mut ObjectWriter,
+        object_writer: &mut dyn Writer,
         field: &Field,
         arrs: &[&dyn Array],
         batch_id: i32,
@@ -597,7 +592,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                 let mut stats_page_table = PageTable::default();
                 for (i, field) in schema.fields.iter().enumerate() {
                     Self::write_array(
-                        &mut self.object_writer,
+                        self.object_writer.as_mut(),
                         field,
                         &[stats_batch.column(i)],
                         0, // Only one batch for statistics.
@@ -606,8 +601,9 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                     .await?;
                 }
 
-                let page_table_position =
-                    stats_page_table.write(&mut self.object_writer, 0).await?;
+                let page_table_position = stats_page_table
+                    .write(self.object_writer.as_mut(), 0)
+                    .await?;
 
                 Ok(Some(StatisticsMetadata {
                     schema,
@@ -624,52 +620,44 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     ///
     /// The offsets and lengths of the written buffers are stored in the given
     /// schema so that the dictionaries can be loaded in the future.
-    async fn write_dictionaries(writer: &mut ObjectWriter, schema: &mut Schema) -> Result<()> {
+    async fn write_dictionaries(writer: &mut dyn Writer, schema: &mut Schema) -> Result<()> {
         // Write dictionary values.
         let max_field_id = schema.max_field_id().unwrap_or(-1);
         for field_id in 0..max_field_id + 1 {
-            if let Some(field) = schema.mut_field_by_id(field_id) {
-                if field.data_type().is_dictionary() {
-                    let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                        Error::io(
-                            format!("Lance field {} misses dictionary info", field.name),
-                            // and wrap it in here.
-                            location!(),
-                        )
-                    })?;
+            if let Some(field) = schema.mut_field_by_id(field_id)
+                && field.data_type().is_dictionary()
+            {
+                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                    // and wrap it in here.
+                    Error::io(format!("Lance field {} misses dictionary info", field.name))
+                })?;
 
-                    let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                        Error::io(
-                            format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array", 
-                        field.name),
-                            location!(),
-                        )
-                    })?;
+                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Lance field {} is dictionary type, but misses the dictionary value array",
+                        field.name
+                    ))
+                })?;
 
-                    let data_type = value_arr.data_type();
-                    let pos = match data_type {
-                        dt if dt.is_numeric() => {
-                            let mut encoder = PlainEncoder::new(writer, dt);
-                            encoder.encode(&[value_arr]).await?
-                        }
-                        dt if dt.is_binary_like() => {
-                            let mut encoder = BinaryEncoder::new(writer);
-                            encoder.encode(&[value_arr]).await?
-                        }
-                        _ => {
-                            return Err(Error::io(
-                                format!(
-                                    "Does not support {} as dictionary value type",
-                                    value_arr.data_type()
-                                ),
-                                location!(),
-                            ));
-                        }
-                    };
-                    dict_info.offset = pos;
-                    dict_info.length = value_arr.len();
-                }
+                let data_type = value_arr.data_type();
+                let pos = match data_type {
+                    dt if dt.is_numeric() => {
+                        let mut encoder = PlainEncoder::new(writer, dt);
+                        encoder.encode(&[value_arr]).await?
+                    }
+                    dt if dt.is_binary_like() => {
+                        let mut encoder = BinaryEncoder::new(writer);
+                        encoder.encode(&[value_arr]).await?
+                    }
+                    _ => {
+                        return Err(Error::schema(format!(
+                            "Does not support {} as dictionary value type",
+                            value_arr.data_type()
+                        )));
+                    }
+                };
+                dict_info.offset = pos;
+                dict_info.length = value_arr.len();
             }
         }
         Ok(())
@@ -680,7 +668,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         let field_id_offset = *self.schema.field_ids().iter().min().unwrap();
         let pos = self
             .page_table
-            .write(&mut self.object_writer, field_id_offset)
+            .write(self.object_writer.as_mut(), field_id_offset)
             .await?;
         self.metadata.page_table_position = pos;
 
@@ -688,8 +676,8 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         self.metadata.stats_metadata = self.write_statistics().await?;
 
         // Step 3. Write manifest and dictionary values.
-        Self::write_dictionaries(&mut self.object_writer, &mut self.schema).await?;
-        let pos = M::store_schema(&mut self.object_writer, &self.schema).await?;
+        Self::write_dictionaries(self.object_writer.as_mut(), &mut self.schema).await?;
+        let pos = M::store_schema(self.object_writer.as_mut(), &self.schema).await?;
 
         // Step 4. Write metadata.
         self.metadata.manifest_position = pos;
@@ -749,11 +737,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
-        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
-        Int64Array, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
-        TimestampSecondArray, UInt8Array,
+        BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray, DurationMicrosecondArray,
+        DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray,
+        FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray,
+        NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array,
+        types::UInt32Type,
     };
     use arrow_buffer::i256;
     use arrow_schema::{

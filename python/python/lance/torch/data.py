@@ -11,7 +11,16 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+)
 
 import pyarrow as pa
 
@@ -30,6 +39,63 @@ from ..sampler import (
 from .dist import get_global_rank, get_global_world_size
 
 __all__ = ["LanceDataset", "SafeLanceDataset", "get_safe_loader"]
+
+
+class ToTensorFn(Protocol):
+    def __call__(
+        self,
+        batch: Union[pa.RecordBatch, Dict[str, Any]],
+        *,
+        hf_converter: Optional[dict] = None,
+        use_blob_api: bool = False,
+        **kwargs: Any,
+    ) -> Union[dict[str, torch.Tensor], torch.Tensor]: ...
+
+
+def _is_bfloat16_type(t: pa.DataType) -> bool:
+    """Check if a PyArrow type is the lance bfloat16 extension type."""
+    return isinstance(t, pa.ExtensionType) and t.extension_name == "lance.bfloat16"
+
+
+def _bf16_to_tensor(arr: pa.Array) -> torch.Tensor:
+    """Convert a bfloat16 extension array to a torch.bfloat16 tensor.
+
+    Reinterprets the raw bytes as uint16 and views as bfloat16,
+    since they share the same 2-byte memory layout.
+    Null values are replaced with NaN.
+    """
+    storage = arr.storage if isinstance(arr.type, pa.ExtensionType) else arr
+    buf = storage.buffers()[1]
+    offset = storage.offset * 2  # 2 bytes per bf16 value
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given buffer is not writable",
+                category=UserWarning,
+            )
+            tensor = torch.frombuffer(
+                memoryview(buf),
+                dtype=torch.uint16,
+                count=len(storage),
+                offset=offset,
+            ).view(torch.bfloat16)
+    except (AttributeError, RuntimeError, TypeError):
+        np_uint16 = np.frombuffer(
+            buf, dtype=np.uint16, count=len(storage), offset=offset
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given NumPy array is not writable",
+                category=UserWarning,
+            )
+            tensor = torch.from_numpy(np_uint16).view(torch.bfloat16)
+    if arr.null_count > 0:
+        tensor = tensor.clone()
+        null_mask = torch.from_numpy(arr.is_null().to_numpy(zero_copy_only=False))
+        tensor[null_mask] = float("nan")
+    return tensor
 
 
 # Convert an Arrow FSL array into a 2D torch tensor
@@ -84,6 +150,14 @@ def _to_tensor(
             or pa.types.is_integer(arr.type.value_type)
         ):
             tensor = _fsl_to_tensor(arr, arr.type.list_size)
+        elif pa.types.is_fixed_size_list(arr.type) and _is_bfloat16_type(
+            arr.type.value_type
+        ):
+            values = arr.values
+            start = arr.offset * arr.type.list_size
+            num_vals = len(arr) * arr.type.list_size
+            values = values.slice(start, num_vals)
+            tensor = _bf16_to_tensor(values).view(-1, arr.type.list_size)
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
@@ -93,13 +167,15 @@ def _to_tensor(
 
             if uint64_as_int64 and tensor.dtype == torch.uint64:
                 tensor = tensor.to(torch.int64)
+        elif _is_bfloat16_type(arr.type):
+            tensor = _bf16_to_tensor(arr)
         elif hf_converter is not None:
             tensor = hf_converter.to_pytorch(col, arr)
 
         if tensor is None:
             raise ValueError(
-                "Only support FixedSizeList<f16/f32/f64> or "
-                + f"numeric values, got: {arr.type}"
+                "Only support FixedSizeList<f16/bf16/f32/f64> or "
+                + f"numeric/bfloat16 values, got: {arr.type}"
             )
 
         del arr
@@ -192,9 +268,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         world_size: Optional[int] = None,
         shard_granularity: Optional[Literal["fragment", "batch"]] = None,
         batch_readahead: int = 16,
-        to_tensor_fn: Optional[
-            Callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
-        ] = _to_tensor,
+        to_tensor_fn: Optional[ToTensorFn] = _to_tensor,
         sampler: Optional[Sampler] = None,
         auto_detect_rank: bool = True,
         **kwargs,
@@ -236,6 +310,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
             A function that samples the dataset.
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
+            Should accept a batch (RecordBatch or Dict[str, pa.Array]) as the first
+            argument, plus optional keyword arguments ``hf_converter`` and
+            ``use_blob_api``.
         auto_detect_rank: bool = True, optional
             If set true, the rank and world_size will be detected automatically.
         """
@@ -422,10 +499,7 @@ class SafeLanceDataset(torch.utils.data.Dataset):
         """
         if self._ds is None:
             # Worker-process initialization
-            import os
-
-            self._ds = lance.dataset(self.uri)
-            print(f"Worker {os.getpid()} initialized dataset")
+            self._ds = lance.dataset(self.uri, **self.dataset_options)
 
         # Leverage native batch reading
         batch = self._ds.take(indices)

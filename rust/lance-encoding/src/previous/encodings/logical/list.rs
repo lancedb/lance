@@ -4,20 +4,20 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
     cast::AsArray,
     new_empty_array,
     types::{Int32Type, Int64Type, UInt64Type},
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
-use futures::{future::BoxFuture, FutureExt};
-use lance_core::{cache::LanceCache, Error, Result};
+use futures::{FutureExt, future::BoxFuture};
+use lance_core::{Error, Result, cache::LanceCache};
 use log::trace;
-use snafu::location;
 use tokio::task::JoinHandle;
 
 use crate::{
+    EncodingsIo,
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
@@ -33,7 +33,6 @@ use crate::{
     },
     repdef::RepDefBuilder,
     utils::accumulation::AccumulationQueue,
-    EncodingsIo,
 };
 
 // Scheduling lists is tricky.  Imagine the following scenario:
@@ -295,8 +294,7 @@ fn decode_offsets(
             );
         trace!(
             "List offsets range of {} lists maps to item range {:?}",
-            num_lists,
-            items_range
+            num_lists, items_range
         );
         offsets_offset += num_offsets_to_norm as u32;
         if !items_range.is_empty() {
@@ -332,7 +330,7 @@ async fn indirect_schedule_task(
     // pages.  We can use a dummy receiver to match the decoder API
     offsets_decoder.wait_for_loaded(num_offsets - 1).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
-    let offsets = decode_task.task.decode()?;
+    let (offsets, _) = decode_task.task.decode()?;
 
     let (item_ranges, offsets, validity) =
         decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
@@ -434,15 +432,16 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
         trace!(
             "Scheduled {} offsets which maps to list requests: {:?}",
-            offsets_scheduled,
-            list_reqs
+            offsets_scheduled, list_reqs
         );
         let null_offset_adjustment = list_reqs[0].null_offset_adjustment;
         // It shouldn't be possible for `list_reqs` to span more than one offsets page and so it shouldn't
         // be possible for the null_offset_adjustment to change
-        debug_assert!(list_reqs
-            .iter()
-            .all(|req| req.null_offset_adjustment == null_offset_adjustment));
+        debug_assert!(
+            list_reqs
+                .iter()
+                .all(|req| req.null_offset_adjustment == null_offset_adjustment)
+        );
         let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
         let next_offsets_decoder = next_offsets
@@ -616,13 +615,13 @@ struct ListDecodeTask {
 }
 
 impl DecodeArrayTask for ListDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let items = self
             .items
             .map(|items| {
                 // When we run the indirect I/O we wrap things in a struct array with a single field
                 // named "item".  We can unwrap that now.
-                let wrapped_items = items.decode()?;
+                let (wrapped_items, _) = items.decode()?;
                 Result::Ok(wrapped_items.as_struct().column(0).clone())
             })
             .unwrap_or_else(|| Ok(new_empty_array(self.items_field.data_type())))?;
@@ -641,33 +640,36 @@ impl DecodeArrayTask for ListDecodeTask {
         };
         let min_offset = UInt64Array::new_scalar(offsets.value(0));
         let offsets = arrow_arith::numeric::sub(&offsets, &min_offset)?;
-        match &self.offset_type {
+        let array: ArrayRef = match &self.offset_type {
             DataType::Int32 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int32)?;
                 let offsets_i32 = offsets.as_primitive::<Int32Type>();
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
-                Ok(Arc::new(ListArray::try_new(
+                Arc::new(ListArray::try_new(
                     self.items_field.clone(),
                     offsets,
                     items,
                     validity,
-                )?))
+                )?)
             }
             DataType::Int64 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int64)?;
                 let offsets_i64 = offsets.as_primitive::<Int64Type>();
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
-                Ok(Arc::new(LargeListArray::try_new(
+                Arc::new(LargeListArray::try_new(
                     self.items_field.clone(),
                     offsets,
                     items,
                     validity,
-                )?))
+                )?)
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
-        }
+        };
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((array, 0))
     }
 }
 
@@ -761,7 +763,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             // shrink the read batch size if we detect the batches are going to be huge (maybe
             // even achieve this with a read_batch_bytes parameter, though some estimation may
             // still be required)
-            return Err(Error::NotSupported { source: format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into(), location: location!() });
+            return Err(Error::not_supported_source(format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into()));
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]

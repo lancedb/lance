@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{CacheBackend, LanceCache};
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
-use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -18,7 +17,7 @@ use crate::session::index_caches::GlobalIndexCache;
 use self::index_extension::IndexExtension;
 
 pub(crate) mod caches;
-pub(crate) mod index_caches;
+pub mod index_caches;
 pub(crate) mod index_extension;
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
@@ -78,11 +77,7 @@ impl std::fmt::Debug for Session {
             )
             .field(
                 "file_metadata_cache",
-                &format!(
-                    "LanceCache(items={}, size_bytes={})",
-                    self.metadata_cache.0.approx_size(),
-                    self.metadata_cache.0.approx_size_bytes(),
-                ),
+                &format!("LanceCache(items={})", self.metadata_cache.0.approx_size(),),
             )
             .field(
                 "index_extensions",
@@ -115,6 +110,23 @@ impl Session {
         }
     }
 
+    /// Create a session with a custom index cache backend.
+    ///
+    /// The provided backend will be used for caching index data. The metadata
+    /// cache will use the default Moka-based backend with the given capacity.
+    pub fn with_index_cache_backend(
+        index_cache_backend: Arc<dyn CacheBackend>,
+        metadata_cache_size: usize,
+        store_registry: Arc<ObjectStoreRegistry>,
+    ) -> Self {
+        Self {
+            index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
+            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            index_extensions: HashMap::new(),
+            store_registry,
+        }
+    }
+
     /// Register a new index extension.
     ///
     /// A name can only be registered once per type of index extension.
@@ -134,30 +146,25 @@ impl Session {
                     .index_extensions
                     .contains_key(&(IndexType::Vector, name.clone()))
                 {
-                    return Err(Error::invalid_input(
-                        format!("{name} is already registered"),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "{name} is already registered"
+                    )));
                 }
 
                 if let Some(ext) = extension.to_vector() {
                     self.index_extensions
                         .insert((IndexType::Vector, name), ext.to_generic());
                 } else {
-                    return Err(Error::invalid_input(
-                        format!("{name} is not a vector index extension"),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "{name} is not a vector index extension"
+                    )));
                 }
             }
             _ => {
-                return Err(Error::invalid_input(
-                    format!(
-                        "scalar index extension is not support yet: {}",
-                        extension.index_type()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "scalar index extension is not support yet: {}",
+                    extension.index_type()
+                )));
             }
         }
 
@@ -188,6 +195,11 @@ impl Session {
         self.store_registry.clone()
     }
 
+    /// Get a reference to the raw metadata cache (for use in index reconstruction).
+    pub fn file_metadata_cache(&self) -> &LanceCache {
+        &self.metadata_cache.0
+    }
+
     /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.0.stats().await
@@ -212,15 +224,31 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::cache::UnsizedCacheKey;
     use lance_index::vector::VectorIndex;
+    use std::borrow::Cow;
+
+    struct TestUnsizedKey(&'static str);
+    impl UnsizedCacheKey for TestUnsizedKey {
+        type ValueType = dyn VectorIndex;
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+
+        fn type_name() -> &'static str {
+            "TestUnsized"
+        }
+    }
 
     #[tokio::test]
     async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0, Default::default());
-        assert!(no_cache
-            .index_cache
-            .get_unsized::<dyn VectorIndex>("abc")
-            .await
-            .is_none());
+        assert!(
+            no_cache
+                .index_cache
+                .get_unsized_with_key(&TestUnsizedKey("abc"))
+                .await
+                .is_none()
+        );
     }
 }

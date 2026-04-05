@@ -6,9 +6,9 @@ use crate::traits::IntoJava;
 use crate::utils::to_java_map;
 use arrow::datatypes::DataType;
 use arrow_schema::{TimeUnit, UnionFields};
+use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
 use jni::sys::{jboolean, jint};
-use jni::JNIEnv;
 use lance_core::datatypes::{Field, Schema};
 
 impl IntoJava for Schema {
@@ -39,12 +39,15 @@ pub fn convert_to_java_field<'local>(
     let name = env.new_string(&lance_field.name)?;
     let children = convert_children_fields(env, lance_field)?;
     let metadata = to_java_map(env, &lance_field.metadata)?;
+    let logical_type = env.new_string(lance_field.logical_type.to_string())?;
     let arrow_type = convert_arrow_type(env, &lance_field.data_type())?;
     let ctor_sig = "(IILjava/lang/String;".to_owned()
-        + "ZLorg/apache/arrow/vector/types/pojo/ArrowType;"
+        + "ZLjava/lang/String;"
+        + "Lorg/apache/arrow/vector/types/pojo/ArrowType;"
         + "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;"
         + "Ljava/util/Map;"
-        + "Ljava/util/List;Z)V";
+        + "Ljava/util/List;ZI)V";
+    let pk_position = lance_field.unenforced_primary_key_position.unwrap_or(0) as jint;
     let field_obj = env.new_object(
         "org/lance/schema/LanceField",
         ctor_sig.as_str(),
@@ -53,11 +56,13 @@ pub fn convert_to_java_field<'local>(
             JValue::Int(lance_field.parent_id as jint),
             JValue::Object(&JObject::from(name)),
             JValue::Bool(lance_field.nullable as jboolean),
+            JValue::Object(&JObject::from(logical_type)),
             JValue::Object(&arrow_type),
             JValue::Object(&JObject::null()),
             JValue::Object(&metadata),
             JValue::Object(&children),
-            JValue::Bool(lance_field.unenforced_primary_key as jboolean),
+            JValue::Bool(lance_field.is_unenforced_primary_key() as jboolean),
+            JValue::Int(pk_position),
         ],
     )?;
 

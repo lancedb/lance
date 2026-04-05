@@ -172,17 +172,17 @@ public class JNITest {
   }
 
   @Test
-  public void testInvalidCombinationSqWithoutHnsw() {
+  public void testValidCombinationIvfSqWithoutHnsw() {
     IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(10).build();
     SQBuildParams sq = new SQBuildParams.Builder().build();
 
-    assertThrows(
-        IllegalArgumentException.class,
-        () -> {
-          new VectorIndexParams.Builder(ivf)
-              .setDistanceType(DistanceType.L2)
-              .setSqParams(sq)
-              .build();
-        });
+    JniTestHelper.parseIndexParams(
+        IndexParams.builder()
+            .setVectorIndexParams(
+                new VectorIndexParams.Builder(ivf)
+                    .setDistanceType(DistanceType.L2)
+                    .setSqParams(sq)
+                    .build())
+            .build());
   }
 }

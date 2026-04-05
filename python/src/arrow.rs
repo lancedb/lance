@@ -18,8 +18,8 @@ use arrow::pyarrow::*;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
-use lance::arrow::bfloat16::BFloat16Array;
 use lance::arrow::bfloat16::BFLOAT16_EXT_NAME;
+use lance::arrow::bfloat16::BFloat16Array;
 use lance::arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use pyo3::{exceptions::PyValueError, prelude::*, pyclass::CompareOp, types::PyType};
 
@@ -72,8 +72,12 @@ const EXPORT_METADATA: [(&str, &str); 2] = [
 ];
 
 #[pyfunction]
-pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyObject> {
-    let array = BFloat16Array::from_iter(values.into_iter().map(|v| v.map(bf16::from_f32)));
+pub fn bfloat16_array<'py>(
+    values: Vec<Option<f32>>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let array =
+        BFloat16Array::from_iter(values.into_iter().map(|v| v.map(bf16::from_f32))).into_inner();
 
     // Create a record batch with a single column and an annotated schema
     let field = Field::new("bfloat16", DataType::FixedSizeBinary(2), true).with_metadata(
@@ -87,5 +91,5 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
         .map_err(|err| PyValueError::new_err(format!("Failed to build array: {}", err)))?;
 
     let pyarrow_batch = batch.to_pyarrow(py)?;
-    pyarrow_batch.call_method1(py, "__getitem__", ("bfloat16",))
+    pyarrow_batch.call_method1("__getitem__", ("bfloat16",))
 }

@@ -65,6 +65,27 @@ impl IOTracker {
             range,
         });
     }
+
+    /// Record a write operation for tracking.
+    ///
+    /// This is used by writers that bypass the ObjectStore layer (like LocalWriter)
+    /// to ensure their IO operations are still tracked.
+    pub fn record_write(
+        &self,
+        #[allow(unused_variables)] method: &'static str,
+        #[allow(unused_variables)] path: Path,
+        num_bytes: u64,
+    ) {
+        let mut stats = self.0.lock().unwrap();
+        stats.write_iops += 1;
+        stats.written_bytes += num_bytes;
+        #[cfg(feature = "test-util")]
+        stats.requests.push(IoRequestRecord {
+            method,
+            path,
+            range: None,
+        });
+    }
 }
 
 impl WrappingObjectStore for IOTracker {
@@ -169,9 +190,8 @@ macro_rules! assert_io_lt {
     };
 }
 
-// These fields are "dead code" because we just use them right now to display
-// in test failure messages through Debug. (The lint ignores Debug impls.)
-#[allow(dead_code)]
+// These request records only exist for test-only diagnostics.
+#[cfg(feature = "test-util")]
 #[derive(Clone)]
 pub struct IoRequestRecord {
     pub method: &'static str,
@@ -179,6 +199,7 @@ pub struct IoRequestRecord {
     pub range: Option<Range<u64>>,
 }
 
+#[cfg(feature = "test-util")]
 impl std::fmt::Debug for IoRequestRecord {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // For example: "put /path/to/file range: 0-100"

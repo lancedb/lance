@@ -6,14 +6,13 @@
 use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::stream::StreamExt;
 use futures::TryStreamExt;
-use snafu::location;
+use futures::stream::StreamExt;
 
 use lance::dataset::Dataset;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance::{Error, Result};
-use lance_index::DatasetIndexExt;
 use lance_linalg::distance::MetricType;
 
 #[derive(Parser)]
@@ -154,25 +153,18 @@ async fn create_index(
     num_sub_vectors: &usize,
     metric_type: &Option<String>,
 ) -> Result<()> {
-    let col = column.as_ref().ok_or_else(|| Error::Index {
-        message: "Must specify column".to_string(),
-        location: location!(),
-    })?;
-    let _ = index_type.ok_or_else(|| Error::Index {
-        message: "Must specify index type".to_string(),
-        location: location!(),
-    })?;
+    let col = column
+        .as_ref()
+        .ok_or_else(|| Error::index("Must specify column".to_string()))?;
+    let _ = index_type.ok_or_else(|| Error::index("Must specify index type".to_string()))?;
     let mt = match metric_type.as_ref().unwrap_or(&"l2".to_string()).as_str() {
         "l2" => MetricType::L2,
         "cosine" => MetricType::Cosine,
         _ => {
-            return Err(Error::Index {
-                message: format!(
-                    "Only l2 and cosine metric type are supported, got: {}",
-                    metric_type.as_ref().unwrap_or(&"N/A".to_string())
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Only l2 and cosine metric type are supported, got: {}",
+                metric_type.as_ref().unwrap_or(&"N/A".to_string())
+            )));
         }
     };
     dataset

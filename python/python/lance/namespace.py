@@ -7,41 +7,91 @@ This module provides:
 1. Native Rust-backed namespace implementations (DirectoryNamespace, RestNamespace)
 2. Storage options integration with LanceNamespace for automatic credential refresh
 3. Plugin registry for external namespace implementations
+4. Dynamic context provider registry for per-request context injection
 
 The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
-from typing import Dict, List
+from abc import ABC, abstractmethod
+from typing import Dict, Optional
 
 from lance_namespace import (
-    CreateEmptyTableRequest,
-    CreateEmptyTableResponse,
+    AlterTableAddColumnsRequest,
+    AlterTableAddColumnsResponse,
+    AlterTableAlterColumnsRequest,
+    AlterTableAlterColumnsResponse,
+    AlterTableDropColumnsRequest,
+    AlterTableDropColumnsResponse,
+    AlterTransactionRequest,
+    AlterTransactionResponse,
+    AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableIndexRequest,
+    CreateTableIndexResponse,
     CreateTableRequest,
     CreateTableResponse,
+    CreateTableTagRequest,
+    CreateTableTagResponse,
+    DeclareTableRequest,
+    DeclareTableResponse,
+    DeleteFromTableRequest,
+    DeleteFromTableResponse,
+    DeleteTableTagRequest,
+    DeleteTableTagResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
+    DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse,
     DescribeTableRequest,
     DescribeTableResponse,
+    DescribeTransactionRequest,
+    DescribeTransactionResponse,
     DropNamespaceRequest,
     DropNamespaceResponse,
+    DropTableIndexRequest,
+    DropTableIndexResponse,
     DropTableRequest,
     DropTableResponse,
+    ExplainTableQueryPlanRequest,
+    GetTableStatsRequest,
+    GetTableStatsResponse,
+    GetTableTagVersionRequest,
+    GetTableTagVersionResponse,
+    InsertIntoTableRequest,
+    InsertIntoTableResponse,
     LanceNamespace,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableIndicesRequest,
+    ListTableIndicesResponse,
     ListTablesRequest,
     ListTablesResponse,
+    ListTableTagsRequest,
+    ListTableTagsResponse,
+    ListTableVersionsRequest,
+    ListTableVersionsResponse,
+    MergeInsertIntoTableRequest,
+    MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
     RegisterTableRequest,
     RegisterTableResponse,
+    RenameTableRequest,
+    RenameTableResponse,
+    RestoreTableRequest,
+    RestoreTableResponse,
     TableExistsRequest,
+    UpdateTableRequest,
+    UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest,
+    UpdateTableTagResponse,
 )
 
-from .io import StorageOptionsProvider
 from .lance import PyDirectoryNamespace  # Low-level Rust binding
 
 try:
@@ -58,8 +108,146 @@ __all__ = [
     "DirectoryNamespace",
     "RestNamespace",
     "RestAdapter",
-    "LanceNamespaceStorageOptionsProvider",
+    "DynamicContextProvider",
 ]
+
+
+# =============================================================================
+# Dynamic Context Provider
+# =============================================================================
+
+
+class DynamicContextProvider(ABC):
+    """Abstract base class for dynamic context providers.
+
+    Implementations provide per-request context (e.g., authentication headers)
+    based on the operation being performed. The provider is called synchronously
+    before each namespace operation.
+
+    For RestNamespace, context keys that start with `headers.` are converted to
+    HTTP headers by stripping the prefix. For example, `{"headers.Authorization":
+    "Bearer token"}` becomes the `Authorization: Bearer token` header.
+
+    Example
+    -------
+    >>> # Define a provider class
+    >>> class MyProvider(DynamicContextProvider):
+    ...     def __init__(self, api_key: str):
+    ...         self.api_key = api_key
+    ...
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {
+    ...             "headers.Authorization": f"Bearer {self.api_key}",
+    ...         }
+    ...
+    >>> # Create provider instance and use directly
+    >>> provider = MyProvider(api_key="secret")
+    >>> provider.provide_context({"operation": "list_tables", "object_id": "ns"})
+    {'headers.Authorization': 'Bearer secret'}
+    """
+
+    @abstractmethod
+    def provide_context(self, info: Dict[str, str]) -> Dict[str, str]:
+        """Provide context for a namespace operation.
+
+        Parameters
+        ----------
+        info : dict
+            Information about the operation:
+            - operation: The operation name (e.g., "list_tables", "describe_table")
+            - object_id: The object identifier (namespace or table ID)
+
+        Returns
+        -------
+        dict
+            Context key-value pairs. For HTTP headers, use keys with the
+            "headers." prefix (e.g., "headers.Authorization").
+        """
+        pass
+
+
+def _create_context_provider_from_properties(
+    properties: Dict[str, str],
+) -> Optional[DynamicContextProvider]:
+    """Create a context provider instance from properties.
+
+    Extracts `dynamic_context_provider.*` properties and creates a provider
+    instance by dynamically loading the class from the given class path.
+
+    Parameters
+    ----------
+    properties : dict
+        The full properties dict that may contain dynamic_context_provider.* keys.
+
+    Returns
+    -------
+    DynamicContextProvider or None
+        The created provider instance, or None if no provider is configured.
+
+    Raises
+    ------
+    ValueError
+        If dynamic_context_provider.impl is set but the class cannot be loaded.
+    """
+    import importlib
+
+    prefix = "dynamic_context_provider."
+    impl_key = "dynamic_context_provider.impl"
+
+    impl_path = properties.get(impl_key)
+    if not impl_path:
+        return None
+
+    # Parse the class path (e.g., "my_module.submodule.MyClass")
+    if "." not in impl_path:
+        raise ValueError(
+            f"Invalid context provider class path '{impl_path}'. "
+            f"Expected format: 'module.ClassName' (e.g., 'my_module.MyProvider')"
+        )
+
+    module_path, class_name = impl_path.rsplit(".", 1)
+
+    try:
+        module = importlib.import_module(module_path)
+        provider_class = getattr(module, class_name)
+    except ModuleNotFoundError as e:
+        raise ValueError(
+            f"Failed to import module '{module_path}' for context provider: {e}"
+        ) from e
+    except AttributeError as e:
+        raise ValueError(
+            f"Class '{class_name}' not found in module '{module_path}': {e}"
+        ) from e
+
+    # Extract provider-specific properties (strip prefix, exclude impl key)
+    provider_props = {}
+    for key, value in properties.items():
+        if key.startswith(prefix) and key != impl_key:
+            prop_name = key[len(prefix) :]
+            provider_props[prop_name] = value
+
+    # Create the provider instance
+    return provider_class(**provider_props)
+
+
+def _filter_context_provider_properties(properties: Dict[str, str]) -> Dict[str, str]:
+    """Remove dynamic_context_provider.* properties from the dict.
+
+    These properties are handled at the Python level and should not be
+    passed to the Rust layer.
+
+    Parameters
+    ----------
+    properties : dict
+        The full properties dict.
+
+    Returns
+    -------
+    dict
+        Properties with dynamic_context_provider.* keys removed.
+    """
+    prefix = "dynamic_context_provider."
+    return {k: v for k, v in properties.items() if not k.startswith(prefix)}
 
 
 class DirectoryNamespace(LanceNamespace):
@@ -86,6 +274,50 @@ class DirectoryNamespace(LanceNamespace):
           (e.g., storage.region="us-west-2" becomes region="us-west-2" in
           storage options)
 
+        Credential vendor properties (vendor is auto-selected based on table location):
+            When credential vendor properties are configured, describe_table() will
+            return vended temporary credentials. The vendor type is auto-selected
+            based on table location URI: s3:// for AWS, gs:// for GCP, az:// for
+            Azure. Requires the corresponding credential-vendor-* feature.
+
+            Common properties:
+                - credential_vendor.enabled (required): Set to "true" to enable
+                - credential_vendor.permission (optional): read, write, or admin
+
+            AWS-specific properties (for s3:// locations):
+                - credential_vendor.aws_role_arn (required): IAM role ARN to assume
+                - credential_vendor.aws_external_id (optional): External ID
+                - credential_vendor.aws_region (optional): AWS region
+                - credential_vendor.aws_role_session_name (optional): Session name
+                - credential_vendor.aws_duration_millis (optional): Duration in ms
+                  (default: 3600000, range: 15min-12hrs)
+
+            GCP-specific properties (for gs:// locations):
+                - credential_vendor.gcp_service_account (optional): Service account
+                  to impersonate using IAM Credentials API
+
+                Note: GCP uses Application Default Credentials (ADC). To use a service
+                account key file, set the GOOGLE_APPLICATION_CREDENTIALS environment
+                variable before starting. GCP token duration cannot be configured;
+                it's determined by the STS endpoint (typically 1 hour).
+
+            Azure-specific properties (for az:// locations):
+                - credential_vendor.azure_account_name (required): Azure storage
+                  account name
+                - credential_vendor.azure_tenant_id (optional): Azure tenant ID
+                - credential_vendor.azure_duration_millis (optional): Duration in ms
+                  (default: 3600000, up to 7 days)
+
+        Testing properties:
+            - ops_metrics_enabled (optional): "true" to enable operation metrics
+              tracking. Use `retrieve_ops_metrics()` to get call counts.
+            - vend_input_storage_options (optional): "true" to return input storage
+              options in describe_table() when no credential vendor is configured.
+              Useful for testing credential refresh.
+            - vend_input_storage_options_refresh_interval_millis (optional): When set
+              with vend_input_storage_options, adds expires_at_millis to storage
+              options. Value is current_time_millis + this interval.
+
     Examples
     --------
     >>> import lance.namespace
@@ -95,14 +327,49 @@ class DirectoryNamespace(LanceNamespace):
     >>> # Using the connect() factory function from lance_namespace
     >>> import lance_namespace
     >>> ns = lance_namespace.connect("dir", {"root": "memory://test"})
+    >>>
+    >>> # With AWS credential vending (requires credential-vendor-aws feature)
+    >>> # Use **dict to pass property names with dots
+    >>> ns = lance.namespace.DirectoryNamespace(**{
+    ...     "root": "s3://my-bucket/data",
+    ...     "credential_vendor.enabled": "true",
+    ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
+    ...     "credential_vendor.aws_duration_millis": "3600000",
+    ... })
+
+    With dynamic context provider:
+
+    >>> import tempfile
+    >>> class MyProvider(DynamicContextProvider):
+    ...     def __init__(self, token: str):
+    ...         self.token = token
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {"headers.Authorization": f"Bearer {self.token}"}
+    ...
+    >>> provider = MyProvider(token="secret-token")
+    >>> with tempfile.TemporaryDirectory() as tmpdir:
+    ...     ns = lance.namespace.DirectoryNamespace(
+    ...         root=tmpdir,
+    ...         context_provider=provider,
+    ...     )
+    ...     _ = ns.namespace_id()  # verify it works
     """
 
-    def __init__(self, session=None, **properties):
+    def __init__(self, session=None, context_provider=None, **properties):
         # Convert all values to strings as expected by Rust from_properties
         str_properties = {str(k): str(v) for k, v in properties.items()}
 
+        # Create context provider from properties if configured
+        if context_provider is None:
+            context_provider = _create_context_provider_from_properties(str_properties)
+
+        # Filter out dynamic_context_provider.* properties before passing to Rust
+        filtered_properties = _filter_context_provider_properties(str_properties)
+
         # Create the underlying Rust namespace
-        self._inner = PyDirectoryNamespace(session=session, **str_properties)
+        self._inner = PyDirectoryNamespace(
+            session=session, context_provider=context_provider, **filtered_properties
+        )
 
     def namespace_id(self) -> str:
         """Return a human-readable unique identifier for this namespace instance."""
@@ -169,11 +436,419 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.create_table(request.model_dump(), request_data)
         return CreateTableResponse.from_dict(response_dict)
 
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        response_dict = self._inner.create_empty_table(request.model_dump())
-        return CreateEmptyTableResponse.from_dict(response_dict)
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        response_dict = self._inner.declare_table(request.model_dump())
+        return DeclareTableResponse.from_dict(response_dict)
+
+    def rename_table(self, request: RenameTableRequest) -> RenameTableResponse:
+        response_dict = self._inner.rename_table(request.model_dump())
+        return RenameTableResponse.from_dict(response_dict)
+
+    # Table version operations
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        response_dict = self._inner.list_table_versions(request.model_dump())
+        return ListTableVersionsResponse.from_dict(response_dict)
+
+    def create_table_version(self, request: dict) -> dict:
+        """Create a table version (for external manifest store integration).
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int - Version number to create
+            - manifest_path: str - Path to staging manifest
+            - manifest_size: int (optional) - Size in bytes
+            - e_tag: str (optional) - ETag for optimistic concurrency
+
+        Returns
+        -------
+        dict
+            Response dictionary with optional transaction_id
+        """
+        return self._inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        """Describe a specific table version.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int (optional) - Version to describe (None = latest)
+
+        Returns
+        -------
+        dict
+            Response dictionary with version info:
+            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        """
+        return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
+
+    # Data manipulation operations
+
+    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+        """Count the number of rows in a table, optionally filtered by a predicate.
+
+        Parameters
+        ----------
+        request : CountTableRowsRequest
+            Request with table id, optional version, and optional predicate filter
+
+        Returns
+        -------
+        int
+            The number of rows matching the criteria
+        """
+        return self._inner.count_table_rows(request.model_dump())
+
+    def insert_into_table(
+        self, request: InsertIntoTableRequest, request_data: bytes
+    ) -> InsertIntoTableResponse:
+        """Insert data into a table.
+
+        Parameters
+        ----------
+        request : InsertIntoTableRequest
+            Request with table id and write mode (append/overwrite)
+        request_data : bytes
+            Arrow IPC stream containing the data to insert
+
+        Returns
+        -------
+        InsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.insert_into_table(
+            request.model_dump(), request_data
+        )
+        return InsertIntoTableResponse.from_dict(response_dict)
+
+    def merge_insert_into_table(
+        self, request: MergeInsertIntoTableRequest, request_data: bytes
+    ) -> MergeInsertIntoTableResponse:
+        """Merge-insert data into a table (upsert operation).
+
+        Parameters
+        ----------
+        request : MergeInsertIntoTableRequest
+            Request with table id, merge keys, and merge behavior
+        request_data : bytes
+            Arrow IPC stream containing the data to merge
+
+        Returns
+        -------
+        MergeInsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.merge_insert_into_table(
+            request.model_dump(), request_data
+        )
+        return MergeInsertIntoTableResponse.from_dict(response_dict)
+
+    def update_table(self, request: UpdateTableRequest) -> UpdateTableResponse:
+        """Update rows in a table matching a filter.
+
+        Parameters
+        ----------
+        request : UpdateTableRequest
+            Request with table id, filter predicate, and column updates
+
+        Returns
+        -------
+        UpdateTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.update_table(request.model_dump())
+        return UpdateTableResponse.from_dict(response_dict)
+
+    def delete_from_table(
+        self, request: DeleteFromTableRequest
+    ) -> DeleteFromTableResponse:
+        """Delete rows from a table matching a filter.
+
+        Parameters
+        ----------
+        request : DeleteFromTableRequest
+            Request with table id and filter predicate
+
+        Returns
+        -------
+        DeleteFromTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.delete_from_table(request.model_dump())
+        return DeleteFromTableResponse.from_dict(response_dict)
+
+    def query_table(self, request) -> bytes:
+        """Query a table and return results as Arrow IPC.
+
+        Parameters
+        ----------
+        request : QueryTableRequest or dict
+            Query request with table id, optional filter, columns, vector search
+            parameters, limit/offset, etc.
+
+        Returns
+        -------
+        bytes
+            Arrow IPC file format containing the query results
+        """
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
+        return self._inner.query_table(request)
+
+    # Index operations
+
+    def create_table_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create an index on a table.
+
+        Parameters
+        ----------
+        request : CreateTableIndexRequest
+            Request with table id, index name, column, and index configuration
+
+        Returns
+        -------
+        CreateTableIndexResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.create_table_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def list_table_indices(
+        self, request: ListTableIndicesRequest
+    ) -> ListTableIndicesResponse:
+        """List all indices on a table.
+
+        Parameters
+        ----------
+        request : ListTableIndicesRequest
+            Request with table id
+
+        Returns
+        -------
+        ListTableIndicesResponse
+            Response with list of index metadata
+        """
+        response_dict = self._inner.list_table_indices(request.model_dump())
+        return ListTableIndicesResponse.from_dict(response_dict)
+
+    def describe_table_index_stats(
+        self, request: DescribeTableIndexStatsRequest
+    ) -> DescribeTableIndexStatsResponse:
+        """Get statistics for a specific index.
+
+        Parameters
+        ----------
+        request : DescribeTableIndexStatsRequest
+            Request with table id and index name
+
+        Returns
+        -------
+        DescribeTableIndexStatsResponse
+            Response with index statistics
+        """
+        response_dict = self._inner.describe_table_index_stats(request.model_dump())
+        return DescribeTableIndexStatsResponse.from_dict(response_dict)
+
+    # Transaction operations
+
+    def describe_transaction(
+        self, request: DescribeTransactionRequest
+    ) -> DescribeTransactionResponse:
+        """Describe a transaction.
+
+        Parameters
+        ----------
+        request : DescribeTransactionRequest
+            Request with transaction id
+
+        Returns
+        -------
+        DescribeTransactionResponse
+            Response with transaction details
+        """
+        response_dict = self._inner.describe_transaction(request.model_dump())
+        return DescribeTransactionResponse.from_dict(response_dict)
+
+    def alter_transaction(
+        self, request: AlterTransactionRequest
+    ) -> AlterTransactionResponse:
+        """Alter a transaction (commit or abort).
+
+        Parameters
+        ----------
+        request : AlterTransactionRequest
+            Request with transaction id and action
+
+        Returns
+        -------
+        AlterTransactionResponse
+            Response confirming the action
+        """
+        response_dict = self._inner.alter_transaction(request.model_dump())
+        return AlterTransactionResponse.from_dict(response_dict)
+
+    # Additional index operations
+
+    def create_table_scalar_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create a scalar index on a table column."""
+        response_dict = self._inner.create_table_scalar_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def drop_table_index(
+        self, request: DropTableIndexRequest
+    ) -> DropTableIndexResponse:
+        """Drop an index from a table."""
+        response_dict = self._inner.drop_table_index(request.model_dump())
+        return DropTableIndexResponse.from_dict(response_dict)
+
+    # Additional table operations
+
+    def list_all_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        """List all tables recursively across all namespaces."""
+        response_dict = self._inner.list_all_tables(request.model_dump())
+        return ListTablesResponse.from_dict(response_dict)
+
+    def restore_table(self, request: RestoreTableRequest) -> RestoreTableResponse:
+        """Restore a previously dropped table."""
+        response_dict = self._inner.restore_table(request.model_dump())
+        return RestoreTableResponse.from_dict(response_dict)
+
+    def update_table_schema_metadata(
+        self, request: UpdateTableSchemaMetadataRequest
+    ) -> UpdateTableSchemaMetadataResponse:
+        """Update the schema metadata of a table."""
+        response_dict = self._inner.update_table_schema_metadata(request.model_dump())
+        return UpdateTableSchemaMetadataResponse.from_dict(response_dict)
+
+    def get_table_stats(self, request: GetTableStatsRequest) -> GetTableStatsResponse:
+        """Get statistics for a table."""
+        response_dict = self._inner.get_table_stats(request.model_dump())
+        return GetTableStatsResponse.from_dict(response_dict)
+
+    # Query plan operations
+
+    def explain_table_query_plan(self, request: ExplainTableQueryPlanRequest) -> str:
+        """Explain the query plan for a table query."""
+        return self._inner.explain_table_query_plan(request.model_dump())
+
+    def analyze_table_query_plan(self, request: AnalyzeTableQueryPlanRequest) -> str:
+        """Analyze the query plan for a table query with execution statistics."""
+        return self._inner.analyze_table_query_plan(request.model_dump())
+
+    # Column alteration operations
+
+    def alter_table_add_columns(
+        self, request: AlterTableAddColumnsRequest
+    ) -> AlterTableAddColumnsResponse:
+        """Add columns to a table."""
+        response_dict = self._inner.alter_table_add_columns(request.model_dump())
+        return AlterTableAddColumnsResponse.from_dict(response_dict)
+
+    def alter_table_alter_columns(
+        self, request: AlterTableAlterColumnsRequest
+    ) -> AlterTableAlterColumnsResponse:
+        """Alter existing columns in a table."""
+        response_dict = self._inner.alter_table_alter_columns(request.model_dump())
+        return AlterTableAlterColumnsResponse.from_dict(response_dict)
+
+    def alter_table_drop_columns(
+        self, request: AlterTableDropColumnsRequest
+    ) -> AlterTableDropColumnsResponse:
+        """Drop columns from a table."""
+        response_dict = self._inner.alter_table_drop_columns(request.model_dump())
+        return AlterTableDropColumnsResponse.from_dict(response_dict)
+
+    # Table tag operations
+
+    def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
+        """List all tags on a table."""
+        response_dict = self._inner.list_table_tags(request.model_dump())
+        return ListTableTagsResponse.from_dict(response_dict)
+
+    def get_table_tag_version(
+        self, request: GetTableTagVersionRequest
+    ) -> GetTableTagVersionResponse:
+        """Get the version associated with a table tag."""
+        response_dict = self._inner.get_table_tag_version(request.model_dump())
+        return GetTableTagVersionResponse.from_dict(response_dict)
+
+    def create_table_tag(
+        self, request: CreateTableTagRequest
+    ) -> CreateTableTagResponse:
+        """Create a new tag pointing to a table version."""
+        response_dict = self._inner.create_table_tag(request.model_dump())
+        return CreateTableTagResponse.from_dict(response_dict)
+
+    def delete_table_tag(
+        self, request: DeleteTableTagRequest
+    ) -> DeleteTableTagResponse:
+        """Delete a tag from a table."""
+        response_dict = self._inner.delete_table_tag(request.model_dump())
+        return DeleteTableTagResponse.from_dict(response_dict)
+
+    def update_table_tag(
+        self, request: UpdateTableTagRequest
+    ) -> UpdateTableTagResponse:
+        """Update a tag to point to a different version."""
+        response_dict = self._inner.update_table_tag(request.model_dump())
+        return UpdateTableTagResponse.from_dict(response_dict)
+
+    # Operation metrics methods
+
+    def retrieve_ops_metrics(self) -> Dict[str, int]:
+        """Retrieve operation metrics as a dictionary.
+
+        Returns a dict where keys are operation names (e.g., "list_tables",
+        "describe_table") and values are the number of times each operation
+        was called.
+
+        Returns an empty dict if `ops_metrics_enabled` was false when creating
+        the namespace.
+
+        Returns
+        -------
+        Dict[str, int]
+            Operation name to call count mapping
+        """
+        return self._inner.retrieve_ops_metrics()
+
+    def reset_ops_metrics(self) -> None:
+        """Reset all operation metrics counters to zero.
+
+        Does nothing if `ops_metrics_enabled` was false when creating the
+        namespace.
+        """
+        self._inner.reset_ops_metrics()
 
 
 class RestNamespace(LanceNamespace):
@@ -205,9 +880,25 @@ class RestNamespace(LanceNamespace):
     >>> # Using the connect() factory function from lance_namespace
     >>> import lance_namespace
     >>> ns = lance_namespace.connect("rest", {"uri": "http://localhost:4099"})
+
+    With dynamic context provider:
+
+    >>> class AuthProvider(DynamicContextProvider):
+    ...     def __init__(self, api_key: str):
+    ...         self.api_key = api_key
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {"headers.Authorization": f"Bearer {self.api_key}"}
+    ...
+    >>> provider = AuthProvider(api_key="my-secret-key")
+    >>> ns = lance.namespace.RestNamespace(
+    ...     uri="http://localhost:4099",
+    ...     context_provider=provider,
+    ... )
+    >>> ns.namespace_id()  # verify it works
+    'RestNamespace { endpoint: "http://localhost:4099", delimiter: "$" }'
     """
 
-    def __init__(self, **properties):
+    def __init__(self, context_provider=None, **properties):
         if PyRestNamespace is None:
             raise RuntimeError(
                 "RestNamespace is not available. "
@@ -217,8 +908,17 @@ class RestNamespace(LanceNamespace):
         # Convert all values to strings as expected by Rust from_properties
         str_properties = {str(k): str(v) for k, v in properties.items()}
 
+        # Create context provider from properties if configured
+        if context_provider is None:
+            context_provider = _create_context_provider_from_properties(str_properties)
+
+        # Filter out dynamic_context_provider.* properties before passing to Rust
+        filtered_properties = _filter_context_provider_properties(str_properties)
+
         # Create the underlying Rust namespace
-        self._inner = PyRestNamespace(**str_properties)
+        self._inner = PyRestNamespace(
+            context_provider=context_provider, **filtered_properties
+        )
 
     def namespace_id(self) -> str:
         """Return a human-readable unique identifier for this namespace instance."""
@@ -285,11 +985,419 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.create_table(request.model_dump(), request_data)
         return CreateTableResponse.from_dict(response_dict)
 
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        response_dict = self._inner.create_empty_table(request.model_dump())
-        return CreateEmptyTableResponse.from_dict(response_dict)
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        response_dict = self._inner.declare_table(request.model_dump())
+        return DeclareTableResponse.from_dict(response_dict)
+
+    def rename_table(self, request: RenameTableRequest) -> RenameTableResponse:
+        response_dict = self._inner.rename_table(request.model_dump())
+        return RenameTableResponse.from_dict(response_dict)
+
+    # Table version operations
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        response_dict = self._inner.list_table_versions(request.model_dump())
+        return ListTableVersionsResponse.from_dict(response_dict)
+
+    def create_table_version(self, request: dict) -> dict:
+        """Create a table version (for external manifest store integration).
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int - Version number to create
+            - manifest_path: str - Path to staging manifest
+            - manifest_size: int (optional) - Size in bytes
+            - e_tag: str (optional) - ETag for optimistic concurrency
+
+        Returns
+        -------
+        dict
+            Response dictionary with optional transaction_id
+        """
+        return self._inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        """Describe a specific table version.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int (optional) - Version to describe (None = latest)
+
+        Returns
+        -------
+        dict
+            Response dictionary with version info:
+            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        """
+        return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
+
+    # Data manipulation operations
+
+    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+        """Count the number of rows in a table, optionally filtered by a predicate.
+
+        Parameters
+        ----------
+        request : CountTableRowsRequest
+            Request with table id, optional version, and optional predicate filter
+
+        Returns
+        -------
+        int
+            The number of rows matching the criteria
+        """
+        return self._inner.count_table_rows(request.model_dump())
+
+    def insert_into_table(
+        self, request: InsertIntoTableRequest, request_data: bytes
+    ) -> InsertIntoTableResponse:
+        """Insert data into a table.
+
+        Parameters
+        ----------
+        request : InsertIntoTableRequest
+            Request with table id and write mode (append/overwrite)
+        request_data : bytes
+            Arrow IPC stream containing the data to insert
+
+        Returns
+        -------
+        InsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.insert_into_table(
+            request.model_dump(), request_data
+        )
+        return InsertIntoTableResponse.from_dict(response_dict)
+
+    def merge_insert_into_table(
+        self, request: MergeInsertIntoTableRequest, request_data: bytes
+    ) -> MergeInsertIntoTableResponse:
+        """Merge-insert data into a table (upsert operation).
+
+        Parameters
+        ----------
+        request : MergeInsertIntoTableRequest
+            Request with table id, merge keys, and merge behavior
+        request_data : bytes
+            Arrow IPC stream containing the data to merge
+
+        Returns
+        -------
+        MergeInsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.merge_insert_into_table(
+            request.model_dump(), request_data
+        )
+        return MergeInsertIntoTableResponse.from_dict(response_dict)
+
+    def update_table(self, request: UpdateTableRequest) -> UpdateTableResponse:
+        """Update rows in a table matching a filter.
+
+        Parameters
+        ----------
+        request : UpdateTableRequest
+            Request with table id, filter predicate, and column updates
+
+        Returns
+        -------
+        UpdateTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.update_table(request.model_dump())
+        return UpdateTableResponse.from_dict(response_dict)
+
+    def delete_from_table(
+        self, request: DeleteFromTableRequest
+    ) -> DeleteFromTableResponse:
+        """Delete rows from a table matching a filter.
+
+        Parameters
+        ----------
+        request : DeleteFromTableRequest
+            Request with table id and filter predicate
+
+        Returns
+        -------
+        DeleteFromTableResponse
+            Response confirming the deletion
+        """
+        response_dict = self._inner.delete_from_table(request.model_dump())
+        return DeleteFromTableResponse.from_dict(response_dict)
+
+    def query_table(self, request) -> bytes:
+        """Query a table and return results as Arrow IPC.
+
+        Parameters
+        ----------
+        request : QueryTableRequest or dict
+            Query request with table id, optional filter, columns, vector search
+            parameters, limit/offset, etc.
+
+        Returns
+        -------
+        bytes
+            Arrow IPC file format containing the query results
+        """
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
+        return self._inner.query_table(request)
+
+    # Index operations
+
+    def create_table_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create an index on a table.
+
+        Parameters
+        ----------
+        request : CreateTableIndexRequest
+            Request with table id, index name, column, and index configuration
+
+        Returns
+        -------
+        CreateTableIndexResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.create_table_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def list_table_indices(
+        self, request: ListTableIndicesRequest
+    ) -> ListTableIndicesResponse:
+        """List all indices on a table.
+
+        Parameters
+        ----------
+        request : ListTableIndicesRequest
+            Request with table id
+
+        Returns
+        -------
+        ListTableIndicesResponse
+            Response with list of index metadata
+        """
+        response_dict = self._inner.list_table_indices(request.model_dump())
+        return ListTableIndicesResponse.from_dict(response_dict)
+
+    def describe_table_index_stats(
+        self, request: DescribeTableIndexStatsRequest
+    ) -> DescribeTableIndexStatsResponse:
+        """Get statistics for a specific index.
+
+        Parameters
+        ----------
+        request : DescribeTableIndexStatsRequest
+            Request with table id and index name
+
+        Returns
+        -------
+        DescribeTableIndexStatsResponse
+            Response with index statistics
+        """
+        response_dict = self._inner.describe_table_index_stats(request.model_dump())
+        return DescribeTableIndexStatsResponse.from_dict(response_dict)
+
+    # Transaction operations
+
+    def describe_transaction(
+        self, request: DescribeTransactionRequest
+    ) -> DescribeTransactionResponse:
+        """Describe a transaction.
+
+        Parameters
+        ----------
+        request : DescribeTransactionRequest
+            Request with transaction id
+
+        Returns
+        -------
+        DescribeTransactionResponse
+            Response with transaction details
+        """
+        response_dict = self._inner.describe_transaction(request.model_dump())
+        return DescribeTransactionResponse.from_dict(response_dict)
+
+    def alter_transaction(
+        self, request: AlterTransactionRequest
+    ) -> AlterTransactionResponse:
+        """Alter a transaction (commit or abort).
+
+        Parameters
+        ----------
+        request : AlterTransactionRequest
+            Request with transaction id and action
+
+        Returns
+        -------
+        AlterTransactionResponse
+            Response confirming the action
+        """
+        response_dict = self._inner.alter_transaction(request.model_dump())
+        return AlterTransactionResponse.from_dict(response_dict)
+
+    # Additional index operations
+
+    def create_table_scalar_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create a scalar index on a table column."""
+        response_dict = self._inner.create_table_scalar_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def drop_table_index(
+        self, request: DropTableIndexRequest
+    ) -> DropTableIndexResponse:
+        """Drop an index from a table."""
+        response_dict = self._inner.drop_table_index(request.model_dump())
+        return DropTableIndexResponse.from_dict(response_dict)
+
+    # Additional table operations
+
+    def list_all_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        """List all tables recursively across all namespaces."""
+        response_dict = self._inner.list_all_tables(request.model_dump())
+        return ListTablesResponse.from_dict(response_dict)
+
+    def restore_table(self, request: RestoreTableRequest) -> RestoreTableResponse:
+        """Restore a previously dropped table."""
+        response_dict = self._inner.restore_table(request.model_dump())
+        return RestoreTableResponse.from_dict(response_dict)
+
+    def update_table_schema_metadata(
+        self, request: UpdateTableSchemaMetadataRequest
+    ) -> UpdateTableSchemaMetadataResponse:
+        """Update the schema metadata of a table."""
+        response_dict = self._inner.update_table_schema_metadata(request.model_dump())
+        return UpdateTableSchemaMetadataResponse.from_dict(response_dict)
+
+    def get_table_stats(self, request: GetTableStatsRequest) -> GetTableStatsResponse:
+        """Get statistics for a table."""
+        response_dict = self._inner.get_table_stats(request.model_dump())
+        return GetTableStatsResponse.from_dict(response_dict)
+
+    # Query plan operations
+
+    def explain_table_query_plan(self, request: ExplainTableQueryPlanRequest) -> str:
+        """Explain the query plan for a table query."""
+        return self._inner.explain_table_query_plan(request.model_dump())
+
+    def analyze_table_query_plan(self, request: AnalyzeTableQueryPlanRequest) -> str:
+        """Analyze the query plan for a table query with execution statistics."""
+        return self._inner.analyze_table_query_plan(request.model_dump())
+
+    # Column alteration operations
+
+    def alter_table_add_columns(
+        self, request: AlterTableAddColumnsRequest
+    ) -> AlterTableAddColumnsResponse:
+        """Add columns to a table."""
+        response_dict = self._inner.alter_table_add_columns(request.model_dump())
+        return AlterTableAddColumnsResponse.from_dict(response_dict)
+
+    def alter_table_alter_columns(
+        self, request: AlterTableAlterColumnsRequest
+    ) -> AlterTableAlterColumnsResponse:
+        """Alter existing columns in a table."""
+        response_dict = self._inner.alter_table_alter_columns(request.model_dump())
+        return AlterTableAlterColumnsResponse.from_dict(response_dict)
+
+    def alter_table_drop_columns(
+        self, request: AlterTableDropColumnsRequest
+    ) -> AlterTableDropColumnsResponse:
+        """Drop columns from a table."""
+        response_dict = self._inner.alter_table_drop_columns(request.model_dump())
+        return AlterTableDropColumnsResponse.from_dict(response_dict)
+
+    # Table tag operations
+
+    def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
+        """List all tags on a table."""
+        response_dict = self._inner.list_table_tags(request.model_dump())
+        return ListTableTagsResponse.from_dict(response_dict)
+
+    def get_table_tag_version(
+        self, request: GetTableTagVersionRequest
+    ) -> GetTableTagVersionResponse:
+        """Get the version associated with a table tag."""
+        response_dict = self._inner.get_table_tag_version(request.model_dump())
+        return GetTableTagVersionResponse.from_dict(response_dict)
+
+    def create_table_tag(
+        self, request: CreateTableTagRequest
+    ) -> CreateTableTagResponse:
+        """Create a new tag pointing to a table version."""
+        response_dict = self._inner.create_table_tag(request.model_dump())
+        return CreateTableTagResponse.from_dict(response_dict)
+
+    def delete_table_tag(
+        self, request: DeleteTableTagRequest
+    ) -> DeleteTableTagResponse:
+        """Delete a tag from a table."""
+        response_dict = self._inner.delete_table_tag(request.model_dump())
+        return DeleteTableTagResponse.from_dict(response_dict)
+
+    def update_table_tag(
+        self, request: UpdateTableTagRequest
+    ) -> UpdateTableTagResponse:
+        """Update a tag to point to a different version."""
+        response_dict = self._inner.update_table_tag(request.model_dump())
+        return UpdateTableTagResponse.from_dict(response_dict)
+
+    # Operation metrics methods
+
+    def retrieve_ops_metrics(self) -> Dict[str, int]:
+        """Retrieve operation metrics as a dictionary.
+
+        Returns a dict where keys are operation names (e.g., "list_tables",
+        "describe_table") and values are the number of times each operation
+        was called.
+
+        Returns an empty dict if `ops_metrics_enabled` was false when creating
+        the namespace.
+
+        Returns
+        -------
+        Dict[str, int]
+            Operation name to call count mapping
+        """
+        return self._inner.retrieve_ops_metrics()
+
+    def reset_ops_metrics(self) -> None:
+        """Reset all operation metrics counters to zero.
+
+        Does nothing if `ops_metrics_enabled` was false when creating the
+        namespace.
+        """
+        self._inner.reset_ops_metrics()
 
 
 class RestAdapter:
@@ -302,11 +1410,12 @@ class RestAdapter:
 
     Parameters
     ----------
-    namespace_impl : str
-        Namespace implementation type ("dir", "rest", etc.)
-    namespace_properties : dict, optional
-        Configuration properties for the backend namespace.
+    namespace_client_impl : str
+        Namespace client implementation type ("dir", "rest", etc.)
+    namespace_client_properties : dict, optional
+        Configuration properties for the backend namespace client.
         For DirectoryNamespace ("dir"):
+
         - root (required): Root directory path or URI
         - manifest_enabled (optional): Enable manifest tracking (default: "true")
         - dir_listing_enabled (optional): Enable directory listing fallback
@@ -334,8 +1443,8 @@ class RestAdapter:
 
     def __init__(
         self,
-        namespace_impl: str,
-        namespace_properties: Dict[str, str] = None,
+        namespace_client_impl: str,
+        namespace_client_properties: Dict[str, str] = None,
         session=None,
         host: str = None,
         port: int = None,
@@ -348,14 +1457,18 @@ class RestAdapter:
             )
 
         # Convert to string properties
-        if namespace_properties is None:
-            namespace_properties = {}
-        str_properties = {str(k): str(v) for k, v in namespace_properties.items()}
+        if namespace_client_properties is None:
+            namespace_client_properties = {}
+        str_properties = {
+            str(k): str(v) for k, v in namespace_client_properties.items()
+        }
 
         # Create the underlying Rust adapter
-        self._inner = PyRestAdapter(namespace_impl, str_properties, session, host, port)
+        self._inner = PyRestAdapter(
+            namespace_client_impl, str_properties, session, host, port
+        )
         self.host = host
-        self.namespace_impl = namespace_impl
+        self.namespace_client_impl = namespace_client_impl
 
     @property
     def port(self) -> int:
@@ -385,120 +1498,3 @@ class RestAdapter:
 
     def __repr__(self) -> str:
         return f"RestAdapter(host='{self.host}', port={self.port})"
-
-
-class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
-    """Storage options provider that fetches storage options from a LanceNamespace.
-
-    This provider automatically fetches fresh storage options by calling the
-    namespace's describe_table() method, which returns both the table location
-    and time-limited storage options. This is currently only used for refreshing
-    AWS temporary access credentials.
-
-    This is the recommended approach for LanceDB Cloud and other namespace-based
-    deployments, as it handles storage options refresh automatically.
-
-    Parameters
-    ----------
-    namespace : LanceNamespace
-        The namespace instance to fetch storage options from. Use
-        lance.namespace.connect() to create a namespace instance.
-    table_id : List[str]
-        The table identifier (e.g., ["workspace", "table_name"])
-
-    Example
-    -------
-    This example shows how to use the storage options provider with a namespace.
-
-    .. code-block:: python
-
-        import lance
-        import lance.namespace
-
-        # Connect to a namespace
-        namespace = lance.namespace.connect("rest", {"uri": "http://localhost:4099"})
-
-        # Create storage options provider
-        provider = lance.LanceNamespaceStorageOptionsProvider(
-            namespace=namespace,
-            table_id=["workspace", "table_name"]
-        )
-
-        # Use with dataset - storage options auto-refresh!
-        dataset = lance.dataset(
-            "s3://bucket/table.lance",
-            storage_options_provider=provider
-        )
-    """
-
-    def __init__(self, namespace: LanceNamespace, table_id: List[str]):
-        """Initialize with namespace and table ID.
-
-        Parameters
-        ----------
-        namespace : LanceNamespace
-            The namespace instance with a describe_table() method
-        table_id : List[str]
-            The table identifier
-        """
-        self._namespace = namespace
-        self._table_id = table_id
-
-    def fetch_storage_options(self) -> Dict[str, str]:
-        """Fetch storage options from the namespace.
-
-        This calls namespace.describe_table() to get the latest storage options
-        and their expiration time.
-
-        Returns
-        -------
-        Dict[str, str]
-            Flat dictionary of string key-value pairs containing storage options
-            and expires_at_millis
-
-        Raises
-        ------
-        RuntimeError
-            If the namespace doesn't return storage options or expiration time
-        """
-        request = DescribeTableRequest(id=self._table_id, version=None)
-        response = self._namespace.describe_table(request)
-        storage_options = response.storage_options
-        if storage_options is None:
-            raise RuntimeError(
-                "Namespace did not return storage_options. "
-                "Ensure the namespace supports storage options providing."
-            )
-
-        # Verify expires_at_millis is present
-        if "expires_at_millis" not in storage_options:
-            raise RuntimeError(
-                "Namespace storage_options missing 'expires_at_millis'. "
-                "Storage options refresh will not work properly."
-            )
-
-        # Return the storage_options directly - it's already a flat Map<String, String>
-        return storage_options
-
-    def provider_id(self) -> str:
-        """Return a human-readable unique identifier for this provider instance.
-
-        This creates a semantic ID based on the namespace's ID and the table ID,
-        enabling proper equality comparison and caching.
-
-        Returns
-        -------
-        str
-            A human-readable unique identifier string combining namespace and table info
-        """
-        # Try to call namespace_id() if available (lance-namespace >= 0.0.20)
-        if hasattr(self._namespace, "namespace_id"):
-            namespace_id = self._namespace.namespace_id()
-        else:
-            # Fallback for older namespace versions
-            namespace_id = str(self._namespace)
-
-        return (
-            f"LanceNamespaceStorageOptionsProvider {{ "
-            f"namespace: {namespace_id}, table_id: {self._table_id!r} }}"
-        )

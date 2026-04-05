@@ -48,6 +48,32 @@ class BasicTypes2_1(UpgradeDowngradeTest):
             writer.write_batch(build_basic_types())
 
 
+# File format 2.2 is not in the stable 2.0.x line; gate this on the first
+# available pre-release that includes 2.2 support.
+@compat_test(min_version="4.0.0b1")
+class BasicTypes2_2(UpgradeDowngradeTest):
+    """Test file format 2.2 compatibility with basic data types."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        batch = build_basic_types()
+        with LanceFileWriter(
+            str(self.path), version="2.2", schema=batch.schema
+        ) as writer:
+            writer.write_batch(batch)
+
+    def check_read(self):
+        reader = LanceFileReader(str(self.path))
+        table = reader.read_all().to_table()
+        assert table == build_basic_types()
+
+    def check_write(self):
+        with LanceFileWriter(str(self.path), version="2.2") as writer:
+            writer.write_batch(build_basic_types())
+
+
 @compat_test(min_version="0.16.0")
 @pytest.mark.parametrize(
     "data_factory,name",

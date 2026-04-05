@@ -3,11 +3,11 @@
 
 use std::sync::Arc;
 
-use lance::{datatypes::Schema, Error};
+use lance::{Error, datatypes::Schema};
 use lance_table::format::{DeletionFile, Fragment};
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-use crate::{rt, utils::PyLance, Dataset};
+use crate::{Dataset, rt, utils::PyLance};
 
 /// Format the Lance schema of a dataset as a string.
 ///
@@ -137,7 +137,7 @@ pub fn list_transactions(
                         return Err(PyIOError::new_err(format!(
                             "Failed to checkout version: {:?}",
                             err
-                        )))
+                        )));
                     }
                 }
             }

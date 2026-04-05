@@ -3,16 +3,28 @@
 
 //! Metadata for index
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
+use futures::StreamExt;
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
+
+/// Metadata about a single file within an index segment.
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct IndexFile {
+    /// Path relative to the index directory (e.g., "index.idx", "auxiliary.idx")
+    pub path: String,
+    /// Size of the file in bytes
+    pub size_bytes: u64,
+}
 
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +69,13 @@ pub struct IndexMetadata {
     /// The base path index of the index files. Used when the index is imported or referred from another dataset.
     /// Lance uses it as key of the base_paths field in Manifest to determine the actual base path of the index files.
     pub base_id: Option<u32>,
+
+    /// List of files and their sizes for this index segment.
+    /// This enables skipping HEAD calls when opening indices and provides
+    /// visibility into index storage size via describe_indices().
+    /// This is None if the file sizes are unknown. This happens for indices created
+    /// before this field was added.
+    pub files: Option<Vec<IndexFile>>,
 }
 
 impl IndexMetadata {
@@ -66,6 +85,38 @@ impl IndexMetadata {
     ) -> Option<RoaringBitmap> {
         let fragment_bitmap = self.fragment_bitmap.as_ref()?;
         Some(fragment_bitmap & existing_fragments)
+    }
+
+    /// Returns a map of relative file paths to their sizes.
+    /// Returns an empty map if file information is not available.
+    pub fn file_size_map(&self) -> HashMap<String, u64> {
+        self.files
+            .as_ref()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|f| (f.path.clone(), f.size_bytes))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns the total size of all files in this index segment in bytes.
+    /// Returns None if file information is not available.
+    pub fn total_size_bytes(&self) -> Option<u64> {
+        self.files
+            .as_ref()
+            .map(|files| files.iter().map(|f| f.size_bytes).sum())
+    }
+
+    /// Returns the set of fragments which are part of the fragment bitmap
+    /// but no longer in the dataset.
+    pub fn deleted_fragment_bitmap(
+        &self,
+        existing_fragments: &RoaringBitmap,
+    ) -> Option<RoaringBitmap> {
+        let fragment_bitmap = self.fragment_bitmap.as_ref()?;
+        Some(fragment_bitmap - existing_fragments)
     }
 }
 
@@ -80,6 +131,7 @@ impl DeepSizeOf for IndexMetadata {
                 .as_ref()
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
+            + self.files.deep_size_of_children(context)
     }
 }
 
@@ -95,12 +147,24 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             )?)
         };
 
+        let files = if proto.files.is_empty() {
+            None
+        } else {
+            Some(
+                proto
+                    .files
+                    .into_iter()
+                    .map(|f| IndexFile {
+                        path: f.path,
+                        size_bytes: f.size_bytes,
+                    })
+                    .collect(),
+            )
+        };
+
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
-                Error::io(
-                    "uuid field does not exist in Index metadata".to_string(),
-                    location!(),
-                )
+                Error::invalid_input("uuid field does not exist in Index metadata".to_string())
             })??,
             name: proto.name,
             fields: proto.fields,
@@ -113,6 +177,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
                     .expect("Invalid timestamp in index metadata")
             }),
             base_id: proto.base_id,
+            files,
         })
     }
 }
@@ -120,14 +185,28 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap {
-            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
-                // In theory, this should never error. But if we do, just
-                // recover gracefully.
-                log::error!("Failed to serialize fragment bitmap: {}", e);
-                fragment_bitmap.clear();
-            }
+        if let Some(bitmap) = &idx.fragment_bitmap
+            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
+        {
+            // In theory, this should never error. But if we do, just
+            // recover gracefully.
+            log::error!("Failed to serialize fragment bitmap: {}", e);
+            fragment_bitmap.clear();
         }
+
+        let files = idx
+            .files
+            .as_ref()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|f| pb::IndexFile {
+                        path: f.path.clone(),
+                        size_bytes: f.size_bytes,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Self {
             uuid: Some((&idx.uuid).into()),
@@ -142,6 +221,34 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             index_version: Some(idx.index_version),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
+            files,
         }
     }
+}
+
+/// List all files in an index directory with their sizes.
+///
+/// Returns a list of `IndexFile` structs containing relative paths and sizes.
+/// This is used to capture file metadata after index creation/modification.
+pub async fn list_index_files_with_sizes(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+) -> Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    let mut stream = object_store.read_dir_all(index_dir, None);
+    while let Some(meta) = stream.next().await {
+        let meta = meta?;
+        // Get relative path by stripping the index_dir prefix
+        let relative_path = meta
+            .location
+            .as_ref()
+            .strip_prefix(index_dir.as_ref())
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+        files.push(IndexFile {
+            path: relative_path,
+            size_bytes: meta.size,
+        });
+    }
+    Ok(files)
 }

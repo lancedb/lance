@@ -3,18 +3,18 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_array::{BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
 use arrow_buffer::NullBuffer;
 use futures::{
+    FutureExt, Stream, StreamExt,
     future::BoxFuture,
     stream::{BoxStream, FuturesOrdered},
-    FutureExt, Stream, StreamExt,
 };
 use lance_arrow::RecordBatchExt;
 use lance_core::{
+    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
-    ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_io::ReadBatchParams;
 use tracing::instrument;
@@ -161,6 +161,56 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     )?)
 }
 
+/// Extract version values for a batch selection by binary-searching over
+/// precomputed RLE run offsets. Single-run fragments (the common case)
+/// take the O(1) fast path.
+fn version_values_for_selection(
+    sequence: &crate::rowids::version::RowDatasetVersionSequence,
+    params: &ReadBatchParams,
+    batch_offset: u32,
+    num_rows: u32,
+) -> Result<Vec<u64>> {
+    let selection = params
+        .slice(batch_offset as usize, num_rows as usize)
+        .unwrap()
+        .to_ranges()
+        .unwrap();
+
+    if sequence.runs.len() == 1 {
+        return Ok(vec![sequence.runs[0].version(); num_rows as usize]);
+    }
+
+    let mut versions = Vec::with_capacity(num_rows as usize);
+    let run_offsets: Vec<usize> = sequence
+        .runs
+        .iter()
+        .scan(0usize, |acc, run| {
+            let start = *acc;
+            *acc += run.len();
+            Some(start)
+        })
+        .collect();
+    let total_len: usize = sequence.runs.iter().map(|r| r.len()).sum();
+
+    for r in &selection {
+        for pos in r.start..r.end {
+            let pos = pos as usize;
+            if pos >= total_len {
+                return Err(lance_core::Error::internal(format!(
+                    "version column position {} out of range (total_len={})",
+                    pos, total_len
+                )));
+            }
+            let run_idx = match run_offsets.binary_search(&pos) {
+                Ok(idx) => idx,
+                Err(idx) => idx - 1,
+            };
+            versions.push(sequence.runs[run_idx].version());
+        }
+    }
+    Ok(versions)
+}
+
 /// Configuration needed to apply row ids and deletions to a batch
 #[derive(Debug)]
 pub struct RowIdAndDeletesConfig {
@@ -208,10 +258,10 @@ pub fn apply_row_id_and_deletes(
 ) -> Result<RecordBatch> {
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
-    if let Some(deletion_vector_inner) = deletion_vector {
-        if matches!(deletion_vector_inner.as_ref(), DeletionVector::NoDeletions) {
-            deletion_vector = None;
-        }
+    if let Some(deletion_vector_inner) = deletion_vector
+        && matches!(deletion_vector_inner.as_ref(), DeletionVector::NoDeletions)
+    {
+        deletion_vector = None;
     }
     let has_deletions = deletion_vector.is_some();
     debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);
@@ -296,24 +346,12 @@ pub fn apply_row_id_and_deletes(
 
         if config.with_row_last_updated_at_version {
             let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
-                // Get the range of rows for this batch
-                let selection = config
-                    .params
-                    .slice(batch_offset as usize, num_rows as usize)
-                    .unwrap()
-                    .to_ranges()
-                    .unwrap();
-                // Extract version values for the selected ranges
-                let versions: Vec<u64> = selection
-                    .iter()
-                    .flat_map(|r| {
-                        sequence
-                            .versions()
-                            .skip(r.start as usize)
-                            .take((r.end - r.start) as usize)
-                    })
-                    .collect();
-                Arc::new(UInt64Array::from(versions))
+                Arc::new(UInt64Array::from(version_values_for_selection(
+                    sequence,
+                    &config.params,
+                    batch_offset,
+                    num_rows,
+                )?))
             } else {
                 // Default to version 1 if sequence not provided
                 Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
@@ -324,24 +362,12 @@ pub fn apply_row_id_and_deletes(
 
         if config.with_row_created_at_version {
             let version_arr = if let Some(sequence) = &config.created_at_sequence {
-                // Get the range of rows for this batch
-                let selection = config
-                    .params
-                    .slice(batch_offset as usize, num_rows as usize)
-                    .unwrap()
-                    .to_ranges()
-                    .unwrap();
-                // Extract version values for the selected ranges
-                let versions: Vec<u64> = selection
-                    .iter()
-                    .flat_map(|r| {
-                        sequence
-                            .versions()
-                            .skip(r.start as usize)
-                            .take((r.end - r.start) as usize)
-                    })
-                    .collect();
-                Arc::new(UInt64Array::from(versions))
+                Arc::new(UInt64Array::from(version_values_for_selection(
+                    sequence,
+                    &config.params,
+                    batch_offset,
+                    num_rows,
+                )?))
             } else {
                 // Default to version 1 if sequence not provided
                 Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
@@ -394,15 +420,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
-    use arrow_array::{types::Int32Type, RecordBatch, UInt32Array};
+    use arrow_array::{RecordBatch, UInt32Array, types::Int32Type};
     use arrow_schema::ArrowError;
-    use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
+    use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
     use lance_core::{
-        utils::{address::RowAddress, deletion::DeletionVector},
         ROW_ID,
+        utils::{address::RowAddress, deletion::DeletionVector},
     };
     use lance_datagen::{BatchCount, RowCount};
-    use lance_io::{stream::arrow_stream_to_lance_stream, ReadBatchParams};
+    use lance_io::{ReadBatchParams, stream::arrow_stream_to_lance_stream};
     use roaring::RoaringBitmap;
 
     use crate::utils::stream::ReadBatchTask;
@@ -646,5 +672,135 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_version_column_with_deletions() {
+        use crate::rowids::segment::U64Segment;
+        use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
+
+        let seq = Arc::new(RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..100),
+                version: 42,
+            }],
+        });
+
+        let data = batch_task_stream(
+            lance_datagen::gen_batch()
+                .col("x", lance_datagen::array::rand::<Int32Type>())
+                .into_reader_stream(RowCount::from(10), BatchCount::from(10))
+                .0,
+        );
+
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: true,
+            deletion_vector: Some(Arc::new(DeletionVector::Bitmap(RoaringBitmap::from_iter(
+                0..35,
+            )))),
+            row_id_sequence: None,
+            last_updated_at_sequence: None,
+            created_at_sequence: Some(seq),
+            make_deletions_null: false,
+            total_num_rows: 100,
+        };
+        let stream = super::wrap_with_row_id_and_delete(data, 0, config);
+        let batches: Vec<_> = stream
+            .buffered(1)
+            .try_filter(|b| std::future::ready(b.num_rows() > 0))
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 65);
+
+        for batch in &batches {
+            let versions = batch
+                .column_by_name("_row_created_at_version")
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .values();
+            assert!(versions.iter().all(|&v| v == 42));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_version_column_multi_run() {
+        use crate::rowids::segment::U64Segment;
+        use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
+
+        // 3 runs: 0..40 v1, 40..70 v2, 70..100 v3
+        let seq = Arc::new(RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..40),
+                    version: 1,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(40..70),
+                    version: 2,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(70..100),
+                    version: 3,
+                },
+            ],
+        });
+
+        // Delete 0..20 and 60..80 (spans run boundary).
+        // Survivors: 20..40 (v1), 40..60 (v2), 80..100 (v3) = 60 rows
+        let mut deletions = RoaringBitmap::from_iter(0..20);
+        deletions.extend(60..80);
+
+        let data = batch_task_stream(
+            lance_datagen::gen_batch()
+                .col("x", lance_datagen::array::rand::<Int32Type>())
+                .into_reader_stream(RowCount::from(10), BatchCount::from(10))
+                .0,
+        );
+
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: true,
+            deletion_vector: Some(Arc::new(DeletionVector::Bitmap(deletions))),
+            row_id_sequence: None,
+            last_updated_at_sequence: None,
+            created_at_sequence: Some(seq),
+            make_deletions_null: false,
+            total_num_rows: 100,
+        };
+        let stream = super::wrap_with_row_id_and_delete(data, 0, config);
+        let batches: Vec<_> = stream
+            .buffered(1)
+            .try_filter(|b| std::future::ready(b.num_rows() > 0))
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 60);
+
+        let all_versions: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("_row_created_at_version")
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        assert!(all_versions[..20].iter().all(|&v| v == 1));
+        assert!(all_versions[20..40].iter().all(|&v| v == 2));
+        assert!(all_versions[40..60].iter().all(|&v| v == 3));
     }
 }

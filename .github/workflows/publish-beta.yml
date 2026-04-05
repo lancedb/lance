@@ -27,7 +27,7 @@ jobs:
       run: echo "${{ toJSON(github.event.inputs) }}"
 
     - name: Check out repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       with:
         token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         fetch-depth: 0
@@ -65,10 +65,7 @@ jobs:
 
         if [ -n "${RELEASE_NOTES_FROM}" ]; then
           echo "Generating release notes from ${RELEASE_NOTES_FROM} to ${BETA_TAG}"
-          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
-            -f tag_name="${BETA_TAG}" \
-            -f previous_tag_name="${RELEASE_NOTES_FROM}" \
-            --jq .body)
+          NOTES=$(python ci/generate_release_notes.py ${RELEASE_NOTES_FROM} ${BETA_TAG})
         else
           echo "No release-root tag found, using automatic generation"
           NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
@@ -83,7 +80,7 @@ jobs:
 
     - name: Create GitHub Pre-Release (if not dry run)
       if: ${{ !inputs.dry_run }}
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
       with:
         tag_name: ${{ steps.publish.outputs.BETA_TAG }}
         name: ${{ steps.publish.outputs.BETA_TAG }}

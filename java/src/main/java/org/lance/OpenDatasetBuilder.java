@@ -14,7 +14,6 @@
 package org.lance;
 
 import org.lance.namespace.LanceNamespace;
-import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -42,11 +41,11 @@ import java.util.Map;
  *     .build();
  * }</pre>
  *
- * <p>Example usage with namespace:
+ * <p>Example usage with namespace client:
  *
  * <pre>{@code
  * Dataset dataset = Dataset.open()
- *     .namespace(myNamespace)
+ *     .namespaceClient(myNamespaceClient)
  *     .tableId(Arrays.asList("my_table"))
  *     .build();
  * }</pre>
@@ -55,10 +54,10 @@ public class OpenDatasetBuilder {
   private BufferAllocator allocator;
   private boolean selfManagedAllocator = false;
   private String uri;
-  private LanceNamespace namespace;
+  private LanceNamespace namespaceClient;
   private List<String> tableId;
   private ReadOptions options = new ReadOptions.Builder().build();
-  private boolean ignoreNamespaceTableStorageOptions = false;
+  private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.open() instead. */
   OpenDatasetBuilder() {}
@@ -79,7 +78,7 @@ public class OpenDatasetBuilder {
   /**
    * Sets the dataset URI.
    *
-   * <p>Either uri() or namespace()+tableId() must be specified, but not both.
+   * <p>Either uri() or namespaceClient()+tableId() must be specified, but not both.
    *
    * @param uri The dataset URI (e.g., "s3://bucket/table.lance" or "file:///path/to/table.lance")
    * @return this builder instance
@@ -90,24 +89,24 @@ public class OpenDatasetBuilder {
   }
 
   /**
-   * Sets the namespace.
+   * Sets the namespace client.
    *
-   * <p>Must be used together with tableId(). Either uri() or namespace()+tableId() must be
+   * <p>Must be used together with tableId(). Either uri() or namespaceClient()+tableId() must be
    * specified, but not both.
    *
-   * @param namespace The namespace implementation to fetch table info from
+   * @param namespaceClient The namespace implementation to fetch table info from
    * @return this builder instance
    */
-  public OpenDatasetBuilder namespace(LanceNamespace namespace) {
-    this.namespace = namespace;
+  public OpenDatasetBuilder namespaceClient(LanceNamespace namespaceClient) {
+    this.namespaceClient = namespaceClient;
     return this;
   }
 
   /**
    * Sets the table identifier.
    *
-   * <p>Must be used together with namespace(). Either uri() or namespace()+tableId() must be
-   * specified, but not both.
+   * <p>Must be used together with namespaceClient(). Either uri() or namespaceClient()+tableId()
+   * must be specified, but not both.
    *
    * @param tableId The table identifier (e.g., Arrays.asList("my_table"))
    * @return this builder instance
@@ -129,47 +128,53 @@ public class OpenDatasetBuilder {
   }
 
   /**
-   * Sets whether to ignore storage options from the namespace's describeTable().
+   * Sets the session to share caches between multiple datasets.
    *
-   * @param ignoreNamespaceTableStorageOptions If true, storage options returned from
-   *     describeTable() will be ignored (treated as null)
+   * <p>When a session is provided, the index and metadata caches from the session will be used
+   * instead of creating new caches. This can improve cache hit rates when opening multiple related
+   * datasets.
+   *
+   * <p>Note: When a session is provided, the indexCacheSizeBytes and metadataCacheSizeBytes
+   * settings in ReadOptions are ignored because the session's caches are used instead.
+   *
+   * @param session The session to use
    * @return this builder instance
    */
-  public OpenDatasetBuilder ignoreNamespaceTableStorageOptions(
-      boolean ignoreNamespaceTableStorageOptions) {
-    this.ignoreNamespaceTableStorageOptions = ignoreNamespaceTableStorageOptions;
+  public OpenDatasetBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 
   /**
    * Opens the dataset with the configured parameters.
    *
-   * <p>If a namespace is configured, this automatically fetches the table location and storage
-   * options from the namespace via describeTable().
+   * <p>If a namespace client is configured, this automatically fetches the table location and
+   * storage options from the namespace client via describeTable().
    *
    * @return Dataset
    * @throws IllegalArgumentException if required parameters are missing or invalid
    */
   public Dataset build() {
-    // Validate that exactly one of uri or namespace+tableId is provided
+    // Validate that exactly one of uri or namespaceClient+tableId is provided
     boolean hasUri = uri != null;
-    boolean hasNamespace = namespace != null && tableId != null;
+    boolean hasNamespaceClient = namespaceClient != null && tableId != null;
 
-    if (hasUri && hasNamespace) {
+    if (hasUri && hasNamespaceClient) {
       throw new IllegalArgumentException(
-          "Cannot specify both uri and namespace+tableId. Use one or the other.");
+          "Cannot specify both uri and namespaceClient+tableId. Use one or the other.");
     }
-    if (!hasUri && !hasNamespace) {
-      if (namespace != null) {
+    if (!hasUri && !hasNamespaceClient) {
+      if (namespaceClient != null) {
         throw new IllegalArgumentException(
-            "namespace is set but tableId is missing. Both namespace and tableId must be"
-                + " provided together.");
+            "namespaceClient is set but tableId is missing. Both namespaceClient and tableId must"
+                + " be provided together.");
       } else if (tableId != null) {
         throw new IllegalArgumentException(
-            "tableId is set but namespace is missing. Both namespace and tableId must be"
-                + " provided together.");
+            "tableId is set but namespaceClient is missing. Both namespaceClient and tableId must"
+                + " be provided together.");
       } else {
-        throw new IllegalArgumentException("Either uri or namespace+tableId must be provided.");
+        throw new IllegalArgumentException(
+            "Either uri or namespaceClient+tableId must be provided.");
       }
     }
 
@@ -181,49 +186,42 @@ public class OpenDatasetBuilder {
       selfManagedAllocator = true;
     }
 
-    // Handle namespace-based opening
-    if (hasNamespace) {
-      return buildFromNamespace();
+    // Handle namespace client-based opening
+    if (hasNamespaceClient) {
+      return buildFromNamespaceClient();
     }
 
     // Handle URI-based opening
-    return Dataset.open(allocator, selfManagedAllocator, uri, options);
+    return Dataset.open(allocator, selfManagedAllocator, uri, options, session);
   }
 
-  private Dataset buildFromNamespace() {
+  private Dataset buildFromNamespaceClient() {
     // Call describe_table to get location and storage options
     DescribeTableRequest request = new DescribeTableRequest();
     request.setId(tableId);
     // Only set version if present
     options.getVersion().ifPresent(v -> request.setVersion(Long.valueOf(v)));
 
-    DescribeTableResponse response = namespace.describeTable(request);
+    DescribeTableResponse response = namespaceClient.describeTable(request);
 
     String location = response.getLocation();
     if (location == null || location.isEmpty()) {
-      throw new IllegalArgumentException("Namespace did not return a table location");
+      throw new IllegalArgumentException("Namespace client did not return a table location");
     }
 
-    Map<String, String> namespaceStorageOptions =
-        ignoreNamespaceTableStorageOptions ? null : response.getStorageOptions();
+    // Check if namespace client manages versioning (commits go through namespace client API)
+    Boolean namespaceClientManagedVersioning = response.getManagedVersioning();
+
+    Map<String, String> namespaceStorageOptions = response.getStorageOptions();
 
     ReadOptions.Builder optionsBuilder =
         new ReadOptions.Builder()
             .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
             .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
 
-    if (namespaceStorageOptions != null && !namespaceStorageOptions.isEmpty()) {
-      LanceNamespaceStorageOptionsProvider storageOptionsProvider =
-          new LanceNamespaceStorageOptionsProvider(namespace, tableId);
-      optionsBuilder.setStorageOptionsProvider(storageOptionsProvider);
-    }
-
     options.getVersion().ifPresent(optionsBuilder::setVersion);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
-    options
-        .getS3CredentialsRefreshOffsetSeconds()
-        .ifPresent(optionsBuilder::setS3CredentialsRefreshOffsetSeconds);
 
     Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
     if (namespaceStorageOptions != null) {
@@ -231,7 +229,19 @@ public class OpenDatasetBuilder {
     }
     optionsBuilder.setStorageOptions(storageOptions);
 
-    // Open dataset with regular open method
-    return Dataset.open(allocator, selfManagedAllocator, location, optionsBuilder.build());
+    // Pass namespaceClient, tableId, and namespaceClientManagedVersioning to Rust
+    // The Rust side will:
+    // - Create a storage options provider when namespaceClient/tableId are non-null for credential
+    // refresh
+    // - Create an external manifest commit handler when namespaceClientManagedVersioning is true
+    return Dataset.open(
+        allocator,
+        selfManagedAllocator,
+        location,
+        optionsBuilder.build(),
+        session,
+        namespaceClient,
+        tableId,
+        Boolean.TRUE.equals(namespaceClientManagedVersioning));
   }
 }

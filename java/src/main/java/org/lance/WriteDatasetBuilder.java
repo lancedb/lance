@@ -13,11 +13,9 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
 import org.lance.namespace.LanceNamespace;
-import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
-import org.lance.namespace.model.CreateEmptyTableRequest;
-import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -51,12 +49,12 @@ import java.util.Optional;
  *     .execute();
  * }</pre>
  *
- * <p>Example usage with namespace:
+ * <p>Example usage with namespace client:
  *
  * <pre>{@code
  * Dataset dataset = Dataset.write(allocator)
  *     .reader(myReader)
- *     .namespace(myNamespace)
+ *     .namespaceClient(myNamespaceClient)
  *     .tableId(Arrays.asList("my_table"))
  *     .mode(WriteMode.CREATE)
  *     .execute();
@@ -67,7 +65,7 @@ public class WriteDatasetBuilder {
   private ArrowReader reader;
   private ArrowArrayStream stream;
   private String uri;
-  private LanceNamespace namespace;
+  private LanceNamespace namespaceClient;
   private List<String> tableId;
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
@@ -77,8 +75,10 @@ public class WriteDatasetBuilder {
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
   private Optional<Long> maxBytesPerFile = Optional.empty();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
-  private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
-  private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
+  private Optional<String> dataStorageVersion = Optional.empty();
+  private Optional<List<BasePath>> initialBases = Optional.empty();
+  private Optional<List<String>> targetBases = Optional.empty();
+  private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
@@ -130,7 +130,7 @@ public class WriteDatasetBuilder {
   /**
    * Sets the dataset URI.
    *
-   * <p>Either uri() or namespace()+tableId() must be specified, but not both.
+   * <p>Either uri() or namespaceClient()+tableId() must be specified, but not both.
    *
    * @param uri The dataset URI (e.g., "s3://bucket/table.lance" or "file:///path/to/table.lance")
    * @return this builder instance
@@ -141,24 +141,24 @@ public class WriteDatasetBuilder {
   }
 
   /**
-   * Sets the namespace.
+   * Sets the namespace client.
    *
-   * <p>Must be used together with tableId(). Either uri() or namespace()+tableId() must be
+   * <p>Must be used together with tableId(). Either uri() or namespaceClient()+tableId() must be
    * specified, but not both.
    *
-   * @param namespace The namespace implementation to use for table operations
+   * @param namespaceClient The namespace implementation to use for table operations
    * @return this builder instance
    */
-  public WriteDatasetBuilder namespace(LanceNamespace namespace) {
-    this.namespace = namespace;
+  public WriteDatasetBuilder namespaceClient(LanceNamespace namespaceClient) {
+    this.namespaceClient = namespaceClient;
     return this;
   }
 
   /**
    * Sets the table identifier.
    *
-   * <p>Must be used together with namespace(). Either uri() or namespace()+tableId() must be
-   * specified, but not both.
+   * <p>Must be used together with namespaceClient(). Either uri() or namespaceClient()+tableId()
+   * must be specified, but not both.
    *
    * @param tableId The table identifier (e.g., Arrays.asList("my_table"))
    * @return this builder instance
@@ -205,11 +205,11 @@ public class WriteDatasetBuilder {
   }
 
   /**
-   * Sets whether to ignore storage options from the namespace's describeTable() or
-   * createEmptyTable().
+   * Sets whether to ignore storage options from the namespace client's describeTable() or
+   * declareTable().
    *
-   * @param ignoreNamespaceStorageOptions If true, storage options returned from namespace will be
-   *     ignored
+   * @param ignoreNamespaceStorageOptions If true, storage options returned from namespace client
+   *     will be ignored
    * @return this builder instance
    */
   public WriteDatasetBuilder ignoreNamespaceStorageOptions(boolean ignoreNamespaceStorageOptions) {
@@ -264,34 +264,45 @@ public class WriteDatasetBuilder {
   /**
    * Sets the data storage version.
    *
-   * @param dataStorageVersion The Lance file version to use
+   * @param dataStorageVersion The Lance file version to use (e.g., "legacy", "stable", "2.0")
    * @return this builder instance
    */
-  public WriteDatasetBuilder dataStorageVersion(WriteParams.LanceFileVersion dataStorageVersion) {
+  public WriteDatasetBuilder dataStorageVersion(String dataStorageVersion) {
     this.dataStorageVersion = Optional.of(dataStorageVersion);
     return this;
   }
 
+  public WriteDatasetBuilder initialBases(List<BasePath> bases) {
+    this.initialBases = Optional.of(bases);
+    return this;
+  }
+
+  public WriteDatasetBuilder targetBases(List<String> targetBases) {
+    this.targetBases = Optional.of(targetBases);
+    return this;
+  }
+
   /**
-   * Sets the S3 credentials refresh offset in seconds.
+   * Sets the session to share caches with other datasets.
    *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
+   * <p>Note: For write operations, the session is currently not used during the write itself, but
+   * is stored for future use when the resulting dataset needs to be reopened with the same session.
+   * This is a placeholder for future session support in write operations.
    *
-   * @param s3CredentialsRefreshOffsetSeconds Refresh offset in seconds
+   * @param session The session to use
    * @return this builder instance
    */
-  public WriteDatasetBuilder s3CredentialsRefreshOffsetSeconds(
-      long s3CredentialsRefreshOffsetSeconds) {
-    this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
+  public WriteDatasetBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 
   /**
    * Executes the write operation and returns the created dataset.
    *
-   * <p>If a namespace is configured via namespace()+tableId(), this automatically handles table
-   * creation or retrieval through the namespace API with credential vending support.
+   * <p>If a namespace client is configured via namespaceClient()+tableId(), this automatically
+   * handles table creation or retrieval through the namespace client API with credential vending
+   * support.
    *
    * @return Dataset
    * @throws IllegalArgumentException if required parameters are missing or invalid
@@ -302,23 +313,24 @@ public class WriteDatasetBuilder {
       allocator = new RootAllocator(Long.MAX_VALUE);
     }
 
-    // Validate that exactly one of uri or namespace is provided
+    // Validate that exactly one of uri or namespaceClient is provided
     boolean hasUri = uri != null;
-    boolean hasNamespace = namespace != null && tableId != null;
+    boolean hasNamespaceClient = namespaceClient != null && tableId != null;
 
-    if (hasUri && hasNamespace) {
+    if (hasUri && hasNamespaceClient) {
       throw new IllegalArgumentException(
-          "Cannot specify both uri() and namespace()+tableId(). Use one or the other.");
+          "Cannot specify both uri() and namespaceClient()+tableId(). Use one or the other.");
     }
-    if (!hasUri && !hasNamespace) {
-      if (namespace != null) {
+    if (!hasUri && !hasNamespaceClient) {
+      if (namespaceClient != null) {
         throw new IllegalArgumentException(
-            "namespace() is set but tableId() is missing. Both must be provided together.");
+            "namespaceClient() is set but tableId() is missing. Both must be provided together.");
       } else if (tableId != null) {
         throw new IllegalArgumentException(
-            "tableId() is set but namespace() is missing. Both must be provided together.");
+            "tableId() is set but namespaceClient() is missing. Both must be provided together.");
       } else {
-        throw new IllegalArgumentException("Either uri() or namespace()+tableId() must be called.");
+        throw new IllegalArgumentException(
+            "Either uri() or namespaceClient()+tableId() must be called.");
       }
     }
 
@@ -338,49 +350,53 @@ public class WriteDatasetBuilder {
               + "Use only one of: reader(), stream(), or schema().");
     }
 
-    // Handle namespace-based writing
-    if (hasNamespace) {
-      return executeWithNamespace();
+    // Handle namespace client-based writing
+    if (hasNamespaceClient) {
+      return executeWithNamespaceClient();
     }
 
     // Handle URI-based writing
     return executeWithUri();
   }
 
-  private Dataset executeWithNamespace() {
+  private Dataset executeWithNamespaceClient() {
     String tableUri;
     Map<String, String> namespaceStorageOptions = null;
+    boolean namespaceClientManagedVersioning = false;
 
-    // Mode-specific namespace operations
+    // Mode-specific namespace client operations
     if (mode == WriteParams.WriteMode.CREATE) {
-      // Call namespace.createEmptyTable() to create new table
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
-      request.setId(tableId);
+      DeclareTableRequest declareRequest = new DeclareTableRequest();
+      declareRequest.setId(tableId);
+      DeclareTableResponse declareResponse = namespaceClient.declareTable(declareRequest);
 
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
-
-      tableUri = response.getLocation();
+      tableUri = declareResponse.getLocation();
       if (tableUri == null || tableUri.isEmpty()) {
-        throw new IllegalArgumentException("Namespace did not return a table location");
+        throw new IllegalArgumentException("Namespace client did not return a table location");
       }
 
-      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      namespaceClientManagedVersioning =
+          Boolean.TRUE.equals(declareResponse.getManagedVersioning());
+      namespaceStorageOptions =
+          ignoreNamespaceStorageOptions ? null : declareResponse.getStorageOptions();
     } else {
-      // For APPEND/OVERWRITE modes, call namespace.describeTable()
+      // For APPEND/OVERWRITE modes, call namespaceClient.describeTable()
       DescribeTableRequest request = new DescribeTableRequest();
       request.setId(tableId);
 
-      DescribeTableResponse response = namespace.describeTable(request);
+      DescribeTableResponse response = namespaceClient.describeTable(request);
 
       tableUri = response.getLocation();
       if (tableUri == null || tableUri.isEmpty()) {
-        throw new IllegalArgumentException("Namespace did not return a table location");
+        throw new IllegalArgumentException("Namespace client did not return a table location");
       }
 
       namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      namespaceClientManagedVersioning = Boolean.TRUE.equals(response.getManagedVersioning());
     }
 
-    // Merge storage options (namespace options + user options, with namespace taking precedence)
+    // Merge storage options (namespace client options + user options, with namespace client taking
+    // precedence)
     Map<String, String> mergedStorageOptions = new HashMap<>(storageOptions);
     if (namespaceStorageOptions != null && !namespaceStorageOptions.isEmpty()) {
       mergedStorageOptions.putAll(namespaceStorageOptions);
@@ -395,19 +411,28 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
+
+    initialBases.ifPresent(paramsBuilder::withInitialBases);
+    targetBases.ifPresent(paramsBuilder::withTargetBases);
 
     WriteParams params = paramsBuilder.build();
 
-    // Create storage options provider for credential refresh during long-running writes
-    StorageOptionsProvider storageOptionsProvider =
-        ignoreNamespaceStorageOptions
-            ? null
-            : new LanceNamespaceStorageOptionsProvider(namespace, tableId);
-
-    // Use Dataset.create() which handles CREATE/APPEND/OVERWRITE modes
-    return createDatasetWithStream(tableUri, params, storageOptionsProvider);
+    // Pass namespaceClient, tableId, and namespaceClientManagedVersioning to JNI
+    // Rust will automatically create a storage options provider when namespaceClient/tableId
+    // are non-null for credential refresh, and will create an external manifest commit handler
+    // when namespaceClientManagedVersioning is true
+    if (namespaceClientManagedVersioning) {
+      return createDatasetWithStreamAndNamespaceClient(
+          tableUri, params, namespaceClient, tableId, true);
+    } else {
+      // Even without managed versioning, pass namespaceClient for credential refresh
+      // when namespace client vends credentials (storage options was non-null)
+      if (!ignoreNamespaceStorageOptions && namespaceStorageOptions != null) {
+        return createDatasetWithStreamAndNamespaceClient(
+            tableUri, params, namespaceClient, tableId, false);
+      }
+      return createDatasetWithStream(tableUri, params);
+    }
   }
 
   private Dataset executeWithUri() {
@@ -419,30 +444,71 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
+    initialBases.ifPresent(paramsBuilder::withInitialBases);
+    targetBases.ifPresent(paramsBuilder::withTargetBases);
 
     WriteParams params = paramsBuilder.build();
 
-    return createDatasetWithStream(uri, params, null);
+    return createDatasetWithStream(uri, params);
   }
 
-  private Dataset createDatasetWithStream(
-      String path, WriteParams params, StorageOptionsProvider storageOptionsProvider) {
+  private Dataset createDatasetWithStream(String path, WriteParams params) {
     // If stream is directly provided, use it
     if (stream != null) {
-      return Dataset.create(allocator, stream, path, params, storageOptionsProvider);
+      return Dataset.create(allocator, stream, path, params);
     }
 
     // If reader is provided, convert to stream
     if (reader != null) {
       try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, tempStream);
-        return Dataset.create(allocator, tempStream, path, params, storageOptionsProvider);
+        return Dataset.create(allocator, tempStream, path, params);
       }
     }
 
     // If only schema is provided (empty table), use Dataset.create with schema
+    if (schema != null) {
+      return Dataset.create(allocator, path, schema, params);
+    }
+
+    throw new IllegalStateException("No data source provided");
+  }
+
+  private Dataset createDatasetWithStreamAndNamespaceClient(
+      String path,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning) {
+    // If stream is directly provided, use it
+    if (stream != null) {
+      return Dataset.create(
+          allocator,
+          stream,
+          path,
+          params,
+          namespaceClient,
+          tableId,
+          namespaceClientManagedVersioning);
+    }
+
+    // If reader is provided, convert to stream
+    if (reader != null) {
+      try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, tempStream);
+        return Dataset.create(
+            allocator,
+            tempStream,
+            path,
+            params,
+            namespaceClient,
+            tableId,
+            namespaceClientManagedVersioning);
+      }
+    }
+
+    // If only schema is provided (empty table), use Dataset.create with schema
+    // Note: Schema-only creation doesn't support namespace client-based commit handling
     if (schema != null) {
       return Dataset.create(allocator, path, schema, params);
     }

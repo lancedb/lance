@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::refs::Branches;
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::location;
 
 pub const BRANCH_DIR: &str = "tree";
 
@@ -17,7 +17,7 @@ pub struct BranchLocation {
 impl BranchLocation {
     /// Find the root location
     pub fn find_main(&self) -> Result<Self> {
-        if let Some(branch_name) = self.branch.as_ref() {
+        if let Some(branch_name) = self.branch.as_deref() {
             let root_path_str = Self::get_root_path(self.path.as_ref(), branch_name)?;
             let root_uri = Self::get_root_path(self.uri.as_str(), branch_name)?;
             Ok(Self {
@@ -44,38 +44,36 @@ impl BranchLocation {
                 }
             })
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "Can not find the root location of branch {} by uri {}",
-                        branch_name, path_str,
-                    ),
-                    location!(),
-                )
+                Error::invalid_input(format!(
+                    "Can not find the root location of branch {} by uri {}",
+                    branch_name, path_str,
+                ))
             })?;
         let root_path_str = if root_path_str.ends_with('/') {
             root_path_str.trim_end_matches('/').to_string()
         } else if cfg!(windows) {
             root_path_str.trim_end_matches('\\').to_string()
         } else {
-            return Err(Error::invalid_input(
-                format!(
-                    "Invalid dataset root uri {} for branch {}",
-                    root_path_str, path_str,
-                ),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Invalid dataset root uri {} for branch {}",
+                root_path_str, path_str,
+            )));
         };
         Ok(root_path_str)
     }
 
     /// Find the target branch location
-    pub fn find_branch(&self, branch_name: Option<String>) -> Result<Self> {
-        if branch_name == self.branch {
+    pub fn find_branch(&self, branch_name: Option<&str>) -> Result<Self> {
+        if branch_name == self.branch.as_deref() {
             return Ok(self.clone());
         }
 
         let root_location = self.find_main()?;
-        if let Some(target_branch) = branch_name.as_ref() {
+        if Branches::is_main_branch(branch_name) {
+            return Ok(root_location);
+        }
+
+        if let Some(target_branch) = branch_name {
             let (new_path, new_uri) = {
                 // Handle empty segment
                 if target_branch.is_empty() {
@@ -94,7 +92,7 @@ impl BranchLocation {
             Ok(Self {
                 path: new_path,
                 uri: new_uri,
-                branch: Some(target_branch.clone()),
+                branch: Some(target_branch.to_string()),
             })
         } else {
             Ok(root_location)
@@ -164,7 +162,7 @@ mod tests {
     fn test_find_branch_from_same_branch() {
         let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
-        let target_branch = location.branch.clone();
+        let target_branch = location.branch.as_deref();
         let new_location = location.find_branch(target_branch).unwrap();
 
         assert_eq!(new_location.path, location.path);
@@ -190,9 +188,9 @@ mod tests {
     fn test_find_simple_branch() {
         let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
-        let new_branch = Some("featureA".to_string());
+        let new_branch = Some("featureA");
         let main_location = location.find_main().unwrap();
-        let new_location = location.find_branch(new_branch.clone()).unwrap();
+        let new_location = location.find_branch(new_branch).unwrap();
 
         assert_eq!(
             new_location.path.as_ref(),
@@ -202,7 +200,7 @@ mod tests {
             new_location.uri,
             format!("{}/tree/featureA", main_location.uri)
         );
-        assert_eq!(new_location.branch, new_branch);
+        assert_eq!(new_location.branch.as_deref(), new_branch);
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
     }
 
@@ -210,7 +208,7 @@ mod tests {
     fn test_find_complex_branch() {
         let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
-        let new_branch = Some("bugfix/issue-123".to_string());
+        let new_branch = Some("bugfix/issue-123");
         let main_location = location.find_main().unwrap();
         let new_location = location.find_branch(new_branch).unwrap();
 
@@ -229,12 +227,12 @@ mod tests {
     fn test_find_empty_branch() {
         let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
-        let new_branch = Some("".to_string());
-        let new_location = location.find_branch(new_branch.clone()).unwrap();
+        let new_branch = Some("");
+        let new_location = location.find_branch(new_branch).unwrap();
 
         assert_eq!(new_location.path, location.path);
         assert_eq!(new_location.uri, location.uri);
-        assert_eq!(new_location.branch, new_branch);
+        assert_eq!(new_location.branch.as_deref(), new_branch);
     }
 
     #[test]
@@ -258,7 +256,7 @@ mod tests {
         assert_eq!(main_location.branch, None);
 
         let new_branch = branch_location
-            .find_branch(Some("feature/nathan/A".to_string()))
+            .find_branch(Some("feature/nathan/A"))
             .unwrap();
         assert_eq!(
             new_branch.uri,
@@ -270,6 +268,6 @@ mod tests {
                 .unwrap()
                 .as_ref()
         );
-        assert_eq!(new_branch.branch, Some("feature/nathan/A".to_string()));
+        assert_eq!(new_branch.branch.as_deref(), Some("feature/nathan/A"));
     }
 }

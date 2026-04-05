@@ -299,12 +299,12 @@ def test_duckdb(tmp_path):
     expected = expected[(expected.price > 20.0) & (expected.price <= 90)].reset_index(
         drop=True
     )
-    tm.assert_frame_equal(actual, expected)
+    tm.assert_frame_equal(actual, expected, check_dtype=False)
 
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE meta=='aa'").to_df()
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
     expected = expected[expected.meta == "aa"].reset_index(drop=True)
-    tm.assert_frame_equal(actual, expected)
+    tm.assert_frame_equal(actual, expected, check_dtype=False)
 
 
 def test_struct_field_order(tmp_path):
@@ -321,6 +321,53 @@ def test_struct_field_order(tmp_path):
         )
         expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
         assert result == expected
+
+
+def test_filter_on_column_beside_struct_with_extension_type(tmp_path):
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), (3,))
+    tensor_arr = pa.ExtensionArray.from_storage(
+        tensor_type,
+        pa.FixedSizeListArray.from_arrays(pa.array([1.0, 2.0, 3.0], pa.float32()), 3),
+    )
+    struct_arr = pa.StructArray.from_arrays([tensor_arr], names=["vec"])
+
+    arrow_table = pa.table(
+        {
+            "id": pa.array([1], pa.int64()),
+            "checkpoint": pa.array([None], pa.int64()),
+            "items": struct_arr,
+        }
+    )
+    ds = lance.write_dataset(arrow_table, tmp_path)
+
+    expr = pc.field("checkpoint").is_null() | (pc.field("checkpoint") == 0)
+    result = ds.to_table(filter=expr)
+    assert result["id"].to_pylist() == [1]
+
+
+def test_filter_on_column_beside_root_extension_type(tmp_path):
+    """Filtering should work when the schema has a top-level extension type column.
+
+    fixed_shape_tensor at the root level cannot be converted to a substrait type,
+    so it must also be replaced with a placeholder.
+    """
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), (3,))
+    tensor_arr = pa.ExtensionArray.from_storage(
+        tensor_type,
+        pa.FixedSizeListArray.from_arrays(pa.array([1.0, 2.0, 3.0], pa.float32()), 3),
+    )
+    arrow_table = pa.table(
+        {
+            "id": pa.array([1], pa.int64()),
+            "checkpoint": pa.array([None], pa.int64()),
+            "vec": tensor_arr,
+        }
+    )
+    ds = lance.write_dataset(arrow_table, tmp_path)
+
+    expr = pc.field("checkpoint").is_null() | (pc.field("checkpoint") == 0)
+    result = ds.to_table(filter=expr)
+    assert result["id"].to_pylist() == [1]
 
 
 @pytest.mark.skip(

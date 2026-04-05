@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import pyarrow as pa
 
-from .io import StorageOptionsProvider
 from .lance import (
     LanceBufferDescriptor,
     LanceColumnMetadata,
@@ -24,6 +23,9 @@ from .lance import (
 from .lance import (
     LanceFileWriter as _LanceFileWriter,
 )
+
+if TYPE_CHECKING:
+    from .namespace import LanceNamespace
 
 
 class ReaderResults:
@@ -67,8 +69,8 @@ class LanceFileReader:
         storage_options: Optional[Dict[str, str]] = None,
         columns: Optional[List[str]] = None,
         *,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
         _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
@@ -83,12 +85,12 @@ class LanceFileReader:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : optional
-            A provider that can provide storage options dynamically. This is useful
-            for credentials that need to be refreshed or vended on-demand.
-        s3_credentials_refresh_offset_seconds : optional, int
-            How early (in seconds) before expiration to refresh S3 credentials.
-            Default is 60 seconds. Only applies when using storage_options_provider.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh.
+            Must be provided together with table_id.
+        table_id : optional, List[str]
+            The table identifier within the namespace.
+            Must be provided together with namespace_client.
         columns: list of str, default None
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
@@ -101,8 +103,8 @@ class LanceFileReader:
             self._reader = _LanceFileReader(
                 path,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
-                s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
+                namespace_client=namespace_client,
+                table_id=table_id,
                 columns=columns,
             )
 
@@ -218,8 +220,8 @@ class LanceFileSession:
         self,
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ):
         """
         Creates a new file session
@@ -233,20 +235,20 @@ class LanceFileSession:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : optional
-            A provider that can provide storage options dynamically. This is useful
-            for credentials that need to be refreshed or vended on-demand.
-        s3_credentials_refresh_offset_seconds : optional, int
-            How early (in seconds) before expiration to refresh S3 credentials.
-            Default is 60 seconds. Only applies when using storage_options_provider.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh.
+            Must be provided together with table_id.
+        table_id : optional, List[str]
+            The table identifier within the namespace.
+            Must be provided together with namespace_client.
         """
         if isinstance(base_path, Path):
             base_path = str(base_path)
         self._session = _LanceFileSession(
             base_path,
             storage_options=storage_options,
-            storage_options_provider=storage_options_provider,
-            s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
+            namespace_client=namespace_client,
+            table_id=table_id,
         )
 
     def open_reader(
@@ -390,8 +392,8 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
         max_page_bytes: Optional[int] = None,
         _inner_writer: Optional[_LanceFileWriter] = None,
         **kwargs,
@@ -418,13 +420,12 @@ class LanceFileWriter:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : optional, StorageOptionsProvider
-            A storage options provider that can fetch and refresh storage options
-            dynamically. This is useful for credentials that expire and need to be
-            refreshed automatically.
-        s3_credentials_refresh_offset_seconds : optional, int
-            How early (in seconds) before expiration to refresh S3 credentials.
-            Default is 60 seconds. Only applies when using storage_options_provider.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh.
+            Must be provided together with table_id.
+        table_id : optional, List[str]
+            The table identifier within the namespace.
+            Must be provided together with namespace_client.
         max_page_bytes : optional, int
             The maximum size of a page in bytes, if a single array would create a
             page larger than this then it will be split into multiple pages. The
@@ -441,8 +442,8 @@ class LanceFileWriter:
                 data_cache_bytes=data_cache_bytes,
                 version=version,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
-                s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
+                namespace_client=namespace_client,
+                table_id=table_id,
                 max_page_bytes=max_page_bytes,
                 **kwargs,
             )

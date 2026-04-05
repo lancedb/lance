@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 use arrow_array::{
-    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    Array, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray, types::UInt32Type,
 };
 use lance_table::utils::LanceIteratorExtension;
-use snafu::location;
 use tracing::instrument;
 
 use lance_arrow::RecordBatchExt;
@@ -87,27 +86,20 @@ impl Transformer for PartitionTransformer {
             .drop_column(PART_ID_COLUMN)?
             .drop_column(CENTROID_DIST_COLUMN)?;
 
-        let arr =
-            batch
-                .column_by_name(&self.input_column)
-                .ok_or_else(|| lance_core::Error::Index {
-                    message: format!(
-                        "PartitionTransformer: column {} not found in the RecordBatch",
-                        self.input_column
-                    ),
-                    location: location!(),
-                })?;
+        let arr = batch.column_by_name(&self.input_column).ok_or_else(|| {
+            lance_core::Error::index(format!(
+                "PartitionTransformer: column {} not found in the RecordBatch",
+                self.input_column
+            ))
+        })?;
 
-        let fsl = arr
-            .as_fixed_size_list_opt()
-            .ok_or_else(|| lance_core::Error::Index {
-                message: format!(
-                    "PartitionTransformer: column {} is not a FixedSizeListArray: {}",
-                    self.input_column,
-                    arr.data_type(),
-                ),
-                location: location!(),
-            })?;
+        let fsl = arr.as_fixed_size_list_opt().ok_or_else(|| {
+            lance_core::Error::index(format!(
+                "PartitionTransformer: column {} is not a FixedSizeListArray: {}",
+                self.input_column,
+                arr.data_type(),
+            ))
+        })?;
 
         let (part_ids, dists) = match &self.index {
             Some(index) => fsl
@@ -173,15 +165,12 @@ impl Transformer for PartitionFilter {
     #[instrument(name = "PartitionFilter::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
-        let arr = batch
-            .column_by_name(&self.column)
-            .ok_or_else(|| lance_core::Error::Index {
-                message: format!(
-                    "PartitionFilter: column {} not found in the RecordBatch",
-                    self.column
-                ),
-                location: location!(),
-            })?;
+        let arr = batch.column_by_name(&self.column).ok_or_else(|| {
+            lance_core::Error::index(format!(
+                "PartitionFilter: column {} not found in the RecordBatch",
+                self.column
+            ))
+        })?;
         let part_ids = arr.as_primitive::<UInt32Type>();
         let indices = UInt32Array::from(self.filter_row_ids(part_ids.values()));
         Ok(batch.take(&indices)?)

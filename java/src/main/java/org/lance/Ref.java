@@ -14,11 +14,11 @@
 package org.lance;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
 
 import java.util.Optional;
 
 public class Ref {
-
   private final Optional<Long> versionNumber;
   private final Optional<String> branchName;
   private final Optional<String> tagName;
@@ -42,6 +42,7 @@ public class Ref {
   }
 
   public static Ref ofMain(long versionNumber) {
+    Preconditions.checkArgument(versionNumber > 0, "versionNumber must be greater than 0");
     return new Ref(Optional.of(versionNumber), Optional.empty(), Optional.empty());
   }
 
@@ -50,14 +51,20 @@ public class Ref {
   }
 
   public static Ref ofBranch(String branchName) {
+    Preconditions.checkArgument(
+        branchName != null && !branchName.isEmpty(), "branchName must not be empty");
     return new Ref(Optional.empty(), Optional.of(branchName), Optional.empty());
   }
 
   public static Ref ofBranch(String branchName, long versionNumber) {
+    Preconditions.checkArgument(
+        branchName != null && !branchName.isEmpty(), "branchName must not be empty");
+    Preconditions.checkArgument(versionNumber > 0, "versionNumber must be greater than 0");
     return new Ref(Optional.of(versionNumber), Optional.of(branchName), Optional.empty());
   }
 
   public static Ref ofTag(String tagName) {
+    Preconditions.checkArgument(tagName != null && !tagName.isEmpty(), "tagName must not be empty");
     return new Ref(Optional.empty(), Optional.empty(), Optional.of(tagName));
   }
 

@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.lance.file.BlobReadMode;
+import org.lance.file.FileReadOptions;
 import org.lance.file.LanceFileReader;
 import org.lance.file.LanceFileWriter;
 import org.lance.util.Range;
@@ -20,11 +22,14 @@ import org.lance.util.Range;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.Assertions;
@@ -303,5 +308,95 @@ public class FileReaderWriterTest {
             () -> writer.addSchemaMetadata(Collections.singletonMap(null, "someValue")));
       }
     }
+  }
+
+  private void writeBlobFile(String filePath, BufferAllocator allocator) throws Exception {
+    Map<String, String> blobMetadata = new HashMap<>();
+    blobMetadata.put("lance-encoding:blob", "true");
+
+    Field blobField =
+        new Field(
+            "blob_data",
+            new FieldType(true, ArrowType.LargeBinary.INSTANCE, null, blobMetadata),
+            Collections.emptyList());
+
+    Schema schema = new Schema(Collections.singletonList(blobField), null);
+
+    try (LanceFileWriter writer =
+        LanceFileWriter.open(filePath, allocator, null, Collections.emptyMap())) {
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+
+        LargeVarBinaryVector blobVector = (LargeVarBinaryVector) root.getVector("blob_data");
+
+        for (int i = 0; i < 5; i++) {
+          byte[] data = new byte[100 * (i + 1)];
+          Arrays.fill(data, (byte) i);
+          blobVector.setSafe(i, data);
+        }
+
+        root.setRowCount(5);
+        writer.write(root);
+      }
+    }
+  }
+
+  @Test
+  void testBlobDescriptorMode(@TempDir Path tempDir) throws Exception {
+    String filePath = tempDir.resolve("test_blob.lance").toString();
+    BufferAllocator allocator = new RootAllocator();
+    writeBlobFile(filePath, allocator);
+
+    try (LanceFileReader reader = LanceFileReader.open(filePath, allocator)) {
+      assertTrue(
+          reader.schema().getFields().get(0).getMetadata().containsKey("lance-encoding:blob"),
+          "Blob metadata should be preserved in schema");
+
+      FileReadOptions options =
+          FileReadOptions.builder().blobReadMode(BlobReadMode.DESCRIPTOR).build();
+      try (ArrowReader batch =
+          reader.readAll(Collections.singletonList("blob_data"), null, 10, options)) {
+        assertTrue(batch.loadNextBatch());
+        VectorSchemaRoot root = batch.getVectorSchemaRoot();
+        assertEquals(5, root.getRowCount());
+
+        FieldVector column = root.getVector("blob_data");
+        assertTrue(
+            column.getField().getType() instanceof ArrowType.Struct,
+            "DESCRIPTOR mode should return Struct but got " + column.getField().getType());
+        assertEquals(
+            2,
+            column.getField().getChildren().size(),
+            "Struct should have 2 fields (position and size)");
+      }
+    }
+    allocator.close();
+  }
+
+  @Test
+  void testBlobContentMode(@TempDir Path tempDir) throws Exception {
+    String filePath = tempDir.resolve("test_blob.lance").toString();
+    BufferAllocator allocator = new RootAllocator();
+    writeBlobFile(filePath, allocator);
+
+    try (LanceFileReader reader = LanceFileReader.open(filePath, allocator)) {
+      // Default readAll (no BlobReadMode) should return materialized binary
+      try (ArrowReader batch = reader.readAll(Collections.singletonList("blob_data"), null, 10)) {
+        assertTrue(batch.loadNextBatch());
+        VectorSchemaRoot root = batch.getVectorSchemaRoot();
+        assertEquals(5, root.getRowCount());
+
+        FieldVector column = root.getVector("blob_data");
+        assertTrue(
+            column.getField().getType() instanceof ArrowType.LargeBinary,
+            "CONTENT mode should return LargeBinary but got " + column.getField().getType());
+
+        LargeVarBinaryVector binaryVector = (LargeVarBinaryVector) column;
+        for (int i = 0; i < 5; i++) {
+          assertEquals(100 * (i + 1), binaryVector.get(i).length);
+        }
+      }
+    }
+    allocator.close();
   }
 }

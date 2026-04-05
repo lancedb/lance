@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
@@ -71,83 +72,86 @@ public class DataReplacementTest extends OperationTestBase {
         List<FragmentMetadata> fragmentMetas =
             Fragment.create(datasetPath, allocator, idRoot, new WriteParams.Builder().build());
 
-        Transaction appendTxn =
-            dataset
-                .newTransactionBuilder()
+        try (Transaction appendTxn =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
                 .operation(Append.builder().fragments(fragmentMetas).build())
-                .build();
+                .build()) {
+          try (Dataset initDataset = new CommitBuilder(dataset).execute(appendTxn)) {
+            assertEquals(2, initDataset.version());
+            assertEquals(rowCount, initDataset.countRows());
 
-        try (Dataset initDataset = appendTxn.commit()) {
-          assertEquals(2, initDataset.version());
-          assertEquals(rowCount, initDataset.countRows());
+            // step 3. use dataset.addColumn to add a new column named as address with all null
+            // values
+            Field addressField = Field.nullable("address", new ArrowType.Utf8());
+            Schema addressSchema = new Schema(Collections.singletonList(addressField), null);
+            initDataset.addColumns(addressSchema);
 
-          // step 3. use dataset.addColumn to add a new column named as address with all null values
-          Field addressField = Field.nullable("address", new ArrowType.Utf8());
-          Schema addressSchema = new Schema(Collections.singletonList(addressField), null);
-          initDataset.addColumns(addressSchema);
+            try (LanceScanner scanner = initDataset.newScan()) {
+              try (ArrowReader resultReader = scanner.scanBatches()) {
+                assertTrue(resultReader.loadNextBatch());
+                VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                assertEquals(rowCount, initDataset.countRows());
+                assertEquals(rowCount, batch.getRowCount());
 
-          try (LanceScanner scanner = initDataset.newScan()) {
-            try (ArrowReader resultReader = scanner.scanBatches()) {
-              assertTrue(resultReader.loadNextBatch());
-              VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
-              assertEquals(rowCount, initDataset.countRows());
-              assertEquals(rowCount, batch.getRowCount());
-
-              // verify all null values
-              VarCharVector resultNameVector = (VarCharVector) batch.getVector("address");
-              for (int i = 0; i < rowCount; i++) {
-                Assertions.assertTrue(resultNameVector.isNull(i));
+                // verify all null values
+                VarCharVector resultNameVector = (VarCharVector) batch.getVector("address");
+                for (int i = 0; i < rowCount; i++) {
+                  Assertions.assertTrue(resultNameVector.isNull(i));
+                }
               }
             }
-          }
 
-          // step 4. use DataReplacement transaction to replace null values
-          try (VectorSchemaRoot replaceVectorRoot =
-              VectorSchemaRoot.create(addressSchema, allocator)) {
-            replaceVectorRoot.allocateNew();
-            VarCharVector addressVector = (VarCharVector) replaceVectorRoot.getVector("address");
+            // step 4. use DataReplacement transaction to replace null values
+            try (VectorSchemaRoot replaceVectorRoot =
+                VectorSchemaRoot.create(addressSchema, allocator)) {
+              replaceVectorRoot.allocateNew();
+              VarCharVector addressVector = (VarCharVector) replaceVectorRoot.getVector("address");
 
-            for (int i = 0; i < rowCount; i++) {
-              String name = "District " + i;
-              addressVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
-            }
-            replaceVectorRoot.setRowCount(rowCount);
+              for (int i = 0; i < rowCount; i++) {
+                String name = "District " + i;
+                addressVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+              }
+              replaceVectorRoot.setRowCount(rowCount);
 
-            DataFile datafile =
-                writeLanceDataFile(
-                    dataset.allocator(),
-                    datasetPath,
-                    replaceVectorRoot,
-                    new int[] {2},
-                    new int[] {0});
-            List<DataReplacement.DataReplacementGroup> replacementGroups =
-                Collections.singletonList(
-                    new DataReplacement.DataReplacementGroup(
-                        fragmentMetas.get(0).getId(), datafile));
-            Transaction replaceTxn =
-                initDataset
-                    .newTransactionBuilder()
-                    .operation(DataReplacement.builder().replacements(replacementGroups).build())
-                    .build();
-
-            try (Dataset datasetWithAddress = replaceTxn.commit()) {
-              assertEquals(4, datasetWithAddress.version());
-              assertEquals(rowCount, datasetWithAddress.countRows());
-
-              try (LanceScanner scanner = datasetWithAddress.newScan()) {
-                try (ArrowReader resultReader = scanner.scanBatches()) {
-                  assertTrue(resultReader.loadNextBatch());
-                  VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+              DataFile datafile =
+                  writeLanceDataFile(
+                      dataset.allocator(),
+                      datasetPath,
+                      replaceVectorRoot,
+                      new int[] {2},
+                      new int[] {0});
+              List<DataReplacement.DataReplacementGroup> replacementGroups =
+                  Collections.singletonList(
+                      new DataReplacement.DataReplacementGroup(
+                          fragmentMetas.get(0).getId(), datafile));
+              try (Transaction replaceTxn =
+                  new Transaction.Builder()
+                      .readVersion(initDataset.version())
+                      .operation(DataReplacement.builder().replacements(replacementGroups).build())
+                      .build()) {
+                try (Dataset datasetWithAddress =
+                    new CommitBuilder(initDataset).execute(replaceTxn)) {
+                  assertEquals(4, datasetWithAddress.version());
                   assertEquals(rowCount, datasetWithAddress.countRows());
-                  assertEquals(rowCount, batch.getRowCount());
 
-                  // verify all address values not null
-                  VarCharVector resultNameVector = (VarCharVector) batch.getVector("address");
-                  for (int i = 0; i < rowCount; i++) {
-                    Assertions.assertFalse(resultNameVector.isNull(i));
-                    String expectedName = "District " + i;
-                    String actualName = new String(resultNameVector.get(i), StandardCharsets.UTF_8);
-                    assertEquals(expectedName, actualName);
+                  try (LanceScanner scanner = datasetWithAddress.newScan()) {
+                    try (ArrowReader resultReader = scanner.scanBatches()) {
+                      assertTrue(resultReader.loadNextBatch());
+                      VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                      assertEquals(rowCount, datasetWithAddress.countRows());
+                      assertEquals(rowCount, batch.getRowCount());
+
+                      // verify all address values not null
+                      VarCharVector resultNameVector = (VarCharVector) batch.getVector("address");
+                      for (int i = 0; i < rowCount; i++) {
+                        Assertions.assertFalse(resultNameVector.isNull(i));
+                        String expectedName = "District " + i;
+                        String actualName =
+                            new String(resultNameVector.get(i), StandardCharsets.UTF_8);
+                        assertEquals(expectedName, actualName);
+                      }
+                    }
                   }
                 }
               }

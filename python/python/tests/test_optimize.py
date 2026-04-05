@@ -74,28 +74,30 @@ def test_optimize_max_bytes(tmp_path: Path):
     arr = pa.FixedSizeListArray.from_arrays(arr, 1024)
     data = pa.table({"a": arr})
 
+    # Write out 4K rows and 32MB of data
     dataset = lance.write_dataset(
         data, base_dir, max_rows_per_file=2 * 1024, data_storage_version="stable"
     )
+    # We get 2 fragments
     assert len(dataset.get_fragments()) == 2
 
-    # max_bytes_per_file is too small and we get tiny files
+    # Now run compaction with a small max_bytes_per_file (1000 bytes) to get more
+    # fragments.  The exact number is a bit tricky to calculate because we don't
+    # split into a new fragment until we've actually written data and that depends
+    # on how much the file format chooses to accumulate, but it should be more than 2
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
         materialize_deletions=False,
         max_bytes_per_file=1000,
         batch_size=128,
     )
-
-    # We get 4 fragments here because we don't actually write any data to the file
-    # until we've accumulated 8MiB for a page.
     assert metrics.fragments_removed == 2
-    assert metrics.fragments_added == 4
+    assert metrics.fragments_added > 2
     assert metrics.files_removed == 2
-    assert metrics.files_added == 4
+    assert metrics.files_added > 2
 
     num_frags = len(dataset.get_fragments())
-    assert num_frags == 4
+    assert num_frags == metrics.fragments_added
 
     dataset = lance.write_dataset(
         data,
@@ -115,9 +117,9 @@ def test_optimize_max_bytes(tmp_path: Path):
     results = [task.execute(dataset) for task in plan.tasks]
     metrics = Compaction.commit(dataset, results)
     assert metrics.fragments_removed == 2
-    assert metrics.fragments_added == 4
+    assert metrics.fragments_added > 2
     assert metrics.files_removed == 2
-    assert metrics.files_added == 4
+    assert metrics.files_added > 2
 
     dataset = lance.write_dataset(
         data,
@@ -296,12 +298,29 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     fragments = list(ds.get_fragments())
     assert len(fragments) == 2
 
-    index = ds.list_indices()[0]
-    index_frag_ids = list(index["fragment_ids"])
+    index = ds.describe_indices()[0]
+    index_frag_ids = list(index.segments[0].fragment_ids)
     frag_ids = [frag.fragment_id for frag in fragments]
 
     assert len(index_frag_ids) == 1
     assert index_frag_ids[0] in frag_ids
+
+
+def test_defer_index_remap(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    options = dict(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
+
+    dataset.delete("i < 500")
+    dataset.optimize.compact_files(**options)
+
+    dataset = lance.dataset(base_dir)
+    indices = dataset.describe_indices()
+    assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):

@@ -5,7 +5,6 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
-use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -14,13 +13,16 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+use tokio::sync::Notify;
 
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
 use crate::utils::CachedFileSize;
+
+mod lite;
 
 // Don't log backpressure warnings until at least this many seconds have passed
 const BACKPRESSURE_MIN: u64 = 5;
@@ -31,19 +33,6 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
-// By default, we limit the number of IOPS across the entire process to 128
-//
-// In theory this is enough for ~10GBps on S3 following the guidelines to issue
-// 1 IOP per 80MBps.  In practice, I have noticed slightly better performance going
-// up to 256.
-//
-// However, non-S3 stores (e.g. GCS, Azure) can suffer significantly from too many
-// concurrent IOPS.  For safety, we set the default to 128 and let the user override
-// this if needed.
-//
-// Note: this only limits things that run through the scheduler.  It does not limit
-// IOPS from other sources like writing or commits.
-static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -52,97 +41,6 @@ pub fn iops_counter() -> u64 {
 pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
 }
-
-// There are two structures that control the I/O scheduler concurrency.  First,
-// we have a hard limit on the number of IOPS that can be issued concurrently.
-// This limit is process-wide.
-//
-// Second, we try and limit how many I/O requests can be buffered in memory without
-// being consumed by a decoder of some kind.  This limit is per-scheduler.  We cannot
-// make this limit process wide without introducing deadlock (because the decoder for
-// file 0 might be waiting on IOPS blocked by a queue filled with requests for file 1)
-// and vice-versa.
-//
-// There is also a per-scan limit on the number of IOPS that can be issued concurrently.
-//
-// The process-wide limit exists when users need a hard limit on the number of parallel
-// IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
-// the network.  (Note: a process-wide limit of X will not necessarily limit the number of
-// open TCP connections to exactly X.  The underlying object store may open more connections
-// anyways)
-//
-// However, it can be too tough in some cases, e.g. when some scans are reading from
-// cloud storage and other scans are reading from local disk.  In these cases users don't
-// need to set a process-limit and can rely on the per-scan limits.
-
-// The IopsQuota enforces the first of the above limits, it is the per-process hard cap
-// on the number of IOPS that can be issued concurrently.
-//
-// The per-scan limits are enforced by IoQueue
-struct IopsQuota {
-    // An Option is used here to avoid mutex overhead if no limit is set
-    iops_avail: Option<Semaphore>,
-}
-
-/// A reservation on the global IOPS quota
-///
-/// When the reservation is dropped, the IOPS quota is released unless
-/// [`Self::forget`] is called.
-struct IopsReservation<'a> {
-    value: Option<SemaphorePermit<'a>>,
-}
-
-impl IopsReservation<'_> {
-    // Forget the reservation, so it won't be released on drop
-    fn forget(&mut self) {
-        if let Some(value) = self.value.take() {
-            value.forget();
-        }
-    }
-}
-
-impl IopsQuota {
-    // By default, we throttle the number of scan IOPS across the entire process
-    //
-    // However, the user can disable this by setting the environment variable
-    // LANCE_PROCESS_IO_THREADS_LIMIT to zero (or a negative integer).
-    fn new() -> Self {
-        let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
-            .map(|s| {
-                s.parse::<i32>().unwrap_or_else(|_| {
-                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
-                    DEFAULT_PROCESS_IOPS_LIMIT
-                })
-            })
-            .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT);
-        let iops_avail = if initial_capacity <= 0 {
-            None
-        } else {
-            Some(Semaphore::new(initial_capacity as usize))
-        };
-        Self { iops_avail }
-    }
-
-    // Return a reservation on the global IOPS quota
-    fn release(&self) {
-        if let Some(iops_avail) = self.iops_avail.as_ref() {
-            iops_avail.add_permits(1);
-        }
-    }
-
-    // Acquire a reservation on the global IOPS quota
-    async fn acquire(&self) -> IopsReservation<'_> {
-        if let Some(iops_avail) = self.iops_avail.as_ref() {
-            IopsReservation {
-                value: Some(iops_avail.acquire().await.unwrap()),
-            }
-        } else {
-            IopsReservation { value: None }
-        }
-    }
-}
-
-static IOPS_QUOTA: std::sync::LazyLock<IopsQuota> = std::sync::LazyLock::new(IopsQuota::new);
 
 // We want to allow requests that have a lower priority than any
 // currently in-flight request.  This helps avoid potential deadlocks
@@ -225,7 +123,9 @@ impl IoQueueState {
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
             tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
-            log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            log::debug!(
+                "Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind"
+            );
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
         }
@@ -300,17 +200,8 @@ impl IoQueue {
     async fn pop(&self) -> Option<IoTask> {
         loop {
             {
-                // First, grab a reservation on the global IOPS quota
-                // If we then get a task to run, transfer the reservation
-                // to the task.  Otherwise, the reservation will be released
-                // when iop_res is dropped.
-                let mut iop_res = IOPS_QUOTA.acquire().await;
-                // Next, try and grab a reservation from the queue
                 let mut state = self.state.lock().unwrap();
                 if let Some(task) = state.next_task() {
-                    // Reservation successfully acquired, we will release the global
-                    // global reservation after task has run.
-                    iop_res.forget();
                     return Some(task);
                 }
 
@@ -389,10 +280,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
-            Err(Error::Wrapped {
-                error: self.err.take().unwrap(),
-                location: location!(),
-            })
+            Err(Error::wrapped(self.err.take().unwrap()))
         } else {
             let mut data = Vec::new();
             std::mem::swap(&mut data, &mut self.data_buffers);
@@ -469,10 +357,9 @@ impl IoTask {
         self.to_read.end - self.to_read.start
     }
     fn cancel(self) {
-        (self.when_done)(Err(Error::Internal {
-            message: "Scheduler closed before I/O was completed".to_string(),
-            location: location!(),
-        }));
+        (self.when_done)(Err(Error::internal(
+            "Scheduler closed before I/O was completed".to_string(),
+        )));
     }
 
     async fn run(self) {
@@ -502,7 +389,6 @@ impl IoTask {
             range_end = self.to_read.end,
             "File I/O completed"
         );
-        IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
 }
@@ -580,6 +466,11 @@ impl ScanStats {
     }
 }
 
+enum IoQueueType {
+    Standard(Arc<IoQueue>),
+    Lite(Arc<lite::IoQueue>),
+}
+
 /// An I/O scheduler which wraps an ObjectStore and throttles the amount of
 /// parallel I/O that can be run.
 ///
@@ -590,7 +481,7 @@ impl ScanStats {
 /// using the ScanScheduler directly.
 pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
-    io_queue: Arc<IoQueue>,
+    io_queue: IoQueueType,
     stats: Arc<StatsCollector>,
 }
 
@@ -615,21 +506,42 @@ pub struct SchedulerConfig {
     /// This controls back pressure.  If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
+    /// Whether to use the lite scheduler.
+    ///
+    /// - `Some(true)` forces the lite scheduler (e.g. from env var or programmatic).
+    /// - `Some(false)` forces the standard scheduler.
+    /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
+    pub use_lite_scheduler: Option<bool>,
 }
 
 impl SchedulerConfig {
+    pub fn new(io_buffer_size_bytes: u64) -> Self {
+        Self {
+            io_buffer_size_bytes,
+            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
+                .ok()
+                .map(|v| str_is_truthy(v.trim())),
+        }
+    }
+
     /// Big enough for unit testing
     pub fn default_for_testing() -> Self {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
         }
     }
 
     /// Configuration that should generally maximize bandwidth (not trying to save RAM
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
+        Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
+    }
+
+    pub fn with_lite_scheduler(self) -> Self {
         Self {
-            io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism() as u64,
+            use_lite_scheduler: Some(true),
+            ..self
         }
     }
 }
@@ -643,20 +555,32 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
-        let io_queue = Arc::new(IoQueue::new(
-            io_capacity as u32,
-            config.io_buffer_size_bytes,
-        ));
-        let slf = Arc::new(Self {
+        let use_lite = config
+            .use_lite_scheduler
+            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+        let io_queue = if use_lite {
+            let io_queue = Arc::new(lite::IoQueue::new(
+                io_capacity as u64,
+                config.io_buffer_size_bytes,
+            ));
+            IoQueueType::Lite(io_queue)
+        } else {
+            let io_queue = Arc::new(IoQueue::new(
+                io_capacity as u32,
+                config.io_buffer_size_bytes,
+            ));
+            let io_queue_clone = io_queue.clone();
+            // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
+            // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
+            // to wait for it to finish but that doesn't seem helpful.
+            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+            IoQueueType::Standard(io_queue)
+        };
+        Arc::new(Self {
             object_store,
-            io_queue: io_queue.clone(),
+            io_queue,
             stats: Arc::new(StatsCollector::new()),
-        });
-        // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
-        // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
-        // to wait for it to finish but that doesn't seem helpful.
-        tokio::task::spawn(async move { run_io_loop(io_queue).await });
-        slf
+        })
     }
 
     /// Open a file for reading
@@ -714,6 +638,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         tx: oneshot::Sender<Response>,
         priority: u128,
+        io_queue: &Arc<IoQueue>,
     ) {
         let num_iops = request.len() as u32;
 
@@ -731,14 +656,14 @@ impl ScanScheduler {
 
         for (task_idx, iop) in request.into_iter().enumerate() {
             let dest = dest.clone();
-            let io_queue = self.io_queue.clone();
+            let io_queue_clone = io_queue.clone();
             let num_bytes = iop.end - iop.start;
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
                 priority,
                 when_done: Box::new(move |data| {
-                    io_queue.on_iop_complete();
+                    io_queue_clone.on_iop_complete();
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
                         data,
@@ -748,33 +673,90 @@ impl ScanScheduler {
                     dest.deliver_data(chunk);
                 }),
             };
-            self.io_queue.push(task);
+            io_queue.push(task);
         }
     }
 
-    fn submit_request(
+    fn submit_request_standard(
         &self,
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+        io_queue: &Arc<IoQueue>,
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
 
-        self.do_submit_request(reader, request, tx, priority);
+        self.do_submit_request(reader, request, tx, priority, io_queue);
 
-        let io_queue = self.io_queue.clone();
+        let io_queue_clone = io_queue.clone();
 
         rx.map(move |wrapped_rsp| {
             // Right now, it isn't possible for I/O to be cancelled so a cancel error should
             // not occur
             let rsp = wrapped_rsp.unwrap();
-            io_queue.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
+            io_queue_clone.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
             rsp.data
         })
     }
 
+    fn submit_request_lite(
+        &self,
+        reader: Arc<dyn Reader>,
+        request: Vec<Range<u64>>,
+        priority: u128,
+        io_queue: &Arc<lite::IoQueue>,
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        // It's important that we submit all requests _before_ we await anything
+        let maybe_tasks = request
+            .into_iter()
+            .map(|task| {
+                let reader = reader.clone();
+                let queue = io_queue.clone();
+                let run_fn = Box::new(move || {
+                    reader
+                        .get_range(task.start as usize..task.end as usize)
+                        .map_err(Error::from)
+                        .boxed()
+                });
+                queue.submit(task, priority, run_fn)
+            })
+            .collect::<Result<Vec<_>>>();
+        match maybe_tasks {
+            Ok(tasks) => async move {
+                let mut results = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    results.push(task.await?);
+                }
+                Ok(results)
+            }
+            .boxed(),
+            Err(e) => async move { Err(e) }.boxed(),
+        }
+    }
+
+    pub fn submit_request(
+        &self,
+        reader: Arc<dyn Reader>,
+        request: Vec<Range<u64>>,
+        priority: u128,
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        match &self.io_queue {
+            IoQueueType::Standard(io_queue) => futures::future::Either::Left(
+                self.submit_request_standard(reader, request, priority, io_queue),
+            ),
+            IoQueueType::Lite(io_queue) => futures::future::Either::Right(
+                self.submit_request_lite(reader, request, priority, io_queue),
+            ),
+        }
+    }
+
     pub fn stats(&self) -> ScanStats {
         ScanStats::new(self.stats.as_ref())
+    }
+
+    #[cfg(test)]
+    fn uses_lite_scheduler(&self) -> bool {
+        matches!(self.io_queue, IoQueueType::Lite(_))
     }
 }
 
@@ -791,7 +773,10 @@ impl Drop for ScanScheduler {
         // In theory, this isn't strictly necessary, as callers should drop any task expecting I/O before they
         // drop the scheduler.  In practice, this can be difficult to do, and it is better to spend a little bit
         // of time letting the I/O loop drain so that we can avoid any potential deadlocks.
-        self.io_queue.close();
+        match &self.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue.close(),
+            IoQueueType::Lite(io_queue) => io_queue.close(),
+        }
     }
 }
 
@@ -831,7 +816,7 @@ impl FileScheduler {
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
-    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
@@ -970,7 +955,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
 
-    use object_store::{memory::InMemory, GetRange, ObjectStore as OSObjectStore};
+    use object_store::{GetRange, ObjectStore as OSObjectStore, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 
@@ -1150,6 +1135,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1240,6 +1226,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -1314,6 +1301,7 @@ mod tests {
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1328,6 +1316,126 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(first_fut.await.unwrap().len(), 10);
         assert_eq!(second_fut.await.unwrap().len(), 10);
+    }
+
+    /// A Reader that tracks how many times get_range has been called.
+    #[derive(Debug)]
+    struct TrackingReader {
+        get_range_count: Arc<AtomicU64>,
+        path: Path,
+    }
+
+    impl deepsize::DeepSizeOf for TrackingReader {
+        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for TrackingReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(1_000_000) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            self.get_range_count.fetch_add(1, Ordering::Release);
+            let num_bytes = range.end - range.start;
+            Box::pin(async move { Ok(Bytes::from(vec![0u8; num_bytes])) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lite_scheduler_submits_eagerly() {
+        let obj_store = Arc::new(ObjectStore::memory());
+        let config = SchedulerConfig::default_for_testing().with_lite_scheduler();
+        let scheduler = ScanScheduler::new(obj_store, config);
+
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        // Submit several requests. The lite scheduler should call get_range
+        // eagerly during submit (before the returned future is polled).
+        let fut1 = scheduler.submit_request(reader.clone(), vec![0..100], 0);
+        let fut2 = scheduler.submit_request(reader.clone(), vec![100..200], 10);
+        let fut3 = scheduler.submit_request(reader.clone(), vec![200..300], 20);
+
+        // get_range must have been called for all 3 requests already.
+        assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+
+        // The futures should still resolve with the correct data.
+        assert_eq!(fut1.await.unwrap()[0].len(), 100);
+        assert_eq!(fut2.await.unwrap()[0].len(), 100);
+        assert_eq!(fut3.await.unwrap()[0].len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_object_store_selects_scheduler() {
+        // A memory:// store should use the standard scheduler when config is None
+        let memory_store = Arc::new(ObjectStore::memory());
+        assert!(!memory_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(memory_store.clone(), config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // A file+uring:// store should use the lite scheduler when config is None
+        let uring_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("file+uring:///tmp").unwrap(),
+            None,
+            None,
+            false,
+            false,
+            8,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        assert!(uring_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(uring_store.clone(), config);
+        assert!(scheduler.uses_lite_scheduler());
+
+        // Explicit Some(false) overrides a file+uring:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(uring_store, config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // Explicit Some(true) overrides a memory:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(true),
+        };
+        let scheduler = ScanScheduler::new(memory_store, config);
+        assert!(scheduler.uses_lite_scheduler());
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -1345,6 +1453,7 @@ mod tests {
         // Only one request will be allowed in
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1,
+            use_lite_scheduler: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler

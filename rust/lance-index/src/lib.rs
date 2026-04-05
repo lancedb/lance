@@ -18,7 +18,6 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::convert::TryFrom;
 
 pub mod frag_reuse;
@@ -26,6 +25,7 @@ pub mod mem_wal;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
+pub mod progress;
 pub mod registry;
 pub mod scalar;
 pub mod traits;
@@ -41,8 +41,13 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
-// Currently all vector indexes are version 1
+/// Default version for vector index metadata.
+///
+/// Most vector indices should use this version unless they need to bump for a
+/// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
+/// Version for IVF_RQ indices.
+pub const IVF_RQ_INDEX_VERSION: u32 = 2;
 
 /// The factor of threshold to trigger split / join for vector index.
 ///
@@ -118,6 +123,8 @@ pub enum IndexType {
 
     BloomFilter = 9, // Bloom filter
 
+    RTree = 10, // RTree
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -142,6 +149,7 @@ impl std::fmt::Display for IndexType {
             Self::MemWal => write!(f, "MemWal"),
             Self::ZoneMap => write!(f, "ZoneMap"),
             Self::BloomFilter => write!(f, "BloomFilter"),
+            Self::RTree => write!(f, "RTree"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -175,10 +183,10 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswSq as i32 => Ok(Self::IvfHnswSq),
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
-            _ => Err(Error::InvalidInput {
-                source: format!("the input value {} is not a valid IndexType", value).into(),
-                location: location!(),
-            }),
+            v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
+            _ => Err(Error::invalid_input_source(
+                format!("the input value {} is not a valid IndexType", value).into(),
+            )),
         }
     }
 }
@@ -188,15 +196,13 @@ impl TryFrom<&str> for IndexType {
 
     fn try_from(value: &str) -> Result<Self> {
         match value {
-            "BTree" => Ok(Self::BTree),
-            "Bitmap" => Ok(Self::Bitmap),
-            "LabelList" => Ok(Self::LabelList),
-            "Inverted" => Ok(Self::Inverted),
-            "NGram" => Ok(Self::NGram),
-            "FragmentReuse" => Ok(Self::FragmentReuse),
-            "MemWal" => Ok(Self::MemWal),
-            "ZoneMap" => Ok(Self::ZoneMap),
-            "Vector" => Ok(Self::Vector),
+            "BTree" | "BTREE" => Ok(Self::BTree),
+            "Bitmap" | "BITMAP" => Ok(Self::Bitmap),
+            "LabelList" | "LABELLIST" => Ok(Self::LabelList),
+            "Inverted" | "INVERTED" => Ok(Self::Inverted),
+            "NGram" | "NGRAM" => Ok(Self::NGram),
+            "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
+            "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
             "IVF_PQ" => Ok(Self::IvfPq),
@@ -204,10 +210,12 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
-            _ => Err(Error::invalid_input(
-                format!("invalid index type: {}", value),
-                location!(),
-            )),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
+            _ => Err(Error::invalid_input(format!(
+                "invalid index type: {}",
+                value
+            ))),
         }
     }
 }
@@ -224,6 +232,7 @@ impl IndexType {
                 | Self::NGram
                 | Self::ZoneMap
                 | Self::BloomFilter
+                | Self::RTree,
         )
     }
 
@@ -262,17 +271,22 @@ impl IndexType {
             Self::MemWal => 0,
             Self::ZoneMap => 0,
             Self::BloomFilter => 0,
+            Self::RTree => 0,
 
-            // for now all vector indices are built by the same builder,
-            // so they share the same version.
+            // IMPORTANT: if any vector index subtype needs a format bump that is
+            // not backward compatible, its new version must be set to
+            // (current max vector index version + 1), even if only one subtype
+            // changed. Compatibility filtering currently cannot distinguish vector
+            // subtypes from details-only metadata, so vector versions effectively
+            // share one global monotonic compatibility level.
             Self::Vector
             | Self::IvfFlat
             | Self::IvfSq
             | Self::IvfPq
             | Self::IvfHnswSq
             | Self::IvfHnswPq
-            | Self::IvfHnswFlat
-            | Self::IvfRq => 1,
+            | Self::IvfHnswFlat => VECTOR_INDEX_VERSION as i32,
+            Self::IvfRq => IVF_RQ_INDEX_VERSION as i32,
         }
     }
 
@@ -293,6 +307,24 @@ impl IndexType {
             Self::IvfHnswPq => 1 << 20,
             _ => 8192,
         }
+    }
+
+    /// Returns the highest supported vector index version in this Lance build.
+    pub fn max_vector_version() -> u32 {
+        [
+            Self::Vector,
+            Self::IvfFlat,
+            Self::IvfSq,
+            Self::IvfPq,
+            Self::IvfHnswSq,
+            Self::IvfHnswPq,
+            Self::IvfHnswFlat,
+            Self::IvfRq,
+        ]
+        .into_iter()
+        .map(|index_type| index_type.version() as u32)
+        .max()
+        .unwrap_or(VECTOR_INDEX_VERSION)
     }
 }
 
@@ -322,5 +354,21 @@ pub fn infer_system_index_type(
         Some(IndexType::MemWal)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ivf_rq_has_dedicated_index_version() {
+        assert!(IndexType::IvfRq.version() > IndexType::IvfPq.version());
+        assert_eq!(IndexType::IvfRq.version() as u32, IVF_RQ_INDEX_VERSION);
+    }
+
+    #[test]
+    fn test_max_vector_version_tracks_highest_supported() {
+        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
     }
 }

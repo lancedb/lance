@@ -9,54 +9,53 @@ use std::time::Instant;
 
 use arrow::array::Float32Builder;
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
+use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_array::{
+    ArrayRef, BooleanArray, RecordBatch, StringArray,
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, RecordBatch, StringArray,
 };
-use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PlanProperties;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
 };
+use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
 use datafusion::{
     common::stats::Precision,
     physical_plan::execution_plan::{Boundedness, EmissionType},
 };
-use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
-use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
-use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::ROW_ID;
-use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
+use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, DELTAS_SEARCHED_METRIC, PARTITIONS_RANKED_METRIC,
-    PARTITIONS_SEARCHED_METRIC,
+    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
+    PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{
-    flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
+    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, Query, flat::compute_distance,
 };
-use lance_index::vector::{VectorIndex, DIST_Q_C_COLUMN};
+use lance_index::vector::{DIST_Q_C_COLUMN, VectorIndex};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
-use snafu::location;
 use tokio::sync::Notify;
 
 use crate::dataset::Dataset;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
-use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -69,6 +68,7 @@ pub struct AnnPartitionMetrics {
     index_metrics: IndexMetrics,
     partitions_ranked: Count,
     deltas_searched: Count,
+    find_partitions_elapsed: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -78,6 +78,7 @@ impl AnnPartitionMetrics {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_ranked: metrics.new_count(PARTITIONS_RANKED_METRIC, partition),
             deltas_searched: metrics.new_count(DELTAS_SEARCHED_METRIC, partition),
+            find_partitions_elapsed: metrics.new_time(FIND_PARTITIONS_ELAPSED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -136,7 +137,7 @@ impl DisplayAs for KNNVectorDistanceExec {
 }
 
 impl KNNVectorDistanceExec {
-    /// Create a new [KNNFlatExec] node.
+    /// Create a new [`KNNVectorDistanceExec`] node.
     ///
     /// Returns an error if the preconditions are not met.
     pub fn try_new(
@@ -231,9 +232,18 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 let key = key.clone();
                 let column = column.clone();
                 async move {
-                    compute_distance(key, dt, &column, batch?)
+                    let batch = compute_distance(key, dt, &column, batch?)
                         .await
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+                    let mask = BooleanArray::from_iter(
+                        distances
+                            .iter()
+                            .map(|v| Some(v.map(|v| !v.is_nan()).unwrap_or(false))),
+                    );
+                    arrow::compute::filter_record_batch(&batch, &mask)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
             })
             .buffer_unordered(get_num_compute_intensive_cpus());
@@ -376,10 +386,9 @@ impl ANNIvfPartitionExec {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
-            return Err(Error::Execution {
-                message: "ANNIVFPartitionExec node: no index found for query".to_string(),
-                location: location!(),
-            });
+            return Err(Error::execution(
+                "ANNIVFPartitionExec node: no index found for query".to_string(),
+            ));
         }
 
         let schema = KNN_PARTITION_SCHEMA.clone();
@@ -502,9 +511,12 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
-                    let (partitions, dist_q_c) = index.find_partitions(&query).map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to find partitions: {}", e))
-                    })?;
+                    let (partitions, dist_q_c) = {
+                        let _timer = metrics.find_partitions_elapsed.timer();
+                        index.find_partitions(&query).map_err(|e| {
+                            DataFusionError::Execution(format!("Failed to find partitions: {}", e))
+                        })?
+                    };
 
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
                         .with_field(Field::new("item", DataType::UInt32, false));
@@ -606,13 +618,10 @@ impl ANNIvfSubIndexExec {
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
-            return Err(Error::Index {
-                message: format!(
-                    "ANNSubIndexExec node: input schema does not have \"{}\" column",
-                    PART_ID_COLUMN
-                ),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "ANNSubIndexExec node: input schema does not have \"{}\" column",
+                PART_ID_COLUMN
+            )));
         }
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
@@ -634,23 +643,30 @@ impl ANNIvfSubIndexExec {
 
 impl DisplayAs for ANNIvfSubIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let metric_str = self
+            .query
+            .metric_type
+            .map(|m| format!("{:?}", m))
+            .unwrap_or_else(|| "default".to_string());
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNSubIndex: name={}, k={}, deltas={}",
+                    "ANNSubIndex: name={}, k={}, deltas={}, metric={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
-                    self.indices.len()
+                    self.indices.len(),
+                    metric_str
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ANNSubIndex\nname={}\nk={}\ndeltas={}",
+                    "ANNSubIndex\nname={}\nk={}\ndeltas={}\nmetric={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
-                    self.indices.len()
+                    self.indices.len(),
+                    metric_str
                 )
             }
         }
@@ -744,41 +760,41 @@ impl ANNIvfSubIndexExec {
 
             let max_results = prefilter_mask.max_len().map(|x| x as usize);
 
-            if let Some(max_results) = max_results {
-                if found_so_far < max_results && max_results <= query.k {
-                    // In this case there are fewer than k results matching the prefilter so
-                    // just return the prefilter ids and don't bother searching any further
+            if let Some(max_results) = max_results
+                && found_so_far < max_results
+                && max_results <= query.k
+            {
+                // In this case there are fewer than k results matching the prefilter so
+                // just return the prefilter ids and don't bother searching any further
 
-                    // This next if check should be true, because we wouldn't get max_results otherwise
-                    if let Some(iter_ids) = prefilter_mask.iter_ids() {
-                        // We only run this on the first delta because the prefilter mask is shared
-                        // by all deltas and we don't want to duplicate the rows.
-                        if state
-                            .took_no_rows_shortcut
-                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            let initial_ids = state.initial_ids.lock().unwrap();
-                            let found_ids = HashSet::<_>::from_iter(initial_ids.iter().copied());
-                            drop(initial_ids);
-                            let mask_ids = HashSet::from_iter(iter_ids.map(u64::from));
-                            let not_found_ids = mask_ids.difference(&found_ids);
-                            let not_found_ids =
-                                UInt64Array::from_iter_values(not_found_ids.copied());
-                            let not_found_distance =
-                                Float32Array::from_value(f32::INFINITY, not_found_ids.len());
-                            let not_found_batch = RecordBatch::try_new(
-                                KNN_INDEX_SCHEMA.clone(),
-                                vec![Arc::new(not_found_distance), Arc::new(not_found_ids)],
-                            )
-                            .unwrap();
-                            return futures::stream::once(async move { Ok(not_found_batch) })
-                                .boxed();
-                        } else {
-                            // We meet all the criteria for an early exit, but we aren't first
-                            // delta so we just return an empty stream and skip the late search
-                            return futures::stream::empty().boxed();
-                        }
+                // This next if check should be true, because we wouldn't get max_results otherwise
+                if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
+                    // We only run this on the first delta because the prefilter mask is shared
+                    // by all deltas and we don't want to duplicate the rows.
+                    if state
+                        .took_no_rows_shortcut
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        let initial_addrs = state.initial_ids.lock().unwrap();
+                        let found_addrs = HashSet::<_>::from_iter(initial_addrs.iter().copied());
+                        drop(initial_addrs);
+                        let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
+                        let not_found_addrs = mask_addrs.difference(&found_addrs);
+                        let not_found_addrs =
+                            UInt64Array::from_iter_values(not_found_addrs.copied());
+                        let not_found_distance =
+                            Float32Array::from_value(f32::INFINITY, not_found_addrs.len());
+                        let not_found_batch = RecordBatch::try_new(
+                            KNN_INDEX_SCHEMA.clone(),
+                            vec![Arc::new(not_found_distance), Arc::new(not_found_addrs)],
+                        )
+                        .unwrap();
+                        return futures::stream::once(async move { Ok(not_found_batch) }).boxed();
+                    } else {
+                        // We meet all the criteria for an early exit, but we aren't first
+                        // delta so we just return an empty stream and skip the late search
+                        return futures::stream::empty().boxed();
                     }
                 }
             }
@@ -1108,10 +1124,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
 fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
     query.minimum_nprobes = query.minimum_nprobes.max(pruned_nprobes);
-    if let Some(maximum) = query.maximum_nprobes {
-        if query.minimum_nprobes > maximum {
-            query.minimum_nprobes = maximum;
-        }
+    if let Some(maximum) = query.maximum_nprobes
+        && query.minimum_nprobes > maximum
+    {
+        query.minimum_nprobes = maximum;
     }
 }
 
@@ -1333,6 +1349,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{
@@ -1341,11 +1358,12 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
+    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
@@ -1365,7 +1383,7 @@ mod tests {
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
-            metric_type: DistanceType::L2,
+            metric_type: Some(DistanceType::L2),
             use_index: true,
             dist_q_c: 0.0,
         }
@@ -1542,7 +1560,7 @@ mod tests {
             maximum_nprobes: None,
             ef: None,
             refine_factor: None,
-            metric_type: DistanceType::Cosine,
+            metric_type: Some(DistanceType::Cosine),
             use_index: true,
             dist_q_c: 0.0,
         };
@@ -1720,6 +1738,17 @@ mod tests {
         }
     }
 
+    fn assert_find_partitions_elapsed_recorded(stats: &ExecutionSummaryCounts) {
+        assert!(
+            stats
+                .all_times
+                .get(FIND_PARTITIONS_ELAPSED_METRIC)
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_no_max_nprobes(#[values(1, 20)] num_deltas: usize) {
@@ -1755,6 +1784,7 @@ mod tests {
         if get_num_compute_intensive_cpus() <= 32 {
             assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
         }
+        assert_find_partitions_elapsed_recorded(&stats);
     }
 
     #[rstest]
@@ -1791,6 +1821,7 @@ mod tests {
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(10 * num_deltas)
         );
+        assert_find_partitions_elapsed_recorded(&stats);
     }
 
     #[rstest]
@@ -1830,6 +1861,7 @@ mod tests {
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
                 &(100 * num_deltas)
             );
+            assert_find_partitions_elapsed_recorded(&stats);
         }
     }
 
@@ -1865,6 +1897,7 @@ mod tests {
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(10 * num_deltas)
         );
+        assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 20);
 
         // 15 of the results come from beyond the closest 10 partitions and these will have infinite
@@ -1936,6 +1969,7 @@ mod tests {
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
             &(100 * num_deltas)
         );
+        assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 10000);
     }
 }

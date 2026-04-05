@@ -169,17 +169,32 @@ fi
 BETA_MAJOR=$(echo "${NEW_VERSION}" | cut -d. -f1)
 BETA_MINOR=$(echo "${NEW_VERSION}" | cut -d. -f2)
 BETA_PATCH=$(echo "${NEW_VERSION}" | cut -d. -f3 | cut -d- -f1)
+BETA_NUM=$(echo "${NEW_VERSION}" | sed 's/.*-beta\.//')
 
 if [[ "${BRANCH}" == "main" ]]; then
-    # For main branch: compare against release-root tag
-    BETA_RELEASE_ROOT_TAG="release-root/${BETA_MAJOR}.${BETA_MINOR}.${BETA_PATCH}-beta.N"
-
-    if git rev-parse "${BETA_RELEASE_ROOT_TAG}" >/dev/null 2>&1; then
-        echo "Release notes will compare from ${BETA_RELEASE_ROOT_TAG} to ${BETA_TAG}"
-        RELEASE_NOTES_FROM="${BETA_RELEASE_ROOT_TAG}"
+    # For main branch:
+    # - First beta (beta.1): compare against release-root tag (all changes since last RC)
+    # - Subsequent betas (beta.2+): compare against previous beta tag (incremental changes)
+    if [ "${BETA_NUM}" -eq 1 ]; then
+        BETA_RELEASE_ROOT_TAG="release-root/${BETA_MAJOR}.${BETA_MINOR}.${BETA_PATCH}-beta.N"
+        if git rev-parse "${BETA_RELEASE_ROOT_TAG}" >/dev/null 2>&1; then
+            echo "First beta: release notes will compare from ${BETA_RELEASE_ROOT_TAG} to ${BETA_TAG}"
+            RELEASE_NOTES_FROM="${BETA_RELEASE_ROOT_TAG}"
+        else
+            echo "Warning: Release root tag ${BETA_RELEASE_ROOT_TAG} not found"
+            RELEASE_NOTES_FROM=""
+        fi
     else
-        echo "Warning: Release root tag ${BETA_RELEASE_ROOT_TAG} not found"
-        RELEASE_NOTES_FROM=""
+        # For beta.2+, compare against previous beta
+        PREV_BETA_NUM=$((BETA_NUM - 1))
+        PREV_BETA_TAG="${TAG_PREFIX}${BETA_MAJOR}.${BETA_MINOR}.${BETA_PATCH}-beta.${PREV_BETA_NUM}"
+        if git rev-parse "${PREV_BETA_TAG}" >/dev/null 2>&1; then
+            echo "Subsequent beta: release notes will compare from ${PREV_BETA_TAG} to ${BETA_TAG}"
+            RELEASE_NOTES_FROM="${PREV_BETA_TAG}"
+        else
+            echo "Warning: Previous beta tag ${PREV_BETA_TAG} not found"
+            RELEASE_NOTES_FROM=""
+        fi
     fi
 elif [[ "${BRANCH}" =~ ^release/ ]]; then
     # For release branch: compare against last stable tag

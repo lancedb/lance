@@ -3,19 +3,18 @@
 
 use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
-use arrow_array::{cast::AsArray, make_array, Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, cast::AsArray, make_array};
 use arrow_buffer::bit_util;
 use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use log::trace;
-use snafu::location;
 
 use crate::decoder::{ColumnBuffers, PageBuffers};
 use crate::previous::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
 use crate::previous::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
 use crate::{data::DataBlock, previous::encodings::physical::decoder_from_array_encoding};
-use lance_core::{datatypes::Field, Error, Result};
+use lance_core::{Error, Result, datatypes::Field};
 
 use crate::{
     decoder::{
@@ -134,8 +133,7 @@ impl SchedulingJob for PrimitiveFieldSchedulingJob<'_> {
         let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
         trace!(
             "Current range is {:?} and current page has {} rows",
-            range,
-            cur_page.num_rows
+            range, cur_page.num_rows
         );
         // Skip entire pages until we have some overlap with our next range
         while cur_page.num_rows + self.global_row_offset <= range.start {
@@ -290,7 +288,7 @@ struct PrimitiveFieldDecodeTask {
 }
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let block = self
             .physical_decoder
             .decode(self.rows_to_skip, self.rows_to_take)?;
@@ -315,10 +313,12 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
                         .data_type(dict.data_type().clone())
                         .build()?,
                 );
-                return Ok(new_array);
+                return Ok((new_array, 0));
             }
         }
-        Ok(array)
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((array, 0))
     }
 }
 
@@ -343,10 +343,10 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         if self.physical_decoder.as_ref().is_none() {
-            return Err(lance_core::Error::Internal {
-                message: format!("drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited", self.data_type, self.column_index),
-                location: location!(),
-            });
+            return Err(lance_core::Error::internal(format!(
+                "drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited",
+                self.data_type, self.column_index
+            )));
         }
 
         let rows_to_skip = self.rows_drained;
@@ -444,10 +444,10 @@ impl PrimitiveFieldEncoder {
         })
         .map(|res_res| {
             res_res.unwrap_or_else(|err| {
-                Err(Error::Internal {
-                    message: format!("Encoding task failed with error: {:?}", err),
-                    location: location!(),
-                })
+                Err(Error::internal(format!(
+                    "Encoding task failed with error: {:?}",
+                    err
+                )))
             })
         })
         .boxed())

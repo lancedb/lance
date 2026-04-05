@@ -10,8 +10,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use snafu::location;
-
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
@@ -101,10 +99,9 @@ impl TryFrom<&DataType> for JsonDataType {
                 ("struct".to_string(), Some(fields))
             }
             _ => {
-                return Err(Error::Arrow {
-                    message: format!("Json conversion: Unsupported type: {dt}"),
-                    location: location!(),
-                })
+                return Err(Error::arrow(format!(
+                    "Json conversion: Unsupported type: {dt}"
+                )));
             }
         };
 
@@ -142,9 +139,8 @@ impl TryFrom<&JsonDataType> for DataType {
                 let fields = value
                     .fields
                     .as_ref()
-                    .ok_or_else(|| Error::Arrow {
-                        message: "Json conversion: List type requires a field".to_string(),
-                        location: location!(),
+                    .ok_or_else(|| {
+                        Error::arrow("Json conversion: List type requires a field".to_string())
                     })?
                     .iter()
                     .map(Field::try_from)
@@ -154,10 +150,10 @@ impl TryFrom<&JsonDataType> for DataType {
                     "list" => Ok(Self::List(Arc::new(fields[0].clone()))),
                     "large_list" => Ok(Self::LargeList(Arc::new(fields[0].clone()))),
                     "fixed_size_list" => {
-                        let length = value.length.ok_or_else(|| Error::Arrow {
-                            message: "Json conversion: FixedSizeList type requires a length"
-                                .to_string(),
-                            location: location!(),
+                        let length = value.length.ok_or_else(|| {
+                            Error::arrow(
+                                "Json conversion: FixedSizeList type requires a length".to_string(),
+                            )
                         })?;
                         Ok(Self::FixedSizeList(
                             Arc::new(fields[0].clone()),
@@ -169,16 +165,16 @@ impl TryFrom<&JsonDataType> for DataType {
                 }
             }
             "fixed_size_binary" => {
-                let length = value.length.ok_or_else(|| Error::Arrow {
-                    message: "Json conversion: FixedSizeBinary type requires a length".to_string(),
-                    location: location!(),
+                let length = value.length.ok_or_else(|| {
+                    Error::arrow(
+                        "Json conversion: FixedSizeBinary type requires a length".to_string(),
+                    )
                 })?;
                 Ok(Self::FixedSizeBinary(length as i32))
             }
-            _ => Err(Error::Arrow {
-                message: format!("Json conversion: Unsupported type: {value:?}"),
-                location: location!(),
-            }),
+            _ => Err(Error::arrow(format!(
+                "Json conversion: Unsupported type: {value:?}"
+            ))),
         }
     }
 }
@@ -310,7 +306,7 @@ mod test {
     use super::*;
 
     use arrow_schema::TimeUnit;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn assert_type_json_str(dt: DataType, val: Value) {
         assert_eq!(

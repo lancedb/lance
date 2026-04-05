@@ -1,5 +1,15 @@
 # Development
 
+For local development, prefer [uv](https://docs.astral.sh/uv/) to create and manage the Python environment:
+
+```shell
+uv sync --extra tests --extra dev
+```
+
+Add extras such as `benchmarks`, `torch`, or `geo` only when you need them. After the environment is initialized, either activate it or use `uv run ...` for commands.
+
+`uv sync` is not just downloading Python packages here. It also builds the local `pylance` Rust extension as part of the editable environment, so the first run, cache misses, or Rust dependency changes can make it noticeably slow. This is expected; let the build finish instead of interrupting it and switching to a different environment setup.
+
 ## Building the project
 
 This project is built with [maturin](https://github.com/PyO3/maturin).
@@ -7,31 +17,27 @@ This project is built with [maturin](https://github.com/PyO3/maturin).
 It can be built in development mode with:
 
 ```shell
-maturin develop
+uv run maturin develop
 ```
 
 This builds the Rust native module in place. You will need to re-run this
 whenever you change the Rust code. But changing the Python code doesn't require
 re-building.
 
+As with `uv sync`, this may take a while because it is compiling Rust code for the local `pylance` extension. Slow builds are expected here, especially after dependency or toolchain changes.
+
 ## Running tests
 
-To run the tests, first install the test packages:
+To run the tests:
 
 ```shell
-pip install '.[tests]'
-```
-
-then:
-
-```shell
-make test
+uv run make test
 ```
 
 To check the documentation examples, use
 
 ```shell
-make doctest
+uv run make doctest
 ```
 
 ## Formatting and linting
@@ -39,7 +45,7 @@ make doctest
 To run formatters, run:
 
 ```shell
-make format
+uv run make format
 ```
 
 (To run for just Python or just Rust, use `make format-python` or `cargo fmt`.)
@@ -47,7 +53,7 @@ make format
 To run format checker and linters, run:
 
 ```shell
-make lint
+uv run make lint
 ```
 
 (To run for just Python or just Rust, use `make lint-python` or `make lint-rust`.)
@@ -59,7 +65,7 @@ then you can use the pre-commit tool. The project includes a pre-commit config
 file already. First, install the pre-commit tool:
 
 ```shell
-pip install pre-commit
+uv tool install pre-commit
 ```
 
 Then install the hooks:
@@ -98,7 +104,8 @@ benchmarks added there should run in less than 5 seconds.
 Before running benchmarks, you should build pylance in release mode:
 
 ```shell
-maturin develop --profile release-with-debug --extras benchmarks --features datagen
+uv sync --extra tests --extra dev --extra benchmarks
+uv run maturin develop --profile release-with-debug --extras benchmarks --features datagen
 ```
 
 (You can also use `--release` or `--profile release`, but `--profile release-with-debug`
@@ -107,7 +114,7 @@ will provide debug symbols for profiling.)
 Then you can run the benchmarks with
 
 ```shell
-pytest python/benchmarks -m "not slow"
+uv run pytest python/benchmarks -m "not slow"
 ```
 
 Note: the first time you run the benchmarks, they may take a while, since they
@@ -118,7 +125,7 @@ Some benchmarks are especially slow, so they are skipped `-m "not slow"`. To run
 the slow benchmarks, use:
 
 ```shell
-pytest python/benchmarks
+uv run pytest python/benchmarks
 ```
 
 ### Run a particular benchmark
@@ -127,7 +134,7 @@ To filter benchmarks by name, use the usual pytest `-k` flag (this can be a
 substring match, so you don't need to type the full name):
 
 ```shell
-pytest python/benchmarks -k test_ivf_pq_index_search
+uv run pytest python/benchmarks -k test_ivf_pq_index_search
 ```
 
 ### Profile a benchmark
@@ -136,7 +143,7 @@ If you have [cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph)
 installed, you can create a flamegraph of a benchmark by running:
 
 ```shell
-flamegraph -F 100 --no-inline -- $(which python) \
+flamegraph -F 100 --no-inline -- $(uv run which python) \
     -m pytest python/benchmarks \
     --benchmark-min-time=2 \
     -k test_ivf_pq_index_search
@@ -165,12 +172,14 @@ the benchmarks again with `--benchmark-compare`.
 ```shell
 CURRENT_BRANCH=$(git branch --show-current)
 git checkout main
-maturin develop --profile release-with-debug  --features datagen
-pytest --benchmark-save=baseline python/benchmarks -m "not slow"
+uv sync --extra tests --extra dev --extra benchmarks
+uv run maturin develop --profile release-with-debug --features datagen
+uv run pytest --benchmark-save=baseline python/benchmarks -m "not slow"
 COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
 git checkout $CURRENT_BRANCH
-maturin develop --profile release-with-debug  --features datagen
-pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
+uv sync --extra tests --extra dev --extra benchmarks
+uv run maturin develop --profile release-with-debug --features datagen
+uv run pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
 ```
 
 ## Tracing

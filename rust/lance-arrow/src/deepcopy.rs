@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{make_array, Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow_data::{transform::MutableArrayData, ArrayData, ArrayDataBuilder};
+use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
 
 pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
     Buffer::from(buffer.as_slice())
@@ -94,7 +94,7 @@ pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch>
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::sync::Arc;
 
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};

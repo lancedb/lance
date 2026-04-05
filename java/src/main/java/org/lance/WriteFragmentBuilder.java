@@ -13,7 +13,7 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
+import org.lance.namespace.LanceNamespace;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.memory.BufferAllocator;
@@ -37,7 +37,6 @@ import java.util.Map;
  *     .allocator(allocator)
  *     .data(vectorSchemaRoot)
  *     .storageOptions(storageOptions)
- *     .s3CredentialsRefreshOffsetSeconds(10)
  *     .execute();
  * }</pre>
  */
@@ -48,7 +47,8 @@ public class WriteFragmentBuilder {
   private ArrowArrayStream arrowArrayStream;
   private WriteParams writeParams;
   private WriteParams.Builder writeParamsBuilder;
-  private StorageOptionsProvider storageOptionsProvider;
+  private LanceNamespace namespaceClient;
+  private List<String> tableId;
 
   WriteFragmentBuilder() {}
 
@@ -124,28 +124,30 @@ public class WriteFragmentBuilder {
   }
 
   /**
-   * Set the storage options provider for dynamic credential refresh.
+   * Set the namespace client for automatic credential refresh.
    *
-   * @param provider the storage options provider
+   * <p>When provided with `tableId`, a storage options provider will be created automatically to
+   * refresh credentials via the namespace client. Must be provided together with `tableId`. The
+   * caller should provide initial/merged storage options via the `storageOptions` method.
+   *
+   * @param namespaceClient the LanceNamespace client instance
    * @return this builder
    */
-  public WriteFragmentBuilder storageOptionsProvider(StorageOptionsProvider provider) {
-    this.storageOptionsProvider = provider;
+  public WriteFragmentBuilder namespaceClient(LanceNamespace namespaceClient) {
+    this.namespaceClient = namespaceClient;
     return this;
   }
 
   /**
-   * Set the S3 credentials refresh offset in seconds.
+   * Set the table ID for namespace client-based credential refresh.
    *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
+   * <p>Must be provided together with `namespaceClient`.
    *
-   * @param seconds refresh offset in seconds
+   * @param tableId the table identifier (e.g., ["workspace", "table_name"])
    * @return this builder
    */
-  public WriteFragmentBuilder s3CredentialsRefreshOffsetSeconds(long seconds) {
-    ensureWriteParamsBuilder();
-    this.writeParamsBuilder.withS3CredentialsRefreshOffsetSeconds(seconds);
+  public WriteFragmentBuilder tableId(List<String> tableId) {
+    this.tableId = tableId;
     return this;
   }
 
@@ -212,10 +214,10 @@ public class WriteFragmentBuilder {
   /**
    * Set the data storage version.
    *
-   * @param version the data storage version
+   * @param version the data storage version (e.g., "legacy", "stable", "2.0")
    * @return this builder
    */
-  public WriteFragmentBuilder dataStorageVersion(WriteParams.LanceFileVersion version) {
+  public WriteFragmentBuilder dataStorageVersion(String version) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withDataStorageVersion(version);
     return this;
@@ -229,15 +231,17 @@ public class WriteFragmentBuilder {
   public List<FragmentMetadata> execute() {
     validate();
 
-    // Build the write params if builder was used
+    // Build the write params
     WriteParams finalWriteParams = buildWriteParams();
 
+    // Pass namespaceClient and tableId to JNI - Rust will automatically create a
+    // storage options provider when these are non-null for credential refresh
     if (vectorSchemaRoot != null) {
       return Fragment.create(
-          datasetUri, allocator, vectorSchemaRoot, finalWriteParams, storageOptionsProvider);
+          datasetUri, allocator, vectorSchemaRoot, finalWriteParams, namespaceClient, tableId);
     } else {
       return Fragment.create(
-          datasetUri, arrowArrayStream, finalWriteParams, storageOptionsProvider);
+          datasetUri, arrowArrayStream, finalWriteParams, namespaceClient, tableId);
     }
   }
 
@@ -271,5 +275,9 @@ public class WriteFragmentBuilder {
     Preconditions.checkState(
         writeParams == null || writeParamsBuilder == null,
         "Cannot use both writeParams() and individual parameter methods");
+    Preconditions.checkState(
+        (namespaceClient == null && tableId == null)
+            || (namespaceClient != null && tableId != null),
+        "Both 'namespaceClient' and 'tableId' must be provided together");
   }
 }

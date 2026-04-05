@@ -4,13 +4,11 @@
 use core::panic;
 use std::cmp::{max, min};
 
+use super::utils::get_sub_vector_centroids;
 use lance_core::assume_eq;
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::distance::{Dot, L2, dot_distance_batch, l2::L2Prepared, l2_distance_batch};
 use lance_linalg::simd::u8::u8x16;
-use lance_linalg::simd::{Shuffle, SIMD};
-use lance_table::utils::LanceIteratorExtension;
-
-use super::{num_centroids, utils::get_sub_vector_centroids};
+use lance_linalg::simd::{SIMD, Shuffle};
 
 // for quantizing the distance table, we need to know the max possible distance,
 // so we perform a flat search on the first `FLAT_NUM_4BIT_PQ` rows.
@@ -43,16 +41,32 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
-    query
-        .chunks_exact(sub_vector_length)
-        .enumerate()
-        .flat_map(|(i, sub_vec)| {
-            let subvec_centroids =
-                get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-            l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
-        })
-        .exact_size(num_sub_vectors * num_centroids)
-        .collect()
+    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
+    for (i, sub_vec) in query.chunks_exact(sub_vector_length).enumerate() {
+        let subvec_centroids =
+            get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
+        result.extend(l2_distance_batch(
+            sub_vec,
+            subvec_centroids,
+            sub_vector_length,
+        ));
+    }
+    result
+}
+
+/// Build an L2 distance table using pre-prepared [L2Prepared] per sub-vector.
+///
+/// This avoids the per-call AoS→SoA transpose by reusing targets that were
+/// transposed once at `ProductQuantizer` construction time.
+pub fn build_distance_table_l2_prepared(l2_targets: &[L2Prepared], query: &[f32]) -> Vec<f32> {
+    let sub_dim = query.len() / l2_targets.len();
+    let num_targets = l2_targets[0].num_targets();
+
+    let mut result = vec![0.0f32; l2_targets.len() * num_targets];
+    for (i, sub_vec) in query.chunks_exact(sub_dim).enumerate() {
+        l2_targets[i].distances_into(sub_vec, &mut result[i * num_targets..][..num_targets]);
+    }
+    result
 }
 
 /// Build a Distance Table from the query to each PQ centroid
@@ -79,16 +93,17 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
-    query
-        .chunks_exact(sub_vector_length)
-        .enumerate()
-        .flat_map(|(i, sub_vec)| {
-            let subvec_centroids =
-                get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-            dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
-        })
-        .exact_size(num_sub_vectors * num_centroids)
-        .collect()
+    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
+    for (i, sub_vec) in query.chunks_exact(sub_vector_length).enumerate() {
+        let subvec_centroids =
+            get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
+        result.extend(dot_distance_batch(
+            sub_vec,
+            subvec_centroids,
+            sub_vector_length,
+        ));
+    }
+    result
 }
 
 /// Compute L2 distance from the query to all code.
@@ -291,14 +306,14 @@ fn quantize_distance_table(distance_table: &[f32], qmax: f32) -> (f32, Vec<u8>) 
 /// - C: the tile size of code-book to run at once.
 /// - V: the tile size of PQ code to run at once.
 ///
-#[allow(dead_code)]
+#[cfg(test)]
 fn compute_l2_distance_without_transposing<const C: usize, const V: usize>(
     distance_table: &[f32],
     num_bits: u32,
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
-    let num_centroids = num_centroids(num_bits);
+    let num_centroids = super::num_centroids(num_bits);
     let iter = code.chunks_exact(num_sub_vectors * V);
     let distances = iter.clone().flat_map(|c| {
         let mut sums = [0.0_f32; V];
