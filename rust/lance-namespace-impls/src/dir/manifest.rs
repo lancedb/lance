@@ -481,7 +481,7 @@ impl ManifestNamespace {
             base_url.set_path(&format!("{}/", base_url.path()));
         }
 
-        let full_url = base_url.join(relative_location).map_err(|e| {
+        let mut full_url = base_url.join(relative_location).map_err(|e| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: format!(
                     "Failed to join URI '{}' with '{}': {:?}",
@@ -489,6 +489,11 @@ impl ManifestNamespace {
                 ),
             })
         })?;
+
+        // Clear any query string to avoid trailing "?" in the URL.
+        // Use set_query(None) instead of set_query("") because the latter
+        // would still add a trailing '?' to the URL when serialized.
+        full_url.set_query(None);
 
         Ok(full_url.to_string())
     }
@@ -3471,6 +3476,25 @@ mod tests {
         assert_eq!(
             trailing_slash_result, "s3://bucket/path/subdir/table.lance",
             "URL with existing trailing slash should still work"
+        );
+
+        // Test that URLs with empty query string don't include trailing "?"
+        // This is important because URL::to_string() can add "?" for empty queries
+        let empty_query_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path?", "table.lance").unwrap();
+        assert_eq!(
+            empty_query_result, "s3://bucket/path/table.lance",
+            "URL with empty query string should not include trailing '?'"
+        );
+
+        // Test that URLs with actual query parameters have them stripped
+        // (query parameters are not meaningful for storage paths)
+        let query_param_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path?param=value", "table.lance")
+                .unwrap();
+        assert_eq!(
+            query_param_result, "s3://bucket/path/table.lance",
+            "URL with query parameters should have them stripped"
         );
     }
 
