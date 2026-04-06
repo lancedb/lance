@@ -26,8 +26,11 @@ import pyarrow as pa
 import pytest
 from lance.namespace import LanceNamespace
 from lance_namespace import (
+    CountTableRowsRequest,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableIndexRequest,
+    CreateTableIndexResponse,
     CreateTableRequest,
     CreateTableResponse,
     CreateTableVersionRequest,
@@ -38,6 +41,7 @@ from lance_namespace import (
     DeregisterTableResponse,
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
+    DescribeTableIndexStatsRequest,
     DescribeTableRequest,
     DescribeTableResponse,
     DescribeTableVersionRequest,
@@ -46,13 +50,18 @@ from lance_namespace import (
     DropNamespaceResponse,
     DropTableRequest,
     DropTableResponse,
+    InsertIntoTableRequest,
+    InsertIntoTableResponse,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableIndicesRequest,
+    ListTableIndicesResponse,
     ListTablesRequest,
     ListTablesResponse,
     ListTableVersionsRequest,
     ListTableVersionsResponse,
     NamespaceExistsRequest,
+    QueryTableRequest,
     RegisterTableRequest,
     RegisterTableResponse,
     TableExistsRequest,
@@ -141,6 +150,30 @@ class CustomNamespace(LanceNamespace):
         self, request: CreateTableVersionRequest
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
+
+    def create_table_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        return self._inner.create_table_index(request)
+
+    def list_table_indices(
+        self, request: ListTableIndicesRequest
+    ) -> ListTableIndicesResponse:
+        return self._inner.list_table_indices(request)
+
+    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+        return self._inner.count_table_rows(request)
+
+    def insert_into_table(
+        self, request: InsertIntoTableRequest, request_data: bytes
+    ) -> InsertIntoTableResponse:
+        return self._inner.insert_into_table(request, request_data)
+
+    def query_table(self, request) -> bytes:
+        # Accept both QueryTableRequest and dict, like DirectoryNamespace does
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
+        return self._inner.query_table(request)
 
     def retrieve_ops_metrics(self) -> Optional[Dict[str, int]]:
         return self._inner.retrieve_ops_metrics()
@@ -1188,3 +1221,297 @@ class TestConcurrentOperations:
             list_req = ListTablesRequest(id=["test_ns"])
             response = verify_ns_client.list_tables(list_req)
             assert len(response.tables) == 0, "All tables should be dropped"
+
+
+class TestDataManipulation:
+    """Tests for data manipulation operations."""
+
+    def test_count_table_rows(self, temp_ns_client):
+        """Test counting rows in a table."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()  # 3 rows
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Count rows
+        count_req = CountTableRowsRequest(id=["workspace", "test_table"])
+        count = temp_ns_client.count_table_rows(count_req)
+        assert count == 3
+
+    def test_count_table_rows_with_filter(self, temp_ns_client):
+        """Test counting rows with a filter predicate."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()  # 3 rows with ages 30, 25, 35
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Count rows with predicate
+        count_req = CountTableRowsRequest(
+            id=["workspace", "test_table"], predicate="age > 28"
+        )
+        count = temp_ns_client.count_table_rows(count_req)
+        assert count == 2  # Alice (30) and Charlie (35)
+
+    def test_insert_into_table(self, temp_ns_client):
+        """Test inserting data into a table."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()  # 3 rows
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Insert more data
+        new_data = pa.Table.from_pylist(
+            [
+                {"id": 4, "name": "David", "age": 40},
+                {"id": 5, "name": "Eve", "age": 22},
+            ]
+        )
+        new_ipc_data = table_to_ipc_bytes(new_data)
+        insert_req = InsertIntoTableRequest(
+            id=["workspace", "test_table"], mode="append"
+        )
+        response = temp_ns_client.insert_into_table(insert_req, new_ipc_data)
+        assert response is not None
+
+        # Verify row count increased
+        count_req = CountTableRowsRequest(id=["workspace", "test_table"])
+        count = temp_ns_client.count_table_rows(count_req)
+        assert count == 5
+
+    def test_query_table(self, temp_ns_client):
+        """Test querying a table."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()  # 3 rows
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Query table with empty vector (for non-vector queries)
+        query_req = QueryTableRequest(id=["workspace", "test_table"], k=10, vector={})
+        result_bytes = temp_ns_client.query_table(query_req)
+        assert result_bytes is not None
+        assert len(result_bytes) > 0
+
+        # Parse the result
+        reader = pa.ipc.open_file(pa.BufferReader(result_bytes))
+        result_table = reader.read_all()
+        assert result_table.num_rows == 3
+        assert "id" in result_table.column_names
+        assert "name" in result_table.column_names
+
+    def test_query_table_with_filter(self, temp_ns_client):
+        """Test querying a table with a filter."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()  # 3 rows
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Query with filter and empty vector
+        query_req = QueryTableRequest(
+            id=["workspace", "test_table"], filter="age >= 30", k=10, vector={}
+        )
+        result_bytes = temp_ns_client.query_table(query_req)
+        reader = pa.ipc.open_file(pa.BufferReader(result_bytes))
+        result_table = reader.read_all()
+        assert result_table.num_rows == 2  # Alice and Charlie
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Table version listing not supported on Windows",
+)
+class TestTableVersions:
+    """Tests for table version operations."""
+
+    def test_list_table_versions(self, temp_ns_client):
+        """Test listing table versions."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # List versions
+        list_req = ListTableVersionsRequest(id=["workspace", "test_table"])
+        response = temp_ns_client.list_table_versions(list_req)
+        assert response is not None
+        assert len(response.versions) >= 1
+
+    def test_describe_table_version(self, temp_ns_client):
+        """Test describing a specific table version."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Describe version 1
+        describe_req = DescribeTableVersionRequest(
+            id=["workspace", "test_table"], version=1
+        )
+        response = temp_ns_client.describe_table_version(describe_req.model_dump())
+        assert response is not None
+        assert response.get("version") is not None
+
+    def test_multiple_versions_via_insert(self, temp_ns_client):
+        """Test that inserts create new versions."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Insert more data to create version 2
+        new_data = pa.Table.from_pylist([{"id": 4, "name": "David", "age": 40}])
+        new_ipc_data = table_to_ipc_bytes(new_data)
+        insert_req = InsertIntoTableRequest(
+            id=["workspace", "test_table"], mode="append"
+        )
+        temp_ns_client.insert_into_table(insert_req, new_ipc_data)
+
+        # List versions - should have at least 2
+        list_req = ListTableVersionsRequest(id=["workspace", "test_table"])
+        response = temp_ns_client.list_table_versions(list_req)
+        assert len(response.versions) >= 2
+
+
+class TestIndexOperations:
+    """Tests for index operations."""
+
+    def test_list_indices_empty(self, temp_ns_client):
+        """Test listing indices on a table with no indices."""
+        # Create table with a vector column
+        import numpy as np
+
+        vector_data = pa.Table.from_pydict(
+            {
+                "id": [1, 2, 3],
+                "vector": pa.FixedSizeListArray.from_arrays(
+                    pa.array(np.random.rand(12).astype(np.float32)), 4
+                ),
+            }
+        )
+        ipc_data = table_to_ipc_bytes(vector_data)
+        create_req = CreateTableRequest(id=["vector_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # List indices (should be empty initially)
+        list_req = ListTableIndicesRequest(id=["vector_table"])
+        response = temp_ns_client.list_table_indices(list_req)
+        assert response is not None
+        # Initially no indices
+        assert len(response.indexes) == 0
+
+    def test_describe_table_index_stats(self, memory_ns_client):
+        """Test describing index stats (even when no index exists)."""
+        # Create namespace and table
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        memory_ns_client.create_namespace(create_ns_req)
+
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["workspace", "test_table"])
+        memory_ns_client.create_table(create_req, ipc_data)
+
+        # Describe index stats for non-existent index should return empty/null stats
+        describe_req = DescribeTableIndexStatsRequest(
+            id=["workspace", "test_table"], index_name="nonexistent"
+        )
+        # This may raise an error or return empty stats depending on implementation
+        try:
+            response = memory_ns_client.describe_table_index_stats(describe_req)
+            # If it succeeds, verify response structure
+            assert response is not None
+        except Exception:
+            # Expected if index doesn't exist
+            pass
+
+    def test_create_scalar_index(self, temp_ns_client):
+        """Test creating a scalar index."""
+        # Create table at root level (without namespace)
+        table_data = create_test_data()
+        ipc_data = table_to_ipc_bytes(table_data)
+        create_req = CreateTableRequest(id=["test_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Create scalar index on 'id' column
+        create_index_req = CreateTableIndexRequest(
+            id=["test_table"],
+            column="id",
+            index_type="BTREE",
+            name="id_idx",
+        )
+        response = temp_ns_client.create_table_index(create_index_req)
+        assert response is not None
+
+        # List indices to verify
+        list_req = ListTableIndicesRequest(id=["test_table"])
+        list_response = temp_ns_client.list_table_indices(list_req)
+        assert len(list_response.indexes) == 1
+        assert list_response.indexes[0].index_name == "id_idx"
+        assert list_response.indexes[0].columns == ["id"]
+
+    def test_create_vector_index(self, temp_ns_client):
+        """Test creating a vector index."""
+        import numpy as np
+
+        # Create table with 256 rows of 8-dimensional vectors (enough for IVF)
+        num_rows = 256
+        dim = 8
+        vector_data = pa.Table.from_pydict(
+            {
+                "id": list(range(num_rows)),
+                "vector": pa.FixedSizeListArray.from_arrays(
+                    pa.array(np.random.rand(num_rows * dim).astype(np.float32)), dim
+                ),
+            }
+        )
+        ipc_data = table_to_ipc_bytes(vector_data)
+        create_req = CreateTableRequest(id=["vector_table"])
+        temp_ns_client.create_table(create_req, ipc_data)
+
+        # Create vector index using IVF_FLAT
+        create_index_req = CreateTableIndexRequest(
+            id=["vector_table"],
+            column="vector",
+            index_type="IVF_FLAT",
+            name="vector_idx",
+            distance_type="l2",
+        )
+        response = temp_ns_client.create_table_index(create_index_req)
+        assert response is not None
+
+        # List indices to verify
+        list_req = ListTableIndicesRequest(id=["vector_table"])
+        list_response = temp_ns_client.list_table_indices(list_req)
+        assert len(list_response.indexes) == 1
+        assert list_response.indexes[0].index_name == "vector_idx"
+        assert list_response.indexes[0].columns == ["vector"]

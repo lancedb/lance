@@ -29,7 +29,7 @@ resolver = "3"
 
 
 [workspace.package]
-version = "5.0.0-beta.4"
+version = "5.0.0-beta.5"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -53,24 +53,24 @@ rust-version = "1.91.0"
 
 [workspace.dependencies]
 libc = "0.2.176"
-lance = { version = "=5.0.0-beta.4", path = "./rust/lance", default-features = false }
-lance-arrow = { version = "=5.0.0-beta.4", path = "./rust/lance-arrow" }
-lance-core = { version = "=5.0.0-beta.4", path = "./rust/lance-core" }
-lance-datafusion = { version = "=5.0.0-beta.4", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=5.0.0-beta.4", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=5.0.0-beta.4", path = "./rust/lance-encoding" }
-lance-file = { version = "=5.0.0-beta.4", path = "./rust/lance-file" }
-lance-geo = { version = "=5.0.0-beta.4", path = "./rust/lance-geo" }
-lance-index = { version = "=5.0.0-beta.4", path = "./rust/lance-index" }
-lance-io = { version = "=5.0.0-beta.4", path = "./rust/lance-io", default-features = false }
-lance-linalg = { version = "=5.0.0-beta.4", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=5.0.0-beta.4", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=5.0.0-beta.4", path = "./rust/lance-namespace-impls" }
-lance-namespace-datafusion = { version = "=5.0.0-beta.4", path = "./rust/lance-namespace-datafusion" }
+lance = { version = "=5.0.0-beta.5", path = "./rust/lance", default-features = false }
+lance-arrow = { version = "=5.0.0-beta.5", path = "./rust/lance-arrow" }
+lance-core = { version = "=5.0.0-beta.5", path = "./rust/lance-core" }
+lance-datafusion = { version = "=5.0.0-beta.5", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=5.0.0-beta.5", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=5.0.0-beta.5", path = "./rust/lance-encoding" }
+lance-file = { version = "=5.0.0-beta.5", path = "./rust/lance-file" }
+lance-geo = { version = "=5.0.0-beta.5", path = "./rust/lance-geo" }
+lance-index = { version = "=5.0.0-beta.5", path = "./rust/lance-index" }
+lance-io = { version = "=5.0.0-beta.5", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=5.0.0-beta.5", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=5.0.0-beta.5", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=5.0.0-beta.5", path = "./rust/lance-namespace-impls" }
+lance-namespace-datafusion = { version = "=5.0.0-beta.5", path = "./rust/lance-namespace-datafusion" }
 lance-namespace-reqwest-client = "0.6.1"
-lance-table = { version = "=5.0.0-beta.4", path = "./rust/lance-table" }
-lance-test-macros = { version = "=5.0.0-beta.4", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=5.0.0-beta.4", path = "./rust/lance-testing" }
+lance-table = { version = "=5.0.0-beta.5", path = "./rust/lance-table" }
+lance-test-macros = { version = "=5.0.0-beta.5", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=5.0.0-beta.5", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "57.0.0", optional = false, features = ["prettyprint"] }
@@ -97,7 +97,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-lance-bitpacking = { version = "=5.0.0-beta.4", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=5.0.0-beta.5", path = "./rust/compression/bitpacking" }
 bitvec = "1"
 bytes = "1.11.1"
 byteorder = "1.5"
@@ -138,7 +138,7 @@ deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=5.0.0-beta.4", path = "./rust/compression/fsst" }
+fsst = { version = "=5.0.0-beta.5", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.7"
 geoarrow-schema = "0.7"
