@@ -659,9 +659,7 @@ def test_blob_column_sources_rejects_unmappable_transform(
     )
     snapshot = {"_columns_with_transform": (("video", "concat(blob, blob)"),)}
 
-    with pytest.raises(
-        NotImplementedError, match="direct blob column references"
-    ):
+    with pytest.raises(NotImplementedError, match="direct blob column references"):
         lance_dataset_module._blob_column_sources(
             projected_schema, snapshot, dataset_for_pandas_blob_tests.schema
         )

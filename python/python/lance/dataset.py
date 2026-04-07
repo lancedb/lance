@@ -117,9 +117,7 @@ def _normalize_blob_pandas_mode(
     blob_mode: str,
 ) -> Literal["lazy", "bytes", "descriptions"]:
     if blob_mode not in {"lazy", "bytes", _BLOB_DESC_PANDAS_MODE}:
-        raise ValueError(
-            "blob_mode must be one of: 'lazy', 'bytes', 'descriptions'"
-        )
+        raise ValueError("blob_mode must be one of: 'lazy', 'bytes', 'descriptions'")
     return cast("Literal['lazy', 'bytes', 'descriptions']", blob_mode)
 
 
@@ -150,11 +148,7 @@ def _blob_column_sources(
     if not columns_with_transform:
         return {name: name for name in output_blob_columns}
 
-    source_is_blob = {
-        field.name
-        for field in dataset_schema
-        if _is_blob_field(field)
-    }
+    source_is_blob = {field.name for field in dataset_schema if _is_blob_field(field)}
     for name in output_blob_columns:
         expr = dict(columns_with_transform).get(name)
         source = _simple_source_column(expr) if expr is not None else name
@@ -168,6 +162,12 @@ def _blob_column_sources(
 
 
 def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
+    def snapshot_value(value: Any) -> Any:
+        try:
+            return copy.deepcopy(value)
+        except (TypeError, AttributeError):
+            return value
+
     return {
         "_limit": builder._limit,
         "_filter": builder._filter,
@@ -183,7 +183,7 @@ def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
             if builder._columns_with_transform is not None
             else None
         ),
-        "_nearest": copy.deepcopy(builder._nearest),
+        "_nearest": snapshot_value(builder._nearest),
         "_batch_size": builder._batch_size,
         "_io_buffer_size": builder._io_buffer_size,
         "_batch_readahead": builder._batch_readahead,
@@ -196,7 +196,7 @@ def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
         "_with_row_address": builder._with_row_address,
         "_use_stats": builder._use_stats,
         "_fast_search": builder._fast_search,
-        "_full_text_query": copy.deepcopy(builder._full_text_query),
+        "_full_text_query": snapshot_value(builder._full_text_query),
         "_use_scalar_index": builder._use_scalar_index,
         "_include_deleted_rows": builder._include_deleted_rows,
         "_scan_stats_callback": builder._scan_stats_callback,
@@ -5662,9 +5662,7 @@ class LanceScanner(pa.dataset.Scanner):
     def to_batches(self) -> Iterator[RecordBatch]:
         yield from self.to_reader()
 
-    def to_pandas(
-        self, *, blob_mode: str = "lazy", **kwargs: Any
-    ) -> "pd.DataFrame":
+    def to_pandas(self, *, blob_mode: str = "lazy", **kwargs: Any) -> "pd.DataFrame":
         blob_mode = _normalize_blob_pandas_mode(blob_mode)
         schema = self.projected_schema
         blob_columns = _blob_columns_in_schema(schema)
@@ -5687,9 +5685,7 @@ class LanceScanner(pa.dataset.Scanner):
             raise RuntimeError("blob-aware to_pandas expected _rowaddr in scan results")
 
         row_addrs = table.column(_BLOB_ROW_ADDR_COLUMN).to_pylist()
-        columns_to_drop = [
-            name for name in blob_columns if name in table.schema.names
-        ]
+        columns_to_drop = [name for name in blob_columns if name in table.schema.names]
         if not requested_rowaddr:
             columns_to_drop.append(_BLOB_ROW_ADDR_COLUMN)
         non_blob_table = (

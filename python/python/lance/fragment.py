@@ -607,7 +607,7 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
-        ) -> pa.Table:
+    ) -> pa.Table:
         return self.scanner(
             columns=columns,
             filter=filter,
