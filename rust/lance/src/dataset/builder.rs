@@ -51,6 +51,8 @@ pub struct DatasetBuilder {
     file_reader_options: Option<FileReaderOptions>,
     /// Storage options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
+    /// Runtime-only per-base storage options keyed by base path URI.
+    base_storage_options_overrides: HashMap<String, HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for DatasetBuilder {
@@ -67,6 +69,10 @@ impl std::fmt::Debug for DatasetBuilder {
             .field(
                 "storage_options_override",
                 &self.storage_options_override.is_some(),
+            )
+            .field(
+                "base_storage_options_overrides",
+                &!self.base_storage_options_overrides.is_empty(),
             )
             .finish()
     }
@@ -86,6 +92,7 @@ impl DatasetBuilder {
             manifest: None,
             file_reader_options: None,
             storage_options_override: None,
+            base_storage_options_overrides: HashMap::new(),
         }
     }
 
@@ -448,6 +455,20 @@ impl DatasetBuilder {
         self
     }
 
+    /// Set runtime-only storage options for a specific registered base path.
+    ///
+    /// These options are not persisted in the manifest. They are applied whenever
+    /// the dataset resolves an object store for the given `BasePath.path`.
+    pub fn with_base_storage_options(
+        mut self,
+        base_path: impl AsRef<str>,
+        storage_options: HashMap<String, String>,
+    ) -> Self {
+        self.base_storage_options_overrides
+            .insert(base_path.as_ref().to_string(), storage_options);
+        self
+    }
+
     /// Set options based on [ReadParams].
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
@@ -566,30 +587,41 @@ impl DatasetBuilder {
         }
     }
 
+    // Runtime per-base overrides are supplied as storage options, but the dataset
+    // ultimately resolves object stores from ObjectStoreParams. Normalize once in
+    // the builder so reads only need to look up the prepared params by base path.
+    fn merge_store_params_with_storage_options(
+        params: &ObjectStoreParams,
+        override_options: &HashMap<String, String>,
+    ) -> ObjectStoreParams {
+        if override_options.is_empty() {
+            return params.clone();
+        }
+
+        let mut merged_params = params.clone();
+        let mut merged_options = merged_params.storage_options().cloned().unwrap_or_default();
+        merged_options.extend(override_options.clone());
+
+        let storage_options_accessor = match merged_params
+            .storage_options_accessor
+            .as_ref()
+            .and_then(|accessor| accessor.provider().cloned())
+        {
+            Some(provider) => Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                merged_options,
+                provider,
+            )),
+            None => Arc::new(StorageOptionsAccessor::with_static_options(merged_options)),
+        };
+        merged_params.storage_options_accessor = Some(storage_options_accessor);
+        merged_params
+    }
+
     async fn load_impl(mut self) -> Result<Dataset> {
         // Apply storage_options_override to merge namespace client options with any existing accessor
         if let Some(override_opts) = self.storage_options_override.take() {
-            // Get existing options and merge
-            let mut merged_opts = self.options.storage_options().cloned().unwrap_or_default();
-            // Override with namespace client storage options - they take precedence
-            merged_opts.extend(override_opts);
-
-            // Update accessor with merged options
-            if let Some(accessor) = &self.options.storage_options_accessor {
-                if let Some(provider) = accessor.provider().cloned() {
-                    self.options.storage_options_accessor = Some(Arc::new(
-                        StorageOptionsAccessor::with_initial_and_provider(merged_opts, provider),
-                    ));
-                } else {
-                    self.options.storage_options_accessor = Some(Arc::new(
-                        StorageOptionsAccessor::with_static_options(merged_opts),
-                    ));
-                }
-            } else {
-                self.options.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(merged_opts),
-                ));
-            }
+            self.options =
+                Self::merge_store_params_with_storage_options(&self.options, &override_opts);
         }
 
         let index_cache_backend = self.index_cache_backend.take();
@@ -617,6 +649,22 @@ impl DatasetBuilder {
 
         let file_reader_options = self.file_reader_options.clone();
         let store_params = self.options.clone();
+        let base_store_params = (!self.base_storage_options_overrides.is_empty()).then(|| {
+            Arc::new(
+                self.base_storage_options_overrides
+                    .iter()
+                    .map(|(base_path, storage_options)| {
+                        (
+                            base_path.clone(),
+                            Self::merge_store_params_with_storage_options(
+                                &store_params,
+                                storage_options,
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+            )
+        });
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         // Two cases that need to check out after loading the manifest:
@@ -669,6 +717,7 @@ impl DatasetBuilder {
             base_path,
             commit_handler,
             Some(store_params),
+            base_store_params,
         )
         .await?;
 
@@ -706,6 +755,7 @@ impl DatasetBuilder {
         base_path: Path,
         commit_handler: Arc<dyn CommitHandler>,
         store_params: Option<ObjectStoreParams>,
+        base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
@@ -768,6 +818,7 @@ impl DatasetBuilder {
             commit_handler,
             file_reader_options,
             store_params,
+            base_store_params,
         )
     }
 }

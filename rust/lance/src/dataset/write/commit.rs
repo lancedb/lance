@@ -404,6 +404,7 @@ impl<'a> CommitBuilder<'a> {
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
+                    base_store_params: None,
                 })
             }
         }

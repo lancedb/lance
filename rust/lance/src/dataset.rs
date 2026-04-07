@@ -177,6 +177,8 @@ pub struct Dataset {
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
+    /// Optional runtime-only object store parameters keyed by base path URI.
+    pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -186,6 +188,7 @@ impl std::fmt::Debug for Dataset {
             .field("base", &self.base)
             .field("version", &self.manifest.version)
             .field("cache_num_items", &self.session.approx_num_items())
+            .field("base_store_params", &self.base_store_params.is_some())
             .finish()
     }
 }
@@ -577,6 +580,7 @@ impl Dataset {
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
             self.store_params.as_deref().cloned(),
+            self.base_store_params.clone(),
         )
     }
 
@@ -695,6 +699,7 @@ impl Dataset {
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
         store_params: Option<ObjectStoreParams>,
+        base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Self> {
         let refs = Refs::new(
             object_store.clone(),
@@ -722,6 +727,7 @@ impl Dataset {
             index_cache,
             file_reader_options,
             store_params: store_params.map(Box::new),
+            base_store_params,
         })
     }
 
@@ -1631,6 +1637,23 @@ impl Dataset {
         cloned
     }
 
+    fn store_params_for_base(
+        &self,
+        base_path: Option<&lance_table::format::BasePath>,
+    ) -> ObjectStoreParams {
+        // Most datasets only use the dataset-level store params. When a base path
+        // has a runtime override, builder precomputes the merged ObjectStoreParams
+        // for that exact `BasePath.path` so reads can do a single lookup here.
+        base_path
+            .and_then(|base_path| {
+                self.base_store_params
+                    .as_ref()
+                    .and_then(|params| params.get(&base_path.path))
+            })
+            .cloned()
+            .unwrap_or_else(|| self.store_params.as_deref().cloned().unwrap_or_default())
+    }
+
     /// Returns the initial storage options used when opening this dataset, if any.
     ///
     /// This returns the static initial options without triggering any refresh.
@@ -1739,11 +1762,12 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
+        let store_params = self.store_params_for_base(Some(base_path));
 
         let (store, _) = ObjectStore::from_uri_and_params(
             self.session.store_registry(),
             &base_path.path,
-            &self.store_params.as_deref().cloned().unwrap_or_default(),
+            &store_params,
         )
         .await?;
 
@@ -2564,6 +2588,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
                         dataset.store_params.as_deref().cloned(),
+                        dataset.base_store_params.clone(),
                     )?;
                     let loaded =
                         Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
@@ -2595,6 +2620,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
                 dataset.store_params.as_deref().cloned(),
+                dataset.base_store_params.clone(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
