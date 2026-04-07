@@ -812,6 +812,7 @@ impl Dataset {
         offset: Option<i64>,
         nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
+        batch_size_bytes: Option<u64>,
         io_buffer_size: Option<u64>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
@@ -955,6 +956,9 @@ impl Dataset {
 
         if let Some(batch_size) = batch_size {
             scanner.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
         }
         if let Some(io_buffer_size) = io_buffer_size {
             scanner.io_buffer_size(io_buffer_size);

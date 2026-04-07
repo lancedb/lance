@@ -719,6 +719,10 @@ pub struct Scanner {
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
+    /// If set, the scanner will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    batch_size_bytes: Option<u64>,
+
     /// Number of batches to prefetch
     batch_readahead: usize,
 
@@ -989,6 +993,7 @@ impl Scanner {
             filter: LanceFilter::default(),
             full_text_query: None,
             batch_size: None,
+            batch_size_bytes: None,
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
@@ -1264,6 +1269,15 @@ impl Scanner {
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the target batch size in bytes.
+    ///
+    /// When set, the scanner will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
         self
     }
 
@@ -4003,6 +4017,7 @@ impl Scanner {
             with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
+            batch_size_bytes: self.batch_size_bytes,
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
@@ -4020,6 +4035,23 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("pushdown_scan");
 
+        let file_reader_options = self
+            .file_reader_options
+            .clone()
+            .or_else(|| self.dataset.file_reader_options.clone())
+            .map(|mut opts| {
+                if opts.batch_size_bytes.is_none() {
+                    opts.batch_size_bytes = self.batch_size_bytes;
+                }
+                opts
+            })
+            .or_else(|| {
+                self.batch_size_bytes.map(|v| FileReaderOptions {
+                    batch_size_bytes: Some(v),
+                    ..Default::default()
+                })
+            });
+
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self
@@ -4029,10 +4061,7 @@ impl Scanner {
             with_row_address: self.projection_plan.physical_projection.with_row_addr,
             make_deletions_null,
             ordered_output: self.ordered,
-            file_reader_options: self
-                .file_reader_options
-                .clone()
-                .or_else(|| self.dataset.file_reader_options.clone()),
+            file_reader_options,
         };
 
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
