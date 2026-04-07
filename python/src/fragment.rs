@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Write as _;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -25,6 +26,9 @@ use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance_core::datatypes::BlobHandling;
+use lance_file::reader::FileReader;
+use lance_file::version::LanceFileVersion;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
@@ -94,6 +98,145 @@ impl FileFragment {
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
         Ok(PyLance(metadata))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (dataset, path, base_id=None))]
+    fn create_data_file(
+        dataset: &Dataset,
+        path: &str,
+        base_id: Option<u32>,
+    ) -> PyResult<PyLance<DataFile>> {
+        rt().block_on(None, async {
+            // Resolve the full file path
+            let data_dir = if let Some(base_id) = base_id {
+                let manifest = dataset.ds.manifest();
+                let base_path = manifest.base_paths.get(&base_id).ok_or_else(|| {
+                    PyValueError::new_err(format!("base_path id {} not found", base_id))
+                })?;
+                let path = base_path
+                    .extract_path(dataset.ds.session().store_registry())
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                if base_path.is_dataset_root {
+                    path.child("data")
+                } else {
+                    path
+                }
+            } else {
+                dataset.ds.data_dir()
+            };
+            let filepath = data_dir.child(path);
+
+            // Get file size
+            let file_size = dataset
+                .ds
+                .object_store()
+                .size(&filepath)
+                .await
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Error getting file size for {}: {}", filepath, e))
+                })?;
+
+            // Read file metadata
+            let scheduler = ScanScheduler::new(
+                dataset.ds.object_store.clone(),
+                SchedulerConfig::new(2 * 1024 * 1024 * 1024),
+            );
+            let file = scheduler
+                .open_file(&filepath, &CachedFileSize::unknown())
+                .await
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Error opening file {}: {}", filepath, e))
+                })?;
+            let file_metadata = FileReader::read_all_metadata(&file).await.map_err(|e| {
+                PyIOError::new_err(format!("Error reading file metadata for {}: {}", filepath, e))
+            })?;
+
+            let file_version = LanceFileVersion::try_from_major_minor(
+                file_metadata.major_version as u32,
+                file_metadata.minor_version as u32,
+            )
+            .map_err(|e| {
+                PyValueError::new_err(format!("Unsupported file version: {}", e))
+            })?;
+
+            // Get top-level column names from file schema in file order
+            let column_names: Vec<String> = file_metadata
+                .file_schema
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect();
+
+            // Project dataset schema by file column names to get dataset field IDs
+            let column_name_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+            let projected_ds_schema = dataset
+                .ds
+                .schema()
+                .project(&column_name_refs)
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "Error matching file columns to dataset schema: {}",
+                        e
+                    ))
+                })?;
+
+            // Walk both schemas in parallel to build fields and column_indices
+            let is_structural = file_version >= LanceFileVersion::V2_1;
+            let ds_fields: Vec<_> = projected_ds_schema.fields_pre_order().collect();
+            let file_fields: Vec<_> = file_metadata.file_schema.fields_pre_order().collect();
+
+            if ds_fields.len() != file_fields.len() {
+                return Err(PyValueError::new_err(format!(
+                    "Schema mismatch: dataset projection has {} fields but file has {} fields",
+                    ds_fields.len(),
+                    file_fields.len()
+                )));
+            }
+
+            let mut fields = Vec::new();
+            let mut column_indices = Vec::new();
+            let mut curr_column_idx: i32 = 0;
+            let mut packed_struct_fields_num: usize = 0;
+
+            for (ds_field, file_field) in ds_fields.iter().zip(file_fields.iter()) {
+                if ds_field.name != file_field.name {
+                    return Err(PyValueError::new_err(format!(
+                        "Schema mismatch: expected field '{}' but file has '{}'",
+                        ds_field.name, file_field.name
+                    )));
+                }
+
+                if packed_struct_fields_num > 0 {
+                    packed_struct_fields_num -= 1;
+                    continue;
+                }
+
+                if file_field.is_packed_struct() {
+                    fields.push(ds_field.id);
+                    column_indices.push(curr_column_idx);
+                    curr_column_idx += 1;
+                    packed_struct_fields_num = file_field.children.len();
+                } else if file_field.children.is_empty() || !is_structural {
+                    fields.push(ds_field.id);
+                    column_indices.push(curr_column_idx);
+                    curr_column_idx += 1;
+                }
+            }
+
+            let file_size_nz = NonZero::new(file_size);
+            let data_file = DataFile::new(
+                path,
+                fields,
+                column_indices,
+                file_metadata.major_version as u32,
+                file_metadata.minor_version as u32,
+                file_size_nz,
+                base_id,
+            );
+
+            Ok(PyLance(data_file))
+        })?
     }
 
     #[staticmethod]
