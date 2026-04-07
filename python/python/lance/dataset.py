@@ -30,6 +30,7 @@ from typing import (
     Tuple,
     TypedDict,
     Union,
+    cast,
 )
 
 import pyarrow as pa
@@ -90,6 +91,165 @@ if TYPE_CHECKING:
         Iterable[float],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
+_BLOB_DESC_PANDAS_MODE = "descriptions"
+_BLOB_ROW_ADDR_COLUMN = "_rowaddr"
+
+
+def _field_metadata_value(field: pa.Field, key: str) -> Optional[bytes]:
+    metadata = field.metadata
+    if metadata is None:
+        return None
+    return metadata.get(key.encode("utf-8"))
+
+
+def _is_blob_field(field: pa.Field) -> bool:
+    return (
+        _field_metadata_value(field, "lance-encoding:blob") == b"true"
+        or _field_metadata_value(field, "ARROW:extension:name") == b"lance.blob.v2"
+    )
+
+
+def _blob_columns_in_schema(schema: pa.Schema) -> set[str]:
+    return {field.name for field in schema if _is_blob_field(field)}
+
+
+def _normalize_blob_pandas_mode(
+    blob_mode: str,
+) -> Literal["lazy", "bytes", "descriptions"]:
+    if blob_mode not in {"lazy", "bytes", _BLOB_DESC_PANDAS_MODE}:
+        raise ValueError(
+            "blob_mode must be one of: 'lazy', 'bytes', 'descriptions'"
+        )
+    return cast("Literal['lazy', 'bytes', 'descriptions']", blob_mode)
+
+
+def _simple_source_column(expr: str) -> Optional[str]:
+    expr = expr.strip()
+    if expr.startswith("`") and expr.endswith("`") and expr.count("`") == 2:
+        return expr[1:-1]
+    if "." in expr or any(ch.isspace() for ch in expr):
+        return None
+    if not expr:
+        return None
+    allowed = set("_$")
+    if not (expr[0].isalpha() or expr[0] == "_"):
+        return None
+    if any(not (ch.isalnum() or ch in allowed) for ch in expr[1:]):
+        return None
+    return expr
+
+
+def _blob_column_sources(
+    schema: pa.Schema,
+    snapshot: Dict[str, Any],
+    dataset_schema: pa.Schema,
+) -> dict[str, str]:
+    blob_columns = {}
+    output_blob_columns = [field.name for field in schema if _is_blob_field(field)]
+    columns_with_transform = snapshot.get("_columns_with_transform")
+    if not columns_with_transform:
+        return {name: name for name in output_blob_columns}
+
+    source_is_blob = {
+        field.name
+        for field in dataset_schema
+        if _is_blob_field(field)
+    }
+    for name in output_blob_columns:
+        expr = dict(columns_with_transform).get(name)
+        source = _simple_source_column(expr) if expr is not None else name
+        if source is None or source not in source_is_blob:
+            raise NotImplementedError(
+                "blob-aware to_pandas only supports direct blob column references "
+                "for transformed projections"
+            )
+        blob_columns[name] = source
+    return blob_columns
+
+
+def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
+    return {
+        "_limit": builder._limit,
+        "_filter": builder._filter,
+        "_search_filter": builder._search_filter,
+        "_substrait_filter": builder._substrait_filter,
+        "_prefilter": builder._prefilter,
+        "_late_materialization": builder._late_materialization,
+        "_blob_handling": builder._blob_handling,
+        "_offset": builder._offset,
+        "_columns": tuple(builder._columns) if builder._columns is not None else None,
+        "_columns_with_transform": (
+            tuple(builder._columns_with_transform)
+            if builder._columns_with_transform is not None
+            else None
+        ),
+        "_nearest": copy.deepcopy(builder._nearest),
+        "_batch_size": builder._batch_size,
+        "_io_buffer_size": builder._io_buffer_size,
+        "_batch_readahead": builder._batch_readahead,
+        "_fragment_readahead": builder._fragment_readahead,
+        "_scan_in_order": builder._scan_in_order,
+        "_fragments": (
+            tuple(builder._fragments) if builder._fragments is not None else None
+        ),
+        "_with_row_id": builder._with_row_id,
+        "_with_row_address": builder._with_row_address,
+        "_use_stats": builder._use_stats,
+        "_fast_search": builder._fast_search,
+        "_full_text_query": copy.deepcopy(builder._full_text_query),
+        "_use_scalar_index": builder._use_scalar_index,
+        "_include_deleted_rows": builder._include_deleted_rows,
+        "_scan_stats_callback": builder._scan_stats_callback,
+        "_strict_batch_size": builder._strict_batch_size,
+        "_orderings": (
+            tuple(builder._orderings) if builder._orderings is not None else None
+        ),
+        "_disable_scoring_autoprojection": builder._disable_scoring_autoprojection,
+        "_substrait_aggregate": builder._substrait_aggregate,
+    }
+
+
+def _scanner_from_snapshot(
+    ds: "LanceDataset", snapshot: Dict[str, Any]
+) -> "LanceScanner":
+    builder = ScannerBuilder(ds)
+    for key, value in snapshot.items():
+        if key == "_columns" and value is not None:
+            setattr(builder, key, list(value))
+        elif key == "_columns_with_transform" and value is not None:
+            setattr(builder, key, list(value))
+        elif key == "_fragments" and value is not None:
+            setattr(builder, key, list(value))
+        elif key == "_orderings" and value is not None:
+            setattr(builder, key, list(value))
+        else:
+            setattr(builder, key, value)
+    return builder.to_scanner()
+
+
+def _read_blob_as_bytes(blob: BlobFile) -> bytes:
+    try:
+        return blob.readall()
+    finally:
+        blob.close()
+
+
+def _is_null_blob_description(description: Any) -> bool:
+    if description is None:
+        return True
+    if not isinstance(description, dict):
+        return False
+    if description.keys() == {"position", "size"}:
+        return description["position"] == 1 and description["size"] == 0
+    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
+        return (
+            description["kind"] == 0
+            and description["position"] == 0
+            and description["size"] == 0
+            and description["blob_id"] == 0
+            and description["blob_uri"] == ""
+        )
+    return False
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -1160,6 +1320,59 @@ class LanceDataset(pa.dataset.Dataset):
             order_by=order_by,
             disable_scoring_autoprojection=disable_scoring_autoprojection,
         ).to_table()
+
+    def to_pandas(
+        self,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        nearest: Optional[dict] = None,
+        batch_size: Optional[int] = None,
+        batch_readahead: Optional[int] = None,
+        fragment_readahead: Optional[int] = None,
+        scan_in_order: Optional[bool] = None,
+        *,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
+        fast_search: Optional[bool] = None,
+        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
+        blob_mode: str = "lazy",
+        use_scalar_index: Optional[bool] = None,
+        include_deleted_rows: Optional[bool] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
+        **kwargs,
+    ) -> "pd.DataFrame":
+        return self.scanner(
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            nearest=nearest,
+            batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
+            batch_readahead=batch_readahead,
+            fragment_readahead=fragment_readahead,
+            late_materialization=late_materialization,
+            blob_handling=blob_handling,
+            use_scalar_index=use_scalar_index,
+            scan_in_order=scan_in_order,
+            prefilter=prefilter,
+            with_row_id=with_row_id,
+            with_row_address=with_row_address,
+            use_stats=use_stats,
+            fast_search=fast_search,
+            full_text_query=full_text_query,
+            include_deleted_rows=include_deleted_rows,
+            order_by=order_by,
+            disable_scoring_autoprojection=disable_scoring_autoprojection,
+        ).to_pandas(blob_mode=blob_mode, **kwargs)
 
     @property
     def partition_expression(self):
@@ -5423,13 +5636,19 @@ class ScannerBuilder:
             self._disable_scoring_autoprojection,
             self._substrait_aggregate,
         )
-        return LanceScanner(scanner, self.ds)
+        return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 
 
 class LanceScanner(pa.dataset.Scanner):
-    def __init__(self, scanner: _Scanner, dataset: LanceDataset):
+    def __init__(
+        self,
+        scanner: _Scanner,
+        dataset: LanceDataset,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ):
         self._scanner = scanner
         self._ds = dataset
+        self._snapshot = snapshot
 
     def to_table(self) -> pa.Table:
         """
@@ -5442,6 +5661,75 @@ class LanceScanner(pa.dataset.Scanner):
 
     def to_batches(self) -> Iterator[RecordBatch]:
         yield from self.to_reader()
+
+    def to_pandas(
+        self, *, blob_mode: str = "lazy", **kwargs: Any
+    ) -> "pd.DataFrame":
+        blob_mode = _normalize_blob_pandas_mode(blob_mode)
+        schema = self.projected_schema
+        blob_columns = _blob_columns_in_schema(schema)
+        if not blob_columns or blob_mode == _BLOB_DESC_PANDAS_MODE:
+            return self.to_table().to_pandas(**kwargs)
+
+        if self._snapshot is None:
+            raise NotImplementedError(
+                "blob-aware to_pandas requires a scanner created from the Python API"
+            )
+
+        blob_sources = _blob_column_sources(schema, self._snapshot, self._ds.schema)
+        snapshot = dict(self._snapshot)
+        snapshot["_with_row_address"] = True
+        snapshot["_blob_handling"] = "blobs_descriptions"
+        table = _scanner_from_snapshot(self._ds, snapshot).to_table()
+
+        requested_rowaddr = bool(self._snapshot.get("_with_row_address", False))
+        if _BLOB_ROW_ADDR_COLUMN not in table.schema.names:
+            raise RuntimeError("blob-aware to_pandas expected _rowaddr in scan results")
+
+        row_addrs = table.column(_BLOB_ROW_ADDR_COLUMN).to_pylist()
+        columns_to_drop = [
+            name for name in blob_columns if name in table.schema.names
+        ]
+        if not requested_rowaddr:
+            columns_to_drop.append(_BLOB_ROW_ADDR_COLUMN)
+        non_blob_table = (
+            table.drop_columns(columns_to_drop) if columns_to_drop else table
+        )
+        if non_blob_table.num_columns == 0:
+            dataframe = pd.DataFrame(index=range(table.num_rows))
+        else:
+            dataframe = non_blob_table.to_pandas(**kwargs)
+
+        output_names = [field.name for field in schema]
+        for index, name in enumerate(output_names):
+            if name not in blob_columns:
+                continue
+
+            descriptions = table.column(name).to_pylist()
+            non_null_positions = [
+                pos
+                for pos, description in enumerate(descriptions)
+                if not _is_null_blob_description(description)
+            ]
+            non_null_addrs = [row_addrs[pos] for pos in non_null_positions]
+            blob_files = (
+                self._ds.take_blobs(blob_sources[name], addresses=non_null_addrs)
+                if non_null_addrs
+                else []
+            )
+            blob_iter = iter(blob_files)
+            values = []
+            for description in descriptions:
+                if _is_null_blob_description(description):
+                    values.append(None)
+                    continue
+                blob = next(blob_iter)
+                values.append(
+                    blob if blob_mode == "lazy" else _read_blob_as_bytes(blob)
+                )
+            dataframe.insert(index, name, values)
+
+        return dataframe
 
     @property
     def projected_schema(self) -> Schema:
