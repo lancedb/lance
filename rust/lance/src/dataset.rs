@@ -2792,6 +2792,16 @@ impl Dataset {
                 )
                 .await
             }
+            IndexType::Bitmap => {
+                lance_index::scalar::bitmap::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                    batch_readhead,
+                    progress,
+                )
+                .await
+            }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \

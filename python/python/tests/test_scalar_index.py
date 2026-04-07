@@ -3746,6 +3746,112 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
+def test_distribute_bitmap_index_build(tmp_path):
+    """
+    Per-fragment BITMAP shards under one index UUID, merge_index_metadata, commit,
+    then match a monolithic bitmap index on the same data.
+    """
+    from lance.dataset import Index
+
+    num_fragments = 4
+    rows_per_fragment = 500
+    tiers_cycle = ["low", "med", "high"]
+
+    def tier_for_row(global_row: int) -> str:
+        return tiers_cycle[global_row % 3]
+
+    first = pa.table(
+        {
+            "id": pa.array(range(rows_per_fragment)),
+            "tier": pa.array([tier_for_row(j) for j in range(rows_per_fragment)]),
+        }
+    )
+    ds = lance.write_dataset(first, tmp_path, max_rows_per_file=rows_per_fragment)
+    for i in range(1, num_fragments):
+        start = i * rows_per_fragment
+        frag = pa.table(
+            {
+                "id": pa.array(range(start, start + rows_per_fragment)),
+                "tier": pa.array(
+                    [tier_for_row(j) for j in range(start, start + rows_per_fragment)]
+                ),
+            }
+        )
+        ds = lance.write_dataset(
+            frag, tmp_path, mode="append", max_rows_per_file=rows_per_fragment
+        )
+
+    index_id = str(uuid.uuid4())
+    index_name = "tier_bitmap_dist_idx"
+    fragments = ds.get_fragments()
+    fragment_ids = [f.fragment_id for f in fragments]
+
+    for fragment in fragments:
+        ds.create_scalar_index(
+            column="tier",
+            index_type="BITMAP",
+            name=index_name,
+            replace=False,
+            index_uuid=index_id,
+            fragment_ids=[fragment.fragment_id],
+        )
+
+    test_tier = "med"
+    pre_merge = ds.scanner(
+        filter=f"tier = '{test_tier}'",
+        columns=["id", "tier"],
+    ).to_table()
+    assert pre_merge.num_rows > 0
+
+    ds.merge_index_metadata(index_id, index_type="BITMAP")
+
+    field_id = ds.schema.get_field_index("tier")
+    index = Index(
+        uuid=index_id,
+        name=index_name,
+        fields=[field_id],
+        dataset_version=ds.version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    ds_committed = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    stats = ds_committed.stats.index_stats(index_name)
+    assert stats["name"] == index_name
+    assert stats["index_type"] == "Bitmap"
+
+    dist_results = ds_committed.scanner(
+        filter=f"tier = '{test_tier}'",
+        columns=["id", "tier"],
+    ).to_table()
+
+    ref_path = tmp_path / "ref_bitmap_mono"
+    full = ds_committed.scanner().to_table()
+    ref_ds = lance.write_dataset(full, ref_path)
+    ref_ds.create_scalar_index(
+        column="tier",
+        index_type="BITMAP",
+        name="ref_tier_bitmap",
+    )
+    ref_results = ref_ds.scanner(
+        filter=f"tier = '{test_tier}'",
+        columns=["id", "tier"],
+    ).to_table()
+
+    assert dist_results.num_rows == ref_results.num_rows
+    assert sorted(dist_results.column("id").to_pylist()) == sorted(
+        ref_results.column("id").to_pylist()
+    )
+
+
 def test_btree_fragment_ids_parameter_validation(tmp_path):
     """
     Test validation of fragment_ids parameter for B-tree indices.

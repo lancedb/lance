@@ -3551,7 +3551,7 @@ class LanceDataset(pa.dataset.Dataset):
         This method does NOT commit changes.
 
         This API merges temporary scalar index files (for example per-fragment
-        BTree or inverted index outputs).
+        BTree, Bitmap, or inverted index outputs).
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
