@@ -2851,7 +2851,10 @@ mod tests {
         assert!(from_bitmap.repetition_levels.is_none());
         assert!(from_bitmap.definition_levels.is_none());
         assert_eq!(from_bitmap.def_meaning, from_no_null.def_meaning);
-        assert_eq!(from_bitmap.max_visible_level, from_no_null.max_visible_level);
+        assert_eq!(
+            from_bitmap.max_visible_level,
+            from_no_null.max_visible_level
+        );
     }
 
     #[test]
