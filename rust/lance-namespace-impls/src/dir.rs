@@ -835,7 +835,15 @@ impl DirectoryNamespace {
     /// * `names` - The vector of table names to paginate
     /// * `page_token` - Skip items until finding one greater than this value (start_after semantics)
     /// * `limit` - Maximum number of items to keep
-    fn apply_pagination(names: &mut Vec<String>, page_token: Option<String>, limit: Option<i32>) {
+    ///
+    /// # Returns
+    /// The next page token (last item in this page) if more results exist beyond the limit,
+    /// or `None` if this is the last page.
+    fn apply_pagination(
+        names: &mut Vec<String>,
+        page_token: Option<String>,
+        limit: Option<i32>,
+    ) -> Option<String> {
         // Sort alphabetically for consistent ordering
         names.sort();
 
@@ -851,12 +859,23 @@ impl DirectoryNamespace {
             }
         }
 
-        // Apply limit
+        // Apply limit and compute next page token
         if let Some(limit) = limit
             && limit >= 0
         {
-            names.truncate(limit as usize);
+            let limit = limit as usize;
+            if names.len() > limit {
+                let next_page_token = if limit > 0 {
+                    Some(names[limit - 1].clone())
+                } else {
+                    None
+                };
+                names.truncate(limit);
+                return next_page_token;
+            }
         }
+
+        None
     }
 
     /// List tables using directory scanning (fallback method)
@@ -1966,8 +1985,10 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         // Apply sorting and pagination
-        Self::apply_pagination(&mut tables, request.page_token, request.limit);
-        let response = ListTablesResponse::new(tables);
+        let next_page_token =
+            Self::apply_pagination(&mut tables, request.page_token, request.limit);
+        let mut response = ListTablesResponse::new(tables);
+        response.page_token = next_page_token;
         Ok(response)
     }
 
@@ -3579,6 +3600,77 @@ mod tests {
         assert_eq!(tables.len(), 2);
         assert!(tables.contains(&"table1".to_string()));
         assert!(tables.contains(&"table2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_tables_pagination() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        for name in ["alpha", "bravo", "charlie"] {
+            let mut req = CreateTableRequest::new();
+            req.id = Some(vec![name.to_string()]);
+            namespace
+                .create_table(req, bytes::Bytes::from(ipc_data.clone()))
+                .await
+                .unwrap();
+        }
+
+        // First page: limit=2, no page_token
+        let first_page = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first_page.tables, vec!["alpha", "bravo"]);
+        assert_eq!(first_page.page_token.as_deref(), Some("bravo"));
+
+        // Second page: use page_token from first response
+        let second_page = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                limit: Some(2),
+                page_token: first_page.page_token.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(second_page.tables, vec!["charlie"]);
+        assert!(second_page.page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_tables_pagination_limit_zero() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut req = CreateTableRequest::new();
+        req.id = Some(vec!["alpha".to_string()]);
+        namespace
+            .create_table(req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let response = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                limit: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(response.tables.is_empty());
+        assert!(response.page_token.is_none());
     }
 
     #[tokio::test]
