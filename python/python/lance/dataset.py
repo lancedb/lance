@@ -91,7 +91,16 @@ if TYPE_CHECKING:
         Iterable[float],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
-_BLOB_DESC_PANDAS_MODE = "descriptions"
+_BLOB_PANDAS_MODE_LAZY = "lazy"
+_BLOB_PANDAS_MODE_BYTES = "bytes"
+_BLOB_PANDAS_MODE_DESCRIPTIONS = "descriptions"
+_BLOB_PANDAS_MODES = frozenset(
+    {
+        _BLOB_PANDAS_MODE_LAZY,
+        _BLOB_PANDAS_MODE_BYTES,
+        _BLOB_PANDAS_MODE_DESCRIPTIONS,
+    }
+)
 _BLOB_ROW_ADDR_COLUMN = "_rowaddr"
 
 
@@ -116,7 +125,7 @@ def _blob_columns_in_schema(schema: pa.Schema) -> set[str]:
 def _normalize_blob_pandas_mode(
     blob_mode: str,
 ) -> Literal["lazy", "bytes", "descriptions"]:
-    if blob_mode not in {"lazy", "bytes", _BLOB_DESC_PANDAS_MODE}:
+    if blob_mode not in _BLOB_PANDAS_MODES:
         raise ValueError("blob_mode must be one of: 'lazy', 'bytes', 'descriptions'")
     return cast("Literal['lazy', 'bytes', 'descriptions']", blob_mode)
 
@@ -162,6 +171,13 @@ def _blob_column_sources(
 
 
 def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
+    """Capture Python-side scanner config needed to rebuild the scan later.
+
+    The native scanner object does not preserve the original builder arguments.
+    We need these values to recreate the same scan when `to_pandas` switches blob
+    handling modes or injects `_rowaddr` for lazy blob export.
+    """
+
     def snapshot_value(value: Any) -> Any:
         try:
             return copy.deepcopy(value)
@@ -169,43 +185,9 @@ def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
             return value
 
     return {
-        "_limit": builder._limit,
-        "_filter": builder._filter,
-        "_search_filter": builder._search_filter,
-        "_substrait_filter": builder._substrait_filter,
-        "_prefilter": builder._prefilter,
-        "_late_materialization": builder._late_materialization,
-        "_blob_handling": builder._blob_handling,
-        "_offset": builder._offset,
-        "_columns": tuple(builder._columns) if builder._columns is not None else None,
-        "_columns_with_transform": (
-            tuple(builder._columns_with_transform)
-            if builder._columns_with_transform is not None
-            else None
-        ),
-        "_nearest": snapshot_value(builder._nearest),
-        "_batch_size": builder._batch_size,
-        "_io_buffer_size": builder._io_buffer_size,
-        "_batch_readahead": builder._batch_readahead,
-        "_fragment_readahead": builder._fragment_readahead,
-        "_scan_in_order": builder._scan_in_order,
-        "_fragments": (
-            tuple(builder._fragments) if builder._fragments is not None else None
-        ),
-        "_with_row_id": builder._with_row_id,
-        "_with_row_address": builder._with_row_address,
-        "_use_stats": builder._use_stats,
-        "_fast_search": builder._fast_search,
-        "_full_text_query": snapshot_value(builder._full_text_query),
-        "_use_scalar_index": builder._use_scalar_index,
-        "_include_deleted_rows": builder._include_deleted_rows,
-        "_scan_stats_callback": builder._scan_stats_callback,
-        "_strict_batch_size": builder._strict_batch_size,
-        "_orderings": (
-            tuple(builder._orderings) if builder._orderings is not None else None
-        ),
-        "_disable_scoring_autoprojection": builder._disable_scoring_autoprojection,
-        "_substrait_aggregate": builder._substrait_aggregate,
+        key: snapshot_value(value)
+        for key, value in vars(builder).items()
+        if key != "ds"
     }
 
 
@@ -225,13 +207,6 @@ def _scanner_from_snapshot(
         else:
             setattr(builder, key, value)
     return builder.to_scanner()
-
-
-def _read_blob_as_bytes(blob: BlobFile) -> bytes:
-    try:
-        return blob.readall()
-    finally:
-        blob.close()
 
 
 def _is_null_blob_description(description: Any) -> bool:
@@ -1341,14 +1316,29 @@ class LanceDataset(pa.dataset.Dataset):
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
-        blob_handling: Optional[str] = None,
-        blob_mode: str = "lazy",
+        blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         **kwargs,
     ) -> "pd.DataFrame":
+        """Read the data into a :py:class:`pandas.DataFrame`.
+
+        Parameters are the same as :meth:`to_table`, except pandas export uses
+        ``blob_mode`` instead of Arrow-facing ``blob_handling``.
+
+        Parameters
+        ----------
+        blob_mode: str, default "lazy"
+            Controls how blob columns are returned.
+
+            - ``"lazy"``: return :class:`lance.BlobFile` objects
+            - ``"bytes"``: return Python ``bytes``
+            - ``"descriptions"``: preserve ``to_table().to_pandas()`` behavior
+        **kwargs
+            Forwarded to :meth:`pyarrow.Table.to_pandas` for non-blob columns.
+        """
         return self.scanner(
             columns=columns,
             filter=filter,
@@ -1360,7 +1350,6 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
-            blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
@@ -5662,11 +5651,18 @@ class LanceScanner(pa.dataset.Scanner):
     def to_batches(self) -> Iterator[RecordBatch]:
         yield from self.to_reader()
 
-    def to_pandas(self, *, blob_mode: str = "lazy", **kwargs: Any) -> "pd.DataFrame":
+    def to_pandas(
+        self, *, blob_mode: str = _BLOB_PANDAS_MODE_LAZY, **kwargs: Any
+    ) -> "pd.DataFrame":
+        """Read the scan results into a :py:class:`pandas.DataFrame`.
+
+        ``blob_mode`` is pandas-specific and does not replace Arrow's
+        ``blob_handling`` setting used by :meth:`to_table`.
+        """
         blob_mode = _normalize_blob_pandas_mode(blob_mode)
         schema = self.projected_schema
         blob_columns = _blob_columns_in_schema(schema)
-        if not blob_columns or blob_mode == _BLOB_DESC_PANDAS_MODE:
+        if not blob_columns or blob_mode == _BLOB_PANDAS_MODE_DESCRIPTIONS:
             return self.to_table().to_pandas(**kwargs)
 
         if self._snapshot is None:
@@ -5674,8 +5670,16 @@ class LanceScanner(pa.dataset.Scanner):
                 "blob-aware to_pandas requires a scanner created from the Python API"
             )
 
-        blob_sources = _blob_column_sources(schema, self._snapshot, self._ds.schema)
         snapshot = dict(self._snapshot)
+        if blob_mode == _BLOB_PANDAS_MODE_BYTES:
+            snapshot["_blob_handling"] = "all_binary"
+            return (
+                _scanner_from_snapshot(self._ds, snapshot)
+                .to_table()
+                .to_pandas(**kwargs)
+            )
+
+        blob_sources = _blob_column_sources(schema, self._snapshot, self._ds.schema)
         snapshot["_with_row_address"] = True
         snapshot["_blob_handling"] = "blobs_descriptions"
         table = _scanner_from_snapshot(self._ds, snapshot).to_table()
@@ -5719,10 +5723,7 @@ class LanceScanner(pa.dataset.Scanner):
                 if _is_null_blob_description(description):
                     values.append(None)
                     continue
-                blob = next(blob_iter)
-                values.append(
-                    blob if blob_mode == "lazy" else _read_blob_as_bytes(blob)
-                )
+                values.append(next(blob_iter))
             dataframe.insert(index, name, values)
 
         return dataframe

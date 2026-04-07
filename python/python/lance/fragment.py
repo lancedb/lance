@@ -627,13 +627,26 @@ class LanceFragment(pa.dataset.Fragment):
         offset: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
-        blob_handling: Optional[
-            Literal["all_binary", "blobs_descriptions", "all_descriptions"]
-        ] = None,
         blob_mode: str = "lazy",
         order_by: Optional[List[ColumnOrdering]] = None,
         **kwargs: Any,
     ) -> Any:
+        """Read this fragment into a :py:class:`pandas.DataFrame`.
+
+        Parameters are the same as :meth:`to_table`, except pandas export uses
+        ``blob_mode`` instead of Arrow-facing ``blob_handling``.
+
+        Parameters
+        ----------
+        blob_mode: str, default "lazy"
+            Controls how blob columns are returned.
+
+            - ``"lazy"``: return :class:`lance.BlobFile` objects
+            - ``"bytes"``: return Python ``bytes``
+            - ``"descriptions"``: preserve ``to_table().to_pandas()`` behavior
+        **kwargs
+            Forwarded to :meth:`pyarrow.Table.to_pandas` for non-blob columns.
+        """
         return self.scanner(
             columns=columns,
             filter=filter,
@@ -641,7 +654,6 @@ class LanceFragment(pa.dataset.Fragment):
             offset=offset,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
-            blob_handling=blob_handling,
             order_by=order_by,
         ).to_pandas(blob_mode=blob_mode, **kwargs)
 
