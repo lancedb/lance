@@ -4033,10 +4033,7 @@ mod tests {
             .map(|part| part["size"].as_u64().unwrap() as usize)
             .sum::<usize>();
         assert_eq!(total_partition_rows, expected_rows);
-        assert_eq!(
-            dataset.count_all_rows().await.unwrap() as usize,
-            expected_rows
-        );
+        assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);
 
         let nearest = dataset
             .scan()
