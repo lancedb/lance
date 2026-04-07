@@ -28,7 +28,9 @@ lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
 lance-table = { path = "../../rust/lance-table" }
 arrow = { version = "57.1", features = ["ffi"] }
+arrow-array = "57.1"
 arrow-schema = "57.1"
+datafusion-common = "52.1.0"
 object_store = { version = "0.12.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
