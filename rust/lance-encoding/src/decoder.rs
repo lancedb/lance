@@ -1887,7 +1887,18 @@ impl StructuralBatchDecodeStream {
                     let num_rows = batch.num_rows() as u64;
                     if num_rows > 0 {
                         let bpr = data_size / num_rows;
-                        bytes_per_row_feedback.store(bpr.max(1), Ordering::Relaxed);
+                        let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
+                        let next = if prev == 0 || bpr >= prev {
+                            // First batch or actual size is larger than estimate:
+                            // adopt immediately to avoid OOM.
+                            bpr
+                        } else {
+                            // Actual size is smaller: degrade gradually toward
+                            // the true value to avoid over-correcting on a
+                            // single anomalous batch.
+                            (prev + bpr) / 2
+                        };
+                        bytes_per_row_feedback.store(next.max(1), Ordering::Relaxed);
                     }
                     Ok(batch)
                 };
@@ -1962,7 +1973,7 @@ pub struct SchedulerDecoderConfig {
     pub decoder_config: DecoderConfig,
     /// If set, target this many bytes per batch instead of using `batch_size` rows.
     ///
-    /// Only supported for v2.1+ (structural) files. For v2.0 (legacy) files this
+    /// Only supported for v2.1+ (structural) files. For v2.0 files this
     /// option is ignored and a warning is logged.
     pub batch_size_bytes: Option<u64>,
 }
@@ -2029,7 +2040,7 @@ pub fn create_decode_stream(
         .into_stream())
     } else {
         if batch_size_bytes.is_some() {
-            warn!("batch_size_bytes is not supported for v2.0 (legacy) files and will be ignored");
+            warn!("batch_size_bytes is not supported for v2.0 files and will be ignored");
         }
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
