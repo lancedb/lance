@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 
 use uuid::Uuid;
 
-use super::util::{WatchableOnceCell, region_wal_path, wal_entry_filename};
+use super::util::{WatchableOnceCell, shard_wal_path, wal_entry_filename};
 
 use super::index::IndexStore;
 use super::memtable::batch_store::{BatchStore, StoredBatch};
@@ -154,8 +154,8 @@ pub struct WalFlusher {
     durable_watermark_rx: watch::Receiver<usize>,
     /// Object store for writing WAL files.
     object_store: Option<Arc<ObjectStore>>,
-    /// Region ID.
-    region_id: Uuid,
+    /// Shard ID.
+    shard_id: Uuid,
     /// Writer epoch (stored in WAL entries for fencing).
     writer_epoch: u64,
     /// Next WAL entry ID to use.
@@ -176,16 +176,16 @@ impl WalFlusher {
     /// # Arguments
     ///
     /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
-    /// * `region_id` - Region UUID
+    /// * `shard_id` - Shard UUID
     /// * `writer_epoch` - Current writer epoch
-    /// * `next_wal_entry_position` - Next WAL entry ID (from recovery or 1 for new region)
+    /// * `next_wal_entry_position` - Next WAL entry ID (from recovery or 1 for new shard)
     pub fn new(
         base_path: &Path,
-        region_id: Uuid,
+        shard_id: Uuid,
         writer_epoch: u64,
         next_wal_entry_position: u64,
     ) -> Self {
-        let wal_dir = region_wal_path(base_path, &region_id);
+        let wal_dir = shard_wal_path(base_path, &shard_id);
         // Initialize durable watermark at 0 (no batches durable yet)
         let (durable_watermark_tx, durable_watermark_rx) = watch::channel(0);
         // Create initial WAL flush cell for backpressure
@@ -194,7 +194,7 @@ impl WalFlusher {
             durable_watermark_tx,
             durable_watermark_rx,
             object_store: None,
-            region_id,
+            shard_id,
             writer_epoch,
             next_wal_entry_position: AtomicU64::new(next_wal_entry_position),
             flush_tx: None,
@@ -461,9 +461,9 @@ impl WalFlusher {
         self.next_wal_entry_position.load(Ordering::SeqCst)
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> Uuid {
-        self.region_id
+    /// Get the shard ID.
+    pub fn shard_id(&self) -> Uuid {
+        self.shard_id
     }
 
     /// Get the writer epoch.
@@ -576,8 +576,8 @@ mod tests {
     #[tokio::test]
     async fn test_wal_flusher_track_batch() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let mut buffer = WalFlusher::new(&base_path, region_id, 1, 1);
+        let shard_id = Uuid::new_v4();
+        let mut buffer = WalFlusher::new(&base_path, shard_id, 1, 1);
         buffer.set_object_store(store);
 
         // Track a batch
@@ -623,8 +623,8 @@ mod tests {
     #[tokio::test]
     async fn test_wal_flusher_flush_to_with_index_update() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let mut buffer = WalFlusher::new(&base_path, region_id, 1, 1);
+        let shard_id = Uuid::new_v4();
+        let mut buffer = WalFlusher::new(&base_path, shard_id, 1, 1);
         buffer.set_object_store(store);
 
         // Create a BatchStore with some data
@@ -667,8 +667,8 @@ mod tests {
     #[tokio::test]
     async fn test_wal_entry_read() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let mut buffer = WalFlusher::new(&base_path, region_id, 42, 1);
+        let shard_id = Uuid::new_v4();
+        let mut buffer = WalFlusher::new(&base_path, shard_id, 42, 1);
         buffer.set_object_store(store.clone());
 
         // Create a BatchStore with some data

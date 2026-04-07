@@ -522,23 +522,23 @@ message FragmentReuseIndexDetails {
 // MemWAL Index Types
 // ============================================================================
 
-// Region manifest containing epoch-based fencing and WAL state.
-// Each region has exactly one active writer at any time.
-message RegionManifest {
-  // Region identifier (UUID v4).
-  UUID region_id = 11;
+// Shard manifest containing epoch-based fencing and WAL state.
+// Each shard has exactly one active writer at any time.
+message ShardManifest {
+  // Shard identifier (UUID v4).
+  UUID shard_id = 11;
 
   // Manifest version number.
   // Matches the version encoded in the filename.
   uint64 version = 1;
 
-  // Region spec ID this region was created with.
-  // Set at region creation and immutable thereafter.
-  // A value of 0 indicates a manually-created region not governed by any spec.
-  uint32 region_spec_id = 10;
+  // Shard spec ID this shard was created with.
+  // Set at shard creation and immutable thereafter.
+  // A value of 0 indicates a manually-created shard not governed by any spec.
+  uint32 shard_spec_id = 10;
 
   // Writer fencing token - monotonically increasing.
-  // A writer must increment this when claiming the region.
+  // A writer must increment this when claiming the shard.
   uint64 writer_epoch = 2;
 
   // The most recent WAL entry position (0-based) that has been flushed to a MemTable.
@@ -564,16 +564,16 @@ message FlushedGeneration {
   // Generation number.
   uint64 generation = 1;
 
-  // Directory name relative to the region directory.
+  // Directory name relative to the shard directory.
   string path = 2;
 }
 
-// A region's merged generation, used in MemWalIndexDetails.
+// A shard's merged generation, used in MemWalIndexDetails.
 message MergedGeneration {
-  // Region identifier (UUID v4).
-  UUID region_id = 1;
+  // Shard identifier (UUID v4).
+  UUID shard_id = 1;
 
-  // Last generation merged to base table for this region.
+  // Last generation merged to base table for this shard.
   uint64 generation = 2;
 }
 
@@ -583,27 +583,27 @@ message IndexCatchupProgress {
   // Name of the base table index (must match an entry in maintained_indexes).
   string index_name = 1;
 
-  // Per-region progress: the generation up to which this index covers.
-  // If a region is not present, the index is assumed to be fully caught up
-  // (i.e., caught_up_generation >= merged_generation for that region).
+  // Per-shard progress: the generation up to which this index covers.
+  // If a shard is not present, the index is assumed to be fully caught up
+  // (i.e., caught_up_generation >= merged_generation for that shard).
   repeated MergedGeneration caught_up_generations = 2;
 }
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
 // This is the centralized structure for all MemWAL metadata:
-// - Configuration (region specs, indexes to maintain)
-// - Merge progress (merged generations per region)
-// - Region state snapshots
+// - Configuration (shard specs, indexes to maintain)
+// - Merge progress (merged generations per shard)
+// - Shard state snapshots
 //
 // Writers read this index to get configuration before writing.
-// Readers read this index to discover regions and their state.
-// A background process updates the index periodically to keep region snapshots current.
+// Readers read this index to discover shards and their state.
+// A background process updates the index periodically to keep shard snapshots current.
 //
-// Region snapshots are stored as a Lance file with one row per region.
-// The schema has one column per RegionManifest field, with region fields as columns:
-//   region_id: fixed_size_binary(16)  -- UUID bytes
+// Shard snapshots are stored as a Lance file with one row per shard.
+// The schema has one column per ShardManifest field, with shard fields as columns:
+//   shard_id: fixed_size_binary(16)  -- UUID bytes
 //   version: uint64
-//   region_spec_id: uint32
+//   shard_spec_id: uint32
 //   writer_epoch: uint64
 //   replay_after_wal_entry_position: uint64
 //   wal_entry_position_last_seen: uint64
@@ -614,19 +614,19 @@ message MemWalIndexDetails {
   // Snapshot timestamp (Unix timestamp in milliseconds).
   int64 snapshot_ts_millis = 1;
 
-  // Number of regions in the snapshot.
+  // Number of shards in the snapshot.
   // Used to determine storage format without reading the snapshot data.
-  uint32 num_regions = 2;
+  uint32 num_shards = 2;
 
-  // Inline region snapshots for small region counts.
-  // When num_regions <= threshold (implementation-defined, e.g., 100),
+  // Inline shard snapshots for small shard counts.
+  // When num_shards <= threshold (implementation-defined, e.g., 100),
   // snapshots are stored inline as serialized bytes.
-  // Format: Lance file bytes with the region snapshot schema.
+  // Format: Lance file bytes with the shard snapshot schema.
   optional bytes inline_snapshots = 3;
 
-  // Region specs defining how to derive region identifiers.
-  // This configuration determines how rows are partitioned into regions.
-  repeated RegionSpec region_specs = 7;
+  // Shard specs defining how to derive shard identifiers.
+  // This configuration determines how rows are partitioned into shards.
+  repeated ShardSpec shard_specs = 7;
 
   // Indexes from the base table to maintain in MemTables.
   // These are index names referencing indexes defined on the base table.
@@ -637,13 +637,13 @@ message MemWalIndexDetails {
   // SQ params) from the base table index to ensure distance comparability.
   repeated string maintained_indexes = 8;
 
-  // Last generation merged to base table for each region.
+  // Last generation merged to base table for each shard.
   // This is updated atomically with merge-insert data commits, enabling
   // conflict resolution when multiple mergers operate concurrently.
   //
-  // Note: This is separate from region snapshots because:
+  // Note: This is separate from shard snapshots because:
   // 1. merged_generations is updated by mergers (atomic with data commit)
-  // 2. region snapshots are updated by background index builder
+  // 2. shard snapshots are updated by background index builder
   repeated MergedGeneration merged_generations = 9;
 
   // Per-index catchup progress tracking.
@@ -658,25 +658,25 @@ message MemWalIndexDetails {
   repeated IndexCatchupProgress index_catchup = 10;
 }
 
-// Region spec definition.
-message RegionSpec {
+// Shard spec definition.
+message ShardSpec {
   // Unique identifier for this spec within the index.
   // IDs are never reused.
   uint32 spec_id = 1;
 
-  // Region field definitions that determine how to compute region identifiers.
-  repeated RegionField fields = 2;
+  // Shard field definitions that determine how to compute shard identifiers.
+  repeated ShardField fields = 2;
 }
 
-// Region field definition.
-message RegionField {
-  // Unique string identifier for this region field.
+// Shard field definition.
+message ShardField {
+  // Unique string identifier for this shard field.
   string field_id = 1;
 
   // Field IDs referencing source columns in the schema.
   repeated int32 source_ids = 2;
 
-  // Well-known region transform name (e.g., "identity", "year", "bucket").
+  // Well-known shard transform name (e.g., "identity", "year", "bucket").
   // Mutually exclusive with expression.
   optional string transform = 3;
 
@@ -684,7 +684,7 @@ message RegionField {
   // Mutually exclusive with transform.
   optional string expression = 4;
 
-  // Output type of the region value (Arrow type name).
+  // Output type of the shard value (Arrow type name).
   string result_type = 5;
 
   // Transform parameters (e.g., num_buckets for bucket transform).

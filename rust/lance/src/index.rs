@@ -2232,6 +2232,63 @@ mod tests {
         .unwrap()
     }
 
+    async fn write_skewed_fragmented_vector_dataset(uri: &str, dimension: i32) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+        let first_fragment_rows = 20_000;
+        let second_fragment_rows = 100;
+        let first_values = vec![0.0f32; first_fragment_rows * dimension as usize];
+        let second_values = vec![100.0f32; second_fragment_rows * dimension as usize];
+        let first_vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(first_values), dimension)
+                .unwrap();
+        let second_vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(second_values), dimension)
+                .unwrap();
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..first_fragment_rows as i32)),
+                    Arc::new(first_vectors),
+                ],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(
+                        first_fragment_rows as i32
+                            ..(first_fragment_rows + second_fragment_rows) as i32,
+                    )),
+                    Arc::new(second_vectors),
+                ],
+            )
+            .unwrap(),
+        ];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_group: 1024,
+                max_rows_per_file: first_fragment_rows,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
     async fn create_segmented_vector_index(
         dataset: &mut Dataset,
         index_name: &str,
@@ -2433,6 +2490,77 @@ mod tests {
             err.to_string().contains("does not belong to column 'id'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_segmented_optimize_rebalances_only_one_segment() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_skewed_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        create_segmented_vector_index(&mut dataset, "vector_idx", "vector", DIMENSION).await;
+
+        let before_segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(before_segments.len(), 2);
+        let before_by_fragment = before_segments
+            .iter()
+            .map(|metadata| {
+                let fragments = metadata
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>();
+                (fragments, metadata.uuid)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(before_by_fragment.len(), 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let after_segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(after_segments.len(), 2);
+        let after_by_fragment = after_segments
+            .iter()
+            .map(|metadata| {
+                let fragments = metadata
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>();
+                (fragments, metadata.uuid)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(after_by_fragment.len(), 2);
+
+        assert_ne!(
+            before_by_fragment[&vec![0]],
+            after_by_fragment[&vec![0]],
+            "expected optimize to replace the oversized segment"
+        );
+        assert_eq!(
+            before_by_fragment[&vec![1]],
+            after_by_fragment[&vec![1]],
+            "expected optimize to leave the smaller segment untouched"
+        );
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        let partitions_per_segment = logical_index
+            .as_ivf()
+            .unwrap()
+            .num_partitions_per_segment()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(partitions_per_segment[&after_by_fragment[&vec![0]]], 3);
+        assert_eq!(partitions_per_segment[&after_by_fragment[&vec![1]]], 2);
     }
 
     #[tokio::test]

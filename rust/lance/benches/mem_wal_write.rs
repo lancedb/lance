@@ -31,9 +31,9 @@
 //! - `NUM_BATCHES`: Total number of batches to write (default: 1000)
 //! - `DURABLE_WRITE`: yes/no/both (default: no) - whether writes wait for WAL flush
 //! - `INDEXED_WRITE`: yes/no/both (default: no) - whether writes update indexes synchronously
-//! - `MAX_WAL_BUFFER_SIZE`: WAL buffer size in bytes (default: 1MB from RegionWriterConfig)
+//! - `MAX_WAL_BUFFER_SIZE`: WAL buffer size in bytes (default: 1MB from ShardWriterConfig)
 //! - `MAX_FLUSH_INTERVAL_MS`: WAL flush interval in milliseconds, 0 to disable (default: 1000ms)
-//! - `MAX_MEMTABLE_SIZE`: MemTable size threshold in bytes (default: 64MB from RegionWriterConfig)
+//! - `MAX_MEMTABLE_SIZE`: MemTable size threshold in bytes (default: 64MB from ShardWriterConfig)
 //! - `VECTOR_DIM`: Vector dimension for the vector column (default: 512)
 //! - `MEMWAL_MAINTAINED_INDEXES`: Comma-separated list of index names to maintain in MemWAL (default: id_btree)
 //!     - Available indexes: id_btree, text_fts, vector_ivfpq (all created on base table)
@@ -52,7 +52,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, RegionWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -393,7 +393,7 @@ async fn create_dataset(
     // Initialize MemWAL with specified maintained indexes
     dataset
         .initialize_mem_wal(MemWalConfig {
-            region_spec: None,
+            shard_spec: None,
             maintained_indexes: maintained_indexes.to_vec(),
         })
         .await
@@ -479,7 +479,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
     let total_bytes = (total_rows * row_size_bytes) as u64;
 
     // Get effective config values for display
-    let default_config = RegionWriterConfig::default();
+    let default_config = ShardWriterConfig::default();
     let effective_wal_buffer = max_wal_buffer_size.unwrap_or(default_config.max_wal_buffer_size);
     let effective_flush_interval =
         max_flush_interval.unwrap_or(default_config.max_wal_flush_interval);
@@ -530,7 +530,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
             let name_prefix = build_name_prefix(durable, indexed);
 
             // Create dataset ONCE before benchmark iterations
-            // Each iteration will use a different region on the same dataset
+            // Each iteration will use a different shard on the same dataset
             let dataset = rt.block_on(create_dataset(
                 &schema,
                 &name_prefix,
@@ -572,12 +572,12 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                 // Re-open dataset (cheap operation)
                                 let dataset = Dataset::open(&dataset_uri).await.unwrap();
 
-                                // Create a NEW region for each iteration
-                                let region_id = Uuid::new_v4();
-                                let default_config = RegionWriterConfig::default();
-                                let config = RegionWriterConfig {
-                                    region_id,
-                                    region_spec_id: 0,
+                                // Create a NEW shard for each iteration
+                                let shard_id = Uuid::new_v4();
+                                let default_config = ShardWriterConfig::default();
+                                let config = ShardWriterConfig {
+                                    shard_id,
+                                    shard_spec_id: 0,
                                     durable_write: durable,
                                     sync_indexed_write: indexed,
                                     max_wal_buffer_size: max_wal_buffer_size
@@ -603,7 +603,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
 
                                 // Get writer through Dataset API (index configs loaded automatically)
                                 let writer =
-                                    dataset.mem_wal_writer(region_id, config).await.unwrap();
+                                    dataset.mem_wal_writer(shard_id, config).await.unwrap();
 
                                 // Time writes (excluding close to measure pure put throughput)
                                 let start = Instant::now();

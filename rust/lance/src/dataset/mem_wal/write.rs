@@ -6,7 +6,7 @@
 //! Write path for MemWAL.
 //!
 //! This module contains all components for the write path:
-//! - [`RegionWriter`] - Main writer interface for a single region
+//! - [`ShardWriter`] - Main writer interface for a single shard
 //! - [`MemTable`] - In-memory table storing Arrow RecordBatches
 //! - [`WalFlusher`] - Write-ahead log buffer for durability (Arrow IPC format)
 //! - [`IndexStore`] - In-memory index management
@@ -23,7 +23,7 @@ use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::RegionManifest;
+use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
 use log::{debug, error, info, warn};
 use object_store::path::Path;
@@ -47,21 +47,21 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 use super::memtable::flush::TriggerMemTableFlush;
 use super::wal::TriggerWalFlush;
 
-use super::manifest::RegionManifestStore;
+use super::manifest::ShardManifestStore;
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Configuration for a region writer.
+/// Configuration for a shard writer.
 #[derive(Debug, Clone)]
-pub struct RegionWriterConfig {
-    /// Unique identifier for this region (UUID v4).
-    pub region_id: Uuid,
+pub struct ShardWriterConfig {
+    /// Unique identifier for this shard (UUID v4).
+    pub shard_id: Uuid,
 
-    /// Region spec ID this region was created with.
-    /// A value of 0 indicates a manually-created region not governed by any spec.
-    pub region_spec_id: u32,
+    /// Shard spec ID this shard was created with.
+    /// A value of 0 indicates a manually-created shard not governed by any spec.
+    pub shard_spec_id: u32,
 
     /// Whether to wait for WAL flush before returning from writes.
     ///
@@ -182,11 +182,11 @@ pub struct RegionWriterConfig {
     pub stats_log_interval: Option<Duration>,
 }
 
-impl Default for RegionWriterConfig {
+impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
-            region_id: Uuid::new_v4(),
-            region_spec_id: 0,
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
             durable_write: true,
             sync_indexed_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
@@ -205,18 +205,18 @@ impl Default for RegionWriterConfig {
     }
 }
 
-impl RegionWriterConfig {
-    /// Create a new configuration with the given region ID.
-    pub fn new(region_id: Uuid) -> Self {
+impl ShardWriterConfig {
+    /// Create a new configuration with the given shard ID.
+    pub fn new(shard_id: Uuid) -> Self {
         Self {
-            region_id,
+            shard_id,
             ..Default::default()
         }
     }
 
-    /// Set the region spec ID.
-    pub fn with_region_spec_id(mut self, spec_id: u32) -> Self {
-        self.region_spec_id = spec_id;
+    /// Set the shard spec ID.
+    pub fn with_shard_spec_id(mut self, spec_id: u32) -> Self {
+        self.shard_spec_id = spec_id;
         self
     }
 
@@ -567,14 +567,14 @@ pub struct BackpressureStatsSnapshot {
 /// Backpressure controller for managing write flow.
 pub struct BackpressureController {
     /// Configuration.
-    config: RegionWriterConfig,
+    config: ShardWriterConfig,
     /// Stats for monitoring.
     stats: Arc<BackpressureStats>,
 }
 
 impl BackpressureController {
     /// Create a new backpressure controller.
-    pub fn new(config: RegionWriterConfig) -> Self {
+    pub fn new(config: ShardWriterConfig) -> Self {
         Self {
             config,
             stats: Arc::new(BackpressureStats::new()),
@@ -653,7 +653,7 @@ pub struct WriteResult {
     pub batch_positions: std::ops::Range<usize>,
 }
 
-/// RegionWriter state shared across tasks.
+/// ShardWriter state shared across tasks.
 struct WriterState {
     memtable: MemTable,
     last_flushed_wal_entry_position: u64,
@@ -685,7 +685,7 @@ struct SharedWriterState {
     wal_flusher: Arc<WalFlusher>,
     wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
     memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
-    config: RegionWriterConfig,
+    config: ShardWriterConfig,
     schema: Arc<ArrowSchema>,
     pk_field_ids: Vec<i32>,
     max_memtable_batches: usize,
@@ -701,7 +701,7 @@ impl SharedWriterState {
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
         memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
-        config: RegionWriterConfig,
+        config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
         pk_field_ids: Vec<i32>,
         max_memtable_batches: usize,
@@ -924,21 +924,21 @@ impl SharedWriterState {
     }
 }
 
-/// Main writer for a MemWAL region.
-pub struct RegionWriter {
-    config: RegionWriterConfig,
+/// Main writer for a MemWAL shard.
+pub struct ShardWriter {
+    config: ShardWriterConfig,
     epoch: u64,
     state: Arc<RwLock<WriterState>>,
     wal_flusher: Arc<WalFlusher>,
     task_executor: Arc<TaskExecutor>,
-    manifest_store: Arc<RegionManifestStore>,
+    manifest_store: Arc<ShardManifestStore>,
     stats: SharedWriteStats,
     writer_state: Arc<SharedWriterState>,
     backpressure: BackpressureController,
 }
 
-impl RegionWriter {
-    /// Open or create a RegionWriter.
+impl ShardWriter {
+    /// Open or create a ShardWriter.
     ///
     /// The `base_path` should come from `ObjectStore::from_uri()` to ensure
     /// WAL files are written inside the dataset directory.
@@ -946,25 +946,25 @@ impl RegionWriter {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
-        config: RegionWriterConfig,
+        config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
         index_configs: Vec<MemIndexConfig>,
     ) -> Result<Self> {
         let base_uri = base_uri.into();
-        let region_id = config.region_id;
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = config.shard_id;
+        let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             config.manifest_scan_batch_size,
         ));
 
-        // Claim the region (epoch-based fencing)
-        let (epoch, manifest) = manifest_store.claim_epoch(config.region_spec_id).await?;
+        // Claim the shard (epoch-based fencing)
+        let (epoch, manifest) = manifest_store.claim_epoch(config.shard_spec_id).await?;
 
         info!(
-            "Opened RegionWriter for region {} (epoch {}, generation {})",
-            region_id, epoch, manifest.current_generation
+            "Opened ShardWriter for shard {} (epoch {}, generation {})",
+            shard_id, epoch, manifest.current_generation
         );
 
         // Create MemTable with primary key field IDs from schema
@@ -1007,7 +1007,7 @@ impl RegionWriter {
         // Create WAL flusher
         let mut wal_flusher = WalFlusher::new(
             &base_path,
-            region_id,
+            shard_id,
             epoch,
             manifest.wal_entry_position_last_seen + 1,
         );
@@ -1025,7 +1025,7 @@ impl RegionWriter {
             object_store.clone(),
             base_path,
             base_uri,
-            region_id,
+            shard_id,
             manifest_store.clone(),
         ));
 
@@ -1083,7 +1083,7 @@ impl RegionWriter {
         })
     }
 
-    /// Write record batches to the region.
+    /// Write record batches to the shard.
     ///
     /// All batches are inserted atomically with a single lock acquisition.
     /// This is more efficient than calling put() multiple times for Arrow IPC
@@ -1182,8 +1182,8 @@ impl RegionWriter {
         self.stats.clone()
     }
 
-    /// Get the current region manifest.
-    pub async fn manifest(&self) -> Result<Option<RegionManifest>> {
+    /// Get the current shard manifest.
+    pub async fn manifest(&self) -> Result<Option<ShardManifest>> {
         self.manifest_store.read_latest().await
     }
 
@@ -1192,9 +1192,9 @@ impl RegionWriter {
         self.epoch
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> Uuid {
-        self.config.region_id
+    /// Get the shard ID.
+    pub fn shard_id(&self) -> Uuid {
+        self.config.shard_id
     }
 
     /// Get current MemTable statistics.
@@ -1258,7 +1258,7 @@ impl RegionWriter {
     ///
     /// Flushes pending data and shuts down background tasks.
     pub async fn close(self) -> Result<()> {
-        info!("Closing RegionWriter for region {}", self.config.region_id);
+        info!("Closing ShardWriter for shard {}", self.config.shard_id);
 
         // Send final WAL flush message and wait for completion
         let state = self.state.read().await;
@@ -1294,7 +1294,7 @@ impl RegionWriter {
         // Shutdown background tasks
         self.task_executor.shutdown_all().await?;
 
-        info!("RegionWriter closed for region {}", self.config.region_id);
+        info!("ShardWriter closed for shard {}", self.config.shard_id);
         Ok(())
     }
 }
@@ -1859,13 +1859,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_region_writer_basic_write() {
+    async fn test_shard_writer_basic_write() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
-        let config = RegionWriterConfig {
-            region_id: Uuid::new_v4(),
-            region_spec_id: 0,
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
             durable_write: false,
             sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
@@ -1875,7 +1875,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = RegionWriter::open(
+        let writer = ShardWriter::open(
             store,
             base_path,
             base_uri,
@@ -1902,13 +1902,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_region_writer_multiple_writes() {
+    async fn test_shard_writer_multiple_writes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
-        let config = RegionWriterConfig {
-            region_id: Uuid::new_v4(),
-            region_spec_id: 0,
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
             durable_write: false,
             sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
@@ -1918,7 +1918,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = RegionWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
             .await
             .unwrap();
 
@@ -1937,13 +1937,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_region_writer_with_indexes() {
+    async fn test_shard_writer_with_indexes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
-        let config = RegionWriterConfig {
-            region_id: Uuid::new_v4(),
-            region_spec_id: 0,
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
             durable_write: false,
             sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
@@ -1959,7 +1959,7 @@ mod tests {
             column: "id".to_string(),
         })];
 
-        let writer = RegionWriter::open(
+        let writer = ShardWriter::open(
             store,
             base_path,
             base_uri,
@@ -1982,14 +1982,14 @@ mod tests {
 
     /// Test memtable auto-flush triggered by size threshold.
     #[tokio::test]
-    async fn test_region_writer_auto_flush_by_size() {
+    async fn test_shard_writer_auto_flush_by_size() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
         // Use a small memtable size to trigger auto-flush
-        let config = RegionWriterConfig {
-            region_id: Uuid::new_v4(),
-            region_spec_id: 0,
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
             durable_write: false,
             sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
@@ -1999,7 +1999,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = RegionWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
             .await
             .unwrap();
 
@@ -2026,7 +2026,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_backpressure_when_under_threshold() {
-        let config = RegionWriterConfig::default().with_max_unflushed_memtable_bytes(1024 * 1024); // 1MB
+        let config = ShardWriterConfig::default().with_max_unflushed_memtable_bytes(1024 * 1024); // 1MB
 
         let controller = BackpressureController::new(config);
 
@@ -2044,7 +2044,7 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         use std::time::Duration;
 
-        let config = RegionWriterConfig::default()
+        let config = ShardWriterConfig::default()
             .with_max_unflushed_memtable_bytes(100) // Very low threshold
             .with_backpressure_log_interval(Duration::from_millis(50));
 
@@ -2121,7 +2121,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod region_writer_tests {
+mod shard_writer_tests {
     use std::sync::Arc;
 
     use crate::index::DatasetIndexExt;
@@ -2142,7 +2142,7 @@ mod region_writer_tests {
     use crate::dataset::{Dataset, WriteParams};
     use crate::index::vector::VectorIndexParams;
 
-    use super::super::RegionWriterConfig;
+    use super::super::ShardWriterConfig;
 
     fn create_test_schema(vector_dim: i32) -> Arc<ArrowSchema> {
         use std::collections::HashMap;
@@ -2202,16 +2202,16 @@ mod region_writer_tests {
         .unwrap()
     }
 
-    /// Quick smoke test for region writer - runs against memory://
-    /// Run with: cargo test -p lance region_writer_tests::test_region_writer_smoke -- --nocapture
+    /// Quick smoke test for shard writer - runs against memory://
+    /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_smoke -- --nocapture
     #[tokio::test]
-    async fn test_region_writer_smoke() {
+    async fn test_shard_writer_smoke() {
         let vector_dim = 128;
         let batch_size = 20;
         let num_batches = 100;
 
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_region_writer_{}", Uuid::new_v4());
+        let uri = format!("memory://test_shard_writer_{}", Uuid::new_v4());
 
         // Create initial dataset
         let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
@@ -2223,20 +2223,20 @@ mod region_writer_tests {
         // Initialize MemWAL (no indexes for smoke test)
         dataset
             .initialize_mem_wal(MemWalConfig {
-                region_spec: None,
+                shard_spec: None,
                 maintained_indexes: vec![],
             })
             .await
             .expect("Failed to initialize MemWAL");
 
-        // Create region writer
-        let region_id = Uuid::new_v4();
-        let config = RegionWriterConfig::new(region_id)
+        // Create shard writer
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
             .with_durable_write(false)
             .with_sync_indexed_write(false);
 
         let writer = dataset
-            .mem_wal_writer(region_id, config)
+            .mem_wal_writer(shard_id, config)
             .await
             .expect("Failed to create writer");
 
@@ -2251,11 +2251,11 @@ mod region_writer_tests {
         writer.close().await.expect("Failed to close");
     }
 
-    /// Test region writer against S3 with IVF-PQ, BTree, and FTS indexes (requires DATASET_PREFIX env var)
-    /// Run with: DATASET_PREFIX=s3://bucket/path cargo test -p lance --release region_writer_tests::test_region_writer_s3_ivfpq -- --nocapture --ignored
+    /// Test shard writer against S3 with IVF-PQ, BTree, and FTS indexes (requires DATASET_PREFIX env var)
+    /// Run with: DATASET_PREFIX=s3://bucket/path cargo test -p lance --release shard_writer_tests::test_shard_writer_s3_ivfpq -- --nocapture --ignored
     #[tokio::test]
     #[ignore]
-    async fn test_region_writer_s3_ivfpq() {
+    async fn test_shard_writer_s3_ivfpq() {
         let prefix = std::env::var("DATASET_PREFIX").expect("DATASET_PREFIX not set");
 
         let vector_dim = 512;
@@ -2332,7 +2332,7 @@ mod region_writer_tests {
         // Initialize MemWAL with all three indexes
         dataset
             .initialize_mem_wal(MemWalConfig {
-                region_spec: None,
+                shard_spec: None,
                 maintained_indexes: vec![
                     "id_btree".to_string(),
                     "text_fts".to_string(),
@@ -2342,14 +2342,14 @@ mod region_writer_tests {
             .await
             .expect("Failed to initialize MemWAL");
 
-        // Create region writer with default config
-        let region_id = Uuid::new_v4();
-        let config = RegionWriterConfig::new(region_id)
+        // Create shard writer with default config
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
             .with_durable_write(false)
             .with_sync_indexed_write(false);
 
         let writer = dataset
-            .mem_wal_writer(region_id, config)
+            .mem_wal_writer(shard_id, config)
             .await
             .expect("Failed to create writer");
 
@@ -2364,7 +2364,7 @@ mod region_writer_tests {
         writer.close().await.expect("Failed to close");
     }
 
-    /// End-to-end correctness test for RegionWriter with multiple memtable flushes.
+    /// End-to-end correctness test for ShardWriter with multiple memtable flushes.
     ///
     /// This test verifies:
     /// 1. Multiple memtable flushes are triggered via small memtable size
@@ -2373,9 +2373,9 @@ mod region_writer_tests {
     /// 4. Data can be read after each flush cycle
     /// 5. Manifest tracks flushed generations correctly
     ///
-    /// Run with: cargo test -p lance region_writer_tests::test_region_writer_e2e_correctness -- --nocapture
+    /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_e2e_correctness -- --nocapture
     #[tokio::test]
-    async fn test_region_writer_e2e_correctness() {
+    async fn test_shard_writer_e2e_correctness() {
         use std::time::Duration;
         use tempfile::TempDir;
 
@@ -2414,15 +2414,15 @@ mod region_writer_tests {
         // Initialize MemWAL with BTree index only (simpler for this test)
         dataset
             .initialize_mem_wal(MemWalConfig {
-                region_spec: None,
+                shard_spec: None,
                 maintained_indexes: vec!["id_btree".to_string()],
             })
             .await
             .expect("Failed to initialize MemWAL");
 
-        // Create region writer with small memtable size to trigger flushes
-        let region_id = Uuid::new_v4();
-        let config = RegionWriterConfig::new(region_id)
+        // Create shard writer with small memtable size to trigger flushes
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
             .with_durable_write(true) // Ensure WAL files are written
             .with_sync_indexed_write(true)
             .with_max_memtable_size(50 * 1024) // 50KB - triggers flush after ~8 batches
@@ -2430,7 +2430,7 @@ mod region_writer_tests {
             .with_max_wal_flush_interval(Duration::from_millis(50)); // Fast flush
 
         let writer = dataset
-            .mem_wal_writer(region_id, config)
+            .mem_wal_writer(shard_id, config)
             .await
             .expect("Failed to create writer");
 
@@ -2462,7 +2462,7 @@ mod region_writer_tests {
         writer.close().await.expect("Failed to close");
 
         // === VERIFY FILE SYSTEM LAYOUT ===
-        let mem_wal_dir = temp_dir.path().join("_mem_wal").join(region_id.to_string());
+        let mem_wal_dir = temp_dir.path().join("_mem_wal").join(shard_id.to_string());
         assert!(mem_wal_dir.exists(), "MemWAL directory should exist");
 
         // Check WAL directory
@@ -2494,7 +2494,7 @@ mod region_writer_tests {
             .await
             .expect("Failed to open store");
         let manifest_store =
-            super::super::manifest::RegionManifestStore::new(store, &base_path, region_id, 2);
+            super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
         let manifest = manifest_store
             .read_latest()
             .await
@@ -2507,12 +2507,12 @@ mod region_writer_tests {
             "Should have at least one flushed generation"
         );
         for flushed_gen in &manifest.flushed_generations {
-            // The path stored in manifest is relative to the region directory
-            // Construct full path: temp_dir/_mem_wal/region_id/generation_folder
+            // The path stored in manifest is relative to the shard directory
+            // Construct full path: temp_dir/_mem_wal/shard_id/generation_folder
             let gen_path = temp_dir
                 .path()
                 .join("_mem_wal")
-                .join(region_id.to_string())
+                .join(shard_id.to_string())
                 .join(&flushed_gen.path);
 
             // The generation directory should exist
@@ -2547,26 +2547,26 @@ mod region_writer_tests {
         // === VERIFY DATA CAN BE READ FROM NEW WRITER ===
         // Re-open dataset and create new writer to verify recovery
         let dataset = Dataset::open(&uri).await.expect("Failed to reopen dataset");
-        let new_region_id = Uuid::new_v4();
-        let new_config = RegionWriterConfig::new(new_region_id)
+        let new_shard_id = Uuid::new_v4();
+        let new_config = ShardWriterConfig::new(new_shard_id)
             .with_durable_write(false)
             .with_sync_indexed_write(true);
 
         let new_writer = dataset
-            .mem_wal_writer(new_region_id, new_config)
+            .mem_wal_writer(new_shard_id, new_config)
             .await
             .expect("Failed to create new writer");
 
-        // Write a test batch to verify the new region works
+        // Write a test batch to verify the new shard works
         let verify_batch = create_test_batch(&schema, 10000, 10, vector_dim);
         new_writer
             .put(vec![verify_batch])
             .await
-            .expect("Failed to write to new region");
+            .expect("Failed to write to new shard");
 
         let scanner = new_writer.scan().await;
         let result = scanner.try_into_batch().await.expect("Failed to scan");
-        assert_eq!(result.num_rows(), 10, "New region should have 10 rows");
+        assert_eq!(result.num_rows(), 10, "New shard should have 10 rows");
 
         new_writer
             .close()

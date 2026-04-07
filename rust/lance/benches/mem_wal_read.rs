@@ -59,9 +59,9 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::{
     ActiveMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner, LsmScanner,
-    LsmVectorSearchPlanner, RegionSnapshot,
+    LsmVectorSearchPlanner, ShardSnapshot,
 };
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, RegionWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance_linalg::distance::DistanceType;
 #[cfg(target_os = "linux")]
@@ -170,8 +170,8 @@ struct BenchContext {
     base_dataset: Arc<Dataset>,
     /// Dataset with MemWAL for LSM scan.
     lsm_dataset: Arc<Dataset>,
-    /// Region snapshots with flushed generations.
-    region_snapshots: Vec<RegionSnapshot>,
+    /// Shard snapshots with flushed generations.
+    shard_snapshots: Vec<ShardSnapshot>,
     /// Active memtable reference.
     active_memtable: Option<(Uuid, ActiveMemTableRef)>,
     /// Total rows across all sources.
@@ -232,7 +232,7 @@ async fn setup_benchmark(
     // Initialize MemWAL
     lsm_dataset
         .initialize_mem_wal(MemWalConfig {
-            region_spec: None,
+            shard_spec: None,
             maintained_indexes: vec![],
         })
         .await
@@ -240,22 +240,22 @@ async fn setup_benchmark(
 
     let lsm_dataset = Arc::new(lsm_dataset);
 
-    // Create RegionWriter with small memtable size to trigger flushes
-    let region_id = Uuid::new_v4();
-    let config = RegionWriterConfig {
-        region_id,
-        region_spec_id: 0,
+    // Create ShardWriter with small memtable size to trigger flushes
+    let shard_id = Uuid::new_v4();
+    let config = ShardWriterConfig {
+        shard_id,
+        shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: false,
         max_memtable_size: memtable_rows * 50, // ~50 bytes per row, triggers flush after memtable_rows
         max_memtable_rows: memtable_rows,
         max_wal_flush_interval: Some(Duration::from_secs(60)), // Long interval to avoid time-based flushes
-        ..RegionWriterConfig::default()
+        ..ShardWriterConfig::default()
     };
 
     let writer = lsm_dataset
         .as_ref()
-        .mem_wal_writer(region_id, config)
+        .mem_wal_writer(shard_id, config)
         .await
         .unwrap();
 
@@ -309,13 +309,12 @@ async fn setup_benchmark(
     // Get active memtable reference
     let active_memtable_ref = writer.active_memtable_ref().await;
 
-    // Build region snapshot
-    let mut region_snapshot = RegionSnapshot::new(region_id);
+    // Build shard snapshot
+    let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {
-        region_snapshot = region_snapshot.with_current_generation(m.current_generation);
+        shard_snapshot = shard_snapshot.with_current_generation(m.current_generation);
         for fg in &m.flushed_generations {
-            region_snapshot =
-                region_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+            shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
         }
     }
 
@@ -346,8 +345,8 @@ async fn setup_benchmark(
     BenchContext {
         base_dataset,
         lsm_dataset,
-        region_snapshots: vec![region_snapshot],
-        active_memtable: Some((region_id, active_memtable_ref)),
+        shard_snapshots: vec![shard_snapshot],
+        active_memtable: Some((shard_id, active_memtable_ref)),
         total_rows: base_rows + memtable_rows * 2 + gen3_rows,
         pk_columns,
     }
@@ -408,14 +407,14 @@ fn bench_scan(c: &mut Criterion) {
         &(),
         |b, _| {
             let dataset = ctx.lsm_dataset.clone();
-            let region_snapshots = ctx.region_snapshots.clone();
+            let shard_snapshots = ctx.shard_snapshots.clone();
             let pk_columns = ctx.pk_columns.clone();
             b.to_async(&rt).iter(|| {
                 let dataset = dataset.clone();
-                let region_snapshots = region_snapshots.clone();
+                let shard_snapshots = shard_snapshots.clone();
                 let pk_columns = pk_columns.clone();
                 async move {
-                    let scanner = LsmScanner::new(dataset, region_snapshots, pk_columns);
+                    let scanner = LsmScanner::new(dataset, shard_snapshots, pk_columns);
                     let batches: Vec<RecordBatch> = scanner
                         .try_into_stream()
                         .await
@@ -431,20 +430,20 @@ fn bench_scan(c: &mut Criterion) {
     );
 
     // LSM scan: base + flushed + active memtable
-    if let Some((region_id, ref active_memtable)) = ctx.active_memtable {
+    if let Some((shard_id, ref active_memtable)) = ctx.active_memtable {
         group.bench_with_input(BenchmarkId::new("LSM_Full", &label), &(), |b, _| {
             let dataset = ctx.lsm_dataset.clone();
-            let region_snapshots = ctx.region_snapshots.clone();
+            let shard_snapshots = ctx.shard_snapshots.clone();
             let pk_columns = ctx.pk_columns.clone();
             let active = active_memtable.clone();
             b.to_async(&rt).iter(|| {
                 let dataset = dataset.clone();
-                let region_snapshots = region_snapshots.clone();
+                let shard_snapshots = shard_snapshots.clone();
                 let pk_columns = pk_columns.clone();
                 let active = active.clone();
                 async move {
-                    let scanner = LsmScanner::new(dataset, region_snapshots, pk_columns)
-                        .with_active_memtable(region_id, active);
+                    let scanner = LsmScanner::new(dataset, shard_snapshots, pk_columns)
+                        .with_active_memtable(shard_id, active);
                     let batches: Vec<RecordBatch> = scanner
                         .try_into_stream()
                         .await
@@ -510,23 +509,23 @@ fn bench_scan_with_projection(c: &mut Criterion) {
     );
 
     // LSM scan with projection
-    if let Some((region_id, ref active_memtable)) = ctx.active_memtable {
+    if let Some((shard_id, ref active_memtable)) = ctx.active_memtable {
         group.bench_with_input(
             BenchmarkId::new("LSM_Full_Projected", &label),
             &(),
             |b, _| {
                 let dataset = ctx.lsm_dataset.clone();
-                let region_snapshots = ctx.region_snapshots.clone();
+                let shard_snapshots = ctx.shard_snapshots.clone();
                 let pk_columns = ctx.pk_columns.clone();
                 let active = active_memtable.clone();
                 b.to_async(&rt).iter(|| {
                     let dataset = dataset.clone();
-                    let region_snapshots = region_snapshots.clone();
+                    let shard_snapshots = shard_snapshots.clone();
                     let pk_columns = pk_columns.clone();
                     let active = active.clone();
                     async move {
-                        let scanner = LsmScanner::new(dataset, region_snapshots, pk_columns)
-                            .with_active_memtable(region_id, active)
+                        let scanner = LsmScanner::new(dataset, shard_snapshots, pk_columns)
+                            .with_active_memtable(shard_id, active)
                             .project(&["id"]);
                         let batches: Vec<RecordBatch> = scanner
                             .try_into_stream()
@@ -609,7 +608,7 @@ fn bench_point_lookup(c: &mut Criterion) {
     );
 
     // LSM point lookup: key in base table
-    if let Some((region_id, ref active_memtable)) = ctx.active_memtable {
+    if let Some((shard_id, ref active_memtable)) = ctx.active_memtable {
         let arrow_schema: Arc<ArrowSchema> = Arc::new(ctx.lsm_dataset.schema().into());
 
         group.bench_with_input(
@@ -617,20 +616,20 @@ fn bench_point_lookup(c: &mut Criterion) {
             &(),
             |b, _| {
                 let dataset = ctx.lsm_dataset.clone();
-                let region_snapshots = ctx.region_snapshots.clone();
+                let shard_snapshots = ctx.shard_snapshots.clone();
                 let pk_columns = ctx.pk_columns.clone();
                 let schema = arrow_schema.clone();
                 let active = active_memtable.clone();
                 let lookup_id = base_lookup_id;
                 b.to_async(&rt).iter(|| {
                     let dataset = dataset.clone();
-                    let region_snapshots = region_snapshots.clone();
+                    let shard_snapshots = shard_snapshots.clone();
                     let pk_columns = pk_columns.clone();
                     let schema = schema.clone();
                     let active = active.clone();
                     async move {
-                        let collector = LsmDataSourceCollector::new(dataset, region_snapshots)
-                            .with_active_memtable(region_id, active);
+                        let collector = LsmDataSourceCollector::new(dataset, shard_snapshots)
+                            .with_active_memtable(shard_id, active);
                         let planner = LsmPointLookupPlanner::new(collector, pk_columns, schema);
                         let plan = planner
                             .plan_lookup(&[ScalarValue::Int64(Some(lookup_id))], None)
@@ -652,20 +651,20 @@ fn bench_point_lookup(c: &mut Criterion) {
             &(),
             |b, _| {
                 let dataset = ctx.lsm_dataset.clone();
-                let region_snapshots = ctx.region_snapshots.clone();
+                let shard_snapshots = ctx.shard_snapshots.clone();
                 let pk_columns = ctx.pk_columns.clone();
                 let schema = arrow_schema.clone();
                 let active = active_memtable.clone();
                 let lookup_id = flushed_lookup_id;
                 b.to_async(&rt).iter(|| {
                     let dataset = dataset.clone();
-                    let region_snapshots = region_snapshots.clone();
+                    let shard_snapshots = shard_snapshots.clone();
                     let pk_columns = pk_columns.clone();
                     let schema = schema.clone();
                     let active = active.clone();
                     async move {
-                        let collector = LsmDataSourceCollector::new(dataset, region_snapshots)
-                            .with_active_memtable(region_id, active);
+                        let collector = LsmDataSourceCollector::new(dataset, shard_snapshots)
+                            .with_active_memtable(shard_id, active);
                         let planner = LsmPointLookupPlanner::new(collector, pk_columns, schema);
                         let plan = planner
                             .plan_lookup(&[ScalarValue::Int64(Some(lookup_id))], None)
@@ -687,20 +686,20 @@ fn bench_point_lookup(c: &mut Criterion) {
             &(),
             |b, _| {
                 let dataset = ctx.lsm_dataset.clone();
-                let region_snapshots = ctx.region_snapshots.clone();
+                let shard_snapshots = ctx.shard_snapshots.clone();
                 let pk_columns = ctx.pk_columns.clone();
                 let schema = arrow_schema.clone();
                 let active = active_memtable.clone();
                 let lookup_id = active_lookup_id;
                 b.to_async(&rt).iter(|| {
                     let dataset = dataset.clone();
-                    let region_snapshots = region_snapshots.clone();
+                    let shard_snapshots = shard_snapshots.clone();
                     let pk_columns = pk_columns.clone();
                     let schema = schema.clone();
                     let active = active.clone();
                     async move {
-                        let collector = LsmDataSourceCollector::new(dataset, region_snapshots)
-                            .with_active_memtable(region_id, active);
+                        let collector = LsmDataSourceCollector::new(dataset, shard_snapshots)
+                            .with_active_memtable(shard_id, active);
                         let planner = LsmPointLookupPlanner::new(collector, pk_columns, schema);
                         let plan = planner
                             .plan_lookup(&[ScalarValue::Int64(Some(lookup_id))], None)
@@ -786,7 +785,7 @@ fn create_query_vector(dim: usize) -> FixedSizeListArray {
 struct VectorBenchContext {
     base_dataset: Arc<Dataset>,
     lsm_dataset: Arc<Dataset>,
-    region_snapshots: Vec<RegionSnapshot>,
+    shard_snapshots: Vec<ShardSnapshot>,
     active_memtable: Option<(Uuid, ActiveMemTableRef)>,
     total_rows: usize,
     pk_columns: Vec<String>,
@@ -842,7 +841,7 @@ async fn setup_vector_benchmark(
     // Initialize MemWAL
     lsm_dataset
         .initialize_mem_wal(MemWalConfig {
-            region_spec: None,
+            shard_spec: None,
             maintained_indexes: vec![],
         })
         .await
@@ -850,21 +849,21 @@ async fn setup_vector_benchmark(
 
     let lsm_dataset = Arc::new(lsm_dataset);
 
-    let region_id = Uuid::new_v4();
-    let config = RegionWriterConfig {
-        region_id,
-        region_spec_id: 0,
+    let shard_id = Uuid::new_v4();
+    let config = ShardWriterConfig {
+        shard_id,
+        shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: false,
         max_memtable_size: memtable_rows * (dim * 4 + 8),
         max_memtable_rows: memtable_rows,
         max_wal_flush_interval: Some(Duration::from_secs(60)),
-        ..RegionWriterConfig::default()
+        ..ShardWriterConfig::default()
     };
 
     let writer = lsm_dataset
         .as_ref()
-        .mem_wal_writer(region_id, config)
+        .mem_wal_writer(shard_id, config)
         .await
         .unwrap();
 
@@ -909,12 +908,11 @@ async fn setup_vector_benchmark(
     let manifest = writer.manifest().await.unwrap();
     let active_memtable_ref = writer.active_memtable_ref().await;
 
-    let mut region_snapshot = RegionSnapshot::new(region_id);
+    let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {
-        region_snapshot = region_snapshot.with_current_generation(m.current_generation);
+        shard_snapshot = shard_snapshot.with_current_generation(m.current_generation);
         for fg in &m.flushed_generations {
-            region_snapshot =
-                region_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+            shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
         }
     }
 
@@ -931,8 +929,8 @@ async fn setup_vector_benchmark(
     VectorBenchContext {
         base_dataset,
         lsm_dataset,
-        region_snapshots: vec![region_snapshot],
-        active_memtable: Some((region_id, active_memtable_ref)),
+        shard_snapshots: vec![shard_snapshot],
+        active_memtable: Some((shard_id, active_memtable_ref)),
         total_rows: base_rows + memtable_rows * 2 + gen3_rows,
         pk_columns,
         vector_dim: dim,
@@ -992,26 +990,26 @@ fn bench_vector_search(c: &mut Criterion) {
     });
 
     // LSM vector search
-    if let Some((region_id, ref active_memtable)) = ctx.active_memtable {
+    if let Some((shard_id, ref active_memtable)) = ctx.active_memtable {
         let arrow_schema: Arc<ArrowSchema> = Arc::new(ctx.lsm_dataset.schema().into());
 
         group.bench_with_input(BenchmarkId::new("LSM_KNN", &label), &(), |b, _| {
             let dataset = ctx.lsm_dataset.clone();
-            let region_snapshots = ctx.region_snapshots.clone();
+            let shard_snapshots = ctx.shard_snapshots.clone();
             let pk_columns = ctx.pk_columns.clone();
             let schema = arrow_schema.clone();
             let active = active_memtable.clone();
             let query = create_query_vector(ctx.vector_dim);
             b.to_async(&rt).iter(|| {
                 let dataset = dataset.clone();
-                let region_snapshots = region_snapshots.clone();
+                let shard_snapshots = shard_snapshots.clone();
                 let pk_columns = pk_columns.clone();
                 let schema = schema.clone();
                 let active = active.clone();
                 let query = query.clone();
                 async move {
-                    let collector = LsmDataSourceCollector::new(dataset, region_snapshots)
-                        .with_active_memtable(region_id, active);
+                    let collector = LsmDataSourceCollector::new(dataset, shard_snapshots)
+                        .with_active_memtable(shard_id, active);
                     let planner = LsmVectorSearchPlanner::new(
                         collector,
                         pk_columns,

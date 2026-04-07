@@ -121,6 +121,17 @@ or independently of column indices due to variable encoding widths (for Lance fi
 
 </details>
 
+!!! note "Field-to-column mapping differs between data storage versions"
+
+    In **2.0**, all fields (including non-leaf fields like struct and list containers) are assigned
+    sequential column indices in `column_indices`.
+
+    In **2.1+**, non-leaf fields (unpacked structs, list containers) are assigned `-1` in
+    `column_indices` because their validity information is folded into repetition/definition
+    levels. Only leaf fields and packed structs have column indices.
+
+    See the [5.0.0 migration guide](../../guide/migration.md#500) for a detailed example.
+
 ## Deletion Files
 
 Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.

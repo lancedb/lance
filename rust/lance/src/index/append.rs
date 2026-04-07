@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::DatasetIndexInternalExt;
 use super::vector::LogicalVectorIndex;
-use super::vector::ivf::optimize_vector_indices;
+use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_rebalance};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
@@ -108,7 +108,13 @@ pub async fn merge_indices<'a>(
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
+    Box::pin(merge_indices_with_unindexed_frags(
+        dataset,
+        old_indices,
+        &unindexed,
+        options,
+    ))
+    .await
 }
 
 /// Merge a list of provided unindexed data, with a specific number of previous indices
@@ -145,12 +151,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         }
     }
 
-    let mut frag_bitmap = RoaringBitmap::new();
+    let mut base_unindexed_bitmap = RoaringBitmap::new();
     unindexed.iter().for_each(|frag| {
-        frag_bitmap.insert(frag.id as u32);
+        base_unindexed_bitmap.insert(frag.id as u32);
     });
 
-    let (new_uuid, indices_merged, created_index) = if first_is_vector_index {
+    let (new_uuid, removed_indices, new_fragment_bitmap, created_index) = if first_is_vector_index {
         let full_logical_index = dataset
             .open_logical_vector_index(&field_path, &old_indices[0].name)
             .await?;
@@ -180,50 +186,130 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         )?;
         let ivf_view = logical_index.as_ivf()?;
 
-        let new_data_stream = if unindexed.is_empty() {
-            None
-        } else {
-            let mut scanner = dataset.scan();
-            scanner
-                .with_fragments(unindexed.to_vec())
-                .with_row_id()
-                .project(&[&field_path])?;
-            if column.nullable {
-                let column_expr = lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
-                scanner.filter_expr(column_expr.is_not_null());
+        let use_single_segment_rebalance = logical_index.num_segments() > 1
+            && options.num_indices_to_merge.is_none()
+            && !options.retrain
+            && unindexed.is_empty();
+
+        if use_single_segment_rebalance {
+            let Some(selected_segment_id) = select_segment_for_single_rebalance(&ivf_view)? else {
+                return Ok(None);
+            };
+            let removed_segment = old_indices
+                .iter()
+                .copied()
+                .find(|metadata| metadata.uuid == selected_segment_id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Append index: logical vector index '{}' does not contain selected segment {}",
+                        old_indices[0].name, selected_segment_id
+                    ))
+                })?;
+            let (selected_metadata, selected_index) = logical_index
+                .iter()
+                .find(|(metadata, _)| metadata.uuid == selected_segment_id)
+                .map(|(metadata, index)| (metadata.clone(), index.clone()))
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Append index: failed to materialize selected segment {} from logical vector index '{}'",
+                        selected_segment_id, old_indices[0].name
+                    ))
+                })?;
+            let selected_logical_index = LogicalVectorIndex::try_new(
+                old_indices[0].name.clone(),
+                field_path.clone(),
+                vec![(selected_metadata, selected_index)],
+            )?;
+            let selected_ivf_view = selected_logical_index.as_ivf()?;
+            let (new_uuid, indices_merged) = Box::pin(optimize_vector_indices(
+                dataset.as_ref().clone(),
+                Option::<
+                    lance_io::stream::RecordBatchStreamAdapter<
+                        futures::stream::Empty<lance_core::Result<arrow_array::RecordBatch>>,
+                    >,
+                >::None,
+                &field_path,
+                &selected_ivf_view,
+                options,
+            ))
+            .await?;
+            if indices_merged == 0 {
+                return Ok(None);
             }
-            Some(scanner.try_into_stream().await?)
-        };
 
-        let (new_uuid, indices_merged) = optimize_vector_indices(
-            dataset.as_ref().clone(),
-            new_data_stream,
-            &field_path,
-            &ivf_view,
-            options,
-        )
-        .boxed()
-        .await?;
+            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+            let new_fragment_bitmap = removed_segment
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .or_else(|| removed_segment.fragment_bitmap.clone())
+                .unwrap_or_default();
 
-        old_indices[old_indices.len() - indices_merged..]
-            .iter()
-            .for_each(|idx| {
+            Ok((
+                new_uuid,
+                vec![removed_segment],
+                new_fragment_bitmap,
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: lance_index::IndexType::Vector.version() as u32,
+                    files: Some(files),
+                },
+            ))
+        } else {
+            let mut frag_bitmap = base_unindexed_bitmap.clone();
+
+            let new_data_stream = if unindexed.is_empty() {
+                None
+            } else {
+                let mut scanner = dataset.scan();
+                scanner
+                    .with_fragments(unindexed.to_vec())
+                    .with_row_id()
+                    .project(&[&field_path])?;
+                if column.nullable {
+                    let column_expr =
+                        lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
+                    scanner.filter_expr(column_expr.is_not_null());
+                }
+                Some(scanner.try_into_stream().await?)
+            };
+
+            let (new_uuid, indices_merged) = optimize_vector_indices(
+                dataset.as_ref().clone(),
+                new_data_stream,
+                &field_path,
+                &ivf_view,
+                options,
+            )
+            .boxed()
+            .await?;
+
+            let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
+            removed_indices.iter().for_each(|idx| {
                 frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
             });
+            for removed in removed_indices.iter() {
+                if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                {
+                    frag_bitmap |= &effective;
+                }
+            }
 
-        let index_dir = dataset.indices_dir().child(new_uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
-        Ok((
-            new_uuid,
-            indices_merged,
-            CreatedIndex {
-                index_details: vector_index_details(),
-                index_version: lance_index::IndexType::Vector.version() as u32,
-                files: Some(files),
-            },
-        ))
+            Ok((
+                new_uuid,
+                removed_indices,
+                frag_bitmap,
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: lance_index::IndexType::Vector.version() as u32,
+                    files: Some(files),
+                },
+            ))
+        }
     } else {
+        let mut frag_bitmap = base_unindexed_bitmap;
         let mut indices = Vec::with_capacity(old_indices.len());
         for idx in old_indices {
             match dataset
@@ -341,7 +427,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 };
 
                 // TODO: don't hard-code index version
-                Ok((new_uuid, 1, created_index))
+                Ok((
+                    new_uuid,
+                    vec![old_indices[old_indices.len() - 1]],
+                    frag_bitmap,
+                    created_index,
+                ))
             }
             _ => Err(Error::index(format!(
                 "Append index: invalid index type: {:?}",
@@ -350,17 +441,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         }
     }?;
 
-    let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
-    for removed in removed_indices.iter() {
-        if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap) {
-            frag_bitmap |= &effective;
-        }
-    }
-
     Ok(Some(IndexMergeResults {
         new_uuid,
         removed_indices,
-        new_fragment_bitmap: frag_bitmap,
+        new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
         files: created_index.files,

@@ -10,63 +10,63 @@ scan, point lookup, vector search and full-text search.
 A Lance table is called a **base table** under the context of the MemWAL spec.
 It must have an [unenforced primary key](index.md#unenforced-primary-key) defined in the table schema.
 
-On top of the base table, the MemWAL spec defines a set of regions.
-Writers write to regions, and data in each region is merged into the base table asynchronously.
-An index is kept in the base table for readers to quickly discover the state of all regions at a point of time.
+On top of the base table, the MemWAL spec defines a set of shards.
+Writers write to shards, and data in each shard is merged into the base table asynchronously.
+An index is kept in the base table for readers to quickly discover the state of all shards at a point of time.
 
-### MemWAL Region
+### MemWAL Shard
 
-A **MemWAL Region** is the main unit to horizontally scale out writes.
+A **MemWAL Shard** is the main unit to horizontally scale out writes.
 
-Each region has exactly one active writer at any time.
-Writers claim a region and then write data to that region.
-Data in each region is expected to be merged into the base table asynchronously.
+Each shard has exactly one active writer at any time.
+Writers claim a shard and then write data to that shard.
+Data in each shard is expected to be merged into the base table asynchronously.
 
-Rows of the same primary key must be written to one and only one region.
-If two regions contain rows with the same primary key, the following scenario can cause data corruption:
+Rows of the same primary key must be written to one and only one shard.
+If two shards contain rows with the same primary key, the following scenario can cause data corruption:
 
-1. Region A receives a write with primary key `pk=1` at time T1
-2. Region B receives a write with primary key `pk=1` at time T2 (T2 > T1)
-3. The row in region B is merged into the base table first
-4. The row in region A is merged into the base table second
-5. The row from Region A (older) now overwrites the row from Region B (newer)
+1. Shard A receives a write with primary key `pk=1` at time T1
+2. Shard B receives a write with primary key `pk=1` at time T2 (T2 > T1)
+3. The row in shard B is merged into the base table first
+4. The row in shard A is merged into the base table second
+5. The row from Shard A (older) now overwrites the row from Shard B (newer)
 
 This violates the expected "last write wins" semantics.
-By ensuring each primary key is assigned to exactly one region via the region spec,
-merge order between regions becomes irrelevant for correctness.
+By ensuring each primary key is assigned to exactly one shard via the shard spec,
+merge order between shards becomes irrelevant for correctness.
 
-See [MemWAL Region Architecture](#region-architecture) for the complete region architecture.
+See [MemWAL Shard Architecture](#shard-architecture) for the complete shard architecture.
 
 ### MemWAL Index
 
 A **MemWAL Index** is the centralized structure for all MemWAL metadata on top of a base table.
 A table has at most one MemWAL index. It stores:
 
-- **Configuration**: Region specs defining how rows map to regions, and which indexes to maintain
-- **Merge progress**: Last generation merged to base table for each region
+- **Configuration**: Shard specs defining how rows map to shards, and which indexes to maintain
+- **Merge progress**: Last generation merged to base table for each shard
 - **Index catchup progress**: Which merged generation each base table index has been rebuilt to cover
-- **Region snapshots**: Snapshot of all region states for read optimization
+- **Shard snapshots**: Snapshot of all shard states for read optimization
 
 The index is the source of truth for **configuration**, **merge progress** and **index catchup progress**
 Writers and mergers read the MemWAL index to get these configurations before writing.
 
-Each [region's manifest](#region-manifest) is authoritative for its own state.
-Readers use **region snapshots** is a read-only optimization to see a point-in-time view of all regions without the need to open each region manifest.
+Each [shard's manifest](#shard-manifest) is authoritative for its own state.
+Readers use **shard snapshots** is a read-only optimization to see a point-in-time view of all shards without the need to open each shard manifest.
 
 See [MemWAL Index Details](#memwal-index-details) for the complete structure.
 
-## Region Architecture
+## Shard Architecture
 
-![Region Architecture](../../images/mem_wal_regional.png)
+![Shard Architecture](../../images/mem_wal_regional.png)
 
-Within a region, writes are stored in an **in-memory table (MemTable)**.
-It is also written to the region's **Write-Ahead Log (WAL)** for durability guarantee.
+Within a shard, writes are stored in an **in-memory table (MemTable)**.
+It is also written to the shard's **Write-Ahead Log (WAL)** for durability guarantee.
 The MemTable is periodically **flushed** to storage based on memory pressure and other conditions.
 **Flushed MemTables** in storage are then asynchronously **merged** into the base table.
 
 ### MemTable
 
-A MemTable holds rows inserted into the region before flushing to storage.
+A MemTable holds rows inserted into the shard before flushing to storage.
 It serves 2 purposes:
 
 1. build up data and related indexes to be flushed to storage as a flushed MemTable
@@ -93,7 +93,7 @@ When MemTable of generation `N` is discarded, the next MemTable gets assigned ge
 
 ### WAL
 
-WAL serves as the durable storage of all MemTables in a region.
+WAL serves as the durable storage of all MemTables in a shard.
 It consists of data in MemTables ordered by generation.
 Every time we write to the WAL, we call it a **WAL Flush**.
 
@@ -121,7 +121,7 @@ If WAL entry `N` is not flushed fully, WAL entry `N+1` must not exist in storage
 **Replaying** a WAL means to read data in the WAL from a lower to a higher position.
 This is commonly used to recover the latest MemTable after it is lost,
 by reading from the start position of the latest MemTable generation till the highest position in the WAL,
-assuming proper fencing to guard against multiple writers to the same region.
+assuming proper fencing to guard against multiple writers to the same shard.
 
 See [Writer Fencing](#writer-fencing) for the full fencing mechanism.
 
@@ -132,7 +132,7 @@ The writer epoch is stored in the stream's Arrow schema metadata with key `write
 
 #### WAL Storage Layout
 
-Each WAL entry is stored within the WAL directory of the region located at `_mem_wal/{region_id}/wal`.
+Each WAL entry is stored within the WAL directory of the shard located at `_mem_wal/{shard_id}/wal`.
 
 WAL files use bit-reversed 64-bit binary naming to distribute files evenly across the directory keyspace.
 This optimizes S3 throughput by spreading sequential writes across S3's internal partitions, minimizing throttling.
@@ -164,11 +164,11 @@ lower numbers represent older data and must be merged to the base table first to
 Within a single flushed MemTable, if there are multiple rows of the same primary key,
 the row that is last inserted wins.
 
-### Region Manifest
+### Shard Manifest
 
-Each region has a manifest file. This is the source of truth for the state of a region.
+Each shard has a manifest file. This is the source of truth for the state of a shard.
 
-#### Region Manifest Contents
+#### Shard Manifest Contents
 
 The manifest contains:
 
@@ -177,21 +177,21 @@ The manifest contains:
 - **Generation trackers**: `current_generation` (next generation to flush), `flushed_generations` list of generation number and directory path pairs (e.g., generation 1 at `a1b2c3d4_gen_1`)
 
 Note: `wal_entry_position_last_seen` is a hint that may be stale since it's not updated on WAL write.
-It is updated opportunistically by any reader that can update the region manifest.
+It is updated opportunistically by any reader that can update the shard manifest.
 The manifest itself is atomically written, but recovery must try to get newer WAL files to find the actual state beyond this hint.
 
-The manifest is serialized as a protobuf binary file using the `RegionManifest` message.
+The manifest is serialized as a protobuf binary file using the `ShardManifest` message.
 
 <details>
-<summary>RegionManifest protobuf message</summary>
+<summary>ShardManifest protobuf message</summary>
 
 ```protobuf
-%%% mem_wal.message.RegionManifest %%%
+%%% mem_wal.message.ShardManifest %%%
 ```
 
 </details>
 
-#### Region Manifest Versioning
+#### Shard Manifest Versioning
 
 Manifests are versioned starting from 1 and immutable.
 Each update creates a new manifest file at the next version number.
@@ -212,13 +212,13 @@ To read the latest manifest version:
 4. The latest version is the last found version
 
 !!!note
-This works because the write rate to region manifests is significantly lower than read rates. Region manifests are only updated when region metadata changes (MemTable flush), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
+This works because the write rate to shard manifests is significantly lower than read rates. Shard manifests are only updated when shard metadata changes (MemTable flush), not on every write. This ensures HEAD requests will eventually terminate and find the latest version.
 
-#### Region Manifest Storage Layout
+#### Shard Manifest Storage Layout
 
-All region manifest versions are stored in `_mem_wal/{region_id}/manifest` directory.
+All shard manifest versions are stored in `_mem_wal/{shard_id}/manifest` directory.
 
-Each region manifest version file uses bit-reversed 64-bit binary naming, the same scheme as WAL files.
+Each shard manifest version file uses bit-reversed 64-bit binary naming, the same scheme as WAL files.
 For example, version 5 becomes `1010000000000000000000000000000000000000000000000000000000000000.binpb`.
 
 ## MemWAL Index Details
@@ -228,24 +228,24 @@ The MemWAL Index uses the [standard index storage](index/index.md#index-storage)
 The index stores its data in two parts:
 
 1. **Index details** (`index_details` in `IndexMetadata`): Contains configuration, merge progress, and snapshot metadata
-2. **Region snapshots**: Stored as a Lance file or inline, depending on region count
+2. **Shard snapshots**: Stored as a Lance file or inline, depending on shard count
 
 ### Index Details
 
 The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` protobuf message with the following key fields:
 
-- **Configuration fields** (`region_specs`, `maintained_indexes`) are the source of truth for MemWAL configuration.
+- **Configuration fields** (`shard_specs`, `maintained_indexes`) are the source of truth for MemWAL configuration.
   Writers read these fields to determine how to partition data and which indexes to maintain.
-- **Merge progress** (`merged_generations`) tracks the last generation merged to the base table for each region.
+- **Merge progress** (`merged_generations`) tracks the last generation merged to the base table for each shard.
   This field is updated atomically with merge-insert data commits, enabling conflict resolution when multiple mergers operate concurrently.
-  Each entry contains the region UUID and generation number.
+  Each entry contains the shard UUID and generation number.
 - **Index catchup progress** (`index_catchup`) tracks which merged generation each base table index has been rebuilt to cover.
   When data is merged from a flushed MemTable to the base table, the base table's indexes may be rebuilt asynchronously.
   During this window, queries should use the flushed MemTable's pre-built indexes instead of scanning unindexed data in the base table.
   See [Indexed Read Plan](#indexed-read-plan) for details.
-- **Region snapshot fields** (`snapshot_ts_millis`, `num_regions`, `inline_snapshots`) provide a snapshot of region states.
-  The actual region manifests remain authoritative for region state.
-  When `num_regions` is 0, the `inline_snapshots` field may be `None` or an empty Lance file with 0 rows but proper schema.
+- **Shard snapshot fields** (`snapshot_ts_millis`, `num_shards`, `inline_snapshots`) provide a snapshot of shard states.
+  The actual shard manifests remain authoritative for shard state.
+  When `num_shards` is 0, the `inline_snapshots` field may be `None` or an empty Lance file with 0 rows but proper schema.
 
 <details>
 <summary>MemWalIndexDetails protobuf message</summary>
@@ -256,55 +256,55 @@ The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` pro
 
 </details>
 
-### Region Identifier
+### Shard Identifier
 
-Each region has a unique identifier across all regions following UUID v4 standard.
-When a new region is created, it is assigned a new identifier.
+Each shard has a unique identifier across all shards following UUID v4 standard.
+When a new shard is created, it is assigned a new identifier.
 
-### Region Spec
+### Shard Spec
 
-A **Region Spec** defines how all rows in a table are logically divided into different regions,
-enabling automatic region assignment and query-time region pruning.
+A **Shard Spec** defines how all rows in a table are logically divided into different shards,
+enabling automatic shard assignment and query-time shard pruning.
 
-Each region spec has:
+Each shard spec has:
 
 - **Spec ID**: A positive integer that uniquely identifies this spec within the MemWAL index. IDs are never reused.
-- **Region fields**: An array of field definitions that determine how to compute region values.
+- **Shard fields**: An array of field definitions that determine how to compute shard values.
 
-Each region is bound to a specific region spec ID, recorded in its [manifest](#region-manifest).
-Regions without a spec ID (`spec_id = 0`) are manually-created regions not governed by any spec.
+Each shard is bound to a specific shard spec ID, recorded in its [manifest](#shard-manifest).
+Shards without a spec ID (`spec_id = 0`) are manually-created shards not governed by any spec.
 
-A region spec's field array consists of **region field** definitions.
-Each region field has the following properties:
+A shard spec's field array consists of **shard field** definitions.
+Each shard field has the following properties:
 
 | Property      | Description                                                               |
 | ------------- | ------------------------------------------------------------------------- |
-| `field_id`    | Unique string identifier for this region field                            |
+| `field_id`    | Unique string identifier for this shard field                            |
 | `source_ids`  | Array of field IDs referencing source columns in the schema               |
-| `transform`   | A well-known region expression, specify this or `expression`              |
+| `transform`   | A well-known shard expression, specify this or `expression`              |
 | `expression`  | A DataFusion SQL expression for custom logic, specify this or `transform` |
-| `result_type` | The output type of the region value                                       |
+| `result_type` | The output type of the shard value                                       |
 
-#### Region Expression
+#### Shard Expression
 
-A **Region Expression** is a [DataFusion SQL expression](https://datafusion.apache.org/user-guide/sql/index.html) that derives a region value from source column(s).
+A **Shard Expression** is a [DataFusion SQL expression](https://datafusion.apache.org/user-guide/sql/index.html) that derives a shard value from source column(s).
 Source columns are referenced as `col0`, `col1`, etc., corresponding to the order of field IDs in `source_ids`.
 
-Region expressions must satisfy the following requirements:
+Shard expressions must satisfy the following requirements:
 
 1. **Deterministic**: The same input value must always produce the same output value.
 2. **Stateless**: The expression must not depend on external state (e.g., current time, random values, session variables).
-3. **Type-promotion resistant**: The expression must produce the same result for equivalent values regardless of their numeric type (e.g., `int32(5)` and `int64(5)` must yield the same region value).
+3. **Type-promotion resistant**: The expression must produce the same result for equivalent values regardless of their numeric type (e.g., `int32(5)` and `int64(5)` must yield the same shard value).
 4. **Column removal resistant**: If a source field ID is not found in the schema, the column should be interpreted as NULL.
 5. **NULL-safe**: The expression should properly handle NULL inputs and have defined behavior (e.g., return NULL if input is NULL for single-column expressions).
 6. **Consistent with result type**: The expression's return type must be consistent with `result_type` in non-NULL cases.
 
-#### Region Transform
+#### Shard Transform
 
-A **Region Transform** is a well-known region expression with a predefined name.
+A **Shard Transform** is a well-known shard expression with a predefined name.
 When a transform is specified, the expression is derived automatically.
 
-| Transform      | Parameters    | Region Expression                                         | Result Type    |
+| Transform      | Parameters    | Shard Expression                                         | Result Type    |
 | -------------- | ------------- | --------------------------------------------------------- | -------------- |
 | `identity`     | (none)        | `col0`                                                    | same as source |
 | `year`         | (none)        | `date_part('year', col0)`                                 | `int32`        |
@@ -322,48 +322,48 @@ The `bucket` and `multi_bucket` transforms use Murmur3 hash functions:
 
 The hash result is wrapped with `abs()` and modulo `N` to produce a non-negative bucket number in the range `[0, N)`.
 
-### Region Snapshot Storage
+### Shard Snapshot Storage
 
-Region snapshots are stored using one of two strategies based on the number of regions:
+Shard snapshots are stored using one of two strategies based on the number of shards:
 
-| Region Count       | Storage Strategy    | Location                                  |
+| Shard Count       | Storage Strategy    | Location                                  |
 | ------------------ | ------------------- | ----------------------------------------- |
 | <= 100 (threshold) | Inline              | `inline_snapshots` field in index details |
 | > 100              | External Lance file | `_indices/{UUID}/index.lance`             |
 
-The threshold (100 regions) is implementation-defined and may vary.
+The threshold (100 shards) is implementation-defined and may vary.
 
-**Inline storage**: For small region counts, snapshots are serialized as a Lance file and stored in the `inline_snapshots` field.
+**Inline storage**: For small shard counts, snapshots are serialized as a Lance file and stored in the `inline_snapshots` field.
 This keeps the index metadata compact while avoiding an additional file read for common cases.
 
-**External Lance file**: For large region counts, snapshots are stored as a Lance file at `_indices/{UUID}/index.lance`.
-This file uses standard Lance format with the region snapshot schema, enabling efficient columnar access and compression.
+**External Lance file**: For large shard counts, snapshots are stored as a Lance file at `_indices/{UUID}/index.lance`.
+This file uses standard Lance format with the shard snapshot schema, enabling efficient columnar access and compression.
 
-### Region Snapshot Arrow Schema
+### Shard Snapshot Arrow Schema
 
-Region snapshots are stored as a Lance file with one row per region.
-The schema has one column per `RegionManifest` field plus region spec columns:
+Shard snapshots are stored as a Lance file with one row per shard.
+The schema has one column per `ShardManifest` field plus shard spec columns:
 
 | Column                            | Type                                             | Description                                              |
 | --------------------------------- | ------------------------------------------------ | -------------------------------------------------------- |
-| `region_id`                       | `fixed_size_binary(16)`                          | Region UUID bytes                                        |
-| `version`                         | `uint64`                                         | Region manifest version                                  |
-| `region_spec_id`                  | `uint32`                                         | Region spec ID (0 if manual)                             |
+| `shard_id`                       | `fixed_size_binary(16)`                          | Shard UUID bytes                                        |
+| `version`                         | `uint64`                                         | Shard manifest version                                  |
+| `shard_spec_id`                  | `uint32`                                         | Shard spec ID (0 if manual)                             |
 | `writer_epoch`                    | `uint64`                                         | Writer fencing token                                     |
 | `replay_after_wal_entry_position` | `uint64`                                         | Last WAL entry position (0-based) flushed to MemTable    |
 | `wal_entry_position_last_seen`    | `uint64`                                         | Last WAL entry position (0-based) seen (hint)            |
 | `current_generation`              | `uint64`                                         | Next generation to flush                                 |
 | `flushed_generations`             | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths                                   |
-| `region_field_{field_id}`         | varies                                           | Region field value (one column per field in region spec) |
+| `region_field_{field_id}`         | varies                                           | Shard field value (one column per field in shard spec) |
 
-For example, with a region spec containing a field `user_bucket` of type `int32`:
+For example, with a shard spec containing a field `user_bucket` of type `int32`:
 
 | Column                     | Type    | Description                  |
 | -------------------------- | ------- | ---------------------------- |
 | ...                        | ...     | (base columns above)         |
-| `region_field_user_bucket` | `int32` | Bucket value for this region |
+| `region_field_user_bucket` | `int32` | Bucket value for this shard |
 
-This schema directly corresponds to the fields in the `RegionManifest` protobuf message plus the computed region field values.
+This schema directly corresponds to the fields in the `ShardManifest` protobuf message plus the computed shard field values.
 
 ## Storage Layout
 
@@ -373,12 +373,12 @@ Here is a recap of the storage layout with all the files and concepts defined so
 {table_path}/
 ├── _indices/
 │   └── {index_uuid}/                    # MemWAL Index (uses standard index storage)
-│       └── index.lance                  # Serialized region snapshots (Lance file)
+│       └── index.lance                  # Serialized shard snapshots (Lance file)
 │
 └── _mem_wal/
-    └── {region_uuid}/                   # Region directory (UUID v4)
+    └── {region_uuid}/                   # Shard directory (UUID v4)
         ├── manifest/
-        │   ├── {bit_reversed_version}.binpb     # Serialized region manifest (bit-reversed naming)
+        │   ├── {bit_reversed_version}.binpb     # Serialized shard manifest (bit-reversed naming)
         │   └── version_hint.json                # Version hint file
         ├── wal/
         │   ├── {bit_reversed_entry_id}.lance    # WAL data files (bit-reversed naming)
@@ -398,7 +398,7 @@ This specification describes the storage layout for the LSM tree architecture. I
 
 The specification defines:
 
-- **Storage layout**: The directory structure, file formats, and naming conventions for WAL entries, flushed MemTables, region manifests, and the MemWAL index
+- **Storage layout**: The directory structure, file formats, and naming conventions for WAL entries, flushed MemTables, shard manifests, and the MemWAL index
 - **Durability guarantees**: How data is persisted through WAL entries and flushed MemTables
 - **Consistency model**: How readers and writers coordinate through manifests and epoch-based fencing
 
@@ -413,19 +413,19 @@ As long as the storage layout is correct and the documented invariants are maint
 
 ## Writer Expectations
 
-A writer operates on a single region and is responsible for:
+A writer operates on a single shard and is responsible for:
 
-1. Claiming the region using epoch-based fencing
+1. Claiming the shard using epoch-based fencing
 2. Writing data to WAL entries and flushed MemTables following the [storage layout](#storage-layout)
-3. Maintaining the region manifest to track WAL and generation progress
+3. Maintaining the shard manifest to track WAL and generation progress
 
 ### Writer Fencing
 
-Writers use epoch-based fencing to ensure single-writer semantics per region.
+Writers use epoch-based fencing to ensure single-writer semantics per shard.
 
-To claim a region:
+To claim a shard:
 
-1. Load the latest region manifest
+1. Load the latest shard manifest
 2. Increment `writer_epoch` by one
 3. Atomically write a new manifest version
 4. If the write fails (another writer claimed the epoch), reload and retry with a higher epoch
@@ -443,20 +443,20 @@ Background jobs handle merging flushed MemTables to the base table and garbage c
 
 ### MemTable Merger
 
-Flushed MemTables must be merged to the base table in **ascending generation order** within each region. This ordering is essential for correct upsert semantics: newer generations must overwrite older ones.
+Flushed MemTables must be merged to the base table in **ascending generation order** within each shard. This ordering is essential for correct upsert semantics: newer generations must overwrite older ones.
 
 The merge uses Lance's merge-insert operation with atomic transaction semantics:
 
-- `merged_generations[region_id]` is updated atomically with the data commit
+- `merged_generations[shard_id]` is updated atomically with the data commit
 - On commit conflict, check the conflicting commit's `merged_generations` to determine if the generation was already merged
 
 For a concrete example, see [Appendix 2: Concurrent Merger Example](#appendix-2-concurrent-merger-example).
 
 ### Garbage Collector
 
-The garbage collector removes obsolete data from region directories. Flushed MemTables and their referenced WAL files may be deleted after:
+The garbage collector removes obsolete data from shard directories. Flushed MemTables and their referenced WAL files may be deleted after:
 
-1. The generation has been merged to the base table (`generation <= merged_generations[region_id]`)
+1. The generation has been merged to the base table (`generation <= merged_generations[shard_id]`)
 2. All maintained indexes have caught up (`generation <= min(index_catchup[I].caught_up_generation)`)
 3. No retained base table version references the generation for time travel
 
@@ -486,9 +486,9 @@ Without proper merging, queries would return duplicate or stale rows.
 Reader consistency depends on two factors:
 
 1. access to in-memory MemTables
-2. the source of region metadata (either through MemWAL index or region manifests)
+2. the source of shard metadata (either through MemWAL index or shard manifests)
 
-Strong consistency requires access to in-memory MemTables for all regions involved in the query and reading region manifests directly.
+Strong consistency requires access to in-memory MemTables for all shards involved in the query and reading shard manifests directly.
 Otherwise, the query is eventually consistent due to missing unflushed data or stale MemWAL Index snapshots.
 
 !!!note
@@ -510,30 +510,30 @@ Datasets come from:
 3. optionally in-memory MemTables (if accessible).
 
 Each dataset is tagged with a generation number: 0 for the base table, and positive integers for MemTable generations.
-Within a region, the generation number determines data freshness, with higher numbers representing newer data.
-Rows from different regions do not need deduplication since each primary key maps to exactly one region.
+Within a shard, the generation number determines data freshness, with higher numbers representing newer data.
+Rows from different shards do not need deduplication since each primary key maps to exactly one shard.
 
 The planner also collects bloom filters from each generation for staleness detection during search queries.
 
-#### Region Pruning
+#### Shard Pruning
 
-Before executing queries, if region spec is available,
-the planner evaluates filter predicates against region specs to determine which regions may contain matching data.
-This pruning step reduces the number of regions to scan.
+Before executing queries, if shard spec is available,
+the planner evaluates filter predicates against shard specs to determine which shards may contain matching data.
+This pruning step reduces the number of shards to scan.
 
 For each filter predicate:
 
-1. Extract predicates on columns used in region specs
-2. Evaluate which region values can satisfy the predicate
-3. Prune regions whose values cannot match
+1. Extract predicates on columns used in shard specs
+2. Evaluate which shard values can satisfy the predicate
+3. Prune shards whose values cannot match
 
-For example, with a region spec using `bucket(user_id, 10)` and a filter `user_id = 123`:
+For example, with a shard spec using `bucket(user_id, 10)` and a filter `user_id = 123`:
 
 1. Compute `bucket(123, 10) = 3`
-2. Only scan regions with bucket value 3
-3. Skip all other regions
+2. Only scan shards with bucket value 3
+3. Skip all other shards
 
-Region pruning applies to both scan queries and prefilters in search queries.
+Shard pruning applies to both scan queries and prefilters in search queries.
 
 #### Indexed Read Plan
 
@@ -553,12 +553,12 @@ This ensures all reads remain indexed regardless of how far behind the async ind
 
 ### Appendix 1: Writer Fencing Example
 
-This example demonstrates how epoch-based fencing prevents data corruption when two writers compete for the same region.
+This example demonstrates how epoch-based fencing prevents data corruption when two writers compete for the same shard.
 
 #### Initial State
 
 ```
-Region manifest (version 1):
+Shard manifest (version 1):
   writer_epoch: 5
   replay_after_wal_entry_position: 10
   wal_entry_position_last_seen: 12
@@ -611,9 +611,9 @@ This example demonstrates how MemWAL Index and conflict resolution handle concur
 
 ```
 MemWAL Index:
-  merged_generations: {region: 5}
+  merged_generations: {shard: 5}
 
-Region manifest (version 1):
+Shard manifest (version 1):
   current_generation: 8
   flushed_generations: [(6, "abc123_gen_6"), (7, "def456_gen_7")]
 ```
@@ -625,10 +625,10 @@ Two mergers both try to merge generation 6 concurrently.
 | Step | Merger A                  | Merger B                       | MemWAL Index     |
 | ---- | ------------------------- | ------------------------------ | ---------------- |
 | 1    | Reads index: merged_gen=5 |                                | merged_gen=5     |
-| 2    | Reads region manifest     |                                |                  |
+| 2    | Reads shard manifest     |                                |                  |
 | 3    | Starts merging gen 6      |                                |                  |
 | 4    |                           | Reads index: merged_gen=5      | merged_gen=5     |
-| 5    |                           | Reads region manifest          |                  |
+| 5    |                           | Reads shard manifest          |                  |
 | 6    |                           | Starts merging gen 6           |                  |
 | 7    | Commits (merged_gen=6)    |                                | **merged_gen=6** |
 | 8    |                           | Tries to commit                |                  |
@@ -648,7 +648,7 @@ Merger A crashes after committing to the table.
 | 2    | Merges gen 6, commits     |                                  | **merged_gen=6** |
 | 3    | **CRASH**                 |                                  | merged_gen=6     |
 | 4    |                           | Reads index: merged_gen=6        | merged_gen=6     |
-| 5    |                           | Reads region manifest            |                  |
+| 5    |                           | Reads shard manifest            |                  |
 | 6    |                           | **Skips gen 6** (already merged) |                  |
 | 7    |                           | Merges gen 7, commits            | **merged_gen=7** |
 

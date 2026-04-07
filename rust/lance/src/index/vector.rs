@@ -157,6 +157,12 @@ impl<'a> LogicalIvfView<'a> {
         self.logical_index.iter().map(|(_, index)| index)
     }
 
+    pub(crate) fn segments(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&IndexMetadata, &Arc<dyn VectorIndex>)> + '_ {
+        self.logical_index.iter()
+    }
+
     /// Returns the partition count for each segment in this IVF index.
     pub fn num_partitions_per_segment(&self) -> Vec<(Uuid, usize)> {
         self.logical_index

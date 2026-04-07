@@ -627,10 +627,10 @@ pub struct PyRowDatasetVersionMeta(pub RowDatasetVersionMeta);
 
 #[pymethods]
 impl PyRowIdMeta {
-    fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
-        Err(PyNotImplementedError::new_err(
-            "PyRowIdMeta.asdict is not yet supported.s",
-        ))
+    fn asdict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        pythonize::pythonize(py, &self.0)
+            .map(|b| b.unbind())
+            .map_err(|err| PyValueError::new_err(format!("Could not convert RowIdMeta: {}", err)))
     }
 
     pub fn json(&self) -> PyResult<String> {
@@ -647,6 +647,13 @@ impl PyRowIdMeta {
         let row_id_meta = serde_json::from_str(&json).map_err(|err| {
             PyValueError::new_err(format!("Could not load RowIdMeta due to error: {}", err))
         })?;
+        Ok(Self(row_id_meta))
+    }
+
+    #[staticmethod]
+    pub fn from_dict(dict: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let row_id_meta: RowIdMeta = pythonize::depythonize(dict)
+            .map_err(|err| PyValueError::new_err(format!("Could not load RowIdMeta: {}", err)))?;
         Ok(Self(row_id_meta))
     }
 

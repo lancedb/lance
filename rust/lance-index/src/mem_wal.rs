@@ -17,8 +17,8 @@ use crate::{Index, IndexType};
 
 pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 
-/// Type alias for region identifier (UUID v4).
-pub type RegionId = Uuid;
+/// Type alias for shard identifier (UUID v4).
+pub type ShardId = Uuid;
 
 /// A flushed MemTable generation and its storage location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
@@ -45,10 +45,10 @@ impl From<pb::FlushedGeneration> for FlushedGeneration {
     }
 }
 
-/// A region's merged generation, used in MemWalIndexDetails.
+/// A shard's merged generation, used in MemWalIndexDetails.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct MergedGeneration {
-    pub region_id: Uuid,
+    pub shard_id: Uuid,
     pub generation: u64,
 }
 
@@ -59,9 +59,9 @@ impl DeepSizeOf for MergedGeneration {
 }
 
 impl MergedGeneration {
-    pub fn new(region_id: Uuid, generation: u64) -> Self {
+    pub fn new(shard_id: Uuid, generation: u64) -> Self {
         Self {
-            region_id,
+            shard_id,
             generation,
         }
     }
@@ -70,7 +70,7 @@ impl MergedGeneration {
 impl From<&MergedGeneration> for pb::MergedGeneration {
     fn from(mg: &MergedGeneration) -> Self {
         Self {
-            region_id: Some((&mg.region_id).into()),
+            shard_id: Some((&mg.shard_id).into()),
             generation: mg.generation,
         }
     }
@@ -80,13 +80,13 @@ impl TryFrom<pb::MergedGeneration> for MergedGeneration {
     type Error = Error;
 
     fn try_from(mg: pb::MergedGeneration) -> lance_core::Result<Self> {
-        let region_id = mg
-            .region_id
+        let shard_id = mg
+            .shard_id
             .as_ref()
             .map(Uuid::try_from)
-            .ok_or_else(|| Error::invalid_input("Missing region_id in MergedGeneration"))??;
+            .ok_or_else(|| Error::invalid_input("Missing shard_id in MergedGeneration"))??;
         Ok(Self {
-            region_id,
+            shard_id,
             generation: mg.generation,
         })
     }
@@ -108,12 +108,12 @@ impl IndexCatchupProgress {
         }
     }
 
-    /// Get the caught up generation for a specific region.
-    /// Returns None if the region is not present (assumed fully caught up).
-    pub fn caught_up_generation_for_region(&self, region_id: &Uuid) -> Option<u64> {
+    /// Get the caught up generation for a specific shard.
+    /// Returns None if the shard is not present (assumed fully caught up).
+    pub fn caught_up_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
         self.caught_up_generations
             .iter()
-            .find(|mg| &mg.region_id == region_id)
+            .find(|mg| &mg.shard_id == shard_id)
             .map(|mg| mg.generation)
     }
 }
@@ -146,13 +146,13 @@ impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
     }
 }
 
-/// Region manifest containing epoch-based fencing and WAL state.
-/// Each region has exactly one active writer at any time.
+/// Shard manifest containing epoch-based fencing and WAL state.
+/// Each shard has exactly one active writer at any time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegionManifest {
-    pub region_id: Uuid,
+pub struct ShardManifest {
+    pub shard_id: Uuid,
     pub version: u64,
-    pub region_spec_id: u32,
+    pub shard_spec_id: u32,
     pub writer_epoch: u64,
     /// The most recent WAL entry position (0-based) flushed to a MemTable.
     /// Recovery replays from `replay_after_wal_entry_position + 1`.
@@ -163,18 +163,18 @@ pub struct RegionManifest {
     pub flushed_generations: Vec<FlushedGeneration>,
 }
 
-impl DeepSizeOf for RegionManifest {
+impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.flushed_generations.deep_size_of_children(context)
     }
 }
 
-impl From<&RegionManifest> for pb::RegionManifest {
-    fn from(rm: &RegionManifest) -> Self {
+impl From<&ShardManifest> for pb::ShardManifest {
+    fn from(rm: &ShardManifest) -> Self {
         Self {
-            region_id: Some((&rm.region_id).into()),
+            shard_id: Some((&rm.shard_id).into()),
             version: rm.version,
-            region_spec_id: rm.region_spec_id,
+            shard_spec_id: rm.shard_spec_id,
             writer_epoch: rm.writer_epoch,
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
@@ -184,19 +184,19 @@ impl From<&RegionManifest> for pb::RegionManifest {
     }
 }
 
-impl TryFrom<pb::RegionManifest> for RegionManifest {
+impl TryFrom<pb::ShardManifest> for ShardManifest {
     type Error = Error;
 
-    fn try_from(rm: pb::RegionManifest) -> lance_core::Result<Self> {
-        let region_id = rm
-            .region_id
+    fn try_from(rm: pb::ShardManifest) -> lance_core::Result<Self> {
+        let shard_id = rm
+            .shard_id
             .as_ref()
             .map(Uuid::try_from)
-            .ok_or_else(|| Error::invalid_input("Missing region_id in RegionManifest"))??;
+            .ok_or_else(|| Error::invalid_input("Missing shard_id in ShardManifest"))??;
         Ok(Self {
-            region_id,
+            shard_id,
             version: rm.version,
-            region_spec_id: rm.region_spec_id,
+            shard_spec_id: rm.shard_spec_id,
             writer_epoch: rm.writer_epoch,
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
@@ -210,9 +210,9 @@ impl TryFrom<pb::RegionManifest> for RegionManifest {
     }
 }
 
-/// Region field definition.
+/// Shard field definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct RegionField {
+pub struct ShardField {
     pub field_id: String,
     pub source_ids: Vec<i32>,
     pub transform: Option<String>,
@@ -221,8 +221,8 @@ pub struct RegionField {
     pub parameters: HashMap<String, String>,
 }
 
-impl From<&RegionField> for pb::RegionField {
-    fn from(rf: &RegionField) -> Self {
+impl From<&ShardField> for pb::ShardField {
+    fn from(rf: &ShardField) -> Self {
         Self {
             field_id: rf.field_id.clone(),
             source_ids: rf.source_ids.clone(),
@@ -234,8 +234,8 @@ impl From<&RegionField> for pb::RegionField {
     }
 }
 
-impl From<pb::RegionField> for RegionField {
-    fn from(rf: pb::RegionField) -> Self {
+impl From<pb::ShardField> for ShardField {
+    fn from(rf: pb::ShardField) -> Self {
         Self {
             field_id: rf.field_id,
             source_ids: rf.source_ids,
@@ -247,15 +247,15 @@ impl From<pb::RegionField> for RegionField {
     }
 }
 
-/// Region spec definition.
+/// Shard spec definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct RegionSpec {
+pub struct ShardSpec {
     pub spec_id: u32,
-    pub fields: Vec<RegionField>,
+    pub fields: Vec<ShardField>,
 }
 
-impl From<&RegionSpec> for pb::RegionSpec {
-    fn from(rs: &RegionSpec) -> Self {
+impl From<&ShardSpec> for pb::ShardSpec {
+    fn from(rs: &ShardSpec) -> Self {
         Self {
             spec_id: rs.spec_id,
             fields: rs.fields.iter().map(|f| f.into()).collect(),
@@ -263,11 +263,11 @@ impl From<&RegionSpec> for pb::RegionSpec {
     }
 }
 
-impl From<pb::RegionSpec> for RegionSpec {
-    fn from(rs: pb::RegionSpec) -> Self {
+impl From<pb::ShardSpec> for ShardSpec {
+    fn from(rs: pb::ShardSpec) -> Self {
         Self {
             spec_id: rs.spec_id,
-            fields: rs.fields.into_iter().map(RegionField::from).collect(),
+            fields: rs.fields.into_iter().map(ShardField::from).collect(),
         }
     }
 }
@@ -276,9 +276,9 @@ impl From<pb::RegionSpec> for RegionSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct MemWalIndexDetails {
     pub snapshot_ts_millis: i64,
-    pub num_regions: u32,
+    pub num_shards: u32,
     pub inline_snapshots: Option<Vec<u8>>,
-    pub region_specs: Vec<RegionSpec>,
+    pub shard_specs: Vec<ShardSpec>,
     pub maintained_indexes: Vec<String>,
     pub merged_generations: Vec<MergedGeneration>,
     pub index_catchup: Vec<IndexCatchupProgress>,
@@ -288,9 +288,9 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
     fn from(details: &MemWalIndexDetails) -> Self {
         Self {
             snapshot_ts_millis: details.snapshot_ts_millis,
-            num_regions: details.num_regions,
+            num_shards: details.num_shards,
             inline_snapshots: details.inline_snapshots.clone(),
-            region_specs: details.region_specs.iter().map(|rs| rs.into()).collect(),
+            shard_specs: details.shard_specs.iter().map(|rs| rs.into()).collect(),
             maintained_indexes: details.maintained_indexes.clone(),
             merged_generations: details
                 .merged_generations
@@ -308,12 +308,12 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
     fn try_from(details: pb::MemWalIndexDetails) -> lance_core::Result<Self> {
         Ok(Self {
             snapshot_ts_millis: details.snapshot_ts_millis,
-            num_regions: details.num_regions,
+            num_shards: details.num_shards,
             inline_snapshots: details.inline_snapshots,
-            region_specs: details
-                .region_specs
+            shard_specs: details
+                .shard_specs
                 .into_iter()
-                .map(RegionSpec::from)
+                .map(ShardSpec::from)
                 .collect(),
             maintained_indexes: details.maintained_indexes,
             merged_generations: details
@@ -341,29 +341,29 @@ impl MemWalIndex {
         Self { details }
     }
 
-    pub fn merged_generation_for_region(&self, region_id: &Uuid) -> Option<u64> {
+    pub fn merged_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
         self.details
             .merged_generations
             .iter()
-            .find(|mg| &mg.region_id == region_id)
+            .find(|mg| &mg.shard_id == shard_id)
             .map(|mg| mg.generation)
     }
 
-    /// Get the caught up generation for a specific index and region.
+    /// Get the caught up generation for a specific index and shard.
     /// Returns None if the index is not tracked (assumed fully caught up).
-    pub fn index_caught_up_generation(&self, index_name: &str, region_id: &Uuid) -> Option<u64> {
+    pub fn index_caught_up_generation(&self, index_name: &str, shard_id: &Uuid) -> Option<u64> {
         self.details
             .index_catchup
             .iter()
             .find(|icp| icp.index_name == index_name)
-            .and_then(|icp| icp.caught_up_generation_for_region(region_id))
+            .and_then(|icp| icp.caught_up_generation_for_shard(shard_id))
     }
 
-    /// Check if an index is fully caught up for a region.
-    /// Returns true if the index covers all merged data for the region.
-    pub fn is_index_caught_up(&self, index_name: &str, region_id: &Uuid) -> bool {
-        let merged_gen = self.merged_generation_for_region(region_id).unwrap_or(0);
-        let caught_up_gen = self.index_caught_up_generation(index_name, region_id);
+    /// Check if an index is fully caught up for a shard.
+    /// Returns true if the index covers all merged data for the shard.
+    pub fn is_index_caught_up(&self, index_name: &str, shard_id: &Uuid) -> bool {
+        let merged_gen = self.merged_generation_for_shard(shard_id).unwrap_or(0);
+        let caught_up_gen = self.index_caught_up_generation(index_name, shard_id);
 
         // If not tracked in index_catchup, assumed fully caught up
         caught_up_gen.is_none_or(|generation| generation >= merged_gen)
@@ -372,9 +372,9 @@ impl MemWalIndex {
 
 #[derive(Serialize)]
 struct MemWalStatistics {
-    num_regions: u32,
+    num_shards: u32,
     num_merged_generations: usize,
-    num_region_specs: usize,
+    num_shard_specs: usize,
     num_maintained_indexes: usize,
     num_index_catchup_entries: usize,
 }
@@ -397,9 +397,9 @@ impl Index for MemWalIndex {
 
     fn statistics(&self) -> lance_core::Result<serde_json::Value> {
         let stats = MemWalStatistics {
-            num_regions: self.details.num_regions,
+            num_shards: self.details.num_shards,
             num_merged_generations: self.details.merged_generations.len(),
-            num_region_specs: self.details.region_specs.len(),
+            num_shard_specs: self.details.shard_specs.len(),
             num_maintained_indexes: self.details.maintained_indexes.len(),
             num_index_catchup_entries: self.details.index_catchup.len(),
         };

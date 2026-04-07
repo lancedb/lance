@@ -1,7 +1,7 @@
 # MemWAL Index
 
 The MemWAL Index is a system index that serves as the centralized structure for all MemWAL metadata.
-It stores configuration (region specs, indexes to maintain), merge progress, and region state snapshots.
+It stores configuration (shard specs, indexes to maintain), merge progress, and shard state snapshots.
 
 A table has at most one MemWAL index.
 

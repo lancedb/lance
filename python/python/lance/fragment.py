@@ -143,7 +143,7 @@ class FragmentMetadata:
 
         row_id_meta = json_data.get("row_id_meta")
         if row_id_meta is not None:
-            row_id_meta = RowIdMeta(**row_id_meta)
+            row_id_meta = RowIdMeta.from_dict(row_id_meta)
 
         created_at_version_meta = json_data.get("created_at_version_meta")
         if created_at_version_meta is not None:

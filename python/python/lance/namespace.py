@@ -16,35 +16,80 @@ from abc import ABC, abstractmethod
 from typing import Dict, Optional
 
 from lance_namespace import (
+    AlterTableAddColumnsRequest,
+    AlterTableAddColumnsResponse,
+    AlterTableAlterColumnsRequest,
+    AlterTableAlterColumnsResponse,
+    AlterTableDropColumnsRequest,
+    AlterTableDropColumnsResponse,
+    AlterTransactionRequest,
+    AlterTransactionResponse,
+    AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableIndexRequest,
+    CreateTableIndexResponse,
     CreateTableRequest,
     CreateTableResponse,
+    CreateTableTagRequest,
+    CreateTableTagResponse,
     DeclareTableRequest,
     DeclareTableResponse,
+    DeleteFromTableRequest,
+    DeleteFromTableResponse,
+    DeleteTableTagRequest,
+    DeleteTableTagResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
+    DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse,
     DescribeTableRequest,
     DescribeTableResponse,
+    DescribeTransactionRequest,
+    DescribeTransactionResponse,
     DropNamespaceRequest,
     DropNamespaceResponse,
+    DropTableIndexRequest,
+    DropTableIndexResponse,
     DropTableRequest,
     DropTableResponse,
+    ExplainTableQueryPlanRequest,
+    GetTableStatsRequest,
+    GetTableStatsResponse,
+    GetTableTagVersionRequest,
+    GetTableTagVersionResponse,
+    InsertIntoTableRequest,
+    InsertIntoTableResponse,
     LanceNamespace,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableIndicesRequest,
+    ListTableIndicesResponse,
     ListTablesRequest,
     ListTablesResponse,
+    ListTableTagsRequest,
+    ListTableTagsResponse,
     ListTableVersionsRequest,
     ListTableVersionsResponse,
+    MergeInsertIntoTableRequest,
+    MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
     RegisterTableRequest,
     RegisterTableResponse,
     RenameTableRequest,
     RenameTableResponse,
+    RestoreTableRequest,
+    RestoreTableResponse,
     TableExistsRequest,
+    UpdateTableRequest,
+    UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest,
+    UpdateTableTagResponse,
 )
 
 from .lance import PyDirectoryNamespace  # Low-level Rust binding
@@ -395,6 +440,10 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.declare_table(request.model_dump())
         return DeclareTableResponse.from_dict(response_dict)
 
+    def rename_table(self, request: RenameTableRequest) -> RenameTableResponse:
+        response_dict = self._inner.rename_table(request.model_dump())
+        return RenameTableResponse.from_dict(response_dict)
+
     # Table version operations
 
     def list_table_versions(
@@ -458,6 +507,321 @@ class DirectoryNamespace(LanceNamespace):
             - deleted_versions: List[int] - List of successfully deleted versions
         """
         return self._inner.batch_delete_table_versions(request)
+
+    # Data manipulation operations
+
+    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+        """Count the number of rows in a table, optionally filtered by a predicate.
+
+        Parameters
+        ----------
+        request : CountTableRowsRequest
+            Request with table id, optional version, and optional predicate filter
+
+        Returns
+        -------
+        int
+            The number of rows matching the criteria
+        """
+        return self._inner.count_table_rows(request.model_dump())
+
+    def insert_into_table(
+        self, request: InsertIntoTableRequest, request_data: bytes
+    ) -> InsertIntoTableResponse:
+        """Insert data into a table.
+
+        Parameters
+        ----------
+        request : InsertIntoTableRequest
+            Request with table id and write mode (append/overwrite)
+        request_data : bytes
+            Arrow IPC stream containing the data to insert
+
+        Returns
+        -------
+        InsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.insert_into_table(
+            request.model_dump(), request_data
+        )
+        return InsertIntoTableResponse.from_dict(response_dict)
+
+    def merge_insert_into_table(
+        self, request: MergeInsertIntoTableRequest, request_data: bytes
+    ) -> MergeInsertIntoTableResponse:
+        """Merge-insert data into a table (upsert operation).
+
+        Parameters
+        ----------
+        request : MergeInsertIntoTableRequest
+            Request with table id, merge keys, and merge behavior
+        request_data : bytes
+            Arrow IPC stream containing the data to merge
+
+        Returns
+        -------
+        MergeInsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.merge_insert_into_table(
+            request.model_dump(), request_data
+        )
+        return MergeInsertIntoTableResponse.from_dict(response_dict)
+
+    def update_table(self, request: UpdateTableRequest) -> UpdateTableResponse:
+        """Update rows in a table matching a filter.
+
+        Parameters
+        ----------
+        request : UpdateTableRequest
+            Request with table id, filter predicate, and column updates
+
+        Returns
+        -------
+        UpdateTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.update_table(request.model_dump())
+        return UpdateTableResponse.from_dict(response_dict)
+
+    def delete_from_table(
+        self, request: DeleteFromTableRequest
+    ) -> DeleteFromTableResponse:
+        """Delete rows from a table matching a filter.
+
+        Parameters
+        ----------
+        request : DeleteFromTableRequest
+            Request with table id and filter predicate
+
+        Returns
+        -------
+        DeleteFromTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.delete_from_table(request.model_dump())
+        return DeleteFromTableResponse.from_dict(response_dict)
+
+    def query_table(self, request) -> bytes:
+        """Query a table and return results as Arrow IPC.
+
+        Parameters
+        ----------
+        request : QueryTableRequest or dict
+            Query request with table id, optional filter, columns, vector search
+            parameters, limit/offset, etc.
+
+        Returns
+        -------
+        bytes
+            Arrow IPC file format containing the query results
+        """
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
+        return self._inner.query_table(request)
+
+    # Index operations
+
+    def create_table_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create an index on a table.
+
+        Parameters
+        ----------
+        request : CreateTableIndexRequest
+            Request with table id, index name, column, and index configuration
+
+        Returns
+        -------
+        CreateTableIndexResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.create_table_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def list_table_indices(
+        self, request: ListTableIndicesRequest
+    ) -> ListTableIndicesResponse:
+        """List all indices on a table.
+
+        Parameters
+        ----------
+        request : ListTableIndicesRequest
+            Request with table id
+
+        Returns
+        -------
+        ListTableIndicesResponse
+            Response with list of index metadata
+        """
+        response_dict = self._inner.list_table_indices(request.model_dump())
+        return ListTableIndicesResponse.from_dict(response_dict)
+
+    def describe_table_index_stats(
+        self, request: DescribeTableIndexStatsRequest
+    ) -> DescribeTableIndexStatsResponse:
+        """Get statistics for a specific index.
+
+        Parameters
+        ----------
+        request : DescribeTableIndexStatsRequest
+            Request with table id and index name
+
+        Returns
+        -------
+        DescribeTableIndexStatsResponse
+            Response with index statistics
+        """
+        response_dict = self._inner.describe_table_index_stats(request.model_dump())
+        return DescribeTableIndexStatsResponse.from_dict(response_dict)
+
+    # Transaction operations
+
+    def describe_transaction(
+        self, request: DescribeTransactionRequest
+    ) -> DescribeTransactionResponse:
+        """Describe a transaction.
+
+        Parameters
+        ----------
+        request : DescribeTransactionRequest
+            Request with transaction id
+
+        Returns
+        -------
+        DescribeTransactionResponse
+            Response with transaction details
+        """
+        response_dict = self._inner.describe_transaction(request.model_dump())
+        return DescribeTransactionResponse.from_dict(response_dict)
+
+    def alter_transaction(
+        self, request: AlterTransactionRequest
+    ) -> AlterTransactionResponse:
+        """Alter a transaction (commit or abort).
+
+        Parameters
+        ----------
+        request : AlterTransactionRequest
+            Request with transaction id and action
+
+        Returns
+        -------
+        AlterTransactionResponse
+            Response confirming the action
+        """
+        response_dict = self._inner.alter_transaction(request.model_dump())
+        return AlterTransactionResponse.from_dict(response_dict)
+
+    # Additional index operations
+
+    def create_table_scalar_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create a scalar index on a table column."""
+        response_dict = self._inner.create_table_scalar_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def drop_table_index(
+        self, request: DropTableIndexRequest
+    ) -> DropTableIndexResponse:
+        """Drop an index from a table."""
+        response_dict = self._inner.drop_table_index(request.model_dump())
+        return DropTableIndexResponse.from_dict(response_dict)
+
+    # Additional table operations
+
+    def list_all_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        """List all tables recursively across all namespaces."""
+        response_dict = self._inner.list_all_tables(request.model_dump())
+        return ListTablesResponse.from_dict(response_dict)
+
+    def restore_table(self, request: RestoreTableRequest) -> RestoreTableResponse:
+        """Restore a previously dropped table."""
+        response_dict = self._inner.restore_table(request.model_dump())
+        return RestoreTableResponse.from_dict(response_dict)
+
+    def update_table_schema_metadata(
+        self, request: UpdateTableSchemaMetadataRequest
+    ) -> UpdateTableSchemaMetadataResponse:
+        """Update the schema metadata of a table."""
+        response_dict = self._inner.update_table_schema_metadata(request.model_dump())
+        return UpdateTableSchemaMetadataResponse.from_dict(response_dict)
+
+    def get_table_stats(self, request: GetTableStatsRequest) -> GetTableStatsResponse:
+        """Get statistics for a table."""
+        response_dict = self._inner.get_table_stats(request.model_dump())
+        return GetTableStatsResponse.from_dict(response_dict)
+
+    # Query plan operations
+
+    def explain_table_query_plan(self, request: ExplainTableQueryPlanRequest) -> str:
+        """Explain the query plan for a table query."""
+        return self._inner.explain_table_query_plan(request.model_dump())
+
+    def analyze_table_query_plan(self, request: AnalyzeTableQueryPlanRequest) -> str:
+        """Analyze the query plan for a table query with execution statistics."""
+        return self._inner.analyze_table_query_plan(request.model_dump())
+
+    # Column alteration operations
+
+    def alter_table_add_columns(
+        self, request: AlterTableAddColumnsRequest
+    ) -> AlterTableAddColumnsResponse:
+        """Add columns to a table."""
+        response_dict = self._inner.alter_table_add_columns(request.model_dump())
+        return AlterTableAddColumnsResponse.from_dict(response_dict)
+
+    def alter_table_alter_columns(
+        self, request: AlterTableAlterColumnsRequest
+    ) -> AlterTableAlterColumnsResponse:
+        """Alter existing columns in a table."""
+        response_dict = self._inner.alter_table_alter_columns(request.model_dump())
+        return AlterTableAlterColumnsResponse.from_dict(response_dict)
+
+    def alter_table_drop_columns(
+        self, request: AlterTableDropColumnsRequest
+    ) -> AlterTableDropColumnsResponse:
+        """Drop columns from a table."""
+        response_dict = self._inner.alter_table_drop_columns(request.model_dump())
+        return AlterTableDropColumnsResponse.from_dict(response_dict)
+
+    # Table tag operations
+
+    def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
+        """List all tags on a table."""
+        response_dict = self._inner.list_table_tags(request.model_dump())
+        return ListTableTagsResponse.from_dict(response_dict)
+
+    def get_table_tag_version(
+        self, request: GetTableTagVersionRequest
+    ) -> GetTableTagVersionResponse:
+        """Get the version associated with a table tag."""
+        response_dict = self._inner.get_table_tag_version(request.model_dump())
+        return GetTableTagVersionResponse.from_dict(response_dict)
+
+    def create_table_tag(
+        self, request: CreateTableTagRequest
+    ) -> CreateTableTagResponse:
+        """Create a new tag pointing to a table version."""
+        response_dict = self._inner.create_table_tag(request.model_dump())
+        return CreateTableTagResponse.from_dict(response_dict)
+
+    def delete_table_tag(
+        self, request: DeleteTableTagRequest
+    ) -> DeleteTableTagResponse:
+        """Delete a tag from a table."""
+        response_dict = self._inner.delete_table_tag(request.model_dump())
+        return DeleteTableTagResponse.from_dict(response_dict)
+
+    def update_table_tag(
+        self, request: UpdateTableTagRequest
+    ) -> UpdateTableTagResponse:
+        """Update a tag to point to a different version."""
+        response_dict = self._inner.update_table_tag(request.model_dump())
+        return UpdateTableTagResponse.from_dict(response_dict)
 
     # Operation metrics methods
 
@@ -692,6 +1056,321 @@ class RestNamespace(LanceNamespace):
             - deleted_versions: List[int] - List of successfully deleted versions
         """
         return self._inner.batch_delete_table_versions(request)
+
+    # Data manipulation operations
+
+    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+        """Count the number of rows in a table, optionally filtered by a predicate.
+
+        Parameters
+        ----------
+        request : CountTableRowsRequest
+            Request with table id, optional version, and optional predicate filter
+
+        Returns
+        -------
+        int
+            The number of rows matching the criteria
+        """
+        return self._inner.count_table_rows(request.model_dump())
+
+    def insert_into_table(
+        self, request: InsertIntoTableRequest, request_data: bytes
+    ) -> InsertIntoTableResponse:
+        """Insert data into a table.
+
+        Parameters
+        ----------
+        request : InsertIntoTableRequest
+            Request with table id and write mode (append/overwrite)
+        request_data : bytes
+            Arrow IPC stream containing the data to insert
+
+        Returns
+        -------
+        InsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.insert_into_table(
+            request.model_dump(), request_data
+        )
+        return InsertIntoTableResponse.from_dict(response_dict)
+
+    def merge_insert_into_table(
+        self, request: MergeInsertIntoTableRequest, request_data: bytes
+    ) -> MergeInsertIntoTableResponse:
+        """Merge-insert data into a table (upsert operation).
+
+        Parameters
+        ----------
+        request : MergeInsertIntoTableRequest
+            Request with table id, merge keys, and merge behavior
+        request_data : bytes
+            Arrow IPC stream containing the data to merge
+
+        Returns
+        -------
+        MergeInsertIntoTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.merge_insert_into_table(
+            request.model_dump(), request_data
+        )
+        return MergeInsertIntoTableResponse.from_dict(response_dict)
+
+    def update_table(self, request: UpdateTableRequest) -> UpdateTableResponse:
+        """Update rows in a table matching a filter.
+
+        Parameters
+        ----------
+        request : UpdateTableRequest
+            Request with table id, filter predicate, and column updates
+
+        Returns
+        -------
+        UpdateTableResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.update_table(request.model_dump())
+        return UpdateTableResponse.from_dict(response_dict)
+
+    def delete_from_table(
+        self, request: DeleteFromTableRequest
+    ) -> DeleteFromTableResponse:
+        """Delete rows from a table matching a filter.
+
+        Parameters
+        ----------
+        request : DeleteFromTableRequest
+            Request with table id and filter predicate
+
+        Returns
+        -------
+        DeleteFromTableResponse
+            Response confirming the deletion
+        """
+        response_dict = self._inner.delete_from_table(request.model_dump())
+        return DeleteFromTableResponse.from_dict(response_dict)
+
+    def query_table(self, request) -> bytes:
+        """Query a table and return results as Arrow IPC.
+
+        Parameters
+        ----------
+        request : QueryTableRequest or dict
+            Query request with table id, optional filter, columns, vector search
+            parameters, limit/offset, etc.
+
+        Returns
+        -------
+        bytes
+            Arrow IPC file format containing the query results
+        """
+        if hasattr(request, "model_dump"):
+            request = request.model_dump()
+        return self._inner.query_table(request)
+
+    # Index operations
+
+    def create_table_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create an index on a table.
+
+        Parameters
+        ----------
+        request : CreateTableIndexRequest
+            Request with table id, index name, column, and index configuration
+
+        Returns
+        -------
+        CreateTableIndexResponse
+            Response with optional transaction_id
+        """
+        response_dict = self._inner.create_table_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def list_table_indices(
+        self, request: ListTableIndicesRequest
+    ) -> ListTableIndicesResponse:
+        """List all indices on a table.
+
+        Parameters
+        ----------
+        request : ListTableIndicesRequest
+            Request with table id
+
+        Returns
+        -------
+        ListTableIndicesResponse
+            Response with list of index metadata
+        """
+        response_dict = self._inner.list_table_indices(request.model_dump())
+        return ListTableIndicesResponse.from_dict(response_dict)
+
+    def describe_table_index_stats(
+        self, request: DescribeTableIndexStatsRequest
+    ) -> DescribeTableIndexStatsResponse:
+        """Get statistics for a specific index.
+
+        Parameters
+        ----------
+        request : DescribeTableIndexStatsRequest
+            Request with table id and index name
+
+        Returns
+        -------
+        DescribeTableIndexStatsResponse
+            Response with index statistics
+        """
+        response_dict = self._inner.describe_table_index_stats(request.model_dump())
+        return DescribeTableIndexStatsResponse.from_dict(response_dict)
+
+    # Transaction operations
+
+    def describe_transaction(
+        self, request: DescribeTransactionRequest
+    ) -> DescribeTransactionResponse:
+        """Describe a transaction.
+
+        Parameters
+        ----------
+        request : DescribeTransactionRequest
+            Request with transaction id
+
+        Returns
+        -------
+        DescribeTransactionResponse
+            Response with transaction details
+        """
+        response_dict = self._inner.describe_transaction(request.model_dump())
+        return DescribeTransactionResponse.from_dict(response_dict)
+
+    def alter_transaction(
+        self, request: AlterTransactionRequest
+    ) -> AlterTransactionResponse:
+        """Alter a transaction (commit or abort).
+
+        Parameters
+        ----------
+        request : AlterTransactionRequest
+            Request with transaction id and action
+
+        Returns
+        -------
+        AlterTransactionResponse
+            Response confirming the action
+        """
+        response_dict = self._inner.alter_transaction(request.model_dump())
+        return AlterTransactionResponse.from_dict(response_dict)
+
+    # Additional index operations
+
+    def create_table_scalar_index(
+        self, request: CreateTableIndexRequest
+    ) -> CreateTableIndexResponse:
+        """Create a scalar index on a table column."""
+        response_dict = self._inner.create_table_scalar_index(request.model_dump())
+        return CreateTableIndexResponse.from_dict(response_dict)
+
+    def drop_table_index(
+        self, request: DropTableIndexRequest
+    ) -> DropTableIndexResponse:
+        """Drop an index from a table."""
+        response_dict = self._inner.drop_table_index(request.model_dump())
+        return DropTableIndexResponse.from_dict(response_dict)
+
+    # Additional table operations
+
+    def list_all_tables(self, request: ListTablesRequest) -> ListTablesResponse:
+        """List all tables recursively across all namespaces."""
+        response_dict = self._inner.list_all_tables(request.model_dump())
+        return ListTablesResponse.from_dict(response_dict)
+
+    def restore_table(self, request: RestoreTableRequest) -> RestoreTableResponse:
+        """Restore a previously dropped table."""
+        response_dict = self._inner.restore_table(request.model_dump())
+        return RestoreTableResponse.from_dict(response_dict)
+
+    def update_table_schema_metadata(
+        self, request: UpdateTableSchemaMetadataRequest
+    ) -> UpdateTableSchemaMetadataResponse:
+        """Update the schema metadata of a table."""
+        response_dict = self._inner.update_table_schema_metadata(request.model_dump())
+        return UpdateTableSchemaMetadataResponse.from_dict(response_dict)
+
+    def get_table_stats(self, request: GetTableStatsRequest) -> GetTableStatsResponse:
+        """Get statistics for a table."""
+        response_dict = self._inner.get_table_stats(request.model_dump())
+        return GetTableStatsResponse.from_dict(response_dict)
+
+    # Query plan operations
+
+    def explain_table_query_plan(self, request: ExplainTableQueryPlanRequest) -> str:
+        """Explain the query plan for a table query."""
+        return self._inner.explain_table_query_plan(request.model_dump())
+
+    def analyze_table_query_plan(self, request: AnalyzeTableQueryPlanRequest) -> str:
+        """Analyze the query plan for a table query with execution statistics."""
+        return self._inner.analyze_table_query_plan(request.model_dump())
+
+    # Column alteration operations
+
+    def alter_table_add_columns(
+        self, request: AlterTableAddColumnsRequest
+    ) -> AlterTableAddColumnsResponse:
+        """Add columns to a table."""
+        response_dict = self._inner.alter_table_add_columns(request.model_dump())
+        return AlterTableAddColumnsResponse.from_dict(response_dict)
+
+    def alter_table_alter_columns(
+        self, request: AlterTableAlterColumnsRequest
+    ) -> AlterTableAlterColumnsResponse:
+        """Alter existing columns in a table."""
+        response_dict = self._inner.alter_table_alter_columns(request.model_dump())
+        return AlterTableAlterColumnsResponse.from_dict(response_dict)
+
+    def alter_table_drop_columns(
+        self, request: AlterTableDropColumnsRequest
+    ) -> AlterTableDropColumnsResponse:
+        """Drop columns from a table."""
+        response_dict = self._inner.alter_table_drop_columns(request.model_dump())
+        return AlterTableDropColumnsResponse.from_dict(response_dict)
+
+    # Table tag operations
+
+    def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
+        """List all tags on a table."""
+        response_dict = self._inner.list_table_tags(request.model_dump())
+        return ListTableTagsResponse.from_dict(response_dict)
+
+    def get_table_tag_version(
+        self, request: GetTableTagVersionRequest
+    ) -> GetTableTagVersionResponse:
+        """Get the version associated with a table tag."""
+        response_dict = self._inner.get_table_tag_version(request.model_dump())
+        return GetTableTagVersionResponse.from_dict(response_dict)
+
+    def create_table_tag(
+        self, request: CreateTableTagRequest
+    ) -> CreateTableTagResponse:
+        """Create a new tag pointing to a table version."""
+        response_dict = self._inner.create_table_tag(request.model_dump())
+        return CreateTableTagResponse.from_dict(response_dict)
+
+    def delete_table_tag(
+        self, request: DeleteTableTagRequest
+    ) -> DeleteTableTagResponse:
+        """Delete a tag from a table."""
+        response_dict = self._inner.delete_table_tag(request.model_dump())
+        return DeleteTableTagResponse.from_dict(response_dict)
+
+    def update_table_tag(
+        self, request: UpdateTableTagRequest
+    ) -> UpdateTableTagResponse:
+        """Update a tag to point to a different version."""
+        response_dict = self._inner.update_table_tag(request.model_dump())
+        return UpdateTableTagResponse.from_dict(response_dict)
 
     # Operation metrics methods
 

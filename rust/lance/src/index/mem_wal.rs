@@ -4,12 +4,12 @@
 //! MemWAL Index operations.
 //!
 //! The MemWAL Index stores:
-//! - Configuration (region_specs, maintained_indexes)
-//! - Merge progress (merged_generations per region)
-//! - Region state snapshots (eventually consistent)
+//! - Configuration (shard_specs, maintained_indexes)
+//! - Merge progress (merged_generations per shard)
+//! - Shard state snapshots (eventually consistent)
 //!
 //! Writers no longer update the index on every write. Instead, they update
-//! region manifests directly. This module provides functions to:
+//! shard manifests directly. This module provides functions to:
 //! - Load the MemWAL index
 //! - Update merged generations (called during merge-insert commits)
 
@@ -65,12 +65,12 @@ pub(crate) fn update_mem_wal_index_merged_generations(
         let current_meta = indices.remove(pos);
         let mut details = load_mem_wal_index_details(current_meta)?;
 
-        // Update merged_generations - for each region, keep the higher generation
+        // Update merged_generations - for each shard, keep the higher generation
         for new_mg in new_merged_generations {
             if let Some(existing) = details
                 .merged_generations
                 .iter_mut()
-                .find(|mg| mg.region_id == new_mg.region_id)
+                .find(|mg| mg.shard_id == new_mg.shard_id)
             {
                 if new_mg.generation > existing.generation {
                     existing.generation = new_mg.generation;
@@ -157,13 +157,13 @@ mod tests {
     #[tokio::test]
     async fn test_update_mem_wal_state_conflict_lower_generation_no_retry() {
         let dataset = test_dataset().await;
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // First commit UpdateMemWalState with generation 10
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -177,7 +177,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -194,13 +194,13 @@ mod tests {
     #[tokio::test]
     async fn test_update_mem_wal_state_conflict_equal_generation_no_retry() {
         let dataset = test_dataset().await;
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // First commit UpdateMemWalState with generation 10
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -213,7 +213,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -231,13 +231,13 @@ mod tests {
     #[tokio::test]
     async fn test_update_mem_wal_state_conflict_higher_generation_retryable() {
         let dataset = test_dataset().await;
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // First commit UpdateMemWalState with generation 5
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -251,7 +251,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -264,18 +264,18 @@ mod tests {
         );
     }
 
-    /// Test that UpdateMemWalState on different regions don't conflict.
+    /// Test that UpdateMemWalState on different shards don't conflict.
     #[tokio::test]
-    async fn test_update_mem_wal_state_different_regions_no_conflict() {
+    async fn test_update_mem_wal_state_different_shards_no_conflict() {
         let dataset = test_dataset().await;
-        let region1 = Uuid::new_v4();
-        let region2 = Uuid::new_v4();
+        let shard1 = Uuid::new_v4();
+        let shard2 = Uuid::new_v4();
 
-        // First commit UpdateMemWalState for region1
+        // First commit UpdateMemWalState for shard1
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region1, 10)],
+                merged_generations: vec![MergedGeneration::new(shard1, 10)],
             },
             None,
         );
@@ -284,12 +284,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Commit UpdateMemWalState for region2 based on old version
-        // This should succeed because different regions don't conflict
+        // Commit UpdateMemWalState for shard2 based on old version
+        // This should succeed because different shards don't conflict
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region2, 5)],
+                merged_generations: vec![MergedGeneration::new(shard2, 5)],
             },
             None,
         );
@@ -297,11 +297,11 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Expected success for different regions, got {:?}",
+            "Expected success for different shards, got {:?}",
             result
         );
 
-        // Verify both regions are in the index
+        // Verify both shards are in the index
         let dataset = result.unwrap();
         let mem_wal_idx = dataset
             .load_indices()
@@ -320,13 +320,13 @@ mod tests {
     #[tokio::test]
     async fn test_create_index_rebase_against_update_mem_wal_state() {
         let dataset = test_dataset().await;
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // First commit UpdateMemWalState with generation 10
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -338,7 +338,7 @@ mod tests {
         // CreateIndex of MemWalIndex based on old version (before UpdateMemWalState)
         // This should succeed and merge the generations
         let details = MemWalIndexDetails {
-            num_regions: 1,
+            num_shards: 1,
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(dataset.manifest.version - 1, details).unwrap();
@@ -371,20 +371,20 @@ mod tests {
             .clone();
         let details = load_mem_wal_index_details(mem_wal_idx).unwrap();
         assert_eq!(details.merged_generations.len(), 1);
-        assert_eq!(details.merged_generations[0].region_id, region);
+        assert_eq!(details.merged_generations[0].shard_id, shard);
         assert_eq!(details.merged_generations[0].generation, 10);
-        assert_eq!(details.num_regions, 1); // Config from CreateIndex preserved
+        assert_eq!(details.num_shards, 1); // Config from CreateIndex preserved
     }
 
     /// Test that UpdateMemWalState against CreateIndex of MemWalIndex checks generations.
     #[tokio::test]
     async fn test_update_mem_wal_state_against_create_index_lower_generation() {
         let dataset = test_dataset().await;
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // First commit CreateIndex of MemWalIndex with merged_generations
         let details = MemWalIndexDetails {
-            merged_generations: vec![MergedGeneration::new(region, 10)],
+            merged_generations: vec![MergedGeneration::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(dataset.manifest.version, details).unwrap();
@@ -406,7 +406,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -422,28 +422,28 @@ mod tests {
     #[test]
     fn test_update_merged_generations() {
         let mut indices = Vec::new();
-        let region1 = Uuid::new_v4();
-        let region2 = Uuid::new_v4();
+        let shard1 = Uuid::new_v4();
+        let shard2 = Uuid::new_v4();
 
         // First update - creates new index
         update_mem_wal_index_merged_generations(
             &mut indices,
             1,
-            vec![MergedGeneration::new(region1, 5)],
+            vec![MergedGeneration::new(shard1, 5)],
         )
         .unwrap();
 
         assert_eq!(indices.len(), 1);
         let details = load_mem_wal_index_details(indices[0].clone()).unwrap();
         assert_eq!(details.merged_generations.len(), 1);
-        assert_eq!(details.merged_generations[0].region_id, region1);
+        assert_eq!(details.merged_generations[0].shard_id, shard1);
         assert_eq!(details.merged_generations[0].generation, 5);
 
-        // Second update - updates existing region
+        // Second update - updates existing shard
         update_mem_wal_index_merged_generations(
             &mut indices,
             2,
-            vec![MergedGeneration::new(region1, 10)],
+            vec![MergedGeneration::new(shard1, 10)],
         )
         .unwrap();
 
@@ -452,11 +452,11 @@ mod tests {
         assert_eq!(details.merged_generations.len(), 1);
         assert_eq!(details.merged_generations[0].generation, 10);
 
-        // Third update - adds new region
+        // Third update - adds new shard
         update_mem_wal_index_merged_generations(
             &mut indices,
             3,
-            vec![MergedGeneration::new(region2, 3)],
+            vec![MergedGeneration::new(shard2, 3)],
         )
         .unwrap();
 
@@ -468,7 +468,7 @@ mod tests {
         update_mem_wal_index_merged_generations(
             &mut indices,
             4,
-            vec![MergedGeneration::new(region1, 8)], // lower than 10
+            vec![MergedGeneration::new(shard1, 8)], // lower than 10
         )
         .unwrap();
 
@@ -476,7 +476,7 @@ mod tests {
         let r1_mg = details
             .merged_generations
             .iter()
-            .find(|mg| mg.region_id == region1)
+            .find(|mg| mg.shard_id == shard1)
             .unwrap();
         assert_eq!(r1_mg.generation, 10); // Should still be 10
     }

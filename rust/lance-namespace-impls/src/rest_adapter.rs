@@ -12,12 +12,12 @@ use std::sync::Arc;
 use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
-    extract::{Path, Query, Request, State},
+    extract::{FromRequest, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::sync::watch;
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
@@ -102,7 +102,7 @@ impl RestAdapter {
                 "/v1/table/:id/create_scalar_index",
                 post(create_table_scalar_index),
             )
-            .route("/v1/table/:id/index/list", get(list_table_indices))
+            .route("/v1/table/:id/index/list", post(list_table_indices))
             .route(
                 "/v1/table/:id/index/:index_name/stats",
                 get(describe_table_index_stats),
@@ -232,8 +232,50 @@ impl RestAdapterHandle {
 }
 
 // ============================================================================
-// Query Parameters
+// Query Parameters and Extractors
 // ============================================================================
+
+/// Optional JSON body extractor that allows empty request bodies.
+/// Similar to sophon's MaybeJson - returns None if body is empty.
+struct MaybeJson<T>(Option<T>);
+
+impl<S, T> FromRequest<S> for MaybeJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send + 'static,
+{
+    type Rejection = Response;
+
+    fn from_request<'life0, 'async_trait>(
+        req: Request,
+        state: &'life0 S,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Self, Self::Rejection>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let bytes = Bytes::from_request(req, state)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+            if bytes.is_empty() {
+                return Ok(Self(None));
+            }
+
+            match serde_json::from_slice(&bytes) {
+                Ok(value) => Ok(Self(Some(value))),
+                Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
+            }
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct DelimiterQuery {
@@ -910,15 +952,11 @@ async fn list_table_indices(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
+    MaybeJson(body): MaybeJson<ListTableIndicesRequest>,
 ) -> Response {
-    let request = ListTableIndicesRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        version: None,
-        page_token: None,
-        limit: None,
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    let mut request = body.unwrap_or_default();
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.list_table_indices(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -1389,6 +1427,55 @@ mod tests {
             let mut buffer = Vec::new();
             {
                 let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            Bytes::from(buffer)
+        }
+
+        /// Helper to create Arrow IPC data with vector column for testing vector index
+        fn create_test_vector_data(num_rows: usize, dim: i32) -> Bytes {
+            use arrow::array::{FixedSizeListArray, Float32Array, Int32Array};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use arrow::record_batch::RecordBatch;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dim,
+                    ),
+                    true,
+                ),
+            ]));
+
+            let ids: Vec<i32> = (0..num_rows as i32).collect();
+            let vector_values: Vec<f32> = (0..(num_rows * dim as usize))
+                .map(|i| (i as f32) * 0.01)
+                .collect();
+
+            let vector_field = Arc::new(Field::new("item", DataType::Float32, true));
+            let vectors = FixedSizeListArray::try_new(
+                vector_field,
+                dim,
+                Arc::new(Float32Array::from(vector_values)),
+                None,
+            )
+            .unwrap();
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(vectors)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
                 writer.write(&batch).unwrap();
                 writer.finish().unwrap();
             }
@@ -3068,6 +3155,145 @@ mod tests {
             assert_eq!(
                 version_info.version.version, 1,
                 "Latest version should be 1"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_create_and_list_table_index() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_test_arrow_data();
+
+            // Create namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["index_test_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "index_test_ns".to_string(),
+                    "index_test_table".to_string(),
+                ]),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Create scalar index on 'id' column
+            let create_index_req = CreateTableIndexRequest {
+                id: Some(vec![
+                    "index_test_ns".to_string(),
+                    "index_test_table".to_string(),
+                ]),
+                column: "id".to_string(),
+                index_type: "BTREE".to_string(),
+                name: Some("id_idx".to_string()),
+                ..Default::default()
+            };
+            let result = fixture.namespace.create_table_index(create_index_req).await;
+            assert!(result.is_ok(), "Failed to create index: {:?}", result.err());
+
+            // List indices
+            let list_indices_req = ListTableIndicesRequest {
+                id: Some(vec![
+                    "index_test_ns".to_string(),
+                    "index_test_table".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_indices(list_indices_req).await;
+            assert!(result.is_ok(), "Failed to list indices: {:?}", result.err());
+            let indices = result.unwrap();
+            assert_eq!(indices.indexes.len(), 1, "Should have exactly one index");
+            assert_eq!(
+                indices.indexes[0].index_name, "id_idx",
+                "Index name should match"
+            );
+            assert_eq!(
+                indices.indexes[0].columns,
+                vec!["id"],
+                "Index column should be 'id'"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_create_vector_index() {
+            let fixture = RestServerFixture::new().await;
+            // Create 256 rows with 8-dimensional vectors for vector index
+            let table_data = create_test_vector_data(256, 8);
+
+            // Create namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["vector_index_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create table with vector data
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "vector_index_ns".to_string(),
+                    "vector_table".to_string(),
+                ]),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Create vector index on 'vector' column using IVF_FLAT
+            let mut create_index_req =
+                CreateTableIndexRequest::new("vector".to_string(), "IVF_FLAT".to_string());
+            create_index_req.id = Some(vec![
+                "vector_index_ns".to_string(),
+                "vector_table".to_string(),
+            ]);
+            create_index_req.name = Some("vector_idx".to_string());
+            create_index_req.distance_type = Some("l2".to_string());
+            let result = fixture.namespace.create_table_index(create_index_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to create vector index: {:?}",
+                result.err()
+            );
+
+            // List indices to verify
+            let list_indices_req = ListTableIndicesRequest {
+                id: Some(vec![
+                    "vector_index_ns".to_string(),
+                    "vector_table".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_indices(list_indices_req).await;
+            assert!(result.is_ok(), "Failed to list indices: {:?}", result.err());
+            let indices = result.unwrap();
+            assert_eq!(indices.indexes.len(), 1, "Should have exactly one index");
+            assert_eq!(
+                indices.indexes[0].index_name, "vector_idx",
+                "Index name should match"
+            );
+            assert_eq!(
+                indices.indexes[0].columns,
+                vec!["vector"],
+                "Index column should be 'vector'"
             );
         }
     }
