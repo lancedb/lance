@@ -18,10 +18,22 @@
 
 // Internal column name for the merge action. Using "__action" to avoid collisions with user columns.
 const MERGE_ACTION_COLUMN: &str = "__action";
-// Sentinel column injected into the source DataFrame before the join so we can reliably
-// detect whether the source side contributed a row to the join output, even when all ON
-// columns contain NULL.  After the join this column is true for every source-side row and
-// NULL for target-only rows (left-outer fill).  It is stripped before writing.
+// ## NULL-safe source row detection via sentinel column
+//
+// The merge join uses standard SQL equality for ON columns, which means NULL != NULL.
+// After an outer join we need to know for each output row whether it came from the
+// source side, the target side, or both.  The naive approach — checking whether an ON
+// column IS NOT NULL — is wrong: a source row whose ON column is legitimately NULL is
+// indistinguishable from a NULL introduced by the outer join on the target side.
+//
+// Solution: inject a `lit(true)` sentinel into every source row *before* the join.
+// After the join:
+//   - source rows (matched or unmatched)  → sentinel = true   (never NULL)
+//   - target-only rows                    → sentinel = NULL   (outer-join fill)
+//
+// `assign_action` then uses `sentinel IS NOT NULL` instead of key-column IS NOT NULL
+// to determine which side each row came from.  The sentinel is stripped by
+// `prepare_stream_schema` and never written to the dataset.
 pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 
 pub mod inserted_rows;
@@ -1508,7 +1520,7 @@ impl MergeInsertJob {
         Ok(matches!(
             self.params.when_matched,
             WhenMatched::UpdateAll
-                | WhenMatched::UpdateIf(_)                                                                  
+                | WhenMatched::UpdateIf(_)
                 | WhenMatched::Fail
                 | WhenMatched::Delete
         ) && (!self.params.use_index || !has_scalar_index)
@@ -2248,7 +2260,6 @@ mod tests {
             assert_plan_node_equals, assert_string_matches,
         },
     };
-    use arrow_array::RecordBatch;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::types::Float32Type;
     use arrow_array::{
@@ -2256,6 +2267,7 @@ mod tests {
         RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
         types::{Int32Type, UInt32Type},
     };
+    use arrow_array::{RecordBatch, record_batch};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
@@ -6472,26 +6484,16 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     /// row, causing it to be silently dropped (Action::Nothing).
     #[tokio::test]
     async fn test_merge_insert_null_on_column_inserts() {
-        // Schema with two ON columns, one of which will hold NULL values.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("record_type", DataType::Utf8, true),
-            Field::new("value", DataType::Int32, true),
-        ]));
-
         // Initial dataset: one row with a NULL record_type.
-        let initial_data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![Some(0)])),
-                Arc::new(StringArray::from(vec![Option::<&str>::None])),
-                Arc::new(Int32Array::from(vec![Some(10)])),
-            ],
+        let initial_data = record_batch!(
+            ("id", Int32, [0]),
+            ("record_type", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [10])
         )
         .unwrap();
 
         let dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(initial_data)], schema.clone()),
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
             "memory://test_null_on_column",
             None,
         )
@@ -6501,36 +6503,41 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // New data: a row with a different id AND a NULL record_type.
         // Because id differs (2 vs 0) no match should be found even with NULL-safe
         // semantics, so this row must be INSERTED.
-        let new_data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![Some(2)])),
-                Arc::new(StringArray::from(vec![Option::<&str>::None])),
-                Arc::new(Int32Array::from(vec![Some(99)])),
-            ],
+        let new_data = record_batch!(
+            ("id", Int32, [Some(2)]),
+            ("record_type", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(99)])
         )
         .unwrap();
 
-        let (merged_dataset, stats) =
-            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string(), "record_type".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .try_build()
-                .unwrap()
-                .execute_reader(Box::new(RecordBatchIterator::new(
-                    vec![Ok(new_data)],
-                    schema.clone(),
-                )))
-                .await
-                .unwrap();
+        let (merged_dataset, stats) = MergeInsertBuilder::try_new(
+            Arc::new(dataset),
+            vec!["id".to_string(), "record_type".to_string()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(new_data.clone())],
+            new_data.schema(),
+        )))
+        .await
+        .unwrap();
 
         // The source row (id=2, record_type=NULL) must be inserted, NOT silently skipped.
-        assert_eq!(stats.num_inserted_rows, 1, "row with NULL ON column should be inserted");
+        assert_eq!(
+            stats.num_inserted_rows, 1,
+            "row with NULL ON column should be inserted"
+        );
         assert_eq!(stats.num_updated_rows, 0, "no row should be updated");
 
         let count = merged_dataset.count_rows(None).await.unwrap();
-        assert_eq!(count, 2, "dataset should have the original row plus the newly inserted row");
+        assert_eq!(
+            count, 2,
+            "dataset should have the original row plus the newly inserted row"
+        );
     }
 
     /// Partial composite key match: the non-null part of the ON key (id) matches an
@@ -6539,25 +6546,16 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     /// and the source row must be inserted, not updated and not silently dropped.
     #[tokio::test]
     async fn test_merge_insert_partial_composite_key_null() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("record_type", DataType::Utf8, true),
-            Field::new("value", DataType::Int32, true),
-        ]));
-
         // Target: one row where id=1 and record_type="A".
-        let initial_data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![Some(1)])),
-                Arc::new(StringArray::from(vec![Some("A")])),
-                Arc::new(Int32Array::from(vec![Some(10)])),
-            ],
+        let initial_data = record_batch!(
+            ("id", Int32, [Some(1)]),
+            ("record_type", Utf8, [Some("A")]),
+            ("value", Int32, [Some(10)])
         )
         .unwrap();
 
         let dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(initial_data)], schema.clone()),
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
             "memory://test_partial_composite_null",
             None,
         )
@@ -6567,32 +6565,28 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // Source: one row where id=1 (matches target) but record_type=NULL.
         // The composite key (1, NULL) does NOT match (1, "A") under standard equality,
         // so this is a "not matched" row that should be inserted.
-        let new_data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![Some(1)])),
-                Arc::new(StringArray::from(vec![Option::<&str>::None])),
-                Arc::new(Int32Array::from(vec![Some(99)])),
-            ],
+        let new_data = record_batch!(
+            ("id", Int32, [Some(1)]),
+            ("record_type", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(99)])
         )
         .unwrap();
 
-        let (merged_dataset, stats) =
-            MergeInsertBuilder::try_new(
-                Arc::new(dataset),
-                vec!["id".to_string(), "record_type".to_string()],
-            )
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
-            .try_build()
-            .unwrap()
-            .execute_reader(Box::new(RecordBatchIterator::new(
-                vec![Ok(new_data)],
-                schema.clone(),
-            )))
-            .await
-            .unwrap();
+        let (merged_dataset, stats) = MergeInsertBuilder::try_new(
+            Arc::new(dataset),
+            vec!["id".to_string(), "record_type".to_string()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(new_data.clone())],
+            new_data.schema(),
+        )))
+        .await
+        .unwrap();
 
         // Source row (id=1, record_type=NULL) must be inserted, not updated and not dropped.
         assert_eq!(
@@ -6606,7 +6600,10 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
 
         // Dataset: original (1, "A") row + newly inserted (1, NULL) row = 2 rows.
         let count = merged_dataset.count_rows(None).await.unwrap();
-        assert_eq!(count, 2, "both the original and the new row must be present");
+        assert_eq!(
+            count, 2,
+            "both the original and the new row must be present"
+        );
     }
 
     /// Variant of test_merge_insert_null_on_column_inserts with a single ON column
@@ -6615,23 +6612,15 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     /// the existing target row and must be inserted separately.
     #[tokio::test]
     async fn test_merge_insert_null_single_on_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("value", DataType::Int32, true),
-        ]));
-
         // Dataset with a single row where id is NULL.
-        let initial_data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![Option::<i32>::None])),
-                Arc::new(Int32Array::from(vec![Some(1)])),
-            ],
+        let initial_data = record_batch!(
+            ("id", Int32, [Option::<i32>::None]),
+            ("value", Int32, [Some(1)])
         )
         .unwrap();
 
         let dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(initial_data)], schema.clone()),
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
             "memory://test_null_single_on_column",
             None,
         )
@@ -6641,12 +6630,9 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // Source has two rows: one with id=NULL and one with id=5.
         // id=NULL should not match the existing id=NULL row (standard equality), so it
         // gets inserted.  id=5 is a brand-new key and also gets inserted.
-        let new_data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![Option::<i32>::None, Some(5)])),
-                Arc::new(Int32Array::from(vec![Some(99), Some(50)])),
-            ],
+        let new_data = record_batch!(
+            ("id", Int32, [Option::<i32>::None, Some(5)]),
+            ("value", Int32, [Some(99), Some(50)])
         )
         .unwrap();
 
@@ -6658,14 +6644,17 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 .try_build()
                 .unwrap()
                 .execute_reader(Box::new(RecordBatchIterator::new(
-                    vec![Ok(new_data)],
-                    schema.clone(),
+                    vec![Ok(new_data.clone())],
+                    new_data.schema(),
                 )))
                 .await
                 .unwrap();
 
         // Both source rows must be inserted (not silently dropped).
-        assert_eq!(stats.num_inserted_rows, 2, "both rows with NULL ON column should be inserted");
+        assert_eq!(
+            stats.num_inserted_rows, 2,
+            "both rows with NULL ON column should be inserted"
+        );
         assert_eq!(stats.num_updated_rows, 0);
 
         // Dataset now has: original NULL-id row + 2 newly inserted rows = 3 total.

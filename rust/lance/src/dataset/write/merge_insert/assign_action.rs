@@ -91,9 +91,8 @@ pub fn merge_insert_action(
 
     let source_only = source_has_row.and(col("target._rowaddr").is_null());
 
-    let target_only = target_has_row.and(
-        col(format!("source.\"{}\"", MERGE_SOURCE_SENTINEL)).is_null(),
-    );
+    let target_only =
+        target_has_row.and(col(format!("source.\"{}\"", MERGE_SOURCE_SENTINEL)).is_null());
 
     let mut cases = vec![];
 
