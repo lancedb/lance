@@ -10,6 +10,7 @@ use futures::Future;
 
 use crate::Result;
 
+use super::CacheCodec;
 use super::backend::{CacheBackend, CacheEntry, InternalCacheKey};
 
 /// Internal record stored in the moka cache.
@@ -54,11 +55,17 @@ impl MokaCacheBackend {
 
 #[async_trait]
 impl CacheBackend for MokaCacheBackend {
-    async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+    async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }
 
-    async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize) {
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        _codec: Option<CacheCodec>,
+    ) {
         self.cache
             .insert(key.clone(), MokaCacheEntry { entry, size_bytes })
             .await;
@@ -68,6 +75,7 @@ impl CacheBackend for MokaCacheBackend {
         &self,
         key: &InternalCacheKey,
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        _codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
         // Use moka's built-in dedup: optionally_get_with runs the init future
         // at most once per key, even under concurrent access.

@@ -3361,7 +3361,12 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             schema,
             config_upsert_values: None,
             initial_bases: _,
-        } => schema_fragments_valid(Some(manifest), schema, fragments),
+        } => {
+            // Pass None for manifest because Overwrite replaces all fragments.
+            // The old manifest's storage format is irrelevant for validating
+            // the new fragments (e.g., LEGACY→STABLE transitions).
+            schema_fragments_valid(None, schema, fragments)
+        }
         Operation::Update {
             updated_fragments,
             new_fragments,
@@ -4456,5 +4461,70 @@ mod tests {
         let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
         assert!(result.is_ok());
         assert!(indices.is_empty());
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/6417
+    ///
+    /// When overwriting a LEGACY dataset with STABLE-format fragments, the
+    /// validation should not use the old manifest's format. STABLE fragments
+    /// omit struct parent fields, which the strict legacy check rejects.
+    #[test]
+    fn test_overwrite_legacy_to_stable_with_struct_fields() {
+        use arrow_schema::Fields;
+
+        // Schema: id (field 0), name (field 1), address (field 2, struct parent),
+        //   city (field 3), country (field 4)
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new(
+                "address",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("city", DataType::Utf8, false),
+                    ArrowField::new("country", DataType::Utf8, false),
+                ])),
+                false,
+            ),
+        ]);
+        let schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // Old manifest is LEGACY format
+        let legacy_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(LanceFileVersion::Legacy),
+            HashMap::new(),
+        );
+
+        // New fragments in STABLE format omit struct parent field (id=2),
+        // only including leaf fields: id=0, name=1, city=3, country=4
+        let stable_fragment = Fragment {
+            id: 0,
+            files: vec![DataFile::new(
+                "data.lance",
+                vec![0, 1, 3, 4], // no field 2 (struct parent)
+                vec![0, 1, 2, 3],
+                lance_file::format::MAJOR_VERSION as u32,
+                lance_file::format::MINOR_VERSION as u32,
+                None,
+                None,
+            )],
+            physical_rows: Some(10),
+            deletion_file: None,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let operation = Operation::Overwrite {
+            fragments: vec![stable_fragment],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        // This should succeed — the old manifest's LEGACY format should not
+        // cause strict validation of the new STABLE fragments.
+        validate_operation(Some(&legacy_manifest), &operation).unwrap();
     }
 }

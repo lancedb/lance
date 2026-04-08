@@ -250,6 +250,36 @@ class DataFile:
         )
         return self.fields
 
+    @classmethod
+    def create(
+        cls,
+        dataset: "LanceDataset",
+        path: str,
+        *,
+        base_id: Optional[int] = None,
+    ) -> "DataFile":
+        """Create a DataFile by reading metadata from an existing lance file.
+
+        This is a convenience method for creating DataFile metadata needed
+        for operations like DataReplacement. It opens the file, reads its
+        schema and version information, matches columns to the dataset's
+        schema to determine field IDs, and calculates column indices.
+
+        Parameters
+        ----------
+        dataset : LanceDataset
+            The dataset this file will belong to.
+        path : str
+            The path to the data file, relative to the dataset's data directory.
+        base_id : int, optional
+            The base path ID if the file is outside the dataset directory.
+
+        Returns
+        -------
+        DataFile
+        """
+        return _Fragment.create_data_file(dataset._ds, path, base_id=base_id)
+
 
 class LanceFragment(pa.dataset.Fragment):
     def __init__(

@@ -29,14 +29,17 @@ use lance_core::utils::tracing::{
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::reader::FileReaderOptions;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
-use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::{
+    CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
+};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
@@ -57,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
+use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1714,14 +1718,116 @@ impl Dataset {
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
-        match data_file.base_id.as_ref() {
+        self.data_file_dir_for_base(data_file.base_id)
+    }
+
+    /// Create a [`DataFile`] by reading metadata from an existing lance file.
+    ///
+    /// This reads the file's schema and version information, matches columns to
+    /// the dataset's schema to determine field IDs, and calculates column indices.
+    /// This is useful for constructing `DataFile` metadata needed for operations
+    /// like [`Operation::DataReplacement`].
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to the data file, relative to the dataset's data directory.
+    /// * `base_id` - The base path ID if the file is outside the dataset directory.
+    pub async fn create_data_file(&self, path: &str, base_id: Option<u32>) -> Result<DataFile> {
+        let data_dir = self.data_file_dir_for_base(base_id)?;
+        let filepath = data_dir.child(path);
+
+        // Get file size
+        let file_size = self.object_store().size(&filepath).await?;
+
+        // Read file metadata
+        let scheduler = ScanScheduler::new(
+            self.object_store.clone(),
+            SchedulerConfig::new(2 * 1024 * 1024 * 1024),
+        );
+        let file = scheduler
+            .open_file(&filepath, &CachedFileSize::new(file_size))
+            .await?;
+        let file_metadata = FileReader::read_all_metadata(&file).await?;
+
+        let file_version = LanceFileVersion::try_from_major_minor(
+            file_metadata.major_version as u32,
+            file_metadata.minor_version as u32,
+        )?;
+
+        // Get top-level column names from file schema in file order
+        let column_names: Vec<&str> = file_metadata
+            .file_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+
+        // Project dataset schema by file column names to get dataset field IDs
+        let projected_ds_schema = self.schema().project(&column_names)?;
+
+        // Walk both schemas in parallel to build fields and column_indices
+        let is_structural = file_version >= LanceFileVersion::V2_1;
+        let ds_fields: Vec<_> = projected_ds_schema.fields_pre_order().collect();
+        let file_fields: Vec<_> = file_metadata.file_schema.fields_pre_order().collect();
+
+        if ds_fields.len() != file_fields.len() {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: dataset projection has {} fields but file has {} fields",
+                ds_fields.len(),
+                file_fields.len()
+            )));
+        }
+
+        let mut fields = Vec::new();
+        let mut column_indices = Vec::new();
+        let mut curr_column_idx: i32 = 0;
+        let mut packed_struct_fields_num: usize = 0;
+
+        for (ds_field, file_field) in ds_fields.iter().zip(file_fields.iter()) {
+            if ds_field.name != file_field.name {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: expected field '{}' but file has '{}'",
+                    ds_field.name, file_field.name
+                )));
+            }
+
+            if packed_struct_fields_num > 0 {
+                packed_struct_fields_num -= 1;
+                continue;
+            }
+
+            if file_field.is_packed_struct() {
+                fields.push(ds_field.id);
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+                packed_struct_fields_num = file_field.children.len();
+            } else if file_field.children.is_empty() || !is_structural {
+                fields.push(ds_field.id);
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+            }
+        }
+
+        let file_size_nz = NonZero::new(file_size);
+        Ok(DataFile::new(
+            path,
+            fields,
+            column_indices,
+            file_metadata.major_version as u32,
+            file_metadata.minor_version as u32,
+            file_size_nz,
+            base_id,
+        ))
+    }
+
+    /// Resolve the data directory for a given base_id.
+    ///
+    /// If `base_id` is `None`, returns the default data directory.
+    fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
+        match base_id {
             Some(base_id) => {
-                let base_paths = &self.manifest.base_paths;
-                let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "base_path id {} not found for data_file {}",
-                        base_id, data_file.path
-                    ))
+                let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                    Error::invalid_input(format!("base_path id {} not found", base_id))
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {

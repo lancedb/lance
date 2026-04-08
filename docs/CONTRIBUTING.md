@@ -7,7 +7,7 @@ To build the docs, first install requirements:
 
 ```bash
 cd docs
-uc sync --dev
+uv sync --dev
 ```
 
 Then build and start the docs server:

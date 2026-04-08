@@ -109,6 +109,10 @@ impl CacheKey for IndexMetadataKey {
     fn type_name() -> &'static str {
         "Vec<IndexMetadata>"
     }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_table::format::index_metadata_codec())
+    }
 }
 
 pub struct ProstAny(pub Arc<prost_types::Any>);
