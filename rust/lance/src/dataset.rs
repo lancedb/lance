@@ -1745,7 +1745,7 @@ impl Dataset {
             SchedulerConfig::new(2 * 1024 * 1024 * 1024),
         );
         let file = scheduler
-            .open_file(&filepath, &CachedFileSize::unknown())
+            .open_file(&filepath, &CachedFileSize::new(file_size))
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file).await?;
 
