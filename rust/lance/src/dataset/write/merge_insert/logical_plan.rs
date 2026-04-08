@@ -19,7 +19,7 @@ use crate::dataset::write::merge_insert::exec::{
 };
 use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
 
-use super::{MERGE_ACTION_COLUMN, MergeInsertParams};
+use super::{MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertParams};
 
 /// Logical plan node for merge insert write.
 ///
@@ -163,11 +163,13 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
         for (i, (qualifier, field)) in input_schema.iter().enumerate() {
             let should_include = match qualifier {
-                // For delete-only: only include source KEY columns (for matching)
-                // For other ops: include all source columns - they contain the new data to write
+                // For delete-only: only include source KEY columns (for matching) plus the
+                // sentinel column needed for action determination.
+                // For other ops: include all source columns - they contain the new data to write.
                 Some(qualifier) if qualifier.table() == "source" => {
                     if no_upsert {
                         self.params.on.iter().any(|k| k == field.name())
+                            || field.name() == MERGE_SOURCE_SENTINEL
                     } else {
                         true
                     }

@@ -29,7 +29,8 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    SourceDedupeBehavior, create_duplicate_row_error, format_key_values_on_columns,
+    MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
+    format_key_values_on_columns,
 };
 use crate::{
     Dataset,
@@ -418,18 +419,19 @@ impl FullSchemaMergeInsertExec {
         // from the logical join, leaving us with the merged data columns plus special columns
         let total_fields = input_schema.fields().len();
 
-        // Select all columns that are data columns (not _rowaddr or __action)
+        // Select all columns that are data columns (not _rowaddr, __action, or the sentinel)
         // These represent the final merged data values to write
         let data_column_indices: Vec<usize> = (0..total_fields)
             .filter(|&idx| {
                 let field = input_schema.field(idx);
                 let name = field.name();
-                // Skip special columns: _rowaddr and __action
+                // Skip special columns: _rowaddr, __action, and the source-presence sentinel
                 idx != rowaddr_idx
                     && idx != action_idx
                     && name != ROW_ADDR
                     && name != ROW_ID
                     && name != MERGE_ACTION_COLUMN
+                    && name != MERGE_SOURCE_SENTINEL
             })
             .collect();
 
