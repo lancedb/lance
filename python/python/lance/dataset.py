@@ -298,7 +298,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
           CoalescePartitionsExec
-            ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, ...]
+            ProjectionExec: expr=[...]
               HashJoinExec: mode=CollectLeft, join_type=Right, ...
                 CooperativeExec
                   LanceRead: uri=test_dataset/data, projection=[id], ...
@@ -317,7 +317,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
           CoalescePartitionsExec
-            ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, ...]
+            ProjectionExec: expr=[...]
               HashJoinExec: mode=CollectLeft, join_type=Right, ...
                 ...
         """
@@ -380,7 +380,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> print(analysis) # doctest: +ELLIPSIS
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
-                ProjectionExec: elapsed=..., expr=[_rowid@1 as _rowid, ...], metrics=[...]
+                ProjectionExec: elapsed=..., expr=[...], metrics=[...]
                   HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
                     CooperativeExec, elapsed=..., metrics=[]
                       LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
