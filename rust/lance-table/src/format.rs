@@ -13,7 +13,7 @@ pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
 pub use fragment::*;
-pub use index::{IndexFile, IndexMetadata, list_index_files_with_sizes};
+pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,

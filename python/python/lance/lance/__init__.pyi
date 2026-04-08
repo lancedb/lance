@@ -48,6 +48,7 @@ from ..fragment import (
     FragmentMetadata,
 )
 from ..progress import FragmentWriteProgress as FragmentWriteProgress
+from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
 from .debug import format_fragment as format_fragment
@@ -362,7 +363,11 @@ class _Dataset:
     def drop_index(self, name: str): ...
     def prewarm_index(self, name: str): ...
     def merge_index_metadata(
-        self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None
+        self,
+        index_uuid: str,
+        index_type: str,
+        batch_readhead: Optional[int] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
     def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
     def commit_existing_index_segments(

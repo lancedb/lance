@@ -17,20 +17,19 @@ use futures::Future;
 
 use crate::Result;
 
+use super::CacheCodec;
+
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
 /// Structured cache key passed to [`CacheBackend`] methods.
 ///
-/// Composed of three parts:
+/// CacheBackend impls receive these ready-made from [`LanceCache`](super::LanceCache)
+/// — you do not construct them yourself. Composed of three parts:
 /// - **prefix**: scopes the key to a dataset or index (e.g. `"s3://bucket/dataset/"`)
 /// - **key**: identifies the specific entry (e.g. `"42"` for a version number)
 /// - **type_name**: distinguishes different value types stored under the same
 ///   user key (e.g. `"Vec<IndexMetadata>"`)
-///
-/// [`LanceCache`](super::LanceCache) constructs these automatically from
-/// [`CacheKey`](super::CacheKey) values; backend authors receive them
-/// ready-made.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct InternalCacheKey {
     prefix: Arc<str>,
@@ -74,10 +73,26 @@ impl InternalCacheKey {
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Look up an entry by its key.
-    async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry>;
+    ///
+    /// `codec` is provided so that persistent backends can deserialize the
+    /// entry from storage. In-memory backends can ignore it. When `codec`
+    /// is `None`, the entry type does not support serialization yet and
+    /// must be stored in-memory.
+    ///
+    /// The goal is for all cache entry types to eventually have codecs,
+    /// at which point the `Option` will be removed.
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry>;
 
     /// Store an entry. `size_bytes` is used for eviction accounting.
-    async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize);
+    ///
+    /// See [`get`](Self::get) for codec semantics.
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+    );
 
     /// Get an existing entry or compute it from `loader`.
     ///
@@ -86,10 +101,13 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Returns `(entry, was_cached)` where `was_cached` is `true` if the entry
     /// was already present in the cache (the loader was not invoked).
+    ///
+    /// See [`get`](Self::get) for codec semantics.
     async fn get_or_insert<'a>(
         &self,
         key: &InternalCacheKey,
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
 
     /// Remove all entries whose prefix starts with the given string.

@@ -8,7 +8,7 @@
 //!
 //! ## Architecture
 //!
-//! Each region has:
+//! Each shard has:
 //! - A **MemTable** for in-memory data (immediately queryable)
 //! - A **WAL Buffer** for durability (persisted to object storage)
 //! - **In-memory indexes** (BTree, IVF-PQ, FTS) for indexed queries
@@ -29,8 +29,8 @@
 //!
 //! ## Epoch-Based Fencing
 //!
-//! Each region has exactly one active writer at any time, enforced via
-//! monotonically increasing writer epochs in the region manifest.
+//! Each shard has exactly one active writer at any time, enforced via
+//! monotonically increasing writer epochs in the shard manifest.
 
 mod api;
 mod index;
@@ -42,8 +42,8 @@ mod wal;
 pub mod write;
 
 pub use api::{DatasetMemWalExt, MemWalConfig};
-pub use manifest::RegionManifestStore;
+pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
-pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, RegionSnapshot};
-pub use write::RegionWriter;
-pub use write::RegionWriterConfig;
+pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};
+pub use write::ShardWriter;
+pub use write::ShardWriterConfig;

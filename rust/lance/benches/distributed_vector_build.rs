@@ -17,6 +17,7 @@ use uuid::Uuid;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::progress::noop_progress;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::{
     IndexType,
@@ -417,6 +418,7 @@ fn bench_distributed_merge_only(c: &mut Criterion) {
                             &target_uuid.to_string(),
                             IndexType::IvfPq,
                             None,
+                            noop_progress(),
                         ))
                         .unwrap();
                     },

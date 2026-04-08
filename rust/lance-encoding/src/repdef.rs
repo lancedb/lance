@@ -817,6 +817,10 @@ impl RepDefBuilder {
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
         self.check_validity_len(validity.len());
+        if validity.null_count() == 0 {
+            self.add_no_null(validity.len());
+            return;
+        }
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             num_values: validity.len(),
             validity: Some(validity.into_inner()),
@@ -2831,6 +2835,26 @@ mod tests {
 
         assert_eq!([2, 1, 0, 2, 2, 0, 1, 1, 0, 0, 0], *rep);
         assert_eq!([0, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1], *def);
+    }
+
+    #[test]
+    fn test_all_valid_validity_bitmap_serializes_as_no_null() {
+        let mut from_bitmap = RepDefBuilder::default();
+        from_bitmap.add_validity_bitmap(validity(&[true, true, true, true]));
+
+        let mut from_no_null = RepDefBuilder::default();
+        from_no_null.add_no_null(4);
+
+        let from_bitmap = RepDefBuilder::serialize(vec![from_bitmap]);
+        let from_no_null = RepDefBuilder::serialize(vec![from_no_null]);
+
+        assert!(from_bitmap.repetition_levels.is_none());
+        assert!(from_bitmap.definition_levels.is_none());
+        assert_eq!(from_bitmap.def_meaning, from_no_null.def_meaning);
+        assert_eq!(
+            from_bitmap.max_visible_level,
+            from_no_null.max_visible_level
+        );
     }
 
     #[test]

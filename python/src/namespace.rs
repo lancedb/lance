@@ -10,9 +10,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
-    CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    ListTableVersionsRequest, ListTableVersionsResponse,
+    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableDropColumnsRequest,
+    AlterTransactionRequest, AnalyzeTableQueryPlanRequest, CountTableRowsRequest,
+    CreateTableIndexRequest, CreateTableTagRequest, CreateTableVersionRequest,
+    CreateTableVersionResponse, DeleteFromTableRequest, DeleteTableTagRequest,
+    DescribeTableIndexStatsRequest, DescribeTableRequest, DescribeTableResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
+    DropTableIndexRequest, ExplainTableQueryPlanRequest, GetTableStatsRequest,
+    GetTableTagVersionRequest, InsertIntoTableRequest, ListTableIndicesRequest,
+    ListTableTagsRequest, ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
+    MergeInsertIntoTableRequest, QueryTableRequest, RestoreTableRequest, UpdateTableRequest,
+    UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
@@ -320,6 +328,18 @@ impl PyDirectoryNamespace {
         Ok(pythonize(py, &response)?.into())
     }
 
+    fn rename_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.rename_table(request))?
+            .infer_error()?;
+        Ok(pythonize(py, &response)?.into())
+    }
+
     // Table version operations
 
     fn list_table_versions<'py>(
@@ -366,6 +386,338 @@ impl PyDirectoryNamespace {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.batch_delete_table_versions(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Data manipulation operations
+
+    fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
+        let request: CountTableRowsRequest = depythonize(request)?;
+        let count = crate::rt()
+            .block_on(Some(py), self.inner.count_table_rows(request))?
+            .infer_error()?;
+        Ok(count)
+    }
+
+    fn insert_into_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+        request_data: &Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: InsertIntoTableRequest = depythonize(request)?;
+        let data = Bytes::copy_from_slice(request_data.as_bytes());
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.insert_into_table(request, data))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn merge_insert_into_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+        request_data: &Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: MergeInsertIntoTableRequest = depythonize(request)?;
+        let data = Bytes::copy_from_slice(request_data.as_bytes());
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.merge_insert_into_table(request, data))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn update_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: UpdateTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.update_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_from_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DeleteFromTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_from_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn query_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let request: QueryTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.query_table(request))?
+            .infer_error()?;
+        Ok(PyBytes::new(py, &response))
+    }
+
+    // Index operations
+
+    fn create_table_index<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateTableIndexRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_index(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn list_table_indices<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: ListTableIndicesRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_indices(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn describe_table_index_stats<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DescribeTableIndexStatsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.describe_table_index_stats(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Transaction operations
+
+    fn describe_transaction<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DescribeTransactionRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.describe_transaction(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_transaction<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTransactionRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_transaction(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Additional index operations
+
+    fn create_table_scalar_index<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateTableIndexRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_scalar_index(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn drop_table_index<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DropTableIndexRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.drop_table_index(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Additional table operations
+
+    fn list_all_tables<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: ListTablesRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_all_tables(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn restore_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: RestoreTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.restore_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn update_table_schema_metadata<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: UpdateTableSchemaMetadataRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.update_table_schema_metadata(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn get_table_stats<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: GetTableStatsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.get_table_stats(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Query plan operations
+
+    fn explain_table_query_plan(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<String> {
+        let request: ExplainTableQueryPlanRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.explain_table_query_plan(request))?
+            .infer_error()?;
+        Ok(response)
+    }
+
+    fn analyze_table_query_plan(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<String> {
+        let request: AnalyzeTableQueryPlanRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.analyze_table_query_plan(request))?
+            .infer_error()?;
+        Ok(response)
+    }
+
+    // Column alteration operations
+
+    fn alter_table_add_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableAddColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_add_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_table_alter_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableAlterColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_alter_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_table_drop_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableDropColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_drop_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Table tag operations
+
+    fn list_table_tags<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: ListTableTagsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_tags(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn get_table_tag_version<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: GetTableTagVersionRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.get_table_tag_version(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_table_tag<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateTableTagRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_tag(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_table_tag<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DeleteTableTagRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_table_tag(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn update_table_tag<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: UpdateTableTagRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.update_table_tag(request))?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
@@ -660,6 +1012,338 @@ impl PyRestNamespace {
         let request = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.batch_delete_table_versions(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Data manipulation operations
+
+    fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
+        let request: CountTableRowsRequest = depythonize(request)?;
+        let count = crate::rt()
+            .block_on(Some(py), self.inner.count_table_rows(request))?
+            .infer_error()?;
+        Ok(count)
+    }
+
+    fn insert_into_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+        request_data: &Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: InsertIntoTableRequest = depythonize(request)?;
+        let data = Bytes::copy_from_slice(request_data.as_bytes());
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.insert_into_table(request, data))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn merge_insert_into_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+        request_data: &Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: MergeInsertIntoTableRequest = depythonize(request)?;
+        let data = Bytes::copy_from_slice(request_data.as_bytes());
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.merge_insert_into_table(request, data))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn update_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: UpdateTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.update_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_from_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DeleteFromTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_from_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn query_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let request: QueryTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.query_table(request))?
+            .infer_error()?;
+        Ok(PyBytes::new(py, &response))
+    }
+
+    // Index operations
+
+    fn create_table_index<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateTableIndexRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_index(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn list_table_indices<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: ListTableIndicesRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_indices(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn describe_table_index_stats<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DescribeTableIndexStatsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.describe_table_index_stats(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Transaction operations
+
+    fn describe_transaction<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DescribeTransactionRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.describe_transaction(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_transaction<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTransactionRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_transaction(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Additional index operations
+
+    fn create_table_scalar_index<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateTableIndexRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_scalar_index(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn drop_table_index<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DropTableIndexRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.drop_table_index(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Additional table operations
+
+    fn list_all_tables<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: ListTablesRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_all_tables(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn restore_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: RestoreTableRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.restore_table(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn update_table_schema_metadata<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: UpdateTableSchemaMetadataRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.update_table_schema_metadata(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn get_table_stats<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: GetTableStatsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.get_table_stats(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Query plan operations
+
+    fn explain_table_query_plan(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<String> {
+        let request: ExplainTableQueryPlanRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.explain_table_query_plan(request))?
+            .infer_error()?;
+        Ok(response)
+    }
+
+    fn analyze_table_query_plan(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<String> {
+        let request: AnalyzeTableQueryPlanRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.analyze_table_query_plan(request))?
+            .infer_error()?;
+        Ok(response)
+    }
+
+    // Column alteration operations
+
+    fn alter_table_add_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableAddColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_add_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_table_alter_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableAlterColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_alter_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_table_drop_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableDropColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_drop_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // Table tag operations
+
+    fn list_table_tags<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: ListTableTagsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_tags(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn get_table_tag_version<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: GetTableTagVersionRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.get_table_tag_version(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_table_tag<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateTableTagRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_tag(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_table_tag<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: DeleteTableTagRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_table_tag(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn update_table_tag<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: UpdateTableTagRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.update_table_tag(request))?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }

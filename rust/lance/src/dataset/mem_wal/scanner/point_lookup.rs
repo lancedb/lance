@@ -293,7 +293,7 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    use crate::dataset::mem_wal::scanner::data_source::RegionSnapshot;
+    use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::{Dataset, WriteParams};
 
     fn create_pk_schema() -> Arc<ArrowSchema> {
@@ -374,18 +374,18 @@ mod tests {
         let base_batch = create_test_batch(&schema, &[1, 2, 3], "base");
         let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
 
-        // Create region snapshot
-        let region_id = Uuid::new_v4();
-        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, region_id);
+        // Create shard snapshot
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[2], "gen1"); // Update id=2
         create_dataset(&gen1_uri, vec![gen1_batch]).await;
 
-        let region_snapshot = RegionSnapshot::new(region_id)
+        let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
             .with_flushed_generation(1, "gen_1".to_string());
 
         // Create collector
-        let collector = LsmDataSourceCollector::new(base_dataset, vec![region_snapshot]);
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot]);
 
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
 

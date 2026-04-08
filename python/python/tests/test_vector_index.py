@@ -17,6 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
@@ -181,6 +182,61 @@ def test_flat(dataset):
 
 def test_ann(indexed_dataset):
     run(indexed_dataset)
+
+
+def test_create_index_progress_callback_vector(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "vector_progress", 1500, 128)
+    recorder = ProgressRecorder()
+
+    ds.create_index(
+        column="vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=4,
+        progress_callback=recorder,
+    )
+
+    tags = progress_event_tags(recorder.events)
+    expected_order = [
+        "start:train_ivf",
+        "complete:train_ivf",
+        "start:train_quantizer",
+        "complete:train_quantizer",
+        "start:shuffle",
+        "complete:shuffle",
+        "start:merge_partitions",
+        "complete:merge_partitions",
+    ]
+    positions = [tags.index(tag) for tag in expected_order]
+    assert positions == sorted(positions)
+
+    shuffle_progress = stage_progress_values(recorder.events, "shuffle")
+    assert shuffle_progress
+    assert shuffle_progress[-1] == ds.count_rows()
+
+    merge_progress = stage_progress_values(recorder.events, "merge_partitions")
+    assert merge_progress
+    assert merge_progress[-1] == 4
+
+
+def test_create_index_progress_callback_error_after_completion_is_ignored(tmp_path):
+    ds = _make_sample_dataset_base(
+        tmp_path, "vector_progress_post_commit_error", 1500, 128
+    )
+    recorder = ProgressRecorder(fail_on_tag="complete:merge_partitions")
+
+    ds.create_index(
+        column="vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=4,
+        progress_callback=recorder,
+    )
+
+    tags = progress_event_tags(recorder.events)
+    assert tags[-1] == "complete:merge_partitions"
+    assert ds.has_index
+    assert ds.describe_indices()[0].field_names == ["vector"]
 
 
 def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):

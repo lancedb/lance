@@ -239,6 +239,32 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         })
     }
 
+    /// Construct from pre-parsed metadata, skipping global buffer reads.
+    /// Used when reconstructing from a disk cache.
+    pub fn from_cached(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
+        Self {
+            reader,
+            distance_type,
+            metadata,
+            ivf,
+            frag_reuse_index,
+        }
+    }
+
+    pub fn reader(&self) -> &FileReader {
+        &self.reader
+    }
+
+    pub fn ivf(&self) -> &IvfModel {
+        &self.ivf
+    }
+
     pub fn num_rows(&self) -> u64 {
         self.reader.num_rows()
     }

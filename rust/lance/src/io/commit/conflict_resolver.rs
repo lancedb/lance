@@ -1138,7 +1138,7 @@ impl<'a> TransactionRebase<'a> {
                     merged_generations: other_merged_generations,
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
-                    // the same region's merged_generation
+                    // the same shard's merged_generation
                     self.check_merged_generations_conflict(
                         other_merged_generations,
                         self_merged_generations,
@@ -1245,11 +1245,11 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        // Check if any region has conflicting updates
+        // Check if any shard has conflicting updates
         for committed_mg in committed {
             for to_commit_mg in to_commit {
-                if committed_mg.region_id == to_commit_mg.region_id {
-                    // Same region being updated
+                if committed_mg.shard_id == to_commit_mg.shard_id {
+                    // Same shard being updated
                     // If committed >= to_commit, data already merged or superseded - abort without retry
                     // If committed < to_commit, can retry with new state
                     if committed_mg.generation >= to_commit_mg.generation {
@@ -1516,13 +1516,13 @@ impl<'a> TransactionRebase<'a> {
                 let current_meta = new_indices.remove(pos);
                 let mut details = load_mem_wal_index_details(current_meta)?;
 
-                // Merge conflicting merged_generations - for each region, keep higher generation
+                // Merge conflicting merged_generations - for each shard, keep higher generation
                 // We own self so we can consume conflicting_mem_wal_merged_gens directly
                 for new_mg in self.conflicting_mem_wal_merged_gens {
                     if let Some(existing) = details
                         .merged_generations
                         .iter_mut()
-                        .find(|mg| mg.region_id == new_mg.region_id)
+                        .find(|mg| mg.shard_id == new_mg.shard_id)
                     {
                         if new_mg.generation > existing.generation {
                             existing.generation = new_mg.generation;
@@ -3275,13 +3275,13 @@ mod tests {
     #[test]
     fn test_merged_generations_conflict_lower_generation_fails() {
         // Test: committed generation >= to_commit generation should be incompatible (no retry)
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // Committed has generation 10, we're trying to commit generation 5
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3289,7 +3289,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -3314,12 +3314,12 @@ mod tests {
     #[test]
     fn test_merged_generations_conflict_equal_generation_fails() {
         // Test: committed generation == to_commit generation should be incompatible (no retry)
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3327,7 +3327,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3352,13 +3352,13 @@ mod tests {
     #[test]
     fn test_merged_generations_conflict_higher_generation_retryable() {
         // Test: committed generation < to_commit generation should be retryable
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // Committed has generation 5, we're trying to commit generation 10
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -3366,7 +3366,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3389,15 +3389,15 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_generations_different_regions_ok() {
-        // Test: different regions should not conflict
-        let region1 = Uuid::new_v4();
-        let region2 = Uuid::new_v4();
+    fn test_merged_generations_different_shards_ok() {
+        // Test: different shards should not conflict
+        let shard1 = Uuid::new_v4();
+        let shard2 = Uuid::new_v4();
 
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region1, 10)],
+                merged_generations: vec![MergedGeneration::new(shard1, 10)],
             },
             None,
         );
@@ -3405,7 +3405,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region2, 5)],
+                merged_generations: vec![MergedGeneration::new(shard2, 5)],
             },
             None,
         );
@@ -3422,7 +3422,7 @@ mod tests {
         let result = rebase.check_txn(&committed_txn, 1);
         assert!(
             result.is_ok(),
-            "Expected OK for different regions, got {:?}",
+            "Expected OK for different shards, got {:?}",
             result
         );
     }
@@ -3432,11 +3432,11 @@ mod tests {
         use crate::index::mem_wal::new_mem_wal_index_meta;
         use lance_index::mem_wal::MemWalIndexDetails;
 
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // Create a MemWalIndex with merged_generations
         let details = MemWalIndexDetails {
-            merged_generations: vec![MergedGeneration::new(region, 10)],
+            merged_generations: vec![MergedGeneration::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
@@ -3455,7 +3455,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 5)],
+                merged_generations: vec![MergedGeneration::new(shard, 5)],
             },
             None,
         );
@@ -3480,7 +3480,7 @@ mod tests {
         let to_commit_txn_higher = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 15)],
+                merged_generations: vec![MergedGeneration::new(shard, 15)],
             },
             None,
         );
@@ -3507,7 +3507,7 @@ mod tests {
         use crate::index::mem_wal::new_mem_wal_index_meta;
         use lance_index::mem_wal::MemWalIndexDetails;
 
-        let region = Uuid::new_v4();
+        let shard = Uuid::new_v4();
 
         // CreateIndex with MemWalIndex (no merged_generations initially)
         let details = MemWalIndexDetails::default();
@@ -3526,7 +3526,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(region, 10)],
+                merged_generations: vec![MergedGeneration::new(shard, 10)],
             },
             None,
         );
@@ -3551,7 +3551,7 @@ mod tests {
 
         // Verify that merged_generations were collected
         assert_eq!(rebase.conflicting_mem_wal_merged_gens.len(), 1);
-        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].region_id, region);
+        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].shard_id, shard);
         assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].generation, 10);
     }
 

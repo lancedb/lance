@@ -187,7 +187,11 @@ impl StructuralMapDecodeTask {
 
 impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        let DecodedArray { array, mut repdef } = self.child_task.decode()?;
+        let DecodedArray {
+            array,
+            mut repdef,
+            data_size,
+        } = self.child_task.decode()?;
 
         // Decode the offsets from RepDef
         let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
@@ -224,6 +228,7 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
         Ok(DecodedArray {
             array: Arc::new(map_array),
             repdef,
+            data_size,
         })
     }
 }
