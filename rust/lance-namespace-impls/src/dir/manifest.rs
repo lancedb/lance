@@ -3682,8 +3682,7 @@ mod tests {
     #[test]
     fn test_apply_pagination_token_and_limit_combined() {
         let mut n = names(&["a", "b", "c", "d", "e"]);
-        let next =
-            ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
+        let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
         assert_eq!(n, names(&["c", "d"]));
         assert_eq!(next, Some("d".to_string()));
     }
