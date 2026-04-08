@@ -2493,7 +2493,8 @@ def test_index_prewarm(tmp_path: Path):
     assert cache_entries_after_query == cache_entries_after_prewarm
 
     with pytest.raises(
-        TypeError, match="LanceDataset\\.prewarm_index\\(\\) takes 2 positional arguments"
+        TypeError,
+        match="takes 2 positional arguments",
     ):
         ds.prewarm_index("fts_idx", True)
 
