@@ -1788,12 +1788,10 @@ impl PostingListReader {
             ))
         })??;
         for (token_id, mut posting_list) in posting_lists {
-            if with_position {
-                if let Some(positions) = posting_list.take_positions() {
-                    self.index_cache
-                        .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
-                        .await;
-                }
+            if with_position && let Some(positions) = posting_list.take_positions() {
+                self.index_cache
+                    .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                    .await;
             }
             self.index_cache
                 .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))

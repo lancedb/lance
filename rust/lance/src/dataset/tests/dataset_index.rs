@@ -39,7 +39,7 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
-use lance_index::{DatasetIndexExt, FtsPrewarmOptions, PrewarmOptions};
+use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;

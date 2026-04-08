@@ -293,7 +293,7 @@ def test_create_inverted_index_progress_callback(tmp_path):
 
     tokenize_progress = stage_progress_values(progress_recorder.events, "tokenize_docs")
     assert tokenize_progress
-    assert tokenize_progress[-1] == ds.count_rows()
+    assert max(tokenize_progress) == ds.count_rows()
 
     assert "progress:copy_partitions" in tags
     assert "progress:write_metadata" in tags
