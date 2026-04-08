@@ -796,12 +796,16 @@ class LanceDataset(pa.dataset.Dataset):
                 }
 
         batch_size: int, default None
-            The target size of batches returned.  In some cases batches can be up to
-            twice this size (but never larger than this).  In some cases batches can
-            be smaller than this size.
+            The maximum number of rows per batch.  In some cases batches can be
+            smaller than this size.  Note: this can be overridden by
+            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
+            configured via ``FileReaderOptions``.
         batch_size_bytes: int, default None
             If set, the scanner will produce batches whose total size in bytes
             is approximately this value, overriding the row-based ``batch_size``.
+            This can also be configured at the dataset level via
+            ``FileReaderOptions``.  A scanner-level setting takes precedence
+            over the dataset-level default.
         io_buffer_size: int, default None
             The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
             for more information.
@@ -5024,7 +5028,12 @@ class ScannerBuilder:
         return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
-        """Set batch size for Scanner"""
+        """Set the maximum number of rows per batch.
+
+        Note: this can be overridden by ``batch_size_bytes`` or by a
+        dataset-level ``batch_size_bytes`` configured via
+        ``FileReaderOptions``.
+        """
         self._batch_size = batch_size
         return self
 
@@ -5033,6 +5042,10 @@ class ScannerBuilder:
 
         When set, the scanner will produce batches whose total size in bytes
         is approximately this value, overriding the row-based ``batch_size``.
+
+        This can also be configured at the dataset level via
+        ``FileReaderOptions``.  A scanner-level setting takes precedence
+        over the dataset-level default.
         """
         self._batch_size_bytes = batch_size_bytes
         return self

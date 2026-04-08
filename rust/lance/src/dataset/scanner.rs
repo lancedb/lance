@@ -1266,7 +1266,11 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Set the batch size.
+    /// Set the maximum number of rows per batch.
+    ///
+    /// Note: this can be overridden by [`Self::batch_size_bytes`] or by a dataset-level
+    /// `batch_size_bytes` set via [`ReadParams::file_reader_options`].  When a byte-based
+    /// batch size is active, the row-based batch size is used only as an initial estimate.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
         self
@@ -1276,6 +1280,10 @@ impl Scanner {
     ///
     /// When set, the scanner will produce batches whose total size in bytes
     /// is approximately this value, overriding the row-based `batch_size`.
+    ///
+    /// This can also be configured at the dataset level via
+    /// [`ReadParams::file_reader_options`].  A scanner-level setting takes
+    /// precedence over the dataset-level default.
     pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
         self.batch_size_bytes = Some(batch_size_bytes);
         self

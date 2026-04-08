@@ -344,6 +344,10 @@ pub struct FileReaderOptions {
     pub read_chunk_size: u64,
     /// If set, the reader will produce batches whose total size in bytes
     /// is approximately this value, overriding the row-based `batch_size`.
+    ///
+    /// This can be set at the dataset level (via [`ReadParams::file_reader_options`])
+    /// to provide a default for all scans, or at the scanner level (via
+    /// [`Scanner::batch_size_bytes`]) to override per scan.
     pub batch_size_bytes: Option<u64>,
 }
 
