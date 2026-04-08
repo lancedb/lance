@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures::{Stream, StreamExt, stream::BoxStream};
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use tokio::sync::Semaphore;
 use tokio_util::sync::PollSemaphore;
 
@@ -264,13 +264,64 @@ impl<S: Stream> FinallyStreamExt<S> for S {
     }
 }
 
+/// A stream wrapper that calls a function when dropped.
+///
+/// Unlike [`FinallyStream`], which fires when the inner stream yields `None`,
+/// this fires when the wrapper is dropped — even if the stream was not fully
+/// consumed.
+#[pin_project(PinnedDrop)]
+pub struct OnDropStream<S: Stream, F: FnOnce()> {
+    #[pin]
+    stream: S,
+    f: Option<F>,
+}
+
+impl<S: Stream, F: FnOnce()> OnDropStream<S, F> {
+    pub fn new(stream: S, f: F) -> Self {
+        Self { stream, f: Some(f) }
+    }
+}
+
+impl<S: Stream, F: FnOnce()> Stream for OnDropStream<S, F> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.project().stream.poll_next(cx)
+    }
+}
+
+#[pinned_drop]
+impl<S: Stream, F: FnOnce()> PinnedDrop for OnDropStream<S, F> {
+    fn drop(self: std::pin::Pin<&mut Self>) {
+        let this = self.project();
+        if let Some(f) = this.f.take() {
+            f();
+        }
+    }
+}
+
+pub trait StreamOnDropExt: Stream + Sized {
+    /// Wrap this stream so that `f` is called when the stream is dropped.
+    fn on_drop<F: FnOnce()>(self, f: F) -> OnDropStream<Self, F> {
+        OnDropStream::new(self, f)
+    }
+}
+
+impl<S: Stream> StreamOnDropExt for S {}
+
 #[cfg(test)]
 mod tests {
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::{FutureExt, StreamExt};
     use tokio_stream::wrappers::ReceiverStream;
 
-    use crate::utils::futures::{Capacity, SharedStreamExt};
+    use crate::utils::futures::{Capacity, SharedStreamExt, StreamOnDropExt};
 
     fn is_pending(fut: &mut (impl std::future::Future + Unpin)) -> bool {
         let noop_waker = futures::task::noop_waker();
@@ -387,5 +438,54 @@ mod tests {
             left_handle.await.unwrap();
             right_handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_on_drop_fires_on_early_drop() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let stream = futures::stream::iter(vec![1, 2, 3]);
+        let mut stream = stream.on_drop(move || {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Consume only one item, then drop
+        assert_eq!(stream.next().await, Some(1));
+        assert!(!called.load(Ordering::SeqCst));
+        drop(stream);
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_on_drop_fires_after_exhaustion() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let stream = futures::stream::iter(vec![1]);
+        let mut stream = stream.on_drop(move || {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        assert_eq!(stream.next().await, Some(1));
+        assert_eq!(stream.next().await, None);
+        assert!(!called.load(Ordering::SeqCst));
+        drop(stream);
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_on_drop_fires_without_polling() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let stream = futures::stream::iter(vec![1, 2, 3]);
+        let stream = stream.on_drop(move || {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        assert!(!called.load(Ordering::SeqCst));
+        drop(stream);
+        assert!(called.load(Ordering::SeqCst));
     }
 }

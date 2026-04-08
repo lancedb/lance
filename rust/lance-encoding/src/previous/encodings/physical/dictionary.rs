@@ -101,7 +101,7 @@ impl PageScheduler for DictionaryPageScheduler {
                 // Decode all items
                 let drained_task = primitive_wrapper.drain(copy_size)?;
                 let items_decode_task = drained_task.task;
-                let decoded_dict = items_decode_task.decode()?;
+                let (decoded_dict, _) = items_decode_task.decode()?;
 
                 let indices_decoder: Box<dyn PrimitivePageDecoder> = indices_page_decoder.await?;
 
@@ -403,7 +403,7 @@ impl ArrayEncoder for DictionaryEncoder {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use arrow_array::{
         ArrayRef, DictionaryArray, StringArray, UInt8Array,

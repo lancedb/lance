@@ -263,6 +263,38 @@ pub enum NamespaceError {
 }
 
 impl NamespaceError {
+    /// Returns the inner message without the Display prefix.
+    ///
+    /// Useful when serializing across boundaries (e.g. REST) where
+    /// the receiver will reconstruct the variant from the error code
+    /// and re-apply its own Display formatting.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unsupported { message }
+            | Self::NamespaceNotFound { message }
+            | Self::NamespaceAlreadyExists { message }
+            | Self::NamespaceNotEmpty { message }
+            | Self::TableNotFound { message }
+            | Self::TableAlreadyExists { message }
+            | Self::TableIndexNotFound { message }
+            | Self::TableIndexAlreadyExists { message }
+            | Self::TableTagNotFound { message }
+            | Self::TableTagAlreadyExists { message }
+            | Self::TransactionNotFound { message }
+            | Self::TableVersionNotFound { message }
+            | Self::TableColumnNotFound { message }
+            | Self::InvalidInput { message }
+            | Self::ConcurrentModification { message }
+            | Self::PermissionDenied { message }
+            | Self::Unauthenticated { message }
+            | Self::ServiceUnavailable { message }
+            | Self::Internal { message }
+            | Self::InvalidTableState { message }
+            | Self::TableSchemaValidationError { message }
+            | Self::Throttled { message } => message,
+        }
+    }
+
     /// Returns the error code for this error.
     ///
     /// Use this for programmatic error handling across language boundaries.

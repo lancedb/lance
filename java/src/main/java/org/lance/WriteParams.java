@@ -40,6 +40,7 @@ public class WriteParams {
   private Map<String, String> storageOptions = new HashMap<>();
   private final Optional<List<BasePath>> initialBases;
   private final Optional<List<String>> targetBases;
+  private final Optional<Boolean> allowExternalBlobOutsideBases;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -51,7 +52,8 @@ public class WriteParams {
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases) {
+      Optional<List<String>> targetBases,
+      Optional<Boolean> allowExternalBlobOutsideBases) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -62,6 +64,7 @@ public class WriteParams {
     this.storageOptions = storageOptions;
     this.initialBases = initialBases;
     this.targetBases = targetBases;
+    this.allowExternalBlobOutsideBases = allowExternalBlobOutsideBases;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -109,6 +112,18 @@ public class WriteParams {
     return targetBases;
   }
 
+  /**
+   * Get whether external blob URIs outside registered bases are allowed.
+   *
+   * <p>When true, blob v2 columns can reference external URIs that are not under any registered
+   * base path. The URI is stored as an absolute external reference with base_id=0.
+   *
+   * @return Optional containing the setting, or empty if not set
+   */
+  public Optional<Boolean> getAllowExternalBlobOutsideBases() {
+    return allowExternalBlobOutsideBases;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -132,6 +147,7 @@ public class WriteParams {
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<List<BasePath>> initialBases = Optional.empty();
     private Optional<List<String>> targetBases = Optional.empty();
+    private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -183,6 +199,21 @@ public class WriteParams {
       return this;
     }
 
+    /**
+     * Allow external blob URIs outside registered bases.
+     *
+     * <p>When true, blob v2 columns can reference external URIs (e.g. pointing to blob files in
+     * another Lance dataset) that are not under any registered base path. The URI is stored as an
+     * absolute external reference with base_id=0.
+     *
+     * @param allow true to allow external blob URIs outside bases
+     * @return this builder
+     */
+    public Builder withAllowExternalBlobOutsideBases(boolean allow) {
+      this.allowExternalBlobOutsideBases = Optional.of(allow);
+      return this;
+    }
+
     public WriteParams build() {
       return new WriteParams(
           maxRowsPerFile,
@@ -194,7 +225,8 @@ public class WriteParams {
           enableV2ManifestPaths,
           storageOptions,
           initialBases,
-          targetBases);
+          targetBases,
+          allowExternalBlobOutsideBases);
     }
   }
 }

@@ -7,6 +7,7 @@ nav:
   - Tags and Branches: tags_and_branches.md
   - Object Store Configuration: object_store.md
   - Distributed Write: distributed_write.md
+  - Distributed Indexing: distributed_indexing.md
   - Migration Guide: migration.md
   - Performance Guide: performance.md
   - Tokenizer: tokenizer.md

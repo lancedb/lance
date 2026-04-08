@@ -358,6 +358,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             return Ok(DecodedArray {
                 array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
                 repdef: CompositeRepDefUnraveler::new(vec![]),
+                data_size: 0,
             });
         }
 
@@ -367,16 +368,19 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             .map(|task| task.decode())
             .collect::<Result<Vec<_>>>()?;
         let mut children = Vec::with_capacity(arrays.len());
+        let mut data_size = 0u64;
         let mut arrays_iter = arrays.into_iter();
         let first_array = arrays_iter.next().unwrap();
         let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
         let mut repdef = first_array.repdef;
+        data_size += first_array.data_size;
         children.push(first_array.array);
 
         for array in arrays_iter {
             debug_assert_eq!(length, array.array.len());
+            data_size += array.data_size;
             children.push(array.array);
         }
 
@@ -391,6 +395,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,
+            data_size,
         })
     }
 }
@@ -493,7 +498,6 @@ pub struct StructFieldEncoder {
 }
 
 impl StructFieldEncoder {
-    #[allow(dead_code)]
     pub fn new(children: Vec<Box<dyn FieldEncoder>>, column_index: u32) -> Self {
         Self {
             children,

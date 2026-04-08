@@ -76,7 +76,7 @@ serde = { workspace = true }
 moka.workspace = true
 permutation = { version = "0.4.0" }
 tantivy.workspace = true
-aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
 humantime = { workspace = true }
 async_cell = "0.2.2"
@@ -97,6 +97,7 @@ libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
+rand_distr.workspace = true
 dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true
@@ -112,7 +113,7 @@ tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 paste = "1.0"
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
-aws-sdk-s3 = { workspace = true }
+aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
 geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
@@ -180,6 +181,10 @@ harness = false
 
 [[bench]]
 name = "vector_throughput"
+harness = false
+
+[[bench]]
+name = "distributed_vector_build"
 harness = false
 
 [[bench]]

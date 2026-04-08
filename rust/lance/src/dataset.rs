@@ -15,6 +15,7 @@ use futures::{FutureExt, Stream};
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
+use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -30,7 +31,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -54,12 +55,11 @@ use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -86,6 +86,8 @@ pub mod udtf;
 pub mod updater;
 mod utils;
 pub mod write;
+
+pub(crate) use take::row_offsets_to_row_addresses;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
@@ -128,8 +130,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder, WriteDestination,
-    WriteMode, WriteParams, write_fragments,
+    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, ExternalBlobMode, InsertBuilder,
+    WriteDestination, WriteMode, WriteParams, WriteProgressFn, WriteStats, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
@@ -743,20 +745,20 @@ impl Dataset {
             .await
     }
 
-    /// Write into a namespace-managed table with automatic credential vending.
+    /// Write into a namespace client-managed table with automatic credential vending.
     ///
     /// For CREATE mode, calls declare_table() to initialize the table.
-    /// For other modes, calls describe_table() and opens dataset with namespace credentials.
+    /// For other modes, calls describe_table() and opens dataset with namespace client credentials.
     ///
     /// # Arguments
     ///
     /// * `batches` - The record batches to write
-    /// * `namespace` - The namespace to use for table management
+    /// * `namespace_client` - The namespace client to use for table management
     /// * `table_id` - The table identifier
     /// * `params` - Write parameters
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
-        namespace: Arc<dyn LanceNamespace>,
+        namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
@@ -768,7 +770,7 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response = namespace
+                let response = namespace_client
                     .declare_table(declare_request)
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -782,7 +784,7 @@ impl Dataset {
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
                     let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace.clone(),
+                        namespace_client.clone(),
                         table_id.clone(),
                     );
                     let commit_handler: Arc<dyn CommitHandler> =
@@ -792,13 +794,13 @@ impl Dataset {
                     write_params.commit_handler = Some(commit_handler);
                 }
 
-                // Set initial credentials and provider from namespace
+                // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
-                        LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                        LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
                     );
 
-                    // Merge namespace storage options with any existing options
+                    // Merge namespace client storage options with any existing options
                     let mut merged_options = write_params
                         .store_params
                         .as_ref()
@@ -825,7 +827,7 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response = namespace
+                let response = namespace_client
                     .describe_table(request)
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -839,7 +841,7 @@ impl Dataset {
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
                     let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace.clone(),
+                        namespace_client.clone(),
                         table_id.clone(),
                     );
                     let commit_handler: Arc<dyn CommitHandler> =
@@ -849,15 +851,15 @@ impl Dataset {
                     write_params.commit_handler = Some(commit_handler);
                 }
 
-                // Set initial credentials and provider from namespace
+                // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> =
                         Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace.clone(),
+                            namespace_client.clone(),
                             table_id.clone(),
                         ));
 
-                    // Merge namespace storage options with any existing options
+                    // Merge namespace client storage options with any existing options
                     let mut merged_options = write_params
                         .store_params
                         .as_ref()
@@ -1466,7 +1468,8 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
-        let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
+        let fragments = self.get_fragments();
+        let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 
@@ -1484,14 +1487,74 @@ impl Dataset {
 
     /// Randomly sample `n` rows from the dataset.
     ///
+    /// If `fragment_ids` is provided, sampling is limited to rows from those
+    /// fragments in the current dataset version.
+    ///
     /// The returned rows are in row-id order (not random order), which allows
     /// the underlying take operation to use an efficient sorted code path.
-    pub async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+    pub async fn sample(
+        &self,
+        n: usize,
+        projection: &Schema,
+        fragment_ids: Option<&[u32]>,
+    ) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows(None).await?;
-        let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
-        ids.sort_unstable();
-        self.take(&ids, projection.clone()).await
+
+        match fragment_ids {
+            None => {
+                let num_rows = self.count_rows(None).await?;
+                let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+                ids.sort_unstable();
+                self.take(&ids, projection.clone()).await
+            }
+            Some(fragment_ids) => {
+                if fragment_ids.is_empty() {
+                    return Err(Error::invalid_input(
+                        "Dataset::sample does not accept an empty fragment_ids list".to_string(),
+                    ));
+                }
+
+                let selected_fragment_ids = fragment_ids.iter().copied().collect::<BTreeSet<_>>();
+                let selected_fragments = self
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|fragment| selected_fragment_ids.contains(&(fragment.id() as u32)))
+                    .collect::<Vec<_>>();
+
+                if selected_fragments.len() != selected_fragment_ids.len() {
+                    let present_fragment_ids = selected_fragments
+                        .iter()
+                        .map(|fragment| fragment.id() as u32)
+                        .collect::<HashSet<_>>();
+                    let missing_fragment_ids = selected_fragment_ids
+                        .into_iter()
+                        .filter(|fragment_id| !present_fragment_ids.contains(fragment_id))
+                        .collect::<Vec<_>>();
+                    return Err(Error::invalid_input(format!(
+                        "Dataset::sample received fragment ids that are not part of the current dataset version: {missing_fragment_ids:?}",
+                    )));
+                }
+
+                let num_rows = stream::iter(selected_fragments.iter().cloned())
+                    .map(|fragment| async move { fragment.count_rows(None).await })
+                    .buffer_unordered(16)
+                    .try_fold(0_u64, |acc, rows| async move { Ok(acc + rows as u64) })
+                    .await?;
+
+                let mut offsets = (0..num_rows).choose_multiple(&mut rand::rng(), n);
+                offsets.sort_unstable();
+
+                let row_addrs = row_offsets_to_row_addresses(&selected_fragments, &offsets).await?;
+                let dataset = Arc::new(self.clone());
+                let projection = Arc::new(
+                    ProjectionRequest::from(projection.clone())
+                        .into_projection_plan(dataset.clone())?,
+                );
+                TakeBuilder::try_new_from_addresses(dataset, row_addrs, projection)?
+                    .execute()
+                    .await
+            }
+        }
     }
 
     /// Delete rows based on a predicate.
@@ -1737,6 +1800,18 @@ impl Dataset {
         self.session.clone()
     }
 
+    /// Get the currently checked-out version id.
+    ///
+    /// This is a cheap accessor that reads the id directly from the loaded
+    /// manifest without constructing the full [Version] summary.
+    pub fn version_id(&self) -> u64 {
+        self.manifest.version
+    }
+
+    /// Get the currently checked-out version details.
+    ///
+    /// This constructs a full [Version], including summary metadata derived
+    /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
         Version::from(self.manifest.as_ref())
     }
@@ -1774,6 +1849,27 @@ impl Dataset {
         versions.sort_by_key(|v| v.version);
 
         Ok(versions)
+    }
+
+    /// List all detached manifest locations.
+    ///
+    /// Detached manifests are versions that are not part of the main version history.
+    /// They are created by `commit_detached` and can be used for staging changes.
+    ///
+    /// To read transaction properties from a detached manifest:
+    /// ```ignore
+    /// let detached = dataset.list_detached_manifests().await?;
+    /// for location in detached {
+    ///     let ds = dataset.checkout_version(location.version).await?;
+    ///     let tx = ds.read_transaction().await?;
+    ///     // Access tx.transaction_properties
+    /// }
+    /// ```
+    pub async fn list_detached_manifests(&self) -> Result<Vec<ManifestLocation>> {
+        self.commit_handler
+            .list_detached_manifest_locations(&self.base, &self.object_store)
+            .try_collect()
+            .await
     }
 
     /// Get the latest version of the dataset
@@ -1815,6 +1911,11 @@ impl Dataset {
             .iter()
             .map(|f| FileFragment::new(dataset.clone(), f.clone()))
             .collect()
+    }
+
+    /// Iterate over manifest fragments without allocating [`FileFragment`] wrappers.
+    pub fn iter_fragments(&self) -> impl Iterator<Item = &Fragment> {
+        self.manifest.fragments.iter()
     }
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
@@ -2658,11 +2759,14 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
+    /// Merge a distributed scalar index into a single root artifact and report
+    /// progress via the supplied callback.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: IndexType,
         batch_readhead: Option<usize>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
         let index_dir = self.indices_dir().child(index_uuid);
@@ -2673,6 +2777,7 @@ impl Dataset {
                     self.object_store(),
                     &index_dir,
                     Arc::new(store),
+                    progress,
                 )
                 .await
             }
@@ -2683,19 +2788,17 @@ impl Dataset {
                     &index_dir,
                     Arc::new(store),
                     batch_readhead,
+                    progress,
                 )
                 .await
             }
-            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
-                // Merge distributed vector index partials and finalize root index via Lance IVF helper
-                crate::index::vector::ivf::finalize_distributed_merge(
-                    self.object_store(),
-                    &index_dir,
-                    Some(index_type),
-                )
-                .await?;
-                Ok(())
+                Err(Error::invalid_input(
+                    "Vector distributed indexing no longer supports merge_index_metadata; \
+                     build segments, optionally merge groups with merge_existing_index_segments(...), \
+                     and commit with commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             _ => Err(Error::invalid_input_source(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

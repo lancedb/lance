@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
-    expr::{InList, ScalarFunction},
+    expr::{InList, Like, ScalarFunction},
 };
 use tokio::try_join;
 
@@ -111,6 +111,29 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
         func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression>;
+
+    /// Visit a LIKE expression
+    ///
+    /// Returns an IndexedExpression if the index can accelerate LIKE expressions.
+    /// For prefix patterns (e.g., "foo%"):
+    /// - ZoneMaps prune zones based on min/max statistics
+    /// - BTrees use range query conversion `[prefix, next_prefix)`
+    ///
+    /// For patterns with wildcards in the middle (e.g., "foo%bar%"), the leading prefix
+    /// can still be used for pruning, with the full pattern as a refine expression.
+    ///
+    /// # Arguments
+    /// * `column` - The column name
+    /// * `like` - The full LIKE expression (for constructing refine_expr if needed)
+    /// * `pattern` - The LIKE pattern as ScalarValue (e.g., "foo%")
+    fn visit_like(
+        &self,
+        _column: &str,
+        _like: &Like,
+        _pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        None
+    }
 
     /// Visits a potential reference to a column
     ///
@@ -211,6 +234,16 @@ impl ScalarQueryParser for MultiQueryParser {
         self.parsers
             .iter()
             .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_like(column, like, pattern))
     }
     /// TODO(low-priority): This is maybe not quite right.  We should filter down the list of parsers based
     /// on those that consider the reference valid.  Instead what we are doing is checking all parsers if any one
@@ -340,13 +373,201 @@ impl ScalarQueryParser for SargableQueryParser {
 
     fn visit_scalar_function(
         &self,
-        _: &str,
-        _: &DataType,
-        _: &ScalarUDF,
-        _: &[Expr],
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
     ) -> Option<IndexedExpression> {
+        // Handle starts_with(col, 'prefix') -> convert to LikePrefix query
+        if func.name() == "starts_with" && args.len() == 2 {
+            // Extract the prefix from the second argument
+            let prefix = match &args[1] {
+                Expr::Literal(ScalarValue::Utf8(Some(s)), _) => ScalarValue::Utf8(Some(s.clone())),
+                Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => {
+                    ScalarValue::LargeUtf8(Some(s.clone()))
+                }
+                _ => return None,
+            };
+
+            let query = SargableQuery::LikePrefix(prefix);
+            return Some(IndexedExpression::index_query_with_recheck(
+                column.to_string(),
+                self.index_name.clone(),
+                Arc::new(query),
+                self.needs_recheck,
+            ));
+        }
+
         None
     }
+
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        // Case-insensitive LIKE (ILIKE) cannot be efficiently pruned with zone maps
+        if like.case_insensitive {
+            return None;
+        }
+
+        // Extract the pattern string
+        let pattern_str = match pattern {
+            ScalarValue::Utf8(Some(s)) => s.as_str(),
+            ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            _ => return None,
+        };
+
+        // Try to extract a prefix from the LIKE pattern
+        let (prefix, needs_refine) = extract_like_leading_prefix(pattern_str, like.escape_char)?;
+
+        // Create the prefix ScalarValue with the same type as the pattern
+        let prefix_value = match pattern {
+            ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(prefix)),
+            ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(prefix)),
+            _ => return None,
+        };
+
+        let query = SargableQuery::LikePrefix(prefix_value);
+        let scalar_query = Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: self.index_name.clone(),
+            query: Arc::new(query),
+            needs_recheck: self.needs_recheck,
+        }));
+
+        // If the pattern has wildcards beyond simple prefix, add refine expression
+        let refine_expr = if needs_refine {
+            Some(Expr::Like(like.clone()))
+        } else {
+            None
+        };
+
+        Some(IndexedExpression {
+            scalar_query,
+            refine_expr,
+        })
+    }
+}
+
+/// Extract the leading literal prefix from a LIKE pattern.
+///
+/// Returns `Some((prefix, needs_refine))` where:
+/// - `prefix` is the leading literal portion before any wildcards
+/// - `needs_refine` is true if the pattern has wildcards beyond a simple trailing `%`
+///
+/// Returns `None` if the pattern starts with a wildcard (no leading literal).
+///
+/// Examples:
+/// - "foo%" -> Some(("foo", false)) - pure prefix, no recheck needed
+/// - "foo%bar%" -> Some(("foo", true)) - can use prefix for pruning, needs recheck
+/// - "foo_bar%" -> Some(("foo", true)) - _ is a wildcard, needs recheck
+/// - "foo\%bar%" with escape '\' -> Some(("foo%bar", false)) - escaped %, pure prefix
+/// - "%foo" -> None - starts with wildcard, cannot prune
+/// - "foo" -> None - no wildcard at all, use equality instead
+fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Option<(String, bool)> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let len = chars.len();
+
+    if len == 0 {
+        return None;
+    }
+
+    // DataFusion's starts_with simplification escapes special characters with backslash
+    // but doesn't set escape_char. Use backslash as default escape character.
+    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
+    // See: https://github.com/apache/datafusion/issues/XXXX
+    let effective_escape_char = escape_char.or(Some('\\'));
+
+    // Helper to check if a character at position i is escaped
+    let is_escaped = |i: usize| -> bool {
+        if let Some(esc) = effective_escape_char {
+            if i > 0 && chars[i - 1] == esc {
+                // Check if the escape char itself is escaped
+                if i >= 2 && chars[i - 2] == esc {
+                    false // Escape was escaped, so this char is NOT escaped
+                } else {
+                    true // This char is escaped
+                }
+            } else {
+                false
+            }
+        } else {
+            // No escape character defined - nothing can be escaped
+            false
+        }
+    };
+
+    // Pattern must contain at least one unescaped wildcard
+    let has_wildcard = chars.iter().enumerate().any(|(i, &c)| {
+        if c != '%' && c != '_' {
+            return false;
+        }
+        !is_escaped(i)
+    });
+
+    if !has_wildcard {
+        return None; // No wildcards, should use equality
+    }
+
+    // Check if pattern starts with an unescaped wildcard
+    if chars[0] == '%' || chars[0] == '_' {
+        return None; // Starts with wildcard, cannot prune
+    }
+
+    // Extract the leading literal prefix (everything before first unescaped wildcard)
+    let mut prefix = String::new();
+    let mut i = 0;
+    let mut found_wildcard = false;
+
+    while i < len {
+        let c = chars[i];
+
+        // Check for escape character (using effective escape char which may be inferred)
+        if let Some(esc) = effective_escape_char
+            && c == esc
+            && i + 1 < len
+        {
+            let next = chars[i + 1];
+            if next == '%' || next == '_' || next == esc {
+                // Escaped character - add the literal character
+                prefix.push(next);
+                i += 2;
+                continue;
+            }
+        }
+
+        // Check for unescaped wildcard
+        if c == '%' || c == '_' {
+            found_wildcard = true;
+            break;
+        }
+
+        prefix.push(c);
+        i += 1;
+    }
+
+    if prefix.is_empty() {
+        return None;
+    }
+
+    // Check if pattern is just a simple prefix (ends with single % and nothing after)
+    let needs_refine = if found_wildcard && i < len {
+        // Check if we're at a % wildcard
+        if chars[i] == '%' && i + 1 == len {
+            // Pattern is "prefix%" - pure prefix match, no refine needed
+            false
+        } else {
+            // Pattern has more after first wildcard, or has _ wildcard
+            true
+        }
+    } else {
+        // No wildcard found (shouldn't happen due to earlier check)
+        false
+    };
+
+    Some((prefix, needs_refine))
 }
 
 /// A parser for bloom filter indices that only support equals, is_null, and is_in operations
@@ -1660,6 +1881,21 @@ fn visit_scalar_fn(
     query_parser.visit_scalar_function(&col, &data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
+fn visit_like_expr(
+    like: &Like,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, _, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
+
+    // Extract the pattern as a ScalarValue
+    let pattern = match like.pattern.as_ref() {
+        Expr::Literal(scalar, _) => scalar.clone(),
+        _ => return None,
+    };
+
+    query_parser.visit_like(&column, like, &pattern)
+}
+
 fn visit_node(
     expr: &Expr,
     index_info: &dyn IndexInformationProvider,
@@ -1683,6 +1919,14 @@ fn visit_node(
         Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth),
         Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info, depth),
         Expr::ScalarFunction(scalar_fn) => Ok(visit_scalar_fn(scalar_fn, index_info)),
+        Expr::Like(like) => {
+            if like.negated {
+                // NOT LIKE cannot be efficiently pruned with zone maps
+                Ok(None)
+            } else {
+                Ok(visit_like_expr(like, index_info))
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -2449,5 +2693,309 @@ mod tests {
             make_exact() | make_at_least(),
             NullableIndexExprResult::AtLeast(_)
         ));
+    }
+
+    #[test]
+    fn test_extract_like_leading_prefix() {
+        // Simple prefix patterns (no recheck needed)
+        assert_eq!(
+            extract_like_leading_prefix("foo%", None),
+            Some(("foo".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("abc%", None),
+            Some(("abc".to_string(), false))
+        );
+
+        // Patterns with wildcards in the middle (need recheck)
+        assert_eq!(
+            extract_like_leading_prefix("foo%bar%", None),
+            Some(("foo".to_string(), true))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("foo_bar%", None),
+            Some(("foo".to_string(), true))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("foo%bar", None),
+            Some(("foo".to_string(), true))
+        );
+        assert_eq!(
+            extract_like_leading_prefix("foo_", None),
+            Some(("foo".to_string(), true))
+        );
+
+        // Not prefix patterns (starts with wildcard)
+        assert_eq!(extract_like_leading_prefix("%foo", None), None);
+        assert_eq!(extract_like_leading_prefix("_foo%", None), None);
+        assert_eq!(extract_like_leading_prefix("%", None), None);
+
+        // No wildcard at all (should use equality)
+        assert_eq!(extract_like_leading_prefix("foo", None), None);
+
+        // With escape character
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\%bar%", Some('\\')),
+            Some(("foo%bar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\_bar%", Some('\\')),
+            Some(("foo_bar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\\bar%", Some('\\')),
+            Some(("foo\\bar".to_string(), false))
+        );
+
+        // Escaped trailing % is not a wildcard (no wildcards)
+        assert_eq!(extract_like_leading_prefix(r"foo\%", Some('\\')), None);
+
+        // With backslash as default escape (for DataFusion starts_with compatibility):
+        // "foo\%" means escaped %, no wildcard -> None (should use equality)
+        assert_eq!(extract_like_leading_prefix(r"foo\%", None), None);
+        // "foo\bar%" - \b is not a valid escape sequence, so \ and b are literals, % is wildcard
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\bar%", None),
+            Some(("foo\\bar".to_string(), false))
+        );
+
+        // Empty pattern
+        assert_eq!(extract_like_leading_prefix("", None), None);
+
+        // Mixed escaped and unescaped
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\%bar%baz%", Some('\\')),
+            Some(("foo%bar".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn test_like_expression_parsing() {
+        // Test that LIKE expressions are parsed correctly with refine_expr for complex patterns
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+            ),
+        )]);
+
+        // Simple prefix pattern: LIKE 'foo%' -> LikePrefix("foo"), no refine_expr
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        let expr = state
+            .create_logical_expr("color LIKE 'foo%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(result.scalar_query.is_some(), "Should have scalar_query");
+        assert!(
+            result.refine_expr.is_none(),
+            "Simple prefix should not need refine_expr"
+        );
+
+        // Extract the query and verify it's LikePrefix
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            assert!(query.is_some(), "Query should be SargableQuery");
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("foo".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // Complex pattern: LIKE 'foo%bar%' -> LikePrefix("foo"), with refine_expr
+        let expr = state
+            .create_logical_expr("color LIKE 'foo%bar%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(result.scalar_query.is_some(), "Should have scalar_query");
+        assert!(
+            result.refine_expr.is_some(),
+            "Complex pattern should have refine_expr"
+        );
+
+        // Verify the query is still LikePrefix("foo")
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            assert!(query.is_some(), "Query should be SargableQuery");
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("foo".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        }
+
+        // Verify the refine_expr is the original LIKE expression
+        let refine = result.refine_expr.unwrap();
+        match refine {
+            Expr::Like(like) => {
+                assert!(!like.negated);
+                assert!(!like.case_insensitive);
+                if let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() {
+                    assert_eq!(pattern, "foo%bar%");
+                } else {
+                    panic!("Expected Utf8 literal pattern");
+                }
+            }
+            _ => panic!("Expected Like expression in refine_expr"),
+        }
+
+        // Pattern starting with wildcard: LIKE '%foo' -> no index, only refine
+        let expr = state
+            .create_logical_expr("color LIKE '%foo'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(
+            result.scalar_query.is_none(),
+            "Pattern starting with wildcard should not use index"
+        );
+        assert!(result.refine_expr.is_some(), "Should fall back to refine");
+    }
+
+    #[test]
+    fn test_starts_with_with_underscore_after_optimization() {
+        // Test that starts_with with underscore in prefix works correctly after DataFusion optimization
+        // DataFusion simplifies starts_with(col, 'test_ns$') to col LIKE 'test_ns$%'
+        // The underscore in the prefix should NOT be treated as a wildcard!
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "object_id",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("object_id_idx".to_string(), false)),
+            ),
+        )]);
+
+        let schema = Schema::new(vec![Field::new("object_id", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        // Create the expression with starts_with containing underscore
+        let expr = state
+            .create_logical_expr("starts_with(object_id, 'test_ns$')", &df_schema)
+            .unwrap();
+
+        // Apply DataFusion simplification (this may convert starts_with to LIKE)
+        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
+        let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+        let simplifier =
+            datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+        let simplified_expr = simplifier.simplify(expr).unwrap();
+
+        // Apply scalar indices
+        let result = apply_scalar_indices(simplified_expr, &index_info).unwrap();
+
+        // The prefix should be "test_ns$", NOT "test"
+        // This test documents the current (potentially broken) behavior
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            match query {
+                SargableQuery::LikePrefix(prefix) => {
+                    let prefix_str = match prefix {
+                        ScalarValue::Utf8(Some(s)) => s.clone(),
+                        _ => panic!("Expected Utf8 prefix"),
+                    };
+                    // Verify the prefix is correctly extracted with underscore as literal
+                    assert_eq!(
+                        prefix_str, "test_ns$",
+                        "Prefix should be 'test_ns$', not 'test' (underscore should not be a wildcard)"
+                    );
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            // If no scalar query, it means the pattern was not recognized
+            panic!("Expected scalar_query to be present");
+        }
+    }
+
+    #[test]
+    fn test_starts_with_to_like_conversion() {
+        // Test that starts_with(col, 'prefix') is converted to LikePrefix query
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+            ),
+        )]);
+
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+
+        // starts_with(color, 'foo') should be converted to LikePrefix("foo")
+        let expr = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+
+        assert!(
+            result.scalar_query.is_some(),
+            "starts_with should use index"
+        );
+        assert!(
+            result.refine_expr.is_none(),
+            "Pure prefix starts_with should not need refine_expr"
+        );
+
+        // Extract the query and verify it's LikePrefix
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            assert!(query.is_some(), "Query should be SargableQuery");
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("foo".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // Both starts_with and LIKE 'prefix%' should produce the same LikePrefix query
+        let like_expr = state
+            .create_logical_expr("color LIKE 'foo%'", &df_schema)
+            .unwrap();
+        let like_result = apply_scalar_indices(like_expr, &index_info).unwrap();
+
+        // Compare the queries - both should be LikePrefix("foo")
+        if let (
+            Some(ScalarIndexExpr::Query(starts_with_search)),
+            Some(ScalarIndexExpr::Query(like_search)),
+        ) = (&result.scalar_query, &like_result.scalar_query)
+        {
+            let sw_query = starts_with_search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            let like_query = like_search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .unwrap();
+            assert_eq!(
+                sw_query, like_query,
+                "starts_with and LIKE 'prefix%' should produce identical queries"
+            );
+        }
     }
 }

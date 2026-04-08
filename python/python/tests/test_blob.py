@@ -378,6 +378,47 @@ def test_blob_extension_write_external(tmp_path):
         assert f.read() == b"hello"
 
 
+def test_blob_extension_write_external_ingest(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"hello")
+    uri = blob_path.as_uri()
+
+    table = pa.table({"blob": lance.blob_array([uri])})
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_external_ingest",
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+
+    blob_path.unlink()
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"hello")
+    uri = blob_path.as_uri()
+    message = (
+        "allow_external_blob_outside_bases only applies when "
+        'external_blob_mode="reference"'
+    )
+
+    table = pa.table({"blob": lance.blob_array([uri])})
+    with pytest.raises(OSError, match=message):
+        lance.write_dataset(
+            table,
+            tmp_path / "test_ds_v2_external_ingest_invalid",
+            data_storage_version="2.2",
+            external_blob_mode="ingest",
+            allow_external_blob_outside_bases=True,
+        )
+
+
 def test_blob_extension_write_external_slice(tmp_path):
     tar_path = tmp_path / "container.tar"
     names = ["a.bin", "b.bin", "c.bin"]
@@ -413,6 +454,49 @@ def test_blob_extension_write_external_slice(tmp_path):
         data_storage_version="2.2",
         allow_external_blob_outside_bases=True,
     )
+
+    blobs = ds.take_blobs("blob", indices=[0, 1, 2])
+    assert len(blobs) == len(payloads)
+
+    for expected, blob_file in zip(payloads, blobs):
+        assert blob_file.size() == len(expected)
+        with blob_file as f:
+            assert f.read() == expected
+
+
+def test_blob_extension_write_external_slice_ingest(tmp_path):
+    tar_path = tmp_path / "container.tar"
+    names = ["a.bin", "b.bin", "c.bin"]
+    payloads = [b"alpha", b"bravo", b"charlie"]
+
+    with tarfile.open(tar_path, "w") as tf:
+        for name, data in zip(names, payloads):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    positions: list[int] = []
+    sizes: list[int] = []
+    with tarfile.open(tar_path, "r") as tf:
+        for name in names:
+            member = tf.getmember(name)
+            positions.append(member.offset_data)
+            sizes.append(member.size)
+
+    uri = tar_path.as_uri()
+    blob_values = [
+        Blob.from_uri(uri, position, size) for position, size in zip(positions, sizes)
+    ]
+    table = pa.table({"blob": lance.blob_array(blob_values)})
+
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "ds_ingest",
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+
+    tar_path.unlink()
 
     blobs = ds.take_blobs("blob", indices=[0, 1, 2])
     assert len(blobs) == len(payloads)

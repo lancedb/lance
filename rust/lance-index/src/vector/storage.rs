@@ -28,6 +28,8 @@ use crate::{
 };
 
 use super::DISTANCE_TYPE_KEY;
+use super::graph::OrderedFloat;
+use super::graph::OrderedNode;
 use super::quantizer::{Quantizer, QuantizerMetadata};
 
 /// <section class="warning">
@@ -101,6 +103,13 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     fn dist_between(&self, u: u32, v: u32) -> f32 {
         let dist_cal_u = self.dist_calculator_from_id(u);
         dist_cal_u.distance(v)
+    }
+
+    fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
+        let dist_cal_candidate = self.dist_calculator_from_id(candidate.id);
+        selected
+            .iter()
+            .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
     }
 }
 
@@ -228,6 +237,32 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
         })
+    }
+
+    /// Construct from pre-parsed metadata, skipping global buffer reads.
+    /// Used when reconstructing from a disk cache.
+    pub fn from_cached(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
+        Self {
+            reader,
+            distance_type,
+            metadata,
+            ivf,
+            frag_reuse_index,
+        }
+    }
+
+    pub fn reader(&self) -> &FileReader {
+        &self.reader
+    }
+
+    pub fn ivf(&self) -> &IvfModel {
+        &self.ivf
     }
 
     pub fn num_rows(&self) -> u64 {

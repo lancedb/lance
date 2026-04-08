@@ -9,7 +9,7 @@ use bytes::Bytes;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
-use lance_index::mem_wal::{FlushedGeneration, RegionManifest};
+use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
-use crate::dataset::mem_wal::manifest::RegionManifestStore;
+use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
 
 #[derive(Debug, Clone)]
@@ -34,8 +34,8 @@ pub struct MemTableFlusher {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     base_uri: String,
-    region_id: Uuid,
-    manifest_store: Arc<RegionManifestStore>,
+    shard_id: Uuid,
+    manifest_store: Arc<ShardManifestStore>,
 }
 
 impl MemTableFlusher {
@@ -43,14 +43,14 @@ impl MemTableFlusher {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
-        region_id: Uuid,
-        manifest_store: Arc<RegionManifestStore>,
+        shard_id: Uuid,
+        manifest_store: Arc<ShardManifestStore>,
     ) -> Self {
         Self {
             object_store,
             base_path,
             base_uri: base_uri.into(),
-            region_id,
+            shard_id,
             manifest_store,
         }
     }
@@ -94,7 +94,7 @@ impl MemTableFlusher {
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path =
-            flushed_memtable_path(&self.base_path, &self.region_id, &random_hash, generation);
+            flushed_memtable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} to {} ({} rows, {} batches)",
@@ -116,8 +116,8 @@ impl MemTableFlusher {
             .await?;
 
         info!(
-            "Flushed generation {} for region {} (manifest version {})",
-            generation, self.region_id, new_manifest.version
+            "Flushed generation {} for shard {} (manifest version {})",
+            generation, self.shard_id, new_manifest.version
         );
 
         Ok(FlushResult {
@@ -202,7 +202,7 @@ impl MemTableFlusher {
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path =
-            flushed_memtable_path(&self.base_path, &self.region_id, &random_hash, generation);
+            flushed_memtable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} with indexes to {} ({} rows, {} batches)",
@@ -247,11 +247,8 @@ impl MemTableFlusher {
                     index_meta.fields = vec![field_idx];
                     index_meta.dataset_version = dataset.version().version;
                     // Calculate fragment_bitmap from dataset fragments
-                    let fragment_ids: roaring::RoaringBitmap = dataset
-                        .get_fragments()
-                        .iter()
-                        .map(|f| f.id() as u32)
-                        .collect();
+                    let fragment_ids: roaring::RoaringBitmap =
+                        dataset.fragment_bitmap.as_ref().clone();
                     index_meta.fragment_bitmap = Some(fragment_ids);
 
                     // Commit the index to the dataset
@@ -290,8 +287,8 @@ impl MemTableFlusher {
             .await?;
 
         info!(
-            "Flushed generation {} for region {} (manifest version {})",
-            generation, self.region_id, new_manifest.version
+            "Flushed generation {} for shard {} (manifest version {})",
+            generation, self.shard_id, new_manifest.version
         );
 
         Ok(FlushResult {
@@ -403,7 +400,7 @@ impl MemTableFlusher {
         total_rows: usize,
     ) -> Result<()> {
         use lance_index::pbold;
-        use lance_index::scalar::inverted::INVERTED_INDEX_VERSION;
+        use lance_index::scalar::inverted::current_fts_format_version;
         use lance_index::scalar::lance_format::LanceIndexStore;
 
         let fts_configs: Vec<_> = index_configs
@@ -467,11 +464,7 @@ impl MemTableFlusher {
             let schema = dataset.schema();
             let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
 
-            let fragment_ids: roaring::RoaringBitmap = dataset
-                .get_fragments()
-                .iter()
-                .map(|f| f.id() as u32)
-                .collect();
+            let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,
@@ -480,9 +473,10 @@ impl MemTableFlusher {
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
-                index_version: INVERTED_INDEX_VERSION as i32,
+                index_version: current_fts_format_version().index_version() as i32,
                 created_at: None,
                 base_id: None,
+                files: None,
             };
 
             // Commit the index to the dataset
@@ -726,19 +720,20 @@ impl MemTableFlusher {
             base_id: None,
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
+            files: None,
         };
 
         Ok(index_meta)
     }
 
-    /// Update the region manifest with the new flushed generation.
+    /// Update the shard manifest with the new flushed generation.
     async fn update_manifest(
         &self,
         epoch: u64,
         generation: u64,
         gen_path: &str,
         covered_wal_entry_position: u64,
-    ) -> Result<RegionManifest> {
+    ) -> Result<ShardManifest> {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
@@ -749,7 +744,7 @@ impl MemTableFlusher {
                     path: gen_path.clone(),
                 });
 
-                RegionManifest {
+                ShardManifest {
                     version: current.version + 1,
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
@@ -861,15 +856,15 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_requires_wal_flush() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             2,
         ));
 
-        // Claim region
+        // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         let schema = create_test_schema();
@@ -882,7 +877,7 @@ mod tests {
         // Not flushed to WAL yet
         assert!(!memtable.all_flushed_to_wal());
 
-        let flusher = MemTableFlusher::new(store, base_path, base_uri, region_id, manifest_store);
+        let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
         let result = flusher.flush(&memtable, epoch).await;
 
         assert!(result.is_err());
@@ -897,21 +892,21 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_empty_memtable() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             2,
         ));
 
-        // Claim region
+        // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         let schema = create_test_schema();
         let memtable = MemTable::new(schema, 1, vec![]).unwrap();
 
-        let flusher = MemTableFlusher::new(store, base_path, base_uri, region_id, manifest_store);
+        let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
         let result = flusher.flush(&memtable, epoch).await;
 
         assert!(result.is_err());
@@ -921,15 +916,15 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_success() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             2,
         ));
 
-        // Claim region
+        // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         let schema = create_test_schema();
@@ -947,7 +942,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
-            region_id,
+            shard_id,
             manifest_store.clone(),
         );
         let result = flusher.flush(&memtable, epoch).await.unwrap();
@@ -967,18 +962,18 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_btree_index() {
         use super::super::super::index::{BTreeIndexConfig, IndexStore};
-        use lance_index::DatasetIndexExt;
+        use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             2,
         ));
 
-        // Claim region
+        // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         // Create index config for the 'id' column (field_id = 0)
@@ -1007,7 +1002,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
-            region_id,
+            shard_id,
             manifest_store.clone(),
         );
         let result = flusher
@@ -1022,7 +1017,7 @@ mod tests {
         // result.generation.path is just the folder name, construct full URI
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
-            base_uri, region_id, result.generation.path
+            base_uri, shard_id, result.generation.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
@@ -1065,24 +1060,24 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_ivf_pq_index() {
         use super::super::super::index::{IndexStore, IvfPqIndexConfig};
+        use crate::index::DatasetIndexExt;
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::DatasetIndexExt;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
         use lance_index::vector::pq::PQBuildParams;
         use lance_linalg::distance::DistanceType;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             2,
         ));
 
-        // Claim region
+        // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         // Create schema with vector column
@@ -1193,7 +1188,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
-            region_id,
+            shard_id,
             manifest_store.clone(),
         );
         let result = flusher
@@ -1207,7 +1202,7 @@ mod tests {
         // Verify the flushed dataset has the IVF-PQ index
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
-            base_uri, region_id, result.generation.path
+            base_uri, shard_id, result.generation.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
@@ -1289,21 +1284,21 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_fts_index() {
         use super::super::super::index::{FtsIndexConfig, IndexStore};
+        use crate::index::DatasetIndexExt;
         use arrow_array::StringArray;
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-        use lance_index::DatasetIndexExt;
         use std::sync::Arc;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = Arc::new(RegionManifestStore::new(
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
-            region_id,
+            shard_id,
             2,
         ));
 
-        // Claim region
+        // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         // Create schema with text column
@@ -1348,7 +1343,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
-            region_id,
+            shard_id,
             manifest_store.clone(),
         );
         let result = flusher
@@ -1362,7 +1357,7 @@ mod tests {
         // Verify the flushed dataset has the FTS index
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
-            base_uri, region_id, result.generation.path
+            base_uri, shard_id, result.generation.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();

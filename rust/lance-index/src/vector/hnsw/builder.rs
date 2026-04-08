@@ -5,7 +5,7 @@
 
 use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Float32Type, UInt32Type};
+use arrow::datatypes::{DataType, Float32Type, UInt32Type};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
@@ -31,12 +31,13 @@ use super::super::graph::beam_search;
 use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
-use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
-    DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode, VisitedGenerator,
+    BorrowingGraph, DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode,
+    VisitedGenerator,
 };
-use crate::vector::graph::{Visited, greedy_search};
+use crate::vector::graph::{Visited, beam_search_borrowed, greedy_search, greedy_search_borrowed};
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
@@ -100,11 +101,25 @@ impl HnswBuildParams {
     /// - `data`: A FixedSizeList to build the HNSW.
     /// - `distance_type`: The distance type to use.
     pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
-        let vec_store = Arc::new(FlatFloatStorage::new(
-            data.as_fixed_size_list().clone(),
-            distance_type,
-        ));
-        HNSW::index_vectors(vec_store.as_ref(), self)
+        let vectors = data.as_fixed_size_list().clone();
+        match (vectors.value_type(), distance_type) {
+            (DataType::UInt8, DistanceType::Hamming) => {
+                let vec_store = Arc::new(FlatBinStorage::new(vectors, distance_type));
+                HNSW::index_vectors(vec_store.as_ref(), self)
+            }
+            (DataType::UInt8, _) => Err(Error::invalid_input(format!(
+                "HNSW only supports hamming distance for UInt8 vectors, got {}",
+                distance_type
+            ))),
+            (_, DistanceType::Hamming) => Err(Error::invalid_input(format!(
+                "HNSW hamming distance only supports UInt8 vectors, got {}",
+                vectors.value_type()
+            ))),
+            _ => {
+                let vec_store = Arc::new(FlatFloatStorage::new(vectors, distance_type));
+                HNSW::index_vectors(vec_store.as_ref(), self)
+            }
+        }
     }
 }
 
@@ -117,7 +132,38 @@ impl HnswBuildParams {
 /// Each node in the graph has a global ID which is the index on the base layer.
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSW {
-    inner: Arc<HnswBuilder>,
+    inner: Arc<HnswCore>,
+}
+
+struct HnswCore {
+    params: HnswBuildParams,
+    nodes: Arc<Vec<GraphBuilderNode>>,
+    level_count: Vec<usize>,
+    entry_point: u32,
+    visited_generator_queue: Arc<ArrayQueue<VisitedGenerator>>,
+}
+
+impl DeepSizeOf for HnswCore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.params.deep_size_of_children(context)
+            + self.nodes.deep_size_of_children(context)
+            + self.level_count.deep_size_of_children(context)
+        // Skipping the visited_generator_queue
+    }
+}
+
+impl HnswCore {
+    fn max_level(&self) -> u16 {
+        self.params.max_level
+    }
+
+    fn num_nodes(&self, level: usize) -> usize {
+        self.level_count[level]
+    }
+
+    fn nodes(&self) -> Arc<Vec<GraphBuilderNode>> {
+        self.nodes.clone()
+    }
 }
 
 impl Debug for HNSW {
@@ -129,7 +175,7 @@ impl Debug for HNSW {
 impl HNSW {
     pub fn empty() -> Self {
         Self {
-            inner: Arc::new(HnswBuilder {
+            inner: Arc::new(HnswCore {
                 params: HnswBuildParams::default(),
                 nodes: Arc::new(Vec::new()),
                 level_count: Vec::new(),
@@ -155,7 +201,7 @@ impl HNSW {
         self.inner.num_nodes(level)
     }
 
-    pub fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
+    pub fn nodes(&self) -> Arc<Vec<GraphBuilderNode>> {
         self.inner.nodes()
     }
 
@@ -172,10 +218,10 @@ impl HNSW {
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
-        let nodes = &self.nodes();
+        let nodes = self.inner.nodes.as_ref();
         for level in (0..self.max_level()).rev() {
-            let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(
+            let cur_level = ImmutableHnswLevelView::new(level, nodes);
+            ep = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 &dist_calc,
@@ -183,9 +229,9 @@ impl HNSW {
             );
         }
 
-        let bottom_level = HnswBottomView::new(nodes);
+        let bottom_level = ImmutableHnswBottomView::new(nodes);
         let mut visited = visited_generator.generate(storage.len());
-        Ok(beam_search(
+        Ok(beam_search_borrowed(
             &bottom_level,
             &ep,
             params,
@@ -306,10 +352,10 @@ impl HNSW {
             .inner
             .level_count
             .iter()
-            .chain(iter::once(&AtomicUsize::new(0)))
+            .chain(iter::once(&0))
             .scan(0, |state, x| {
                 let start = *state;
-                *state += x.load(Ordering::Relaxed);
+                *state += *x;
                 Some(start)
             })
             .collect();
@@ -343,16 +389,33 @@ impl DeepSizeOf for HnswBuilder {
 }
 
 impl HnswBuilder {
-    fn max_level(&self) -> u16 {
-        self.params.max_level
-    }
+    fn finish(self) -> HNSW {
+        let nodes = match Arc::try_unwrap(self.nodes) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .map(|node| node.into_inner().expect("builder lock poisoned"))
+                .collect(),
+            Err(nodes) => nodes
+                .iter()
+                .map(|node| node.read().expect("builder lock poisoned").clone())
+                .collect(),
+        };
 
-    fn num_nodes(&self, level: usize) -> usize {
-        self.level_count[level].load(Ordering::Relaxed)
-    }
+        let level_count = self
+            .level_count
+            .into_iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
 
-    fn nodes(&self) -> Arc<Vec<RwLock<GraphBuilderNode>>> {
-        self.nodes.clone()
+        HNSW {
+            inner: Arc::new(HnswCore {
+                params: self.params,
+                nodes: Arc::new(nodes),
+                level_count,
+                entry_point: self.entry_point,
+                visited_generator_queue: self.visited_generator_queue,
+            }),
+        }
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
@@ -387,10 +450,11 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
+            let mut level_rng = rng();
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,
-                    builder.random_level() as usize + 1,
+                    builder.random_level(&mut level_rng) as usize + 1,
                 )));
             }
         }
@@ -402,8 +466,7 @@ impl HnswBuilder {
     /// New node's level
     ///
     /// See paper `Algorithm 1`
-    fn random_level(&self) -> u16 {
-        let mut rng = rng();
+    fn random_level<R: Rng + ?Sized>(&self, rng: &mut R) -> u16 {
         let ml = 1.0 / (self.params.m as f32).ln();
         min(
             (-rng.random::<f32>().ln() * ml) as u16,
@@ -486,7 +549,7 @@ impl HnswBuilder {
         ep: &OrderedNode,
         level: u16,
         dist_calc: &impl DistCalculator,
-        nodes: &Vec<RwLock<GraphBuilderNode>>,
+        nodes: &[RwLock<GraphBuilderNode>],
         visited_generator: &mut VisitedGenerator,
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
@@ -518,7 +581,6 @@ impl HnswBuilder {
         if level_neighbors.len() <= m_max {
             builder_node.update_from_ranked_neighbors(level);
             return;
-            //return level_neighbors;
         }
 
         *neighbors_ranked = select_neighbors_heuristic(storage, &level_neighbors, m_max);
@@ -530,11 +592,11 @@ impl HnswBuilder {
 // This is used to iterate over neighbors in a specific level.
 pub(crate) struct HnswLevelView<'a> {
     level: u16,
-    nodes: &'a Vec<RwLock<GraphBuilderNode>>,
+    nodes: &'a [RwLock<GraphBuilderNode>],
 }
 
 impl<'a> HnswLevelView<'a> {
-    pub fn new(level: u16, nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
+    pub fn new(level: u16, nodes: &'a [RwLock<GraphBuilderNode>]) -> Self {
         Self { level, nodes }
     }
 }
@@ -550,24 +612,64 @@ impl Graph for HnswLevelView<'_> {
     }
 }
 
-pub(crate) struct HnswBottomView<'a> {
-    nodes: &'a Vec<RwLock<GraphBuilderNode>>,
+pub(crate) struct ImmutableHnswLevelView<'a> {
+    level: u16,
+    nodes: &'a [GraphBuilderNode],
 }
 
-impl<'a> HnswBottomView<'a> {
-    pub fn new(nodes: &'a Vec<RwLock<GraphBuilderNode>>) -> Self {
-        Self { nodes }
+impl<'a> ImmutableHnswLevelView<'a> {
+    pub fn new(level: u16, nodes: &'a [GraphBuilderNode]) -> Self {
+        Self { level, nodes }
     }
 }
 
-impl Graph for HnswBottomView<'_> {
+impl Graph for ImmutableHnswLevelView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
 
     fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
-        let node = &self.nodes[key as usize];
-        node.read().unwrap().bottom_neighbors.clone()
+        self.nodes[key as usize].level_neighbors[self.level as usize].clone()
+    }
+}
+
+impl BorrowingGraph for ImmutableHnswLevelView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.nodes[key as usize].level_neighbors[self.level as usize].as_slice()
+    }
+}
+
+pub(crate) struct ImmutableHnswBottomView<'a> {
+    nodes: &'a [GraphBuilderNode],
+}
+
+impl<'a> ImmutableHnswBottomView<'a> {
+    pub fn new(nodes: &'a [GraphBuilderNode]) -> Self {
+        Self { nodes }
+    }
+}
+
+impl Graph for ImmutableHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
+        self.nodes[key as usize].bottom_neighbors.clone()
+    }
+}
+
+impl BorrowingGraph for ImmutableHnswBottomView<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> &[u32] {
+        self.nodes[key as usize].bottom_neighbors.as_slice()
     }
 }
 
@@ -657,10 +759,10 @@ impl IvfSubIndex for HNSW {
                 .push(VisitedGenerator::new(0))
                 .unwrap();
         }
-        let inner = HnswBuilder {
+        let inner = HnswCore {
             params: hnsw_metadata.params,
-            nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
-            level_count: level_count.into_iter().map(AtomicUsize::new).collect(),
+            nodes: Arc::new(nodes),
+            level_count,
             entry_point: hnsw_metadata.entry_point,
             visited_generator_queue,
         };
@@ -756,35 +858,32 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
-        let inner = HnswBuilder::with_params(params, storage);
-        let hnsw = Self {
-            inner: Arc::new(inner),
-        };
+        let builder = HnswBuilder::with_params(params, storage);
 
         log::debug!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
-            hnsw.inner.params.max_level,
-            hnsw.inner.params.m,
-            hnsw.inner.params.ef_construction,
+            builder.params.max_level,
+            builder.params.m,
+            builder.params.ef_construction,
             storage.distance_type(),
         );
 
         if storage.is_empty() {
-            return Ok(hnsw);
+            return Ok(builder.finish());
         }
 
         let len = storage.len();
-        hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
+        builder.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..len).into_par_iter().for_each_init(
             || VisitedGenerator::new(len),
             |visited_generator, node| {
-                hnsw.inner.insert(node as u32, visited_generator, storage);
+                builder.insert(node as u32, visited_generator, storage);
             },
         );
 
-        assert_eq!(hnsw.inner.level_count[0].load(Ordering::Relaxed), len);
-        Ok(hnsw)
+        assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
+        Ok(builder.finish())
     }
 
     fn remap(
@@ -807,7 +906,6 @@ impl IvfSubIndex for HNSW {
         for level in 0..self.max_level() {
             let level = level as usize;
             for (id, node) in self.inner.nodes.iter().enumerate() {
-                let node = node.read().unwrap();
                 if level >= node.level_neighbors.len() {
                     continue;
                 }
@@ -850,7 +948,7 @@ impl IvfSubIndex for HNSW {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, UInt8Array};
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_file::previous::{
@@ -869,7 +967,7 @@ mod tests {
     use crate::scalar::IndexWriter;
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::FlatFloatStorage,
+        flat::storage::{FlatBinStorage, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{
             HNSW, VECTOR_ID_FIELD,
@@ -895,6 +993,67 @@ mod tests {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("test_builder_write_load");
+        let writer = object_store.create(&path).await.unwrap();
+        let schema = Schema::new(vec![
+            VECTOR_ID_FIELD.clone(),
+            NEIGHBORS_FIELD.clone(),
+            DISTS_FIELD.clone(),
+        ]);
+        let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
+        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+            writer,
+            schema,
+            &PreviousFileWriterOptions::default(),
+        )
+        .unwrap();
+        let batch = builder.to_batch().unwrap();
+        let metadata = batch.schema_ref().metadata().clone();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish_with_metadata(&metadata).await.unwrap();
+
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+            .await
+            .unwrap();
+        let batch = reader
+            .read_range(0..reader.len(), reader.schema())
+            .await
+            .unwrap();
+        let loaded_hnsw = HNSW::load(batch).unwrap();
+
+        let query = fsl.value(0);
+        let k = 10;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let builder_results = builder
+            .search_basic(query.clone(), k, &params, None, store.as_ref())
+            .unwrap();
+        let loaded_results = loaded_hnsw
+            .search_basic(query, k, &params, None, store.as_ref())
+            .unwrap();
+        assert_eq!(builder_results, loaded_results);
+    }
+
+    #[tokio::test]
+    async fn test_builder_write_load_binary_hamming() {
+        const DIM: usize = 8;
+        const TOTAL: usize = 256;
+        const NUM_EDGES: usize = 20;
+        let data = UInt8Array::from_iter_values((0..TOTAL * DIM).map(|v| (v % 16) as u8));
+        let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let store = Arc::new(FlatBinStorage::new(fsl.clone(), DistanceType::Hamming));
+        let builder = HnswBuildParams::default()
+            .num_edges(NUM_EDGES)
+            .ef_construction(50)
+            .build(Arc::new(fsl.clone()), DistanceType::Hamming)
+            .await
+            .unwrap();
+
+        let object_store = ObjectStore::memory();
+        let path = Path::from("test_builder_write_load_binary_hamming");
         let writer = object_store.create(&path).await.unwrap();
         let schema = Schema::new(vec![
             VECTOR_ID_FIELD.clone(),

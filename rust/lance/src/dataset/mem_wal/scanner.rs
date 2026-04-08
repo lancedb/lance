@@ -23,7 +23,7 @@
 //! ```ignore
 //! use lance::dataset::mem_wal::scanner::LsmScanner;
 //!
-//! let scanner = LsmScanner::new(base_table, region_snapshots, vec!["pk".to_string()])
+//! let scanner = LsmScanner::new(base_table, shard_snapshots, vec!["pk".to_string()])
 //!     .project(&["id", "name"])
 //!     .filter("id > 10")?
 //!     .limit(100, None);
@@ -41,6 +41,6 @@ mod vector_search;
 
 pub use builder::LsmScanner;
 pub use collector::{ActiveMemTableRef, LsmDataSourceCollector};
-pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, RegionSnapshot};
+pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
 pub use point_lookup::LsmPointLookupPlanner;
 pub use vector_search::{DISTANCE_COLUMN, LsmVectorSearchPlanner};

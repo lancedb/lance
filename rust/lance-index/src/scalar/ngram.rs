@@ -170,6 +170,10 @@ impl CacheKey for NGramPostingListKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("posting-list-{}", self.row_offset).into()
     }
+
+    fn type_name() -> &'static str {
+        "NGramPostingList"
+    }
 }
 
 impl NGramPostingList {
@@ -504,6 +508,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -524,6 +529,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -1291,6 +1297,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 

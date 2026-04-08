@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use lance_core::cache::CacheBackend;
+
 use super::refs::{Ref, Refs};
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
@@ -37,6 +39,8 @@ pub struct DatasetBuilder {
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size_bytes: usize,
+    /// Custom index cache backend. If set, overrides `index_cache_size_bytes`.
+    index_cache_backend: Option<Arc<dyn CacheBackend>>,
     /// Optional pre-loaded manifest to avoid loading it again.
     manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
@@ -45,7 +49,7 @@ pub struct DatasetBuilder {
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
-    /// Storage options that override user-provided options (e.g., from namespace)
+    /// Storage options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
 }
 
@@ -73,6 +77,7 @@ impl DatasetBuilder {
         Self {
             index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
+            index_cache_backend: None,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
@@ -84,17 +89,17 @@ impl DatasetBuilder {
         }
     }
 
-    /// Create a DatasetBuilder from a LanceNamespace
+    /// Create a DatasetBuilder from a LanceNamespace client
     ///
     /// This will automatically fetch the table location and storage options from the namespace
-    /// via `describe_table()`.
+    /// client via `describe_table()`.
     ///
-    /// Storage options from the namespace will override any user-provided storage options
-    /// set via `.with_storage_options()`. This ensures the namespace is always the source
+    /// Storage options from the namespace client will override any user-provided storage options
+    /// set via `.with_storage_options()`. This ensures the namespace client is always the source
     /// of truth for storage options.
     ///
     /// # Arguments
-    /// * `namespace` - The namespace implementation to fetch table info from
+    /// * `namespace_client` - The namespace client implementation to fetch table info from
     /// * `table_id` - The table identifier (e.g., vec!["my_table"])
     ///
     /// # Example
@@ -103,14 +108,14 @@ impl DatasetBuilder {
     /// use lance::dataset::DatasetBuilder;
     ///
     /// // Connect to a REST namespace
-    /// let namespace = ConnectBuilder::new("rest")
+    /// let namespace_client = ConnectBuilder::new("rest")
     ///     .property("uri", "http://localhost:8080")
     ///     .connect()
     ///     .await?;
     ///
-    /// // Load a dataset using storage options from namespace
+    /// // Load a dataset using storage options from namespace client
     /// let dataset = DatasetBuilder::from_namespace(
-    ///     namespace,
+    ///     namespace_client,
     ///     vec!["my_table".to_string()],
     /// )
     /// .await?
@@ -119,7 +124,7 @@ impl DatasetBuilder {
     /// ```
     #[allow(deprecated)]
     pub async fn from_namespace(
-        namespace: Arc<dyn LanceNamespace>,
+        namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
     ) -> Result<Self> {
         let request = DescribeTableRequest {
@@ -127,7 +132,7 @@ impl DatasetBuilder {
             ..Default::default()
         };
 
-        let response = namespace
+        let response = namespace_client
             .describe_table(request)
             .await
             .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -142,8 +147,10 @@ impl DatasetBuilder {
 
         // Check managed_versioning flag to determine if namespace-managed commits should be used
         if response.managed_versioning == Some(true) {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::new(
+                namespace_client.clone(),
+                table_id.clone(),
+            );
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -157,7 +164,7 @@ impl DatasetBuilder {
 
         if let Some(initial_opts) = namespace_storage_options {
             let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
             );
             builder.options.storage_options_accessor = Some(Arc::new(
                 StorageOptionsAccessor::with_initial_and_provider(initial_opts, provider),
@@ -174,6 +181,15 @@ impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
     pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
         self.index_cache_size_bytes = cache_size;
+        self
+    }
+
+    /// Use a custom index cache backend.
+    ///
+    /// When set, this overrides `with_index_cache_size_bytes` — the custom
+    /// backend is responsible for its own capacity management.
+    pub fn with_index_cache_backend(mut self, backend: Arc<dyn CacheBackend>) -> Self {
+        self.index_cache_backend = Some(backend);
         self
     }
 
@@ -337,10 +353,10 @@ impl DatasetBuilder {
         self
     }
 
-    /// Enable credential vending from a LanceNamespace
+    /// Enable credential vending from a LanceNamespace client
     ///
-    /// Credentials will be automatically refreshed from the namespace
-    /// before they expire. The namespace should return `expires_at_millis`
+    /// Credentials will be automatically refreshed from the namespace client
+    /// before they expire. The namespace client should return `expires_at_millis`
     /// in the storage_options from `describe_table()`.
     ///
     /// Use `with_s3_credentials_refresh_offset()` to configure how early
@@ -357,14 +373,14 @@ impl DatasetBuilder {
     /// use lance_io::object_store::{StorageOptionsProvider, LanceNamespaceStorageOptionsProvider};
     ///
     /// // Connect to a REST namespace
-    /// let namespace = ConnectBuilder::new("rest")
+    /// let namespace_client = ConnectBuilder::new("rest")
     ///     .property("uri", "http://localhost:8080")
     ///     .connect()
     ///     .await?;
     ///
-    /// // Create a storage options provider from namespace
+    /// // Create a storage options provider from namespace client
     /// let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
-    ///     namespace,
+    ///     namespace_client,
     ///     vec!["my_table".to_string()],
     /// ));
     ///
@@ -551,11 +567,11 @@ impl DatasetBuilder {
     }
 
     async fn load_impl(mut self) -> Result<Dataset> {
-        // Apply storage_options_override to merge namespace options with any existing accessor
+        // Apply storage_options_override to merge namespace client options with any existing accessor
         if let Some(override_opts) = self.storage_options_override.take() {
             // Get existing options and merge
             let mut merged_opts = self.options.storage_options().cloned().unwrap_or_default();
-            // Override with namespace storage options - they take precedence
+            // Override with namespace client storage options - they take precedence
             merged_opts.extend(override_opts);
 
             // Update accessor with merged options
@@ -576,13 +592,21 @@ impl DatasetBuilder {
             }
         }
 
+        let index_cache_backend = self.index_cache_backend.take();
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
-            None => Arc::new(Session::new(
-                self.index_cache_size_bytes,
-                self.metadata_cache_size_bytes,
-                Default::default(),
-            )),
+            None => match index_cache_backend {
+                Some(backend) => Arc::new(Session::with_index_cache_backend(
+                    backend,
+                    self.metadata_cache_size_bytes,
+                    Default::default(),
+                )),
+                None => Arc::new(Session::new(
+                    self.index_cache_size_bytes,
+                    self.metadata_cache_size_bytes,
+                    Default::default(),
+                )),
+            },
         };
 
         let target_ref = self.version.clone();
@@ -717,7 +741,12 @@ impl DatasetBuilder {
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)
                     .await
-                    .map_err(|e| Error::dataset_not_found(base_path.to_string(), Box::new(e)))?,
+                    .map_err(|e| match &e {
+                        Error::NotFound { .. } => {
+                            Error::dataset_not_found(base_path.to_string(), Box::new(e))
+                        }
+                        _ => e,
+                    })?,
             };
             let manifest = Dataset::load_manifest(
                 &object_store,

@@ -32,9 +32,12 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
+#[cfg(target_os = "linux")]
+use crate::uring::{UringCurrentThreadReader, UringReader};
 mod list_retry;
 pub mod providers;
 pub mod storage_options;
+pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
@@ -531,11 +534,19 @@ impl ObjectStore {
 
     /// Returns true if the object store pointed to a local file system.
     pub fn is_local(&self) -> bool {
-        self.scheme == "file"
+        self.scheme == "file" || self.scheme == "file+uring"
     }
 
     pub fn is_cloud(&self) -> bool {
-        self.scheme != "file" && self.scheme != "memory"
+        !self.is_local() && self.scheme != "memory"
+    }
+
+    /// Whether this object store prefers the lite scheduler.
+    ///
+    /// The lite scheduler is designed for backends like io_uring where
+    /// tasks should only be polled when the consumer polls them.
+    pub fn prefers_lite_scheduler(&self) -> bool {
+        self.scheme == "file+uring"
     }
 
     pub fn scheme(&self) -> &str {
@@ -596,6 +607,31 @@ impl ObjectStore {
                 )
                 .await
             }
+            #[cfg(target_os = "linux")]
+            "file+uring" => {
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| str_is_truthy(&v))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -632,6 +668,31 @@ impl ObjectStore {
                     Arc::new(self.io_tracker.clone()),
                 )
                 .await
+            }
+            #[cfg(target_os = "linux")]
+            "file+uring" => {
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| str_is_truthy(&v))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
             }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
@@ -873,7 +934,7 @@ impl StorageOptions {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
             .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(10)
+            .unwrap_or(3)
     }
 
     /// Seconds of timeout to set in RetryConfig for object store client
@@ -1065,6 +1126,13 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
+
+        let (store, path) =
+            ObjectStore::from_uri("abfss://filesystem@account.dfs.core.windows.net/foo.lance")
+                .await
+                .unwrap();
+        assert_eq!(store.scheme, "abfss");
+        assert_eq!(path.to_string(), "foo.lance");
     }
 
     async fn test_block_size_used_test_helper(
@@ -1106,6 +1174,11 @@ mod tests {
       Some(HashMap::from([
             (String::from("account_name"), String::from("account")),
             (String::from("container_name"), String::from("container"))
+           ])))]
+    #[case("abfss://filesystem@account.dfs.core.windows.net/foo.lance",
+      Some(HashMap::from([
+            (String::from("account_name"), String::from("account")),
+            (String::from("container_name"), String::from("filesystem"))
            ])))]
     #[tokio::test]
     async fn test_block_size_used_cloud(

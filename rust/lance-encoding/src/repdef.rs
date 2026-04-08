@@ -817,6 +817,10 @@ impl RepDefBuilder {
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
         self.check_validity_len(validity.len());
+        if validity.null_count() == 0 {
+            self.add_no_null(validity.len());
+            return;
+        }
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             num_values: validity.len(),
             validity: Some(validity.into_inner()),
@@ -1225,7 +1229,7 @@ impl RepDefUnraveler {
     }
 
     pub fn is_all_valid(&self) -> bool {
-        self.def_meaning[self.current_layer].is_all_valid()
+        self.def_levels.is_none() || self.def_meaning[self.current_layer].is_all_valid()
     }
 
     /// If the current level is a repetition layer then this returns the number of lists
@@ -1400,15 +1404,14 @@ impl RepDefUnraveler {
     }
 
     pub fn skip_validity(&mut self) {
-        debug_assert!(
-            self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValidItem
-        );
+        debug_assert!(self.is_all_valid());
         self.current_layer += 1;
     }
 
     /// Unravels a layer of validity from the definition levels
     pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
-        if self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValidItem {
+        let meaning = self.def_meaning[self.current_layer];
+        if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
             self.current_layer += 1;
             validity.append_n(self.num_items as usize, true);
             return;
@@ -2835,6 +2838,26 @@ mod tests {
     }
 
     #[test]
+    fn test_all_valid_validity_bitmap_serializes_as_no_null() {
+        let mut from_bitmap = RepDefBuilder::default();
+        from_bitmap.add_validity_bitmap(validity(&[true, true, true, true]));
+
+        let mut from_no_null = RepDefBuilder::default();
+        from_no_null.add_no_null(4);
+
+        let from_bitmap = RepDefBuilder::serialize(vec![from_bitmap]);
+        let from_no_null = RepDefBuilder::serialize(vec![from_no_null]);
+
+        assert!(from_bitmap.repetition_levels.is_none());
+        assert!(from_bitmap.definition_levels.is_none());
+        assert_eq!(from_bitmap.def_meaning, from_no_null.def_meaning);
+        assert_eq!(
+            from_bitmap.max_visible_level,
+            from_no_null.max_visible_level
+        );
+    }
+
+    #[test]
     fn test_slicer() {
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(
@@ -3182,6 +3205,33 @@ mod tests {
                 offsets_32(&[0, 2, 2, 2, 4]),
                 Some(validity(&[true, true, false, true]))
             )
+        );
+    }
+
+    #[test]
+    fn test_mixed_unraveler_nullable_without_def_levels() {
+        // A page can keep nullable layer metadata even when all definition levels are 0
+        // and no definition buffer needs to be materialized. This should decode as all-valid.
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![
+            RepDefUnraveler::new(
+                None,
+                Some(vec![0, 1, 0, 1]),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                4,
+            ),
+            RepDefUnraveler::new(
+                None,
+                None,
+                vec![DefinitionInterpretation::NullableItem].into(),
+                4,
+            ),
+        ]);
+
+        assert_eq!(
+            unraveler.unravel_validity(8),
+            Some(validity(&[
+                true, false, true, false, true, true, true, true
+            ]))
         );
     }
 }

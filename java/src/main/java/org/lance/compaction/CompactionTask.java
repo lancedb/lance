@@ -55,7 +55,8 @@ public class CompactionTask implements Serializable {
         compactionOptions.getBatchSize(),
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
-        compactionOptions.getBinaryCopyReadBatchBytes());
+        compactionOptions.getBinaryCopyReadBatchBytes(),
+        compactionOptions.getMaxSourceFragments());
   }
 
   private native RewriteResult nativeExecute(
@@ -71,7 +72,8 @@ public class CompactionTask implements Serializable {
       Optional<Long> batchSize,
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
-      Optional<Long> binaryCopyReadBatchBytes);
+      Optional<Long> binaryCopyReadBatchBytes,
+      Optional<Long> maxSourceFragments);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

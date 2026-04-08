@@ -10,7 +10,7 @@ use std::{
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
-use opendal::{Operator, services::Azblob};
+use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
@@ -21,6 +21,7 @@ use url::Url;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
 
@@ -28,36 +29,84 @@ use lance_core::error::{Error, Result};
 pub struct AzureBlobStoreProvider;
 
 impl AzureBlobStoreProvider {
+    fn build_opendal_operator(
+        base_path: &Url,
+        storage_options: &StorageOptions,
+    ) -> Result<Operator> {
+        // Start with all storage options as the config map
+        // OpenDAL will handle environment variables through its default credentials chain
+        let mut config_map: HashMap<String, String> = storage_options.0.clone();
+
+        match base_path.scheme() {
+            "az" => {
+                let container = base_path
+                    .host_str()
+                    .ok_or_else(|| Error::invalid_input("Azure URL must contain container name"))?
+                    .to_string();
+
+                config_map.insert("container".to_string(), container);
+
+                let prefix = base_path.path().trim_start_matches('/');
+                if !prefix.is_empty() {
+                    config_map.insert("root".to_string(), format!("/{}", prefix));
+                }
+
+                Operator::from_iter::<Azblob>(config_map)
+                    .map_err(|e| {
+                        Error::invalid_input(format!(
+                            "Failed to create Azure Blob operator: {:?}",
+                            e
+                        ))
+                    })
+                    .map(|b| b.finish())
+            }
+            "abfss" => {
+                let filesystem = base_path.username();
+                if filesystem.is_empty() {
+                    return Err(Error::invalid_input(
+                        "abfss:// URL must include account: abfss://<filesystem>@<account>.dfs.core.windows.net/path",
+                    ));
+                }
+                let host = base_path.host_str().ok_or_else(|| {
+                    Error::invalid_input(
+                        "abfss:// URL must include account: abfss://<filesystem>@<account>.dfs.core.windows.net/path"
+                    )
+                })?;
+
+                config_map.insert("filesystem".to_string(), filesystem.to_string());
+                config_map.insert("endpoint".to_string(), format!("https://{}", host));
+                config_map
+                    .entry("account_name".to_string())
+                    .or_insert_with(|| host.split('.').next().unwrap_or(host).to_string());
+
+                let root_path = base_path.path().trim_start_matches('/');
+                if !root_path.is_empty() {
+                    config_map.insert("root".to_string(), format!("/{}", root_path));
+                }
+
+                Operator::from_iter::<Azdls>(config_map)
+                    .map_err(|e| {
+                        Error::invalid_input(format!(
+                            "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
+                            e
+                        ))
+                    })
+                    .map(|b| b.finish())
+            }
+            _ => Err(Error::invalid_input(format!(
+                "Unsupported Azure scheme: {}",
+                base_path.scheme()
+            ))),
+        }
+    }
+
     async fn build_opendal_azure_store(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
     ) -> Result<Arc<dyn OSObjectStore>> {
-        let container = base_path
-            .host_str()
-            .ok_or_else(|| Error::invalid_input("Azure URL must contain container name"))?
-            .to_string();
-
-        let prefix = base_path.path().trim_start_matches('/').to_string();
-
-        // Start with all storage options as the config map
-        // OpenDAL will handle environment variables through its default credentials chain
-        let mut config_map: HashMap<String, String> = storage_options.0.clone();
-
-        // Set required OpenDAL configuration
-        config_map.insert("container".to_string(), container);
-
-        if !prefix.is_empty() {
-            config_map.insert("root".to_string(), format!("/{}", prefix));
-        }
-
-        let operator = Operator::from_iter::<Azblob>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(format!("Failed to create Azure Blob operator: {:?}", e))
-            })?
-            .finish();
-
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        let operator = Self::build_opendal_operator(base_path, storage_options)?;
+        Ok(Arc::new(OpendalStore::new(operator)))
     }
 
     async fn build_microsoft_azure_store(
@@ -65,12 +114,12 @@ impl AzureBlobStoreProvider {
         base_path: &Url,
         storage_options: &StorageOptions,
     ) -> Result<Arc<dyn OSObjectStore>> {
-        let max_retries = storage_options.client_max_retries();
-        let retry_timeout = storage_options.client_retry_timeout();
+        // Use a low retry count since the AIMD throttle layer handles
+        // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
             backoff: Default::default(),
-            max_retries,
-            retry_timeout: Duration::from_secs(retry_timeout),
+            max_retries: storage_options.client_max_retries(),
+            retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
         let mut builder = MicrosoftAzureBuilder::new()
@@ -88,9 +137,17 @@ impl AzureBlobStoreProvider {
 #[async_trait::async_trait]
 impl ObjectStoreProvider for AzureBlobStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        let scheme = base_path.scheme().to_string();
+        if scheme != "az" && scheme != "abfss" {
+            return Err(Error::invalid_input(format!(
+                "Unsupported Azure scheme '{}', expected 'az' or 'abfss'",
+                scheme
+            )));
+        }
+
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
-            StorageOptions(params.storage_options().cloned().unwrap_or_default());
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_azure();
         let download_retry_count = storage_options.download_retry_count();
 
@@ -100,17 +157,30 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             .map(|v| v.as_str() == "true")
             .unwrap_or(false);
 
-        let inner = if use_opendal {
+        let inner: Arc<dyn OSObjectStore> = if use_opendal {
             self.build_opendal_azure_store(&base_path, &storage_options)
                 .await?
         } else {
             self.build_microsoft_azure_store(&base_path, &storage_options)
                 .await?
         };
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let inner = if throttle_config.is_disabled() {
+            inner
+        } else if storage_options.client_max_retries() == 0 {
+            log::warn!(
+                "AIMD throttle disabled: the current implementation relies on the object store \
+                 client surfacing retry errors, which requires client_max_retries > 0. \
+                 No throttle or retry layer will be applied."
+            );
+            inner
+        } else {
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
+        };
 
         Ok(ObjectStore {
             inner,
-            scheme: String::from("az"),
+            scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
@@ -131,8 +201,10 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let authority = url.authority();
         let (container, account) = match authority.find("@") {
             Some(at_index) => {
-                // The URI looks like 'az://container@account.dfs.core.windows.net/path-part/file',
-                // or possibly 'az://container@account/path-part/file'.
+                // The URI has an:
+                // - az:// schema type and is similar to 'az://container@account.dfs.core.windows.net/path-part/file
+                //         or possibly 'az://container@account/path-part/file' (the short version).
+                // - abfss:// schema type and is similar to 'abfss://filesystem@account.dfs.core.windows.net/path-part/file'.
                 let container = &authority[..at_index];
                 let account = &authority[at_index + 1..];
                 (
@@ -250,6 +322,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "az");
+        let inner_desc = store.inner.to_string();
+        assert!(
+            inner_desc.contains("Opendal") && inner_desc.contains("azblob"),
+            "az:// with use_opendal=true should use OpenDAL Azblob, got: {}",
+            inner_desc
+        );
     }
 
     #[test]
@@ -300,6 +378,21 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_object_store_prefix_from_url_short_account() {
+        let provider = AzureBlobStoreProvider;
+        let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
+        assert_eq!(
+            "az$container@account",
+            provider
+                .calculate_object_store_prefix(
+                    &Url::parse("az://container@account/path").unwrap(),
+                    Some(&options)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn test_fail_to_calculate_object_store_prefix_from_url() {
         let provider = AzureBlobStoreProvider;
         let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
@@ -312,5 +405,158 @@ mod tests {
             .expect_err("expected error")
             .to_string();
         assert_eq!(expected, &result[..expected.len()]);
+    }
+
+    // --- abfss:// tests ---
+
+    #[test]
+    fn test_abfss_extract_path() {
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path/to/dataset.lance")
+            .unwrap();
+        let path = provider.extract_path(&url).unwrap();
+        assert_eq!(
+            path,
+            object_store::path::Path::from("path/to/dataset.lance")
+        );
+    }
+
+    #[test]
+    fn test_calculate_abfss_prefix() {
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path/to/data").unwrap();
+        let prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
+        assert_eq!(prefix, "abfss$myfs@myaccount");
+    }
+
+    #[test]
+    fn test_calculate_abfss_prefix_ignores_storage_options() {
+        let provider = AzureBlobStoreProvider;
+        let options =
+            HashMap::from_iter([("account_name".to_string(), "other_account".to_string())]);
+        let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path").unwrap();
+        let prefix = provider
+            .calculate_object_store_prefix(&url, Some(&options))
+            .unwrap();
+        assert_eq!(prefix, "abfss$myfs@myaccount");
+    }
+
+    #[tokio::test]
+    async fn test_abfss_default_uses_microsoft_builder() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "testaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert_eq!(store.scheme, "abfss");
+        assert!(!store.is_local());
+        assert!(store.is_cloud());
+        let inner_desc = store.inner.to_string();
+        assert!(
+            inner_desc.contains("MicrosoftAzure"),
+            "abfss:// without use_opendal should use MicrosoftAzureBuilder, got: {}",
+            inner_desc
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_scheme_rejected() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("wasbs://container@myaccount.blob.core.windows.net/path").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "myaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let err = provider
+            .new_store(url, &params)
+            .await
+            .expect_err("expected error for unsupported scheme");
+        assert!(
+            err.to_string().contains("Unsupported Azure scheme"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abfss_with_opendal_uses_azdls() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("account_name".to_string(), "testaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert_eq!(store.scheme, "abfss");
+        assert!(!store.is_local());
+        assert!(store.is_cloud());
+        let inner_desc = store.inner.to_string();
+        assert!(
+            inner_desc.contains("Opendal") && inner_desc.contains("azdls"),
+            "abfss:// with use_opendal=true should use OpenDAL Azdls, got: {}",
+            inner_desc
+        );
+    }
+
+    #[test]
+    fn test_azdls_capabilities_differ_from_azblob() {
+        let common_opts = StorageOptions(HashMap::from([
+            ("account_name".to_string(), "testaccount".to_string()),
+            ("account_key".to_string(), "dGVzdA==".to_string()),
+            (
+                "endpoint".to_string(),
+                "https://testaccount.blob.core.windows.net".to_string(),
+            ),
+        ]));
+
+        // Build az:// operator (uses Azblob backend)
+        let az_url = Url::parse("az://test-container/path").unwrap();
+        let az_operator =
+            AzureBlobStoreProvider::build_opendal_operator(&az_url, &common_opts).unwrap();
+
+        // Build abfss:// operator (uses Azdls backend)
+        let abfss_url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+        let abfss_operator =
+            AzureBlobStoreProvider::build_opendal_operator(&abfss_url, &common_opts).unwrap();
+
+        let azblob_cap = az_operator.info().native_capability();
+        let azdls_cap = abfss_operator.info().native_capability();
+
+        // Both support basic operations
+        assert!(azblob_cap.read);
+        assert!(azdls_cap.read);
+        assert!(azblob_cap.write);
+        assert!(azdls_cap.write);
+        assert!(azblob_cap.list);
+        assert!(azdls_cap.list);
+
+        // Azdls supports rename and create_dir (HNS features); Azblob does not
+        assert!(azdls_cap.rename, "Azdls should support rename");
+        assert!(azdls_cap.create_dir, "Azdls should support create_dir");
+        assert!(!azblob_cap.rename, "Azblob should not support rename");
     }
 }

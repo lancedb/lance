@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::str;
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
@@ -46,16 +47,17 @@ use lance::dataset::{
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
-    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
-    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, WriteMode, WriteParams,
+    Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
+    MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
+    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexInternalExt, vector::VectorIndexParams};
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -67,8 +69,9 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    DatasetIndexExt, IndexParams, IndexType,
+    IndexParams, IndexType,
     optimize::OptimizeOptions,
+    progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
@@ -78,7 +81,9 @@ use lance_index::{
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
+};
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
@@ -111,6 +116,7 @@ pub mod stats;
 
 const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
+const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -482,7 +488,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, storage_options_provider=None, namespace=None, table_id=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false))]
     fn new(
         py: Python,
         uri: String,
@@ -497,9 +503,9 @@ impl Dataset {
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
         session: Option<Session>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
-        namespace: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -569,6 +575,9 @@ impl Dataset {
                 ));
             };
         }
+        // Save a copy of storage options for potential namespace-based credential refresh
+        let initial_storage_options = storage_options.clone();
+
         if let Some(mut storage_options) = storage_options {
             if let Some(user_agent) = storage_options.get_mut("user_agent") {
                 user_agent.push_str(&format!(" pylance/{}", env!("CARGO_PKG_VERSION")));
@@ -589,21 +598,34 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        // Add storage options provider if provided
-        if let Some(provider_obj) = storage_options_provider {
-            use crate::storage_options::py_object_to_storage_options_provider;
-            let provider = py_object_to_storage_options_provider(provider_obj)?;
-            builder = builder.with_storage_options_provider(provider);
-        }
+        // Set up namespace-based features if namespace_client and table_id are provided
+        if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(py, ns_client)?;
 
-        // Set up namespace commit handler if namespace and table_id are provided
-        if let (Some(ns), Some(tid)) = (namespace, table_id) {
-            let ns_arc = extract_namespace_arc(py, ns)?;
-            let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            builder = builder.with_commit_handler(commit_handler);
+            // Auto-create storage options provider from namespace client
+            // when storage_options are present (meaning credentials came from namespace.describe_table)
+            if initial_storage_options.is_some() {
+                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                    LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
+                );
+                // Create accessor with initial options and provider for credential refresh
+                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                    initial_storage_options.clone().unwrap_or_default(),
+                    provider,
+                ));
+                builder = builder.with_storage_options_accessor(accessor);
+            }
+
+            // Set up commit handler only if namespace manages versioning
+            if namespace_client_managed_versioning {
+                let external_store =
+                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
+                let commit_handler: Arc<dyn CommitHandler> =
+                    Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: Arc::new(external_store),
+                    });
+                builder = builder.with_commit_handler(commit_handler);
+            }
         }
 
         let dataset = rt().block_on(Some(py), builder.load())?;
@@ -1459,7 +1481,7 @@ impl Dataset {
 
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
-        Ok(self.ds.version().version)
+        Ok(self.ds.version_id())
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
@@ -1746,6 +1768,7 @@ impl Dataset {
         for (name, meta) in branches.iter() {
             let dict = PyDict::new(py);
             dict.set_item("parent_branch", meta.parent_branch.clone())?;
+            dict.set_item("branch_identifier", meta.identifier.version_mapping.clone())?;
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
@@ -1780,6 +1803,7 @@ impl Dataset {
         for (name, meta) in ordered.into_iter() {
             let dict = PyDict::new(py);
             dict.set_item("parent_branch", meta.parent_branch.clone())?;
+            dict.set_item("branch_identifier", meta.identifier.version_mapping.clone())?;
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
@@ -1941,8 +1965,11 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
-                    if let Some(skip_merge) = kwargs.get_item("skip_merge")? {
-                        params = params.skip_merge(skip_merge.extract()?);
+                    if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
+                        params = params.memory_limit_mb(memory_limit.extract()?);
+                    }
+                    if let Some(num_workers) = kwargs.get_item("num_workers")? {
+                        params = params.num_workers(num_workers.extract()?);
                     }
                 }
                 Box::new(params)
@@ -1961,6 +1988,7 @@ impl Dataset {
         let replace = replace.unwrap_or(true);
         let train = train.unwrap_or(true); // Default to true for backward compatibility
 
+        let mut progress_handler = Self::make_index_progress_handler_from_kwargs(kwargs)?;
         let mut new_self = self.ds.as_ref().clone();
         let mut builder = new_self
             .create_index_builder(&columns, idx_type, params.as_ref())
@@ -1997,6 +2025,9 @@ impl Dataset {
         if let Some(index_uuid) = index_uuid {
             builder = builder.index_uuid(index_uuid);
         }
+        if let Some(progress_handler) = progress_handler.as_ref() {
+            builder = builder.progress(progress_handler.progress.clone());
+        }
 
         use std::future::IntoFuture;
 
@@ -2004,16 +2035,52 @@ impl Dataset {
         let index_metadata = if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
             // Note: We don't update self.ds here as the index is not committed
-            rt().block_on(None, builder.execute_uncommitted())?
+            Self::run_index_future(builder.execute_uncommitted(), progress_handler.as_mut())?
                 .infer_error()?
         } else {
             // For regular indexing, use the standard execute path
-            let index_metadata = rt().block_on(None, builder.into_future())?.infer_error()?;
+            let index_metadata =
+                Self::run_index_future(builder.into_future(), progress_handler.as_mut())?
+                    .infer_error()?;
             self.ds = Arc::new(new_self);
             index_metadata
         };
 
         Ok(PyLance(index_metadata))
+    }
+
+    fn merge_existing_index_segments(
+        &self,
+        segments: Vec<PyLance<IndexMetadata>>,
+    ) -> PyResult<PyLance<IndexMetadata>> {
+        let merged = rt()
+            .block_on(
+                None,
+                self.ds
+                    .merge_existing_index_segments(segments.into_iter().map(|s| s.0).collect()),
+            )?
+            .infer_error()?;
+        Ok(PyLance(merged))
+    }
+
+    fn commit_existing_index_segments(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<PyLance<IndexMetadata>>,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(
+            None,
+            new_self.commit_existing_index_segments(
+                index_name,
+                column,
+                segments.into_iter().map(|segment| segment.0).collect(),
+            ),
+        )?
+        .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn drop_index(&mut self, name: &str) -> PyResult<()> {
@@ -2030,18 +2097,34 @@ impl Dataset {
             .infer_error()
     }
 
-    #[pyo3(signature = (index_uuid, index_type, batch_readhead=None))]
+    #[pyo3(signature = (index_uuid, index_type, batch_readhead=None, progress_callback=None))]
     fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: &str,
         batch_readhead: Option<usize>,
+        progress_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        rt().block_on(None, async {
-            self.ds
-                .merge_index_metadata(index_uuid, IndexType::try_from(index_type)?, batch_readhead)
-                .await
-        })?
+        let mut progress_handler =
+            Self::make_index_progress_handler_from_callback(progress_callback)?;
+        let progress: Arc<dyn IndexBuildProgress> = progress_handler
+            .as_ref()
+            .map(|handler| handler.progress.clone() as Arc<dyn IndexBuildProgress>)
+            .unwrap_or_else(|| Arc::new(NoopIndexBuildProgress));
+
+        Self::run_index_future(
+            async {
+                self.ds
+                    .merge_index_metadata(
+                        index_uuid,
+                        IndexType::try_from(index_type)?,
+                        batch_readhead,
+                        progress,
+                    )
+                    .await
+            },
+            progress_handler.as_mut(),
+        )?
         .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
@@ -2135,21 +2218,21 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
-        namespace: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2165,37 +2248,35 @@ impl Dataset {
             PyLance(transaction),
             commit_lock,
             storage_options,
-            storage_options_provider,
             enable_v2_manifest_paths,
             detached,
             max_retries,
             enable_stable_row_ids,
-            namespace,
+            namespace_client,
             table_id,
+            namespace_client_managed_versioning,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace = None, table_id = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
         enable_stable_row_ids: Option<bool>,
-        namespace: Option<&Bound<'_, PyAny>>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
     ) -> PyResult<Self> {
-        let accessor = crate::storage_options::create_accessor_from_python(
-            storage_options.clone(),
-            storage_options_provider,
-        )?;
+        let accessor =
+            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -2206,7 +2287,8 @@ impl Dataset {
             None
         };
 
-        // Create commit_handler: prefer user-provided commit_lock, then namespace-based handler
+        // Create commit_handler: prefer user-provided commit_lock, then namespace client-based handler
+        // (only if namespace_client_managed_versioning is true)
         let commit_handler: Option<Arc<dyn CommitHandler>> =
             if let Some(commit_lock) = commit_lock.as_ref() {
                 // User provided a commit_lock
@@ -2215,10 +2297,13 @@ impl Dataset {
                         .into_py_any(commit_lock.py())
                         .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
                 )
-            } else if let (Some(ns), Some(tid)) = (namespace, table_id) {
-                // Create ExternalManifestCommitHandler from namespace and table_id
-                let ns_arc = extract_namespace_arc(ns.py(), ns)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, tid);
+            } else if namespace_client_managed_versioning
+                && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
+            {
+                // Create ExternalManifestCommitHandler from namespace client and table_id
+                // only when namespace manages versioning
+                let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns_client, tid);
                 Some(Arc::new(ExternalManifestCommitHandler {
                     external_manifest_store: Arc::new(external_store),
                 }) as Arc<dyn CommitHandler>)
@@ -2260,21 +2345,18 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, storage_options_provider = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch(
         dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let accessor = crate::storage_options::create_accessor_from_python(
-            storage_options.clone(),
-            storage_options_provider,
-        )?;
+        let accessor =
+            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -2880,6 +2962,190 @@ impl PyWriteDest {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IndexProgressEventType {
+    Start,
+    Progress,
+    Complete,
+}
+
+impl IndexProgressEventType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Progress => "progress",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexProgressEvent {
+    event: IndexProgressEventType,
+    stage: String,
+    completed: Option<u64>,
+    total: Option<u64>,
+    unit: String,
+}
+
+#[derive(Debug, Default)]
+struct ActiveIndexProgressStage {
+    stage: Option<String>,
+    completed: Option<u64>,
+    total: Option<u64>,
+    unit: String,
+}
+
+#[derive(Debug)]
+struct PyIndexBuildProgress {
+    sender: SyncSender<IndexProgressEvent>,
+    active_stage: Mutex<ActiveIndexProgressStage>,
+}
+
+impl PyIndexBuildProgress {
+    fn new(sender: SyncSender<IndexProgressEvent>) -> Self {
+        Self {
+            sender,
+            active_stage: Mutex::new(ActiveIndexProgressStage::default()),
+        }
+    }
+
+    /// Send a lifecycle event (start/complete) with blocking semantics.
+    ///
+    /// These events are rare relative to the channel capacity
+    /// (`INDEX_PROGRESS_QUEUE_SIZE`), so blocking here will not stall
+    /// the tokio runtime in practice.  Progress events use the
+    /// non-blocking `try_send_progress_event` instead.
+    fn send_event(&self, event: IndexProgressEvent) -> lance::Result<()> {
+        self.sender.send(event).map_err(|_| {
+            Error::invalid_input("Index progress callback receiver disconnected".to_string())
+        })
+    }
+
+    fn try_send_progress_event(&self, event: IndexProgressEvent) -> lance::Result<()> {
+        match self.sender.try_send(event) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err(Error::invalid_input(
+                "Index progress callback receiver disconnected".to_string(),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl IndexBuildProgress for PyIndexBuildProgress {
+    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
+        {
+            let mut active_stage = self.active_stage.lock().unwrap();
+            *active_stage = ActiveIndexProgressStage {
+                stage: Some(stage.to_string()),
+                completed: Some(0),
+                total,
+                unit: unit.to_string(),
+            };
+        }
+
+        self.send_event(IndexProgressEvent {
+            event: IndexProgressEventType::Start,
+            stage: stage.to_string(),
+            completed: Some(0),
+            total,
+            unit: unit.to_string(),
+        })
+    }
+
+    async fn stage_progress(&self, stage: &str, completed: u64) -> lance::Result<()> {
+        let event = {
+            let mut active_stage = self.active_stage.lock().unwrap();
+            if active_stage.stage.is_none() {
+                active_stage.stage = Some(stage.to_string());
+            }
+            active_stage.completed = Some(completed);
+            IndexProgressEvent {
+                event: IndexProgressEventType::Progress,
+                stage: stage.to_string(),
+                completed: Some(completed),
+                total: active_stage.total,
+                unit: active_stage.unit.clone(),
+            }
+        };
+
+        self.try_send_progress_event(event)
+    }
+
+    async fn stage_complete(&self, stage: &str) -> lance::Result<()> {
+        let event = {
+            let mut active_stage = self.active_stage.lock().unwrap();
+            let completed = active_stage.completed.or(active_stage.total);
+            let total = active_stage.total;
+            let unit = active_stage.unit.clone();
+            *active_stage = ActiveIndexProgressStage::default();
+            IndexProgressEvent {
+                event: IndexProgressEventType::Complete,
+                stage: stage.to_string(),
+                completed,
+                total,
+                unit,
+            }
+        };
+
+        self.send_event(event)
+    }
+}
+
+struct IndexProgressDispatcher {
+    callback: Py<PyAny>,
+    index_progress_cls: Py<PyAny>,
+    receiver: Receiver<IndexProgressEvent>,
+}
+
+impl IndexProgressDispatcher {
+    fn new(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        receiver: Receiver<IndexProgressEvent>,
+    ) -> PyResult<Self> {
+        let index_progress_cls = py
+            .import("lance.progress")?
+            .getattr("IndexProgress")?
+            .unbind();
+        Ok(Self {
+            callback,
+            index_progress_cls,
+            receiver,
+        })
+    }
+
+    fn drain(&mut self) -> PyResult<()> {
+        while let Ok(event) = self.receiver.try_recv() {
+            self.dispatch(event)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch(&self, event: IndexProgressEvent) -> PyResult<()> {
+        Python::attach(|py| {
+            let progress = self.index_progress_cls.call1(
+                py,
+                (
+                    event.event.as_str(),
+                    event.stage,
+                    event.completed,
+                    event.total,
+                    event.unit,
+                ),
+            )?;
+            self.callback.call1(py, (progress,))?;
+            Ok(())
+        })
+    }
+}
+
+struct IndexProgressHandler {
+    progress: Arc<PyIndexBuildProgress>,
+    dispatcher: IndexProgressDispatcher,
+}
+
 impl Dataset {
     fn transform_ref(&self, reference: Option<Bound<PyAny>>) -> PyResult<Ref> {
         if let Some(reference) = reference {
@@ -2907,7 +3173,7 @@ impl Dataset {
         } else {
             Ok(Ref::Version(
                 self.ds.manifest.branch.clone(),
-                Some(self.ds.version().version),
+                Some(self.ds.version_id()),
             ))
         }
     }
@@ -2971,6 +3237,62 @@ impl Dataset {
                 }
             });
         }))
+    }
+
+    fn make_index_progress_handler(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+    ) -> PyResult<IndexProgressHandler> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyValueError::new_err("Progress callback must be callable"));
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(INDEX_PROGRESS_QUEUE_SIZE);
+        let progress = Arc::new(PyIndexBuildProgress::new(sender));
+        let dispatcher = IndexProgressDispatcher::new(py, callback, receiver)?;
+        Ok(IndexProgressHandler {
+            progress,
+            dispatcher,
+        })
+    }
+
+    fn make_index_progress_handler_from_kwargs(
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Option<IndexProgressHandler>> {
+        let Some(kwargs) = kwargs else {
+            return Ok(None);
+        };
+
+        let Some(callback) = get_dict_opt::<Py<PyAny>>(kwargs, "progress_callback")? else {
+            return Ok(None);
+        };
+
+        Self::make_index_progress_handler(kwargs.py(), callback).map(Some)
+    }
+
+    fn make_index_progress_handler_from_callback(
+        callback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<IndexProgressHandler>> {
+        let Some(callback) = callback else {
+            return Ok(None);
+        };
+
+        Self::make_index_progress_handler(callback.py(), callback.clone().unbind()).map(Some)
+    }
+
+    fn run_index_future<F>(
+        future: F,
+        progress_handler: Option<&mut IndexProgressHandler>,
+    ) -> PyResult<F::Output>
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if let Some(progress_handler) = progress_handler {
+            rt().block_on_pumping(None, future, || progress_handler.dispatcher.drain())
+        } else {
+            rt().block_on(None, future)
+        }
     }
 }
 
@@ -3076,20 +3398,35 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
-        let storage_options_provider =
-            get_dict_opt::<Py<PyAny>>(options, "storage_options_provider")?;
 
-        if storage_options.is_some() || storage_options_provider.is_some() {
-            let accessor = crate::storage_options::create_accessor_from_python(
-                storage_options,
-                storage_options_provider
-                    .as_ref()
-                    .map(|py_obj| py_obj.bind(options.py())),
-            )?;
-            p.store_params = Some(ObjectStoreParams {
-                storage_options_accessor: accessor,
-                ..Default::default()
-            });
+        // Extract namespace_client and table_id for storage options provider creation
+        let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
+        let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+
+        if let Some(so) = storage_options.clone() {
+            // If namespace_client and table_id are provided, create storage options provider from them
+            if let (Some(ns_client), Some(table_id)) =
+                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
+            {
+                let ns_client = extract_namespace_arc(options.py(), ns_client)?;
+                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                    LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
+                );
+                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                    so, provider,
+                ));
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                });
+            } else {
+                // No namespace, just use storage options directly
+                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                });
+            }
         }
 
         if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?
@@ -3158,6 +3495,11 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         {
             p = p.with_allow_external_blob_outside_bases(allow_external);
         }
+        if let Some(external_blob_mode) = get_dict_opt::<String>(options, "external_blob_mode")? {
+            p = p.with_external_blob_mode(
+                ExternalBlobMode::try_from(external_blob_mode.as_str()).infer_error()?,
+            );
+        }
 
         // Handle properties
         if let Some(props) =
@@ -3174,21 +3516,22 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.transaction_properties = Some(Arc::new(new_props));
         }
 
-        // Handle namespace and table_id for managed versioning (external manifest store)
-        // Only set if commit_handler is not already set by user
-        if p.commit_handler.is_none() {
-            let namespace_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace")?;
-            let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
-
-            if let (Some(ns), Some(table_id)) = (namespace_opt, table_id_opt) {
-                let ns_arc = extract_namespace_arc(options.py(), &ns)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_arc, table_id);
-                let commit_handler: Arc<dyn CommitHandler> =
-                    Arc::new(ExternalManifestCommitHandler {
-                        external_manifest_store: Arc::new(external_store),
-                    });
-                p.commit_handler = Some(commit_handler);
-            }
+        // Handle namespace_client and table_id for managed versioning (external manifest store)
+        // Only set if commit_handler is not already set by user and namespace_client_managed_versioning is true
+        let namespace_client_managed_versioning =
+            get_dict_opt::<bool>(options, "namespace_client_managed_versioning")?.unwrap_or(false);
+        if p.commit_handler.is_none()
+            && namespace_client_managed_versioning
+            && let (Some(ns_client), Some(table_id)) =
+                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
+        {
+            let ns_client = extract_namespace_arc(options.py(), ns_client)?;
+            let external_store =
+                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            p.commit_handler = Some(commit_handler);
         }
 
         Some(p)

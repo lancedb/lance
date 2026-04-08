@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::ProductQuantizer;
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use crate::frag_reuse::FragReuseIndex;
+use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
     vector::{
@@ -106,11 +107,19 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        debug_assert!(self.codebook.is_some());
-        let codebook_tensor: pb::Tensor = pb::Tensor::try_from(self.codebook.as_ref().unwrap())?;
-        let mut bytes = BytesMut::new();
-        codebook_tensor.encode(&mut bytes)?;
-        Ok(Some(bytes.freeze()))
+        if let Some(codebook) = &self.codebook {
+            let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
+            let mut bytes = BytesMut::new();
+            codebook_tensor.encode(&mut bytes)?;
+            Ok(Some(bytes.freeze()))
+        } else if !self.codebook_tensor.is_empty() {
+            // Legacy format: codebook is stored inline in the metadata JSON.
+            // Return it as-is; it's already a protobuf-encoded Tensor that
+            // parse_buffer() can handle.
+            Ok(Some(Bytes::from(self.codebook_tensor.clone())))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn load(reader: &PreviousFileReader) -> Result<Self> {
@@ -823,6 +832,12 @@ impl VectorStore for ProductQuantizationStorage {
             }
             _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
         }
+    }
+
+    fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
+        selected
+            .iter()
+            .all(|other| candidate.dist < OrderedFloat(self.dist_between(candidate.id, other.id)))
     }
 }
 

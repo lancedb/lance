@@ -20,6 +20,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
+    compute_next_prefix,
 };
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
@@ -325,6 +326,53 @@ impl ZoneMapIndex {
             SargableQuery::FullTextSearch(_) => Err(Error::not_supported_source(
                 "full text search is not supported for zonemap indexes".into(),
             )),
+            SargableQuery::LikePrefix(prefix) => {
+                // For prefix matching, a zone can match if:
+                // - zone.max >= prefix (there could be values >= prefix)
+                // - zone.min < next_prefix (there could be values < next_prefix)
+                //
+                // For example, prefix "foo":
+                // - Zone [aaa, azz]: max="azz" < "foo", so no match
+                // - Zone [fa, foz]: min="fa" < "fop", max="foz" >= "foo", so potential match
+                // - Zone [fop, fzz]: min="fop" >= "fop", so no match
+
+                let prefix_str = match prefix {
+                    ScalarValue::Utf8(Some(s)) => s.as_str(),
+                    ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+                    _ => return Ok(true), // Conservative: include zone if not a string prefix
+                };
+
+                // Empty prefix matches everything
+                if prefix_str.is_empty() {
+                    return Ok(true);
+                }
+
+                // Check zone.max >= prefix
+                let max_check = &zone.max >= prefix;
+                if !max_check {
+                    return Ok(false);
+                }
+
+                // Compute next_prefix by incrementing the last byte
+                // If the prefix ends with 0xFF bytes, we need to handle overflow
+                let next_prefix = compute_next_prefix(prefix_str);
+
+                match next_prefix {
+                    Some(next) => {
+                        // Check zone.min < next_prefix
+                        let next_scalar = match prefix {
+                            ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(next)),
+                            ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(next)),
+                            _ => return Ok(true),
+                        };
+                        Ok(zone.min < next_scalar)
+                    }
+                    None => {
+                        // No upper bound (prefix is all 0xFF), so any zone with max >= prefix matches
+                        Ok(true)
+                    }
+                }
+            }
         }
     }
 
@@ -557,6 +605,7 @@ impl ScalarIndex for ZoneMapIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -890,6 +939,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -921,7 +971,11 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::utils::mask::NullableRowAddrSet;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{ROW_ADDR, cache::LanceCache, utils::mask::RowAddrTreeMap};
+    use lance_core::{
+        ROW_ADDR,
+        cache::{LanceCache, WeakLanceCache},
+        utils::mask::RowAddrTreeMap,
+    };
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
@@ -2196,5 +2250,290 @@ mod tests {
             fragment1_rowaddrs.values(),
             &[4294967296, 4294967297, 4294967298, 4294967299, 4294967300]
         );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_query() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create zones with different string ranges
+        // Zone 0: ["aaa", "azz"] - should NOT match "foo%"
+        // Zone 1: ["bar", "baz"] - should NOT match "foo%"
+        // Zone 2: ["fa", "foz"]  - should match "foo%" (contains potential matches)
+        // Zone 3: ["fop", "fzz"] - should NOT match "foo%" (all values >= "fop")
+        // Zone 4: ["foo", "foobar"] - should match "foo%"
+        // Zone 5: ["gaa", "gzz"] - should NOT match "foo%"
+
+        let zones = vec![
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("aaa".to_string())),
+                max: ScalarValue::Utf8(Some("azz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("bar".to_string())),
+                max: ScalarValue::Utf8(Some("baz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("fa".to_string())),
+                max: ScalarValue::Utf8(Some("foz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 2,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("fop".to_string())),
+                max: ScalarValue::Utf8(Some("fzz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 3,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("foo".to_string())),
+                max: ScalarValue::Utf8(Some("foobar".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 4,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("gaa".to_string())),
+                max: ScalarValue::Utf8(Some("gzz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 5,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::Utf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix query for "foo"
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("foo".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match zones 2 and 4 only
+        let mut expected = RowAddrTreeMap::new();
+        // Zone 2: fragment 2
+        expected.insert_range((2u64 << 32)..((2u64 << 32) + 100));
+        // Zone 4: fragment 4
+        expected.insert_range((4u64 << 32)..((4u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_edge_cases() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test edge cases for LIKE prefix
+        let zones = vec![
+            // Zone with values that contain the prefix exactly
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("test".to_string())),
+                max: ScalarValue::Utf8(Some("test".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            // Zone with values that span across the prefix boundary
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("te".to_string())),
+                max: ScalarValue::Utf8(Some("tf".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            // Zone completely before prefix
+            ZoneMapStatistics {
+                min: ScalarValue::Utf8(Some("abc".to_string())),
+                max: ScalarValue::Utf8(Some("def".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 2,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::Utf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix "test"
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("test".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match zones 0 and 1
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..100); // Zone 0: fragment 0
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+
+        // Test empty prefix - should match all zones
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..100); // Zone 0: fragment 0
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+        expected.insert_range((2u64 << 32)..((2u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_large_utf8() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test with LargeUtf8 type
+        let zones = vec![
+            ZoneMapStatistics {
+                min: ScalarValue::LargeUtf8(Some("aaa".to_string())),
+                max: ScalarValue::LargeUtf8(Some("azz".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 100,
+                },
+            },
+            ZoneMapStatistics {
+                min: ScalarValue::LargeUtf8(Some("foo".to_string())),
+                max: ScalarValue::LargeUtf8(Some("foobar".to_string())),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 0,
+                    length: 100,
+                },
+            },
+        ];
+
+        let index = ZoneMapIndex {
+            zones,
+            data_type: DataType::LargeUtf8,
+            rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            store: test_store,
+            fri: None,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        };
+
+        // Test LikePrefix with LargeUtf8
+        let query = SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("foo".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match only zone 1
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
+
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[test]
+    fn test_compute_next_prefix() {
+        use super::compute_next_prefix;
+
+        // Basic cases
+        assert_eq!(compute_next_prefix("foo"), Some("fop".to_string()));
+        assert_eq!(compute_next_prefix("abc"), Some("abd".to_string()));
+        assert_eq!(compute_next_prefix("a"), Some("b".to_string()));
+        assert_eq!(compute_next_prefix("z"), Some("{".to_string())); // 'z' + 1 = '{'
+
+        // Edge case: prefix with 'z' at the end
+        assert_eq!(compute_next_prefix("abz"), Some("ab{".to_string()));
+
+        // Edge case with tilde (~) which is 0x7E
+        assert_eq!(compute_next_prefix("ab~"), Some("ab\x7f".to_string()));
+
+        // Empty prefix
+        assert_eq!(compute_next_prefix(""), None);
+
+        // Non-ASCII: works correctly by incrementing Unicode code points
+        // é (U+00E9) -> ê (U+00EA)
+        assert_eq!(compute_next_prefix("café"), Some("cafê".to_string()));
+        // 中 (U+4E2D) -> 丮 (U+4E2E)
+        assert_eq!(compute_next_prefix("abc中"), Some("abc丮".to_string()));
+        // ÿ (U+00FF) -> Ā (U+0100) - crosses byte boundary but works
+        assert_eq!(compute_next_prefix("cafÿ"), Some("cafĀ".to_string()));
+
+        // Edge case: character just before surrogate range
+        // U+D7FF -> U+E000 (skips surrogate range U+D800-U+DFFF)
+        assert_eq!(
+            compute_next_prefix("a\u{D7FF}"),
+            Some("a\u{E000}".to_string())
+        );
+
+        // Edge case: max Unicode character U+10FFFF, falls back to previous char
+        assert_eq!(compute_next_prefix("ab\u{10FFFF}"), Some("ac".to_string()));
+        // All max characters
+        assert_eq!(compute_next_prefix("\u{10FFFF}\u{10FFFF}"), None);
     }
 }

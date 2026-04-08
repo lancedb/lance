@@ -110,6 +110,9 @@ message Transaction {
       google.protobuf.Any new_index_details = 3;
       // the version of the new index
       uint32 new_index_version = 4;
+      // Files in the new index with their sizes.
+      // Empty if file sizes are not available (e.g. older writers).
+      repeated IndexFile new_index_files = 5;
     }
 
     // A group of rewrite files that are all part of the same rewrite.
@@ -235,7 +238,7 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// List of MemWAL region generations to mark as merged after this transaction
+    /// List of MemWAL shard generations to mark as merged after this transaction
     repeated MergedGeneration merged_generations = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
@@ -309,7 +312,7 @@ message Transaction {
   // This operation is used during merge-insert to atomically record which
   // generations have been merged to the base table.
   message UpdateMemWalState {
-    // Regions and generations being marked as merged.
+    // Shards and generations being marked as merged.
     repeated MergedGeneration merged_generations = 1;
   }
 

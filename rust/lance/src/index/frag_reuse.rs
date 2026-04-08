@@ -3,8 +3,8 @@
 
 use crate::Dataset;
 use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
+use crate::index::DatasetIndexExt;
 use lance_core::Error;
-use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
     FragReuseIndexDetails, FragReuseVersion,
@@ -172,5 +172,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         index_version: index_meta.map_or(0, |index_meta| index_meta.index_version),
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        // Fragment reuse index is inline (no files)
+        files: None,
     })
 }

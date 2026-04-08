@@ -51,7 +51,8 @@ class IndicesBuilder:
             the dataset containing the data
         column: str
             The vector column to index, must be a fixed size list of floats
-            or 1-dimensional fixed-shape tensor column.
+            (or unsigned integers for hamming distance) or 1-dimensional
+            fixed-shape tensor column.
         """
         self.dataset = dataset
         self.column = self._normalize_column(column)
@@ -65,6 +66,7 @@ class IndicesBuilder:
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         sample_rate: int = 256,
         max_iters: int = 50,
+        fragment_ids: Optional[list[int]] = None,
     ) -> IvfModel:
         """
         Train IVF centroids for the given vector column.
@@ -89,7 +91,7 @@ class IndicesBuilder:
             overtraining, reduced recall, and require large nprobes values.  If not
             specified the default will be the integer nearest the square root of the
             number of rows.
-        distance_type: "l2" | "dot" | "cosine"
+        distance_type: "l2" | "dot" | "cosine" | "hamming"
             The distance type to used.  This is defined in more detail in the LanceDB
             documentation on creating indices.
         accelerator: str | torch.Device
@@ -105,8 +107,10 @@ class IndicesBuilder:
             some cases, k-means will not converge but will cycle between various
             possible minima.  In these cases we must terminate or run forever.  The
             max_iters parameter defines a cutoff at which we terminate training.
+        fragment_ids: list[int], optional
+            If provided, train using only the specified fragments from the dataset.
         """
-        num_rows = self.dataset.count_rows()
+        num_rows = self._count_rows(fragment_ids)
         num_partitions = self._determine_num_partitions(num_partitions, num_rows)
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
@@ -123,9 +127,14 @@ class IndicesBuilder:
                 distance_type,
                 sample_rate,
                 max_iters,
+                fragment_ids,
             )
             return IvfModel(ivf_centroids, distance_type)
         else:
+            if fragment_ids is not None:
+                raise NotImplementedError(
+                    "fragment_ids is not supported with accelerator IVF training"
+                )
             # Use accelerator to train ivf centroids
             from lance.vector import train_ivf_centroids_on_accelerator
 
@@ -153,6 +162,7 @@ class IndicesBuilder:
         *,
         sample_rate: int = 256,
         max_iters: int = 50,
+        fragment_ids: Optional[list[int]] = None,
     ) -> PqModel:
         """
         Train a PQ model for a given column.
@@ -183,10 +193,12 @@ class IndicesBuilder:
             This parameter is used in the same way as in the IVF model.
         max_iters: int
             This parameter is used in the same way as in the IVF model.
+        fragment_ids: list[int], optional
+            If provided, train using only the specified fragments from the dataset.
         """
         from lance.lance import indices
 
-        num_rows = self.dataset.count_rows()
+        num_rows = self._count_rows(fragment_ids)
         self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)
         self._verify_pq_sample_rate(num_rows, sample_rate)
@@ -200,6 +212,7 @@ class IndicesBuilder:
             sample_rate,
             max_iters,
             ivf_model.centroids,
+            fragment_ids,
         )
         return PqModel(num_subvectors, pq_codebook)
 
@@ -212,10 +225,16 @@ class IndicesBuilder:
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         sample_rate: int = 256,
         max_iters: int = 50,
+        fragment_ids: Optional[list[int]] = None,
     ) -> dict:
         """
         Perform global training for IVF+PQ using existing CPU training paths and
         return preprocessed artifacts for distributed builds.
+
+        Parameters
+        ----------
+        fragment_ids: list[int], optional
+            If provided, train using only the specified fragments from the dataset.
 
         Returns
         -------
@@ -238,6 +257,7 @@ class IndicesBuilder:
             accelerator=accelerator,  # None by default (CPU path)
             sample_rate=sample_rate,
             max_iters=max_iters,
+            fragment_ids=fragment_ids,
         )
 
         # Global PQ training using IVF residuals
@@ -246,6 +266,7 @@ class IndicesBuilder:
             num_subvectors,
             sample_rate=sample_rate,
             max_iters=max_iters,
+            fragment_ids=fragment_ids,
         )
 
         return {"ivf_centroids": ivf_model.centroids, "pq_codebook": pq_model.codebook}
@@ -458,6 +479,18 @@ class IndicesBuilder:
             return round(math.sqrt(num_rows))
         return num_partitions
 
+    def _count_rows(self, fragment_ids: Optional[list[int]] = None) -> int:
+        if fragment_ids is None:
+            return self.dataset.count_rows()
+
+        num_rows = 0
+        for fragment_id in fragment_ids:
+            fragment = self.dataset.get_fragment(fragment_id)
+            if fragment is None:
+                raise ValueError(f"Fragment id does not exist: {fragment_id}")
+            num_rows += fragment.count_rows()
+        return num_rows
+
     def _normalize_pq_params(self, num_subvectors: int, dimension: int):
         if num_subvectors is None:
             if dimension % 16 == 0:
@@ -529,6 +562,7 @@ class IndicesBuilder:
             "cosine",
             "euclidean",
             "dot",
+            "hamming",
         ]:
             raise ValueError(f"Distance type {distance_type} not supported.")
         return distance_type.lower()
@@ -555,10 +589,13 @@ class IndicesBuilder:
                     f"Vector column {c} must be FixedSizeListArray "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
-            if not pa.types.is_floating(field.type.value_type):
+            if not (
+                pa.types.is_floating(field.type.value_type)
+                or pa.types.is_unsigned_integer(field.type.value_type)
+            ):
                 raise TypeError(
-                    f"Vector column {c} must have floating value type, "
-                    f"got {field.type.value_type}"
+                    f"Vector column {c} must have floating or unsigned integer "
+                    f"value type, got {field.type.value_type}"
                 )
 
         return column

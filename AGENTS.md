@@ -62,6 +62,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Comments should explain non-obvious "why" reasoning, not restate what the code does.
 - Remove debug prints (`println!`, `dbg!`, `print()`) before merging — use `tracing` or logging frameworks.
 - Extract logic repeated in 2+ places into a shared helper; inline single-use logic at its call site.
+- Think carefully before adding a helper: only introduce one when it materially reduces cognitive load or eliminates substantial duplication, and do not add thin wrappers that only rename or forward existing calls.
 - Keep PRs focused — no drive-by refactors, reformatting, or cosmetic changes.
 - Be mindful of memory use: avoid collecting streams of `RecordBatch` into memory; use `RoaringBitmap` instead of `HashSet<u32>`.
 

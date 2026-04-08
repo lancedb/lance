@@ -9,7 +9,8 @@
 
 <a href="https://lance.org">Documentation</a> •
 <a href="https://lance.org/community">Community</a> •
-<a href="https://discord.gg/lance">Discord</a>
+<a href="https://discord.gg/lance">Discord</a> •
+<a href="https://groups.google.com/a/lance.org/g/dev">Mailing List</a>
 
 [CI]: https://github.com/lance-format/lance/actions/workflows/rust.yml
 [CI Badge]: https://github.com/lance-format/lance/actions/workflows/rust.yml/badge.svg
@@ -68,9 +69,6 @@ To install a preview release:
 ```shell
 pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance
 ```
-
-> [!NOTE]
-> For versions prior to 1.0.0-beta.4, you can find them at https://pypi.fury.io/lancedb/pylance
 
 > [!TIP]
 > Preview releases are released more often than full releases and contain the

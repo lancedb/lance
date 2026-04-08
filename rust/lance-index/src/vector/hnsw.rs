@@ -12,7 +12,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;
-use super::graph::{OrderedFloat, OrderedNode};
+use super::graph::OrderedNode;
 use super::storage::VectorStore;
 
 pub mod builder;
@@ -76,11 +76,7 @@ fn select_neighbors_heuristic(
             break;
         }
 
-        if results.is_empty()
-            || results
-                .iter()
-                .all(|v| u.dist < OrderedFloat(storage.dist_between(u.id, v.id)))
-        {
+        if results.is_empty() || storage.prefers_candidate(u, &results) {
             results.push(u.clone());
         }
     }

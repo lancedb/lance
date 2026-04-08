@@ -489,6 +489,9 @@ pub struct ExecutionSummaryCounts {
     /// Additional metrics for more detailed statistics.  These are subject to change in the future
     /// and should only be used for debugging purposes.
     pub all_counts: HashMap<String, usize>,
+    /// Additional time metrics for more detailed statistics, stored in nanoseconds.
+    /// These are subject to change in the future and should only be used for debugging purposes.
+    pub all_times: HashMap<String, usize>,
 }
 
 pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
@@ -509,6 +512,13 @@ pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut Executio
                     *existing += count.value();
                 }
             }
+        }
+        for (metric_name, time) in metrics.iter_times() {
+            let existing = counts
+                .all_times
+                .entry(metric_name.as_ref().to_string())
+                .or_insert(0);
+            *existing += time.value();
         }
         // Include gauge-based I/O metrics (some nodes record I/O as gauges)
         for (metric_name, gauge) in metrics.iter_gauges() {

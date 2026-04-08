@@ -84,6 +84,15 @@ public final class IndexDescription {
   }
 
   /**
+   * Physical index segments for this logical index.
+   *
+   * <p>This is an alias for {@link #getMetadata()} with a less ambiguous name.
+   */
+  public List<Index> getSegments() {
+    return metadata;
+  }
+
+  /**
    * JSON representation of index-specific details.
    *
    * <p>The exact structure depends on the index implementation.

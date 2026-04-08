@@ -32,7 +32,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, is_detached_version, pb,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -48,6 +48,7 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -56,7 +57,7 @@ use crate::session::index_caches::IndexMetadataKey;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::{DatasetIndexExt, is_system_index};
+use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::path::Path;
@@ -72,7 +73,7 @@ pub mod namespace_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
@@ -361,6 +362,67 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     Ok(())
 }
 
+fn check_column_indices(manifest: &Manifest) -> Result<()> {
+    let data_storage_version = manifest.data_storage_format.lance_file_version()?;
+    if data_storage_version < LanceFileVersion::V2_1 {
+        return Ok(());
+    }
+
+    for fragment in manifest.fragments.iter() {
+        for data_file in &fragment.files {
+            if data_file.is_legacy_file() || data_file.column_indices.is_empty() {
+                continue;
+            }
+            if data_file.fields.len() != data_file.column_indices.len() {
+                return Err(Error::invalid_input(format!(
+                    "Data file '{}' (fragment {}) has {} field ids but {} column indices. \
+                     These must be the same length.",
+                    data_file.path,
+                    fragment.id,
+                    data_file.fields.len(),
+                    data_file.column_indices.len()
+                )));
+            }
+            let file_version = LanceFileVersion::try_from_major_minor(
+                data_file.file_major_version,
+                data_file.file_minor_version,
+            )?;
+            if file_version < LanceFileVersion::V2_1 {
+                continue;
+            }
+            for (field_id, column_index) in
+                data_file.fields.iter().zip(data_file.column_indices.iter())
+            {
+                // Field ids may not exist in the current schema after schema
+                // evolution (e.g. cast/drop column). Skip those.
+                let Some(field) = manifest.schema.field_by_id(*field_id) else {
+                    continue;
+                };
+                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+                if needs_column && *column_index == -1 {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' (id={}) in data file '{}' (fragment {}) \
+                         has column_index=-1, but leaf fields, packed structs, \
+                         and blob fields must have a valid column index in \
+                         file format 2.1+.",
+                        field.name, field_id, data_file.path, fragment.id
+                    )));
+                }
+                if !needs_column && *column_index != -1 {
+                    return Err(Error::invalid_input(format!(
+                        "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) \
+                         has column_index={}, but non-leaf fields should have \
+                         column_index=-1 in file format 2.1+. Only leaf fields, \
+                         packed structs, and blob fields should have column indices.",
+                        field.name, field_id, data_file.path, fragment.id, column_index
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fix schema in case of duplicate field ids.
 ///
 /// See test dataset v0.10.5/corrupt_schema
@@ -564,6 +626,7 @@ fn must_recalculate_fragment_bitmap(
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
+/// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
@@ -571,7 +634,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             bad_indices.into_iter().map(|(name, _)| name).collect()
         }
     };
-    for index in indices {
+    for index in indices.iter_mut() {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
@@ -595,6 +658,38 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 "the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.",
                 index.uuid
             );
+        }
+
+        // Migrate file sizes for indices that don't have them.
+        // Use indice_files_dir to handle shallow-cloned indices with base_id.
+        if index.files.is_none() && !is_system_index(index) {
+            let result = async {
+                let index_dir = dataset
+                    .indice_files_dir(index)?
+                    .child(index.uuid.to_string());
+                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+            }
+            .await;
+            match result {
+                Ok(files) => {
+                    log::debug!(
+                        "Migrated file sizes for index {} (uuid: {}): {} files",
+                        index.name,
+                        index.uuid,
+                        files.len()
+                    );
+                    index.files = Some(files);
+                }
+                Err(e) => {
+                    // Log but don't fail - file sizes are optional
+                    log::debug!(
+                        "Could not collect file sizes for index {} (uuid: {}): {}",
+                        index.name,
+                        index.uuid,
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -686,6 +781,7 @@ pub(crate) async fn do_commit_detached_transaction(
         // fix_schema and check_storage_version are just for sanity-checking and consistency
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
+        check_column_indices(&manifest)?;
         migrate_indices(dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -883,6 +979,7 @@ pub(crate) async fn commit_transaction(
         fix_schema(&mut manifest)?;
 
         check_storage_version(&mut manifest)?;
+        check_column_indices(&manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
@@ -1216,9 +1313,16 @@ mod tests {
             .collect();
 
         let results = join_all(futures).await;
-        for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-        }
+        let success_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Ok(_))))
+            .count();
+        let retryable_count = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Err(Error::RetryableCommitConflict { .. }))))
+            .count();
+        assert_eq!(success_count, 2, "{results:?}");
+        assert_eq!(retryable_count, 1, "{results:?}");
 
         // Validate that each version has the anticipated number of indexes
         let dataset = dataset.checkout_version(1).await.unwrap();
@@ -1241,12 +1345,7 @@ mod tests {
             assert_eq!(indices[0].fields, vec![0]);
         }
 
-        let dataset = dataset.checkout_version(4).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 2);
-        let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
-        fields.sort();
-        assert_eq!(fields, vec![0, 1]);
+        assert!(dataset.checkout_version(4).await.is_err());
     }
 
     #[tokio::test]
@@ -1599,5 +1698,217 @@ mod tests {
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
+    }
+
+    /// Helper to build a simple manifest for check_column_indices tests.
+    fn make_manifest_with_file(
+        schema: Schema,
+        data_file: DataFile,
+        data_storage_version: LanceFileVersion,
+    ) -> Manifest {
+        let fragment = Fragment {
+            id: 0,
+            files: vec![data_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(100),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(data_storage_version),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_struct_with_column() {
+        // Struct (non-leaf) field with column_index=0 in v2.1 should be rejected.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // field ids: struct=0, leaf=1; give struct a real column_index (wrong)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected error for struct with column_index=0"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_list_with_column() {
+        // List (non-leaf) field with column_index=0 in v2.1 should be rejected.
+        let mut list_field = Field::try_from(ArrowField::new(
+            "l",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            false,
+        ))
+        .unwrap();
+        list_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![list_field],
+            metadata: Default::default(),
+        };
+
+        // field ids: list=0, item=1; give list a real column_index (wrong)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected error for list with column_index=0"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_allows_correct_v21() {
+        // Non-leaf with column_index=-1 and leaf with column_index>=0 should pass.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1 (correct), leaf=0 (correct)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![-1, 0], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_allows_packed_struct() {
+        // Packed struct with a real column_index in v2.1 should be allowed.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+        struct_field
+            .metadata
+            .insert("lance-encoding:packed".to_string(), "true".to_string());
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // packed struct=0 (allowed), leaf=1
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_skips_v20() {
+        // Non-leaf with column_index>=0 in v2.0 should be allowed (no validation).
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_0);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_mismatched_lengths() {
+        // fields and column_indices must have the same length.
+        let mut leaf_field = Field::try_from(ArrowField::new("x", DataType::Int32, false)).unwrap();
+        leaf_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![leaf_field],
+            metadata: Default::default(),
+        };
+
+        // 1 field id but 2 column indices
+        let data_file = DataFile::new("data.lance", vec![0], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(result.is_err(), "Expected error for mismatched lengths");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("1 field ids but 2 column indices"), "{msg}");
+    }
+
+    #[test]
+    fn test_check_column_indices_skips_unknown_field_id() {
+        // A field id not present in the schema is skipped (schema evolution).
+        let mut leaf_field = Field::try_from(ArrowField::new("x", DataType::Int32, false)).unwrap();
+        leaf_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![leaf_field],
+            metadata: Default::default(),
+        };
+
+        // field id 99 does not exist in the schema — should be skipped
+        let data_file = DataFile::new("data.lance", vec![0, 99], vec![0, 1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        assert!(check_column_indices(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_check_column_indices_rejects_leaf_with_negative_one() {
+        // A leaf field with column_index=-1 in v2.1 should be rejected.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1 (correct), but leaf=-1 (wrong — leaf must have a real column)
+        let data_file = DataFile::new("data.lance", vec![0, 1], vec![-1, -1], 2, 1, None, None);
+        let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected error for leaf with column_index=-1"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("must have a valid column index"), "{msg}");
     }
 }

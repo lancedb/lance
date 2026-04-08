@@ -30,6 +30,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     StorageOptionsProvider,
+    throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
 
@@ -44,12 +45,12 @@ impl AwsStoreProvider {
         storage_options: &StorageOptions,
         is_s3_express: bool,
     ) -> Result<Arc<dyn OSObjectStore>> {
-        let max_retries = storage_options.client_max_retries();
-        let retry_timeout = storage_options.client_retry_timeout();
+        // Use a low retry count since the AIMD throttle layer handles
+        // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
             backoff: Default::default(),
-            max_retries,
-            retry_timeout: Duration::from_secs(retry_timeout),
+            max_retries: storage_options.client_max_retries(),
+            retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
         let mut s3_storage_options = storage_options.as_s3_options();
@@ -131,7 +132,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
     ) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
-            StorageOptions(params.storage_options().cloned().unwrap_or_default());
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_s3();
         let download_retry_count = storage_options.download_retry_count();
 
@@ -158,6 +159,19 @@ impl ObjectStoreProvider for AwsStoreProvider {
             // Use default Amazon S3 implementation
             self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
                 .await?
+        };
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let inner = if throttle_config.is_disabled() {
+            inner
+        } else if storage_options.client_max_retries() == 0 {
+            log::warn!(
+                "AIMD throttle disabled: the current implementation relies on the object store \
+                 client surfacing retry errors, which requires client_max_retries > 0. \
+                 No throttle or retry layer will be applied."
+            );
+            inner
+        } else {
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
         };
 
         Ok(ObjectStore {
@@ -260,7 +274,9 @@ pub async fn build_aws_credential(
 
     let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
 
-    // If accessor has a provider, use DynamicStorageOptionsCredentialProvider
+    // If accessor has a provider, check whether it vends credentials.
+    // If it does, use DynamicStorageOptionsCredentialProvider for ongoing
+    // refresh. If not, fall through to the default credentials chain.
     if let Some(accessor) = storage_options_accessor
         && accessor.has_provider()
     {
@@ -268,11 +284,21 @@ pub async fn build_aws_credential(
         if let Some(creds) = credentials {
             return Ok((creds, region));
         }
-        // Use accessor for dynamic credential refresh
-        return Ok((
-            Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
-            region,
-        ));
+
+        // Check if the accessor's storage options contain credentials
+        let opts = accessor.get_storage_options().await?;
+        let s3_options = opts.as_s3_options();
+        if extract_static_s3_credentials(&s3_options).is_some() {
+            return Ok((
+                Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
+                region,
+            ));
+        }
+
+        log::debug!(
+            "Storage options from provider do not contain explicit AWS credentials, \
+             falling back to default AWS credentials chain."
+        );
     }
 
     // Fall back to existing logic for static credentials

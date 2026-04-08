@@ -65,6 +65,7 @@ mod test {
         sync::{Arc, atomic::AtomicBool},
     };
 
+    use crate::index::DatasetIndexExt;
     use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
@@ -75,8 +76,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
-        DatasetIndexExt, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata,
-        IndexType,
+        INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
         vector::{Query, hnsw::VECTOR_ID_FIELD},
     };
     use lance_index::{

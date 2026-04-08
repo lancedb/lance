@@ -46,8 +46,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use google_cloud_auth::credentials;
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_io::object_store::uri_to_url;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::models::Identity;
 use log::{debug, info, warn};
 use reqwest::Client;
@@ -249,10 +250,9 @@ impl GcpCredentialVendor {
         let credential = credentials::create_access_token_credential()
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to create GCP credentials: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to create GCP credentials: {}", e),
+                })
             })?;
 
         Ok(Self {
@@ -267,19 +267,21 @@ impl GcpCredentialVendor {
         let url = uri_to_url(uri)?;
 
         if url.scheme() != "gs" {
-            return Err(Error::invalid_input_source(
-                format!(
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
                     "Unsupported GCS URI scheme '{}', expected 'gs'",
                     url.scheme()
-                )
-                .into(),
-            ));
+                ),
+            }
+            .into());
         }
 
         let bucket = url
             .host_str()
             .ok_or_else(|| {
-                Error::invalid_input_source(format!("GCS URI '{}' missing bucket", uri).into())
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("GCS URI '{}' missing bucket", uri),
+                })
             })?
             .to_string();
 
@@ -295,10 +297,9 @@ impl GcpCredentialVendor {
     /// directly.
     async fn get_source_token(&self) -> Result<String> {
         let base_token = self.credential.get_token().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to get GCP token: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to get GCP token: {}", e),
+            })
         })?;
 
         // If service account impersonation is configured, use generateAccessToken API
@@ -337,10 +338,9 @@ impl GcpCredentialVendor {
             .send()
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to call IAM generateAccessToken: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to call IAM generateAccessToken: {}", e),
+                })
             })?;
 
         if !response.status().is_success() {
@@ -349,17 +349,19 @@ impl GcpCredentialVendor {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
-                "IAM generateAccessToken failed for '{}' with status {}: {}",
-                service_account, status, body
-            )))));
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "IAM generateAccessToken failed for '{}' with status {}: {}",
+                    service_account, status, body
+                ),
+            }
+            .into());
         }
 
         let token_response: GenerateAccessTokenResponse = response.json().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to parse generateAccessToken response: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to parse generateAccessToken response: {}", e),
+            })
         })?;
 
         Ok(token_response.access_token)
@@ -445,10 +447,9 @@ impl GcpCredentialVendor {
         access_boundary: &CredentialAccessBoundary,
     ) -> Result<(String, u64)> {
         let options_json = serde_json::to_string(access_boundary).map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to serialize access boundary: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to serialize access boundary: {}", e),
+            })
         })?;
 
         let params = [
@@ -475,10 +476,9 @@ impl GcpCredentialVendor {
             .send()
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to call STS token exchange: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to call STS token exchange: {}", e),
+                })
             })?;
 
         if !response.status().is_success() {
@@ -487,17 +487,16 @@ impl GcpCredentialVendor {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
-                "STS token exchange failed with status {}: {}",
-                status, body
-            )))));
+            return Err(NamespaceError::Internal {
+                message: format!("STS token exchange failed with status {}: {}", status, body),
+            }
+            .into());
         }
 
         let token_response: TokenExchangeResponse = response.json().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to parse STS response: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to parse STS response: {}", e),
+            })
         })?;
 
         // Calculate expiration time
@@ -592,10 +591,11 @@ impl GcpCredentialVendor {
             .workload_identity_provider
             .as_ref()
             .ok_or_else(|| {
-                Error::invalid_input_source(
-                    "gcp_workload_identity_provider must be configured for OIDC token exchange"
-                        .into(),
-                )
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message:
+                        "gcp_workload_identity_provider must be configured for OIDC token exchange"
+                            .to_string(),
+                })
             })?;
 
         // Normalize audience to full format expected by GCP STS
@@ -624,26 +624,27 @@ impl GcpCredentialVendor {
             .send()
             .await
             .map_err(|e| {
-                Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to exchange OIDC token for GCP token: {}",
-                    e
-                ))))
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to exchange OIDC token for GCP token: {}", e),
+                })
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::io_source(Box::new(std::io::Error::other(format!(
-                "GCP STS token exchange failed with status {}: {}",
-                status, body
-            )))));
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "GCP STS token exchange failed with status {}: {}",
+                    status, body
+                ),
+            }
+            .into());
         }
 
         let token_response: TokenExchangeResponse = response.json().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to parse GCP STS token response: {}",
-                e
-            ))))
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to parse GCP STS token response: {}", e),
+            })
         })?;
 
         let federated_token = token_response.access_token;
@@ -706,9 +707,10 @@ impl GcpCredentialVendor {
         api_key: &str,
     ) -> Result<VendedCredentials> {
         let salt = self.config.api_key_salt.as_ref().ok_or_else(|| {
-            Error::invalid_input_source(
-                "api_key_salt must be configured to use API key authentication".into(),
-            )
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "api_key_salt must be configured to use API key authentication"
+                    .to_string(),
+            })
         })?;
 
         let key_hash = Self::hash_api_key(api_key, salt);
@@ -724,7 +726,9 @@ impl GcpCredentialVendor {
                     "Invalid API key: hash {} not found in permissions map",
                     &key_hash[..8]
                 );
-                Error::invalid_input_source("Invalid API key".into())
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Invalid API key".to_string(),
+                })
             })?;
 
         debug!(
@@ -790,9 +794,10 @@ impl CredentialVendor for GcpCredentialVendor {
                 let api_key = id.api_key.as_ref().unwrap();
                 self.vend_with_api_key(&bucket, &prefix, api_key).await
             }
-            Some(_) => Err(Error::invalid_input_source(
-                "Identity provided but neither auth_token nor api_key is set".into(),
-            )),
+            Some(_) => Err(NamespaceError::InvalidInput {
+                message: "Identity provided but neither auth_token nor api_key is set".to_string(),
+            }
+            .into()),
             None => {
                 // Static credential vending using ADC
                 let source_token = self.get_source_token().await?;

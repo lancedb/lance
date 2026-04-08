@@ -94,7 +94,7 @@ pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch>
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use std::sync::Arc;
 
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};

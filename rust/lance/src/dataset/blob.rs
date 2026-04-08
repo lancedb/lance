@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    ops::{DerefMut, Range},
+    sync::Arc,
+};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -17,12 +22,13 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use super::take::TakeBuilder;
+use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result, utils::address::RowAddress};
-use lance_io::traits::{Reader, Writer};
+use lance_io::traits::{Reader, WriteExt, Writer};
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -151,12 +157,12 @@ impl PackWriter {
     async fn write_with_allocator<F>(
         &mut self,
         alloc_blob_id: &mut F,
-        data: &[u8],
+        source: BlobWriteSource<'_>,
     ) -> Result<(u32, u64)>
     where
         F: FnMut() -> u32,
     {
-        let len = data.len();
+        let len = source.size();
         if self
             .current_blob_id
             .map(|_| self.current_size + len > self.max_pack_size)
@@ -169,7 +175,7 @@ impl PackWriter {
 
         let writer = self.writer.as_mut().expect("pack writer is initialized");
         let position = self.current_size as u64;
-        writer.write_all(data).await?;
+        source.write_to(writer.as_mut()).await?;
         self.current_size += len;
         Ok((self.current_blob_id.expect("pack blob id"), position))
     }
@@ -200,9 +206,98 @@ pub struct BlobPreprocessor {
     writer_metadata: Vec<HashMap<String, String>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
+}
+
+/// A logical slice of an external blob that can be materialized or streamed into Lance-managed
+/// storage.
+struct ExternalBlobSource {
+    reader: Box<dyn Reader>,
+    start: u64,
+    size: u64,
+}
+
+/// A blob payload source used by packed and dedicated writers.
+///
+/// Inline blobs still need an in-memory byte slice because they are embedded into the descriptor
+/// array, while external ingest can stream bytes from the source reader.
+enum BlobWriteSource<'a> {
+    Bytes(&'a [u8]),
+    External(&'a ExternalBlobSource),
+}
+
+impl ExternalBlobSource {
+    /// Return the logical payload size after applying any external slice.
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Convert the logical slice into the current reader API's usize-based range.
+    fn reader_range(&self) -> Result<Range<usize>> {
+        let start = usize::try_from(self.start).map_err(|_| {
+            Error::invalid_input(format!(
+                "External blob position {} does not fit into usize",
+                self.start
+            ))
+        })?;
+        let size = usize::try_from(self.size).map_err(|_| {
+            Error::invalid_input(format!(
+                "External blob size {} does not fit into usize",
+                self.size
+            ))
+        })?;
+        let end = start.checked_add(size).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "External blob range overflows usize: position={}, size={}",
+                self.start, self.size
+            ))
+        })?;
+        Ok(start..end)
+    }
+
+    /// Materialize the slice into memory for the inline blob path.
+    async fn read_all(&self) -> Result<bytes::Bytes> {
+        let range = self.reader_range()?;
+        self.reader.get_range(range).await.map_err(Into::into)
+    }
+
+    /// Stream the slice into a writer for packed or dedicated blob storage.
+    async fn copy_to_writer(&self, writer: &mut dyn Writer) -> Result<()> {
+        let range = self.reader_range()?;
+        writer
+            .copy_range_from_reader(self.reader.as_ref(), range)
+            .await?;
+        Ok(())
+    }
+}
+
+impl BlobWriteSource<'_> {
+    /// Return the payload size regardless of whether bytes come from memory or an external reader.
+    fn size(&self) -> usize {
+        match self {
+            Self::Bytes(data) => data.len(),
+            Self::External(source) => usize::try_from(source.size())
+                .expect("packed and inline external blobs must fit into usize"),
+        }
+    }
+
+    /// Write the payload into Lance-managed storage without forcing callers to branch on source
+    /// type.
+    async fn write_to(&self, writer: &mut dyn Writer) -> Result<()> {
+        match self {
+            Self::Bytes(data) => {
+                writer.write_all(data).await?;
+                Ok(())
+            }
+            Self::External(source) => source.copy_to_writer(writer).await,
+        }
+    }
 }
 
 impl BlobPreprocessor {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         object_store: ObjectStore,
         data_dir: Path,
@@ -210,6 +305,9 @@ impl BlobPreprocessor {
         schema: &lance_core::datatypes::Schema,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
+        external_blob_mode: ExternalBlobMode,
+        source_store_registry: Arc<ObjectStoreRegistry>,
+        source_store_params: ObjectStoreParams,
     ) -> Self {
         let pack_writer = PackWriter::new(
             object_store.clone(),
@@ -239,6 +337,9 @@ impl BlobPreprocessor {
             writer_metadata,
             external_base_resolver,
             allow_external_blob_outside_bases,
+            external_blob_mode,
+            source_store_registry,
+            source_store_params,
         }
     }
 
@@ -248,15 +349,15 @@ impl BlobPreprocessor {
         id
     }
 
-    async fn write_dedicated(&mut self, blob_id: u32, data: &[u8]) -> Result<Path> {
+    async fn write_dedicated(&mut self, blob_id: u32, source: BlobWriteSource<'_>) -> Result<Path> {
         let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let mut writer = self.object_store.create(&path).await?;
-        writer.write_all(data).await?;
+        source.write_to(writer.as_mut()).await?;
         Writer::shutdown(&mut writer).await?;
         Ok(path)
     }
 
-    async fn write_packed(&mut self, data: &[u8]) -> Result<(u32, u64)> {
+    async fn write_packed(&mut self, source: BlobWriteSource<'_>) -> Result<(u32, u64)> {
         let (counter, pack_writer) = (&mut self.local_counter, &mut self.pack_writer);
         pack_writer
             .write_with_allocator(
@@ -265,7 +366,7 @@ impl BlobPreprocessor {
                     *counter += 1;
                     id
                 },
-                data,
+                source,
             )
             .await
     }
@@ -289,6 +390,48 @@ impl BlobPreprocessor {
             "External blob URI '{}' is outside registered external bases (dataset root is not allowed). Set allow_external_blob_outside_bases=true to store it as absolute external URI.",
             uri
         )))
+    }
+
+    async fn open_external_source(
+        &mut self,
+        uri: &str,
+        position: Option<u64>,
+        size: Option<u64>,
+    ) -> Result<ExternalBlobSource> {
+        let (object_store, path) = ObjectStore::from_uri_and_params(
+            self.source_store_registry.clone(),
+            uri,
+            &self.source_store_params,
+        )
+        .await?;
+        let reader = object_store.open(&path).await?;
+        match (position, size) {
+            (Some(position), Some(size)) => {
+                position.checked_add(size).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "External blob range overflows u64: position={}, size={}",
+                        position, size
+                    ))
+                })?;
+                Ok(ExternalBlobSource {
+                    reader,
+                    start: position,
+                    size,
+                })
+            }
+            (None, None) => {
+                let size = reader.size().await? as u64;
+                Ok(ExternalBlobSource {
+                    reader,
+                    start: 0,
+                    size,
+                })
+            }
+            _ => Err(Error::invalid_input(format!(
+                "External blob URI '{}' must set both position and size when slicing for ingest",
+                uri
+            ))),
+        }
     }
 
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
@@ -374,7 +517,8 @@ impl BlobPreprocessor {
                 let dedicated_threshold = self.dedicated_thresholds[idx];
                 if has_data && data_len > dedicated_threshold {
                     let blob_id = self.next_blob_id();
-                    self.write_dedicated(blob_id, data_col.value(i)).await?;
+                    self.write_dedicated(blob_id, BlobWriteSource::Bytes(data_col.value(i)))
+                        .await?;
 
                     kind_builder.append_value(BlobKind::Dedicated as u8);
                     data_builder.append_null();
@@ -386,7 +530,9 @@ impl BlobPreprocessor {
                 }
 
                 if has_data && data_len > INLINE_MAX {
-                    let (pack_blob_id, position) = self.write_packed(data_col.value(i)).await?;
+                    let (pack_blob_id, position) = self
+                        .write_packed(BlobWriteSource::Bytes(data_col.value(i)))
+                        .await?;
 
                     kind_builder.append_value(BlobKind::Packed as u8);
                     data_builder.append_null();
@@ -399,6 +545,64 @@ impl BlobPreprocessor {
 
                 if has_uri {
                     let uri_val = uri_col.value(i);
+                    if self.external_blob_mode == ExternalBlobMode::Ingest {
+                        let position = if has_position {
+                            Some(
+                                position_col
+                                    .as_ref()
+                                    .expect("position column must exist")
+                                    .value(i),
+                            )
+                        } else {
+                            None
+                        };
+                        let size = if has_size {
+                            Some(size_col.as_ref().expect("size column must exist").value(i))
+                        } else {
+                            None
+                        };
+                        let source = self.open_external_source(uri_val, position, size).await?;
+                        let data_len = source.size();
+
+                        if data_len > dedicated_threshold as u64 {
+                            let blob_id = self.next_blob_id();
+                            self.write_dedicated(blob_id, BlobWriteSource::External(&source))
+                                .await?;
+
+                            kind_builder.append_value(BlobKind::Dedicated as u8);
+                            data_builder.append_null();
+                            uri_builder.append_null();
+                            blob_id_builder.append_value(blob_id);
+                            blob_size_builder.append_value(data_len);
+                            position_builder.append_null();
+                            continue;
+                        }
+
+                        if data_len > INLINE_MAX as u64 {
+                            let (pack_blob_id, position) = self
+                                .write_packed(BlobWriteSource::External(&source))
+                                .await?;
+
+                            kind_builder.append_value(BlobKind::Packed as u8);
+                            data_builder.append_null();
+                            uri_builder.append_null();
+                            blob_id_builder.append_value(pack_blob_id);
+                            blob_size_builder.append_value(data_len);
+                            position_builder.append_value(position);
+                            continue;
+                        }
+
+                        let data = source.read_all().await?;
+
+                        kind_builder.append_value(BlobKind::Inline as u8);
+                        data_builder.append_value(data.as_ref());
+                        uri_builder.append_null();
+                        blob_id_builder.append_null();
+                        blob_size_builder.append_null();
+                        position_builder.append_null();
+                        continue;
+                    }
+
                     let (external_base_id, external_uri_or_path) =
                         self.resolve_external_reference(uri_val).await?;
                     kind_builder.append_value(BlobKind::External as u8);
@@ -1124,11 +1328,15 @@ mod tests {
         datatypes::{UInt8Type, UInt32Type, UInt64Type},
     };
     use arrow_array::RecordBatch;
-    use arrow_array::{RecordBatchIterator, UInt32Array};
+    use arrow_array::{
+        ArrayRef, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use futures::TryStreamExt;
-    use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, DataTypeExt};
+    use lance_arrow::{
+        ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
+    };
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
@@ -1150,7 +1358,7 @@ mod tests {
     use crate::{
         Dataset,
         blob::{BlobArrayBuilder, blob_field},
-        dataset::WriteParams,
+        dataset::{ExternalBlobMode, WriteParams},
         utils::test::TestDatasetGenerator,
     };
 
@@ -1928,6 +2136,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_v2_external_ingest_inline_slice() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"prefix-inline-suffix").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
+            .into_iter()
+            .collect();
+        let blob_field = Field::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    Field::new("data", DataType::LargeBinary, true),
+                    Field::new("uri", DataType::Utf8, true),
+                    Field::new("position", DataType::UInt64, true),
+                    Field::new("size", DataType::UInt64, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata);
+        let blob_array: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![
+                    Field::new("data", DataType::LargeBinary, true),
+                    Field::new("uri", DataType::Utf8, true),
+                    Field::new("position", DataType::UInt64, true),
+                    Field::new("size", DataType::UInt64, true),
+                ]
+                .into(),
+                vec![
+                    Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![Some(external_uri.as_str())])) as ArrayRef,
+                    Arc::new(UInt64Array::from(vec![Some(7)])) as ArrayRef,
+                    Arc::new(UInt64Array::from(vec![Some(6)])) as ArrayRef,
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![blob_field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &dataset_dir.path_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    external_blob_mode: ExternalBlobMode::Ingest,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let desc = dataset
+            .scan()
+            .project(&["blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .as_struct()
+            .to_owned();
+        assert_eq!(
+            desc.column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::Inline as u8
+        );
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Inline);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"inline");
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_ingest_packed() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        let payload = vec![0x5A; super::INLINE_MAX + 1024];
+        std::fs::write(&external_path, &payload).unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &dataset_dir.path_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    external_blob_mode: ExternalBlobMode::Ingest,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let desc = dataset
+            .scan()
+            .project(&["blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .as_struct()
+            .to_owned();
+        assert_eq!(
+            desc.column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::Packed as u8
+        );
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_ingest_dedicated() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        let payload = vec![0x7A; super::DEDICATED_THRESHOLD + 1024];
+        std::fs::write(&external_path, &payload).unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &dataset_dir.path_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    external_blob_mode: ExternalBlobMode::Ingest,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let desc = dataset
+            .scan()
+            .project(&["blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .as_struct()
+            .to_owned();
+        assert_eq!(
+            desc.column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::Dedicated as u8
+        );
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].kind(), BlobKind::Dedicated);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
     async fn test_blob_v2_requires_v2_2() {
         let test_dir = TempStrDir::default();
 
@@ -1994,6 +2396,9 @@ mod tests {
             &writer_schema,
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
         );
 
         let mut blob_builder = BlobArrayBuilder::new(1);

@@ -483,6 +483,7 @@ mod tests {
     use super::*;
 
     use crate::dataset::{WriteDestination, WriteMode};
+    use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::{array::AsArray, datatypes::UInt32Type};
@@ -495,7 +496,6 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
-    use lance_index::DatasetIndexExt;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
     use lance_io::object_store::ObjectStoreParams;

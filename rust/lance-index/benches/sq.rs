@@ -65,7 +65,6 @@ fn create_sq_batch(row_id_range: Range<u64>, dim: usize) -> RecordBatch {
     batch.drop_column("vector").unwrap()
 }
 
-#[allow(dead_code)]
 pub fn bench_storage(c: &mut Criterion) {
     let mut rng = rand::rng();
 

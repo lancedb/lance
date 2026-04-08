@@ -13,8 +13,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+use tokio::sync::Notify;
 
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
@@ -32,19 +33,6 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
-// By default, we limit the number of IOPS across the entire process to 128
-//
-// In theory this is enough for ~10GBps on S3 following the guidelines to issue
-// 1 IOP per 80MBps.  In practice, I have noticed slightly better performance going
-// up to 256.
-//
-// However, non-S3 stores (e.g. GCS, Azure) can suffer significantly from too many
-// concurrent IOPS.  For safety, we set the default to 128 and let the user override
-// this if needed.
-//
-// Note: this only limits things that run through the scheduler.  It does not limit
-// IOPS from other sources like writing or commits.
-static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -53,97 +41,6 @@ pub fn iops_counter() -> u64 {
 pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
 }
-
-// There are two structures that control the I/O scheduler concurrency.  First,
-// we have a hard limit on the number of IOPS that can be issued concurrently.
-// This limit is process-wide.
-//
-// Second, we try and limit how many I/O requests can be buffered in memory without
-// being consumed by a decoder of some kind.  This limit is per-scheduler.  We cannot
-// make this limit process wide without introducing deadlock (because the decoder for
-// file 0 might be waiting on IOPS blocked by a queue filled with requests for file 1)
-// and vice-versa.
-//
-// There is also a per-scan limit on the number of IOPS that can be issued concurrently.
-//
-// The process-wide limit exists when users need a hard limit on the number of parallel
-// IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
-// the network.  (Note: a process-wide limit of X will not necessarily limit the number of
-// open TCP connections to exactly X.  The underlying object store may open more connections
-// anyways)
-//
-// However, it can be too tough in some cases, e.g. when some scans are reading from
-// cloud storage and other scans are reading from local disk.  In these cases users don't
-// need to set a process-limit and can rely on the per-scan limits.
-
-// The IopsQuota enforces the first of the above limits, it is the per-process hard cap
-// on the number of IOPS that can be issued concurrently.
-//
-// The per-scan limits are enforced by IoQueue
-struct IopsQuota {
-    // An Option is used here to avoid mutex overhead if no limit is set
-    iops_avail: Option<Semaphore>,
-}
-
-/// A reservation on the global IOPS quota
-///
-/// When the reservation is dropped, the IOPS quota is released unless
-/// [`Self::forget`] is called.
-struct IopsReservation<'a> {
-    value: Option<SemaphorePermit<'a>>,
-}
-
-impl IopsReservation<'_> {
-    // Forget the reservation, so it won't be released on drop
-    fn forget(&mut self) {
-        if let Some(value) = self.value.take() {
-            value.forget();
-        }
-    }
-}
-
-impl IopsQuota {
-    // By default, we throttle the number of scan IOPS across the entire process
-    //
-    // However, the user can disable this by setting the environment variable
-    // LANCE_PROCESS_IO_THREADS_LIMIT to zero (or a negative integer).
-    fn new() -> Self {
-        let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
-            .map(|s| {
-                s.parse::<i32>().unwrap_or_else(|_| {
-                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
-                    DEFAULT_PROCESS_IOPS_LIMIT
-                })
-            })
-            .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT);
-        let iops_avail = if initial_capacity <= 0 {
-            None
-        } else {
-            Some(Semaphore::new(initial_capacity as usize))
-        };
-        Self { iops_avail }
-    }
-
-    // Return a reservation on the global IOPS quota
-    fn release(&self) {
-        if let Some(iops_avail) = self.iops_avail.as_ref() {
-            iops_avail.add_permits(1);
-        }
-    }
-
-    // Acquire a reservation on the global IOPS quota
-    async fn acquire(&self) -> IopsReservation<'_> {
-        if let Some(iops_avail) = self.iops_avail.as_ref() {
-            IopsReservation {
-                value: Some(iops_avail.acquire().await.unwrap()),
-            }
-        } else {
-            IopsReservation { value: None }
-        }
-    }
-}
-
-static IOPS_QUOTA: std::sync::LazyLock<IopsQuota> = std::sync::LazyLock::new(IopsQuota::new);
 
 // We want to allow requests that have a lower priority than any
 // currently in-flight request.  This helps avoid potential deadlocks
@@ -303,17 +200,8 @@ impl IoQueue {
     async fn pop(&self) -> Option<IoTask> {
         loop {
             {
-                // First, grab a reservation on the global IOPS quota
-                // If we then get a task to run, transfer the reservation
-                // to the task.  Otherwise, the reservation will be released
-                // when iop_res is dropped.
-                let mut iop_res = IOPS_QUOTA.acquire().await;
-                // Next, try and grab a reservation from the queue
                 let mut state = self.state.lock().unwrap();
                 if let Some(task) = state.next_task() {
-                    // Reservation successfully acquired, we will release the global
-                    // global reservation after task has run.
-                    iop_res.forget();
                     return Some(task);
                 }
 
@@ -501,7 +389,6 @@ impl IoTask {
             range_end = self.to_read.end,
             "File I/O completed"
         );
-        IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
 }
@@ -619,15 +506,21 @@ pub struct SchedulerConfig {
     /// This controls back pressure.  If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
-    /// Whether to use the new lite scheduler
-    pub use_lite_scheduler: bool,
+    /// Whether to use the lite scheduler.
+    ///
+    /// - `Some(true)` forces the lite scheduler (e.g. from env var or programmatic).
+    /// - `Some(false)` forces the standard scheduler.
+    /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
+    pub use_lite_scheduler: Option<bool>,
 }
 
 impl SchedulerConfig {
     pub fn new(io_buffer_size_bytes: u64) -> Self {
         Self {
             io_buffer_size_bytes,
-            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok(),
+            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
+                .ok()
+                .map(|v| str_is_truthy(v.trim())),
         }
     }
 
@@ -635,7 +528,7 @@ impl SchedulerConfig {
     pub fn default_for_testing() -> Self {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         }
     }
 
@@ -647,7 +540,7 @@ impl SchedulerConfig {
 
     pub fn with_lite_scheduler(self) -> Self {
         Self {
-            use_lite_scheduler: true,
+            use_lite_scheduler: Some(true),
             ..self
         }
     }
@@ -662,7 +555,10 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
-        let io_queue = if config.use_lite_scheduler {
+        let use_lite = config
+            .use_lite_scheduler
+            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+        let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
                 config.io_buffer_size_bytes,
@@ -856,6 +752,11 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         ScanStats::new(self.stats.as_ref())
+    }
+
+    #[cfg(test)]
+    fn uses_lite_scheduler(&self) -> bool {
+        matches!(self.io_queue, IoQueueType::Lite(_))
     }
 }
 
@@ -1234,7 +1135,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1325,7 +1226,7 @@ mod tests {
 
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -1400,7 +1301,7 @@ mod tests {
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1488,6 +1389,55 @@ mod tests {
         assert_eq!(fut3.await.unwrap()[0].len(), 100);
     }
 
+    #[tokio::test]
+    async fn test_object_store_selects_scheduler() {
+        // A memory:// store should use the standard scheduler when config is None
+        let memory_store = Arc::new(ObjectStore::memory());
+        assert!(!memory_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(memory_store.clone(), config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // A file+uring:// store should use the lite scheduler when config is None
+        let uring_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("file+uring:///tmp").unwrap(),
+            None,
+            None,
+            false,
+            false,
+            8,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        assert!(uring_store.prefers_lite_scheduler());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: None,
+        };
+        let scheduler = ScanScheduler::new(uring_store.clone(), config);
+        assert!(scheduler.uses_lite_scheduler());
+
+        // Explicit Some(false) overrides a file+uring:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(uring_store, config);
+        assert!(!scheduler.uses_lite_scheduler());
+
+        // Explicit Some(true) overrides a memory:// store's preference
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 256 * 1024 * 1024,
+            use_lite_scheduler: Some(true),
+        };
+        let scheduler = ScanScheduler::new(memory_store, config);
+        assert!(scheduler.uses_lite_scheduler());
+    }
+
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn stress_backpressure() {
         // This test ensures that the backpressure mechanism works correctly with
@@ -1503,7 +1453,7 @@ mod tests {
         // Only one request will be allowed in
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1,
-            use_lite_scheduler: false,
+            use_lite_scheduler: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler

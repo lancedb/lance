@@ -17,7 +17,19 @@ use crate::{buffer::LanceBuffer, data::DataBlock, format::pb21::CompressiveEncod
 use lance_core::Result;
 
 pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
-pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
+
+const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
+
+fn parse_max_miniblock_values() -> u64 {
+    let val = std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES);
+    val.clamp(1, DEFAULT_MAX_MINIBLOCK_VALUES)
+}
+
+pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> =
+    std::sync::LazyLock::new(parse_max_miniblock_values);
 
 /// Page data that has been compressed into a series of chunks put into
 /// a single buffer.
@@ -36,10 +48,15 @@ pub struct MiniBlockCompressed {
 /// Mini-block chunks are designed to be small (just a few disk sectors)
 /// and contain a power-of-two number of values (except for the last chunk)
 ///
-/// To enforce this we limit a chunk to 4Ki values and slightly less than
+/// By default we limit a chunk to 4Ki values and slightly less than
 /// 8KiB of compressed data.  This means that even in the extreme case
 /// where we have 4 bytes of rep/def then we will have at most 24KiB of
 /// data (values, repetition, and definition) per mini-block.
+///
+/// The maximum number of values per chunk can be configured via the
+/// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.  This is only
+/// useful in extremely bandwidth-limited environments; the default is
+/// appropriate for local disks and same-region cloud object storage.
 #[derive(Debug)]
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
@@ -54,7 +71,7 @@ pub struct MiniBlockChunk {
     // For example, 1 would mean there are 2 values in the chunk and 12 would mean there
     // are 4Ki values in the chunk.
     //
-    // This must be <= 12 (i.e. <= 4096 values)
+    // This must be <= log2(MAX_MINIBLOCK_VALUES) (i.e. <= 12 at the default of 4096)
     pub log_num_values: u8,
 }
 
@@ -86,4 +103,50 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_parse_default() {
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+        assert_eq!(parse_max_miniblock_values(), 4096);
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_custom_value() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "256") };
+        assert_eq!(parse_max_miniblock_values(), 256);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_clamps_zero_to_one() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "0") };
+        assert_eq!(parse_max_miniblock_values(), 1);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_clamps_above_max() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "99999") };
+        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_invalid_falls_back_to_default() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "not_a_number") };
+        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
 }

@@ -77,6 +77,31 @@ def test_ivf_centroids(tmpdir, rand_dataset):
     assert ivf.centroids == reloaded.centroids
 
 
+def test_ivf_centroids_hamming(tmpdir):
+    num_rows = NUM_ROWS
+    vectors = np.random.randint(0, 256, size=(num_rows, DIMENSION), dtype=np.uint8)
+    vectors_flat = vectors.reshape(-1)
+    vectors_arr = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors_flat, type=pa.uint8()), DIMENSION
+    )
+    table = pa.Table.from_arrays([vectors_arr], names=["vectors"])
+    uri = str(tmpdir / "hamming_dataset")
+    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+
+    ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        sample_rate=16, distance_type="hamming"
+    )
+
+    assert ivf.distance_type == "hamming"
+    expected_partitions = round(math.sqrt(num_rows))
+    assert len(ivf.centroids) == expected_partitions
+
+    ivf.save(str(tmpdir / "ivf_hamming"))
+    reloaded = IvfModel.load(str(tmpdir / "ivf_hamming"))
+    assert reloaded.distance_type == "hamming"
+    assert ivf.centroids == reloaded.centroids
+
+
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
@@ -157,6 +182,58 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     reloaded = PqModel.load(str(tmpdir / "pq"))
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
+
+
+def test_ivf_centroids_fragment_ids(tmpdir):
+    rows_per_fragment = 32
+    vectors = np.concatenate(
+        [
+            np.zeros((rows_per_fragment, DIMENSION), dtype=np.float32),
+            np.full((rows_per_fragment, DIMENSION), 10.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    vectors.shape = -1
+    table = pa.Table.from_arrays(
+        [pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)], names=["vectors"]
+    )
+    ds = lance.write_dataset(
+        table,
+        pathlib.Path(tmpdir) / "fragment_ivf",
+        max_rows_per_file=rows_per_fragment,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+
+    first_ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[0]]
+    )
+    second_ivf = IndicesBuilder(ds, "vectors").train_ivf(
+        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[1]]
+    )
+
+    first_centroid = first_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
+    second_centroid = second_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
+
+    assert np.allclose(first_centroid, 0.0, atol=1e-4)
+    assert np.allclose(second_centroid, 10.0, atol=1e-4)
+
+
+def test_pq_fragment_ids(rand_dataset):
+    fragment_id = rand_dataset.get_fragments()[0].fragment_id
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        num_partitions=4,
+        sample_rate=16,
+        fragment_ids=[fragment_id],
+    )
+
+    pq = IndicesBuilder(rand_dataset, "vectors").train_pq(
+        ivf,
+        sample_rate=2,
+        fragment_ids=[fragment_id],
+    )
+
+    assert pq.dimension == DIMENSION
+    assert pq.num_subvectors == NUM_SUBVECTORS
 
 
 def test_pq_invalid_sub_vectors(tmpdir, rand_dataset, rand_ivf):

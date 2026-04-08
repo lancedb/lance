@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
+use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
@@ -60,19 +62,20 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::expression::{INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
 use lance_index::vector::{DIST_COL, Query};
-use lance_index::{DatasetIndexExt, scalar::expression::ScalarIndexExpr};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{Span, info_span, instrument};
+use uuid::Uuid;
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
@@ -760,6 +763,9 @@ pub struct Scanner {
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
 
+    /// If set, this scanner will only search the specified vector index segments.
+    index_segments: Option<Vec<Uuid>>,
+
     /// Only search the data being indexed (weak consistency search).
     ///
     /// Default value is false.
@@ -993,6 +999,7 @@ impl Scanner {
             use_stats: true,
             ordered: true,
             fragments: None,
+            index_segments: None,
             fast_search: false,
             use_scalar_index: true,
             include_deleted_rows: false,
@@ -1037,6 +1044,23 @@ impl Scanner {
     pub fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
         self.fragments = Some(fragments);
         self
+    }
+
+    /// Restrict vector index search to the specified index segments.
+    ///
+    /// This setting is only supported for vector search.
+    ///
+    /// If [`Self::with_fragments`] is also set then rows from those fragments that are not covered
+    /// by the selected index segments will still be searched with flat KNN. Otherwise, unindexed
+    /// fragments outside the selected index segments are not searched.
+    pub fn with_index_segments(&mut self, segments: Vec<Uuid>) -> Result<&mut Self> {
+        if segments.is_empty() {
+            return Err(Error::invalid_input(
+                "with_index_segments does not accept an empty segment list".to_string(),
+            ));
+        }
+        self.index_segments = Some(segments);
+        Ok(self)
     }
 
     fn get_batch_size(&self) -> usize {
@@ -2166,6 +2190,12 @@ impl Scanner {
             }
         }
 
+        if self.index_segments.is_some() && self.nearest.is_none() {
+            return Err(Error::not_supported(
+                "with_index_segments is only supported for vector search".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -2698,8 +2728,7 @@ impl Scanner {
         let row_addrs = RowAddrTreeMap::from_iter(u64s);
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
         let index_result = IndexExprResult::Exact(row_addr_mask);
-        let fragments_covered =
-            RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32));
+        let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let batch = index_result.serialize_to_arrow(&fragments_covered)?;
         let stream = futures::stream::once(async move { Ok(batch) });
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -2719,15 +2748,21 @@ impl Scanner {
             TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
-                    row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                    row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
                 self.u64s_as_take_input(addrs)
             }
         }?;
 
+        let mut filtered_read_options = FilteredReadOptions::new(projection);
+        if let Some(fragment) = self.fragments.as_ref() {
+            filtered_read_options =
+                filtered_read_options.with_fragments(Arc::new(fragment.clone()));
+        }
+
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
-            FilteredReadOptions::new(projection),
+            filtered_read_options,
             Some(input),
         )?))
     }
@@ -3415,42 +3450,127 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        // Find an index for the column and check if metric is compatible
-        let matching_index = if let Some(index) =
-            indices.iter().find(|i| i.fields.contains(&column_id))
-        {
-            // TODO: Once we do https://github.com/lance-format/lance/issues/5231, we
-            // should be able to get the metric type directly from the index metadata,
-            // at least for newer indexes.
-            let idx = self
-                .dataset
-                .open_vector_index(
-                    q.column.as_str(),
-                    &index.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await?;
-            let index_metric = idx.metric_type();
+        let index_and_segments = if use_index {
+            if let Some(requested_segments) = self.index_segments.as_ref() {
+                let requested_segment_set =
+                    requested_segments.iter().copied().collect::<HashSet<_>>();
+                let requested_index_segments = indices
+                    .iter()
+                    .filter(|idx| requested_segment_set.contains(&idx.uuid))
+                    .cloned()
+                    .collect::<Vec<_>>();
 
-            // Check if user's requested metric is compatible with index
-            let use_this_index = match q.metric_type {
-                Some(user_metric) => {
-                    if user_metric == index_metric {
-                        true
+                if requested_index_segments.len() != requested_segment_set.len() {
+                    let found_segment_set = requested_index_segments
+                        .iter()
+                        .map(|idx| idx.uuid)
+                        .collect::<HashSet<_>>();
+                    let missing_segments = requested_segment_set
+                        .difference(&found_segment_set)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    return Err(Error::invalid_input(format!(
+                        "with_index_segments referenced unknown index segments: {missing_segments:?}",
+                    )));
+                }
+
+                if requested_index_segments
+                    .iter()
+                    .any(|idx| !idx.fields.contains(&column_id))
+                {
+                    return Err(Error::invalid_input(format!(
+                        "with_index_segments contained a segment that does not belong to vector column '{}'",
+                        q.column
+                    )));
+                }
+
+                let index_name = requested_index_segments[0].name.clone();
+                if requested_index_segments
+                    .iter()
+                    .any(|idx| idx.name != index_name)
+                {
+                    return Err(Error::invalid_input(
+                        "with_index_segments must reference segments from a single logical index"
+                            .to_string(),
+                    ));
+                }
+
+                let selected_index_segments =
+                    self.retain_relevant_index_segments(requested_index_segments);
+                if selected_index_segments.is_empty() {
+                    None
+                } else {
+                    let idx = self
+                        .dataset
+                        .open_vector_index(
+                            q.column.as_str(),
+                            &selected_index_segments[0].uuid.to_string(),
+                            &NoOpMetricsCollector,
+                        )
+                        .await?;
+                    let index_metric = idx.metric_type();
+                    let use_this_index = match q.metric_type {
+                        Some(user_metric) => {
+                            if user_metric == index_metric {
+                                true
+                            } else {
+                                return Err(Error::invalid_input(format!(
+                                    "with_index_segments requested metric {:?} but the selected index segments use {:?}",
+                                    user_metric, index_metric
+                                )));
+                            }
+                        }
+                        None => true,
+                    };
+                    if use_this_index {
+                        Some((index_name, selected_index_segments, index_metric))
                     } else {
-                        log::warn!(
-                            "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
-                            user_metric,
-                            index_metric
-                        );
-                        false
+                        None
                     }
                 }
-                None => true, // No preference, use index's metric
-            };
+            } else if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+                // TODO: Once we do https://github.com/lance-format/lance/issues/5231, we
+                // should be able to get the metric type directly from the index metadata,
+                // at least for newer indexes.
+                let idx = self
+                    .dataset
+                    .open_vector_index(
+                        q.column.as_str(),
+                        &index.uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+                let index_metric = idx.metric_type();
 
-            if use_this_index {
-                Some((index, idx, index_metric))
+                let use_this_index = match q.metric_type {
+                    Some(user_metric) => {
+                        if user_metric == index_metric {
+                            true
+                        } else {
+                            log::warn!(
+                                "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
+                                user_metric,
+                                index_metric
+                            );
+                            false
+                        }
+                    }
+                    None => true,
+                };
+
+                if use_this_index {
+                    let index_segments = self.retain_relevant_index_segments(
+                        self.dataset.load_indices_by_name(&index.name).await?,
+                    );
+                    let index_frags = self.get_indexed_frags(&index_segments);
+                    if !index_segments.is_empty() && !index_frags.is_empty() {
+                        Some((index.name.clone(), index_segments, index_metric))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -3458,20 +3578,7 @@ impl Scanner {
             None
         };
 
-        // Only return index and deltas if there is an index on the column and at least one of the target fragments are indexed
-        let index_and_deltas = if let Some((index, _idx, index_metric)) = matching_index {
-            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let index_frags = self.get_indexed_frags(&deltas);
-            if !index_frags.is_empty() {
-                Some((index, deltas, index_metric))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some((index, deltas, index_metric)) = index_and_deltas {
+        if let Some((index_name, index_segments, index_metric)) = index_and_segments {
             log::trace!("index found for vector search");
             // Use the index's metric type
             q.metric_type = Some(index_metric);
@@ -3483,8 +3590,8 @@ impl Scanner {
                 ));
             }
             let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(&q, &deltas, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(&q, &deltas, filter_plan).await?,
+                DataType::FixedSizeList(_, _) => self.ann(&q, &index_segments, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(&q, &index_segments, filter_plan).await?,
                 _ => unreachable!(),
             };
 
@@ -3501,7 +3608,9 @@ impl Scanner {
             }; // vector, _distance, _rowid
 
             if !self.fast_search {
-                knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
+                knn_node = self
+                    .knn_combined(&q, &index_name, &index_segments, knn_node, filter_plan)
+                    .await?;
             }
 
             Ok(knn_node)
@@ -3551,27 +3660,27 @@ impl Scanner {
     async fn knn_combined(
         &self,
         q: &Query,
-        index: &IndexMetadata,
+        index_name: &str,
+        indexed_segments: &[IndexMetadata],
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Get unindexed fragments and filter to target fragments
-        let unindexed_fragments =
-            self.retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
+        let fallback_fragments = if let Some(target_fragments) = &self.fragments {
+            let indexed_fragments = self.get_indexed_frags(indexed_segments);
+            target_fragments
+                .iter()
+                .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else if self.index_segments.is_some() {
+            Vec::new()
+        } else {
+            self.dataset.unindexed_fragments(index_name).await?
+        };
 
-        if !unindexed_fragments.is_empty() {
-            // need to set the metric type to be the same as the index
-            // to make sure the distance is comparable.
-            let idx = self
-                .dataset
-                .open_vector_index(
-                    q.column.as_str(),
-                    &index.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await?;
-            let mut q = q.clone();
-            q.metric_type = Some(idx.metric_type());
+        if !fallback_fragments.is_empty() {
+            let q = q.clone();
+            debug_assert!(q.metric_type.is_some());
 
             // If the vector column is not present, we need to take the vector column, so
             // that the distance value is comparable with the flat search ones.
@@ -3600,7 +3709,7 @@ impl Scanner {
                 false,
                 false,
                 vector_scan_projection,
-                Arc::new(unindexed_fragments),
+                Arc::new(fallback_fragments),
                 // Can't pushdown limit/offset in an ANN search
                 None,
                 // We are re-ordering anyways, so no need to get data in data
@@ -4166,7 +4275,26 @@ impl Scanner {
         if let Some(fragments) = &self.fragments {
             RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
         } else {
-            RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32))
+            self.dataset.fragment_bitmap.as_ref().clone()
+        }
+    }
+
+    fn retain_relevant_index_segments(
+        &self,
+        index_segments: Vec<IndexMetadata>,
+    ) -> Vec<IndexMetadata> {
+        if let Some(fragments) = &self.fragments {
+            let target_fragments = RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32));
+            index_segments
+                .into_iter()
+                .filter(|idx| {
+                    idx.fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|fragmap| !(fragmap & &target_fragments).is_empty())
+                })
+                .collect()
+        } else {
+            index_segments
         }
     }
 
@@ -4537,6 +4665,7 @@ pub mod test_dataset {
 
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+        types::Float32Type,
     };
     use arrow_schema::{ArrowError, DataType};
     use lance_arrow::FixedSizeListArrayExt;
@@ -4545,7 +4674,13 @@ pub mod test_dataset {
     use lance_index::{
         IndexType,
         scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
+        vector::{
+            ivf::IvfBuildParams,
+            kmeans::{KMeansParams, train_kmeans},
+        },
     };
+    use lance_linalg::distance::DistanceType;
+    use uuid::Uuid;
 
     use crate::dataset::WriteParams;
     use crate::index::vector::VectorIndexParams;
@@ -4654,6 +4789,63 @@ pub mod test_dataset {
                 )
                 .await?;
             Ok(())
+        }
+
+        pub async fn make_segmented_vector_index(&mut self) -> Result<Vec<Uuid>> {
+            let batch = self
+                .dataset
+                .scan()
+                .project(&["vec"])
+                .unwrap()
+                .try_into_batch()
+                .await?;
+            let vectors = batch
+                .column_by_name("vec")
+                .expect("vector column should exist")
+                .as_fixed_size_list();
+            let values = vectors.values().as_primitive::<Float32Type>();
+            let centroids = train_kmeans::<Float32Type>(
+                values,
+                KMeansParams::new(None, 10, 1, DistanceType::L2),
+                self.dimension as usize,
+                2,
+                2,
+            )
+            .unwrap()
+            .centroids
+            .as_primitive::<Float32Type>()
+            .clone();
+            let centroids = Arc::new(
+                FixedSizeListArray::try_new_from_values(centroids, self.dimension as i32).unwrap(),
+            );
+            let params = VectorIndexParams::with_ivf_flat_params(
+                DistanceType::L2,
+                IvfBuildParams::try_with_centroids(2, centroids).unwrap(),
+            );
+            let fragment_ids = self
+                .dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>();
+
+            let mut segments = Vec::with_capacity(fragment_ids.len());
+            for fragment_id in fragment_ids {
+                let mut builder =
+                    self.dataset
+                        .create_index_builder(&["vec"], IndexType::Vector, &params);
+                builder = builder.name("idx".to_string()).fragments(vec![fragment_id]);
+                segments.push(builder.execute_uncommitted().await?);
+            }
+
+            let segment_ids = segments
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>();
+            self.dataset
+                .commit_existing_index_segments("idx", "vec", segments)
+                .await?;
+            Ok(segment_ids)
         }
 
         pub async fn make_scalar_index(&mut self) -> Result<()> {
@@ -7509,6 +7701,558 @@ mod test {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_like_prefix_with_btree_index() {
+        // Create dataset with string data that has various prefixes
+        // Avoid LIKE special characters (%, _) in data to keep tests simple
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(data, "memory://test_like", None)
+            .await
+            .unwrap();
+
+        // Create BTree index on string column
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test 1: Verify LIKE 'app%' uses scalar index and returns correct results
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("name LIKE 'app%'"),
+            "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
+             range_before=None, range_after=None, row_id=false, row_addr=false, \
+             full_filter=name LIKE Utf8(\"app%\"), refine_filter=--
+               ScalarIndexQuery: query=[name LIKE 'app%']@name_idx",
+        )
+        .await
+        .unwrap();
+
+        // Verify correct results for LIKE 'app%'
+        let results = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: apple, application, app (repeated in cycle)
+        assert!(names.iter().all(|n| n.starts_with("app")));
+        assert!(!names.is_empty());
+
+        // Test 2: Verify starts_with() uses scalar index (simple prefix without special chars)
+        // Note: DataFusion optimizes starts_with() to LIKE before our index planning
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("starts_with(name, 'ban')"),
+            "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
+             range_before=None, range_after=None, row_id=false, row_addr=false, \
+             full_filter=name LIKE Utf8(\"ban%\"), refine_filter=--
+               ScalarIndexQuery: query=[name LIKE 'ban%']@name_idx",
+        )
+        .await
+        .unwrap();
+
+        // Verify correct results for starts_with
+        let results = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: banana, band
+        assert!(names.iter().all(|n| n.starts_with("ban")));
+        assert!(!names.is_empty());
+
+        // Test 3: LIKE with pattern requiring refine (e.g., 'test%2')
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("name LIKE 'test%2'"),
+            "ProjectionExec: expr=[name@0 as name, id@1 as id]
+  LanceRead: uri=..., projection=[name, id], num_fragments=1, \
+range_before=None, range_after=None, row_id=true, row_addr=false, \
+full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
+    ScalarIndexQuery: query=[name LIKE 'test%']@name_idx",
+        )
+        .await
+        .unwrap();
+
+        // Verify correct results for LIKE 'test%2' (needs refine)
+        let results = dataset
+            .scan()
+            .filter("name LIKE 'test%2'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: testns2 (ends with '2')
+        assert!(
+            names
+                .iter()
+                .all(|n| n.starts_with("test") && n.ends_with("2"))
+        );
+
+        // Test 4: LIKE starting with wildcard should NOT use scalar index for pruning
+        // Verify by checking the plan does NOT have ScalarIndexQuery
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE '%app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            !plan_str.contains("ScalarIndexQuery"),
+            "LIKE '%app%' should not use scalar index, but got: {}",
+            plan_str
+        );
+
+        // Verify correct results for LIKE '%app%'
+        let results = dataset
+            .scan()
+            .filter("name LIKE '%app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        // Should match: apple, application, app (contain 'app')
+        assert!(names.iter().all(|n| n.contains("app")));
+
+        // Test 5: NOT LIKE should NOT use scalar index
+        let mut scanner = dataset.scan();
+        scanner.filter("name NOT LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            !plan_str.contains("ScalarIndexQuery"),
+            "NOT LIKE should not use scalar index, but got: {}",
+            plan_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_correctness_with_btree_index() {
+        // Create dataset with deterministic string data for exact result verification
+        let names: Vec<&str> = vec![
+            "alpha", "alphabet", "beta", "gamma", "delta", "epsilon", "eta", "theta", "iota",
+            "kappa",
+        ];
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..10)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(data)],
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+        );
+
+        let mut dataset = Dataset::write(reader, "memory://test_like_correctness", None)
+            .await
+            .unwrap();
+
+        // Create BTree index
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test with index
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Test without index (for comparison)
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Both should return same results: alpha, alphabet
+        assert_eq!(with_index.num_rows(), without_index.num_rows());
+        assert_eq!(with_index.num_rows(), 2);
+
+        let with_index_names: BTreeSet<String> = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        let without_index_names: BTreeSet<String> = without_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        assert_eq!(with_index_names, without_index_names);
+        assert_eq!(
+            with_index_names,
+            BTreeSet::from(["alpha".to_string(), "alphabet".to_string()])
+        );
+
+        // Test starts_with correctness
+        let starts_with_result = dataset
+            .scan()
+            .filter("starts_with(name, 'e')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let starts_with_names: BTreeSet<String> = starts_with_result
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        // Should match: epsilon, eta
+        assert_eq!(
+            starts_with_names,
+            BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_with_zone_map() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        // Create dataset with string data that has various prefixes
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(data, "memory://test_like_zonemap", None)
+            .await
+            .unwrap();
+
+        // Create ZoneMap index on string column
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test 1: Verify LIKE 'app%' uses zone map index
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        // Zone map uses ScalarIndexExec with LikePrefix query
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "LIKE 'app%' should use zone map index with LikePrefix, but got: {}",
+            plan_str
+        );
+
+        // Verify correct results for LIKE 'app%'
+        let results = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with("app")));
+        assert!(!names.is_empty());
+
+        // Test 2: Verify starts_with() uses zone map index
+        let mut scanner = dataset.scan();
+        scanner.filter("starts_with(name, 'ban')").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "starts_with should use zone map index with LikePrefix, but got: {}",
+            plan_str
+        );
+
+        // Verify correct results
+        let results = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let names: Vec<&str> = results
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with("ban")));
+
+        // Test 3: LIKE with refine pattern still uses zone map for prefix pruning
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'test%2'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "LIKE 'test%2' should use zone map index for prefix, but got: {}",
+            plan_str
+        );
+
+        // Test 4: LIKE starting with wildcard should NOT use zone map
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE '%app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            !plan_str.contains("LikePrefix"),
+            "LIKE '%app%' should not use LikePrefix index, but got: {}",
+            plan_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_correctness_with_zone_map() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        // Create dataset with deterministic string data for exact result verification
+        let names: Vec<&str> = vec![
+            "alpha", "alphabet", "beta", "gamma", "delta", "epsilon", "eta", "theta", "iota",
+            "kappa",
+        ];
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..10)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(data)],
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("name", DataType::Utf8, false),
+                ArrowField::new("id", DataType::Int32, false),
+            ])),
+        );
+
+        let mut dataset = Dataset::write(reader, "memory://test_like_correctness_zonemap", None)
+            .await
+            .unwrap();
+
+        // Create ZoneMap index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test with zone map index
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Test without index (for comparison)
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'alpha%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Both should return same results: alpha, alphabet
+        assert_eq!(with_index.num_rows(), without_index.num_rows());
+        assert_eq!(with_index.num_rows(), 2);
+
+        let with_index_names: BTreeSet<String> = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        let without_index_names: BTreeSet<String> = without_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        assert_eq!(with_index_names, without_index_names);
+        assert_eq!(
+            with_index_names,
+            BTreeSet::from(["alpha".to_string(), "alphabet".to_string()])
+        );
+
+        // Test starts_with correctness with zone map
+        let starts_with_result = dataset
+            .scan()
+            .filter("starts_with(name, 'e')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let starts_with_names: BTreeSet<String> = starts_with_result
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect();
+
+        // Should match: epsilon, eta
+        assert_eq!(
+            starts_with_names,
+            BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_late_materialization(
@@ -9700,8 +10444,8 @@ mod test {
             .await
             .unwrap();
 
-        // Create index on first 2 fragments
-        test_ds.make_vector_index().await.unwrap();
+        // Create one segment per indexed fragment so fragment filtering must prune ANN fan-out.
+        test_ds.make_segmented_vector_index().await.unwrap();
 
         let query: Float32Array = (0..32).map(|v| v as f32).collect();
 
@@ -9720,6 +10464,207 @@ mod test {
             scanner
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_fragment_filter_prunes_segment_fanout() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_segmented_vector_index().await.unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        test_ds.append_data_with_range(400, 410).await.unwrap();
+        test_ds.append_data_with_range(410, 420).await.unwrap();
+        let fragments = test_ds.dataset.fragments();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query, 420).unwrap();
+        let full_plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            full_plan.contains("ANNSubIndex: name=idx, k=420, deltas=2, metric=L2"),
+            "expected two ANN deltas without fragment filter, plan was:\n{full_plan}"
+        );
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query, 420)
+            .unwrap()
+            .with_fragments(vec![fragments[0].clone()]);
+        let filtered_plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            filtered_plan.contains("ANNSubIndex: name=idx, k=420, deltas=1, metric=L2"),
+            "expected one ANN delta with fragment filter, plan was:\n{filtered_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_respects_index_segments() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let segment_ids = test_ds.make_segmented_vector_index().await.unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        test_ds.append_data_with_range(400, 410).await.unwrap();
+        test_ds.append_data_with_range(410, 420).await.unwrap();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query, 420)
+            .unwrap()
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 200);
+        assert_values_in_range(
+            i_array,
+            0..200,
+            "Should only get results from the selected index segment",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_intersects_fragments_and_index_segments() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let segment_ids = test_ds.make_segmented_vector_index().await.unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        test_ds.append_data_with_range(400, 410).await.unwrap();
+        test_ds.append_data_with_range(410, 420).await.unwrap();
+        let fragments = test_ds.dataset.fragments();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query, 420)
+            .unwrap()
+            .with_fragments(vec![fragments[0].clone(), fragments[2].clone()])
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(
+            i_array
+                .iter()
+                .all(|v| v.is_some_and(|val| (0..200).contains(&val) || (400..410).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (0..200).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (400..410).contains(&val))),
+            "Should get selected segment rows plus flat fallback for target fragments outside the selected segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_rejects_unknown_index_segment() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_segmented_vector_index().await.unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        let err = test_ds
+            .dataset
+            .scan()
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .with_index_segments(vec![Uuid::new_v4()])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown index segments"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_rejects_metric_mismatch_for_index_segments() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let segment_ids = test_ds.make_segmented_vector_index().await.unwrap();
+
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+        let err = test_ds
+            .dataset
+            .scan()
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(DistanceType::Dot)
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("with_index_segments requested metric"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_index_segments_rejects_empty_list() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+
+        let Err(err) = test_ds
+            .dataset
+            .scan()
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .with_index_segments(vec![])
+        else {
+            panic!("expected empty index segments to be rejected");
+        };
+        assert!(
+            err.to_string()
+                .contains("with_index_segments does not accept an empty segment list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_index_segments_rejected_for_non_vector_query() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let segment_ids = test_ds.make_segmented_vector_index().await.unwrap();
+
+        let err = test_ds
+            .dataset
+            .scan()
+            .project(&["i"])
+            .unwrap()
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("with_index_segments is only supported for vector search"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

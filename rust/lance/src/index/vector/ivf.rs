@@ -3,11 +3,16 @@
 
 //! IVF - Inverted File index.
 
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
+    LogicalIvfView,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
+use super::{
+    builder::{IvfIndexBuilder, index_type_string},
+    utils::PartitionLoadLock,
+};
+use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
@@ -55,14 +60,16 @@ use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
-use lance_index::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel};
+use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::v3::shuffler::IvfShuffler;
+use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
+    MAX_PARTITION_SIZE_FACTOR, MIN_PARTITION_SIZE_PERCENT,
     optimize::OptimizeOptions,
     vector::{
         Query, VectorIndex,
@@ -87,13 +94,13 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
+use lance_table::format::{IndexMetadata as TableIndexMetadata, list_index_files_with_sizes};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::instrument;
@@ -101,6 +108,7 @@ use uuid::Uuid;
 
 pub mod builder;
 pub mod io;
+mod partition_serde;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects
@@ -121,6 +129,10 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "LegacyIVFPartition"
     }
 }
 
@@ -263,6 +275,95 @@ impl std::fmt::Debug for IVFIndex {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SegmentRebalanceCandidate {
+    segment_id: Uuid,
+    score: usize,
+    created_at_ms: i64,
+}
+
+fn candidate_is_better(
+    candidate: SegmentRebalanceCandidate,
+    current_best: Option<SegmentRebalanceCandidate>,
+) -> bool {
+    match current_best {
+        None => true,
+        Some(current_best) => {
+            candidate.score > current_best.score
+                || (candidate.score == current_best.score
+                    && (candidate.created_at_ms, candidate.segment_id.as_bytes())
+                        < (
+                            current_best.created_at_ms,
+                            current_best.segment_id.as_bytes(),
+                        ))
+        }
+    }
+}
+
+fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
+    let (sub_index_type, quantization_type) = index.sub_index_type();
+    IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
+}
+
+pub(crate) fn select_segment_for_single_rebalance(
+    logical_index: &LogicalIvfView<'_>,
+) -> Result<Option<Uuid>> {
+    let mut best_split = None;
+    let mut best_join = None;
+
+    for (metadata, index) in logical_index.segments() {
+        let index_type = index_type_for_segmented_optimize(index.as_ref())?;
+        let split_threshold = MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size();
+        let join_threshold = MIN_PARTITION_SIZE_PERCENT * index_type.target_partition_size() / 100;
+        let num_partitions = index.ivf_model().num_partitions();
+        if num_partitions == 0 {
+            continue;
+        }
+
+        let mut split_partition_count = 0usize;
+        let mut join_partition_count = 0usize;
+        for partition_id in 0..num_partitions {
+            let partition_size = index.partition_size(partition_id);
+            if partition_size > split_threshold {
+                split_partition_count += 1;
+            }
+            if num_partitions > 1 && partition_size < join_threshold {
+                join_partition_count += 1;
+            }
+        }
+
+        let created_at_ms = metadata
+            .created_at
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(i64::MIN);
+
+        let split_candidate = (split_partition_count > 0).then_some(SegmentRebalanceCandidate {
+            segment_id: metadata.uuid,
+            score: split_partition_count,
+            created_at_ms,
+        });
+        if let Some(candidate) = split_candidate
+            && candidate_is_better(candidate, best_split)
+        {
+            best_split = Some(candidate);
+        }
+
+        let join_candidate = (join_partition_count > 0).then_some(SegmentRebalanceCandidate {
+            segment_id: metadata.uuid,
+            score: join_partition_count,
+            created_at_ms,
+        });
+        if let Some(candidate) = join_candidate
+            && candidate_is_better(candidate, best_join)
+        {
+            best_join = Some(candidate);
+        }
+    }
+
+    let selected = best_split.or(best_join);
+    Ok(selected.map(|candidate| candidate.segment_id))
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged)
@@ -270,9 +371,10 @@ pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
+    logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
+    let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -287,7 +389,7 @@ pub(crate) async fn optimize_vector_indices(
             &dataset,
             unindexed,
             vector_column,
-            existing_indices,
+            &existing_indices,
             options,
         )
         .await;
@@ -314,7 +416,7 @@ pub(crate) async fn optimize_vector_indices(
             pq_index,
             vector_column,
             unindexed,
-            existing_indices,
+            &existing_indices,
             options,
             writer,
             dataset.version().version,
@@ -336,7 +438,7 @@ pub(crate) async fn optimize_vector_indices(
             hnsw_sq,
             vector_column,
             unindexed,
-            existing_indices,
+            &existing_indices,
             options,
             writer,
             aux_writer,
@@ -357,7 +459,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
     // Sanity check the indices
@@ -366,11 +468,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
-    let existing_indices = existing_indices
-        .iter()
-        .cloned()
-        .map(|idx| idx.as_vector_index())
-        .collect::<Result<Vec<_>>>()?;
+    let existing_indices = existing_indices.to_vec();
 
     let new_uuid = Uuid::new_v4();
     let index_dir = dataset.indices_dir().child(new_uuid.to_string());
@@ -381,9 +479,11 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
+    let format_version = dataset_format_version(dataset);
+
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
+    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let merged_num = match index_type {
@@ -488,23 +588,43 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
-                dataset.clone(),
-                vector_column.to_owned(),
-                index_dir,
-                distance_type,
-                shuffler,
-                HnswBuildParams::default(),
-                frag_reuse_index,
-                options.clone(),
-            )?
-            .with_ivf(ivf_model.clone())
-            .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
-            .build()
-            .await?
+            if element_type == DataType::UInt8 {
+                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            } else {
+                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            }
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
@@ -564,7 +684,7 @@ async fn optimize_ivf_pq_indices(
     pq_index: &PQIndex,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
     mut writer: Box<dyn Writer>,
     dataset_version: u64,
@@ -647,7 +767,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
     writer: Box<dyn Writer>,
     aux_writer: Box<dyn Writer>,
@@ -1216,6 +1336,7 @@ pub async fn build_ivf_model(
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
@@ -1238,7 +1359,8 @@ pub async fn build_ivf_model(
         "Loading training data for IVF. Sample size: {}",
         sample_size_hint
     );
-    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let training_data =
+        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1295,8 +1417,16 @@ async fn build_ivf_model_and_pq(
     get_vector_type(dataset.schema(), column)?;
     let dim = get_vector_dim(dataset.schema(), column)?;
 
-    let ivf_model =
-        build_ivf_model(dataset, column, dim, metric_type, ivf_params, progress).await?;
+    let ivf_model = build_ivf_model(
+        dataset,
+        column,
+        dim,
+        metric_type,
+        ivf_params,
+        None,
+        progress,
+    )
+    .await?;
 
     let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
         Some(&ivf_model)
@@ -1530,6 +1660,13 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
@@ -1541,6 +1678,13 @@ pub(crate) async fn remap_index_file_v3(
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
                 .remap(mapping)
                 .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
@@ -1854,29 +1998,150 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-/// Finalize distributed merge for IVF-based vector indices.
-///
-/// This helper merges partial auxiliary index files produced by distributed
-/// jobs into a unified `auxiliary.idx` and then creates a root `index.idx`
-/// using the v2 index format so that `open_vector_index_v2` can load it.
-///
-/// The caller must pass `index_dir` pointing at the index UUID directory
-/// (e.g. `<table>/indices/<uuid>`). `requested_index_type` is only used as
-/// a fallback when the unified auxiliary file does not contain index
-/// metadata.
-pub async fn finalize_distributed_merge(
+/// Merge one caller-defined group of source segments into a single segment.
+pub(crate) async fn merge_segments(
     object_store: &ObjectStore,
-    index_dir: &object_store::path::Path,
-    requested_index_type: Option<IndexType>,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
+    merge_segments_with_progress(
+        object_store,
+        indices_dir,
+        segments,
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
+
+/// Merge one caller-defined group of source segments into a single segment and
+/// report progress through the provided callback.
+pub(crate) async fn merge_segments_with_progress(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<TableIndexMetadata> {
+    if segments.is_empty() {
+        return Err(Error::index("No segment metadata was provided".to_string()));
+    }
+    if segments.len() == 1 {
+        return Ok(segments.into_iter().next().unwrap());
+    }
+
+    let mut merged_segment = segments[0].clone();
+    let mut fragment_bitmap = RoaringBitmap::new();
+    for segment in &segments {
+        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        fragment_bitmap |= source_fragment_bitmap.clone();
+    }
+
+    let index_version = infer_source_index_version(&segments)?;
+    let segment_uuid = Uuid::new_v4();
+    let final_dir = indices_dir.child(segment_uuid.to_string());
+    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments, progress).await?;
+    let files = list_index_files_with_sizes(object_store, &final_dir).await?;
+
+    merged_segment = TableIndexMetadata {
+        uuid: segment_uuid,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(crate::index::vector_index_details())),
+        index_version,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(files),
+        ..merged_segment
+    };
+    Ok(merged_segment)
+}
+
+/// Merge the selected input segments into `final_dir`.
+///
+/// The caller defines the source segment group explicitly. This helper reads
+/// those input segments directly from `indices/<segment_uuid>/` and writes the
+/// merged auxiliary/index files into `final_dir`.
+async fn merge_segments_to_dir(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    final_dir: &Path,
+    segments: &[TableIndexMetadata],
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
-    // Merge per-shard auxiliary files into a unified auxiliary.idx.
+    reset_final_segment_dir(object_store, final_dir).await?;
+
+    debug_assert!(
+        segments.len() > 1,
+        "merge helper should only be used for multi-source groups"
+    );
+
+    let aux_paths = segments
+        .iter()
+        .map(|segment| {
+            indices_dir
+                .child(segment.uuid.to_string())
+                .child(INDEX_AUXILIARY_FILE_NAME)
+        })
+        .collect::<Vec<_>>();
+    let source_index_paths = segments
+        .iter()
+        .map(|segment| {
+            indices_dir
+                .child(segment.uuid.to_string())
+                .child(INDEX_FILE_NAME)
+        })
+        .collect::<Vec<_>>();
+
     lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
         object_store,
-        index_dir,
+        &aux_paths,
+        final_dir,
+        progress.clone(),
+    )
+    .await?;
+    write_root_vector_index_from_auxiliary(
+        object_store,
+        final_dir,
+        None,
+        &source_index_paths,
+        progress.clone(),
     )
     .await?;
 
-    // Open the unified auxiliary file.
+    Ok(())
+}
+
+fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
+    debug_assert!(!group.is_empty());
+    let first = group[0].index_version;
+    if group.iter().any(|segment| segment.index_version != first) {
+        return Err(Error::index(
+            "Distributed vector segments must all have the same index version".to_string(),
+        ));
+    }
+    Ok(first)
+}
+
+/// Best-effort reset of one target directory before rewriting it.
+async fn reset_final_segment_dir(object_store: &ObjectStore, final_dir: &Path) -> Result<()> {
+    match object_store.remove_dir_all(final_dir.clone()).await {
+        Ok(()) => {}
+        Err(Error::NotFound { .. }) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+async fn write_root_vector_index_from_auxiliary(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    requested_index_type: Option<IndexType>,
+    centroid_source_index_paths: &[Path],
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<()> {
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
@@ -1895,6 +2160,8 @@ pub async fn finalize_distributed_merge(
     .await?;
 
     let meta = aux_reader.metadata();
+    // Inherit file format version from the unified auxiliary (which inherited it from shards)
+    let format_version = meta.version();
     let ivf_buf_idx: u32 = meta
         .file_schema
         .metadata
@@ -1907,36 +2174,20 @@ pub async fn finalize_distributed_merge(
     let mut pb_ivf: lance_index::pb::Ivf = Message::decode(raw_ivf_bytes.clone())?;
 
     // If the unified IVF metadata does not contain centroids, try to source them
-    // from any partial_* index.idx under this index directory.
+    // from one of the shard index files that fed this merge.
     if pb_ivf.centroids_tensor.is_none() {
-        let mut stream = object_store.list(Some(index_dir.clone()));
-        let mut partial_index_path = None;
-
-        while let Some(item) = stream.next().await {
-            let meta = item?;
-            if let Some(fname) = meta.location.filename()
-                && fname == INDEX_FILE_NAME
-            {
-                let parts: Vec<_> = meta.location.parts().collect();
-                if parts.len() >= 2 {
-                    let parent = parts[parts.len() - 2].as_ref();
-                    if parent.starts_with("partial_") {
-                        partial_index_path = Some(meta.location.clone());
-                        break;
-                    }
-                }
+        for partial_index_path in centroid_source_index_paths {
+            if !object_store.exists(partial_index_path).await? {
+                continue;
             }
-        }
-
-        if let Some(partial_index_path) = partial_index_path {
             let fh = scheduler
-                .open_file(&partial_index_path, &CachedFileSize::unknown())
+                .open_file(partial_index_path, &CachedFileSize::unknown())
                 .await?;
             let partial_reader = V2Reader::try_open(
                 fh,
                 None,
                 Arc::default(),
-                &lance_core::cache::LanceCache::no_cache(),
+                &LanceCache::no_cache(),
                 V2ReaderOptions::default(),
             )
             .await?;
@@ -1948,6 +2199,7 @@ pub async fn finalize_distributed_merge(
                 let partial_pb_ivf: lance_index::pb::Ivf = Message::decode(partial_ivf_bytes)?;
                 if partial_pb_ivf.centroids_tensor.is_some() {
                     pb_ivf.centroids_tensor = partial_pb_ivf.centroids_tensor;
+                    break;
                 }
             }
         }
@@ -1983,11 +2235,21 @@ pub async fn finalize_distributed_merge(
     // Write root index.idx via V2 writer so downstream opens through v2 path.
     let index_path = index_dir.child(INDEX_FILE_NAME);
     let obj_writer = object_store.create(&index_path).await?;
+    progress
+        .stage_start("write_root_index", Some(1), "files")
+        .await?;
 
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = V2Writer::try_new(obj_writer, schema, V2WriterOptions::default())?;
+    let mut v2_writer = V2Writer::try_new(
+        obj_writer,
+        schema,
+        V2WriterOptions {
+            format_version: Some(format_version),
+            ..Default::default()
+        },
+    )?;
 
     // Attach precise index metadata (type + distance).
     v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);
@@ -2002,7 +2264,7 @@ pub async fn finalize_distributed_merge(
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),
-        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ"
+        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ"
     );
 
     if is_hnsw {
@@ -2021,68 +2283,8 @@ pub async fn finalize_distributed_merge(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
-
-    if let Err(err) = cleanup_partial_vector_dirs(object_store, index_dir).await {
-        warn!(
-            "Failed to cleanup partial_* vector index directories under '{}': {}",
-            index_dir.as_ref(),
-            err
-        );
-    }
-
-    Ok(())
-}
-
-/// Cleanup for distributed partial vector index directories after
-/// a distributed merge.
-///
-/// This helper scans `index_dir` for direct child directories whose names
-/// start with `partial_` (e.g. `<index_dir>/partial_0`, `<index_dir>/partial_1`)
-/// and attempts to recursively delete them via [`ObjectStore::remove_dir_all`].
-///
-/// Listing and deletion failures are logged with [`warn!`] and ignored so that
-/// index finalization is never blocked by cleanup. The function always returns
-/// `Ok(())`.
-async fn cleanup_partial_vector_dirs(
-    object_store: &ObjectStore,
-    index_dir: &object_store::path::Path,
-) -> Result<()> {
-    let mut partial_dirs: HashSet<Path> = HashSet::new();
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
-
-    while let Some(item) = list_stream.next().await {
-        match item {
-            Ok(meta) => {
-                if let Some(relative_parts) = meta.location.prefix_match(index_dir) {
-                    let rel_parts: Vec<_> = relative_parts.collect();
-                    // Expect paths like: <index_dir>/partial_*/<file>
-                    if rel_parts.len() >= 2 {
-                        let parent_name = rel_parts[0].as_ref();
-                        if parent_name.starts_with("partial_") {
-                            partial_dirs.insert(index_dir.child(parent_name));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to list index directory '{}' while collecting partial_* dirs: {}",
-                    index_dir.as_ref(),
-                    e
-                );
-            }
-        }
-    }
-
-    for dir in partial_dirs {
-        if let Err(e) = object_store.remove_dir_all(dir.clone()).await {
-            warn!(
-                "Failed to remove partial_* directory '{}' after distributed merge: {}",
-                dir.as_ref(),
-                e
-            );
-        }
-    }
+    progress.stage_progress("write_root_index", 1).await?;
+    progress.stage_complete("write_root_index").await?;
 
     Ok(())
 }
@@ -2262,6 +2464,7 @@ mod tests {
     use crate::index::vector::IndexFileVersion;
     use crate::index::vector_index_details;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+    use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
 
@@ -2643,17 +2846,12 @@ mod tests {
             dataset_version: dataset.version().version,
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(
-                dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -2692,6 +2890,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            files: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2746,17 +2945,12 @@ mod tests {
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(
-                dataset_mut
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            ),
+            fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this new index to the dataset so it can be found
@@ -3087,6 +3281,7 @@ mod tests {
             DIM,
             MetricType::L2,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -3122,6 +3317,7 @@ mod tests {
             DIM,
             MetricType::Cosine,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -3640,50 +3836,6 @@ mod tests {
         assert!(correct_times >= 9, "correct: {}", correct_times);
     }
 
-    #[tokio::test]
-    async fn test_cleanup_removes_only_partial_dirs() {
-        let object_store = ObjectStore::memory();
-        let index_dir = Path::from("index/uuid_test_cleanup");
-
-        // partial_* directories that should be removed
-        let partial0_file = index_dir.child("partial_0").child("file.bin");
-        let partial_abc_file = index_dir.child("partial_abc").child("file.bin");
-
-        // Non-partial paths that must be preserved
-        let partialx_file = index_dir.child("partialX").child("file.bin");
-        let shard_file = index_dir.child("shard_0").child("file.bin");
-        let keep_root_file = index_dir.child("keep_root.txt");
-
-        object_store.put(&partial0_file, b"partial0").await.unwrap();
-        object_store
-            .put(&partial_abc_file, b"partial_abc")
-            .await
-            .unwrap();
-        object_store.put(&partialx_file, b"partialx").await.unwrap();
-        object_store.put(&shard_file, b"shard").await.unwrap();
-        object_store.put(&keep_root_file, b"root").await.unwrap();
-
-        // Sanity: all files exist before cleanup
-        assert!(object_store.exists(&partial0_file).await.unwrap());
-        assert!(object_store.exists(&partial_abc_file).await.unwrap());
-        assert!(object_store.exists(&partialx_file).await.unwrap());
-        assert!(object_store.exists(&shard_file).await.unwrap());
-        assert!(object_store.exists(&keep_root_file).await.unwrap());
-
-        cleanup_partial_vector_dirs(&object_store, &index_dir)
-            .await
-            .unwrap();
-
-        // partial_* directories should be removed
-        assert!(!object_store.exists(&partial0_file).await.unwrap());
-        assert!(!object_store.exists(&partial_abc_file).await.unwrap());
-
-        // Non-partial directories and root files must be preserved
-        assert!(object_store.exists(&partialx_file).await.unwrap());
-        assert!(object_store.exists(&shard_file).await.unwrap());
-        assert!(object_store.exists(&keep_root_file).await.unwrap());
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_ivf_model_progress_callback() {
         use lance_index::progress::IndexBuildProgress;
@@ -3725,6 +3877,7 @@ mod tests {
             DIM,
             MetricType::L2,
             &ivf_params,
+            None,
             progress,
         )
         .await
@@ -3752,27 +3905,6 @@ mod tests {
                 window[0].1,
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_idempotent() {
-        let object_store = ObjectStore::memory();
-        let index_dir = Path::from("index/uuid_test_cleanup_idempotent");
-
-        let partial_file = index_dir.child("partial_0").child("file.bin");
-        object_store.put(&partial_file, b"partial").await.unwrap();
-
-        assert!(object_store.exists(&partial_file).await.unwrap());
-
-        cleanup_partial_vector_dirs(&object_store, &index_dir)
-            .await
-            .unwrap();
-        assert!(!object_store.exists(&partial_file).await.unwrap());
-
-        // Second call should succeed even when there are no partial_* directories left.
-        cleanup_partial_vector_dirs(&object_store, &index_dir)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -3845,6 +3977,80 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_legacy_multiple_deltas() {
+        use lance_io::assert_io_eq;
+
+        let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let test_uri = test_dir.path_str();
+        let test_uri = &test_uri;
+
+        // Trigger migration to repair legacy corrupt fragment bitmaps.
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.index_statistics("vector_idx").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Reopen dataset to avoid carrying index state in-memory from migration.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2, "expected two index deltas for vector_idx");
+        let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
+        assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
+
+        let sample_batch = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .project(&["vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = sample_batch["vector"]
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap()
+            .value(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .clone();
+
+        // Reset IO stats after migration and sampling.
+        dataset.object_store().io_stats_incremental();
+
+        // Prewarm should perform IO to load all index deltas into cache.
+        dataset.prewarm_index("vector_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert!(
+            stats.read_iops > 0,
+            "prewarm should have read from disk, but read_iops was 0"
+        );
+
+        // Query should not perform index IO after prewarm of all deltas.
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "query should not perform IO after prewarm"
+        );
+
+        // Second prewarm should not need IO (already cached).
+        dataset.prewarm_index("vector_idx").await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }

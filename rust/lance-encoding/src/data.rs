@@ -970,12 +970,8 @@ impl DataBlock {
             Self::FixedWidth(inner) => inner.data_size(),
             Self::FixedSizeList(inner) => inner.data_size(),
             Self::VariableWidth(inner) => inner.data_size(),
-            Self::Struct(_) => {
-                todo!("the data_size method for StructDataBlock is not implemented yet")
-            }
-            Self::Dictionary(_) => {
-                todo!("the data_size method for DictionaryDataBlock is not implemented yet")
-            }
+            Self::Struct(inner) => inner.children.iter().map(|child| child.data_size()).sum(),
+            Self::Dictionary(inner) => inner.indices.data_size() + inner.dictionary.data_size(),
             Self::Opaque(inner) => inner.data_size(),
         }
     }

@@ -28,6 +28,7 @@ from typing import (
 )
 
 import pyarrow as pa
+from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
 from ..commit import CommitLock
@@ -46,8 +47,8 @@ from ..fragment import (
     DataFile,
     FragmentMetadata,
 )
-from ..io import StorageOptionsProvider
 from ..progress import FragmentWriteProgress as FragmentWriteProgress
+from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
 from .debug import format_fragment as format_fragment
@@ -61,6 +62,7 @@ from .fragment import (
     RowIdMeta as RowIdMeta,
 )
 from .indices import IndexDescription as IndexDescription
+from .indices import IndexSegmentDescription as IndexSegmentDescription
 from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
@@ -99,7 +101,8 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int],
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
-        storage_options_provider: Optional[StorageOptionsProvider],
+        namespace_client: Optional[LanceNamespace],
+        table_id: Optional[List[str]],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -113,7 +116,8 @@ class LanceFileSession:
         self,
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        namespace_client: Optional[LanceNamespace] = None,
+        table_id: Optional[List[str]] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -137,7 +141,8 @@ class LanceFileReader:
         self,
         path: str,
         storage_options: Optional[Dict[str, str]],
-        storage_options_provider: Optional[StorageOptionsProvider],
+        namespace_client: Optional[LanceNamespace],
+        table_id: Optional[List[str]],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -358,8 +363,16 @@ class _Dataset:
     def drop_index(self, name: str): ...
     def prewarm_index(self, name: str): ...
     def merge_index_metadata(
-        self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None
+        self,
+        index_uuid: str,
+        index_type: str,
+        batch_readhead: Optional[int] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
+    def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
+    def commit_existing_index_segments(
+        self, index_name: str, column: str, segments: List[Index]
+    ) -> None: ...
     def count_fragments(self) -> int: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
@@ -380,7 +393,6 @@ class _Dataset:
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
@@ -393,7 +405,6 @@ class _Dataset:
         transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
@@ -504,6 +515,8 @@ def _write_fragments(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
+    namespace_client: Optional[LanceNamespace],
+    table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
 ): ...
 def _write_fragments_transaction(
@@ -516,6 +529,8 @@ def _write_fragments_transaction(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
+    namespace_client: Optional[LanceNamespace],
+    table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...

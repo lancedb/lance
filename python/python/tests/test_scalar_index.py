@@ -7,6 +7,7 @@ import random
 import re
 import shutil
 import string
+import uuid
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -260,6 +262,107 @@ def test_indexed_between(tmp_path):
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 0
+
+
+def test_create_inverted_index_progress_callback(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=75
+    )
+    progress_recorder = ProgressRecorder()
+
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        remove_stop_words=False,
+        progress_callback=progress_recorder,
+    )
+
+    tags = progress_event_tags(progress_recorder.events)
+    expected_order = [
+        "start:load_data",
+        "complete:load_data",
+        "start:tokenize_docs",
+        "complete:tokenize_docs",
+        "start:copy_partitions",
+        "complete:copy_partitions",
+        "start:write_metadata",
+        "complete:write_metadata",
+    ]
+    positions = [tags.index(tag) for tag in expected_order]
+    assert positions == sorted(positions)
+
+    tokenize_progress = stage_progress_values(progress_recorder.events, "tokenize_docs")
+    assert tokenize_progress
+    assert tokenize_progress[-1] == ds.count_rows()
+
+    assert "progress:copy_partitions" in tags
+    assert "progress:write_metadata" in tags
+    assert "start:merge_partitions" not in tags
+
+
+def test_merge_index_metadata_inverted_index_progress_callback(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=60
+    )
+
+    inverted_index_id = str(uuid.uuid4())
+    for fragment in ds.get_fragments():
+        ds.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            name="text_inverted_progress_idx",
+            replace=False,
+            index_uuid=inverted_index_id,
+            fragment_ids=[fragment.fragment_id],
+            remove_stop_words=False,
+        )
+
+    progress_recorder = ProgressRecorder()
+    ds.merge_index_metadata(
+        inverted_index_id,
+        index_type="INVERTED",
+        progress_callback=progress_recorder,
+    )
+
+    tags = progress_event_tags(progress_recorder.events)
+    expected_order = [
+        "start:read_partition_metadata",
+        "complete:read_partition_metadata",
+        "start:remap_partition_files",
+        "complete:remap_partition_files",
+        "start:write_merged_metadata",
+        "complete:write_merged_metadata",
+    ]
+    positions = [tags.index(tag) for tag in expected_order]
+    assert positions == sorted(positions)
+
+    metadata_progress = stage_progress_values(
+        progress_recorder.events, "read_partition_metadata"
+    )
+    assert metadata_progress
+    assert metadata_progress[-1] == len(ds.get_fragments())
+    assert "progress:remap_partition_files" in tags
+    assert "progress:write_merged_metadata" in tags
+
+
+def test_create_inverted_index_progress_callback_error_after_completion_is_ignored(
+    tmp_path,
+):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=75
+    )
+    progress_recorder = ProgressRecorder(fail_on_tag="complete:write_metadata")
+
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        remove_stop_words=False,
+        progress_callback=progress_recorder,
+    )
+
+    tags = progress_event_tags(progress_recorder.events)
+    assert tags[-1] == "complete:write_metadata"
+    assert any(idx.index_type == "Inverted" for idx in ds.describe_indices())
 
 
 def test_index_combination(tmp_path):
@@ -849,7 +952,12 @@ def test_fts_ngram_tokenizer(tmp_path):
 
 def test_fts_stats(dataset):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
+        "doc",
+        index_type="INVERTED",
+        with_position=False,
+        remove_stop_words=True,
+        memory_limit=4096,
+        num_workers=2,
     )
     stats = dataset.stats.index_stats("doc_idx")
     assert stats["index_type"] == "Inverted"
@@ -864,6 +972,8 @@ def test_fts_stats(dataset):
     assert params["stem"] is True
     assert params["remove_stop_words"] is True
     assert params["ascii_folding"] is True
+    assert "memory_limit" not in params
+    assert "num_workers" not in params
 
 
 def test_fts_score(tmp_path):
@@ -2125,10 +2235,9 @@ def test_label_list_index_null_list_match(tmp_path: Path):
         "array_has_any(labels, ['foo'])",
         "array_has_all(labels, ['foo'])",
         "array_contains(labels, 'foo')",
-        # TODO(issue #5904): Enable after fixing NOT filters with whole-list NULLs
-        # "NOT array_has_any(labels, ['foo'])",
-        # "NOT array_has_all(labels, ['foo'])",
-        # "NOT array_contains(labels, 'foo')",
+        "NOT array_has_any(labels, ['foo'])",
+        "NOT array_has_all(labels, ['foo'])",
+        "NOT array_contains(labels, 'foo')",
     ]
     expected = {
         f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
@@ -4254,7 +4363,9 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-def test_describe_indices(tmp_path):
+@pytest.mark.parametrize("fts_format_version", ["1", "2"])
+def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
+    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", fts_format_version)
     data = pa.table(
         {
             "id": range(100),
@@ -4284,9 +4395,13 @@ def test_describe_indices(tmp_path):
     assert indices[0].segments[0].uuid is not None
     assert indices[0].segments[0].fragment_ids == {0}
     assert indices[0].segments[0].dataset_version_at_last_update == 1
-    assert indices[0].segments[0].index_version == 1
+    assert indices[0].segments[0].index_version == int(fts_format_version)
     assert indices[0].segments[0].created_at is not None
     assert isinstance(indices[0].segments[0].created_at, datetime)
+    assert indices[0].segments[0].size_bytes is not None
+    assert indices[0].segments[0].size_bytes > 0
+    assert indices[0].total_size_bytes is not None
+    assert indices[0].total_size_bytes > 0
 
     details = indices[0].details
     assert details is not None and len(details) > 0
@@ -4367,6 +4482,10 @@ def test_describe_indices(tmp_path):
         assert indices[i].segments[0].index_version == 0
         assert indices[i].segments[0].created_at is not None
         assert isinstance(indices[i].segments[0].created_at, datetime)
+        assert indices[i].segments[0].size_bytes is not None
+        assert indices[i].segments[0].size_bytes > 0
+        assert indices[i].total_size_bytes is not None
+        assert indices[i].total_size_bytes > 0
         assert indices[i].details == json.loads(details[i])
 
     ds.delete("id < 50")

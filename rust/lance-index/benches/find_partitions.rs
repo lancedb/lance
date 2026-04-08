@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-mod sq;
-
 use arrow_array::Float32Array;
 use arrow_array::{FixedSizeListArray, types::Float32Type};
 use lance_arrow::FixedSizeListArrayExt;

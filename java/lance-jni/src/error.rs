@@ -120,60 +120,29 @@ impl Error {
         env: &mut JNIEnv,
         code: u32,
     ) -> std::result::Result<(), ()> {
-        // Try to find and call the LanceNamespaceException constructor
-        // that takes ErrorCode and message
-        let class_name = "org/lance/namespace/errors/LanceNamespaceException";
-        let error_code_class = "org/lance/namespace/errors/ErrorCode";
+        // Use ErrorFactory.fromErrorCode(code, message) to get the specific exception subclass
+        // (e.g., TableNotFoundException, NamespaceNotFoundException, etc.)
+        let factory_class = "org/lance/namespace/errors/ErrorFactory";
 
-        // Find the ErrorCode.fromCode method
-        let error_code_cls = env.find_class(error_code_class).map_err(|_| ())?;
-        let from_code_method = env
+        let factory_cls = env.find_class(factory_class).map_err(|_| ())?;
+        let from_error_code_method = env
             .get_static_method_id(
-                &error_code_cls,
-                "fromCode",
-                "(I)Lorg/lance/namespace/errors/ErrorCode;",
+                &factory_cls,
+                "fromErrorCode",
+                "(ILjava/lang/String;)Lorg/lance/namespace/errors/LanceNamespaceException;",
             )
             .map_err(|_| ())?;
-        let error_code_obj = unsafe {
-            env.call_static_method_unchecked(
-                &error_code_cls,
-                from_code_method,
-                jni::signature::ReturnType::Object,
-                &[jni::sys::jvalue {
-                    i: code as jni::sys::jint,
-                }],
-            )
-        }
-        .map_err(|_| ())?;
 
-        let error_code = match error_code_obj {
-            jni::objects::JValueGen::Object(obj) => obj,
-            _ => return Err(()),
-        };
-
-        // Find the LanceNamespaceException class
-        let exception_cls = env.find_class(class_name).map_err(|_| ())?;
-
-        // Create message JString
         let message_str = env.new_string(&self.message).map_err(|_| ())?;
 
-        // Find constructor (ErrorCode, String)
-        let constructor = env
-            .get_method_id(
-                &exception_cls,
-                "<init>",
-                "(Lorg/lance/namespace/errors/ErrorCode;Ljava/lang/String;)V",
-            )
-            .map_err(|_| ())?;
-
-        // Create the exception object
         let exception_obj = unsafe {
-            env.new_object_unchecked(
-                &exception_cls,
-                constructor,
+            env.call_static_method_unchecked(
+                &factory_cls,
+                from_error_code_method,
+                jni::signature::ReturnType::Object,
                 &[
                     jni::sys::jvalue {
-                        l: error_code.as_raw(),
+                        i: code as jni::sys::jint,
                     },
                     jni::sys::jvalue {
                         l: message_str.as_raw(),
@@ -183,8 +152,13 @@ impl Error {
         }
         .map_err(|_| ())?;
 
+        let exception = match exception_obj {
+            jni::objects::JValueGen::Object(obj) => obj,
+            _ => return Err(()),
+        };
+
         // Throw the exception
-        env.throw(jni::objects::JThrowable::from(exception_obj))
+        env.throw(jni::objects::JThrowable::from(exception))
             .map_err(|_| ())?;
 
         Ok(())

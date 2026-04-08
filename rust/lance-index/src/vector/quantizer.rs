@@ -65,6 +65,7 @@ pub trait Quantization:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationType {
     Flat,
+    FlatBin,
     Product,
     Scalar,
     Rabit,
@@ -76,6 +77,7 @@ impl FromStr for QuantizationType {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "FLAT" => Ok(Self::Flat),
+            "FLATBIN" => Ok(Self::FlatBin),
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
             "RABIT" => Ok(Self::Rabit),
@@ -88,6 +90,7 @@ impl std::fmt::Display for QuantizationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Flat => write!(f, "FLAT"),
+            Self::FlatBin => write!(f, "FLATBIN"),
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
             Self::Rabit => write!(f, "RQ"),
@@ -156,7 +159,7 @@ impl Quantizer {
     pub fn quantization_type(&self) -> QuantizationType {
         match self {
             Self::Flat(_) => QuantizationType::Flat,
-            Self::FlatBin(_) => QuantizationType::Flat,
+            Self::FlatBin(_) => QuantizationType::FlatBin,
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
             Self::Rabit(_) => QuantizationType::Rabit,
@@ -313,7 +316,6 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     }
 }
 
-#[allow(dead_code)]
 impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///

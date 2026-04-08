@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance::session::Session;
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
 
 use crate::context::DynamicContextProvider;
 
@@ -186,9 +187,11 @@ impl ConnectBuilder {
                 Ok(Arc::new(builder.build()) as Arc<dyn LanceNamespace>)
             }
             #[cfg(not(feature = "rest"))]
-            "rest" => Err(Error::namespace_source(
-                "REST namespace implementation requires 'rest' feature to be enabled".into(),
-            )),
+            "rest" => Err(NamespaceError::Unsupported {
+                message: "REST namespace implementation requires 'rest' feature to be enabled"
+                    .to_string(),
+            }
+            .into()),
             "dir" => {
                 // Create directory implementation (always available)
                 let mut builder = crate::dir::DirectoryNamespaceBuilder::from_properties(
@@ -203,14 +206,14 @@ impl ConnectBuilder {
                     .await
                     .map(|ns| Arc::new(ns) as Arc<dyn LanceNamespace>)
             }
-            _ => Err(Error::namespace_source(
-                format!(
+            _ => Err(NamespaceError::Unsupported {
+                message: format!(
                     "Implementation '{}' is not available. Supported: dir{}",
                     self.impl_name,
                     if cfg!(feature = "rest") { ", rest" } else { "" }
-                )
-                .into(),
-            )),
+                ),
+            }
+            .into()),
         }
     }
 }

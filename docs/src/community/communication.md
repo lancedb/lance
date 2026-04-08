@@ -24,8 +24,12 @@ There are two mailing lists used by Lance:
 - [dev@lance.org](https://groups.google.com/a/lance.org/g/dev): Archive for discussions from GitHub Discussions (public)
 - [private@lance.org](https://groups.google.com/a/lance.org/g/private): Private discussions, security and harassment issues reporting, voting (private, PMC only)
 
-## Community Events
+## Community Sync
 
-Check out [Lance Community Events](https://calendar.google.com/calendar/u/0?cid=Y29tbXVuaXR5QGxhbmNlLm9yZw) 
-for upcoming virtual or in-person events related to Lance.
-The community can self-organize additional meetups as well.
+We hold Lance community syncs every other Thursday at 9am PT. Everyone is welcome to attend! 
+
+- Subscribe to the [Lance Format mailing list](https://groups.google.com/a/lance.org/g/dev) to receive the meeting invite
+- Feel free to suggest discussion topics on the [meeting notes](https://docs.google.com/document/d/1cP058pJLVjj39DGaFV5yHI6qyWBwp1B2YKyIwXzYlAI/edit?tab=t.0)
+- Past recordings can be found [here](https://www.youtube.com/playlist?list=PLQysAafL04jUgOj7j6mCE5fcZEBB9Amu9)
+
+If you have issues seeing the calendar invite, please reach out via the mailing list or the [Lance discord](https://discord.gg/lance).

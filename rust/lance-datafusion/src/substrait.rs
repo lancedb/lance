@@ -1127,4 +1127,40 @@ mod tests {
             agg.aggregates[1].schema_name()
         );
     }
+
+    // ==================== LIKE and starts_with tests ====================
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_like() {
+        use datafusion::logical_expr::Like;
+
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+
+        let like_expr = Expr::Like(Like {
+            negated: false,
+            expr: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            pattern: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("test%".to_string())),
+                None,
+            )),
+            escape_char: None,
+            case_insensitive: false,
+        });
+
+        assert_substrait_roundtrip(schema, like_expr).await;
+    }
+
+    #[tokio::test]
+    async fn test_substrait_roundtrip_starts_with() {
+        use datafusion::functions::string::starts_with;
+
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+
+        let starts_with_expr = starts_with().call(vec![
+            Expr::Column(Column::new_unqualified("name")),
+            Expr::Literal(ScalarValue::Utf8(Some("prefix".to_string())), None),
+        ]);
+
+        assert_substrait_roundtrip(schema, starts_with_expr).await;
+    }
 }

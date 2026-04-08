@@ -16,7 +16,7 @@ use lance_core::{Error, Result};
 use uuid::Uuid;
 
 use super::collector::{ActiveMemTableRef, LsmDataSourceCollector};
-use super::data_source::RegionSnapshot;
+use super::data_source::ShardSnapshot;
 use super::planner::LsmScanPlanner;
 use crate::dataset::Dataset;
 
@@ -34,7 +34,7 @@ use crate::dataset::Dataset;
 /// # Example
 ///
 /// ```ignore
-/// let scanner = LsmScanner::new(base_table, region_snapshots, vec!["pk".to_string()])
+/// let scanner = LsmScanner::new(base_table, shard_snapshots, vec!["pk".to_string()])
 ///     .project(&["id", "name"])
 ///     .filter("id > 10")?
 ///     .limit(100, None);
@@ -44,7 +44,7 @@ use crate::dataset::Dataset;
 pub struct LsmScanner {
     // Data sources
     base_table: Arc<Dataset>,
-    region_snapshots: Vec<RegionSnapshot>,
+    shard_snapshots: Vec<ShardSnapshot>,
     active_memtables: HashMap<Uuid, ActiveMemTableRef>,
 
     // Query configuration
@@ -67,16 +67,16 @@ impl LsmScanner {
     /// # Arguments
     ///
     /// * `base_table` - The base Lance table (merged data)
-    /// * `region_snapshots` - Snapshots of region states from MemWAL index
+    /// * `shard_snapshots` - Snapshots of shard states from MemWAL index
     /// * `pk_columns` - Primary key column names for deduplication
     pub fn new(
         base_table: Arc<Dataset>,
-        region_snapshots: Vec<RegionSnapshot>,
+        shard_snapshots: Vec<ShardSnapshot>,
         pk_columns: Vec<String>,
     ) -> Self {
         Self {
             base_table,
-            region_snapshots,
+            shard_snapshots,
             active_memtables: HashMap::new(),
             projection: None,
             filter: None,
@@ -93,8 +93,8 @@ impl LsmScanner {
     /// Active MemTables contain data that may not be persisted yet.
     /// Including them provides strong consistency at the cost of
     /// requiring coordination with the writer.
-    pub fn with_active_memtable(mut self, region_id: Uuid, memtable: ActiveMemTableRef) -> Self {
-        self.active_memtables.insert(region_id, memtable);
+    pub fn with_active_memtable(mut self, shard_id: Uuid, memtable: ActiveMemTableRef) -> Self {
+        self.active_memtables.insert(shard_id, memtable);
         self
     }
 
@@ -223,10 +223,10 @@ impl LsmScanner {
     /// Build the data source collector.
     fn build_collector(&self) -> LsmDataSourceCollector {
         let mut collector =
-            LsmDataSourceCollector::new(self.base_table.clone(), self.region_snapshots.clone());
+            LsmDataSourceCollector::new(self.base_table.clone(), self.shard_snapshots.clone());
 
-        for (region_id, memtable) in &self.active_memtables {
-            collector = collector.with_active_memtable(*region_id, memtable.clone());
+        for (shard_id, memtable) in &self.active_memtables {
+            collector = collector.with_active_memtable(*shard_id, memtable.clone());
         }
 
         collector
@@ -237,7 +237,7 @@ impl std::fmt::Debug for LsmScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LsmScanner")
             .field("base_table", &self.base_table.uri())
-            .field("num_regions", &self.region_snapshots.len())
+            .field("num_shards", &self.shard_snapshots.len())
             .field("num_active_memtables", &self.active_memtables.len())
             .field("projection", &self.projection)
             .field("limit", &self.limit)
@@ -257,26 +257,26 @@ mod tests {
         // Full integration tests would require a real dataset
 
         let pk_columns = ["id".to_string()];
-        let region_snapshots: Vec<RegionSnapshot> = vec![];
+        let shard_snapshots: Vec<ShardSnapshot> = vec![];
 
         // We can't easily create an Arc<Dataset> without I/O,
         // so just test the type construction
         assert_eq!(pk_columns.len(), 1);
-        assert!(region_snapshots.is_empty());
+        assert!(shard_snapshots.is_empty());
     }
 
     #[test]
-    fn test_region_snapshot_construction() {
-        use super::super::data_source::RegionSnapshot;
+    fn test_shard_snapshot_construction() {
+        use super::super::data_source::ShardSnapshot;
 
-        let region_id = Uuid::new_v4();
-        let snapshot = RegionSnapshot::new(region_id)
+        let shard_id = Uuid::new_v4();
+        let snapshot = ShardSnapshot::new(shard_id)
             .with_spec_id(1)
             .with_current_generation(5)
             .with_flushed_generation(1, "path/gen_1".to_string())
             .with_flushed_generation(2, "path/gen_2".to_string());
 
-        assert_eq!(snapshot.region_id, region_id);
+        assert_eq!(snapshot.shard_id, shard_id);
         assert_eq!(snapshot.spec_id, 1);
         assert_eq!(snapshot.current_generation, 5);
         assert_eq!(snapshot.flushed_generations.len(), 2);
