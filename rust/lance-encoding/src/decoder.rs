@@ -1693,12 +1693,16 @@ impl<T: RootDecoderType> RecordBatchReader for BatchDecodeIterator<T> {
 /// binary, lists) a rough default is used. The estimate is used as a
 /// starting point when `batch_size_bytes` is set; a post-decode feedback
 /// loop corrects it after the first batch.
+///
+/// This estimate ignores validity bitmaps at the moment.  We can't infer
+/// their presence simply from the data_type and their impact is probably
+/// fairly negligible.
 fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
     if let Some(w) = data_type.byte_width_opt() {
         return w as f64;
     }
     match data_type {
-        DataType::Boolean => 1.0,
+        DataType::Boolean => 1.0 / 8.0,
         DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => 64.0,
         DataType::Struct(fields) => fields
             .iter()
@@ -2852,7 +2856,7 @@ mod tests {
         assert_eq!(estimate_bytes_per_row(&DataType::Int32), 4.0);
         assert_eq!(estimate_bytes_per_row(&DataType::Int64), 8.0);
         assert_eq!(estimate_bytes_per_row(&DataType::Float32), 4.0);
-        assert_eq!(estimate_bytes_per_row(&DataType::Boolean), 1.0);
+        assert_eq!(estimate_bytes_per_row(&DataType::Boolean), 1.0 / 8.0);
         assert_eq!(estimate_bytes_per_row(&DataType::Utf8), 64.0);
         assert_eq!(estimate_bytes_per_row(&DataType::Binary), 64.0);
         // Struct of 4 x Int32 = 16 bytes
