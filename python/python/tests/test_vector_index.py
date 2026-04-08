@@ -223,7 +223,7 @@ def test_create_index_progress_callback_error_before_completion_propagates(tmp_p
     ds = _make_sample_dataset_base(
         tmp_path, "vector_progress_post_commit_error", 1500, 128
     )
-    recorder = ProgressRecorder(fail_on_tag="complete:shuffle")
+    recorder = ProgressRecorder(fail_on_tag="start:train_ivf")
 
     with pytest.raises(RuntimeError, match="progress callback failure"):
         ds.create_index(
@@ -235,7 +235,7 @@ def test_create_index_progress_callback_error_before_completion_propagates(tmp_p
         )
 
     tags = progress_event_tags(recorder.events)
-    assert tags[-1] == "complete:shuffle"
+    assert tags == ["start:train_ivf"]
     assert not ds.has_index
     assert ds.describe_indices() == []
 
