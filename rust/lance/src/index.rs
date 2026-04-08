@@ -41,7 +41,9 @@ use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -61,7 +63,7 @@ use scalar::index_matches_criteria;
 use serde_json::json;
 use tracing::{info, instrument};
 use uuid::Uuid;
-use vector::ivf::v2::IVFIndex;
+use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -154,19 +156,19 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct VectorIndexCacheKey<'a> {
-    pub uuid: &'a str,
-    pub fri_uuid: Option<&'a Uuid>,
+pub(crate) struct LegacyVectorIndexCacheKey<'a> {
+    uuid: &'a str,
+    fri_uuid: Option<&'a Uuid>,
 }
 
-impl<'a> VectorIndexCacheKey<'a> {
-    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+impl<'a> LegacyVectorIndexCacheKey<'a> {
+    fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
 
-impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
-    type ValueType = dyn VectorIndex;
+impl CacheKey for LegacyVectorIndexCacheKey<'_> {
+    type ValueType = CachedLegacyVectorIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -177,9 +179,51 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
     }
 
     fn type_name() -> &'static str {
-        "VectorIndex"
+        "LegacyVectorIndex"
     }
 }
+
+/// Sized cache key for `IvfIndexState`.
+///
+/// Used for v0.3+ indices that support serialization. This key has a codec,
+/// so custom cache backends can serialize the state to disk/Redis/etc.
+/// Legacy indices use `LegacyVectorIndexCacheKey` instead (in-memory only).
+#[derive(Debug, Clone)]
+pub(crate) struct IvfIndexStateCacheKey<'a> {
+    uuid: &'a str,
+    fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> IvfIndexStateCacheKey<'a> {
+    fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl CacheKey for IvfIndexStateCacheKey<'_> {
+    type ValueType = IvfStateEntryBox;
+
+    fn type_name() -> &'static str {
+        "IvfIndexState"
+    }
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            self.uuid.into()
+        }
+    }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>())
+    }
+}
+
+/// Wrapper that stores a live VectorIndex in the cache.
+/// Used for v0.1/v0.2 indices that don't support serializable caching.
+#[derive(Debug, deepsize::DeepSizeOf)]
+pub(crate) struct CachedLegacyVectorIndex(Arc<dyn VectorIndex>);
 
 #[derive(Debug, Clone)]
 pub struct FragReuseIndexCacheKey<'a> {
@@ -1396,13 +1440,18 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index.as_index());
         }
 
-        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self
-            .index_cache
-            .get_unsized_with_key(&vector_cache_key)
-            .await
-        {
+        // Check sized cache for IvfIndexState (v2+ indices).
+        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if self.index_cache.get_with_key(&state_key).await.is_some() {
+            // Reconstruct via open_vector_index which will hit the same sized key.
+            let index = self.open_vector_index(column, uuid, metrics).await?;
             return Ok(index.as_index());
+        }
+
+        // Fallback: in-memory cache for legacy indices.
+        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
+            return Ok(cached.0.clone().as_index());
         }
 
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -1477,11 +1526,26 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-        let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            log::debug!("Found vector index in cache uuid: {}", uuid);
-            return Ok(index);
+        // Check sized cache first (v2+ indices with serializable state).
+        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
+            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
+            let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            return entry
+                .0
+                .reconstruct(
+                    self.object_store.clone(),
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                )
+                .await;
+        }
+
+        // Fallback: in-memory cache for legacy indices.
+        let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
+            return Ok(cached.0.clone());
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
@@ -1499,23 +1563,35 @@ impl DatasetIndexInternalExt for Dataset {
         // Namespace the index cache by the UUID of the index.
         let index_cache = self.index_cache.with_key_prefix(&cache_key.key());
 
+        // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
+        fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+            ivf: IVFIndex<S, Q>,
+        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
+            let entry = ivf.to_state_entry();
+            (Arc::new(ivf), Some(entry))
+        }
+
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        let index = match (major_version, minor_version) {
+        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
+            major_version,
+            minor_version,
+        ) {
             (0, 1) | (0, 0) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
                         let dataset = Arc::new(self.clone());
-                        vector::open_vector_index(
+                        let idx = vector::open_vector_index(
                             dataset,
                             uuid,
                             vector_index,
                             reader,
                             frag_reuse_index,
                         )
-                        .await
+                        .await?;
+                        Ok((idx, None::<IvfStateEntryBox>))
                     }
                     None => Err(Error::internal(
                         "Index proto was missing implementation field",
@@ -1530,14 +1606,15 @@ impl DatasetIndexInternalExt for Dataset {
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
-                vector::open_vector_index_v2(
+                let idx = vector::open_vector_index_v2(
                     Arc::new(self.clone()),
                     column,
                     uuid,
                     reader,
                     frag_reuse_index,
                 )
-                .await
+                .await?;
+                Ok((idx, None::<IvfStateEntryBox>))
             }
 
             (0, 3) | (2, _) => {
@@ -1587,7 +1664,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                            Ok(wrap_ivf(ivf))
                         }
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
@@ -1600,7 +1677,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                            Ok(wrap_ivf(ivf))
                         }
                         _ => Err(Error::index(format!(
                             "the field type {} is not supported for FLAT index",
@@ -1619,7 +1696,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_SQ" => {
@@ -1633,7 +1710,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_RQ" => {
@@ -1647,42 +1724,37 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        Ok(wrap_ivf(ivf))
                     }
 
-                    "IVF_HNSW_FLAT" => {
-                        let uri = index_dir.child(uuid).child("index.pb");
-                        let file_metadata_cache =
-                            self.session.metadata_cache.file_metadata_cache(&uri);
-                        match element_type {
-                            DataType::UInt8 => {
-                                let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
-                                    self.object_store.clone(),
-                                    index_dir,
-                                    uuid.to_owned(),
-                                    frag_reuse_index,
-                                    &file_metadata_cache,
-                                    index_cache,
-                                    file_sizes,
-                                )
-                                .await?;
-                                Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
-                            }
-                            _ => {
-                                let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
-                                    self.object_store.clone(),
-                                    index_dir,
-                                    uuid.to_owned(),
-                                    frag_reuse_index,
-                                    &file_metadata_cache,
-                                    index_cache,
-                                    file_sizes,
-                                )
-                                .await?;
-                                Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
-                            }
+                    "IVF_HNSW_FLAT" => match element_type {
+                        DataType::UInt8 => {
+                            let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
+                                self.object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
                         }
-                    }
+                        _ => {
+                            let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
+                                self.object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                    },
 
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
@@ -1695,7 +1767,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_HNSW_PQ" => {
@@ -1709,7 +1781,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     _ => Err(Error::index(format!(
@@ -1723,11 +1795,18 @@ impl DatasetIndexInternalExt for Dataset {
                 "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
             )),
         };
-        let index = index?;
+        let (index, ivf_entry) = result?;
         metrics.record_index_load();
-        self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone())
-            .await;
+        if let Some(ivf_entry) = ivf_entry {
+            let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+            self.index_cache
+                .insert_with_key(&state_key, Arc::new(ivf_entry))
+                .await;
+        } else {
+            self.index_cache
+                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
+                .await;
+        }
         Ok(index)
     }
 

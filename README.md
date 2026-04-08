@@ -9,7 +9,8 @@
 
 <a href="https://lance.org">Documentation</a> •
 <a href="https://lance.org/community">Community</a> •
-<a href="https://discord.gg/lance">Discord</a>
+<a href="https://discord.gg/lance">Discord</a> •
+<a href="https://groups.google.com/a/lance.org/g/dev">Mailing List</a>
 
 [CI]: https://github.com/lance-format/lance/actions/workflows/rust.yml
 [CI Badge]: https://github.com/lance-format/lance/actions/workflows/rust.yml/badge.svg

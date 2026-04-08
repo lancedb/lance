@@ -2073,6 +2073,12 @@ enum PartitionAdjustment {
 }
 
 pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: QuantizationType) -> String {
+    // FlatBin is a QuantizationType variant used internally for reconstruction,
+    // but the persisted index type string uses "FLAT" (differentiated by DataType).
+    let quantizer = match quantizer {
+        QuantizationType::FlatBin => QuantizationType::Flat,
+        other => other,
+    };
     match (sub_index, quantizer) {
         // ignore FLAT sub index,
         // IVF_FLAT_FLAT => IVF_FLAT

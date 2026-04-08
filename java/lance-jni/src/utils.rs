@@ -49,8 +49,9 @@ pub fn extract_write_params(
     data_storage_version: &JObject,
     enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
-    initial_bases: &JObject, // Optional<BasePath>
-    target_bases: &JObject,  // Optional<String>
+    initial_bases: &JObject,                     // Optional<BasePath>
+    target_bases: &JObject,                      // Optional<String>
+    allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -95,6 +96,10 @@ pub fn extract_write_params(
 
     if let Some(names) = env.get_strings_opt(target_bases)? {
         write_params.target_base_names_or_paths = Some(names);
+    }
+
+    if let Some(allow) = env.get_boolean_opt(allow_external_blob_outside_bases)? {
+        write_params.allow_external_blob_outside_bases = allow;
     }
 
     // Create storage options accessor from static storage_options

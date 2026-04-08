@@ -107,11 +107,19 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        debug_assert!(self.codebook.is_some());
-        let codebook_tensor: pb::Tensor = pb::Tensor::try_from(self.codebook.as_ref().unwrap())?;
-        let mut bytes = BytesMut::new();
-        codebook_tensor.encode(&mut bytes)?;
-        Ok(Some(bytes.freeze()))
+        if let Some(codebook) = &self.codebook {
+            let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
+            let mut bytes = BytesMut::new();
+            codebook_tensor.encode(&mut bytes)?;
+            Ok(Some(bytes.freeze()))
+        } else if !self.codebook_tensor.is_empty() {
+            // Legacy format: codebook is stored inline in the metadata JSON.
+            // Return it as-is; it's already a protobuf-encoded Tensor that
+            // parse_buffer() can handle.
+            Ok(Some(Bytes::from(self.codebook_tensor.clone())))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn load(reader: &PreviousFileReader) -> Result<Self> {

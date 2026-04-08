@@ -233,6 +233,10 @@ impl PartialEq for CachedFileSize {
 impl Eq for CachedFileSize {}
 
 impl CachedFileSize {
+    /// Create a `CachedFileSize` from a raw byte count.
+    ///
+    /// Passing `0` is equivalent to calling [`unknown`](Self::unknown): the
+    /// type interprets zero as "size not yet known".
     pub fn new(size: u64) -> Self {
         Self(AtomicU64::new(size))
     }
