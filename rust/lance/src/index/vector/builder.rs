@@ -1377,6 +1377,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .await?;
         let mut split_plans = split_plans.into_iter().flatten().collect::<Vec<_>>();
         split_plans.sort_by_key(|plan| plan.part_idx);
+        Self::finalize_split_plans(&mut split_plans, ivf.num_partitions());
 
         if split_plans.is_empty() {
             return Ok(AssignResult {
@@ -1539,7 +1540,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ))?;
                 let baseline_dists =
                     self.distance_type.arrow_batch_func()(candidate_centroid.as_ref(), &vectors)?;
-                let mut best_moves = HashMap::<u64, CandidateMove>::new();
+                let mut best_moves = vec![None; row_ids.len()];
                 for request in requests {
                     let d1 = self.distance_type.arrow_batch_func()(
                         request.centroid1.as_ref(),
@@ -1562,13 +1563,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     );
                 }
 
-                Ok(best_moves.into_values().collect::<Vec<_>>())
+                Ok(best_moves.into_iter().flatten().collect::<Vec<_>>())
             })
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
 
         Ok(candidate_moves.into_iter().flatten().collect())
+    }
+
+    fn finalize_split_plans(split_plans: &mut [SplitPlan], base_num_partitions: usize) {
+        for (split_order, split_plan) in split_plans.iter_mut().enumerate() {
+            let actual_centroid2_part_idx = base_num_partitions + split_order;
+            if split_plan.centroid2_part_idx == actual_centroid2_part_idx {
+                continue;
+            }
+            let placeholder_centroid2_part_idx = split_plan.centroid2_part_idx;
+            for (target_idx, _) in &mut split_plan.original_assign_ops {
+                if *target_idx == placeholder_centroid2_part_idx {
+                    *target_idx = actual_centroid2_part_idx;
+                }
+            }
+            split_plan.centroid2_part_idx = actual_centroid2_part_idx;
+        }
     }
 
     // join the given partition:
@@ -1950,7 +1967,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         baseline_dists: &[f32],
         centroid1_dists: &[f32],
         centroid2_dists: &[f32],
-        best_moves: &mut HashMap<u64, CandidateMove>,
+        best_moves: &mut [Option<CandidateMove>],
         part_idx: usize,
     ) where
         T::Native: Dot + L2 + Normalize,
@@ -1972,12 +1989,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 dest_distance,
                 vector: vectors.value(i),
             };
-            match best_moves.get_mut(&row_id) {
+            match best_moves[i].as_mut() {
                 Some(best_move) if Self::is_better_candidate_move(&candidate_move, best_move) => {
                     *best_move = candidate_move;
                 }
                 None => {
-                    best_moves.insert(row_id, candidate_move);
+                    best_moves[i] = Some(candidate_move);
                 }
                 _ => {}
             }
@@ -2246,7 +2263,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut best_moves = HashMap::new();
+        let mut best_moves = vec![None; row_ids.len()];
         IvfIndexBuilder::<FlatIndex, FlatQuantizer>::update_best_candidate_moves::<Float32Type>(
             1,
             2,
@@ -2259,8 +2276,8 @@ mod tests {
             0,
         );
 
-        assert_eq!(best_moves.len(), 1);
-        let candidate_move = best_moves.get(&1).unwrap();
+        assert_eq!(best_moves.iter().flatten().count(), 1);
+        let candidate_move = best_moves[0].as_ref().unwrap();
         assert_eq!(candidate_move.row_id, 1);
         assert_eq!(candidate_move.source_part_idx, 0);
         assert_eq!(candidate_move.dest_part_idx, 1);
@@ -2268,6 +2285,69 @@ mod tests {
             candidate_move.vector.as_primitive::<Float32Type>().values(),
             &[0.0_f32, 0.0]
         );
+    }
+
+    #[test]
+    fn update_best_candidate_moves_preserves_multivector_entries() {
+        let row_ids = UInt64Array::from(vec![7_u64, 7_u64]);
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32, 0.0, 1.0, 1.0]),
+            2,
+        )
+        .unwrap();
+        let baseline_dists = Float32Array::from(vec![10.0_f32, 10.0]);
+        let centroid1_dists = Float32Array::from(vec![1.0_f32, 2.0]);
+        let centroid2_dists = Float32Array::from(vec![3.0_f32, 4.0]);
+
+        let mut best_moves = vec![None; row_ids.len()];
+        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::update_best_candidate_moves::<Float32Type>(
+            1,
+            2,
+            &row_ids,
+            &vectors,
+            baseline_dists.values(),
+            centroid1_dists.values(),
+            centroid2_dists.values(),
+            &mut best_moves,
+            0,
+        );
+
+        let best_moves = best_moves.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(best_moves.len(), 2);
+        assert_eq!(best_moves[0].row_id, 7);
+        assert_eq!(best_moves[1].row_id, 7);
+        assert_eq!(
+            best_moves[0].vector.as_primitive::<Float32Type>().values(),
+            &[0.0_f32, 0.0]
+        );
+        assert_eq!(
+            best_moves[1].vector.as_primitive::<Float32Type>().values(),
+            &[1.0_f32, 1.0]
+        );
+    }
+
+    #[test]
+    fn finalize_split_plans_reassigns_filtered_centroid_ids() {
+        let centroid1: ArrayRef = Arc::new(Float32Array::from(vec![0.0_f32, 0.0]));
+        let centroid2: ArrayRef = Arc::new(Float32Array::from(vec![1.0_f32, 1.0]));
+        let vector: ArrayRef = Arc::new(Float32Array::from(vec![2.0_f32, 2.0]));
+        let mut split_plans = vec![SplitPlan {
+            part_idx: 3,
+            centroid2_part_idx: 5,
+            centroid1,
+            centroid2,
+            reassign_part_ids: UInt32Array::from(vec![0_u32]),
+            original_assign_ops: vec![
+                (3, AssignOp::Add((10, vector.clone()))),
+                (5, AssignOp::Add((11, vector))),
+            ],
+        }];
+
+        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::finalize_split_plans(&mut split_plans, 4);
+
+        assert_eq!(split_plans[0].centroid2_part_idx, 4);
+        assert_eq!(split_plans[0].original_assign_ops[0].0, 3);
+        assert_eq!(split_plans[0].original_assign_ops[1].0, 4);
     }
 
     #[tokio::test]
