@@ -8,9 +8,7 @@ from .builder import IndexConfig, IndicesBuilder
 from .ivf import IvfModel
 from .pq import PqModel
 
-IndexSegment = _lance.indices.IndexSegment
 IndexSegmentDescription = _lance.indices.IndexSegmentDescription
-IndexSegmentPlan = _lance.indices.IndexSegmentPlan
 
 __all__ = [
     "IndicesBuilder",
@@ -18,9 +16,7 @@ __all__ = [
     "PqModel",
     "IvfModel",
     "IndexFileVersion",
-    "IndexSegment",
     "IndexSegmentDescription",
-    "IndexSegmentPlan",
 ]
 
 

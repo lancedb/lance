@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use lance_table::format::Fragment;
 
@@ -24,6 +26,47 @@ pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
 
     /// Complete writing a [Fragment].
     async fn complete(&self, fragment: &Fragment) -> Result<()>;
+}
+
+/// Statistics reported to the write progress callback set via
+/// [`InsertBuilder::progress`](crate::dataset::InsertBuilder::progress) or
+/// [`WriteParams::write_progress`](crate::dataset::WriteParams::write_progress).
+#[derive(Debug, Clone, Default)]
+pub struct WriteStats {
+    /// Cumulative bytes handed to the writer so far.
+    ///
+    /// For local storage this closely tracks bytes flushed to disk. For cloud
+    /// object stores (S3, GCS, Azure) this reflects bytes handed to the
+    /// multipart-upload buffer; actual network I/O may lag slightly.
+    pub bytes_written: u64,
+    /// Cumulative rows written so far.
+    pub rows_written: u64,
+    /// Number of files (fragments) whose writes have completed so far.
+    pub files_written: u32,
+}
+
+/// An opaque wrapper around a write-progress closure.
+///
+/// Stored inside [`WriteParams::write_progress`](crate::dataset::WriteParams::write_progress).
+/// Construct via [`InsertBuilder::progress`](crate::dataset::InsertBuilder::progress) or
+/// directly with [`WriteProgressFn::new`].
+#[derive(Clone)]
+pub struct WriteProgressFn(Arc<dyn Fn(WriteStats) + Send + Sync>);
+
+impl WriteProgressFn {
+    pub fn new(f: impl Fn(WriteStats) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub(crate) fn call(&self, stats: WriteStats) {
+        (self.0)(stats);
+    }
+}
+
+impl std::fmt::Debug for WriteProgressFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteProgressFn").finish_non_exhaustive()
+    }
 }
 
 /// By default, Progress tracker is Noop.

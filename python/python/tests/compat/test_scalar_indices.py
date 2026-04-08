@@ -19,6 +19,7 @@ from .compat_decorator import (
     UpgradeDowngradeTest,
     compat_test,
 )
+from .util import safe_data_storage_version
 
 
 @compat_test(min_version="0.30.0")
@@ -40,7 +41,12 @@ class BTreeIndex(UpgradeDowngradeTest):
                 "btree": pa.array(range(1000)),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("btree", "BTREE")
 
     def check_read(self):
@@ -92,7 +98,12 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
                 "label_list": pa.array([[f"label{i}"] for i in range(1000)]),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("bitmap", "BITMAP")
         dataset.create_scalar_index("label_list", "LABEL_LIST")
 
@@ -141,7 +152,12 @@ class NgramIndex(UpgradeDowngradeTest):
                 "ngram": pa.array([f"word{i}" for i in range(1000)]),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("ngram", "NGRAM")
 
     def check_read(self):
@@ -186,7 +202,12 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
                 "bloomfilter": pa.array(range(1000)),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("zonemap", "ZONEMAP")
         dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
 
@@ -237,7 +258,12 @@ class JsonIndex(UpgradeDowngradeTest):
                 "json": pa.array([f'{{"val": {i}}}' for i in range(1000)], pa.json_()),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index(
             "json",
             IndexConfig(
@@ -288,7 +314,12 @@ class FtsIndex(UpgradeDowngradeTest):
                 ),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("text", "INVERTED", with_position=True)
 
     def check_read(self):

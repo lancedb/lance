@@ -58,16 +58,17 @@ public class RestAdapter implements Closeable, AutoCloseable {
   /**
    * Creates a new REST adapter with the given backend namespace.
    *
-   * @param namespaceImpl The namespace implementation type (e.g., "dir" for DirectoryNamespace)
-   * @param backendConfig Configuration properties for the backend namespace
+   * @param namespaceClientImpl The namespace client implementation type (e.g., "dir" for
+   *     DirectoryNamespace)
+   * @param backendConfig Configuration properties for the backend namespace client
    * @param host Host to bind the server to, or null for default (127.0.0.1)
    * @param port Port to bind the server to. Use 0 to let the OS assign an available port, or null
    *     for default (2333).
    */
   public RestAdapter(
-      String namespaceImpl, Map<String, String> backendConfig, String host, Integer port) {
-    if (namespaceImpl == null || namespaceImpl.isEmpty()) {
-      throw new IllegalArgumentException("namespace implementation cannot be null or empty");
+      String namespaceClientImpl, Map<String, String> backendConfig, String host, Integer port) {
+    if (namespaceClientImpl == null || namespaceClientImpl.isEmpty()) {
+      throw new IllegalArgumentException("namespace client implementation cannot be null or empty");
     }
     if (backendConfig == null) {
       throw new IllegalArgumentException("backend config cannot be null");
@@ -76,18 +77,28 @@ public class RestAdapter implements Closeable, AutoCloseable {
       throw new IllegalArgumentException("port must be between 0 and 65535");
     }
 
-    this.nativeRestAdapterHandle = createNative(namespaceImpl, backendConfig, host, port);
+    this.nativeRestAdapterHandle = createNative(namespaceClientImpl, backendConfig, host, port);
   }
 
   /**
    * Creates a new REST adapter with default host and port.
    *
-   * @param namespaceImpl The namespace implementation type
-   * @param backendConfig Configuration properties for the backend namespace
+   * @param namespaceClientImpl The namespace client implementation type
+   * @param backendConfig Configuration properties for the backend namespace client
    */
-  public RestAdapter(String namespaceImpl, Map<String, String> backendConfig) {
-    this(namespaceImpl, backendConfig, null, null);
+  public RestAdapter(String namespaceClientImpl, Map<String, String> backendConfig) {
+    this(namespaceClientImpl, backendConfig, null, null);
   }
+
+  /**
+   * Creates a new REST adapter with the given backend namespace.
+   *
+   * @param namespaceImpl The namespace implementation type (e.g., "dir" for DirectoryNamespace)
+   * @param backendConfig Configuration properties for the backend namespace
+   * @param host Host to bind the server to, or null for default (127.0.0.1)
+   * @param port Port to bind the server to. Use 0 to let the OS assign an available port, or null
+   *     for default (2333).
+   */
 
   /**
    * Start the REST server in the background.
@@ -144,7 +155,7 @@ public class RestAdapter implements Closeable, AutoCloseable {
 
   // Native methods
   private native long createNative(
-      String namespaceImpl, Map<String, String> backendConfig, String host, Integer port);
+      String namespaceClientImpl, Map<String, String> backendConfig, String host, Integer port);
 
   private native void start(long handle);
 

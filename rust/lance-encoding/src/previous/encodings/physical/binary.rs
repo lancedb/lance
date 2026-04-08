@@ -109,7 +109,7 @@ impl BinaryPageScheduler {
             PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows, false);
         let drained_task = primitive_wrapper.drain(num_rows)?;
         let indices_decode_task = drained_task.task;
-        indices_decode_task.decode()
+        indices_decode_task.decode().map(|(arr, _)| arr)
     }
 }
 

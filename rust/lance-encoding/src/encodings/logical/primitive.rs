@@ -3509,8 +3509,10 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         let mut arrays = Vec::with_capacity(self.tasks.len());
         let mut unravelers = Vec::with_capacity(self.tasks.len());
+        let mut data_size = 0u64;
         for task in self.tasks {
             let decoded = task.decode()?;
+            data_size += decoded.data.data_size();
             unravelers.push(decoded.repdef);
 
             let array = make_array(
@@ -3527,7 +3529,11 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
 
         let array = Self::restore_validity(array, &mut repdef);
 
-        Ok(DecodedArray { array, repdef })
+        Ok(DecodedArray {
+            array,
+            repdef,
+            data_size,
+        })
     }
 }
 
@@ -3796,7 +3802,7 @@ impl PrimitiveStructuralEncoder {
         // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
         // ratio tells us how many levels a chunk of that size would need.
         let levels_per_chunk =
-            (num_levels as f64 / num_values as f64) * miniblock::MAX_MINIBLOCK_VALUES as f64;
+            (num_levels as f64 / num_values as f64) * *miniblock::MAX_MINIBLOCK_VALUES as f64;
 
         levels_per_chunk > max_levels_per_chunk as f64
     }

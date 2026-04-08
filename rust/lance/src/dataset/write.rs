@@ -52,6 +52,7 @@ pub mod merge_insert;
 mod retry;
 pub mod update;
 
+pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::CommitBuilder;
 pub use delete::{DeleteBuilder, DeleteResult};
 pub use insert::InsertBuilder;
@@ -132,6 +133,43 @@ impl TryFrom<&str> for WriteMode {
     }
 }
 
+/// The strategy for handling external blob URIs on write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExternalBlobMode {
+    /// Store the URI as an external blob reference.
+    #[default]
+    Reference,
+    /// Read the external bytes during write and store them in Lance-managed storage.
+    Ingest,
+}
+
+impl TryFrom<&str> for ExternalBlobMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            "reference" => Ok(Self::Reference),
+            "ingest" => Ok(Self::Ingest),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid external blob mode: {}",
+                value
+            ))),
+        }
+    }
+}
+
+fn validate_external_blob_write_params(params: &WriteParams) -> Result<()> {
+    if params.external_blob_mode == ExternalBlobMode::Ingest
+        && params.allow_external_blob_outside_bases
+    {
+        return Err(Error::invalid_input(
+            "allow_external_blob_outside_bases only applies when external_blob_mode=\"reference\"",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Auto cleanup parameters
 #[derive(Debug, Clone)]
 pub struct AutoCleanupParams {
@@ -176,6 +214,13 @@ pub struct WriteParams {
     pub store_params: Option<ObjectStoreParams>,
 
     pub progress: Arc<dyn WriteFragmentProgress>,
+
+    /// Optional callback invoked after each batch is written.
+    ///
+    /// Receives cumulative [`WriteStats`] so callers can render a progress bar
+    /// or compute throughput. The callback must be cheap and non-blocking;
+    /// spawn a task if you need async work.
+    pub write_progress: Option<WriteProgressFn>,
 
     /// If present, dataset will use this to update the latest version
     ///
@@ -250,6 +295,9 @@ pub struct WriteParams {
     /// Allow writing external blob URIs that cannot be mapped to any registered
     /// non-dataset-root base path. When disabled, such rows are rejected.
     pub allow_external_blob_outside_bases: bool,
+
+    /// The strategy used when writing external blob URIs.
+    pub external_blob_mode: ExternalBlobMode,
 }
 
 impl Default for WriteParams {
@@ -263,6 +311,7 @@ impl Default for WriteParams {
             mode: WriteMode::Create,
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            write_progress: None,
             commit_handler: None,
             data_storage_version: None,
             enable_stable_row_ids: false,
@@ -275,6 +324,7 @@ impl Default for WriteParams {
             target_bases: None,
             target_base_names_or_paths: None,
             allow_external_blob_outside_bases: false,
+            external_blob_mode: ExternalBlobMode::Reference,
         }
     }
 }
@@ -361,6 +411,14 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Configure how external blob URIs are handled during writes.
+    pub fn with_external_blob_mode(self, mode: ExternalBlobMode) -> Self {
+        Self {
+            external_blob_mode: mode,
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -417,6 +475,10 @@ pub async fn do_write_fragments(
     } else {
         None
     };
+    let source_store_registry = dataset
+        .map(|ds| ds.session.store_registry())
+        .unwrap_or_else(|| params.store_registry());
+    let source_store_params = params.store_params.clone().unwrap_or_default();
 
     let writer_generator = WriterGenerator::new(
         object_store,
@@ -426,10 +488,16 @@ pub async fn do_write_fragments(
         target_bases_info,
         external_base_resolver,
         params.allow_external_blob_outside_bases,
+        params.external_blob_mode,
+        source_store_registry,
+        source_store_params,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
+    let mut bytes_completed: u64 = 0;
+    let mut rows_completed: u64 = 0;
+    let mut files_written: u32 = 0;
     while let Some(batch_chunk) = buffered_reader.next().await {
         let batch_chunk = batch_chunk?;
 
@@ -441,8 +509,17 @@ pub async fn do_write_fragments(
         }
 
         writer.as_mut().unwrap().write(&batch_chunk).await?;
-        for batch in batch_chunk {
+        for batch in &batch_chunk {
             num_rows_in_current_file += batch.num_rows() as u32;
+        }
+
+        if let Some(cb) = &params.write_progress {
+            let current_bytes = writer.as_mut().unwrap().tell().await?;
+            cb.call(WriteStats {
+                bytes_written: bytes_completed + current_bytes,
+                rows_written: rows_completed + num_rows_in_current_file as u64,
+                files_written,
+            });
         }
 
         if num_rows_in_current_file >= params.max_rows_per_file as u32
@@ -451,6 +528,9 @@ pub async fn do_write_fragments(
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
+            bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+            rows_completed += num_rows as u64;
+            files_written += 1;
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
             last_fragment.physical_rows = Some(num_rows as usize);
@@ -463,6 +543,16 @@ pub async fn do_write_fragments(
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+        bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+        rows_completed += num_rows as u64;
+        files_written += 1;
+        if let Some(cb) = &params.write_progress {
+            cb.call(WriteStats {
+                bytes_written: bytes_completed,
+                rows_written: rows_completed,
+                files_written,
+            });
+        }
         let last_fragment = fragments.last_mut().unwrap();
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);
@@ -696,6 +786,7 @@ pub async fn write_fragments_internal(
 
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+    validate_external_blob_write_params(&params)?;
 
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
@@ -905,6 +996,9 @@ struct WriterOptions {
     base_id: Option<u32>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
 }
 
 async fn open_writer_with_options(
@@ -919,6 +1013,9 @@ async fn open_writer_with_options(
         base_id,
         external_base_resolver,
         allow_external_blob_outside_bases,
+        external_blob_mode,
+        source_store_registry,
+        source_store_params,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -963,6 +1060,9 @@ async fn open_writer_with_options(
                 schema,
                 external_base_resolver,
                 allow_external_blob_outside_bases,
+                external_blob_mode,
+                source_store_registry,
+                source_store_params,
             ))
         } else {
             None
@@ -1002,11 +1102,15 @@ struct WriterGenerator {
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
+    external_blob_mode: ExternalBlobMode,
+    source_store_registry: Arc<ObjectStoreRegistry>,
+    source_store_params: ObjectStoreParams,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
 
 impl WriterGenerator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
@@ -1015,6 +1119,9 @@ impl WriterGenerator {
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
+        external_blob_mode: ExternalBlobMode,
+        source_store_registry: Arc<ObjectStoreRegistry>,
+        source_store_params: ObjectStoreParams,
     ) -> Self {
         Self {
             object_store,
@@ -1024,6 +1131,9 @@ impl WriterGenerator {
             target_bases_info,
             external_base_resolver,
             allow_external_blob_outside_bases,
+            external_blob_mode,
+            source_store_registry,
+            source_store_params,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1054,6 +1164,9 @@ impl WriterGenerator {
                     base_id: Some(base_info.base_id),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                    external_blob_mode: self.external_blob_mode,
+                    source_store_registry: self.source_store_registry.clone(),
+                    source_store_params: self.source_store_params.clone(),
                 },
             )
             .await?
@@ -1068,6 +1181,9 @@ impl WriterGenerator {
                     base_id: None,
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+                    external_blob_mode: self.external_blob_mode,
+                    source_store_registry: self.source_store_registry.clone(),
+                    source_store_params: self.source_store_params.clone(),
                 },
             )
             .await?
@@ -1701,6 +1817,9 @@ mod tests {
             Some(target_bases),
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
         );
 
         // Create a writer
@@ -1815,6 +1934,9 @@ mod tests {
             Some(target_bases),
             None,
             false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
         );
 
         // Create test batch
@@ -1910,6 +2032,8 @@ mod tests {
     }
 
     fn validate_write_params(params: &WriteParams) -> Result<()> {
+        validate_external_blob_write_params(params)?;
+
         // Replicate the validation logic from the main write function
         if matches!(params.mode, WriteMode::Create)
             && let Some(target_bases) = &params.target_bases
@@ -1935,6 +2059,21 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_external_blob_mode_validation() {
+        let params = WriteParams {
+            external_blob_mode: ExternalBlobMode::Ingest,
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+
+        let err = validate_write_params(&params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("allow_external_blob_outside_bases only applies")
+        );
     }
 
     #[tokio::test]

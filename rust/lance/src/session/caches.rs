@@ -34,12 +34,6 @@ impl GlobalMetadataCache {
         // This prevents collisions between different datasets.
         DSMetadataCache(self.0.with_key_prefix(uri))
     }
-
-    /// Create a file-specific metadata cache with the given prefix.
-    /// This is used by file readers and other components that need file-level caching.
-    pub(crate) fn file_metadata_cache(&self, path: &Path) -> LanceCache {
-        self.0.with_key_prefix(path.as_ref())
-    }
 }
 
 impl Clone for GlobalMetadataCache {

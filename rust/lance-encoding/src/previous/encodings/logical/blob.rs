@@ -77,7 +77,7 @@ impl SchedulingJob for BlobFieldSchedulingJob<'_> {
                     .await
                     .unwrap();
                 let descriptions_task = decoder.drain(decoder.num_rows()).unwrap();
-                descriptions_task.task.decode()
+                descriptions_task.task.decode().map(|(arr, _)| arr)
             }
             .boxed();
             let decoder = Box::new(BlobFieldDecoder {
@@ -254,7 +254,7 @@ impl BlobArrayDecodeTask {
 }
 
 impl DecodeArrayTask for BlobArrayDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let num_bytes = self.bytes.iter().map(|b| b.len()).sum::<usize>();
         let offsets = self
             .bytes
@@ -272,11 +272,12 @@ impl DecodeArrayTask for BlobArrayDecodeTask {
             buffer.extend_from_slice(&bytes);
         }
         let data_buf = Buffer::from_vec(buffer);
-        Ok(Arc::new(LargeBinaryArray::new(
-            offsets,
-            data_buf,
-            self.validity,
-        )))
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((
+            Arc::new(LargeBinaryArray::new(offsets, data_buf, self.validity)),
+            0,
+        ))
     }
 }
 

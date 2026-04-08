@@ -7,6 +7,7 @@ import random
 import re
 import shutil
 import string
+import uuid
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -260,6 +262,107 @@ def test_indexed_between(tmp_path):
 
     actual_data = scanner.to_table()
     assert actual_data.num_rows == 0
+
+
+def test_create_inverted_index_progress_callback(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=75
+    )
+    progress_recorder = ProgressRecorder()
+
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        remove_stop_words=False,
+        progress_callback=progress_recorder,
+    )
+
+    tags = progress_event_tags(progress_recorder.events)
+    expected_order = [
+        "start:load_data",
+        "complete:load_data",
+        "start:tokenize_docs",
+        "complete:tokenize_docs",
+        "start:copy_partitions",
+        "complete:copy_partitions",
+        "start:write_metadata",
+        "complete:write_metadata",
+    ]
+    positions = [tags.index(tag) for tag in expected_order]
+    assert positions == sorted(positions)
+
+    tokenize_progress = stage_progress_values(progress_recorder.events, "tokenize_docs")
+    assert tokenize_progress
+    assert tokenize_progress[-1] == ds.count_rows()
+
+    assert "progress:copy_partitions" in tags
+    assert "progress:write_metadata" in tags
+    assert "start:merge_partitions" not in tags
+
+
+def test_merge_index_metadata_inverted_index_progress_callback(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=60
+    )
+
+    inverted_index_id = str(uuid.uuid4())
+    for fragment in ds.get_fragments():
+        ds.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            name="text_inverted_progress_idx",
+            replace=False,
+            index_uuid=inverted_index_id,
+            fragment_ids=[fragment.fragment_id],
+            remove_stop_words=False,
+        )
+
+    progress_recorder = ProgressRecorder()
+    ds.merge_index_metadata(
+        inverted_index_id,
+        index_type="INVERTED",
+        progress_callback=progress_recorder,
+    )
+
+    tags = progress_event_tags(progress_recorder.events)
+    expected_order = [
+        "start:read_partition_metadata",
+        "complete:read_partition_metadata",
+        "start:remap_partition_files",
+        "complete:remap_partition_files",
+        "start:write_merged_metadata",
+        "complete:write_merged_metadata",
+    ]
+    positions = [tags.index(tag) for tag in expected_order]
+    assert positions == sorted(positions)
+
+    metadata_progress = stage_progress_values(
+        progress_recorder.events, "read_partition_metadata"
+    )
+    assert metadata_progress
+    assert metadata_progress[-1] == len(ds.get_fragments())
+    assert "progress:remap_partition_files" in tags
+    assert "progress:write_merged_metadata" in tags
+
+
+def test_create_inverted_index_progress_callback_error_after_completion_is_ignored(
+    tmp_path,
+):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=75
+    )
+    progress_recorder = ProgressRecorder(fail_on_tag="complete:write_metadata")
+
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        remove_stop_words=False,
+        progress_callback=progress_recorder,
+    )
+
+    tags = progress_event_tags(progress_recorder.events)
+    assert tags[-1] == "complete:write_metadata"
+    assert any(idx.index_type == "Inverted" for idx in ds.describe_indices())
 
 
 def test_index_combination(tmp_path):

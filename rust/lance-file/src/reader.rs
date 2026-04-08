@@ -103,6 +103,15 @@ pub struct CachedFileMetadata {
     pub num_footer_bytes: u64,
     pub major_version: u16,
     pub minor_version: u16,
+    /// The actual total file size in bytes, as reported by the object store.
+    pub file_size_bytes: u64,
+}
+
+impl CachedFileMetadata {
+    /// Total file size in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.file_size_bytes
+    }
 }
 
 impl DeepSizeOf for CachedFileMetadata {
@@ -344,7 +353,7 @@ impl Default for FileReaderOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileReader {
     scheduler: Arc<dyn EncodingsIo>,
     // The default projection to be applied to all reads
@@ -653,6 +662,7 @@ impl FileReader {
             file_buffers: gbo_table,
             major_version: footer.major_version,
             minor_version: footer.minor_version,
+            file_size_bytes: file_len,
         })
     }
 

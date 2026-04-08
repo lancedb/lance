@@ -141,7 +141,7 @@ def from_lance(
     filter: Optional[str] = None,
     fragments: Union[Iterable[int], Iterable[LanceFragment], tf.data.Dataset] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
-    namespace: Optional["LanceNamespace"] = None,
+    namespace_client: Optional["LanceNamespace"] = None,
     table_id: Optional[List[str]] = None,
     ignore_namespace_table_storage_options: bool = False,
 ) -> tf.data.Dataset:
@@ -151,7 +151,7 @@ def from_lance(
     ----------
     dataset : Union[str, Path, LanceDataset], optional
         Lance dataset or dataset URI/path. Either ``dataset`` or both
-        ``namespace`` and ``table_id`` must be provided.
+        ``namespace_client`` and ``table_id`` must be provided.
     columns : Optional[List[str]], optional
         List of columns to include in the output dataset.
         If not set, all columns will be read.
@@ -165,13 +165,15 @@ def from_lance(
     output_signature : Optional[tf.TypeSpec], optional
         Override output signature of the returned tensors. If not provided,
         the output signature is inferred from the projection Schema.
-    namespace : Optional[LanceNamespace], optional
-        Namespace to resolve the table location when ``table_id`` is provided.
+    namespace_client : Optional[LanceNamespace], optional
+        Namespace client to resolve the table location when ``table_id`` is
+        provided.
     table_id : Optional[List[str]], optional
-        Table identifier used together with ``namespace`` to locate the table.
+        Table identifier used together with ``namespace_client`` to locate
+        the table.
     ignore_namespace_table_storage_options : bool, default False
-        When using ``namespace``/``table_id``, ignore storage options returned
-        by the namespace.
+        When using ``namespace_client``/``table_id``, ignore storage options
+        returned by the namespace.
 
     Examples
     --------
@@ -212,15 +214,15 @@ def from_lance(
 
     """
     if isinstance(dataset, LanceDataset):
-        if namespace is not None or table_id is not None:
+        if namespace_client is not None or table_id is not None:
             raise ValueError(
-                "Cannot specify 'namespace' or 'table_id' when passing "
+                "Cannot specify 'namespace_client' or 'table_id' when passing "
                 "a LanceDataset instance"
             )
     else:
         dataset = lance.dataset(
             dataset,
-            namespace=namespace,
+            namespace_client=namespace_client,
             table_id=table_id,
             ignore_namespace_table_storage_options=ignore_namespace_table_storage_options,
         )

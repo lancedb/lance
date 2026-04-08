@@ -461,14 +461,8 @@ impl Debug for OperationThrottle {
 /// A [`MultipartUpload`] wrapper that throttles and retries `put_part`,
 /// `complete`, and `abort`, feeding outcomes back to the write AIMD
 /// controller.
-///
-/// Uses a `std::sync::Mutex` (not `tokio::sync::Mutex`) so that aborted
-/// futures cannot cause deadlocks — the guard is always dropped
-/// deterministically. The lock is held only briefly for the sync
-/// `put_part` dispatch; `complete`/`abort` hold it across their await but
-/// are never called concurrently with part uploads.
 struct ThrottledMultipartUpload {
-    target: Arc<std::sync::Mutex<Box<dyn MultipartUpload>>>,
+    target: Box<dyn MultipartUpload>,
     write: Arc<OperationThrottle>,
 }
 
@@ -482,27 +476,19 @@ impl Debug for ThrottledMultipartUpload {
 impl MultipartUpload for ThrottledMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let write = Arc::clone(&self.write);
-        let target = Arc::clone(&self.target);
+        // Call put_part synchronously to preserve part ordering regardless
+        // of which futures are awaited first.
+        let fut = self.target.put_part(data);
         Box::pin(async move {
-            write
-                .throttled(|| {
-                    // The let binding is intentional: it ensures the
-                    // MutexGuard is dropped before the future is awaited.
-                    #[allow(clippy::let_and_return)]
-                    let fut = target.lock().unwrap().put_part(data.clone());
-                    fut
-                })
-                .await
+            write.acquire_token().await;
+            let result = fut.await;
+            write.observe_outcome(&result);
+            result
         })
     }
 
     async fn complete(&mut self) -> OSResult<PutResult> {
-        // &mut self guarantees no concurrent put_part futures are alive,
-        // so get_mut always succeeds (Arc refcount == 1).
-        let target = Arc::get_mut(&mut self.target)
-            .expect("complete called while put_part futures are still alive")
-            .get_mut()
-            .unwrap();
+        let target = &mut self.target;
         for attempt in 0..=self.write.max_retries {
             self.write.acquire_token().await;
             let result = target.complete().await;
@@ -522,10 +508,7 @@ impl MultipartUpload for ThrottledMultipartUpload {
     }
 
     async fn abort(&mut self) -> OSResult<()> {
-        let target = Arc::get_mut(&mut self.target)
-            .expect("abort called while put_part futures are still alive")
-            .get_mut()
-            .unwrap();
+        let target = &mut self.target;
         for attempt in 0..=self.write.max_retries {
             self.write.acquire_token().await;
             let result = target.abort().await;
@@ -655,7 +638,7 @@ impl ObjectStore for AimdThrottledStore {
             .throttled(|| self.target.put_multipart(location))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
-            target: Arc::new(std::sync::Mutex::new(target)),
+            target,
             write: Arc::clone(&self.write),
         }))
     }
@@ -670,7 +653,7 @@ impl ObjectStore for AimdThrottledStore {
             .throttled(|| self.target.put_multipart_opts(location, opts.clone()))
             .await?;
         Ok(Box::new(ThrottledMultipartUpload {
-            target: Arc::new(std::sync::Mutex::new(target)),
+            target,
             write: Arc::clone(&self.write),
         }))
     }
@@ -1610,5 +1593,36 @@ mod tests {
 
         // Should have called get 4 times: initial attempt + 3 retries
         assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn test_throttled_multipart_reorders_parts() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store.clone(), config).unwrap();
+
+        let path = Path::from("test/multipart_ordering.bin");
+        let mut upload = throttled.put_multipart(&path).await.unwrap();
+
+        // Create futures for two parts in order: A then B.
+        let fut_a = upload.put_part(PutPayload::from_static(b"AAAA"));
+        let fut_b = upload.put_part(PutPayload::from_static(b"BBBB"));
+
+        // Await in REVERSE order. Part ordering should be determined by
+        // creation order (put_part call order), not by await order.
+        fut_b.await.unwrap();
+        fut_a.await.unwrap();
+
+        upload.complete().await.unwrap();
+
+        let result = store.get(&path).await.unwrap();
+        let bytes = result.bytes().await.unwrap();
+
+        assert_eq!(
+            bytes.as_ref(),
+            b"AAAABBBB",
+            "Parts were reordered! Got {:?} instead of AAAABBBB.",
+            std::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
+        );
     }
 }

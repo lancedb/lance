@@ -17,6 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
@@ -181,6 +182,62 @@ def test_flat(dataset):
 
 def test_ann(indexed_dataset):
     run(indexed_dataset)
+
+
+def test_create_index_progress_callback_vector(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "vector_progress", 1500, 128)
+    recorder = ProgressRecorder()
+
+    ds.create_index(
+        column="vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=4,
+        progress_callback=recorder,
+    )
+
+    tags = progress_event_tags(recorder.events)
+    expected_order = [
+        "start:train_ivf",
+        "complete:train_ivf",
+        "start:train_quantizer",
+        "complete:train_quantizer",
+        "start:shuffle",
+        "complete:shuffle",
+        "start:merge_partitions",
+        "complete:merge_partitions",
+    ]
+    positions = [tags.index(tag) for tag in expected_order]
+    assert positions == sorted(positions)
+
+    shuffle_progress = stage_progress_values(recorder.events, "shuffle")
+    assert shuffle_progress
+    assert shuffle_progress[-1] == ds.count_rows()
+
+    merge_progress = stage_progress_values(recorder.events, "merge_partitions")
+    assert merge_progress
+    assert merge_progress[-1] == 4
+
+
+def test_create_index_progress_callback_error_before_completion_propagates(tmp_path):
+    ds = _make_sample_dataset_base(
+        tmp_path, "vector_progress_post_commit_error", 1500, 128
+    )
+    recorder = ProgressRecorder(fail_on_tag="start:train_ivf")
+
+    with pytest.raises(RuntimeError, match="progress callback failure"):
+        ds.create_index(
+            column="vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=4,
+            progress_callback=recorder,
+        )
+
+    tags = progress_event_tags(recorder.events)
+    assert tags == ["start:train_ivf"]
+    assert not ds.has_index
+    assert ds.describe_indices() == []
 
 
 def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):
@@ -2148,9 +2205,6 @@ def build_distributed_vector_index(
             )
         )
 
-    segments = (
-        dataset.create_index_segment_builder().with_segments(segments).build_all()
-    )
     return dataset.commit_existing_index_segments(f"{column}_idx", column, segments)
 
 
@@ -2522,7 +2576,6 @@ def test_metadata_merge_pq_success(tmp_path):
             ivf_centroids=pre["ivf_centroids"],
             pq_codebook=pre["pq_codebook"],
         )
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
         ds = _commit_segments_helper(ds, segments, "vector")
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
@@ -2561,7 +2614,6 @@ def test_distributed_workflow_merge_and_search(tmp_path):
             ivf_centroids=pre["ivf_centroids"],
             pq_codebook=pre["pq_codebook"],
         )
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
         ds = _commit_segments_helper(ds, segments, "vector")
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
@@ -2597,7 +2649,6 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
         ivf_centroids=preprocessed["ivf_centroids"],
         pq_codebook=preprocessed["pq_codebook"],
     )
-    segments = ds.create_index_segment_builder().with_segments(segments).build_all()
     ds = _commit_segments_helper(ds, segments, column="vector")
     q = np.random.rand(128).astype(np.float32)
     result = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
@@ -2650,7 +2701,6 @@ def test_distributed_ivf_parameterized(tmp_path, index_type, num_sub_vectors):
             ds.create_index_uncommitted(**kwargs1),
             ds.create_index_uncommitted(**kwargs2),
         ]
-        segments = ds.create_index_segment_builder().with_segments(segments).build_all()
         ds = _commit_segments_helper(ds, segments, "vector")
 
         q = np.random.rand(128).astype(np.float32)
@@ -2711,20 +2761,16 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
             kwargs2["pq_codebook"] = pre["pq_codebook"]
     segment2 = ds.create_index_uncommitted(**kwargs2)
 
-    segments = (
-        ds.create_index_segment_builder()
-        .with_segments([segment1, segment2])
-        .build_all()
-    )
-    ds = _commit_segments_helper(ds, segments, column="vector")
+    merged_segment = ds.merge_existing_index_segments([segment1, segment2])
+    ds = _commit_segments_helper(ds, [merged_segment], column="vector")
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
 
 
-def test_index_segment_builder_builds_vector_segments(tmp_path):
-    ds = _make_sample_dataset_base(tmp_path, "segment_builder_ds", 2000, 128)
+def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "merge_existing_segments_ds", 2000, 128)
     frags = ds.get_fragments()
     assert len(frags) >= 2
     builder = IndicesBuilder(ds, "vector")
@@ -2750,15 +2796,14 @@ def test_index_segment_builder_builds_vector_segments(tmp_path):
         )
         for fragment in frags[:2]
     ]
+    assert all(segment.index_details is not None for segment in segments)
 
-    segment_builder = ds.create_index_segment_builder().with_segments(segments)
-    plans = segment_builder.plan()
-    assert len(plans) == 2
-    assert all(len(plan.segments) == 1 for plan in plans)
-
-    segments = segment_builder.build_all()
-    assert len(segments) == 2
-    ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
+    merged_segment = ds.merge_existing_index_segments(segments)
+    assert merged_segment.fragment_ids is not None
+    assert sorted(merged_segment.fragment_ids) == sorted(
+        [fragment.fragment_id for fragment in frags[:2]]
+    )
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged_segment])
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
@@ -2818,11 +2863,6 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
                 num_sub_vectors=16,
                 ivf_centroids=pre["ivf_centroids"],
                 pq_codebook=pre["pq_codebook"],
-            )
-            segments = (
-                ds_copy.create_index_segment_builder()
-                .with_segments(segments)
-                .build_all()
             )
             return _commit_segments_helper(ds_copy, segments, column="vector")
         except ValueError as e:

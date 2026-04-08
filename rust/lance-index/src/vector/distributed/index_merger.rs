@@ -3,6 +3,7 @@
 
 //! Index merging mechanisms for distributed vector index building
 
+use crate::progress::IndexBuildProgress;
 use crate::vector::shared::partition_merger::{
     SupportedIvfIndexType, write_unified_ivf_and_index_metadata,
 };
@@ -18,6 +19,10 @@ use std::sync::Arc;
 
 use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
+use crate::vector::bq::storage::{
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, pack_codes,
+};
+use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
 use crate::vector::flat::index::FlatMetadata;
 use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
 use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
@@ -283,6 +288,49 @@ pub async fn init_writer_for_sq(
     Ok(w)
 }
 
+/// Create and initialize a unified writer for RQ storage.
+pub async fn init_writer_for_rq(
+    object_store: &lance_io::object_store::ObjectStore,
+    aux_out: &object_store::path::Path,
+    dt: DistanceType,
+    rq_meta: &RabitQuantizationMetadata,
+    format_version: LanceFileVersion,
+) -> Result<FileWriter> {
+    let num_bytes = (rq_meta.code_dim as usize).div_ceil(u8::BITS as usize);
+    let arrow_schema = ArrowSchema::new(vec![
+        (*ROW_ID_FIELD).clone(),
+        Field::new(
+            RABIT_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                num_bytes as i32,
+            ),
+            true,
+        ),
+        ADD_FACTORS_FIELD.clone(),
+        SCALE_FACTORS_FIELD.clone(),
+    ]);
+    let writer = object_store.create(aux_out).await?;
+    let mut w = FileWriter::try_new(
+        writer,
+        LanceSchema::try_from(&arrow_schema)?,
+        FileWriterOptions {
+            format_version: Some(format_version),
+            ..Default::default()
+        },
+    )?;
+
+    let mut rq_meta_init = rq_meta.clone();
+    rq_meta_init.packed = true;
+    if let Some(extra_metadata) = rq_meta_init.extra_metadata()? {
+        let pos = w.add_global_buffer(extra_metadata).await?;
+        rq_meta_init.set_buffer_index(pos);
+    }
+    let rq_meta_json = serde_json::to_string(&rq_meta_init)?;
+    init_writer_for_storage(&mut w, dt, &rq_meta_json, RABIT_METADATA_KEY)?;
+    Ok(w)
+}
+
 /// Stream and write a range of rows from reader into writer.
 ///
 /// The caller is responsible for ensuring that `range` corresponds to a
@@ -342,6 +390,41 @@ async fn write_partition_rows_pq_transposed(
     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
 
     // Write in reasonably sized chunks to avoid huge batches.
+    let batch_size: usize = 10_240;
+    for offset in (0..num_rows).step_by(batch_size) {
+        let len = std::cmp::min(batch_size, num_rows - offset);
+        let slice = batch.slice(offset, len);
+        w.write_batch(&slice).await?;
+    }
+    Ok(())
+}
+
+/// Pack the RQ code column for a batch and write it to the unified writer.
+///
+/// This helper assumes `batch` contains a contiguous range of rows for a single
+/// IVF partition and that the shard batch stores row-major RQ codes.
+async fn write_partition_rows_rq_packed(w: &mut FileWriter, mut batch: RecordBatch) -> Result<()> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(());
+    }
+
+    let rq_col = batch.column_by_name(RABIT_CODE_COLUMN).ok_or_else(|| {
+        Error::index(format!(
+            "RQ column {} missing in auxiliary shard",
+            RABIT_CODE_COLUMN
+        ))
+    })?;
+    let rq_fsl = rq_col.as_fixed_size_list_opt().ok_or_else(|| {
+        Error::index(format!(
+            "RQ column {} is not a FixedSizeList in auxiliary shard, got {}",
+            RABIT_CODE_COLUMN,
+            rq_col.data_type(),
+        ))
+    })?;
+    let packed_codes = pack_codes(rq_fsl);
+    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(packed_codes))?;
+
     let batch_size: usize = 10_240;
     for offset in (0..num_rows).step_by(batch_size) {
         let len = std::cmp::min(batch_size, num_rows - offset);
@@ -617,6 +700,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
     target_dir: &object_store::path::Path,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     if aux_paths.is_empty() {
         return Err(Error::index(
@@ -628,6 +712,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut distance_type: Option<DistanceType> = None;
     let mut pq_meta: Option<ProductQuantizationMetadata> = None;
     let mut sq_meta: Option<ScalarQuantizationMetadata> = None;
+    let mut rq_meta: Option<RabitQuantizationMetadata> = None;
     let mut dim: Option<usize> = None;
     let mut detected_index_type: Option<SupportedIvfIndexType> = None;
     // Inherit file format version from the first shard (set on first iteration)
@@ -654,8 +739,16 @@ pub async fn merge_partial_vector_auxiliary_files(
     // This avoids reopening each shard file for every partition during merge.
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
 
+    progress
+        .stage_start(
+            "read_shard_metadata",
+            Some(aux_paths.len() as u64),
+            "shards",
+        )
+        .await?;
+
     // Iterate over each shard auxiliary file and merge its metadata and collect lengths
-    for aux in aux_paths {
+    for (idx, aux) in aux_paths.iter().enumerate() {
         let fh = sched.open_file(aux, &CachedFileSize::unknown()).await?;
         let reader = V2Reader::try_open(
             fh,
@@ -727,6 +820,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
                         "IVF_PQ" => SupportedIvfIndexType::IvfPq,
                         "IVF_SQ" => SupportedIvfIndexType::IvfSq,
+                        "IVF_RQ" => SupportedIvfIndexType::IvfRq,
                         "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                         "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                         "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
@@ -840,6 +934,87 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if v2w_opt.is_none() {
                     let w =
                         init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
+                    v2w_opt = Some(w);
+                }
+            }
+            SupportedIvfIndexType::IvfRq => {
+                let rq_json = if let Some(rq_json) = reader
+                    .metadata()
+                    .file_schema
+                    .metadata
+                    .get(RABIT_METADATA_KEY)
+                {
+                    rq_json.clone()
+                } else if let Some(storage_meta_json) = reader
+                    .metadata()
+                    .file_schema
+                    .metadata
+                    .get(STORAGE_METADATA_KEY)
+                {
+                    let storage_metadata_vec: Vec<String> = serde_json::from_str(storage_meta_json)
+                        .map_err(|e| {
+                            Error::index(format!("Failed to parse storage metadata: {}", e))
+                        })?;
+                    if let Some(first_meta) = storage_metadata_vec.first() {
+                        if let Ok(_rq_meta) =
+                            serde_json::from_str::<RabitQuantizationMetadata>(first_meta)
+                        {
+                            first_meta.clone()
+                        } else {
+                            return Err(Error::index(
+                                "RQ metadata missing in storage metadata".to_string(),
+                            ));
+                        }
+                    } else {
+                        return Err(Error::index(
+                            "RQ metadata missing in storage metadata".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(Error::index("RQ metadata missing".to_string()));
+                };
+                let mut rq_meta_parsed: RabitQuantizationMetadata = serde_json::from_str(&rq_json)
+                    .map_err(|e| Error::index(format!("RQ metadata parse error: {}", e)))?;
+                if rq_meta_parsed.rotation_type == crate::vector::bq::RQRotationType::Matrix
+                    && rq_meta_parsed.rotate_mat.is_none()
+                    && let Some(buf_idx) = rq_meta_parsed.buffer_index()
+                {
+                    let rotate_mat_bytes = reader.read_global_buffer(buf_idx).await?;
+                    rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
+                }
+
+                let d0 = (rq_meta_parsed.code_dim as usize)
+                    .checked_div(rq_meta_parsed.num_bits as usize)
+                    .ok_or_else(|| {
+                        Error::index("Invalid RQ metadata: num_bits is zero".to_string())
+                    })?;
+                dim.get_or_insert(d0);
+                if let Some(dprev) = dim
+                    && dprev != d0
+                {
+                    return Err(Error::index("Dimension mismatch across shards".to_string()));
+                }
+                if let Some(existing_rq) = rq_meta.as_ref()
+                    && (existing_rq.code_dim != rq_meta_parsed.code_dim
+                        || existing_rq.num_bits != rq_meta_parsed.num_bits
+                        || existing_rq.rotation_type != rq_meta_parsed.rotation_type)
+                {
+                    return Err(Error::index(format!(
+                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
+                        existing_rq.code_dim,
+                        existing_rq.num_bits,
+                        existing_rq.rotation_type,
+                        rq_meta_parsed.code_dim,
+                        rq_meta_parsed.num_bits,
+                        rq_meta_parsed.rotation_type
+                    )));
+                }
+                if rq_meta.is_none() {
+                    rq_meta = Some(rq_meta_parsed.clone());
+                }
+                if v2w_opt.is_none() {
+                    let w =
+                        init_writer_for_rq(object_store, &aux_out, dt, &rq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1198,7 +1373,11 @@ pub async fn merge_partial_vector_auxiliary_files(
             partition_offsets,
             total_rows: running_offset,
         });
+        progress
+            .stage_progress("read_shard_metadata", idx as u64 + 1)
+            .await?;
     }
+    progress.stage_complete("read_shard_metadata").await?;
 
     // Write rows grouped by partition across all shards to ensure contiguous ranges per partition
 
@@ -1210,6 +1389,15 @@ pub async fn merge_partial_vector_auxiliary_files(
     let nlist = nlist_opt.ok_or_else(|| Error::index("Missing IVF partition count".to_string()))?;
     let idx_type_final = detected_index_type
         .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
+
+    let total_rows = accumulated_lengths
+        .iter()
+        .map(|length| *length as u64)
+        .sum::<u64>();
+    progress
+        .stage_start("merge_partitions", Some(total_rows), "rows")
+        .await?;
+    let mut merged_rows = 0u64;
 
     match idx_type_final {
         SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
@@ -1240,10 +1428,47 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_pq_transposed(w, partition_batch).await?;
                 }
+                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                progress
+                    .stage_progress("merge_partitions", merged_rows)
+                    .await?;
+            }
+        }
+        SupportedIvfIndexType::IvfRq => {
+            let partition_window_size = *PARTITION_WINDOW_SIZE;
+            let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
+            let mut shard_merge_reader = ShardMergeReader::new(
+                shard_infos,
+                nlist,
+                partition_window_size,
+                prefetch_window_count,
+            );
+
+            while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
+                if accumulated_lengths[pid] == 0 {
+                    continue;
+                }
+                if batches.is_empty() {
+                    return Err(Error::index(format!(
+                        "No merged batches found for non-empty partition {}",
+                        pid
+                    )));
+                }
+
+                let schema = batches[0].schema();
+                let partition_batch = concat_batches(&schema, batches.iter())?;
+                if let Some(w) = v2w_opt.as_mut() {
+                    write_partition_rows_rq_packed(w, partition_batch).await?;
+                }
+                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                progress
+                    .stage_progress("merge_partitions", merged_rows)
+                    .await?;
             }
         }
         _ => {
-            for pid in 0..nlist {
+            for (pid, total_part_len) in accumulated_lengths.iter().copied().enumerate().take(nlist)
+            {
                 for shard in shard_infos.iter() {
                     let part_len = shard.lengths[pid] as usize;
                     if part_len == 0 {
@@ -1255,12 +1480,23 @@ pub async fn merge_partial_vector_auxiliary_files(
                             .await?;
                     }
                 }
+                if total_part_len == 0 {
+                    continue;
+                }
+                merged_rows = merged_rows.saturating_add(total_part_len as u64);
+                progress
+                    .stage_progress("merge_partitions", merged_rows)
+                    .await?;
             }
         }
     }
+    progress.stage_complete("merge_partitions").await?;
 
     // Write unified IVF metadata into global buffer & set schema metadata
     if let Some(w) = v2w_opt.as_mut() {
+        progress
+            .stage_start("write_auxiliary_index", Some(1), "files")
+            .await?;
         let mut ivf_model = if let Some(c) = first_centroids {
             IvfStorageModel::new(c, None)
         } else {
@@ -1272,6 +1508,8 @@ pub async fn merge_partial_vector_auxiliary_files(
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
         w.finish().await?;
+        progress.stage_progress("write_auxiliary_index", 1).await?;
+        progress.stage_complete("write_auxiliary_index").await?;
     } else {
         return Err(Error::index(
             "Failed to initialize unified writer".to_string(),
@@ -1298,6 +1536,13 @@ mod tests {
     use lance_linalg::distance::DistanceType;
     use object_store::path::Path;
     use prost::Message;
+
+    use crate::vector::bq::RQRotationType;
+    lance_testing::define_stage_event_progress!(
+        RecordingProgress,
+        IndexBuildProgress,
+        lance_core::Result<()>
+    );
 
     async fn write_flat_partial_aux(
         store: &ObjectStore,
@@ -1390,13 +1635,85 @@ mod tests {
             .await
             .unwrap();
 
+        let progress = Arc::new(RecordingProgress::default());
         merge_partial_vector_auxiliary_files(
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            progress.clone(),
         )
         .await
         .unwrap();
+
+        let events = progress.recorded_events();
+        let tags = events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let merge_total = events
+            .iter()
+            .find_map(|(kind, stage, value)| {
+                if kind == "start" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .expect("missing merge_partitions start total");
+        let merged_rows = events
+            .iter()
+            .filter_map(|(kind, stage, value)| {
+                if kind == "progress" && stage == "merge_partitions" {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .next_back()
+            .unwrap_or_default();
+        let read_start = tags
+            .iter()
+            .position(|e| e == "start:read_shard_metadata")
+            .expect("missing read_shard_metadata start");
+        let read_complete = tags
+            .iter()
+            .position(|e| e == "complete:read_shard_metadata")
+            .expect("missing read_shard_metadata complete");
+        let merge_start = tags
+            .iter()
+            .position(|e| e == "start:merge_partitions")
+            .expect("missing merge_partitions start");
+        let merge_complete = tags
+            .iter()
+            .position(|e| e == "complete:merge_partitions")
+            .expect("missing merge_partitions complete");
+        let write_start = tags
+            .iter()
+            .position(|e| e == "start:write_auxiliary_index")
+            .expect("missing write_auxiliary_index start");
+        let write_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_auxiliary_index")
+            .expect("missing write_auxiliary_index complete");
+        assert!(read_start < read_complete);
+        assert!(read_complete < merge_start);
+        assert!(merge_start < merge_complete);
+        assert!(merge_complete < write_start);
+        assert!(write_start < write_complete);
+        assert!(
+            tags.iter().any(|e| e == "progress:read_shard_metadata"),
+            "expected read_shard_metadata progress callbacks"
+        );
+        assert!(
+            tags.iter().any(|e| e == "progress:merge_partitions"),
+            "expected merge_partitions progress callbacks"
+        );
+        assert_eq!(merge_total, 6, "expected merge_partitions total rows");
+        assert_eq!(merged_rows, 6, "expected merge_partitions completed rows");
+        assert!(
+            tags.iter().any(|e| e == "progress:write_auxiliary_index"),
+            "expected write_auxiliary_index progress callbacks"
+        );
 
         let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
@@ -1496,6 +1813,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await;
         match res {
@@ -1617,6 +1935,88 @@ mod tests {
         Ok(total_rows)
     }
 
+    async fn write_rq_partial_aux(
+        store: &ObjectStore,
+        aux_path: &Path,
+        metadata: &RabitQuantizationMetadata,
+        lengths: &[u32],
+        base_row_id: u64,
+        distance_type: DistanceType,
+    ) -> Result<usize> {
+        let num_bytes = (metadata.code_dim as usize).div_ceil(u8::BITS as usize);
+        let arrow_schema = ArrowSchema::new(vec![
+            (*ROW_ID_FIELD).clone(),
+            Field::new(
+                RABIT_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    num_bytes as i32,
+                ),
+                true,
+            ),
+            ADD_FACTORS_FIELD.clone(),
+            SCALE_FACTORS_FIELD.clone(),
+        ]);
+
+        let writer = store.create(aux_path).await?;
+        let mut v2w = V2Writer::try_new(
+            writer,
+            lance_core::datatypes::Schema::try_from(&arrow_schema)?,
+            V2WriterOptions::default(),
+        )?;
+        v2w.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
+
+        let rq_meta_json = serde_json::to_string(metadata)?;
+        v2w.add_schema_metadata(RABIT_METADATA_KEY, rq_meta_json);
+
+        let ivf_meta = pb::Ivf {
+            centroids: Vec::new(),
+            offsets: Vec::new(),
+            lengths: lengths.to_vec(),
+            centroids_tensor: None,
+            loss: None,
+        };
+        let buf = Bytes::from(ivf_meta.encode_to_vec());
+        let ivf_pos = v2w.add_global_buffer(buf).await?;
+        v2w.add_schema_metadata(IVF_METADATA_KEY, ivf_pos.to_string());
+
+        let total_rows: usize = lengths.iter().map(|v| *v as usize).sum();
+        let mut row_ids = Vec::with_capacity(total_rows);
+        let mut codes = Vec::with_capacity(total_rows * num_bytes);
+        let mut add_factors = Vec::with_capacity(total_rows);
+        let mut scale_factors = Vec::with_capacity(total_rows);
+
+        let mut current_row_id = base_row_id;
+        for (pid, len) in lengths.iter().enumerate() {
+            for row_offset in 0..*len as usize {
+                row_ids.push(current_row_id);
+                current_row_id += 1;
+                for b in 0..num_bytes {
+                    codes.push((pid + row_offset + b) as u8);
+                }
+                add_factors.push(pid as f32 + row_offset as f32 * 0.1);
+                scale_factors.push(pid as f32 + row_offset as f32 * 0.2);
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(codes),
+                    num_bytes as i32,
+                )?),
+                Arc::new(Float32Array::from(add_factors)),
+                Arc::new(Float32Array::from(scale_factors)),
+            ],
+        )?;
+
+        v2w.write_batch(&batch).await?;
+        v2w.finish().await?;
+        Ok(total_rows)
+    }
+
     #[tokio::test]
     async fn test_merge_ivf_pq_success() {
         let object_store = ObjectStore::memory();
@@ -1676,6 +2076,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await
         .unwrap();
@@ -1747,6 +2148,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_ivf_rq_success() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq");
+
+        let partial0 = index_dir.child("partial_0");
+        let partial1 = index_dir.child("partial_1");
+        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+
+        let lengths0 = vec![2_u32, 1_u32];
+        let lengths1 = vec![1_u32, 2_u32];
+
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 1,
+            packed: false,
+        };
+
+        write_rq_partial_aux(
+            &object_store,
+            &aux0,
+            &rq_meta,
+            &lengths0,
+            0,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+        write_rq_partial_aux(
+            &object_store,
+            &aux1,
+            &rq_meta,
+            &lengths1,
+            1_000,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+
+        merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        assert!(object_store.exists(&aux_out).await.unwrap());
+
+        let sched = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let fh = sched
+            .open_file(&aux_out, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let meta = reader.metadata();
+
+        let ivf_idx: u32 = meta
+            .file_schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let bytes = reader.read_global_buffer(ivf_idx).await.unwrap();
+        let pb_ivf: pb::Ivf = prost::Message::decode(bytes).unwrap();
+        let expected_lengths: Vec<u32> = lengths0
+            .iter()
+            .zip(lengths1.iter())
+            .map(|(a, b)| *a + *b)
+            .collect();
+        assert_eq!(pb_ivf.lengths, expected_lengths);
+
+        let idx_meta_json = meta
+            .file_schema
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .unwrap();
+        let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json).unwrap();
+        assert_eq!(idx_meta.index_type, "IVF_RQ");
+        assert_eq!(idx_meta.distance_type, DistanceType::L2.to_string());
+
+        let rq_meta_json = meta.file_schema.metadata.get(RABIT_METADATA_KEY).unwrap();
+        let merged_rq_meta: RabitQuantizationMetadata = serde_json::from_str(rq_meta_json).unwrap();
+        assert_eq!(merged_rq_meta.code_dim, rq_meta.code_dim);
+        assert_eq!(merged_rq_meta.num_bits, rq_meta.num_bits);
+        assert!(merged_rq_meta.packed);
+
+        let mut total_rows = 0usize;
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                4,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.unwrap().num_rows();
+        }
+        let expected_total: usize = expected_lengths.iter().map(|v| *v as usize).sum();
+        assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
     async fn test_merge_ivf_pq_codebook_mismatch() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq_mismatch");
@@ -1808,6 +2331,7 @@ mod tests {
             &object_store,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await;
         match res {
@@ -1888,6 +2412,7 @@ mod tests {
             &object_store,
             &[aux_a.clone(), aux_b.clone()],
             &index_dir,
+            crate::progress::noop_progress(),
         )
         .await
         .unwrap();

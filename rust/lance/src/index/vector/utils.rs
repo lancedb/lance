@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
-use futures::StreamExt;
+use futures::{Stream, StreamExt, stream};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
 use lance_linalg::distance::DistanceType;
@@ -18,7 +20,7 @@ use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use tokio::sync::Mutex;
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder, row_offsets_to_row_addresses};
 use crate::{Error, Result};
 
 /// Helper function to extract a column from a RecordBatch, supporting nested field paths.
@@ -427,33 +429,33 @@ async fn sample_training_data(
     is_nullable: bool,
     fragment_ids: Option<&[u32]>,
 ) -> Result<FixedSizeListArray> {
-    if fragment_ids.is_some() {
-        if !is_nullable {
-            let projection = dataset.schema().project(&[column])?;
-            let batch = dataset
-                .sample(sample_size_hint, &projection, fragment_ids)
-                .await?;
-            return vector_column_to_fsl(&batch, column);
-        }
-
-        let batch = scan_all_training_data(dataset, column, is_nullable, fragment_ids).await?;
-        let training_data = vector_column_to_fsl(&batch, column)?;
-        if training_data.len() <= sample_size_hint {
-            return Ok(training_data);
-        }
-        let indices = UInt32Array::from_iter_values(
-            generate_random_indices(training_data.len(), sample_size_hint)
-                .into_iter()
-                .map(|index| index as u32),
-        );
-        let sampled = arrow_select::take::take(&training_data, &indices, None)?;
-        return Ok(sampled.as_fixed_size_list().clone());
-    }
-
     let byte_width = vector_field
         .data_type()
         .byte_width_opt()
         .unwrap_or(4 * 1024);
+
+    if let Some(fragment_ids) = fragment_ids {
+        if !is_nullable {
+            let projection = dataset.schema().project(&[column])?;
+            let batch = dataset
+                .sample(sample_size_hint, &projection, Some(fragment_ids))
+                .await?;
+            return vector_column_to_fsl(&batch, column);
+        }
+        let scan = sample_training_data_scan_from_fragments(
+            dataset,
+            column,
+            sample_size_hint,
+            num_rows,
+            fragment_ids,
+        )?;
+        return match vector_field.data_type() {
+            DataType::FixedSizeList(_, _) => {
+                sample_nullable_fsl(column, sample_size_hint, byte_width, vector_field, scan).await
+            }
+            _ => sample_nullable_fallback(column, sample_size_hint, is_nullable, scan).await,
+        };
+    }
 
     match vector_field.data_type() {
         DataType::FixedSizeList(_, _) if !is_nullable && fragment_ids.is_none() => {
@@ -495,6 +497,105 @@ fn sample_training_data_scan(
         Arc::new(dataset.schema().project(&[column])?),
         dataset.object_store().io_parallelism(),
     ))
+}
+
+/// Build a batch stream over fragment-limited random samples.
+///
+/// This is the only extra sampling helper we keep for ENT-1099. The existing
+/// range-based scan only works for dataset-wide offsets, while fragment-limited
+/// sampling must first map random offsets within the selected fragments to row
+/// addresses and then `take` those rows. Both nullable FSL and multivector
+/// paths reuse this stream to avoid duplicating fragment sampling logic.
+fn sample_training_data_scan_from_fragments(
+    dataset: &Dataset,
+    column: &str,
+    sample_size_hint: usize,
+    num_rows: usize,
+    fragment_ids: &[u32],
+) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+    if fragment_ids.is_empty() {
+        return Err(Error::invalid_input(
+            "Training fragment filter must not be empty".to_string(),
+        ));
+    }
+
+    let mut ordered_ids = fragment_ids.to_vec();
+    ordered_ids.sort_unstable();
+    ordered_ids.dedup();
+    let selected_fragments = dataset
+        .get_frags_from_ordered_ids(&ordered_ids)
+        .into_iter()
+        .zip(ordered_ids.iter())
+        .map(|(fragment, fragment_id)| {
+            fragment.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Unknown fragment id {fragment_id} in training fragment filter"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let dataset = Arc::new(dataset.clone());
+    let projection = Arc::new(
+        ProjectionRequest::from(dataset.schema().project(&[column])?)
+            .into_projection_plan(dataset.clone())?,
+    );
+
+    let stream = stream::try_unfold(
+        (
+            dataset,
+            projection,
+            selected_fragments,
+            HashSet::<u64>::with_capacity(sample_size_hint.min(num_rows)),
+            SmallRng::from_os_rng(),
+        ),
+        move |(dataset, projection, selected_fragments, mut seen_offsets, mut rng)| async move {
+            if seen_offsets.len() >= num_rows {
+                return Ok(None);
+            }
+
+            let remaining = num_rows.saturating_sub(seen_offsets.len());
+            let target = sample_size_hint.saturating_mul(2).min(remaining);
+            let mut sampled_offsets = if remaining <= target.saturating_mul(4) {
+                let mut unseen_indices = (0..num_rows as u64)
+                    .filter(|index| !seen_offsets.contains(index))
+                    .collect::<Vec<_>>();
+                unseen_indices.shuffle(&mut rng);
+                unseen_indices.truncate(target);
+                seen_offsets.extend(unseen_indices.iter().copied());
+                unseen_indices
+            } else {
+                let mut sampled_offsets = Vec::with_capacity(target);
+                while sampled_offsets.len() < target {
+                    let index = rng.random_range(0..num_rows as u64);
+                    if seen_offsets.insert(index) {
+                        sampled_offsets.push(index);
+                    }
+                }
+                sampled_offsets
+            };
+            if sampled_offsets.is_empty() {
+                return Ok(None);
+            }
+            sampled_offsets.sort_unstable();
+
+            let mut row_addrs =
+                row_offsets_to_row_addresses(&selected_fragments, &sampled_offsets).await?;
+            row_addrs.sort_unstable();
+
+            let batch = TakeBuilder::try_new_from_addresses(
+                dataset.clone(),
+                row_addrs,
+                projection.clone(),
+            )?
+            .execute()
+            .await?;
+            Ok(Some((
+                batch,
+                (dataset, projection, selected_fragments, seen_offsets, rng),
+            )))
+        },
+    );
+    Ok(Box::pin(stream))
 }
 
 fn resolve_scan_fragments(
@@ -570,13 +671,16 @@ fn fsl_values_to_array(
 /// accumulate non-null vector bytes directly into a flat buffer, dropping
 /// each source batch immediately. This keeps peak memory proportional to the
 /// output sample rather than the input scan.
-async fn sample_nullable_fsl(
+async fn sample_nullable_fsl<S>(
     column: &str,
     sample_size_hint: usize,
     byte_width: usize,
     vector_field: &lance_core::datatypes::Field,
-    mut scan: crate::dataset::scanner::DatasetRecordBatchStream,
-) -> Result<FixedSizeListArray> {
+    mut scan: S,
+) -> Result<FixedSizeListArray>
+where
+    S: Stream<Item = Result<RecordBatch>> + Unpin,
+{
     let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
     let mut num_non_null: usize = 0;
 
@@ -602,7 +706,6 @@ async fn sample_nullable_fsl(
 
     fsl_values_to_array(vector_field, values_buf, num_rows_out)
 }
-
 /// True uniform random sampling for non-nullable FixedSizeList columns.
 ///
 /// Generates truly random row indices, sorts them, and fetches via
@@ -679,12 +782,15 @@ fn accumulate_fsl_values(
 /// Fallback sampling for non-FixedSizeList columns (e.g. multivector List
 /// columns). Collects batches and concatenates them. When `is_nullable` is
 /// true, filters null rows from each batch.
-async fn sample_nullable_fallback(
+async fn sample_nullable_fallback<S>(
     column: &str,
     sample_size_hint: usize,
     is_nullable: bool,
-    mut scan: crate::dataset::scanner::DatasetRecordBatchStream,
-) -> Result<FixedSizeListArray> {
+    mut scan: S,
+) -> Result<FixedSizeListArray>
+where
+    S: Stream<Item = Result<RecordBatch>> + Unpin,
+{
     let mut schema = None;
     let mut filtered = Vec::new();
     let mut num_non_null: usize = 0;
@@ -834,12 +940,11 @@ fn random_ranges(
 mod tests {
     use super::*;
 
-    use arrow_array::{Float32Array, types::Float32Type};
+    use crate::dataset::InsertBuilder;
+    use arrow_array::{ArrayRef, Float32Array, types::Float32Type};
     use arrow_schema::{DataType, Field};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
-
-    use crate::dataset::InsertBuilder;
 
     #[rstest::rstest]
     #[test]

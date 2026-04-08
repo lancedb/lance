@@ -5231,11 +5231,16 @@ def test_branches(tmp_path: Path):
     branch1.tags.create("main_latest", (None, None))
     branch1.tags.create("main_latest2", ("main", None))
     branch1.create_branch("branch_from_main", ("main", None))
+    branches_with_main = branch1.branches.list()
     assert branch1.tags.list()["branch1_latest"]["branch"] == "branch1"
     assert branch1.tags.list()["main_latest"]["branch"] is None
     assert branch1.tags.list()["main_latest2"]["branch"] is None
-    assert branch1.branches.list()["branch_from_main"]["parent_branch"] is None
-    assert branch1.branches.list()["branch_from_main"]["parent_version"] == 1
+    assert branches_with_main["branch_from_main"]["parent_branch"] is None
+    assert branches_with_main["branch_from_main"]["branch_identifier"][0][0] == 1
+    assert isinstance(
+        branches_with_main["branch_from_main"]["branch_identifier"][0][1], str
+    )
+    assert branches_with_main["branch_from_main"]["parent_version"] == 1
     assert branch1.checkout_version("main_latest").latest_version == 1
     assert branch1.checkout_version("main_latest2").latest_version == 1
     assert branch1.checkout_version(("branch_from_main", None)).latest_version == 1
@@ -5261,6 +5266,9 @@ def test_branches(tmp_path: Path):
     b1_meta = branches["branch1"]
     assert isinstance(b1_meta["parent_version"], int)
     assert b1_meta["manifest_size"] > 0
+    assert b1_meta["branch_identifier"][0][0] == b1_meta["parent_version"]
+    assert isinstance(b1_meta["branch_identifier"][0][1], str)
+    assert len(b1_meta["branch_identifier"][0][1]) > 0
     assert "create_at" in b1_meta
 
     try:

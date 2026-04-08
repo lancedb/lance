@@ -126,39 +126,39 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
     Some(bit_reverse_u64(reversed))
 }
 
-/// Base path for a region within the MemWAL directory.
+/// Base path for a shard within the MemWAL directory.
 ///
-/// Returns: `{base_path}/_mem_wal/{region_id}/`
-pub fn region_base_path(base_path: &Path, region_id: &Uuid) -> Path {
+/// Returns: `{base_path}/_mem_wal/{shard_id}/`
+pub fn shard_base_path(base_path: &Path, shard_id: &Uuid) -> Path {
     base_path
         .child("_mem_wal")
-        .child(region_id.as_hyphenated().to_string())
+        .child(shard_id.as_hyphenated().to_string())
 }
 
-/// Path to the WAL directory for a region.
+/// Path to the WAL directory for a shard.
 ///
-/// Returns: `{base_path}/_mem_wal/{region_id}/wal/`
-pub fn region_wal_path(base_path: &Path, region_id: &Uuid) -> Path {
-    region_base_path(base_path, region_id).child("wal")
+/// Returns: `{base_path}/_mem_wal/{shard_id}/wal/`
+pub fn shard_wal_path(base_path: &Path, shard_id: &Uuid) -> Path {
+    shard_base_path(base_path, shard_id).child("wal")
 }
 
-/// Path to the manifest directory for a region.
+/// Path to the manifest directory for a shard.
 ///
-/// Returns: `{base_path}/_mem_wal/{region_id}/manifest/`
-pub fn region_manifest_path(base_path: &Path, region_id: &Uuid) -> Path {
-    region_base_path(base_path, region_id).child("manifest")
+/// Returns: `{base_path}/_mem_wal/{shard_id}/manifest/`
+pub fn shard_manifest_path(base_path: &Path, shard_id: &Uuid) -> Path {
+    shard_base_path(base_path, shard_id).child("manifest")
 }
 
 /// Path to a flushed MemTable directory.
 ///
-/// Returns: `{base_path}/_mem_wal/{region_id}/{random_hash}_gen_{generation}/`
+/// Returns: `{base_path}/_mem_wal/{shard_id}/{random_hash}_gen_{generation}/`
 pub fn flushed_memtable_path(
     base_path: &Path,
-    region_id: &Uuid,
+    shard_id: &Uuid,
     random_hash: &str,
     generation: u64,
 ) -> Path {
-    region_base_path(base_path, region_id).child(format!("{}_gen_{}", random_hash, generation))
+    shard_base_path(base_path, shard_id).child(format!("{}_gen_{}", random_hash, generation))
 }
 
 /// Generate an 8-character random hex string for flushed MemTable directories.
@@ -177,7 +177,7 @@ pub fn wal_entry_filename(wal_entry_position: u64) -> String {
     bit_reversed_filename(wal_entry_position, "arrow")
 }
 
-/// Region manifest filename.
+/// Shard manifest filename.
 ///
 /// Returns bit-reversed filename with .binpb extension.
 pub fn manifest_filename(version: u64) -> String {
@@ -241,34 +241,34 @@ mod tests {
     }
 
     #[test]
-    fn test_region_paths() {
+    fn test_shard_paths() {
         let base_path = Path::from("my/dataset");
-        let region_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let shard_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
 
         assert_eq!(
-            region_base_path(&base_path, &region_id).as_ref(),
+            shard_base_path(&base_path, &shard_id).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000"
         );
 
         assert_eq!(
-            region_wal_path(&base_path, &region_id).as_ref(),
+            shard_wal_path(&base_path, &shard_id).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/wal"
         );
 
         assert_eq!(
-            region_manifest_path(&base_path, &region_id).as_ref(),
+            shard_manifest_path(&base_path, &shard_id).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/manifest"
         );
 
         assert_eq!(
-            flushed_memtable_path(&base_path, &region_id, "a1b2c3d4", 5).as_ref(),
+            flushed_memtable_path(&base_path, &shard_id, "a1b2c3d4", 5).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/a1b2c3d4_gen_5"
         );
 
         // Test with empty base path
         let empty_base = Path::from("");
         assert_eq!(
-            region_wal_path(&empty_base, &region_id).as_ref(),
+            shard_wal_path(&empty_base, &shard_id).as_ref(),
             "_mem_wal/550e8400-e29b-41d4-a716-446655440000/wal"
         );
     }

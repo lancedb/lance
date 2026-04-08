@@ -20,6 +20,7 @@ from .compat_decorator import (
     UpgradeDowngradeTest,
     compat_test,
 )
+from .util import safe_data_storage_version
 
 
 @compat_test(min_version="0.29.1.beta2")
@@ -44,7 +45,11 @@ class PqVectorIndex(UpgradeDowngradeTest):
             }
         )
 
-        dataset = lance.write_dataset(data, self.path)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_index(
             "vec",
             "IVF_PQ",
@@ -109,7 +114,11 @@ class HnswPqVectorIndex(UpgradeDowngradeTest):
             }
         )
 
-        dataset = lance.write_dataset(data, self.path)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_index(
             "vec",
             "IVF_HNSW_PQ",
@@ -174,7 +183,11 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
             }
         )
 
-        dataset = lance.write_dataset(data, self.path)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_index(
             "vec",
             "IVF_HNSW_SQ",
@@ -235,7 +248,11 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
             }
         )
 
-        dataset = lance.write_dataset(data, self.path)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_index(
             "vec",
             "IVF_RQ",

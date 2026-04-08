@@ -238,7 +238,7 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// List of MemWAL region generations to mark as merged after this transaction
+    /// List of MemWAL shard generations to mark as merged after this transaction
     repeated MergedGeneration merged_generations = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
@@ -312,7 +312,7 @@ message Transaction {
   // This operation is used during merge-insert to atomically record which
   // generations have been merged to the base table.
   message UpdateMemWalState {
-    // Regions and generations being marked as merged.
+    // Shards and generations being marked as merged.
     repeated MergedGeneration merged_generations = 1;
   }
 

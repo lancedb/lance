@@ -380,6 +380,7 @@ mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
@@ -986,13 +987,37 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        // Sort the data by value column (nulls first) to match the production
+        // scanner behavior (TrainingOrdering::Values).
+        let schema = data.schema();
+        let batches: Vec<_> = data
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let combined = arrow::compute::concat_batches(&schema, &batches).unwrap();
+        let options = arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let indices =
+            arrow::compute::sort_to_indices(combined.column(0), Some(options), None).unwrap();
+        let sorted_columns: Vec<_> = combined
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &indices, None).unwrap())
+            .collect();
+        let sorted_batch = RecordBatch::try_new(schema.clone(), sorted_columns).unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(sorted_batch) }),
+        ));
+
         let request = BitmapIndexPlugin
             .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
             .unwrap();
         BitmapIndexPlugin
             .train_index(
-                data,
+                stream,
                 index_store.as_ref(),
                 request,
                 None,

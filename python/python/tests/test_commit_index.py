@@ -179,3 +179,48 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     files_by_path = {f.path: f.size_bytes for f in committed_index.files}
     assert files_by_path["index.idx"] == 1024
     assert files_by_path["auxiliary.bin"] == 2048
+
+
+def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_path):
+    """Test that index_details round-trip through Python transaction bindings."""
+    from lance.dataset import Index
+
+    original_txn = dataset_with_index.get_transactions(1)[0]
+    original_index = original_txn.operation.new_indices[0]
+    assert original_index.index_details is not None
+
+    index_id = original_index.uuid
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    field_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+        index_details=original_index.index_details,
+    )
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    dataset_without_index = lance.LanceDataset.commit(
+        dataset_without_index.uri,
+        create_index_op,
+        read_version=dataset_without_index.version,
+    )
+
+    committed_txn = dataset_without_index.get_transactions(1)[0]
+    committed_index = committed_txn.operation.new_indices[0]
+    assert committed_index.index_details == original_index.index_details

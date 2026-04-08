@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::index::DatasetIndexExt;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, RegionSpec};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardSpec};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_io::object_store::ObjectStore;
@@ -24,19 +24,19 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::new_mem_wal_index_meta;
 
-use super::RegionWriterConfig;
+use super::ShardWriterConfig;
 use super::write::MemIndexConfig;
-use super::write::RegionWriter;
+use super::write::ShardWriter;
 
 /// Configuration for initializing MemWAL on a Dataset.
 #[derive(Debug, Clone, Default)]
 pub struct MemWalConfig {
-    /// Optional region specification for partitioning writes.
+    /// Optional shard specification for partitioning writes.
     ///
-    /// If None, MemWAL is initialized without any region spec (manual region management).
+    /// If None, MemWAL is initialized without any shard spec (manual shard management).
     ///
-    /// TODO: Add `add_region_spec()` API to add region specs after initialization.
-    pub region_spec: Option<RegionSpec>,
+    /// TODO: Add `add_shard_spec()` API to add shard specs after initialization.
+    pub shard_spec: Option<ShardSpec>,
     /// Index names to maintain in MemTables.
     /// These must reference indexes already defined on the base table.
     pub maintained_indexes: Vec<String>,
@@ -55,20 +55,20 @@ pub trait DatasetMemWalExt {
     /// ```ignore
     /// let mut dataset = Dataset::open("s3://bucket/dataset").await?;
     /// dataset.initialize_mem_wal(MemWalConfig {
-    ///     region_specs: vec![],
+    ///     shard_specs: vec![],
     ///     maintained_indexes: vec!["id_btree".to_string()],
     /// }).await?;
     /// ```
     async fn initialize_mem_wal(&mut self, config: MemWalConfig) -> Result<()>;
 
-    /// Get a RegionWriter for the specified region.
+    /// Get a ShardWriter for the specified shard.
     ///
     /// Automatically loads index configurations from the MemWalIndex
     /// and creates the appropriate in-memory indexes.
     ///
     /// # Arguments
     ///
-    /// * `region_id` - UUID identifying this region
+    /// * `shard_id` - UUID identifying this shard
     /// * `config` - Writer configuration (durability, buffer sizes, etc.)
     ///
     /// # Example
@@ -76,15 +76,15 @@ pub trait DatasetMemWalExt {
     /// ```ignore
     /// let writer = dataset.mem_wal_writer(
     ///     Uuid::new_v4(),
-    ///     RegionWriterConfig::default(),
+    ///     ShardWriterConfig::default(),
     /// ).await?;
     /// writer.put(vec![batch1, batch2]).await?;
     /// ```
     async fn mem_wal_writer(
         &self,
-        region_id: Uuid,
-        config: RegionWriterConfig,
-    ) -> Result<RegionWriter>;
+        shard_id: Uuid,
+        config: ShardWriterConfig,
+    ) -> Result<ShardWriter>;
 }
 
 #[async_trait]
@@ -119,7 +119,7 @@ impl DatasetMemWalExt for Dataset {
 
         // Create MemWalIndexDetails
         let details = MemWalIndexDetails {
-            region_specs: config.region_spec.into_iter().collect(),
+            shard_specs: config.shard_spec.into_iter().collect(),
             maintained_indexes: config.maintained_indexes,
             ..Default::default()
         };
@@ -149,9 +149,9 @@ impl DatasetMemWalExt for Dataset {
 
     async fn mem_wal_writer(
         &self,
-        region_id: Uuid,
-        mut config: RegionWriterConfig,
-    ) -> Result<RegionWriter> {
+        shard_id: Uuid,
+        mut config: ShardWriterConfig,
+    ) -> Result<ShardWriter> {
         use lance_index::metrics::NoOpMetricsCollector;
 
         // Load MemWalIndex to get maintained_indexes
@@ -214,15 +214,15 @@ impl DatasetMemWalExt for Dataset {
             };
         }
 
-        // Set region_id in config
-        config.region_id = region_id;
+        // Set shard_id in config
+        config.shard_id = shard_id;
 
         // Get object store and base path
         let base_uri = self.uri();
         let (store, base_path) = ObjectStore::from_uri(base_uri).await?;
 
-        // Create RegionWriter
-        RegionWriter::open(
+        // Create ShardWriter
+        ShardWriter::open(
             store,
             base_path,
             base_uri,

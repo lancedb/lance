@@ -330,7 +330,7 @@ async fn indirect_schedule_task(
     // pages.  We can use a dummy receiver to match the decoder API
     offsets_decoder.wait_for_loaded(num_offsets - 1).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
-    let offsets = decode_task.task.decode()?;
+    let (offsets, _) = decode_task.task.decode()?;
 
     let (item_ranges, offsets, validity) =
         decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
@@ -615,13 +615,13 @@ struct ListDecodeTask {
 }
 
 impl DecodeArrayTask for ListDecodeTask {
-    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+    fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let items = self
             .items
             .map(|items| {
                 // When we run the indirect I/O we wrap things in a struct array with a single field
                 // named "item".  We can unwrap that now.
-                let wrapped_items = items.decode()?;
+                let (wrapped_items, _) = items.decode()?;
                 Result::Ok(wrapped_items.as_struct().column(0).clone())
             })
             .unwrap_or_else(|| Ok(new_empty_array(self.items_field.data_type())))?;
@@ -640,33 +640,36 @@ impl DecodeArrayTask for ListDecodeTask {
         };
         let min_offset = UInt64Array::new_scalar(offsets.value(0));
         let offsets = arrow_arith::numeric::sub(&offsets, &min_offset)?;
-        match &self.offset_type {
+        let array: ArrayRef = match &self.offset_type {
             DataType::Int32 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int32)?;
                 let offsets_i32 = offsets.as_primitive::<Int32Type>();
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
-                Ok(Arc::new(ListArray::try_new(
+                Arc::new(ListArray::try_new(
                     self.items_field.clone(),
                     offsets,
                     items,
                     validity,
-                )?))
+                )?)
             }
             DataType::Int64 => {
                 let offsets = arrow_cast::cast(&offsets, &DataType::Int64)?;
                 let offsets_i64 = offsets.as_primitive::<Int64Type>();
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
-                Ok(Arc::new(LargeListArray::try_new(
+                Arc::new(LargeListArray::try_new(
                     self.items_field.clone(),
                     offsets,
                     items,
                     validity,
-                )?))
+                )?)
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
-        }
+        };
+        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // v2.0 path does not need it so we return 0.
+        Ok((array, 0))
     }
 }
 

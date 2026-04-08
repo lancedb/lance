@@ -123,12 +123,12 @@ public class DatasetTest {
   @Test
   void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      // Test default version (V2_0)
+      // Test default version (V2_1)
       String defaultPath = tempDir.resolve("default_version").toString();
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_0, dataset.getLanceFileFormatVersion());
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
       }
 
       // Test LEGACY version
@@ -869,7 +869,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(100, dataset2.calculateDataSize());
+        assertEquals(108, dataset2.calculateDataSize());
       }
     }
   }
@@ -1293,6 +1293,33 @@ public class DatasetTest {
   }
 
   @Test
+  void testHasStableRowIds(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("uses_stable_row_ids").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // Dataset created without stable row IDs
+      try (Dataset ds = testDataset.createEmptyDataset()) {
+        assertFalse(ds.hasStableRowIds());
+      }
+    }
+
+    String datasetPathWithRowIds = tempDir.resolve("uses_stable_row_ids_enabled").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPathWithRowIds);
+
+      // Dataset created with stable row IDs
+      try (Dataset ds =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())) {
+        assertTrue(ds.hasStableRowIds());
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -1709,12 +1736,21 @@ public class DatasetTest {
                   assertEquals("branch1", branch1Meta.getName());
                   assertEquals(2, branch1Meta.getParentVersion());
                   assertFalse(branch1Meta.getParentBranch().isPresent());
+                  assertEquals(1, branch1Meta.getBranchIdentifier().size());
+                  assertEquals(2, branch1Meta.getBranchIdentifier().get(0).getVersion());
+                  assertFalse(branch1Meta.getBranchIdentifier().get(0).getUuid().isEmpty());
                   assertTrue(branch1Meta.getCreateAt() > 0);
                   assertTrue(branch1Meta.getManifestSize() > 0);
 
                   assertEquals("branch2", branch2Meta.getName());
                   assertTrue(branch2Meta.getParentBranch().isPresent());
                   assertEquals("branch1", branch2Meta.getParentBranch().get());
+                  assertEquals(2, branch2Meta.getBranchIdentifier().size());
+                  assertEquals(
+                      branch1Meta.getBranchIdentifier().get(0),
+                      branch2Meta.getBranchIdentifier().get(0));
+                  assertEquals(3, branch2Meta.getBranchIdentifier().get(1).getVersion());
+                  assertFalse(branch2Meta.getBranchIdentifier().get(1).getUuid().isEmpty());
                   assertEquals(3, branch2Meta.getParentVersion());
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);

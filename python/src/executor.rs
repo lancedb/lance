@@ -173,6 +173,80 @@ impl BackgroundExecutor {
         }
     }
 
+    /// Block on a future, periodically draining a caller-provided pump.
+    ///
+    /// This is intended for progress callbacks where the future emits events from
+    /// background tasks and the caller needs to run Python code while waiting for
+    /// the future to complete.
+    ///
+    /// Unlike [`block_on`], this method does **not** wrap the future in
+    /// `result_or_interrupt`, so keyboard interrupts are only checked on the
+    /// main thread between poll intervals (`SIGNAL_CHECK_INTERVAL`).  This is
+    /// acceptable because index operations yield frequently to emit progress
+    /// events.
+    pub fn block_on_pumping<F, P>(
+        &self,
+        py: Option<Python<'_>>,
+        future: F,
+        mut pump: P,
+    ) -> PyResult<F::Output>
+    where
+        F: Future + Send,
+        F::Output: Send,
+        P: FnMut() -> PyResult<()>,
+    {
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            pump()?;
+
+            let signal_check = match Python::try_attach(|py| py.check_signals()) {
+                Some(result) => result,
+                None => Ok(()),
+            };
+            signal_check?;
+
+            let maybe_output = if let Some(py) = py {
+                py.detach(|| {
+                    self.runtime.block_on(async {
+                        tokio::select! {
+                            result = &mut future => Some(result),
+                            _ = tokio::time::sleep(SIGNAL_CHECK_INTERVAL) => None,
+                        }
+                    })
+                })
+            } else if let Some(result) = Python::try_attach(|py| {
+                py.detach(|| {
+                    self.runtime.block_on(async {
+                        tokio::select! {
+                            result = &mut future => Some(result),
+                            _ = tokio::time::sleep(SIGNAL_CHECK_INTERVAL) => None,
+                        }
+                    })
+                })
+            }) {
+                result
+            } else {
+                self.runtime.block_on(async {
+                    tokio::select! {
+                        result = &mut future => Some(result),
+                        _ = tokio::time::sleep(SIGNAL_CHECK_INTERVAL) => None,
+                    }
+                })
+            };
+
+            if let Some(output) = maybe_output {
+                if let Err(err) = pump() {
+                    log::warn!(
+                        "Ignoring progress callback error after operation completed successfully: {}",
+                        err
+                    );
+                }
+                return Ok(output);
+            }
+        }
+    }
+
     async fn result_or_interrupt<F>(future: F) -> PyResult<F::Output>
     where
         F: Future + Send,
