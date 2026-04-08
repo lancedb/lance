@@ -275,10 +275,12 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
+                let config = config_for_stream.clone();
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
@@ -291,11 +293,8 @@ impl LanceStream {
                                 config.with_row_last_updated_at_version,
                             )
                             .with_row_created_at_version(config.with_row_created_at_version);
-                        if let Some(batch_size_bytes) = config.batch_size_bytes {
-                            frag_config = frag_config.with_file_reader_options(FileReaderOptions {
-                                batch_size_bytes: Some(batch_size_bytes),
-                                ..Default::default()
-                            });
+                        if let Some(file_reader_options) = config.file_reader_options {
+                            frag_config = frag_config.with_file_reader_options(file_reader_options);
                         }
                         let reader = open_file(
                             file_fragment.fragment,
@@ -507,7 +506,7 @@ pub struct LanceScanConfig {
     pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
-    pub batch_size_bytes: Option<u64>,
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 // This is mostly for testing purposes, end users are unlikely to create this
@@ -525,7 +524,7 @@ impl Default for LanceScanConfig {
             with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
-            batch_size_bytes: None,
+            file_reader_options: None,
         }
     }
 }

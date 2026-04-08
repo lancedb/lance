@@ -1702,6 +1702,30 @@ impl Scanner {
         self
     }
 
+    /// Compute the resolved file reader options, merging the scanner's explicit
+    /// `file_reader_options`, the dataset-level defaults, and the `batch_size_bytes`
+    /// setting.
+    fn resolved_file_reader_options(&self) -> Option<FileReaderOptions> {
+        let base = self
+            .file_reader_options
+            .clone()
+            .or_else(|| self.dataset.file_reader_options.clone());
+        match (base, self.batch_size_bytes) {
+            (Some(mut opts), Some(bsb)) => {
+                if opts.batch_size_bytes.is_none() {
+                    opts.batch_size_bytes = Some(bsb);
+                }
+                Some(opts)
+            }
+            (Some(opts), None) => Some(opts),
+            (None, Some(bsb)) => Some(FileReaderOptions {
+                batch_size_bytes: Some(bsb),
+                ..Default::default()
+            }),
+            (None, None) => None,
+        }
+    }
+
     /// Create a physical expression for a column that may be nested
     fn create_column_expr(
         column_name: &str,
@@ -2670,6 +2694,10 @@ impl Scanner {
 
         if let Some(batch_size) = self.batch_size {
             read_options = read_options.with_batch_size(batch_size as u32);
+        }
+
+        if let Some(file_reader_options) = self.resolved_file_reader_options() {
+            read_options = read_options.with_file_reader_options(file_reader_options);
         }
 
         if let Some(fragment_readahead) = self.fragment_readahead {
@@ -4017,7 +4045,7 @@ impl Scanner {
             with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
-            batch_size_bytes: self.batch_size_bytes,
+            file_reader_options: self.resolved_file_reader_options(),
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
@@ -4035,23 +4063,6 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("pushdown_scan");
 
-        let file_reader_options = self
-            .file_reader_options
-            .clone()
-            .or_else(|| self.dataset.file_reader_options.clone())
-            .map(|mut opts| {
-                if opts.batch_size_bytes.is_none() {
-                    opts.batch_size_bytes = self.batch_size_bytes;
-                }
-                opts
-            })
-            .or_else(|| {
-                self.batch_size_bytes.map(|v| FileReaderOptions {
-                    batch_size_bytes: Some(v),
-                    ..Default::default()
-                })
-            });
-
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self
@@ -4061,7 +4072,7 @@ impl Scanner {
             with_row_address: self.projection_plan.physical_projection.with_row_addr,
             make_deletions_null,
             ordered_output: self.ordered,
-            file_reader_options,
+            file_reader_options: self.resolved_file_reader_options(),
         };
 
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
