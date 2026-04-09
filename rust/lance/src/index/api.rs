@@ -51,7 +51,15 @@ pub trait DatasetIndexExt {
     async fn prewarm_index(&self, name: &str) -> Result<()>;
 
     /// Prewarm an index by name with additional options.
-    async fn prewarm_index_with_options(&self, name: &str, options: &PrewarmOptions) -> Result<()>;
+    async fn prewarm_index_with_options(
+        &self,
+        _name: &str,
+        _options: &PrewarmOptions,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "prewarm options are not supported by this dataset implementation".to_owned(),
+        ))
+    }
 
     /// Read all indices of this Dataset version.
     ///
