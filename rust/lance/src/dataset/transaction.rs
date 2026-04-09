@@ -1719,17 +1719,23 @@ impl Transaction {
                 if next_row_id.is_some() {
                     let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
 
-                    // Build a map of original fragment ID -> original fragment for lookup
-                    let original_frags_map: std::collections::HashMap<u64, &Fragment> =
-                        existing_fragments.iter().map(|f| (f.id, f)).collect();
+                    // Build a reverse index: stable row ID → (fragment ref, position within fragment)
+                    // by reading each existing fragment's RowIdMeta sequence.
+                    let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
+                        std::collections::HashMap::new();
+                    for frag in existing_fragments.iter() {
+                        if let Some(row_id_meta) = &frag.row_id_meta {
+                            if let lance_table::format::RowIdMeta::Inline(data) = row_id_meta {
+                                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
+                                    for (offset, rid) in seq.iter().enumerate() {
+                                        row_id_to_source.insert(rid, (frag, offset));
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     for fragment in new_fragments.iter_mut() {
-                        // For update operations with RewriteRows mode:
-                        // - Rows are deleted from old fragments and rewritten to new fragments
-                        // - last_updated_at should be the current version (when update happened)
-                        // - created_at should be preserved from the original fragment
-
-                        // Read row IDs from this fragment to find original fragments
                         let row_ids = if let Some(row_id_meta) = &fragment.row_id_meta {
                             match row_id_meta {
                                 lance_table::format::RowIdMeta::Inline(data) => {
@@ -1742,44 +1748,37 @@ impl Transaction {
                         };
 
                         if let Some(row_ids) = row_ids {
-                            // Extract created_at version for each row from original fragments
                             let physical_rows = fragment.physical_rows.unwrap_or(0);
                             let mut created_at_versions = Vec::with_capacity(physical_rows);
 
                             for row_id in row_ids.iter() {
-                                // Row ID format: upper 32 bits = fragment ID, lower 32 bits = row offset
-                                let orig_frag_id = row_id >> 32;
-                                let row_offset = (row_id & 0xFFFFFFFF) as usize;
-
-                                // Look up the original fragment
-                                if let Some(orig_frag) = original_frags_map.get(&orig_frag_id) {
-                                    // Get created_at version from original fragment's metadata
-                                    let created_version = if let Some(created_meta) =
-                                        &orig_frag.created_at_version_meta
+                                let created_version =
+                                    if let Some((orig_frag, row_offset)) =
+                                        row_id_to_source.get(&row_id)
                                     {
-                                        // Load and index into the version sequence
-                                        match created_meta.load_sequence() {
-                                            Ok(seq) => {
-                                                let versions: Vec<u64> = seq.versions().collect();
-                                                versions.get(row_offset).copied().unwrap_or(1)
+                                        if let Some(created_meta) =
+                                            &orig_frag.created_at_version_meta
+                                        {
+                                            match created_meta.load_sequence() {
+                                                Ok(seq) => {
+                                                    let versions: Vec<u64> =
+                                                        seq.versions().collect();
+                                                    versions
+                                                        .get(*row_offset)
+                                                        .copied()
+                                                        .unwrap_or(1)
+                                                }
+                                                Err(_) => 1,
                                             }
-                                            Err(_e) => {
-                                                1 // Default to version 1 on error
-                                            }
+                                        } else {
+                                            1
                                         }
                                     } else {
-                                        // No metadata on original fragment, default to version 1
                                         1
                                     };
-                                    created_at_versions.push(created_version);
-                                } else {
-                                    // Original fragment not found, default to version 1
-                                    created_at_versions.push(1);
-                                }
+                                created_at_versions.push(created_version);
                             }
 
-                            // Build version metadata from the collected versions
-                            // Compress into runs: consecutive identical versions become one run
                             let mut runs = Vec::new();
                             if !created_at_versions.is_empty() {
                                 let mut current_version = created_at_versions[0];
@@ -1788,7 +1787,6 @@ impl Transaction {
                                 for (i, &version) in created_at_versions.iter().enumerate().skip(1)
                                 {
                                     if version != current_version {
-                                        // End current run, start new one
                                         runs.push(lance_table::format::RowDatasetVersionRun {
                                             span: lance_table::rowids::segment::U64Segment::Range(
                                                 run_start..i as u64,
@@ -1799,7 +1797,6 @@ impl Transaction {
                                         run_start = i as u64;
                                     }
                                 }
-                                // Add final run
                                 runs.push(lance_table::format::RowDatasetVersionRun {
                                     span: lance_table::rowids::segment::U64Segment::Range(
                                         run_start..created_at_versions.len() as u64,
@@ -1822,7 +1819,6 @@ impl Transaction {
                                 })?,
                             );
 
-                            // Set last_updated_at to the new version for all rows
                             let last_updated_meta =
                                 lance_table::rowids::version::build_version_meta(
                                     fragment,
@@ -1830,7 +1826,6 @@ impl Transaction {
                                 );
                             fragment.last_updated_at_version_meta = last_updated_meta;
                         } else {
-                            // Fallback: can't read row IDs, set both to new version
                             let version_meta = lance_table::rowids::version::build_version_meta(
                                 fragment,
                                 new_version,
@@ -4526,5 +4521,261 @@ mod tests {
         // This should succeed — the old manifest's LEGACY format should not
         // cause strict validation of the new STABLE fragments.
         validate_operation(Some(&legacy_manifest), &operation).unwrap();
+    }
+
+    #[test]
+    fn test_update_version_tracking_preserves_created_at() {
+        use lance_table::format::{
+            RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        };
+        use lance_table::rowids::segment::U64Segment;
+        use lance_table::rowids::write_row_ids;
+
+        let existing_row_ids: Vec<u64> = vec![100, 101, 102];
+        let existing_seq = RowIdSequence::from(existing_row_ids.as_slice());
+        let existing_row_id_bytes = write_row_ids(&existing_seq);
+
+        let created_at_seq = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..3),
+                version: 5,
+            }],
+        };
+        let created_at_meta = RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap();
+
+        let existing_fragment = Fragment {
+            id: 0,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(existing_row_id_bytes)),
+            physical_rows: Some(3),
+            created_at_version_meta: Some(created_at_meta.clone()),
+            last_updated_at_version_meta: None,
+        };
+
+        let new_row_ids: Vec<u64> = vec![100, 102];
+        let new_seq = RowIdSequence::from(new_row_ids.as_slice());
+        let new_row_id_bytes = write_row_ids(&new_seq);
+
+        let new_fragment = Fragment {
+            id: 10,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(new_row_id_bytes)),
+            physical_rows: Some(2),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+
+        let existing_fragments = vec![existing_fragment];
+
+        let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
+            std::collections::HashMap::new();
+        for frag in existing_fragments.iter() {
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
+                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
+                    for (offset, rid) in seq.iter().enumerate() {
+                        row_id_to_source.insert(rid, (frag, offset));
+                    }
+                }
+            }
+        }
+
+        let row_ids = if let Some(RowIdMeta::Inline(data)) = &new_fragment.row_id_meta {
+            lance_table::rowids::read_row_ids(data).ok()
+        } else {
+            None
+        };
+
+        if let Some(row_ids) = row_ids {
+            let physical_rows = new_fragment.physical_rows.unwrap_or(0);
+            let mut created_at_versions = Vec::with_capacity(physical_rows);
+
+            for row_id in row_ids.iter() {
+                let created_version =
+                    if let Some((orig_frag, row_offset)) = row_id_to_source.get(&row_id) {
+                        if let Some(created_meta) = &orig_frag.created_at_version_meta {
+                            match created_meta.load_sequence() {
+                                Ok(seq) => {
+                                    let versions: Vec<u64> = seq.versions().collect();
+                                    versions.get(*row_offset).copied().unwrap_or(1)
+                                }
+                                Err(_) => 1,
+                            }
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    };
+                created_at_versions.push(created_version);
+            }
+
+            assert_eq!(created_at_versions, vec![5, 5]);
+        } else {
+            panic!("Expected row IDs to be present");
+        }
+    }
+
+    #[test]
+    fn test_update_version_tracking_mixed_origins() {
+        use lance_table::format::{
+            RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        };
+        use lance_table::rowids::segment::U64Segment;
+        use lance_table::rowids::write_row_ids;
+
+        let frag_a_ids: Vec<u64> = vec![10, 11];
+        let frag_a_seq = RowIdSequence::from(frag_a_ids.as_slice());
+        let frag_a_created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..2),
+                version: 2,
+            }],
+        };
+
+        let frag_b_ids: Vec<u64> = vec![20, 21, 22];
+        let frag_b_seq = RowIdSequence::from(frag_b_ids.as_slice());
+        let frag_b_created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..3),
+                version: 3,
+            }],
+        };
+
+        let existing_fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq))),
+                physical_rows: Some(2),
+                created_at_version_meta: Some(
+                    RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
+                ),
+                last_updated_at_version_meta: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq))),
+                physical_rows: Some(3),
+                created_at_version_meta: Some(
+                    RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
+                ),
+                last_updated_at_version_meta: None,
+            },
+        ];
+
+        let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
+            std::collections::HashMap::new();
+        for frag in existing_fragments.iter() {
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
+                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
+                    for (offset, rid) in seq.iter().enumerate() {
+                        row_id_to_source.insert(rid, (frag, offset));
+                    }
+                }
+            }
+        }
+
+        // New fragment has rows from both original fragments: row 11 from frag_a, row 20 from frag_b
+        let new_ids: Vec<u64> = vec![11, 20];
+        let new_seq = RowIdSequence::from(new_ids.as_slice());
+
+        let row_ids = lance_table::rowids::read_row_ids(&write_row_ids(&new_seq)).unwrap();
+        let mut created_at_versions = Vec::new();
+        for row_id in row_ids.iter() {
+            let created_version =
+                if let Some((orig_frag, row_offset)) = row_id_to_source.get(&row_id) {
+                    if let Some(created_meta) = &orig_frag.created_at_version_meta {
+                        match created_meta.load_sequence() {
+                            Ok(seq) => {
+                                let versions: Vec<u64> = seq.versions().collect();
+                                versions.get(*row_offset).copied().unwrap_or(1)
+                            }
+                            Err(_) => 1,
+                        }
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
+            created_at_versions.push(created_version);
+        }
+
+        // Row 11 came from frag_a (offset 1, version 2), row 20 came from frag_b (offset 0, version 3)
+        assert_eq!(created_at_versions, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_update_version_tracking_unknown_row_id_defaults_to_1() {
+        use lance_table::format::{RowIdMeta, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence};
+        use lance_table::rowids::segment::U64Segment;
+        use lance_table::rowids::write_row_ids;
+
+        let existing_ids: Vec<u64> = vec![10, 11];
+        let existing_seq = RowIdSequence::from(existing_ids.as_slice());
+        let existing_created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..2),
+                version: 5,
+            }],
+        };
+
+        let existing_fragments = vec![Fragment {
+            id: 0,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: Some(
+                RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
+            ),
+            last_updated_at_version_meta: None,
+        }];
+
+        let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
+            std::collections::HashMap::new();
+        for frag in existing_fragments.iter() {
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
+                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
+                    for (offset, rid) in seq.iter().enumerate() {
+                        row_id_to_source.insert(rid, (frag, offset));
+                    }
+                }
+            }
+        }
+
+        // New fragment has row 10 (known) and row 999 (unknown — freshly inserted)
+        let new_ids: Vec<u64> = vec![10, 999];
+        let new_seq = RowIdSequence::from(new_ids.as_slice());
+        let row_ids = lance_table::rowids::read_row_ids(&write_row_ids(&new_seq)).unwrap();
+
+        let mut created_at_versions = Vec::new();
+        for row_id in row_ids.iter() {
+            let created_version =
+                if let Some((orig_frag, row_offset)) = row_id_to_source.get(&row_id) {
+                    if let Some(created_meta) = &orig_frag.created_at_version_meta {
+                        match created_meta.load_sequence() {
+                            Ok(seq) => {
+                                let versions: Vec<u64> = seq.versions().collect();
+                                versions.get(*row_offset).copied().unwrap_or(1)
+                            }
+                            Err(_) => 1,
+                        }
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
+            created_at_versions.push(created_version);
+        }
+
+        // Row 10: offset 0 in frag 0 → version 5. Row 999: unknown → default 1
+        assert_eq!(created_at_versions, vec![5, 1]);
     }
 }
