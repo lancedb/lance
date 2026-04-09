@@ -1752,30 +1752,23 @@ impl Transaction {
                             let mut created_at_versions = Vec::with_capacity(physical_rows);
 
                             for row_id in row_ids.iter() {
-                                let created_version =
-                                    if let Some((orig_frag, row_offset)) =
-                                        row_id_to_source.get(&row_id)
-                                    {
-                                        if let Some(created_meta) =
-                                            &orig_frag.created_at_version_meta
-                                        {
-                                            match created_meta.load_sequence() {
-                                                Ok(seq) => {
-                                                    let versions: Vec<u64> =
-                                                        seq.versions().collect();
-                                                    versions
-                                                        .get(*row_offset)
-                                                        .copied()
-                                                        .unwrap_or(1)
-                                                }
-                                                Err(_) => 1,
+                                let created_version = if let Some((orig_frag, row_offset)) =
+                                    row_id_to_source.get(&row_id)
+                                {
+                                    if let Some(created_meta) = &orig_frag.created_at_version_meta {
+                                        match created_meta.load_sequence() {
+                                            Ok(seq) => {
+                                                let versions: Vec<u64> = seq.versions().collect();
+                                                versions.get(*row_offset).copied().unwrap_or(1)
                                             }
-                                        } else {
-                                            1
+                                            Err(_) => 1,
                                         }
                                     } else {
                                         1
-                                    };
+                                    }
+                                } else {
+                                    1
+                                };
                                 created_at_versions.push(created_version);
                             }
 
@@ -4712,7 +4705,9 @@ mod tests {
 
     #[test]
     fn test_update_version_tracking_unknown_row_id_defaults_to_1() {
-        use lance_table::format::{RowIdMeta, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence};
+        use lance_table::format::{
+            RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        };
         use lance_table::rowids::segment::U64Segment;
         use lance_table::rowids::write_row_ids;
 

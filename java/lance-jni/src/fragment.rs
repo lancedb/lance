@@ -726,8 +726,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
 
         let deletion_file =
             extract_nullable_field(env, self, "getDeletionFile", DELETE_FILE_CLASS)?;
-        let row_id_meta =
-            extract_nullable_field(env, self, "getRowIdMeta", ROW_ID_META_CLASS)?;
+        let row_id_meta = extract_nullable_field(env, self, "getRowIdMeta", ROW_ID_META_CLASS)?;
         let created_at_version_meta =
             extract_nullable_field(env, self, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
         let last_updated_at_version_meta =
