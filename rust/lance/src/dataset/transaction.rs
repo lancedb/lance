@@ -1724,13 +1724,12 @@ impl Transaction {
                     let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
                         std::collections::HashMap::new();
                     for frag in existing_fragments.iter() {
-                        if let Some(row_id_meta) = &frag.row_id_meta {
-                            if let lance_table::format::RowIdMeta::Inline(data) = row_id_meta {
-                                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
-                                    for (offset, rid) in seq.iter().enumerate() {
-                                        row_id_to_source.insert(rid, (frag, offset));
-                                    }
-                                }
+                        if let Some(lance_table::format::RowIdMeta::Inline(data)) =
+                            &frag.row_id_meta
+                            && let Ok(seq) = lance_table::rowids::read_row_ids(data)
+                        {
+                            for (offset, rid) in seq.iter().enumerate() {
+                                row_id_to_source.insert(rid, (frag, offset));
                             }
                         }
                     }
@@ -4542,7 +4541,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(existing_row_id_bytes)),
             physical_rows: Some(3),
-            created_at_version_meta: Some(created_at_meta.clone()),
+            created_at_version_meta: Some(created_at_meta),
             last_updated_at_version_meta: None,
         };
 
@@ -4560,16 +4559,16 @@ mod tests {
             last_updated_at_version_meta: None,
         };
 
-        let existing_fragments = vec![existing_fragment];
+        let existing_fragments = [existing_fragment];
 
         let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
             std::collections::HashMap::new();
         for frag in existing_fragments.iter() {
-            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
-                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
-                    for (offset, rid) in seq.iter().enumerate() {
-                        row_id_to_source.insert(rid, (frag, offset));
-                    }
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
+                && let Ok(seq) = lance_table::rowids::read_row_ids(data)
+            {
+                for (offset, rid) in seq.iter().enumerate() {
+                    row_id_to_source.insert(rid, (frag, offset));
                 }
             }
         }
@@ -4636,7 +4635,7 @@ mod tests {
             }],
         };
 
-        let existing_fragments = vec![
+        let existing_fragments = [
             Fragment {
                 id: 0,
                 files: vec![],
@@ -4664,11 +4663,11 @@ mod tests {
         let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
             std::collections::HashMap::new();
         for frag in existing_fragments.iter() {
-            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
-                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
-                    for (offset, rid) in seq.iter().enumerate() {
-                        row_id_to_source.insert(rid, (frag, offset));
-                    }
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
+                && let Ok(seq) = lance_table::rowids::read_row_ids(data)
+            {
+                for (offset, rid) in seq.iter().enumerate() {
+                    row_id_to_source.insert(rid, (frag, offset));
                 }
             }
         }
@@ -4720,7 +4719,7 @@ mod tests {
             }],
         };
 
-        let existing_fragments = vec![Fragment {
+        let existing_fragments = [Fragment {
             id: 0,
             files: vec![],
             deletion_file: None,
@@ -4735,11 +4734,11 @@ mod tests {
         let mut row_id_to_source: std::collections::HashMap<u64, (&Fragment, usize)> =
             std::collections::HashMap::new();
         for frag in existing_fragments.iter() {
-            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
-                if let Ok(seq) = lance_table::rowids::read_row_ids(data) {
-                    for (offset, rid) in seq.iter().enumerate() {
-                        row_id_to_source.insert(rid, (frag, offset));
-                    }
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
+                && let Ok(seq) = lance_table::rowids::read_row_ids(data)
+            {
+                for (offset, rid) in seq.iter().enumerate() {
+                    row_id_to_source.insert(rid, (frag, offset));
                 }
             }
         }
