@@ -85,14 +85,41 @@ pub fn encode_substrait(
     Ok(extended_expr.encode_to_vec())
 }
 
-fn count_fields(dtype: &Type) -> usize {
+/// Count fields using the "deep" convention (DataFusion style):
+/// List<Struct<a, b>> produces names ["col", "a", "b"] (3 names).
+fn count_fields_deep(dtype: &Type) -> usize {
     match dtype.kind.as_ref().unwrap() {
-        Kind::Struct(struct_type) => struct_type.types.iter().map(count_fields).sum::<usize>() + 1,
+        Kind::Struct(struct_type) => {
+            struct_type
+                .types
+                .iter()
+                .map(count_fields_deep)
+                .sum::<usize>()
+                + 1
+        }
         Kind::List(list_type) => {
             // Recursively count fields in the list's child type
             // This is critical for schemas with List<Struct> patterns
-            count_fields(list_type.r#type.as_ref().unwrap())
+            count_fields_deep(list_type.r#type.as_ref().unwrap())
         }
+        _ => 1,
+    }
+}
+
+/// Count fields using the "shallow" convention (PyArrow style):
+/// List<Struct<a, b>> produces only 1 name: ["col"].
+fn count_fields_shallow(dtype: &Type) -> usize {
+    match dtype.kind.as_ref().unwrap() {
+        Kind::Struct(struct_type) => {
+            struct_type
+                .types
+                .iter()
+                .map(count_fields_shallow)
+                .sum::<usize>()
+                + 1
+        }
+        // PyArrow does NOT emit names for fields nested inside List element types.
+        Kind::List(_) => 1,
         _ => 1,
     }
 }
@@ -105,6 +132,23 @@ fn remove_extension_types(
     if fields.types.len() != arrow_schema.fields.len() {
         return Err(Error::invalid_input_source("the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into()));
     }
+
+    // Detect whether names follow the "deep" convention (DataFusion) or
+    // "shallow" convention (PyArrow).  DataFusion emits names for fields
+    // nested inside List element types, whereas PyArrow does not.
+    let deep_count: usize = fields.types.iter().map(count_fields_deep).sum();
+    let shallow_count: usize = fields.types.iter().map(count_fields_shallow).sum();
+    let use_deep = substrait_schema.names.len() >= deep_count;
+    let count_fields_fn: fn(&Type) -> usize = if use_deep {
+        count_fields_deep
+    } else if substrait_schema.names.len() >= shallow_count {
+        count_fields_shallow
+    } else {
+        // Fallback: use deep counting even if names are shorter; downstream
+        // code will just skip names that are out of bounds.
+        count_fields_deep
+    };
+
     let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
     let mut index_mapping = HashMap::with_capacity(arrow_schema.fields.len());
@@ -112,7 +156,7 @@ fn remove_extension_types(
     let mut field_index = 0;
     // TODO: this logic doesn't catch user defined fields inside of struct fields
     for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields.iter()) {
-        let num_fields = count_fields(substrait_field);
+        let num_fields = count_fields_fn(substrait_field);
 
         let kind = substrait_field.kind.as_ref().unwrap();
         let is_user_defined = match kind {
@@ -123,9 +167,10 @@ fn remove_extension_types(
             _ => false,
         };
 
-        if !substrait_schema.names[field_index].starts_with("__unlikely_name_placeholder")
-            && !is_user_defined
-        {
+        let name_check = field_index < substrait_schema.names.len()
+            && substrait_schema.names[field_index].starts_with("__unlikely_name_placeholder");
+
+        if !name_check && !is_user_defined {
             kept_substrait_fields.push(substrait_field.clone());
             kept_arrow_fields.push(arrow_field.clone());
             for i in 0..num_fields {
@@ -1162,5 +1207,109 @@ mod tests {
         ]);
 
         assert_substrait_roundtrip(schema, starts_with_expr).await;
+    }
+
+    /// Regression test for https://github.com/lancedb/lance/issues/6130
+    ///
+    /// When PyArrow produces Substrait, it uses a "shallow" naming convention
+    /// for List<Struct> columns: only the top-level column name is emitted,
+    /// not the names of fields nested inside the list element type.
+    /// DataFusion uses a "deep" convention that includes nested names.
+    ///
+    /// This test verifies that `remove_extension_types` correctly detects the
+    /// shallow convention and does not panic with "index out of bounds".
+    #[test]
+    fn test_remove_extension_types_shallow_names() {
+        use super::remove_extension_types;
+        use datafusion_substrait::substrait::proto::r#type::{I64, List};
+
+        // Schema: id (i64), items (list<struct<value: i64, label: i64>>), checkpoint (i64)
+        let struct_type = Type {
+            kind: Some(Kind::Struct(Struct {
+                types: vec![
+                    Type {
+                        kind: Some(Kind::I64(I64 {
+                            type_variation_reference: 0,
+                            nullability: Nullability::Nullable as i32,
+                        })),
+                    },
+                    Type {
+                        kind: Some(Kind::I64(I64 {
+                            type_variation_reference: 0,
+                            nullability: Nullability::Nullable as i32,
+                        })),
+                    },
+                ],
+                type_variation_reference: 0,
+                nullability: Nullability::Nullable as i32,
+            })),
+        };
+        let list_type = Type {
+            kind: Some(Kind::List(Box::new(List {
+                r#type: Some(Box::new(struct_type)),
+                type_variation_reference: 0,
+                nullability: Nullability::Nullable as i32,
+            }))),
+        };
+        let id_type = Type {
+            kind: Some(Kind::I64(I64 {
+                type_variation_reference: 0,
+                nullability: Nullability::Nullable as i32,
+            })),
+        };
+        let checkpoint_type = Type {
+            kind: Some(Kind::I64(I64 {
+                type_variation_reference: 0,
+                nullability: Nullability::Nullable as i32,
+            })),
+        };
+
+        // PyArrow shallow names: only 3 names for 3 top-level columns.
+        // DataFusion deep names would be: ["id", "value", "label", "checkpoint"] (4 names).
+        let substrait_schema = NamedStruct {
+            names: vec![
+                "id".to_string(),
+                "items".to_string(),
+                "checkpoint".to_string(),
+            ],
+            r#struct: Some(Struct {
+                types: vec![id_type, list_type, checkpoint_type],
+                type_variation_reference: 0,
+                nullability: Nullability::Required as i32,
+            }),
+        };
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new("value", DataType::Int64, true),
+                            Field::new("label", DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new("checkpoint", DataType::Int64, true),
+        ]));
+
+        // This should NOT panic. Before the fix, it panicked with
+        // "index out of bounds: the len is 3 but the index is 4".
+        let result = remove_extension_types(&substrait_schema, arrow_schema);
+        assert!(result.is_ok(), "remove_extension_types should succeed");
+
+        let (schema, _, mapping) = result.unwrap();
+        // All 3 fields should be kept (none are user-defined or placeholders).
+        assert_eq!(schema.r#struct.as_ref().unwrap().types.len(), 3);
+        // Index 0 (id) -> 0, index 1 (items) -> 1, index 2 (checkpoint) -> 2
+        assert_eq!(mapping.get(&0), Some(&0));
+        assert_eq!(mapping.get(&1), Some(&1));
+        assert_eq!(mapping.get(&2), Some(&2));
     }
 }
