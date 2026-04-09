@@ -50,31 +50,26 @@ fn max_conn_reset_retries() -> u16 {
 /// Maximum part size in GCS and S3: 5GB.
 const MAX_UPLOAD_PART_SIZE: usize = 1024 * 1024 * 1024 * 5;
 
-fn initial_upload_size() -> Result<usize> {
-    static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<std::result::Result<usize, String>> =
-        OnceLock::new();
-    LANCE_INITIAL_UPLOAD_SIZE
-        .get_or_init(|| {
-            let size = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(INITIAL_UPLOAD_STEP);
-            if size < INITIAL_UPLOAD_STEP {
-                Err(format!(
-                    "LANCE_INITIAL_UPLOAD_SIZE must be at least 5MB, got {} bytes",
-                    size
-                ))
-            } else if size > MAX_UPLOAD_PART_SIZE {
-                Err(format!(
-                    "LANCE_INITIAL_UPLOAD_SIZE must be at most 5GB, got {} bytes",
-                    size
-                ))
-            } else {
-                Ok(size)
-            }
-        })
-        .clone()
-        .map_err(Error::invalid_input)
+fn initial_upload_size() -> usize {
+    static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
+    *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
+        let Some(raw) = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            return INITIAL_UPLOAD_STEP;
+        };
+        let clamped = raw.clamp(INITIAL_UPLOAD_STEP, MAX_UPLOAD_PART_SIZE);
+        if clamped != raw {
+            // OnceLock caches the result, so this warning fires at most once per process.
+            tracing::warn!(
+                requested = raw,
+                clamped,
+                "LANCE_INITIAL_UPLOAD_SIZE must be between 5MB and 5GB; clamping to valid range"
+            );
+        }
+        clamped
+    })
 }
 
 /// Writer to an object in an object store.
@@ -169,7 +164,7 @@ impl UploadState {
 
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
-        let upload_size = initial_upload_size()?;
+        let upload_size = initial_upload_size();
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
