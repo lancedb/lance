@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import math
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -67,6 +66,7 @@ class IndicesBuilder:
         sample_rate: int = 256,
         max_iters: int = 50,
         fragment_ids: Optional[list[int]] = None,
+        target_partition_size: Optional[int] = None,
     ) -> IvfModel:
         """
         Train IVF centroids for the given vector column.
@@ -85,12 +85,14 @@ class IndicesBuilder:
         Parameters
         ----------
 
-        num_partitions: int
+        num_partitions: int, optional
+            Deprecated. Use ``target_partition_size`` instead.
+
             The number of partitions to train.  Large values are more expensive to
             train and can lead to longer search times.  Smaller values could lead to
-            overtraining, reduced recall, and require large nprobes values.  If not
-            specified the default will be the integer nearest the square root of the
-            number of rows.
+            overtraining, reduced recall, and require large nprobes values.  If both
+            ``num_partitions`` and ``target_partition_size`` are specified,
+            ``num_partitions`` takes precedence.
         distance_type: "l2" | "dot" | "cosine" | "hamming"
             The distance type to used.  This is defined in more detail in the LanceDB
             documentation on creating indices.
@@ -109,9 +111,26 @@ class IndicesBuilder:
             max_iters parameter defines a cutoff at which we terminate training.
         fragment_ids: list[int], optional
             If provided, train using only the specified fragments from the dataset.
+        target_partition_size: int, optional
+            The target number of rows per partition.  If set, the number of partitions
+            will be computed as ``num_rows // target_partition_size``, clamped to
+            [1, 4096].  If both ``num_partitions`` and ``target_partition_size`` are
+            specified, ``num_partitions`` takes precedence.
+            If neither is specified, a default target partition size of 8192 is used.
         """
         num_rows = self._count_rows(fragment_ids)
-        num_partitions = self._determine_num_partitions(num_partitions, num_rows)
+        if num_partitions is not None:
+            if target_partition_size is not None:
+                warnings.warn(
+                    "Both num_partitions and target_partition_size are specified. "
+                    "num_partitions takes precedence.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+        else:
+            num_partitions = self._determine_num_partitions(
+                target_partition_size, num_rows
+            )
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
         self._verify_ivf_params(num_partitions)
@@ -474,10 +493,22 @@ class IndicesBuilder:
         else:
             raise ValueError("filenames must be a list of strings")
 
-    def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
-        if num_partitions is None:
-            return round(math.sqrt(num_rows))
-        return num_partitions
+    @staticmethod
+    def _determine_num_partitions(
+        target_partition_size: Optional[int],
+        num_rows: int,
+    ) -> int:
+        """Compute num_partitions from target_partition_size.
+
+        Uses the same algorithm as Rust ``recommended_num_partitions``:
+        ``clamp(num_rows // target_partition_size, 1, 4096)``.
+
+        The default ``target_partition_size`` is 8192 (matching the Rust
+        default for IVF_PQ).
+        """
+        if target_partition_size is None:
+            target_partition_size = 8192
+        return max(1, min(num_rows // target_partition_size, 4096))
 
     def _count_rows(self, fragment_ids: Optional[list[int]] = None) -> int:
         if fragment_ids is None:

@@ -157,6 +157,33 @@ def test_num_partitions(rand_dataset):
     assert ivf.num_partitions == 10
 
 
+def test_target_partition_size(rand_dataset):
+    # NUM_ROWS = 30000, target_partition_size=10000 => 30000 // 10000 = 3
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        sample_rate=16, target_partition_size=10000
+    )
+    assert ivf.num_partitions == 3
+
+
+def test_target_partition_size_default(rand_dataset):
+    # When neither num_partitions nor target_partition_size is specified,
+    # default target_partition_size=8192 is used.
+    # NUM_ROWS = 30000 => 30000 // 8192 = 3
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
+    assert ivf.num_partitions == 3
+
+
+def test_num_partitions_overrides_target(rand_dataset):
+    # num_partitions takes precedence over target_partition_size
+    with pytest.warns(DeprecationWarning, match="num_partitions takes precedence"):
+        ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            num_partitions=5,
+            sample_rate=16,
+            target_partition_size=10000,
+        )
+    assert ivf.num_partitions == 5
+
+
 @pytest.fixture
 def rand_ivf(rand_dataset):
     dtype = rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
