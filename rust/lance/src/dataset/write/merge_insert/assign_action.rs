@@ -95,11 +95,10 @@ pub fn merge_insert_action(
             .map(|key| col(format!("source.\"{}\"", key)).is_not_null())
             .collect();
 
-        // Use AND to combine all key column checks (all must be non-null)
-        key_conditions
-            .into_iter()
-            .reduce(|acc, expr| acc.and(expr))
-            .unwrap_or_else(|| datafusion_expr::lit(false))
+        // Use AND to combine all key column checks (all must be non-null).
+        // Build a balanced tree to avoid O(n)-deep nesting that can overflow the
+        // stack when DataFusion recursively traverses the expression.
+        balanced_and(key_conditions).unwrap_or_else(|| datafusion_expr::lit(false))
     };
 
     let target_has_row = col("target._rowaddr").is_not_null();
@@ -171,4 +170,63 @@ pub fn merge_insert_action(
             .collect(),
         else_expr: Some(Box::new(Action::Nothing.as_literal_expr())),
     }))
+}
+
+/// Combines a list of expressions with AND into a balanced binary tree.
+///
+/// A naive left-fold (`a AND b AND c AND ...`) produces a tree of depth N,
+/// which can overflow the stack when DataFusion recursively traverses it.
+/// This function produces a tree of depth O(log N) instead.
+fn balanced_and(mut exprs: Vec<Expr>) -> Option<Expr> {
+    if exprs.is_empty() {
+        return None;
+    }
+    while exprs.len() > 1 {
+        let mut next = Vec::with_capacity((exprs.len() + 1) / 2);
+        let mut iter = exprs.into_iter();
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                next.push(left.and(right));
+            } else {
+                next.push(left);
+            }
+        }
+        exprs = next;
+    }
+    exprs.into_iter().next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_many_match_keys_does_not_overflow_stack() {
+        // Before the balanced-tree fix, building the action expression with many
+        // match keys produced a left-linear AND chain of depth N.  DataFusion's
+        // recursive traversal (Display, Clone, TreeNode, etc.) would then
+        // overflow the stack.  With the balanced tree the depth is O(log N).
+        let num_keys = 10_000;
+        let keys: Vec<String> = (0..num_keys).map(|i| format!("key_{i}")).collect();
+
+        let params = super::super::MergeInsertParams {
+            on: keys,
+            when_matched: crate::dataset::WhenMatched::UpdateAll,
+            insert_not_matched: true,
+            delete_not_matched_by_source: super::super::WhenNotMatchedBySource::Keep,
+            conflict_retries: 0,
+            retry_timeout: Duration::ZERO,
+            merged_generations: vec![],
+            skip_auto_cleanup: false,
+            use_index: false,
+            source_dedupe_behavior: super::super::SourceDedupeBehavior::default(),
+            commit_retries: None,
+        };
+
+        let expr = merge_insert_action(&params, None).expect("should build action expression");
+
+        // Force a recursive traversal — without the fix this SIGABRTs.
+        let _display = format!("{expr}");
+    }
 }
