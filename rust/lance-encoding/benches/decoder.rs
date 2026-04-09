@@ -541,6 +541,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
                                 false,
                                 false,
                                 rx,
+                                None,
                             )
                             .unwrap();
 

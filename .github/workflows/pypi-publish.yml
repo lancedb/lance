@@ -26,6 +26,9 @@ on:
       - ".github/workflows/build_windows_wheel/**"
       - ".github/workflows/upload_wheel/**"
 
+permissions:
+  contents: read
+
 jobs:
   linux:
     timeout-minutes: 60

@@ -570,3 +570,85 @@ pub fn to_java_float_obj<'local>(
         None => Ok(JObject::null()),
     }
 }
+
+pub fn to_java_double_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<f64>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(v) => Ok(env.new_object("java/lang/Double", "(D)V", &[JValue::Double(v)])?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_string_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<&str>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(v) => {
+            let jstr = env.new_string(v)?;
+            Ok(jstr.into())
+        }
+        None => Ok(JObject::null()),
+    }
+}
+
+/// Convert a DataFusion ScalarValue to a Java Comparable object.
+///
+/// Maps numeric types to their boxed Java equivalents (Long, Double)
+/// and string types to Java String. Null ScalarValues produce JObject::null().
+///
+/// This is useful for exposing index statistics (e.g., zonemap min/max)
+/// to Java clients in a type-safe, Comparable-compatible way.
+pub fn scalar_value_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    value: &datafusion_common::ScalarValue,
+) -> Result<JObject<'a>> {
+    use datafusion_common::ScalarValue;
+
+    match value {
+        ScalarValue::Null => Ok(JObject::null()),
+
+        ScalarValue::Boolean(v) => to_java_boolean_obj(env, *v),
+
+        // Integer types → Java Long
+        ScalarValue::Int8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int64(v) => to_java_long_obj(env, *v),
+        ScalarValue::UInt8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        // UInt64 may overflow i64, but for min/max stats this is acceptable
+        ScalarValue::UInt64(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+
+        // Float types → Java Double
+        ScalarValue::Float16(v) => to_java_double_obj(env, v.map(|x| f64::from(x.to_f32()))),
+        ScalarValue::Float32(v) => to_java_double_obj(env, v.map(|x| x as f64)),
+        ScalarValue::Float64(v) => to_java_double_obj(env, *v),
+
+        // String types → Java String
+        ScalarValue::Utf8(v) => to_java_string_obj(env, v.as_deref()),
+        ScalarValue::LargeUtf8(v) => to_java_string_obj(env, v.as_deref()),
+
+        // Date types → Java Long
+        ScalarValue::Date32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Date64(v) => to_java_long_obj(env, *v),
+
+        // Timestamp types → Java Long
+        ScalarValue::TimestampSecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampMillisecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampMicrosecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampNanosecond(v, _) => to_java_long_obj(env, *v),
+
+        // For any unsupported type, return null (conservative: caller will skip)
+        _ => {
+            log::warn!(
+                "Unsupported ScalarValue type for Java conversion: {:?}",
+                value.data_type()
+            );
+            Ok(JObject::null())
+        }
+    }
+}

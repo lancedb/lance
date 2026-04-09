@@ -57,7 +57,7 @@ impl IndicesNormalizer {
         }
     }
 
-    fn extend(&mut self, new_indices: &PrimitiveArray<UInt64Type>, is_start: bool) {
+    fn extend(&mut self, new_indices: &PrimitiveArray<UInt64Type>, is_start: bool) -> Result<()> {
         let mut last = *self.indices.last().unwrap();
         if is_start {
             let (is_valid, val) = self.normalize(new_indices.value(0));
@@ -66,14 +66,25 @@ impl IndicesNormalizer {
             last += val;
         }
         let mut prev = self.normalize(*new_indices.values().first().unwrap()).1;
-        for w in new_indices.values().windows(2) {
+        for (i, w) in new_indices.values().windows(2).enumerate() {
             let (is_valid, val) = self.normalize(w[1]);
-            let next = val - prev + last;
+            let next = match val.checked_sub(prev) {
+                Some(delta) => delta + last,
+                None => {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "corrupt binary page: normalized offset {} is less than previous offset {} \
+                             at index {}, null_adjustment={}, raw values were [{}, {}]. \
+                             This usually indicates the file data has been corrupted.",
+                        val, prev, i, self.null_adjustment, w[0], w[1]
+                    )));
+                }
+            };
             self.indices.push(next);
             self.validity.append(is_valid);
             prev = val;
             last = next;
         }
+        Ok(())
     }
 
     fn into_parts(mut self) -> (Vec<u64>, BooleanBuffer) {
@@ -201,11 +212,12 @@ impl PageScheduler for BinaryPageScheduler {
                 let last = indices_builder
                     .normalize(*curr_indices.values().last().unwrap())
                     .1;
+
                 if first != last {
                     bytes_ranges.push(first..last);
                 }
 
-                indices_builder.extend(&curr_indices, row_start == 0);
+                indices_builder.extend(&curr_indices, row_start == 0)?;
             }
 
             let (indices, validity) = indices_builder.into_parts();

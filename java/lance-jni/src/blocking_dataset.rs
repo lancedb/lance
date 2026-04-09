@@ -3072,3 +3072,196 @@ fn inner_get_session_handle(env: &mut JNIEnv, java_dataset: JObject) -> Result<j
     let session = dataset_guard.inner.session();
     Ok(handle_from_session(session))
 }
+
+/////////////////////////////////
+// Zonemap Stats Methods       //
+/////////////////////////////////
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetZonemapStats<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    jcolumn_name: JString,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_get_zonemap_stats(&mut env, java_dataset, jcolumn_name)
+    )
+}
+
+fn inner_get_zonemap_stats<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    jcolumn_name: JString,
+) -> Result<JObject<'local>> {
+    use arrow_array::Array;
+    use datafusion_common::ScalarValue;
+    use lance::dataset::index::LanceIndexStoreExt;
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::IndexStore;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+
+    let column_name: String = jcolumn_name.extract(env)?;
+
+    // 1. Get the dataset and find the zonemap index for this column
+    let zonemap_data = {
+        let dataset = {
+            let dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+            }?;
+            dataset_guard.inner.clone()
+        };
+        // Guard is dropped here — dataset is owned
+
+        // Find the field for the requested column (validates it exists)
+        dataset.schema().field(&column_name).ok_or_else(|| {
+            Error::input_error(format!(
+                "Column '{}' not found in dataset schema",
+                column_name
+            ))
+        })?;
+
+        // Do all async work in a single block_on call to avoid nested runtime issues
+        RT.block_on(async {
+            // Find the zonemap index for this column using describe_indices
+            let descriptions = dataset
+                .describe_indices(Some(lance_index::IndexCriteria {
+                    for_column: Some(&column_name),
+                    has_name: None,
+                    must_support_fts: false,
+                    must_support_exact_equality: false,
+                }))
+                .await
+                .map_err(Error::from)?;
+
+            let zonemap_desc = descriptions
+                .iter()
+                .find(|desc| desc.index_type().to_lowercase().contains("zonemap"));
+
+            match zonemap_desc {
+                Some(desc) => {
+                    let indices = dataset.load_indices().await.map_err(Error::from)?;
+                    let index_meta = indices.iter().find(|idx| idx.name == desc.name());
+                    match index_meta {
+                        Some(index) => {
+                            let index_store = Arc::new(
+                                LanceIndexStore::from_dataset_for_existing(&dataset, index)
+                                    .map_err(Error::from)?,
+                            );
+                            let index_file = index_store
+                                .open_index_file("zonemap.lance")
+                                .await
+                                .map_err(Error::from)?;
+                            let record_batch = index_file
+                                .read_range(0..index_file.num_rows(), None)
+                                .await
+                                .map_err(Error::from)?;
+                            Ok::<_, Error>(Some(record_batch))
+                        }
+                        None => Ok(None),
+                    }
+                }
+                None => Ok(None),
+            }
+        })?
+    };
+
+    // 3. Convert the RecordBatch to a Java ArrayList<ZoneStats>
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+
+    let record_batch = match zonemap_data {
+        Some(batch) => batch,
+        None => return Ok(array_list), // empty list if no zonemap index
+    };
+
+    if record_batch.num_rows() == 0 {
+        return Ok(array_list);
+    }
+
+    let min_col = record_batch
+        .column_by_name("min")
+        .ok_or_else(|| Error::input_error("ZoneMap index file missing 'min' column".to_string()))?;
+    let max_col = record_batch
+        .column_by_name("max")
+        .ok_or_else(|| Error::input_error("ZoneMap index file missing 'max' column".to_string()))?;
+    let null_count_col = record_batch
+        .column_by_name("null_count")
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap index file missing 'null_count' column".to_string())
+        })?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap 'null_count' column is not UInt32".to_string())
+        })?;
+    let fragment_id_col = record_batch
+        .column_by_name("fragment_id")
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap index file missing 'fragment_id' column".to_string())
+        })?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap 'fragment_id' column is not UInt64".to_string())
+        })?;
+    let zone_start_col = record_batch
+        .column_by_name("zone_start")
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap index file missing 'zone_start' column".to_string())
+        })?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap 'zone_start' column is not UInt64".to_string())
+        })?;
+    let zone_length_col = record_batch
+        .column_by_name("zone_length")
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap index file missing 'zone_length' column".to_string())
+        })?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .ok_or_else(|| {
+            Error::input_error("ZoneMap 'zone_length' column is not UInt64".to_string())
+        })?;
+
+    for i in 0..record_batch.num_rows() {
+        let fragment_id = fragment_id_col.value(i) as i32;
+        let zone_start = zone_start_col.value(i) as i64;
+        let zone_length = zone_length_col.value(i) as i64;
+        let null_count = null_count_col.value(i) as i64;
+
+        // Convert min/max ScalarValues to Java Comparable objects
+        let min_scalar = ScalarValue::try_from_array(min_col, i).map_err(|e| {
+            Error::input_error(format!("Failed to read min value at row {}: {}", i, e))
+        })?;
+        let max_scalar = ScalarValue::try_from_array(max_col, i).map_err(|e| {
+            Error::input_error(format!("Failed to read max value at row {}: {}", i, e))
+        })?;
+
+        let j_min = crate::utils::scalar_value_to_java(env, &min_scalar)?;
+        let j_max = crate::utils::scalar_value_to_java(env, &max_scalar)?;
+
+        let zone_stats = env.new_object(
+            "org/lance/index/scalar/ZoneStats",
+            "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;J)V",
+            &[
+                JValue::Int(fragment_id),
+                JValue::Long(zone_start),
+                JValue::Long(zone_length),
+                JValue::Object(&j_min),
+                JValue::Object(&j_max),
+                JValue::Long(null_count),
+            ],
+        )?;
+
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&zone_stats)],
+        )?;
+    }
+
+    Ok(array_list)
+}

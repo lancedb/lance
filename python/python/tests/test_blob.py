@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import importlib
 import io
 import subprocess
 import sys
@@ -10,7 +11,9 @@ import textwrap
 import lance
 import pyarrow as pa
 import pytest
-from lance import Blob, BlobColumn, DatasetBasePath
+from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+
+lance_dataset_module = importlib.import_module("lance.dataset")
 
 
 def test_blob_read_from_binary():
@@ -544,3 +547,119 @@ def test_blob_extension_take_blobs_multi_base(payload, is_dataset_root, tmp_path
     assert len(blobs) == 1
     with blobs[0] as f:
         assert f.read() == payload
+
+
+@pytest.fixture
+def dataset_for_pandas_blob_tests(tmp_path):
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "blob": pa.array([b"hello", None, b"world"], pa.large_binary()),
+            "bin": pa.array([b"x", b"y", b"z"], pa.large_binary()),
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field(
+                    "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+                pa.field("bin", pa.large_binary()),
+            ]
+        ),
+    )
+    return lance.write_dataset(table, tmp_path / "blob_pandas_ds")
+
+
+def test_dataset_to_pandas_blob_lazy(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.to_pandas()
+
+    assert list(df.columns) == ["id", "blob", "bin"]
+    assert isinstance(df.iloc[0]["blob"], BlobFile)
+    assert df.iloc[1]["blob"] is None
+    assert isinstance(df.iloc[2]["blob"], BlobFile)
+    assert df["bin"].tolist() == [b"x", b"y", b"z"]
+    assert [df.iloc[0]["blob"].readall(), df.iloc[2]["blob"].readall()] == [
+        b"hello",
+        b"world",
+    ]
+
+
+def test_dataset_to_pandas_blob_bytes(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.to_pandas(blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob", "bin"]
+    assert df["blob"].tolist() == [b"hello", None, b"world"]
+    assert df["bin"].tolist() == [b"x", b"y", b"z"]
+
+
+def test_dataset_to_pandas_blob_descriptions(dataset_for_pandas_blob_tests):
+    descriptions_df = dataset_for_pandas_blob_tests.to_pandas(blob_mode="descriptions")
+    table_df = dataset_for_pandas_blob_tests.to_table().to_pandas()
+
+    assert descriptions_df.equals(table_df)
+
+
+def test_scanner_to_pandas_blob_alias(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.scanner(
+        columns={"video": "blob", "id": "id"}
+    ).to_pandas()
+
+    assert list(df.columns) == ["video", "id"]
+    assert isinstance(df.iloc[0]["video"], BlobFile)
+    assert df.iloc[1]["video"] is None
+    assert df.iloc[2]["video"].readall() == b"world"
+
+
+def test_scanner_to_pandas_blob_filter_limit_order(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.scanner(
+        columns=["id", "blob"],
+        filter="id > 1",
+        limit=1,
+        order_by=["id"],
+    ).to_pandas(blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df["id"].tolist() == [2]
+    assert df["blob"].tolist() == [None]
+
+
+def test_scanner_to_pandas_blob_empty_result(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.scanner(
+        columns=["id", "blob"], filter="id > 10"
+    ).to_pandas()
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df.empty
+
+
+def test_fragment_to_pandas_blob(dataset_for_pandas_blob_tests):
+    fragment = dataset_for_pandas_blob_tests.get_fragments()[0]
+    df = fragment.to_pandas(columns=["id", "blob"], blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df["blob"].tolist() == [b"hello", None, b"world"]
+
+
+def test_dataset_to_pandas_invalid_blob_mode(dataset_for_pandas_blob_tests):
+    with pytest.raises(ValueError, match="blob_mode must be one of"):
+        dataset_for_pandas_blob_tests.to_pandas(blob_mode="inline")
+
+
+def test_blob_column_sources_rejects_unmappable_transform(
+    dataset_for_pandas_blob_tests,
+):
+    projected_schema = pa.schema(
+        [
+            pa.field(
+                "video",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            )
+        ]
+    )
+    snapshot = {"_columns_with_transform": (("video", "concat(blob, blob)"),)}
+
+    with pytest.raises(NotImplementedError, match="direct blob column references"):
+        lance_dataset_module._blob_column_sources(
+            projected_schema, snapshot, dataset_for_pandas_blob_tests.schema
+        )

@@ -97,6 +97,20 @@ impl FileFragment {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (dataset, path, base_id=None))]
+    fn create_data_file(
+        dataset: &Dataset,
+        path: &str,
+        base_id: Option<u32>,
+    ) -> PyResult<PyLance<DataFile>> {
+        let ds = dataset.ds.clone();
+        let data_file = rt()
+            .block_on(None, ds.create_data_file(path, base_id))?
+            .infer_error()?;
+        Ok(PyLance(data_file))
+    }
+
+    #[staticmethod]
     #[pyo3(signature = (dataset_uri, fragment_id, reader, **kwargs))]
     fn create(
         dataset_uri: &str,

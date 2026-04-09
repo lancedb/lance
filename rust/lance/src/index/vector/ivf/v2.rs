@@ -1652,10 +1652,9 @@ mod tests {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
-        assert_eq!(
-            final_ctx.num_partitions(),
-            3,
-            "Expected partition split to increase partitions from 2 to 3 for {}, got stats: {}",
+        assert!(
+            final_ctx.num_partitions() >= 3,
+            "Expected partition split to increase partitions beyond 2 for {}, got stats: {}",
             description,
             final_ctx.stats_json()
         );
@@ -1730,6 +1729,51 @@ mod tests {
 
     async fn append_constant_vector(dataset: &mut Dataset, rows: usize, template: &[f32]) {
         append_constant_vector_with_params(dataset, rows, template, None).await;
+    }
+
+    async fn append_partition_templates(
+        dataset: &mut Dataset,
+        rows_per_template: usize,
+        templates: &[Vec<f32>],
+    ) {
+        assert!(
+            !templates.is_empty(),
+            "at least one template is required for append"
+        );
+        for template in templates {
+            assert_eq!(
+                template.len(),
+                DIM,
+                "Template vector should have {} dimensions",
+                DIM
+            );
+        }
+
+        let start_id = dataset.count_all_rows().await.unwrap() as u64;
+        let total_rows = rows_per_template * templates.len();
+        let ids = Arc::new(UInt64Array::from_iter_values(
+            start_id..start_id + total_rows as u64,
+        ));
+        let mut appended_values = Vec::with_capacity(total_rows * DIM);
+        for template in templates {
+            for _ in 0..rows_per_template {
+                appended_values.extend_from_slice(template);
+            }
+        }
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(appended_values),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors]).unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        dataset.append(batches, None).await.unwrap();
     }
 
     async fn append_constant_vector_with_params(
@@ -4596,6 +4640,119 @@ mod tests {
         // Split triggers when partition_size > 4 * 8192 = 32,768
         let params = VectorIndexParams::ivf_pq(2, 8, DIM / 8, DistanceType::Cosine, 50);
         verify_partition_split_after_append(dataset, test_uri, params, "multivector data").await;
+    }
+
+    #[tokio::test]
+    async fn test_split_multiple_partitions_in_one_optimize() {
+        const INDEX_NAME: &str = "vector_idx";
+        const BASE_ROWS_PER_PARTITION: usize = 512;
+        const APPEND_ROWS_PER_PARTITION: usize = 40_000;
+        let offsets = [-50.0, 50.0];
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (batch, schema) = generate_clustered_batch(BASE_ROWS_PER_PARTITION, offsets);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let centroids = build_centroids_for_offsets(&offsets);
+        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let initial_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(initial_ctx.num_partitions(), 2);
+        let mut templates = Vec::with_capacity(2);
+        for partition_idx in 0..2 {
+            let row_ids = load_partition_row_ids(initial_ctx.ivf(), partition_idx).await;
+            let template_batch = dataset
+                .take_rows(&[row_ids[0]], dataset.schema().clone())
+                .await
+                .unwrap();
+            templates.push(
+                template_batch["vector"]
+                    .as_fixed_size_list()
+                    .value(0)
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .to_vec(),
+            );
+        }
+
+        append_partition_templates(&mut dataset, APPEND_ROWS_PER_PARTITION, &templates).await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            final_ctx.num_partitions(),
+            4,
+            "Expected both original partitions to split in one optimize, stats: {}",
+            final_ctx.stats_json()
+        );
+
+        let indices = final_ctx.stats()["indices"]
+            .as_array()
+            .expect("indices should be present");
+        assert_eq!(
+            indices.len(),
+            1,
+            "Expected split optimize to merge into one index, stats: {}",
+            final_ctx.stats_json()
+        );
+
+        let partitions = indices[0]["partitions"]
+            .as_array()
+            .expect("partitions should be present");
+        assert_eq!(partitions.len(), 4);
+        let expected_rows = 2 * BASE_ROWS_PER_PARTITION + 2 * APPEND_ROWS_PER_PARTITION;
+        let total_partition_rows = partitions
+            .iter()
+            .map(|part| part["size"].as_u64().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(total_partition_rows, expected_rows);
+        assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);
+
+        let nearest = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", &Float32Array::from(templates[0].clone()), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = nearest[ROW_ID].as_primitive::<UInt64Type>();
+        let mut seen = HashSet::new();
+        for row_id in ids.values() {
+            assert!(seen.insert(*row_id), "Duplicate row id found: {}", row_id);
+        }
     }
 
     #[tokio::test]

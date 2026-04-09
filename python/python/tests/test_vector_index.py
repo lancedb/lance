@@ -219,24 +219,25 @@ def test_create_index_progress_callback_vector(tmp_path):
     assert merge_progress[-1] == 4
 
 
-def test_create_index_progress_callback_error_after_completion_is_ignored(tmp_path):
+def test_create_index_progress_callback_error_before_completion_propagates(tmp_path):
     ds = _make_sample_dataset_base(
         tmp_path, "vector_progress_post_commit_error", 1500, 128
     )
-    recorder = ProgressRecorder(fail_on_tag="complete:merge_partitions")
+    recorder = ProgressRecorder(fail_on_tag="start:train_ivf")
 
-    ds.create_index(
-        column="vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=4,
-        progress_callback=recorder,
-    )
+    with pytest.raises(RuntimeError, match="progress callback failure"):
+        ds.create_index(
+            column="vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=4,
+            progress_callback=recorder,
+        )
 
     tags = progress_event_tags(recorder.events)
-    assert tags[-1] == "complete:merge_partitions"
-    assert ds.has_index
-    assert ds.describe_indices()[0].field_names == ["vector"]
+    assert tags == ["start:train_ivf"]
+    assert not ds.has_index
+    assert ds.describe_indices() == []
 
 
 def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch):

@@ -69,7 +69,7 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    IndexParams, IndexType,
+    FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
@@ -2092,9 +2092,21 @@ impl Dataset {
         Ok(())
     }
 
-    fn prewarm_index(&self, name: &str) -> PyResult<()> {
-        rt().block_on(None, self.ds.prewarm_index(name))?
-            .infer_error()
+    #[pyo3(signature = (name, *, with_position = false))]
+    fn prewarm_index(&self, name: &str, with_position: bool) -> PyResult<()> {
+        rt().block_on(None, async {
+            if with_position {
+                self.ds
+                    .prewarm_index_with_options(
+                        name,
+                        &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+                    )
+                    .await
+            } else {
+                self.ds.prewarm_index(name).await
+            }
+        })?
+        .infer_error()
     }
 
     #[pyo3(signature = (index_uuid, index_type, batch_readhead=None, progress_callback=None))]

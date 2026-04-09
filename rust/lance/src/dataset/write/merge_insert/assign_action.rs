@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{MergeInsertParams, WhenNotMatchedBySource};
+use super::{MERGE_SOURCE_SENTINEL, MergeInsertParams, WhenNotMatchedBySource};
 use crate::{Result, dataset::WhenMatched};
 use datafusion::common::{
     Column, TableReference,
@@ -78,36 +78,21 @@ pub fn merge_insert_action(
     params: &MergeInsertParams,
     schema: Option<&arrow_schema::Schema>,
 ) -> Result<Expr> {
-    // Check that at least one key column is non-null in the source
-    // This ensures we only process rows that have valid join keys
-    // Note: Column names are wrapped in double quotes to preserve case
-    // (DataFusion's col() function lowercases unquoted identifiers)
-    let source_has_key: Expr = if params.on.len() == 1 {
-        // Single key column case - check if the source key column is not null
-        // Need to qualify the column to avoid ambiguity between target.key and source.key
-        col(format!("source.\"{}\"", &params.on[0])).is_not_null()
-    } else {
-        // Multiple key columns - require that ALL key columns are non-null
-        // This is a stricter requirement than "at least one" to ensure proper joins
-        let key_conditions: Vec<Expr> = params
-            .on
-            .iter()
-            .map(|key| col(format!("source.\"{}\"", key)).is_not_null())
-            .collect();
-
-        // Use AND to combine all key column checks (all must be non-null)
-        key_conditions
-            .into_iter()
-            .reduce(|acc, expr| acc.and(expr))
-            .unwrap_or_else(|| datafusion_expr::lit(false))
-    };
+    // Use a sentinel column to detect whether the source side contributed a row to the
+    // join output.  This is NULL-safe: the sentinel is `true` for every source row and
+    // is NULL-filled by the outer join for target-only rows, regardless of whether any
+    // ON column contains NULL.  Using ON key columns for this purpose is incorrect
+    // because a key column that is legitimately NULL is indistinguishable from a NULL
+    // introduced by the outer join on the target side.
+    let source_has_row = col(format!("source.\"{}\"", MERGE_SOURCE_SENTINEL)).is_not_null();
 
     let target_has_row = col("target._rowaddr").is_not_null();
-    let matched = source_has_key.clone().and(target_has_row.clone());
+    let matched = source_has_row.clone().and(target_has_row.clone());
 
-    let source_only = source_has_key.clone().and(col("target._rowaddr").is_null());
+    let source_only = source_has_row.and(col("target._rowaddr").is_null());
 
-    let target_only = target_has_row.and(source_has_key.is_not_true());
+    let target_only =
+        target_has_row.and(col(format!("source.\"{}\"", MERGE_SOURCE_SENTINEL)).is_null());
 
     let mut cases = vec![];
 

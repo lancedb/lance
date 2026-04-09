@@ -6,9 +6,11 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::ROW_ID;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::index::vector::VectorIndexParams;
+use crate::session::Session;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -37,6 +39,7 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
+use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -1774,6 +1777,181 @@ async fn test_fts_phrase_query() {
         .await
         .unwrap();
     assert_eq!(result.num_rows(), 0);
+}
+
+async fn open_dataset_with_fresh_session(uri: &str) -> Dataset {
+    DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(Session::new(1 << 20, 1 << 20, Default::default())))
+        .load()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_fts_prewarm_with_position_controls_phrase_query_cache() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search",
+        "lance search with tail",
+        "phrase query",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    dataset.prewarm_index("fts_idx").await.unwrap();
+    let cache_entries_after_prewarm = dataset.index_cache_entry_count().await;
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+    let cache_entries_after_query = dataset.index_cache_entry_count().await;
+    assert!(
+        cache_entries_after_query > cache_entries_after_prewarm,
+        "phrase query should populate positions cache when prewarm skipped positions"
+    );
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap();
+    let cache_entries_after_prewarm = dataset.index_cache_entry_count().await;
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+    let cache_entries_after_query = dataset.index_cache_entry_count().await;
+    assert_eq!(
+        cache_entries_after_query, cache_entries_after_prewarm,
+        "phrase query should not add cache entries after prewarming positions"
+    );
+}
+
+#[tokio::test]
+async fn test_prewarm_index_with_position_validation() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search",
+        "phrase query",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    let err = dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_contains!(
+        err,
+        "cannot prewarm positions for an inverted index that was built without positions"
+    );
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let batch = RecordBatch::try_from_iter(vec![(
+        "id",
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+    )])
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    let err = dataset
+        .prewarm_index_with_options("id_idx", &PrewarmOptions::Fts(FtsPrewarmOptions::default()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_contains!(
+        err,
+        "FTS prewarm options are only supported for inverted indices"
+    );
 }
 
 #[tokio::test]

@@ -293,7 +293,7 @@ def test_create_inverted_index_progress_callback(tmp_path):
 
     tokenize_progress = stage_progress_values(progress_recorder.events, "tokenize_docs")
     assert tokenize_progress
-    assert tokenize_progress[-1] == ds.count_rows()
+    assert max(tokenize_progress) == ds.count_rows()
 
     assert "progress:copy_partitions" in tags
     assert "progress:write_metadata" in tags
@@ -2466,6 +2466,37 @@ def test_index_prewarm(tmp_path: Path):
         scan_stats_callback=scan_stats_callback, full_text_query="word"
     ).to_table()
     assert scan_stats.parts_loaded == 0
+
+    phrase_path = tmp_path / "phrase"
+    phrase_table = pa.table(
+        {
+            "fts": ["word word" for _ in range(test_table_size)],
+        }
+    )
+    ds = lance.write_dataset(phrase_table, phrase_path)
+    ds.create_scalar_index("fts", index_type="INVERTED", with_position=True)
+
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx")
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query > cache_entries_after_prewarm
+
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx", with_position=True)
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query == cache_entries_after_prewarm
+
+    with pytest.raises(
+        TypeError,
+        match="takes 2 positional arguments",
+    ):
+        ds.prewarm_index("fts_idx", True)
 
 
 def test_btree_prewarm(tmp_path: Path):

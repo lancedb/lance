@@ -33,7 +33,7 @@ pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::expression::{
     IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
 };
-use lance_index::scalar::inverted::InvertedIndexPlugin;
+use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{CreatedIndex, ScalarIndex};
@@ -44,7 +44,7 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
+use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
@@ -777,6 +777,41 @@ impl DatasetIndexExt for Dataset {
                 .open_generic_index(name, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
                 .await?;
             index.prewarm().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn prewarm_index_with_options(&self, name: &str, options: &PrewarmOptions) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", name)));
+        }
+
+        for index_meta in indices {
+            let index = self
+                .open_generic_index(name, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+                .await?;
+
+            match options {
+                PrewarmOptions::Fts(fts_options) => {
+                    let inverted = index
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "FTS prewarm options are only supported for inverted indices, got {:?}",
+                                index.index_type()
+                            ))
+                        })?;
+                    inverted.prewarm_with_options(fts_options).await?;
+                }
+                _ => {
+                    return Err(Error::not_supported(
+                        "unsupported prewarm options for this lance version".to_owned(),
+                    ));
+                }
+            }
         }
 
         Ok(())

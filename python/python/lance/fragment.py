@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Iterator,
@@ -249,6 +250,36 @@ class DataFile:
             DeprecationWarning,
         )
         return self.fields
+
+    @classmethod
+    def create(
+        cls,
+        dataset: "LanceDataset",
+        path: str,
+        *,
+        base_id: Optional[int] = None,
+    ) -> "DataFile":
+        """Create a DataFile by reading metadata from an existing lance file.
+
+        This is a convenience method for creating DataFile metadata needed
+        for operations like DataReplacement. It opens the file, reads its
+        schema and version information, matches columns to the dataset's
+        schema to determine field IDs, and calculates column indices.
+
+        Parameters
+        ----------
+        dataset : LanceDataset
+            The dataset this file will belong to.
+        path : str
+            The path to the data file, relative to the dataset's data directory.
+        base_id : int, optional
+            The base path ID if the file is outside the dataset directory.
+
+        Returns
+        -------
+        DataFile
+        """
+        return _Fragment.create_data_file(dataset._ds, path, base_id=base_id)
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -501,7 +532,40 @@ class LanceFragment(pa.dataset.Fragment):
         )
         from .dataset import LanceScanner
 
-        return LanceScanner(s, self._ds)
+        snapshot = {
+            "_limit": limit,
+            "_filter": filter_str,
+            "_search_filter": None,
+            "_substrait_filter": None,
+            "_prefilter": False,
+            "_late_materialization": None,
+            "_blob_handling": blob_handling,
+            "_offset": offset,
+            "_columns": tuple(columns) if isinstance(columns, list) else None,
+            "_columns_with_transform": (
+                tuple(columns.items()) if isinstance(columns, dict) else None
+            ),
+            "_nearest": None,
+            "_batch_size": batch_size,
+            "_io_buffer_size": None,
+            "_batch_readahead": batch_readahead,
+            "_fragment_readahead": None,
+            "_scan_in_order": True,
+            "_fragments": (self._fragment,),
+            "_with_row_id": with_row_id,
+            "_with_row_address": with_row_address,
+            "_use_stats": True,
+            "_fast_search": False,
+            "_full_text_query": None,
+            "_use_scalar_index": None,
+            "_include_deleted_rows": None,
+            "_scan_stats_callback": None,
+            "_strict_batch_size": False,
+            "_orderings": tuple(order_by) if order_by is not None else None,
+            "_disable_scoring_autoprojection": False,
+            "_substrait_aggregate": None,
+        }
+        return LanceScanner(s, self._ds, snapshot=snapshot)
 
     def open_session(
         self,
@@ -584,6 +648,44 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
         ).to_table()
+
+    def to_pandas(
+        self,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        with_row_id: bool = False,
+        with_row_address: bool = False,
+        blob_mode: str = "lazy",
+        order_by: Optional[List[ColumnOrdering]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Read this fragment into a :py:class:`pandas.DataFrame`.
+
+        Parameters are the same as :meth:`to_table`, except pandas export uses
+        ``blob_mode`` instead of Arrow-facing ``blob_handling``.
+
+        Parameters
+        ----------
+        blob_mode: str, default "lazy"
+            Controls how blob columns are returned.
+
+            - ``"lazy"``: return :class:`lance.BlobFile` objects
+            - ``"bytes"``: return Python ``bytes``
+            - ``"descriptions"``: preserve ``to_table().to_pandas()`` behavior
+        **kwargs
+            Forwarded to :meth:`pyarrow.Table.to_pandas` for non-blob columns.
+        """
+        return self.scanner(
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
+            with_row_address=with_row_address,
+            order_by=order_by,
+        ).to_pandas(blob_mode=blob_mode, **kwargs)
 
     def merge(
         self,

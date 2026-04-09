@@ -5,10 +5,15 @@ on:
     - cron: "0 0 * * *" # Runs every day at midnight UTC
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   run:
     runs-on: ubuntu-24.04
     if: github.repository == 'lancedb/lance'
+    permissions:
+      actions: write
     steps:
       - name: Nightly Run File Verification Workflow
         uses: benc-uk/workflow-dispatch@7a027648b88c2413826b6ddd6c76114894dc5ec4 # v1

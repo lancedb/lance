@@ -62,7 +62,6 @@ use super::{
     builder::{InnerBuilder, PositionRecorder},
     iter::CompressedPostingListIterator,
 };
-use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
@@ -72,6 +71,7 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
+use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
@@ -761,20 +761,8 @@ impl Index for InvertedIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let io_parallelism = self.store.io_parallelism();
-        let prewarm_futures = self
-            .partitions
-            .iter()
-            .map(Arc::clone)
-            .map(|part| async move {
-                part.inverted_list.prewarm().await?;
-                Result::Ok(())
-            });
-        stream::iter(prewarm_futures)
-            .buffer_unordered(io_parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(())
+        self.prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
     }
 
     fn index_type(&self) -> crate::IndexType {
@@ -787,6 +775,25 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
+    pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
+        let with_position = options.with_position;
+        let io_parallelism = self.store.io_parallelism();
+        let prewarm_futures = self
+            .partitions
+            .iter()
+            .map(Arc::clone)
+            .map(|part| async move {
+                part.inverted_list
+                    .prewarm_posting_lists(with_position)
+                    .await?;
+                Result::Ok(())
+            });
+        stream::iter(prewarm_futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
@@ -1670,7 +1677,7 @@ impl PostingListReader {
             .as_ref()
             .clone();
 
-        if is_phrase_query {
+        if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
             let positions = self.read_positions(token_id).await?;
             posting.set_positions(positions);
@@ -1748,9 +1755,15 @@ impl PostingListReader {
         Ok(posting_lists)
     }
 
-    async fn prewarm(&self) -> Result<()> {
+    async fn prewarm_posting_lists(&self, with_position: bool) -> Result<()> {
+        if with_position && !self.has_positions() {
+            return Err(Error::invalid_input(
+                "cannot prewarm positions for an inverted index that was built without positions; recreate the index with with_position=true".to_owned(),
+            ));
+        }
+
         let read_batch_start = Instant::now();
-        let batch = self.read_batch(false).await?;
+        let batch = self.read_batch(with_position).await?;
         let read_batch_elapsed = read_batch_start.elapsed();
 
         let legacy_layout = self.offsets.is_some();
@@ -1774,7 +1787,12 @@ impl PostingListReader {
                 "Failed to build prewarm posting lists in blocking task: {err}"
             ))
         })??;
-        for (token_id, posting_list) in posting_lists {
+        for (token_id, mut posting_list) in posting_lists {
+            if with_position && let Some(positions) = posting_list.take_positions() {
+                self.index_cache
+                    .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                    .await;
+            }
             self.index_cache
                 .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
                 .await;
@@ -1783,6 +1801,7 @@ impl PostingListReader {
 
         info!(
             legacy_layout,
+            with_position,
             token_count = self.len(),
             read_batch_ms = read_batch_elapsed.as_secs_f64() * 1000.0,
             post_read_loop_ms = populate_elapsed.as_secs_f64() * 1000.0,
@@ -2084,6 +2103,16 @@ impl PostingList {
             Self::Compressed(posting) => {
                 posting.positions = Some(positions);
             }
+        }
+    }
+
+    pub fn take_positions(&mut self) -> Option<CompressedPositionStorage> {
+        match self {
+            Self::Plain(posting) => posting
+                .positions
+                .take()
+                .map(CompressedPositionStorage::LegacyPerDoc),
+            Self::Compressed(posting) => posting.positions.take(),
         }
     }
 
@@ -4827,7 +4856,7 @@ mod tests {
             "test should use modern posting layout"
         );
 
-        inverted_list.prewarm().await.unwrap();
+        inverted_list.prewarm_posting_lists(false).await.unwrap();
 
         let alpha = inverted_list
             .index_cache
@@ -4853,6 +4882,99 @@ mod tests {
             "prewarm should not leave cached posting lists sharing the same values buffer"
         );
     }
+
+    #[tokio::test]
+    async fn test_prewarm_with_positions_populates_separate_position_cache() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V1,
+        );
+        builder.tokens.add("hello".to_owned());
+        builder.tokens.add("world".to_owned());
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                PostingTailCodec::Fixed32,
+            ));
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                PostingTailCodec::Fixed32,
+            ));
+        builder.posting_lists[0].add(0, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(0, PositionRecorder::Position(vec![1].into()));
+        builder.posting_lists[0].add(1, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(1, PositionRecorder::Position(vec![2].into()));
+        builder.docs.append(100, 2);
+        builder.docs.append(101, 2);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::new().with_position(true))
+            .await
+            .unwrap();
+
+        let inverted_list = &index.partitions[0].inverted_list;
+        let posting = inverted_list
+            .index_cache
+            .get_with_key(&PostingListKey { token_id: 0 })
+            .await
+            .unwrap();
+        assert!(
+            !posting.has_position(),
+            "posting cache should remain positions-free after prewarm"
+        );
+
+        let positions = inverted_list
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                positions.as_ref().0,
+                CompressedPositionStorage::LegacyPerDoc(_)
+            ),
+            "positions should be stored in the dedicated position cache"
+        );
+    }
+
     #[test]
     fn test_block_max_scores_capacity_matches_block_count() {
         let mut docs = DocSet::default();

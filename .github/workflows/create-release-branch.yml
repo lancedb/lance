@@ -14,6 +14,9 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
 jobs:
   create-release-branch:
     runs-on: ubuntu-latest
