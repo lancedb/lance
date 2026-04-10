@@ -536,8 +536,8 @@ impl IntoJava for &FragmentUpdateResult {
 impl IntoJava for &DataFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let path = env.new_string(self.path.clone())?.into();
-        let fields = JLance(self.fields.clone()).into_java(env)?;
-        let column_indices = JLance(self.column_indices.clone()).into_java(env)?;
+        let fields = JLance(self.fields.to_vec()).into_java(env)?;
+        let column_indices = JLance(self.column_indices.to_vec()).into_java(env)?;
         let file_size_bytes = match self.file_size_bytes.get() {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
@@ -775,8 +775,8 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let base_id = get_base_id(env, self)?;
         Ok(DataFile {
             path,
-            fields,
-            column_indices,
+            fields: fields.into(),
+            column_indices: column_indices.into(),
             file_major_version,
             file_minor_version,
             file_size_bytes,

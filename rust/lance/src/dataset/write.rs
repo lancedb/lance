@@ -1761,7 +1761,7 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![0, 1, 3]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
 
         let path = base_path
             .child(DATA_DIR)

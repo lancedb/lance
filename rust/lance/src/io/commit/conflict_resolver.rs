@@ -607,7 +607,7 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
-                        for field in &replacement.1.fields {
+                        for field in replacement.1.fields.iter() {
                             if newly_indexed_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
@@ -898,7 +898,7 @@ impl<'a> TransactionRebase<'a> {
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
-                        for field in &replacement.1.fields {
+                        for field in replacement.1.fields.iter() {
                             if newly_indexed_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
@@ -933,7 +933,7 @@ impl<'a> TransactionRebase<'a> {
                                 continue;
                             }
 
-                            for field in &replacement.1.fields {
+                            for field in replacement.1.fields.iter() {
                                 if other_replacement.1.fields.contains(field) {
                                     return Err(self
                                         .retryable_conflict_err(other_transaction, other_version));

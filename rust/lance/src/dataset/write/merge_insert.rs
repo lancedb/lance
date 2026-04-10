@@ -1264,12 +1264,19 @@ impl MergeInsertJob {
             let updated_fields = fragment.files.last().unwrap().fields.clone();
             all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
-                for field in &mut data_file.fields {
-                    if updated_fields.contains(field) {
-                        // Tombstone these fields
-                        *field = -2;
-                    }
-                }
+                let new_fields: Arc<[i32]> = data_file
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        if updated_fields.contains(field) {
+                            -2 // Tombstone
+                        } else {
+                            *field
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                data_file.fields = new_fields;
             }
         }
 
@@ -3618,8 +3625,8 @@ mod tests {
                 let data_files = &frag.files;
                 // Updated columns should be only columns in new data files
                 // -2 field ids are tombstoned.
-                assert_eq!(&data_files[0].fields, &[0, -2, -2]);
-                assert_eq!(&data_files[1].fields, &[2, 1]);
+                assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
+                assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
             };
             has_added_files(&fragments_after[1]);
             has_added_files(&fragments_after[2]);
