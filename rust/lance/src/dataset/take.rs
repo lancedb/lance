@@ -378,6 +378,13 @@ async fn do_take_rows(
 
         if builder.with_row_address {
             // inject `ROW_ADDR` column
+            // The unsorted path (above) always requests row addresses for reordering,
+            // so the batch may already contain a _rowaddr column. Remove it first
+            // to avoid a duplicate-column error, then add the correctly ordered one.
+            if batch.column_by_name(ROW_ADDR).is_some() {
+                let idx = batch.schema().index_of(ROW_ADDR).unwrap();
+                batch = batch.remove_column(idx);
+            }
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
             batch = batch.try_with_column(row_addr_field, row_addr_col)?;
