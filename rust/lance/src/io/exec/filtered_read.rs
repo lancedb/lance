@@ -59,7 +59,7 @@ use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
 };
 
-use super::utils::IoMetrics;
+use super::utils::{ChopBatchesStream, IoMetrics};
 
 #[derive(Debug)]
 pub struct EvaluatedIndex {
@@ -1707,16 +1707,18 @@ impl FilteredReadExec {
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
         let options = self.options.clone();
+        let batch_size_bytes = options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
         let index_input = self.index_input.clone();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
-            if let Some(running_stream) = &*running_stream {
-                DataFusionResult::<SendableRecordBatchStream>::Ok(
-                    running_stream.get_stream(&metrics, partition),
-                )
+            let inner = if let Some(running_stream) = &*running_stream {
+                running_stream.get_stream(&metrics, partition)
             } else {
                 let plan = Self::get_or_create_plan_impl(
                     &plan_cell,
@@ -1726,13 +1728,20 @@ impl FilteredReadExec {
                     partition,
                     context.clone(),
                 )
-                .await?;
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone()).await?;
+                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
+                        .await
+                        .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
-                DataFusionResult::Ok(first_stream)
-            }
+                first_stream
+            };
+            DataFusionResult::<SendableRecordBatchStream>::Ok(ChopBatchesStream::wrap_if_needed(
+                inner,
+                batch_size_bytes,
+            ))
         })
         .try_flatten();
 

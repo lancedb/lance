@@ -418,6 +418,105 @@ impl MetricsCollector for IndexMetrics {
     }
 }
 
+/// A stream wrapper that splits batches exceeding a target byte size.
+///
+/// This serves as a fallback when the underlying reader does not estimate
+/// batch sizes accurately enough. Batches larger than `target_bytes * 1.5`
+/// are sliced into sub-batches of approximately `target_bytes`.
+///
+/// Uses [`RecordBatch::get_array_memory_size`] for size estimation and
+/// [`RecordBatch::slice`] for zero-copy splitting.
+#[pin_project]
+pub struct ChopBatchesStream {
+    schema: SchemaRef,
+    #[pin]
+    inner: SendableRecordBatchStream,
+    target_bytes: u64,
+    /// Buffered sub-batches from a previous oversized batch, yielded before
+    /// polling the inner stream again.
+    pending: std::collections::VecDeque<RecordBatch>,
+}
+
+impl ChopBatchesStream {
+    pub fn new(inner: SendableRecordBatchStream, target_bytes: u64) -> Self {
+        let schema = inner.schema();
+        Self {
+            schema,
+            inner,
+            target_bytes,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Wrap `stream` if `batch_size_bytes` is set, otherwise return it unchanged.
+    pub fn wrap_if_needed(
+        stream: SendableRecordBatchStream,
+        batch_size_bytes: Option<u64>,
+    ) -> SendableRecordBatchStream {
+        match batch_size_bytes {
+            Some(target) => Box::pin(Self::new(stream, target)),
+            None => stream,
+        }
+    }
+}
+
+fn chop_batch(batch: RecordBatch, target_bytes: u64) -> std::collections::VecDeque<RecordBatch> {
+    let batch_size = batch.get_array_memory_size() as u64;
+    let threshold = target_bytes + target_bytes / 2;
+
+    if batch_size <= threshold || batch.num_rows() <= 1 {
+        return std::collections::VecDeque::from([batch]);
+    }
+
+    // Estimate bytes per row and compute target row count
+    let bytes_per_row = batch_size as f64 / batch.num_rows() as f64;
+    let target_rows = (target_bytes as f64 / bytes_per_row).max(1.0) as usize;
+
+    let mut result = std::collections::VecDeque::new();
+    let mut offset = 0;
+    let total = batch.num_rows();
+    while offset < total {
+        let len = target_rows.min(total - offset);
+        result.push_back(batch.slice(offset, len));
+        offset += len;
+    }
+    result
+}
+
+impl Stream for ChopBatchesStream {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+
+        // Drain any pending sub-batches first
+        if let Some(batch) = this.pending.pop_front() {
+            return Poll::Ready(Some(Ok(batch)));
+        }
+
+        match this.inner.poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let mut chopped = chop_batch(batch, *this.target_bytes);
+                // Return the first sub-batch immediately
+                let first = chopped.pop_front();
+                // Buffer the rest
+                *this.pending = chopped;
+                Poll::Ready(first.map(Ok))
+            }
+            other => other,
+        }
+    }
+}
+
+impl RecordBatchStream for ChopBatchesStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -439,6 +538,90 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
 
     use super::ReplayExec;
+
+    #[tokio::test]
+    async fn test_chop_batches_splits_large() {
+        use super::ChopBatchesStream;
+
+        // Create a stream of 2 batches, each with 1000 rows of u32 (~4KB each)
+        let data = lance_datagen::gen_batch()
+            .col("x", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(2));
+        let schema = data.schema();
+        let stream: datafusion::execution::SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(data).map_err(datafusion::error::DataFusionError::from),
+            ));
+
+        // Set a target that is much smaller than each batch so chopping kicks in.
+        // Each 1000-row u32 batch is ~4000 bytes, so target 1000 bytes should split ~4x.
+        let chopped = ChopBatchesStream::new(stream, 1000);
+        let batches: Vec<_> = Box::pin(chopped).try_collect::<Vec<_>>().await.unwrap();
+
+        // We should have more than 2 batches now
+        assert!(
+            batches.len() > 2,
+            "expected chopping to produce >2 batches, got {}",
+            batches.len()
+        );
+        // Total rows should be preserved
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2000);
+        // Each batch should have at most ~250 rows (1000 bytes / 4 bytes per u32 row)
+        for batch in &batches {
+            assert!(
+                batch.num_rows() <= 250,
+                "batch has {} rows, expected at most ~250",
+                batch.num_rows()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chop_batches_passes_small() {
+        use super::ChopBatchesStream;
+
+        // Create 4 small batches
+        let data = lance_datagen::gen_batch()
+            .col("x", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(4));
+        let schema = data.schema();
+        let stream: datafusion::execution::SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(data).map_err(datafusion::error::DataFusionError::from),
+            ));
+
+        // Target is larger than any batch, so no chopping should occur
+        let chopped = ChopBatchesStream::new(stream, 1_000_000);
+        let batches: Vec<_> = Box::pin(chopped).try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 4);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 400);
+    }
+
+    #[tokio::test]
+    async fn test_chop_batches_wrap_if_needed_none() {
+        use super::ChopBatchesStream;
+
+        let data = lance_datagen::gen_batch()
+            .col("x", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let schema = data.schema();
+        let stream: datafusion::execution::SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(data).map_err(datafusion::error::DataFusionError::from),
+            ));
+
+        // wrap_if_needed with None should pass through unchanged
+        let wrapped = ChopBatchesStream::wrap_if_needed(stream, None);
+        let batches: Vec<_> = wrapped.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 100);
+    }
 
     #[tokio::test]
     async fn test_replay() {
