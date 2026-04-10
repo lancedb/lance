@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
-use lance_core::{ROW_ID_FIELD, Result};
+use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use quantizer::{QuantizationType, Quantizer};
@@ -70,6 +70,36 @@ pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
 });
 
 /// Query parameters for the vector indices
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelMode {
+    #[default]
+    Sequential,
+    Parallel,
+}
+
+impl std::fmt::Display for ParallelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sequential => write!(f, "Sequential"),
+            Self::Parallel => write!(f, "Parallel"),
+        }
+    }
+}
+
+impl TryFrom<&str> for ParallelMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_ascii_lowercase().as_str() {
+            "sequential" => Ok(Self::Sequential),
+            "parallel" => Ok(Self::Parallel),
+            other => Err(Error::invalid_input(format!(
+                "invalid parallel_mode '{other}', expected one of: Sequential, Parallel"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Query {
     /// The column to be searched.
@@ -112,6 +142,9 @@ pub struct Query {
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
+
+    /// How partition searches are scheduled.
+    pub parallel_mode: ParallelMode,
 
     /// the distance between the query and the centroid
     /// this is only used for IVF index with Rabit quantization

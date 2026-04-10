@@ -266,6 +266,7 @@ mod test {
                 refine_factor: None,
                 metric_type: Some(metric),
                 use_index: true,
+                parallel_mode: lance_index::vector::ParallelMode::Sequential,
                 dist_q_c: 0.0,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;

@@ -1880,6 +1880,41 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
+def test_vector_index_with_parallel_mode(indexed_dataset):
+    q = np.random.randn(128)
+
+    sequential = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "parallel_mode": "Sequential",
+        }
+    )
+    parallel = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "parallel_mode": "Parallel",
+        }
+    )
+
+    assert sequential == parallel
+
+
+def test_vector_index_invalid_parallel_mode(indexed_dataset):
+    with pytest.raises(ValueError, match="parallel_mode"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "parallel_mode": "nope",
+            }
+        )
+
+
 def test_knn_deleted_rows(tmp_path):
     data = create_table()
     ds = lance.write_dataset(data, tmp_path)

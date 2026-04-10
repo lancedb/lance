@@ -5472,6 +5472,7 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        parallel_mode: Optional[str] = None,
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ) -> ScannerBuilder:
         self._nearest = _build_vector_search_query(
@@ -5486,6 +5487,7 @@ class ScannerBuilder:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            parallel_mode=parallel_mode,
             distance_range=distance_range,
         )
         return self
@@ -6585,6 +6587,7 @@ def _build_vector_search_query(
     refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
+    parallel_mode: Optional[str] = None,
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -6612,6 +6615,8 @@ def _build_vector_search_query(
         Whether to use the index for the search.
     ef: int, optional
         The ef parameter for HNSW search.
+    parallel_mode: str, optional
+        Partition search execution mode. One of "Sequential" or "Parallel".
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -6679,6 +6684,15 @@ def _build_vector_search_query(
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
         raise ValueError(f"ef must be > 0 but got {ef}")
+    if parallel_mode is not None:
+        normalized_parallel_mode = parallel_mode.strip().lower()
+        if normalized_parallel_mode not in {
+            "sequential",
+            "parallel",
+        }:
+            raise ValueError(
+                "parallel_mode must be one of: Sequential, Parallel"
+            )
 
     if distance_range is not None:
         if len(distance_range) != 2:
@@ -6696,6 +6710,7 @@ def _build_vector_search_query(
         "refine_factor": refine_factor,
         "use_index": use_index,
         "ef": ef,
+        "parallel_mode": parallel_mode,
         "distance_range": distance_range,
     }
 
@@ -6868,6 +6883,7 @@ class VectorSearchQuery:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        parallel_mode: Optional[str] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -6880,6 +6896,7 @@ class VectorSearchQuery:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            parallel_mode=parallel_mode,
         )
 
     def inner(self):

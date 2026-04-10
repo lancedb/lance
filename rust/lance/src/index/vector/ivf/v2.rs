@@ -45,8 +45,8 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, Query, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
-        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
+        DISTANCE_TYPE_KEY, ParallelMode, Query, ivf::storage::IVF_METADATA_KEY,
+        quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
@@ -946,7 +946,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter.wait_for_ready().await?;
 
         let query = self.preprocess_query(partition_id, query)?;
-        let (batch, local_metrics) = spawn_cpu(move || {
+        let parallel_mode = query.parallel_mode;
+        let search = move || {
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
             let k = query.k * refine_factor;
@@ -966,8 +967,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 &local_metrics,
             )?;
             Result::Ok((batch, local_metrics))
-        })
-        .await?;
+        };
+        let (batch, local_metrics) = if parallel_mode == ParallelMode::Sequential {
+            search()?
+        } else {
+            spawn_cpu(search).await?
+        };
 
         local_metrics.dump_into(metrics);
 

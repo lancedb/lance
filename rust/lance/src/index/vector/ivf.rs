@@ -2647,6 +2647,7 @@ mod tests {
                     refine_factor: None,
                     metric_type: Some(MetricType::L2),
                     use_index: true,
+                    parallel_mode: lance_index::vector::ParallelMode::Sequential,
                     dist_q_c: 0.0,
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();

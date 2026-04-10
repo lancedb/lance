@@ -68,7 +68,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DIST_COL, Query};
+use lance_index::vector::{DIST_COL, ParallelMode, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -1481,6 +1481,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: None,
             use_index: true,
+            parallel_mode: ParallelMode::Sequential,
             dist_q_c: 0.0,
         });
         Ok(self)
@@ -1644,6 +1645,16 @@ impl Scanner {
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = use_index
+        }
+        self
+    }
+
+    /// Configure how partition search is executed for vector indices.
+    pub fn parallel_mode(&mut self, parallel_mode: ParallelMode) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.parallel_mode = parallel_mode;
+        } else {
+            log::warn!("parallel_mode is not set because nearest has not been called yet");
         }
         self
     }
@@ -4930,6 +4941,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+    use lance_index::vector::ParallelMode;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -9741,6 +9753,49 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .project(&["i"])
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_knn_parallel_mode_defaults_and_setter() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(
+            scanner.nearest_mut().unwrap().parallel_mode,
+            ParallelMode::Sequential
+        );
+
+        scanner.parallel_mode(ParallelMode::Parallel);
+        assert_eq!(
+            scanner.nearest_mut().unwrap().parallel_mode,
+            ParallelMode::Parallel
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_parallel_modes_return_same_results() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+
+        let mut sequential = test_ds.dataset.scan();
+        sequential.nearest("vec", &query_vector, 50).unwrap();
+        let sequential_results = sequential.try_into_batch().await.unwrap();
+
+        let mut parallel = test_ds.dataset.scan();
+        parallel
+            .nearest("vec", &query_vector, 50)
+            .unwrap()
+            .parallel_mode(ParallelMode::Parallel);
+        let parallel_results = parallel.try_into_batch().await.unwrap();
+
+        assert_eq!(sequential_results, parallel_results);
     }
 
     #[tokio::test]

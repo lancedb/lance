@@ -74,7 +74,7 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
+        ParallelMode, Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
         pq::PQBuildParams, sq::builder::SQBuildParams,
     },
 };
@@ -1055,6 +1055,7 @@ impl Dataset {
                 refine_factor,
                 use_index,
                 ef,
+                parallel_mode,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1115,6 +1116,7 @@ impl Dataset {
                     if let Some(ef) = ef {
                         s = s.ef(ef);
                     }
+                    s = s.parallel_mode(parallel_mode);
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -4001,7 +4003,22 @@ type VectorQueryParams = (
     Option<u32>,
     bool,
     Option<usize>,
+    ParallelMode,
 );
+
+fn vector_query_parallel_mode_from_dict(
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<ParallelMode> {
+    if let Some(parallel_mode) = dict.get_item("parallel_mode")?
+        && !parallel_mode.is_none()
+    {
+        let parallel_mode = parallel_mode.extract::<String>()?;
+        ParallelMode::try_from(parallel_mode.as_str())
+            .map_err(|err| PyValueError::new_err(err.to_string()))
+    } else {
+        Ok(ParallelMode::Sequential)
+    }
+}
 
 fn vector_query_params_from_dict(
     dict: &Bound<'_, PyDict>,
@@ -4108,6 +4125,8 @@ fn vector_query_params_from_dict(
         None
     };
 
+    let parallel_mode = vector_query_parallel_mode_from_dict(dict)?;
+
     Ok((
         column,
         key,
@@ -4118,6 +4137,7 @@ fn vector_query_params_from_dict(
         refine_factor,
         use_index,
         ef,
+        parallel_mode,
     ))
 }
 
@@ -4153,6 +4173,7 @@ impl PySearchFilter {
             refine_factor,
             use_index,
             ef,
+            parallel_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -4169,6 +4190,7 @@ impl PySearchFilter {
             refine_factor,
             metric_type,
             use_index,
+            parallel_mode,
             dist_q_c: 0.0,
         };
 

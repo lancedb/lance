@@ -30,7 +30,7 @@ use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     Index, IndexType,
-    vector::{Query, pq::ProductQuantizer},
+    vector::{ParallelMode, Query, pq::ProductQuantizer},
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -234,8 +234,9 @@ impl VectorIndex for PQIndex {
 
         let pq = self.pq.clone();
         let query = query.clone();
+        let parallel_mode = query.parallel_mode;
         let num_sub_vectors = self.pq.code_dim() as i32;
-        spawn_cpu(move || {
+        let search = move || {
             let (code, row_ids) = if pre_filter.is_empty() {
                 Ok((code, row_ids))
             } else {
@@ -284,8 +285,12 @@ impl VectorIndex for PQIndex {
                     vec![dists, ids],
                 )?)
             }
-        })
-        .await
+        };
+        if parallel_mode == ParallelMode::Sequential {
+            search()
+        } else {
+            spawn_cpu(search).await
+        }
     }
 
     fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
