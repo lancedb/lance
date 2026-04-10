@@ -4006,9 +4006,7 @@ type VectorQueryParams = (
     ParallelMode,
 );
 
-fn vector_query_parallel_mode_from_dict(
-    dict: &Bound<'_, PyDict>,
-) -> PyResult<ParallelMode> {
+fn vector_query_parallel_mode_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<ParallelMode> {
     if let Some(parallel_mode) = dict.get_item("parallel_mode")?
         && !parallel_mode.is_none()
     {

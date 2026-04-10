@@ -742,6 +742,9 @@ enum SequentialPartitionSearchMode {
     Late { max_results: usize },
 }
 
+type SequentialPartitionSearchWorker =
+    std::pin::Pin<Box<dyn Future<Output = DataFusionResult<()>> + Send>>;
+
 struct SequentialPartitionSearchState {
     index: Arc<dyn VectorIndex>,
     query: Query,
@@ -754,7 +757,7 @@ struct SequentialPartitionSearchState {
     state: Arc<ANNIvfEarlySearchResults>,
     mode: SequentialPartitionSearchMode,
     job_tx: Option<mpsc::Sender<SequentialPreparedPartitionJob>>,
-    worker: Option<std::pin::Pin<Box<dyn Future<Output = DataFusionResult<()>> + Send>>>,
+    worker: Option<SequentialPartitionSearchWorker>,
 }
 
 impl ANNIvfSubIndexExec {
@@ -793,7 +796,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
     ) -> (
         mpsc::Sender<SequentialPreparedPartitionJob>,
-        std::pin::Pin<Box<dyn Future<Output = DataFusionResult<()>> + Send>>,
+        SequentialPartitionSearchWorker,
     ) {
         let (tx, rx) = mpsc::channel::<SequentialPreparedPartitionJob>();
         let worker = Box::pin(spawn_cpu(move || {
@@ -812,34 +815,14 @@ impl ANNIvfSubIndexExec {
     }
 
     fn sequential_partition_search_stream(
-        index: Arc<dyn VectorIndex>,
-        query: Query,
-        partitions: Arc<UInt32Array>,
-        q_c_dists: Arc<Float32Array>,
-        start_idx: usize,
-        end_idx: usize,
-        prefilter: Arc<DatasetPreFilter>,
-        metrics: Arc<AnnIndexMetrics>,
-        state: Arc<ANNIvfEarlySearchResults>,
-        mode: SequentialPartitionSearchMode,
+        mut initial_state: SequentialPartitionSearchState,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        let (job_tx, worker) =
-            Self::spawn_sequential_partition_search_worker(index.clone(), metrics.clone());
-        let initial_state = SequentialPartitionSearchState {
-            index,
-            query,
-            partitions,
-            q_c_dists,
-            next_idx: start_idx,
-            end_idx,
-            prefilter,
-            metrics,
-            state,
-            mode,
-            job_tx: Some(job_tx),
-            worker: Some(worker),
-        };
-
+        let (job_tx, worker) = Self::spawn_sequential_partition_search_worker(
+            initial_state.index.clone(),
+            initial_state.metrics.clone(),
+        );
+        initial_state.job_tx = Some(job_tx);
+        initial_state.worker = Some(worker);
         stream::try_unfold(initial_state, |mut state| async move {
             if let SequentialPartitionSearchMode::Late { max_results } = state.mode
                 && state.state.num_results_found.load(Ordering::Relaxed) >= max_results
@@ -986,18 +969,20 @@ impl ANNIvfSubIndexExec {
             let state_clone = state.clone();
 
             if query.parallel_mode == ParallelMode::Sequential {
-                return Self::sequential_partition_search_stream(
+                return Self::sequential_partition_search_stream(SequentialPartitionSearchState {
                     index,
                     query,
                     partitions,
                     q_c_dists,
-                    min_nprobes,
-                    max_nprobes,
+                    next_idx: min_nprobes,
+                    end_idx: max_nprobes,
                     prefilter,
                     metrics,
                     state,
-                    SequentialPartitionSearchMode::Late { max_results },
-                )
+                    mode: SequentialPartitionSearchMode::Late { max_results },
+                    job_tx: None,
+                    worker: None,
+                })
                 .boxed();
             }
 
@@ -1051,18 +1036,20 @@ impl ANNIvfSubIndexExec {
         metrics.partitions_searched.add(minimum_nprobes);
 
         if query.parallel_mode == ParallelMode::Sequential {
-            return Self::sequential_partition_search_stream(
+            return Self::sequential_partition_search_stream(SequentialPartitionSearchState {
                 index,
                 query,
                 partitions,
                 q_c_dists,
-                0,
-                minimum_nprobes,
+                next_idx: 0,
+                end_idx: minimum_nprobes,
                 prefilter,
                 metrics,
                 state,
-                SequentialPartitionSearchMode::Initial,
-            )
+                mode: SequentialPartitionSearchMode::Initial,
+                job_tx: None,
+                worker: None,
+            })
             .boxed();
         }
 
