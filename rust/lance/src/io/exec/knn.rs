@@ -1033,7 +1033,6 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
-        metrics.partitions_searched.add(minimum_nprobes);
 
         if query.parallel_mode == ParallelMode::Sequential {
             return Self::sequential_partition_search_stream(SequentialPartitionSearchState {
@@ -1053,6 +1052,7 @@ impl ANNIvfSubIndexExec {
             .boxed();
         }
 
+        metrics.partitions_searched.add(minimum_nprobes);
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
                 let part_id = partitions.value(idx);
