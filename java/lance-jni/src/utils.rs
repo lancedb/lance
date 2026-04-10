@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
 use crate::traits::FromJObjectWithEnv;
-use lance_index::vector::Query;
+use lance_index::vector::{ParallelMode, Query};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -217,6 +217,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             metric_type: distance_type,
             use_index,
             dist_q_c: 0.0,
+            parallel_mode: ParallelMode::Sequential,
         })
     })?;
 

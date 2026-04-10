@@ -6690,9 +6690,7 @@ def _build_vector_search_query(
             "sequential",
             "parallel",
         }:
-            raise ValueError(
-                "parallel_mode must be one of: Sequential, Parallel"
-            )
+            raise ValueError("parallel_mode must be one of: Sequential, Parallel")
 
     if distance_range is not None:
         if len(distance_range) != 2:
