@@ -428,7 +428,7 @@ impl WriteParams {
 /// IDs can be assigned after writing is complete.
 #[deprecated(
     since = "0.20.0",
-    note = "Use [`InsertBuilder::write_uncommitted_stream`] instead"
+    note = "Use [`InsertBuilder::execute_uncommitted_stream`] instead"
 )]
 pub async fn write_fragments(
     dest: impl Into<WriteDestination<'_>>,

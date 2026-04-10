@@ -47,22 +47,35 @@ fn max_conn_reset_retries() -> u16 {
     })
 }
 
+/// Maximum part size in GCS and S3: 5GB.
+const MAX_UPLOAD_PART_SIZE: usize = 1024 * 1024 * 1024 * 5;
+
+/// Clamps a requested upload part size to the valid [5MB, 5GB] range.
+/// Returns the clamped value and whether clamping was necessary.
+fn clamp_initial_upload_size(raw: usize) -> (usize, bool) {
+    let clamped = raw.clamp(INITIAL_UPLOAD_STEP, MAX_UPLOAD_PART_SIZE);
+    (clamped, clamped != raw)
+}
+
 fn initial_upload_size() -> usize {
     static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
     *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
-        std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
+        let Some(raw) = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .inspect(|size| {
-                if *size < INITIAL_UPLOAD_STEP {
-                    // Minimum part size in GCS and S3
-                    panic!("LANCE_INITIAL_UPLOAD_SIZE must be at least 5MB");
-                } else if *size > 1024 * 1024 * 1024 * 5 {
-                    // Maximum part size in GCS and S3
-                    panic!("LANCE_INITIAL_UPLOAD_SIZE must be at most 5GB");
-                }
-            })
-            .unwrap_or(INITIAL_UPLOAD_STEP)
+        else {
+            return INITIAL_UPLOAD_STEP;
+        };
+        let (clamped, was_clamped) = clamp_initial_upload_size(raw);
+        if was_clamped {
+            // OnceLock caches the result, so this warning fires at most once per process.
+            tracing::warn!(
+                requested = raw,
+                clamped,
+                "LANCE_INITIAL_UPLOAD_SIZE must be between 5MB and 5GB; clamping to valid range"
+            );
+        }
+        clamped
     })
 }
 
@@ -819,5 +832,40 @@ mod tests {
         drop(writer);
         assert!(!temp_file_path.exists());
         assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn clamp_initial_upload_size_below_min_is_clamped_up() {
+        assert_eq!(clamp_initial_upload_size(0), (INITIAL_UPLOAD_STEP, true));
+        assert_eq!(
+            clamp_initial_upload_size(INITIAL_UPLOAD_STEP - 1),
+            (INITIAL_UPLOAD_STEP, true)
+        );
+    }
+
+    #[test]
+    fn clamp_initial_upload_size_within_range_is_unchanged() {
+        assert_eq!(
+            clamp_initial_upload_size(INITIAL_UPLOAD_STEP),
+            (INITIAL_UPLOAD_STEP, false)
+        );
+        assert_eq!(
+            clamp_initial_upload_size(MAX_UPLOAD_PART_SIZE),
+            (MAX_UPLOAD_PART_SIZE, false)
+        );
+        let mid = INITIAL_UPLOAD_STEP * 8; // 40MB, in range
+        assert_eq!(clamp_initial_upload_size(mid), (mid, false));
+    }
+
+    #[test]
+    fn clamp_initial_upload_size_above_max_is_clamped_down() {
+        assert_eq!(
+            clamp_initial_upload_size(MAX_UPLOAD_PART_SIZE + 1),
+            (MAX_UPLOAD_PART_SIZE, true)
+        );
+        assert_eq!(
+            clamp_initial_upload_size(usize::MAX),
+            (MAX_UPLOAD_PART_SIZE, true)
+        );
     }
 }
