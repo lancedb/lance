@@ -11,7 +11,7 @@ use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -22,7 +22,6 @@ use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -45,7 +44,7 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, ParallelMode, Query, ivf::storage::IVF_METADATA_KEY,
+        DISTANCE_TYPE_KEY, PreparedPartitionSearchHandle, Query, ivf::storage::IVF_METADATA_KEY,
         quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
 };
@@ -95,6 +94,14 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// when reconstructing from cache.
     pub(crate) index_file_size: u64,
     pub(crate) aux_file_size: u64,
+}
+
+struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
+    query: Query,
+    pre_filter: Arc<dyn PreFilter>,
+    partition_centroid: Option<ArrayRef>,
+    part_entry: Arc<dyn VectorIndexCacheEntry>,
+    _marker: PhantomData<(S, Q)>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
@@ -526,6 +533,77 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
+    async fn prepare_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionSearch<S, Q>> {
+        let (part_entry, ()) = tokio::try_join!(
+            self.load_partition(partition_id, true, metrics),
+            pre_filter.wait_for_ready(),
+        )?;
+        Ok(PreparedPartitionSearch {
+            query: query.clone(),
+            pre_filter,
+            partition_centroid: self.ivf.centroid(partition_id),
+            part_entry,
+            _marker: PhantomData,
+        })
+    }
+
+    fn run_prepared_partition_search(
+        distance_type: DistanceType,
+        prepared: PreparedPartitionSearch<S, Q>,
+    ) -> Result<(RecordBatch, LocalMetricsCollector)> {
+        let PreparedPartitionSearch {
+            query,
+            pre_filter,
+            partition_centroid,
+            part_entry,
+            _marker: _,
+        } = prepared;
+        let query =
+            Self::preprocess_partition_query(distance_type, partition_centroid.as_ref(), &query)?;
+        let param = (&query).into();
+        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+        let k = query.k * refine_factor;
+        let local_metrics = LocalMetricsCollector::default();
+        let part = part_entry
+            .as_any()
+            .downcast_ref::<PartitionEntry<S, Q>>()
+            .ok_or(Error::internal(
+                "failed to downcast partition entry".to_string(),
+            ))?;
+        let batch = part.index.search(
+            query.key,
+            k,
+            param,
+            &part.storage,
+            pre_filter,
+            &local_metrics,
+        )?;
+        Ok((batch, local_metrics))
+    }
+
+    fn preprocess_partition_query(
+        distance_type: DistanceType,
+        partition_centroid: Option<&ArrayRef>,
+        query: &Query,
+    ) -> Result<Query> {
+        if Q::use_residual(distance_type) {
+            let partition_centroid = partition_centroid
+                .ok_or_else(|| Error::index("partition centroid does not exist".to_string()))?;
+            let residual_key = sub(&query.key, partition_centroid)?;
+            let mut part_query = query.clone();
+            part_query.key = residual_key;
+            Ok(part_query)
+        } else {
+            Ok(query.clone())
+        }
+    }
+
     /// Create a new IVF index.
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -752,20 +830,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// Internal API with no stability guarantees.
     #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
-        if Q::use_residual(self.distance_type) {
-            let partition_centroids = self.ivf.centroid(partition_id).ok_or_else(|| {
-                Error::index(format!(
-                    "partition centroid {} does not exist",
-                    partition_id
-                ))
-            })?;
-            let residual_key = sub(&query.key, &partition_centroids)?;
-            let mut part_query = query.clone();
-            part_query.key = residual_key;
-            Ok(part_query)
-        } else {
-            Ok(query.clone())
-        }
+        Self::preprocess_partition_query(
+            self.distance_type,
+            self.ivf.centroid(partition_id).as_ref(),
+            query,
+        )
     }
 
     /// Export the index state needed for reconstruction from a disk cache.
@@ -942,40 +1011,41 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        pre_filter.wait_for_ready().await?;
-
-        let query = self.preprocess_query(partition_id, query)?;
-        let parallel_mode = query.parallel_mode;
-        let search = move || {
-            let param = (&query).into();
-            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-            let k = query.k * refine_factor;
-            let local_metrics = LocalMetricsCollector::default();
-            let part = part_entry
-                .as_any()
-                .downcast_ref::<PartitionEntry<S, Q>>()
-                .ok_or(Error::internal(
-                    "failed to downcast partition entry".to_string(),
-                ))?;
-            let batch = part.index.search(
-                query.key,
-                k,
-                param,
-                &part.storage,
-                pre_filter,
-                &local_metrics,
-            )?;
-            Result::Ok((batch, local_metrics))
-        };
-        let (batch, local_metrics) = if parallel_mode == ParallelMode::Sequential {
-            search()?
-        } else {
-            spawn_cpu(search).await?
-        };
+        let prepared = self
+            .prepare_partition(partition_id, query, pre_filter, metrics)
+            .await?;
+        let (batch, local_metrics) =
+            Self::run_prepared_partition_search(self.distance_type, prepared)?;
 
         local_metrics.dump_into(metrics);
 
+        Ok(batch)
+    }
+
+    async fn prepare_partition_search(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionSearchHandle> {
+        Ok(Box::new(
+            self.prepare_partition(partition_id, query, pre_filter, metrics)
+                .await?,
+        ))
+    }
+
+    fn search_prepared_partition(
+        &self,
+        prepared: PreparedPartitionSearchHandle,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let prepared = prepared
+            .downcast::<PreparedPartitionSearch<S, Q>>()
+            .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
+        let (batch, local_metrics) =
+            Self::run_prepared_partition_search(self.distance_type, *prepared)?;
+        local_metrics.dump_into(metrics);
         Ok(batch)
     }
 

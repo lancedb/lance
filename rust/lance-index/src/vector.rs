@@ -54,6 +54,8 @@ pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const LOSS_METADATA_KEY: &str = "_loss";
 
+pub type PreparedPartitionSearchHandle = Box<dyn Any + Send>;
+
 pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::new(|| {
     arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
         Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
@@ -230,6 +232,27 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
+
+    /// Asynchronously prepare a single-partition search so the CPU-heavy portion
+    /// can be executed separately.
+    async fn prepare_partition_search(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionSearchHandle> {
+        unimplemented!("prepared partition search is not supported for this index")
+    }
+
+    /// Execute the synchronous portion of a previously prepared partition search.
+    fn search_prepared_partition(
+        &self,
+        _prepared: PreparedPartitionSearchHandle,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        unimplemented!("prepared partition search is not supported for this index")
+    }
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -48,13 +49,13 @@ use lance_datafusion::utils::{
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::{
-    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, ParallelMode, Query, VectorIndex,
-    flat::compute_distance,
+    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, ParallelMode, PreparedPartitionSearchHandle,
+    Query, VectorIndex, flat::compute_distance,
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -731,57 +732,180 @@ impl ANNIvfEarlySearchResults {
     }
 }
 
+struct SequentialPreparedPartitionJob {
+    prepared: PreparedPartitionSearchHandle,
+    response: oneshot::Sender<DataFusionResult<RecordBatch>>,
+}
+
+enum SequentialPartitionSearchMode {
+    Initial,
+    Late { max_results: usize },
+}
+
+struct SequentialPartitionSearchState {
+    index: Arc<dyn VectorIndex>,
+    query: Query,
+    partitions: Arc<UInt32Array>,
+    q_c_dists: Arc<Float32Array>,
+    next_idx: usize,
+    end_idx: usize,
+    prefilter: Arc<DatasetPreFilter>,
+    metrics: Arc<AnnIndexMetrics>,
+    state: Arc<ANNIvfEarlySearchResults>,
+    mode: SequentialPartitionSearchMode,
+    job_tx: Option<mpsc::Sender<SequentialPreparedPartitionJob>>,
+    worker: Option<std::pin::Pin<Box<dyn Future<Output = DataFusionResult<()>> + Send>>>,
+}
+
 impl ANNIvfSubIndexExec {
-    async fn search_partition(
+    async fn prepare_partition_search(
         index: Arc<dyn VectorIndex>,
         mut query: Query,
         part_id: usize,
         pre_filter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
-    ) -> DataFusionResult<RecordBatch> {
+    ) -> DataFusionResult<PreparedPartitionSearchHandle> {
         if index.metric_type() == DistanceType::Cosine {
             let key = normalize_arrow(&query.key)?.0;
             query.key = key;
         };
 
+        index
+            .prepare_partition_search(part_id, &query, pre_filter, &metrics.index_metrics)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to prepare KNN: {}", e)))
+            .await
+    }
+
+    fn search_prepared_partition(
+        index: Arc<dyn VectorIndex>,
+        prepared: PreparedPartitionSearchHandle,
+        metrics: Arc<AnnIndexMetrics>,
+    ) -> DataFusionResult<RecordBatch> {
         let batch = index
-            .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
-            .await?;
+            .search_prepared_partition(prepared, &metrics.index_metrics)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))?;
         metrics.baseline_metrics.record_output(batch.num_rows());
         Ok(batch)
     }
 
-    fn run_on_dedicated_cpu_thread<T, Fut, F>(task: F) -> impl Future<Output = DataFusionResult<T>>
-    where
-        T: Send + 'static,
-        Fut: Future<Output = DataFusionResult<T>> + 'static,
-        F: FnOnce() -> Fut + Send + 'static,
-    {
-        spawn_cpu(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|err| {
-                    DataFusionError::Execution(format!(
-                        "Failed to build runtime for sequential partition search: {}",
-                        err
-                    ))
-                })?;
-            runtime.block_on(task())
-        })
+    fn spawn_sequential_partition_search_worker(
+        index: Arc<dyn VectorIndex>,
+        metrics: Arc<AnnIndexMetrics>,
+    ) -> (
+        mpsc::Sender<SequentialPreparedPartitionJob>,
+        std::pin::Pin<Box<dyn Future<Output = DataFusionResult<()>> + Send>>,
+    ) {
+        let (tx, rx) = mpsc::channel::<SequentialPreparedPartitionJob>();
+        let worker = Box::pin(spawn_cpu(move || {
+            while let Ok(job) = rx.recv() {
+                let result =
+                    Self::search_prepared_partition(index.clone(), job.prepared, metrics.clone());
+                let should_stop = result.is_err();
+                let _ = job.response.send(result);
+                if should_stop {
+                    break;
+                }
+            }
+            Ok(())
+        }));
+        (tx, worker)
     }
 
-    fn stream_batches_from_future<F>(future: F) -> impl Stream<Item = DataFusionResult<RecordBatch>>
-    where
-        F: Future<Output = DataFusionResult<Vec<RecordBatch>>> + Send + 'static,
-    {
-        stream::once(future)
-            .map(|result| match result {
-                Ok(batches) => stream::iter(batches.into_iter().map(Ok)).boxed(),
-                Err(err) => stream::iter(vec![Err(err)]).boxed(),
-            })
-            .flatten()
+    fn sequential_partition_search_stream(
+        index: Arc<dyn VectorIndex>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
+        start_idx: usize,
+        end_idx: usize,
+        prefilter: Arc<DatasetPreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+        state: Arc<ANNIvfEarlySearchResults>,
+        mode: SequentialPartitionSearchMode,
+    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        let (job_tx, worker) =
+            Self::spawn_sequential_partition_search_worker(index.clone(), metrics.clone());
+        let initial_state = SequentialPartitionSearchState {
+            index,
+            query,
+            partitions,
+            q_c_dists,
+            next_idx: start_idx,
+            end_idx,
+            prefilter,
+            metrics,
+            state,
+            mode,
+            job_tx: Some(job_tx),
+            worker: Some(worker),
+        };
+
+        stream::try_unfold(initial_state, |mut state| async move {
+            if let SequentialPartitionSearchMode::Late { max_results } = state.mode
+                && state.state.num_results_found.load(Ordering::Relaxed) >= max_results
+            {
+                drop(state.job_tx.take());
+                if let Some(worker) = state.worker.take() {
+                    worker.await?;
+                }
+                return Ok(None);
+            }
+
+            if state.next_idx >= state.end_idx {
+                drop(state.job_tx.take());
+                if let Some(worker) = state.worker.take() {
+                    worker.await?;
+                }
+                return Ok(None);
+            }
+
+            let idx = state.next_idx;
+            state.next_idx += 1;
+            let part_id = state.partitions.value(idx);
+            let mut query = state.query.clone();
+            query.dist_q_c = state.q_c_dists.value(idx);
+            state.metrics.partitions_searched.add(1);
+            let prepared = Self::prepare_partition_search(
+                state.index.clone(),
+                query,
+                part_id as usize,
+                state.prefilter.clone(),
+                state.metrics.clone(),
+            )
+            .await?;
+            let (response_tx, response_rx) = oneshot::channel();
+            state
+                .job_tx
+                .as_ref()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Sequential partition search worker is unavailable".to_string(),
+                    )
+                })?
+                .send(SequentialPreparedPartitionJob {
+                    prepared,
+                    response: response_tx,
+                })
+                .map_err(|_| {
+                    DataFusionError::Execution(
+                        "Sequential partition search worker terminated".to_string(),
+                    )
+                })?;
+            let batch = response_rx.await.map_err(|_| {
+                DataFusionError::Execution(
+                    "Sequential partition search worker dropped response".to_string(),
+                )
+            })??;
+
+            match state.mode {
+                SequentialPartitionSearchMode::Initial => state.state.record_batch(&batch),
+                SequentialPartitionSearchMode::Late { .. } => {
+                    state.state.record_late_batch(batch.num_rows())
+                }
+            }
+
+            Ok(Some((batch, state)))
+        })
     }
 
     fn late_search(
@@ -862,34 +986,18 @@ impl ANNIvfSubIndexExec {
             let state_clone = state.clone();
 
             if query.parallel_mode == ParallelMode::Sequential {
-                return Self::stream_batches_from_future(Self::run_on_dedicated_cpu_thread(
-                    move || async move {
-                        let mut batches = Vec::with_capacity(max_nprobes - min_nprobes);
-                        for idx in min_nprobes..max_nprobes {
-                            let found_so_far =
-                                state_clone.num_results_found.load(Ordering::Relaxed);
-                            if found_so_far >= max_results {
-                                break;
-                            }
-
-                            let part_id = partitions.value(idx);
-                            let mut query = query.clone();
-                            query.dist_q_c = q_c_dists.value(idx);
-                            metrics.partitions_searched.add(1);
-                            let batch = Self::search_partition(
-                                index.clone(),
-                                query,
-                                part_id as usize,
-                                prefilter.clone(),
-                                metrics.clone(),
-                            )
-                            .await?;
-                            state.record_late_batch(batch.num_rows());
-                            batches.push(batch);
-                        }
-                        Ok(batches)
-                    },
-                ))
+                return Self::sequential_partition_search_stream(
+                    index,
+                    query,
+                    partitions,
+                    q_c_dists,
+                    min_nprobes,
+                    max_nprobes,
+                    prefilter,
+                    metrics,
+                    state,
+                    SequentialPartitionSearchMode::Late { max_results },
+                )
                 .boxed();
             }
 
@@ -904,13 +1012,17 @@ impl ANNIvfSubIndexExec {
                     let index = index.clone();
                     async move {
                         metrics.partitions_searched.add(1);
-                        let batch = Self::search_partition(
-                            index,
+                        let prepared = Self::prepare_partition_search(
+                            index.clone(),
                             query,
                             part_id as usize,
                             pre_filter,
-                            metrics,
+                            metrics.clone(),
                         )
+                        .await?;
+                        let batch = spawn_cpu(move || {
+                            Self::search_prepared_partition(index, prepared, metrics)
+                        })
                         .await?;
                         state.record_late_batch(batch.num_rows());
                         Ok(batch)
@@ -939,27 +1051,18 @@ impl ANNIvfSubIndexExec {
         metrics.partitions_searched.add(minimum_nprobes);
 
         if query.parallel_mode == ParallelMode::Sequential {
-            return Self::stream_batches_from_future(Self::run_on_dedicated_cpu_thread(
-                move || async move {
-                    let mut batches = Vec::with_capacity(minimum_nprobes);
-                    for idx in 0..minimum_nprobes {
-                        let part_id = partitions.value(idx);
-                        let mut query = query.clone();
-                        query.dist_q_c = q_c_dists.value(idx);
-                        let batch = Self::search_partition(
-                            index.clone(),
-                            query,
-                            part_id as usize,
-                            prefilter.clone(),
-                            metrics.clone(),
-                        )
-                        .await?;
-                        state.record_batch(&batch);
-                        batches.push(batch);
-                    }
-                    Ok(batches)
-                },
-            ))
+            return Self::sequential_partition_search_stream(
+                index,
+                query,
+                partitions,
+                q_c_dists,
+                0,
+                minimum_nprobes,
+                prefilter,
+                metrics,
+                state,
+                SequentialPartitionSearchMode::Initial,
+            )
             .boxed();
         }
 
@@ -973,9 +1076,18 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let batch =
-                        Self::search_partition(index, query, part_id as usize, pre_filter, metrics)
-                            .await?;
+                    let prepared = Self::prepare_partition_search(
+                        index.clone(),
+                        query,
+                        part_id as usize,
+                        pre_filter,
+                        metrics.clone(),
+                    )
+                    .await?;
+                    let batch = spawn_cpu(move || {
+                        Self::search_prepared_partition(index, prepared, metrics)
+                    })
+                    .await?;
                     state.record_batch(&batch);
                     Ok(batch)
                 }
