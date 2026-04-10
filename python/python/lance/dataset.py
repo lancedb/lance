@@ -67,6 +67,12 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import FullTextQuery
+from .schema import (
+    _restore_map_keys_sorted_reader,
+    _restore_map_keys_sorted_schema,
+    _restore_map_keys_sorted_table,
+    _table_from_restored_batches,
+)
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -1117,9 +1123,9 @@ class LanceDataset(pa.dataset.Dataset):
         The pyarrow Schema for this dataset
         """
         if self._default_scan_options is None:
-            return self._ds.schema
+            return _restore_map_keys_sorted_schema(self._ds.schema)
         else:
-            return self.scanner().projected_schema
+            return _restore_map_keys_sorted_schema(self.scanner().projected_schema)
 
     @property
     def lance_schema(self) -> "LanceSchema":
@@ -1270,7 +1276,7 @@ class LanceDataset(pa.dataset.Dataset):
         1. nearest is executed first.
         2. The results are filtered afterward, unless pre-filter sets to True.
         """
-        return self.scanner(
+        table = self.scanner(
             columns=columns,
             filter=filter,
             limit=limit,
@@ -1294,6 +1300,7 @@ class LanceDataset(pa.dataset.Dataset):
             order_by=order_by,
             disable_scoring_autoprojection=disable_scoring_autoprojection,
         ).to_table()
+        return _restore_map_keys_sorted_table(table)
 
     def to_pandas(
         self,
@@ -1829,7 +1836,7 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
-        return pa.Table.from_batches(
+        return _table_from_restored_batches(
             [self._ds.take(indices, columns, columns_with_transform)]
         )
 
@@ -1862,7 +1869,7 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
-        return pa.Table.from_batches(
+        return _table_from_restored_batches(
             [self._ds.take_rows(row_ids, columns, columns_with_transform)]
         )
 
@@ -5646,10 +5653,11 @@ class LanceScanner(pa.dataset.Scanner):
         """
         Read the data into memory and return a pyarrow Table.
         """
-        return self.to_reader().read_all()
+        table = self.to_reader().read_all()
+        return _restore_map_keys_sorted_table(table)
 
     def to_reader(self) -> pa.RecordBatchReader:
-        return self._scanner.to_pyarrow()
+        return _restore_map_keys_sorted_reader(self._scanner.to_pyarrow())
 
     def to_batches(self) -> Iterator[RecordBatch]:
         yield from self.to_reader()
@@ -5733,7 +5741,7 @@ class LanceScanner(pa.dataset.Scanner):
 
     @property
     def projected_schema(self) -> Schema:
-        return self._scanner.schema
+        return _restore_map_keys_sorted_schema(self._scanner.schema)
 
     @staticmethod
     def from_dataset(*args, **kwargs):
@@ -5759,7 +5767,7 @@ class LanceScanner(pa.dataset.Scanner):
     @property
     def dataset_schema(self) -> Schema:
         """The schema with which batches will be read from fragments."""
-        return self._ds.schema
+        return _restore_map_keys_sorted_schema(self._ds.schema)
 
     def scan_batches(self):
         """

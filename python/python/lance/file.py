@@ -23,6 +23,7 @@ from .lance import (
 from .lance import (
     LanceFileWriter as _LanceFileWriter,
 )
+from .schema import _restore_map_keys_sorted_reader
 
 if TYPE_CHECKING:
     from .namespace import LanceNamespace
@@ -39,7 +40,7 @@ class ReaderResults:
         """
         Creates a new instance, not meant for external use
         """
-        self.reader = reader
+        self.reader = _restore_map_keys_sorted_reader(reader)
 
     def to_batches(self) -> pa.RecordBatchReader:
         """

@@ -283,14 +283,7 @@ impl StructuralStructDecoder {
                     field.data_type().clone(),
                 )))
             }
-            DataType::Map(entries_field, keys_sorted) => {
-                if *keys_sorted {
-                    return Err(Error::not_supported_source(
-                        "Map data type with keys_sorted=true is not supported yet"
-                            .to_string()
-                            .into(),
-                    ));
-                }
+            DataType::Map(entries_field, _) => {
                 let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
                 Ok(Box::new(StructuralMapDecoder::new(
                     child_decoder,

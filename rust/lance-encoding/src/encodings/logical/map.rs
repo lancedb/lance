@@ -198,16 +198,7 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
 
         // Extract the entries field and keys_sorted from the map data type
         let (entries_field, keys_sorted) = match &self.data_type {
-            DataType::Map(field, keys_sorted) => {
-                if *keys_sorted {
-                    return Err(Error::not_supported_source(
-                        "Map type decoder does not support keys_sorted=true now"
-                            .to_string()
-                            .into(),
-                    ));
-                }
-                (field.clone(), *keys_sorted)
-            }
+            DataType::Map(field, keys_sorted) => (field.clone(), *keys_sorted),
             _ => {
                 return Err(Error::schema(
                     "Map decoder did not have a map field".to_string(),
@@ -288,6 +279,39 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_range(0..2)
+            .with_min_file_version(LanceFileVersion::V2_2);
+
+        check_round_trip_encoding_of_data(vec![Arc::new(map_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sorted_map() {
+        let string_builder = StringBuilder::new();
+        let int_builder = Int32Builder::new();
+        let mut map_builder = MapBuilder::new(None, string_builder, int_builder);
+
+        map_builder.keys().append_value("a");
+        map_builder.values().append_value(1);
+        map_builder.keys().append_value("b");
+        map_builder.values().append_value(2);
+        map_builder.append(true).unwrap();
+
+        let map_array = map_builder.finish();
+        let entries_field = match map_array.data_type() {
+            DataType::Map(entries_field, _) => entries_field.clone(),
+            _ => unreachable!("MapBuilder should create a map array"),
+        };
+        let map_array = MapArray::new(
+            entries_field,
+            map_array.offsets().clone(),
+            map_array.entries().clone(),
+            map_array.nulls().cloned(),
+            true,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..1)
             .with_min_file_version(LanceFileVersion::V2_2);
 
         check_round_trip_encoding_of_data(vec![Arc::new(map_array)], &test_cases, HashMap::new())

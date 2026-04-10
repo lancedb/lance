@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::namespace::extract_namespace_arc;
+use crate::schema::restore_map_keys_sorted_py_schema;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
@@ -38,7 +39,7 @@ use lance_io::{
 };
 use object_store::path::Path;
 use pyo3::{
-    Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
+    Bound, Py, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyRuntimeError},
     pyclass, pyfunction, pymethods,
     types::PyAny,
@@ -198,7 +199,7 @@ pub struct LanceFileMetadata {
 impl LanceFileMetadata {
     fn new(inner: &CachedFileMetadata, py: Python) -> Self {
         let arrow_schema = arrow_schema::Schema::from(inner.file_schema.as_ref());
-        let schema = PyArrowType(arrow_schema).into_py_any(py).ok();
+        let schema = restore_map_keys_sorted_py_schema(py, arrow_schema).ok();
         Self {
             major_version: inner.major_version,
             minor_version: inner.minor_version,

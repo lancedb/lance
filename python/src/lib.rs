@@ -69,6 +69,7 @@ pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
 pub(crate) mod namespace;
+pub(crate) mod pyarrow_reader;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;

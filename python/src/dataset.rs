@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
-use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
 use arrow_array::{RecordBatch, RecordBatchReader, make_array};
@@ -94,6 +93,7 @@ use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
 use crate::namespace::extract_namespace_arc;
+use crate::pyarrow_reader::convert_reader;
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
@@ -117,21 +117,6 @@ pub mod stats;
 const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
-
-fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
-    let py = reader.py();
-    if reader.is_instance_of::<Scanner>() {
-        let scanner: Scanner = reader.extract()?;
-        Ok(Box::new(
-            rt().spawn(Some(py), async move { scanner.to_reader().await })?
-                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-        ))
-    } else {
-        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
-            reader,
-        )?))
-    }
-}
 
 #[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
 pub struct MergeInsertBuilder {
@@ -1343,15 +1328,16 @@ impl Dataset {
 
     fn merge(
         &mut self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: &Bound<'_, PyAny>,
         left_on: String,
         right_on: String,
     ) -> PyResult<()> {
+        let reader = convert_reader(reader)?;
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
                 new_self
-                    .merge(reader.0, &left_on, &right_on)
+                    .merge(reader, &left_on, &right_on)
                     .await
                     .map(|_| new_self)
             })?
@@ -2450,7 +2436,7 @@ impl Dataset {
         reader: &Bound<'_, PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<()> {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = convert_reader(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 
@@ -3328,7 +3314,7 @@ pub fn write_dataset(
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = convert_reader(reader)?;
         rt().block_on(
             Some(py),
             LanceDataset::write(batches, dest.as_dest(), params),

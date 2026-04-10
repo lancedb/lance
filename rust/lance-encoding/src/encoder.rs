@@ -474,13 +474,7 @@ impl StructuralEncodingStrategy {
                         child_encoder,
                     )))
                 }
-                DataType::Map(_, keys_sorted) => {
-                    // TODO: We only support keys_sorted=false for now,
-                    //  because converting a rust arrow map field to the python arrow field will
-                    //  lose the keys_sorted property.
-                    if keys_sorted {
-                        return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", keys_sorted).into()));
-                    }
+                DataType::Map(_, _) => {
                     if self.version < LanceFileVersion::V2_2 {
                         return Err(Error::not_supported_source(format!(
                             "Map data type is only supported in Lance file format 2.2+, current version: {}",

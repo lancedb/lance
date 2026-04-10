@@ -15,10 +15,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
-use arrow_array::RecordBatchReader;
-use futures::TryFutureExt;
+use arrow::pyarrow::ToPyArrow;
 use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
@@ -38,6 +35,7 @@ use pyo3::{intern, prelude::*};
 
 use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
+use crate::pyarrow_reader::convert_reader;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
@@ -302,7 +300,7 @@ impl FileFragment {
         reader: &Bound<PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = convert_reader(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 
@@ -340,16 +338,17 @@ impl FileFragment {
 
     fn merge(
         &mut self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: &Bound<'_, PyAny>,
         left_on: String,
         right_on: String,
         max_field_id: i32,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
+        let reader = convert_reader(reader)?;
         let mut fragment = self.fragment.clone();
         let (fragment, schema) = rt()
             .spawn(None, async move {
                 fragment
-                    .merge_columns(reader.0, &left_on, &right_on, max_field_id)
+                    .merge_columns(reader, &left_on, &right_on, max_field_id)
                     .await
             })?
             .infer_error()?;
@@ -359,14 +358,15 @@ impl FileFragment {
 
     fn update_columns(
         &mut self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: &Bound<'_, PyAny>,
         left_on: String,
         right_on: String,
     ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+        let reader = convert_reader(reader)?;
         let mut fragment = self.fragment.clone();
         let (updated_fragment, fields_modified) = rt()
             .spawn(None, async move {
-                fragment.update_columns(reader.0, &left_on, &right_on).await
+                fragment.update_columns(reader, &left_on, &right_on).await
             })?
             .infer_error()?;
 
@@ -479,23 +479,6 @@ pub fn write_fragments_transaction<'py>(
     let written = do_write_fragments(dest, reader, kwargs)?;
 
     PyLance(written).into_pyobject(reader.py())
-}
-
-fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
-    if reader.is_instance_of::<Scanner>() {
-        let scanner: Scanner = reader.extract()?;
-        let reader = rt().block_on(
-            Some(reader.py()),
-            scanner
-                .to_reader()
-                .map_err(|err| PyValueError::new_err(err.to_string())),
-        )??;
-        Ok(Box::new(reader))
-    } else {
-        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
-            reader,
-        )?))
-    }
 }
 
 #[pyclass(name = "DeletionFile", module = "lance.fragment")]

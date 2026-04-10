@@ -72,8 +72,8 @@ impl LanceField {
             .filter(|&pos| pos > 0)
     }
 
-    pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
-        PyArrowType((&self.0).into())
+    pub fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        restore_map_keys_sorted_py_field(py, (&self.0).into())
     }
 }
 
@@ -108,8 +108,8 @@ impl LanceSchema {
     }
 
     /// Convert the schema to a PyArrow schema.
-    pub fn to_pyarrow(&self) -> PyArrowType<ArrowSchema> {
-        PyArrowType(ArrowSchema::from(&self.0))
+    pub fn to_pyarrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        restore_map_keys_sorted_py_schema(py, ArrowSchema::from(&self.0))
     }
 
     /// Create a Lance schema from a PyArrow schema.
@@ -216,4 +216,26 @@ pub(crate) fn logical_arrow_schema(schema: &ArrowSchema) -> ArrowSchema {
 
 pub(crate) fn logical_schema_from_lance(schema: &Schema) -> ArrowSchema {
     logical_arrow_schema(&ArrowSchema::from(schema))
+}
+
+pub(crate) fn restore_map_keys_sorted_py_schema(
+    py: Python<'_>,
+    schema: ArrowSchema,
+) -> PyResult<Py<PyAny>> {
+    let py_schema = PyArrowType(schema).into_py_any(py)?;
+    Ok(PyModule::import(py, "lance.schema")?
+        .getattr("_restore_map_keys_sorted_schema")?
+        .call1((py_schema,))?
+        .unbind())
+}
+
+fn restore_map_keys_sorted_py_field(
+    py: Python<'_>,
+    field: arrow_schema::Field,
+) -> PyResult<Py<PyAny>> {
+    let py_field = PyArrowType(field).into_py_any(py)?;
+    Ok(PyModule::import(py, "lance.schema")?
+        .getattr("_restore_map_keys_sorted_field")?
+        .call1((py_field,))?
+        .unbind())
 }

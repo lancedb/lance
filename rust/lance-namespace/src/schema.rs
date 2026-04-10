@@ -181,12 +181,6 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         }
 
         DataType::Map(entries_field, keys_sorted) => {
-            if *keys_sorted {
-                return Err(Error::namespace(format!(
-                    "Map types with keys_sorted=true are not yet supported for JSON conversion: {:?}",
-                    data_type
-                )));
-            }
             let inner_type = arrow_type_to_json(entries_field.data_type())?;
             let inner_field = JsonArrowField {
                 name: entries_field.name().clone(),
@@ -199,7 +193,11 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 },
             };
             Ok(JsonArrowDataType {
-                r#type: "map".to_string(),
+                r#type: if *keys_sorted {
+                    "map.keys_sorted".to_string()
+                } else {
+                    "map".to_string()
+                },
                 fields: Some(vec![inner_field]),
                 length: None,
             })
@@ -316,34 +314,17 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
 
         // Nested types
         "list" => {
-            let inner = json_type
-                .fields
-                .as_ref()
-                .and_then(|f| f.first())
-                .ok_or_else(|| Error::namespace("list type missing inner field"))?;
-            Ok(DataType::List(Arc::new(convert_json_arrow_field(inner)?)))
+            let field = convert_single_json_child(json_type, type_name.as_str())?;
+            Ok(DataType::List(Arc::new(field)))
         }
         "large_list" => {
-            let inner = json_type
-                .fields
-                .as_ref()
-                .and_then(|f| f.first())
-                .ok_or_else(|| Error::namespace("large_list type missing inner field"))?;
-            Ok(DataType::LargeList(Arc::new(convert_json_arrow_field(
-                inner,
-            )?)))
+            let field = convert_single_json_child(json_type, type_name.as_str())?;
+            Ok(DataType::LargeList(Arc::new(field)))
         }
         "fixed_size_list" => {
-            let inner = json_type
-                .fields
-                .as_ref()
-                .and_then(|f| f.first())
-                .ok_or_else(|| Error::namespace("fixed_size_list type missing inner field"))?;
+            let field = convert_single_json_child(json_type, type_name.as_str())?;
             let size = json_type.length.unwrap_or(0) as i32;
-            Ok(DataType::FixedSizeList(
-                Arc::new(convert_json_arrow_field(inner)?),
-                size,
-            ))
+            Ok(DataType::FixedSizeList(Arc::new(field), size))
         }
         "struct" => {
             let fields = json_type
@@ -354,23 +335,32 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
                 fields.iter().map(convert_json_arrow_field).collect();
             Ok(DataType::Struct(arrow_fields?.into()))
         }
-        "map" => {
-            let entries = json_type
-                .fields
-                .as_ref()
-                .and_then(|f| f.first())
-                .ok_or_else(|| Error::namespace("map type missing entries field"))?;
+        "map" | "map.keys_sorted" => {
+            let field = convert_single_json_child(json_type, type_name.as_str())?;
             Ok(DataType::Map(
-                Arc::new(convert_json_arrow_field(entries)?),
-                false,
+                Arc::new(field),
+                type_name.as_str() == "map.keys_sorted",
             ))
         }
-
         _ => Err(Error::namespace(format!(
             "Unsupported Arrow type: {}",
             type_name
         ))),
     }
+}
+
+fn convert_single_json_child(json_type: &JsonArrowDataType, type_name: &str) -> Result<Field> {
+    let fields = json_type
+        .fields
+        .as_ref()
+        .ok_or_else(|| Error::namespace(format!("{type_name} JSON type missing child field")))?;
+    if fields.len() != 1 {
+        return Err(Error::namespace(format!(
+            "{type_name} JSON type expected one child field, got {}",
+            fields.len()
+        )));
+    }
+    convert_json_arrow_field(&fields[0])
 }
 
 #[cfg(test)]
@@ -608,6 +598,33 @@ mod tests {
     }
 
     #[test]
+    fn test_sorted_map_type_json_roundtrip() {
+        use arrow::datatypes::Field;
+
+        let key_field = Field::new("keys", DataType::Utf8, false);
+        let value_field = Field::new("values", DataType::Int32, true);
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![key_field, value_field].into()),
+            false,
+        ));
+        let schema = ArrowSchema::new(vec![Field::new(
+            "props",
+            DataType::Map(entries_field, true),
+            true,
+        )]);
+
+        let json_schema = arrow_schema_to_json(&schema).unwrap();
+        assert_eq!(json_schema.fields[0].r#type.r#type, "map.keys_sorted");
+
+        let roundtrip = convert_json_arrow_schema(&json_schema).unwrap();
+        match roundtrip.field(0).data_type() {
+            DataType::Map(_, keys_sorted) => assert!(*keys_sorted),
+            data_type => panic!("Expected sorted map, got {data_type:?}"),
+        }
+    }
+
+    #[test]
     fn test_additional_types() {
         // Test Date types
         let date32 = arrow_type_to_json(&DataType::Date32).unwrap();
@@ -692,6 +709,20 @@ mod tests {
                 )),
                 false,
             ),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                true,
+            ),
         ];
 
         for dt in &cases {
@@ -744,27 +775,6 @@ mod tests {
         let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
         let json = arrow_type_to_json(&dict_type).unwrap();
         assert_eq!(json.r#type, "utf8");
-    }
-
-    #[test]
-    fn test_map_keys_sorted_unsupported() {
-        let map_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Field::new("keys", DataType::Utf8, false),
-                        Field::new("values", DataType::Int32, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            true, // keys_sorted = true
-        );
-        let result = arrow_type_to_json(&map_type);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("keys_sorted=true"));
     }
 
     #[test]

@@ -6,6 +6,43 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
+from lance.file import LanceFileReader, LanceFileWriter
+from lance.schema import LanceSchema
+
+
+def assert_map_keys_sorted(
+    schema: pa.Schema,
+    field_name: str = "sorted_map",
+    *,
+    expected: bool = True,
+):
+    assert_map_field_keys_sorted(schema.field(field_name), expected=expected)
+
+
+def assert_map_field_keys_sorted(
+    field: pa.Field,
+    *,
+    expected: bool = True,
+):
+    map_type = field.type
+    assert isinstance(map_type, pa.MapType)
+    assert map_type.keys_sorted is expected
+
+
+def sorted_map_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int32()),
+            pa.field("sorted_map", pa.map_(pa.string(), pa.int32(), keys_sorted=True)),
+        ]
+    )
+
+
+def sorted_map_table() -> pa.Table:
+    return pa.table(
+        {"id": [1, 2], "sorted_map": [[("a", 1), ("b", 2)], [("c", 3)]]},
+        schema=sorted_map_schema(),
+    )
 
 
 def test_simple_map_write_read(tmp_path: Path):
@@ -775,33 +812,264 @@ def test_map_projection_multiple_value_types(tmp_path: Path):
     assert result4["bool_map"][2].as_py() == [("flag3", True), ("flag4", False)]
 
 
-def test_map_keys_sorted_unsupported(tmp_path: Path):
-    """Test that keys_sorted=True is not supported"""
-    # Test that keys_sorted=True is rejected
-    schema_sorted = pa.schema(
+def test_map_keys_sorted_reader_restore_fast_path():
+    from lance.schema import _restore_map_keys_sorted_reader
+
+    plain_reader = pa.table({"id": [1]}).to_reader()
+    assert _restore_map_keys_sorted_reader(plain_reader) is plain_reader
+
+    marked_schema = pa.schema(
         [
-            pa.field("id", pa.int32()),
-            pa.field("sorted_map", pa.map_(pa.string(), pa.int32(), keys_sorted=True)),
+            pa.field(
+                "sorted_map",
+                pa.map_(pa.string(), pa.int32()),
+                metadata={b"lance:map_keys_sorted": b"true"},
+            )
         ]
     )
+    marked_reader = pa.RecordBatchReader.from_batches(marked_schema, [])
+    restored_reader = _restore_map_keys_sorted_reader(marked_reader)
+    assert restored_reader is not marked_reader
+    assert_map_keys_sorted(restored_reader.schema)
 
-    data_sorted = pa.table(
-        {"id": [1, 2], "sorted_map": [[("a", 1), ("b", 2)], [("c", 3)]]},
-        schema=schema_sorted,
+
+def test_map_keys_sorted_read_paths(tmp_path: Path):
+    data_sorted = sorted_map_table()
+    dataset_sorted = lance.write_dataset(
+        data_sorted, tmp_path / "sorted", data_storage_version="2.2"
+    )
+    result_sorted = dataset_sorted.to_table()
+
+    assert_map_keys_sorted(dataset_sorted.schema)
+    assert_map_keys_sorted(result_sorted.schema)
+    assert result_sorted["sorted_map"][0].as_py() == [("a", 1), ("b", 2)]
+    assert result_sorted["sorted_map"][1].as_py() == [("c", 3)]
+
+    assert_map_keys_sorted(dataset_sorted.scanner().to_reader().schema)
+    assert_map_keys_sorted(dataset_sorted.scanner().projected_schema)
+    assert_map_keys_sorted(dataset_sorted.scanner().dataset_schema)
+    assert_map_keys_sorted(next(dataset_sorted.to_batches()).schema)
+    assert_map_keys_sorted(next(dataset_sorted.scanner().to_batches()).schema)
+
+    lance_schema = dataset_sorted.lance_schema
+    assert_map_keys_sorted(lance_schema.to_pyarrow())
+    assert_map_field_keys_sorted(lance_schema.field("sorted_map").to_arrow())
+    assert_map_keys_sorted(LanceSchema.from_pyarrow(data_sorted.schema).to_pyarrow())
+
+    assert_map_keys_sorted(dataset_sorted.take([0]).schema)
+    assert_map_keys_sorted(dataset_sorted._take_rows([0]).schema)
+
+    fragment = dataset_sorted.get_fragments()[0]
+    assert_map_keys_sorted(fragment.schema)
+    assert_map_keys_sorted(fragment.to_table().schema)
+    assert_map_keys_sorted(next(fragment.to_batches()).schema)
+    assert_map_keys_sorted(fragment.scanner().projected_schema)
+    assert_map_keys_sorted(fragment.take([0]).schema)
+    assert_map_keys_sorted(fragment.open_session().take([0]).schema)
+
+    file_path = tmp_path / "sorted_file.lance"
+    with LanceFileWriter(str(file_path), data_sorted.schema, version="2.2") as writer:
+        writer.write_batch(data_sorted)
+
+    file_reader = LanceFileReader(str(file_path))
+    assert_map_keys_sorted(file_reader.metadata().schema)
+    assert_map_keys_sorted(file_reader.read_all().to_batches().schema)
+    assert_map_keys_sorted(file_reader.read_all().to_table().schema)
+    assert_map_keys_sorted(file_reader.read_range(0, 1).to_batches().schema)
+    assert_map_keys_sorted(file_reader.read_range(0, 1).to_table().schema)
+    assert_map_keys_sorted(file_reader.take_rows([0]).to_batches().schema)
+    assert_map_keys_sorted(file_reader.take_rows([0]).to_table().schema)
+
+
+def test_map_keys_sorted_empty_projection_preserves_row_count(tmp_path: Path):
+    data_sorted = sorted_map_table()
+    dataset_sorted = lance.write_dataset(
+        data_sorted, tmp_path / "sorted", data_storage_version="2.2"
     )
 
-    # Writing should fail with keys_sorted=True
-    with pytest.raises(Exception) as exc_info:
-        lance.write_dataset(
-            data_sorted, tmp_path / "sorted", data_storage_version="2.2"
-        )
-    error_msg = str(exc_info.value)
-    assert (
-        "keys_sorted=true" in error_msg.lower()
-        or "unsupported map field" in error_msg.lower()
-    ), f"Expected error about keys_sorted=true, got: {error_msg}"
+    empty_table = dataset_sorted.to_table(columns=[])
+    assert empty_table.num_columns == 0
+    assert empty_table.num_rows == data_sorted.num_rows
 
-    # Test that keys_sorted=False (default) is supported
+    empty_scanner_table = dataset_sorted.scanner(columns=[]).to_table()
+    assert empty_scanner_table.num_columns == 0
+    assert empty_scanner_table.num_rows == data_sorted.num_rows
+
+    empty_batch = next(dataset_sorted.to_batches(columns=[]))
+    assert empty_batch.num_columns == 0
+    assert empty_batch.num_rows == data_sorted.num_rows
+
+    empty_take = dataset_sorted.take([0, 1], columns=[])
+    assert empty_take.num_columns == 0
+    assert empty_take.num_rows == 2
+
+    empty_take_rows = dataset_sorted._take_rows([0, 1], columns=[])
+    assert empty_take_rows.num_columns == 0
+    assert empty_take_rows.num_rows == 2
+
+
+def test_map_keys_sorted_write_paths(tmp_path: Path):
+    data_sorted = sorted_map_table()
+    schema_sorted = data_sorted.schema
+
+    overwrite_uri = tmp_path / "overwrite"
+    lance.write_dataset(data_sorted, overwrite_uri, data_storage_version="2.2")
+    overwrite_dataset = lance.write_dataset(
+        data_sorted,
+        overwrite_uri,
+        mode="overwrite",
+        data_storage_version="2.2",
+    )
+    assert_map_keys_sorted(overwrite_dataset.schema)
+
+    fragment_transaction = lance.fragment.write_fragments(
+        data_sorted,
+        tmp_path / "fragment_write",
+        mode="create",
+        return_transaction=True,
+        data_storage_version="2.2",
+    )
+    fragment_dataset = lance.LanceDataset.commit(
+        tmp_path / "fragment_write",
+        fragment_transaction,
+    )
+    assert_map_keys_sorted(fragment_dataset.schema)
+
+    created_fragment = lance.fragment.LanceFragment.create(
+        tmp_path / "fragment_create",
+        data_sorted,
+        mode="create",
+        data_storage_version="2.2",
+    )
+    created_dataset = lance.LanceDataset.commit(
+        tmp_path / "fragment_create",
+        lance.LanceOperation.Overwrite(schema_sorted, [created_fragment]),
+    )
+    assert_map_keys_sorted(created_dataset.schema)
+
+    fragments = lance.fragment.write_fragments(
+        data_sorted,
+        tmp_path / "fragment_write_list",
+        mode="create",
+        data_storage_version="2.2",
+    )
+    fragments_dataset = lance.LanceDataset.commit(
+        tmp_path / "fragment_write_list",
+        lance.LanceOperation.Overwrite(schema_sorted, fragments),
+    )
+    assert_map_keys_sorted(fragments_dataset.schema)
+
+    dataset_merge_uri = tmp_path / "dataset_merge"
+    dataset_merge = lance.write_dataset(
+        pa.table({"id": pa.array([1, 2], type=pa.int32())}),
+        dataset_merge_uri,
+        data_storage_version="2.2",
+    )
+    dataset_merge.merge(data_sorted, "id")
+    assert_map_keys_sorted(dataset_merge.schema)
+
+    add_columns_uri = tmp_path / "add_columns"
+    add_columns_dataset = lance.write_dataset(
+        pa.table({"id": pa.array([1, 2], type=pa.int32())}),
+        add_columns_uri,
+        data_storage_version="2.2",
+    )
+    add_columns_dataset.add_columns(data_sorted.select(["sorted_map"]))
+    assert_map_keys_sorted(add_columns_dataset.schema)
+
+    merge_uri = tmp_path / "fragment_merge"
+    merge_base = lance.write_dataset(
+        pa.table({"id": pa.array([1, 2], type=pa.int32())}),
+        merge_uri,
+        data_storage_version="2.2",
+    )
+    merged_fragment, merged_schema = merge_base.get_fragment(0).merge(data_sorted, "id")
+    merge = lance.LanceOperation.Merge([merged_fragment], merged_schema)
+    merged_dataset = lance.LanceDataset.commit(
+        merge_uri,
+        merge,
+        read_version=merge_base.version,
+    )
+    assert_map_keys_sorted(merged_dataset.schema)
+
+    merge_columns_uri = tmp_path / "fragment_merge_columns"
+    merge_columns_base = lance.write_dataset(
+        pa.table({"id": pa.array([1, 2], type=pa.int32())}),
+        merge_columns_uri,
+        data_storage_version="2.2",
+    )
+    merged_columns_fragment, merged_columns_schema = merge_columns_base.get_fragment(
+        0
+    ).merge_columns(data_sorted.select(["sorted_map"]))
+    merge_columns = lance.LanceOperation.Merge(
+        [merged_columns_fragment],
+        merged_columns_schema,
+    )
+    merged_columns_dataset = lance.LanceDataset.commit(
+        merge_columns_uri,
+        merge_columns,
+        read_version=merge_columns_base.version,
+    )
+    assert_map_keys_sorted(merged_columns_dataset.schema)
+
+    update_uri = tmp_path / "fragment_update_columns"
+    update_base = lance.write_dataset(
+        data_sorted,
+        update_uri,
+        data_storage_version="2.2",
+    )
+    update_data = pa.table(
+        {"id": [1], "sorted_map": [[("d", 4)]]},
+        schema=schema_sorted,
+    )
+    updated_fragment, fields_modified = update_base.get_fragment(0).update_columns(
+        update_data,
+        left_on="id",
+        right_on="id",
+    )
+    update = lance.LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        update_uri,
+        update,
+        read_version=update_base.version,
+    )
+    assert_map_keys_sorted(updated_dataset.schema)
+    assert updated_dataset.to_table()["sorted_map"][0].as_py() == [("d", 4)]
+
+    append_uri = tmp_path / "append"
+    append_dataset = lance.write_dataset(
+        data_sorted,
+        append_uri,
+        data_storage_version="2.2",
+    )
+    append_dataset.insert(data_sorted, data_storage_version="2.2")
+    assert_map_keys_sorted(append_dataset.schema)
+    assert append_dataset.count_rows() == 4
+
+    merge_insert_uri = tmp_path / "merge_insert"
+    merge_insert_dataset = lance.write_dataset(
+        data_sorted,
+        merge_insert_uri,
+        data_storage_version="2.2",
+    )
+    merge_insert_data = pa.table(
+        {"id": [2, 3], "sorted_map": [[("e", 5)], [("f", 6)]]},
+        schema=schema_sorted,
+    )
+    (
+        merge_insert_dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(merge_insert_data)
+    )
+    assert_map_keys_sorted(merge_insert_dataset.schema)
+    assert merge_insert_dataset.count_rows() == 3
+
+
+def test_map_keys_sorted_false_and_default(tmp_path: Path):
     schema_unsorted = pa.schema(
         [
             pa.field("id", pa.int32()),
@@ -821,18 +1089,12 @@ def test_map_keys_sorted_unsupported(tmp_path: Path):
     )
     result_unsorted = dataset_unsorted.to_table()
 
-    # Verify keys_sorted=False is preserved
-    map_type_unsorted = result_unsorted.schema.field("unsorted_map").type
-    assert isinstance(map_type_unsorted, pa.MapType)
-    assert map_type_unsorted.keys_sorted is False
+    assert_map_keys_sorted(result_unsorted.schema, "unsorted_map", expected=False)
 
-    # Test that default (keys_sorted=False) works
     schema_default = pa.schema(
         [
             pa.field("id", pa.int32()),
-            pa.field(
-                "default_map", pa.map_(pa.string(), pa.int32())
-            ),  # default is False
+            pa.field("default_map", pa.map_(pa.string(), pa.int32())),
         ]
     )
 
@@ -846,7 +1108,4 @@ def test_map_keys_sorted_unsupported(tmp_path: Path):
     )
     result_default = dataset_default.to_table()
 
-    # Verify default keys_sorted=False is preserved
-    map_type_default = result_default.schema.field("default_map").type
-    assert isinstance(map_type_default, pa.MapType)
-    assert map_type_default.keys_sorted is False
+    assert_map_keys_sorted(result_default.schema, "default_map", expected=False)

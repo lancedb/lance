@@ -36,6 +36,7 @@ from .lance import (
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
+from .schema import _restore_map_keys_sorted_schema, _table_from_restored_batches
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
@@ -594,7 +595,9 @@ class LanceFragment(pa.dataset.Fragment):
         indices,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
     ) -> pa.Table:
-        return pa.Table.from_batches([self._fragment.take(indices, columns=columns)])
+        return _table_from_restored_batches(
+            [self._fragment.take(indices, columns=columns)]
+        )
 
     def to_batches(
         self,
@@ -964,7 +967,7 @@ class LanceFragment(pa.dataset.Fragment):
     def schema(self) -> pa.Schema:
         """Return the schema of this fragment."""
 
-        return self._fragment.schema()
+        return _restore_map_keys_sorted_schema(self._fragment.schema())
 
     def data_files(self):
         """Return the data files of this fragment."""
@@ -1219,4 +1222,4 @@ class FragmentSession:
         -------
         table : pyarrow.Table
         """
-        return pa.Table.from_batches([self._session.take(indices)])
+        return _table_from_restored_batches([self._session.take(indices)])
