@@ -2438,11 +2438,12 @@ mod tests {
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
-        FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
-        UInt64Array, make_array,
+        FixedSizeListArray, Float16Array, Float32Array, RecordBatch, RecordBatchIterator,
+        RecordBatchReader, UInt64Array, make_array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, Schema};
+    use half::f16;
     use itertools::Itertools;
     use lance_core::ROW_ID;
     use lance_core::utils::address::RowAddress;
@@ -3524,6 +3525,106 @@ mod tests {
                 Field::new("_distance", DataType::Float32, true)
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_flat_f16() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5), DIM));
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let schema = results[0].schema();
+        let field = schema.field(0);
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!("vector column should remain fixed size list");
+        };
+        assert_eq!(item.data_type(), &DataType::Float16);
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_flat_f16() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_hnsw(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5), DIM));
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let schema = results[0].schema();
+        let field = schema.field(0);
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!("vector column should remain fixed size list");
+        };
+        assert_eq!(item.data_type(), &DataType::Float16);
     }
 
     #[tokio::test]

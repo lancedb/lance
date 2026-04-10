@@ -10,18 +10,18 @@ use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow::datatypes::UInt8Type;
+use arrow::datatypes::{Float16Type, Float64Type, UInt8Type};
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
     types::{Float32Type, UInt64Type},
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::hamming::hamming;
+use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
 
 pub const FLAT_COLUMN: &str = "flat";
 
@@ -126,7 +126,7 @@ impl FlatFloatStorage {
 }
 
 impl VectorStore for FlatFloatStorage {
-    type DistanceCalculator<'a> = FlatDistanceCal<'a, Float32Type>;
+    type DistanceCalculator<'a> = FlatFloatDistanceCalc<'a>;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
@@ -136,6 +136,20 @@ impl VectorStore for FlatFloatStorage {
         // TODO: use chunked storage
         let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
         let mut storage = self.clone();
+        storage.row_ids = Arc::new(
+            new_batch
+                .column_by_name(ROW_ID)
+                .ok_or(Error::schema(format!("column {} not found", ROW_ID)))?
+                .as_primitive::<UInt64Type>()
+                .clone(),
+        );
+        storage.vectors = Arc::new(
+            new_batch
+                .column_by_name(FLAT_COLUMN)
+                .ok_or(Error::schema("column flat not found".to_string()))?
+                .as_fixed_size_list()
+                .clone(),
+        );
         storage.batch = new_batch;
         Ok(storage)
     }
@@ -288,6 +302,20 @@ impl VectorStore for FlatBinStorage {
         // TODO: use chunked storage
         let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
         let mut storage = self.clone();
+        storage.row_ids = Arc::new(
+            new_batch
+                .column_by_name(ROW_ID)
+                .ok_or(Error::schema(format!("column {} not found", ROW_ID)))?
+                .as_primitive::<UInt64Type>()
+                .clone(),
+        );
+        storage.vectors = Arc::new(
+            new_batch
+                .column_by_name(FLAT_COLUMN)
+                .ok_or(Error::schema("column flat not found".to_string()))?
+                .as_fixed_size_list()
+                .clone(),
+        );
         storage.batch = new_batch;
         Ok(storage)
     }
@@ -317,11 +345,11 @@ impl VectorStore for FlatBinStorage {
     }
 
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
-        Self::DistanceCalculator::new(self.vectors.as_ref(), query, self.distance_type)
+        Self::DistanceCalculator::new_binary(self.vectors.as_ref(), query, self.distance_type)
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        Self::DistanceCalculator::new(
+        Self::DistanceCalculator::new_binary(
             self.vectors.as_ref(),
             self.vectors.value(id as usize),
             self.distance_type,
@@ -337,15 +365,18 @@ pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
 }
 
-impl<'a> FlatDistanceCal<'a, Float32Type> {
+impl<'a, T> FlatDistanceCal<'a, T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: L2 + Cosine + Dot,
+{
     fn new(vectors: &'a FixedSizeListArray, query: ArrayRef, distance_type: DistanceType) -> Self {
         // Gained significant performance improvement by using strong typed primitive slice.
-        // TODO: to support other data types other than `f32`, make FlatDistanceCal a generic struct.
-        let flat_array = vectors.values().as_primitive::<Float32Type>();
+        let flat_array = vectors.values().as_primitive::<T>();
         let dimension = vectors.value_length() as usize;
         Self {
             vectors: flat_array.values(),
-            query: query.as_primitive::<Float32Type>().values().to_vec(),
+            query: query.as_primitive::<T>().values().to_vec(),
             dimension,
             distance_fn: distance_type.func(),
         }
@@ -353,7 +384,11 @@ impl<'a> FlatDistanceCal<'a, Float32Type> {
 }
 
 impl<'a> FlatDistanceCal<'a, UInt8Type> {
-    fn new(vectors: &'a FixedSizeListArray, query: ArrayRef, _distance_type: DistanceType) -> Self {
+    fn new_binary(
+        vectors: &'a FixedSizeListArray,
+        query: ArrayRef,
+        _distance_type: DistanceType,
+    ) -> Self {
         // Gained significant performance improvement by using strong typed primitive slice.
         // TODO: to support other data types other than `f32`, make FlatDistanceCal a generic struct.
         let flat_array = vectors.values().as_primitive::<UInt8Type>();
@@ -393,5 +428,115 @@ impl<T: ArrowPrimitiveType> DistCalculator for FlatDistanceCal<'_, T> {
     fn prefetch(&self, id: u32) {
         let vector = self.get_vector(id);
         do_prefetch(vector.as_ptr_range())
+    }
+}
+
+pub enum FlatFloatDistanceCalc<'a> {
+    Float16(FlatDistanceCal<'a, Float16Type>),
+    Float32(FlatDistanceCal<'a, Float32Type>),
+    Float64(FlatDistanceCal<'a, Float64Type>),
+}
+
+impl<'a> FlatFloatDistanceCalc<'a> {
+    fn new(vectors: &'a FixedSizeListArray, query: ArrayRef, distance_type: DistanceType) -> Self {
+        match vectors.value_type() {
+            DataType::Float16 => Self::Float16(FlatDistanceCal::<Float16Type>::new(
+                vectors,
+                query,
+                distance_type,
+            )),
+            DataType::Float32 => Self::Float32(FlatDistanceCal::<Float32Type>::new(
+                vectors,
+                query,
+                distance_type,
+            )),
+            DataType::Float64 => Self::Float64(FlatDistanceCal::<Float64Type>::new(
+                vectors,
+                query,
+                distance_type,
+            )),
+            dt => panic!("flat float storage does not support data type {dt}"),
+        }
+    }
+}
+
+impl DistCalculator for FlatFloatDistanceCalc<'_> {
+    fn distance(&self, id: u32) -> f32 {
+        match self {
+            Self::Float16(calc) => calc.distance(id),
+            Self::Float32(calc) => calc.distance(id),
+            Self::Float64(calc) => calc.distance(id),
+        }
+    }
+
+    fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+        match self {
+            Self::Float16(calc) => calc.distance_all(k_hint),
+            Self::Float32(calc) => calc.distance_all(k_hint),
+            Self::Float64(calc) => calc.distance_all(k_hint),
+        }
+    }
+
+    fn prefetch(&self, id: u32) {
+        match self {
+            Self::Float16(calc) => calc.prefetch(id),
+            Self::Float32(calc) => calc.prefetch(id),
+            Self::Float64(calc) => calc.prefetch(id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{Float16Array, Float64Array};
+    use half::f16;
+    use lance_arrow::FixedSizeListArrayExt;
+
+    fn make_f16_storage() -> FlatFloatStorage {
+        let values = Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(4.0),
+            f16::from_f32(6.0),
+        ]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        FlatFloatStorage::new(vectors, DistanceType::L2)
+    }
+
+    fn make_f64_storage() -> FlatFloatStorage {
+        let values = Float64Array::from(vec![1.0, 2.0, 4.0, 6.0]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        FlatFloatStorage::new(vectors, DistanceType::L2)
+    }
+
+    #[test]
+    fn test_flat_float_storage_distance_f16() {
+        let storage = make_f16_storage();
+        let query: ArrayRef = Arc::new(Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+        ]));
+
+        let calc = storage.dist_calculator(query, 0.0);
+        let distances = calc.distance_all(2);
+
+        assert_eq!(distances.len(), 2);
+        assert_eq!(distances[0], 0.0);
+        assert!((distances[1] - 25.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_flat_float_storage_distance_f64() {
+        let storage = make_f64_storage();
+        let query: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+
+        let calc = storage.dist_calculator(query, 0.0);
+        let distances = calc.distance_all(2);
+
+        assert_eq!(distances.len(), 2);
+        assert_eq!(distances[0], 0.0);
+        assert!((distances[1] - 25.0).abs() < 1e-6);
     }
 }
