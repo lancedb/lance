@@ -254,6 +254,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         unimplemented!("prepared partition search is not supported for this index")
     }
 
+    /// Return true if the index supports splitting partition search into async
+    /// prepare and sync execute phases.
+    fn supports_prepared_partition_search(&self) -> bool {
+        false
+    }
+
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;

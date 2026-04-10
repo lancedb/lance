@@ -761,6 +761,26 @@ struct SequentialPartitionSearchState {
 }
 
 impl ANNIvfSubIndexExec {
+    async fn search_partition(
+        index: Arc<dyn VectorIndex>,
+        mut query: Query,
+        part_id: usize,
+        pre_filter: Arc<DatasetPreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+    ) -> DataFusionResult<RecordBatch> {
+        if index.metric_type() == DistanceType::Cosine {
+            let key = normalize_arrow(&query.key)?.0;
+            query.key = key;
+        };
+
+        let batch = index
+            .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
+            .await?;
+        metrics.baseline_metrics.record_output(batch.num_rows());
+        Ok(batch)
+    }
+
     async fn prepare_partition_search(
         index: Arc<dyn VectorIndex>,
         mut query: Query,
@@ -848,6 +868,26 @@ impl ANNIvfSubIndexExec {
             let mut query = state.query.clone();
             query.dist_q_c = state.q_c_dists.value(idx);
             state.metrics.partitions_searched.add(1);
+            if !state.index.supports_prepared_partition_search() {
+                let batch = Self::search_partition(
+                    state.index.clone(),
+                    query,
+                    part_id as usize,
+                    state.prefilter.clone(),
+                    state.metrics.clone(),
+                )
+                .await?;
+
+                match state.mode {
+                    SequentialPartitionSearchMode::Initial => state.state.record_batch(&batch),
+                    SequentialPartitionSearchMode::Late { .. } => {
+                        state.state.record_late_batch(batch.num_rows())
+                    }
+                }
+
+                return Ok(Some((batch, state)));
+            }
+
             let prepared = Self::prepare_partition_search(
                 state.index.clone(),
                 query,
@@ -997,18 +1037,29 @@ impl ANNIvfSubIndexExec {
                     let index = index.clone();
                     async move {
                         metrics.partitions_searched.add(1);
-                        let prepared = Self::prepare_partition_search(
-                            index.clone(),
-                            query,
-                            part_id as usize,
-                            pre_filter,
-                            metrics.clone(),
-                        )
-                        .await?;
-                        let batch = spawn_cpu(move || {
-                            Self::search_prepared_partition(index, prepared, metrics)
-                        })
-                        .await?;
+                        let batch = if index.supports_prepared_partition_search() {
+                            let prepared = Self::prepare_partition_search(
+                                index.clone(),
+                                query,
+                                part_id as usize,
+                                pre_filter,
+                                metrics.clone(),
+                            )
+                            .await?;
+                            spawn_cpu(move || {
+                                Self::search_prepared_partition(index, prepared, metrics)
+                            })
+                            .await?
+                        } else {
+                            Self::search_partition(
+                                index,
+                                query,
+                                part_id as usize,
+                                pre_filter,
+                                metrics,
+                            )
+                            .await?
+                        };
                         state.record_late_batch(batch.num_rows());
                         Ok(batch)
                     }
@@ -1063,18 +1114,21 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let prepared = Self::prepare_partition_search(
-                        index.clone(),
-                        query,
-                        part_id as usize,
-                        pre_filter,
-                        metrics.clone(),
-                    )
-                    .await?;
-                    let batch = spawn_cpu(move || {
-                        Self::search_prepared_partition(index, prepared, metrics)
-                    })
-                    .await?;
+                    let batch = if index.supports_prepared_partition_search() {
+                        let prepared = Self::prepare_partition_search(
+                            index.clone(),
+                            query,
+                            part_id as usize,
+                            pre_filter,
+                            metrics.clone(),
+                        )
+                        .await?;
+                        spawn_cpu(move || Self::search_prepared_partition(index, prepared, metrics))
+                            .await?
+                    } else {
+                        Self::search_partition(index, query, part_id as usize, pre_filter, metrics)
+                            .await?
+                    };
                     state.record_batch(&batch);
                     Ok(batch)
                 }

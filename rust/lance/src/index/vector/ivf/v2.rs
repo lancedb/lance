@@ -1049,6 +1049,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(batch)
     }
 
+    fn supports_prepared_partition_search(&self) -> bool {
+        true
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
