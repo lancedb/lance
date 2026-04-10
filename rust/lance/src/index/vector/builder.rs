@@ -1176,7 +1176,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     DataType::FixedSizeList(
                         Arc::new(arrow_schema::Field::new(
                             "item",
-                            centroids.value_type().clone(),
+                            centroids.value_type(),
                             true,
                         )),
                         centroids.value_length(),
