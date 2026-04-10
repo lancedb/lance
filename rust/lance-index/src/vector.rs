@@ -12,7 +12,9 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use futures::stream;
 use ivf::storage::IvfModel;
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
@@ -55,6 +57,13 @@ pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const LOSS_METADATA_KEY: &str = "_loss";
 
 pub type PreparedPartitionSearchHandle = Box<dyn Any + Send>;
+
+/// Controls when a multi-partition search should stop producing more partition results.
+pub trait PartitionSearchControl: Send + Sync {
+    fn should_stop(&self) -> bool;
+
+    fn record_batch(&self, _batch: &RecordBatch) {}
+}
 
 pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::new(|| {
     arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
@@ -258,6 +267,76 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// prepare and sync execute phases.
     fn supports_prepared_partition_search(&self) -> bool {
         false
+    }
+
+    /// Search a range of partitions and return a stream of per-partition result batches.
+    ///
+    /// The default implementation searches each partition sequentially with
+    /// [`VectorIndex::search_in_partition`]. Implementations can override this
+    /// to use a more efficient execution strategy.
+    async fn search_partitions(
+        self: Arc<Self>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
+        start_idx: usize,
+        end_idx: usize,
+        pre_filter: Arc<dyn PreFilter>,
+        control: Option<Arc<dyn PartitionSearchControl>>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream>
+    where
+        Self: 'static,
+    {
+        if partitions.len() != q_c_dists.len() {
+            return Err(Error::invalid_input(format!(
+                "partition count {} does not match centroid distance count {}",
+                partitions.len(),
+                q_c_dists.len()
+            )));
+        }
+        if start_idx > end_idx || end_idx > partitions.len() {
+            return Err(Error::invalid_input(format!(
+                "invalid partition search range [{start_idx}, {end_idx}) for {} partitions",
+                partitions.len()
+            )));
+        }
+
+        let stream = stream::try_unfold(start_idx, move |idx| {
+            let index = self.clone();
+            let partitions = partitions.clone();
+            let q_c_dists = q_c_dists.clone();
+            let query = query.clone();
+            let pre_filter = pre_filter.clone();
+            let control = control.clone();
+            let metrics = metrics.clone();
+            async move {
+                if idx >= end_idx
+                    || control
+                        .as_ref()
+                        .is_some_and(|control| control.should_stop())
+                {
+                    return Ok(None);
+                }
+                let part_id = partitions.value(idx);
+                let mut query = query;
+                query.dist_q_c = q_c_dists.value(idx);
+                index
+                    .search_in_partition(part_id as usize, &query, pre_filter, metrics.as_ref())
+                    .await
+                    .map(|batch| {
+                        if let Some(control) = control.as_ref() {
+                            control.record_batch(&batch);
+                        }
+                        Some((batch, idx + 1))
+                    })
+                    .map_err(Into::into)
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            stream,
+        )))
     }
 
     /// If the index is loadable by IVF, so it can be a sub-index that

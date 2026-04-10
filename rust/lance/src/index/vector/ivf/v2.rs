@@ -14,6 +14,7 @@ use arrow_arith::numeric::sub;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
@@ -22,13 +23,14 @@ use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -44,8 +46,9 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, PreparedPartitionSearchHandle, Query, ivf::storage::IVF_METADATA_KEY,
-        quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
+        DISTANCE_TYPE_KEY, PartitionSearchControl, PreparedPartitionSearchHandle, Query,
+        VECTOR_RESULT_SCHEMA, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
+        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
@@ -59,6 +62,8 @@ use lance_linalg::distance::DistanceType;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
@@ -556,7 +561,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     fn run_prepared_partition_search(
         distance_type: DistanceType,
         prepared: PreparedPartitionSearch<S, Q>,
-    ) -> Result<(RecordBatch, LocalMetricsCollector)> {
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -569,7 +575,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let param = (&query).into();
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
-        let local_metrics = LocalMetricsCollector::default();
         let part = part_entry
             .as_any()
             .downcast_ref::<PartitionEntry<S, Q>>()
@@ -582,9 +587,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             param,
             &part.storage,
             pre_filter,
-            &local_metrics,
+            metrics,
         )?;
-        Ok((batch, local_metrics))
+        Ok(batch)
     }
 
     fn preprocess_partition_query(
@@ -1014,12 +1019,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepared = self
             .prepare_partition(partition_id, query, pre_filter, metrics)
             .await?;
-        let (batch, local_metrics) =
-            Self::run_prepared_partition_search(self.distance_type, prepared)?;
-
-        local_metrics.dump_into(metrics);
-
-        Ok(batch)
+        Self::run_prepared_partition_search(self.distance_type, prepared, metrics)
     }
 
     async fn prepare_partition_search(
@@ -1043,14 +1043,127 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepared = prepared
             .downcast::<PreparedPartitionSearch<S, Q>>()
             .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
-        let (batch, local_metrics) =
-            Self::run_prepared_partition_search(self.distance_type, *prepared)?;
-        local_metrics.dump_into(metrics);
-        Ok(batch)
+        Self::run_prepared_partition_search(self.distance_type, *prepared, metrics)
     }
 
     fn supports_prepared_partition_search(&self) -> bool {
         true
+    }
+
+    async fn search_partitions(
+        self: Arc<Self>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
+        start_idx: usize,
+        end_idx: usize,
+        pre_filter: Arc<dyn PreFilter>,
+        control: Option<Arc<dyn PartitionSearchControl>>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partitions.len() != q_c_dists.len() {
+            return Err(Error::invalid_input(format!(
+                "partition count {} does not match centroid distance count {}",
+                partitions.len(),
+                q_c_dists.len()
+            )));
+        }
+        if start_idx > end_idx || end_idx > partitions.len() {
+            return Err(Error::invalid_input(format!(
+                "invalid partition search range [{start_idx}, {end_idx}) for {} partitions",
+                partitions.len()
+            )));
+        }
+
+        let (prepared_tx, mut prepared_rx) = mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(1);
+        let (batch_tx, batch_rx) = mpsc::channel::<DataFusionResult<RecordBatch>>(1);
+        let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+
+        let prepare_index = self.clone();
+        let prepare_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let prepare_stream = stream::iter(start_idx..end_idx)
+                .map(move |idx| {
+                    let part_id = partitions.value(idx);
+                    let mut query = query.clone();
+                    query.dist_q_c = q_c_dists.value(idx);
+                    let index = prepare_index.clone();
+                    let pre_filter = pre_filter.clone();
+                    let metrics = prepare_metrics.clone();
+                    async move {
+                        index
+                            .prepare_partition(part_id as usize, &query, pre_filter, metrics.as_ref())
+                            .await
+                    }
+                })
+                .buffered(prepare_parallelism);
+
+            futures::pin_mut!(prepare_stream);
+            while let Some(prepared) = prepare_stream.next().await {
+                let has_error = prepared.is_err();
+                if prepared_tx.send(prepared).await.is_err() || has_error {
+                    break;
+                }
+            }
+        });
+
+        let distance_type = self.distance_type;
+        let search_metrics = metrics.clone();
+        let batch_tx_for_search = batch_tx.clone();
+        let search_control = control.clone();
+        tokio::spawn(async move {
+            let search_result = spawn_cpu(move || -> DataFusionResult<()> {
+                while let Some(prepared) = prepared_rx.blocking_recv() {
+                    let prepared = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            let _ = batch_tx_for_search
+                                .blocking_send(Err(DataFusionError::from(err)));
+                            return Ok(());
+                        }
+                    };
+
+                    if search_control
+                        .as_ref()
+                        .is_some_and(|control| control.should_stop())
+                    {
+                        return Ok(());
+                    }
+
+                    let batch = Self::run_prepared_partition_search(
+                        distance_type,
+                        prepared,
+                        search_metrics.as_ref(),
+                    )
+                    .map_err(DataFusionError::from);
+                    match batch {
+                        Ok(batch) => {
+                            if let Some(control) = search_control.as_ref() {
+                                control.record_batch(&batch);
+                            }
+                            if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => {
+                            let _ = batch_tx_for_search.blocking_send(Err(err));
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
+
+            if let Err(err) = search_result {
+                let _ = batch_tx.send(Err(DataFusionError::from(err))).await;
+            }
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            ReceiverStream::new(batch_rx),
+        )))
     }
 
     fn is_loadable(&self) -> bool {
