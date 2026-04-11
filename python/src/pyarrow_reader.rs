@@ -17,9 +17,7 @@ use pyo3::prelude::*;
 use crate::rt;
 use crate::scanner::Scanner;
 
-pub(crate) fn convert_reader(
-    reader: &Bound<PyAny>,
-) -> PyResult<Box<dyn RecordBatchReader + Send>> {
+pub(crate) fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
@@ -42,9 +40,9 @@ impl Iterator for SchemaOverrideReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|batch| {
-            batch.and_then(|batch| restore_batch_schema(batch, self.schema.clone()))
-        })
+        self.inner
+            .next()
+            .map(|batch| batch.and_then(|batch| restore_batch_schema(batch, self.schema.clone())))
     }
 }
 
