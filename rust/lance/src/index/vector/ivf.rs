@@ -4204,7 +4204,8 @@ mod tests {
             .unwrap();
 
         // Append more data so optimize_indices has unindexed fragments to merge
-        let arr2 = arrow_array::UInt8Array::from_iter_values((0..500 * BIN_DIM).map(|i| (i + 7) as u8));
+        let arr2 =
+            arrow_array::UInt8Array::from_iter_values((0..500 * BIN_DIM).map(|i| (i + 7) as u8));
         let fsl2 = FixedSizeListArray::try_new_from_values(arr2, BIN_DIM as i32).unwrap();
         let batch2 = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl2)]).unwrap();
         let mut dataset = InsertBuilder::new(Arc::new(dataset))
