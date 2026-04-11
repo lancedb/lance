@@ -527,6 +527,26 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .await?
             }
         }
+        // IVF_FLAT (binary vectors)
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?
+        }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
             IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_incremental(
