@@ -1691,9 +1691,15 @@ impl PostingListReader {
         max_score: Option<f32>,
         length: Option<u32>,
         posting_tail_codec: PostingTailCodec,
+        positions_layout: PositionsLayout,
     ) -> Result<PostingList> {
-        let posting_list =
-            PostingList::from_batch_with_tail_codec(batch, max_score, length, posting_tail_codec)?;
+        let posting_list = PostingList::from_batch_with_tail_codec_and_positions_layout(
+            batch,
+            max_score,
+            length,
+            posting_tail_codec,
+            positions_layout,
+        )?;
         Ok(posting_list)
     }
 
@@ -1711,6 +1717,7 @@ impl PostingListReader {
                 .as_ref()
                 .map(|lengths| lengths[token_id as usize]),
             self.posting_tail_codec,
+            self.positions_layout,
         )
     }
 
@@ -1720,6 +1727,7 @@ impl PostingListReader {
         max_scores: Option<Vec<f32>>,
         lengths: Option<Vec<u32>>,
         posting_tail_codec: PostingTailCodec,
+        positions_layout: PositionsLayout,
     ) -> Result<Vec<(u32, PostingList)>> {
         let token_count = if let Some(offsets) = offsets.as_ref() {
             offsets.len()
@@ -1748,6 +1756,7 @@ impl PostingListReader {
                 max_scores.as_ref().map(|scores| scores[token_id]),
                 lengths.as_ref().map(|lengths| lengths[token_id]),
                 posting_tail_codec,
+                positions_layout,
             )?;
             posting_lists.push((token_id as u32, posting_list));
         }
@@ -1771,6 +1780,7 @@ impl PostingListReader {
         let max_scores = self.max_scores.clone();
         let lengths = self.lengths.clone();
         let posting_tail_codec = self.posting_tail_codec;
+        let positions_layout = self.positions_layout;
         let populate_start = Instant::now();
         let posting_lists = spawn_blocking(move || {
             Self::build_prewarm_posting_lists(
@@ -1779,6 +1789,7 @@ impl PostingListReader {
                 max_scores,
                 lengths,
                 posting_tail_codec,
+                positions_layout,
             )
         })
         .await
@@ -2061,14 +2072,44 @@ impl PostingList {
         length: Option<u32>,
         posting_tail_codec: PostingTailCodec,
     ) -> Result<Self> {
+        let positions_layout = if batch.column_by_name(COMPRESSED_POSITION_COL).is_some() {
+            PositionsLayout::SharedStream(parse_shared_position_codec(
+                batch.schema_ref().metadata(),
+            )?)
+        } else if batch.column_by_name(POSITION_COL).is_some() {
+            PositionsLayout::LegacyPerDoc
+        } else {
+            PositionsLayout::None
+        };
+        Self::from_batch_with_tail_codec_and_positions_layout(
+            batch,
+            max_score,
+            length,
+            posting_tail_codec,
+            positions_layout,
+        )
+    }
+
+    fn from_batch_with_tail_codec_and_positions_layout(
+        batch: &RecordBatch,
+        max_score: Option<f32>,
+        length: Option<u32>,
+        posting_tail_codec: PostingTailCodec,
+        positions_layout: PositionsLayout,
+    ) -> Result<Self> {
         match batch.column_by_name(POSTING_COL) {
             Some(_) => {
                 debug_assert!(max_score.is_some() && length.is_some());
+                let shared_position_codec = match positions_layout {
+                    PositionsLayout::SharedStream(codec) => Some(codec),
+                    _ => None,
+                };
                 let posting = CompressedPostingList::from_batch(
                     batch,
                     max_score.unwrap(),
                     length.unwrap(),
                     posting_tail_codec,
+                    shared_position_codec,
                 );
                 Ok(Self::Compressed(posting))
             }
@@ -2343,6 +2384,7 @@ impl CompressedPostingList {
         max_score: f32,
         length: u32,
         posting_tail_codec: PostingTailCodec,
+        shared_position_codec: Option<PositionStreamCodec>,
     ) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
         let blocks = batch[POSTING_COL]
@@ -2358,8 +2400,10 @@ impl CompressedPostingList {
                 .as_primitive::<UInt32Type>()
                 .values()
                 .to_vec();
-            let codec = parse_shared_position_codec(batch.schema_ref().metadata())
-                .expect("shared position stream codec metadata should be valid");
+            let codec = shared_position_codec.unwrap_or_else(|| {
+                parse_shared_position_codec(batch.schema_ref().metadata())
+                    .expect("shared position stream codec metadata should be valid")
+            });
             Some(CompressedPositionStorage::SharedStream(
                 SharedPositionStream::new(codec, block_offsets, bytes),
             ))
@@ -4973,6 +5017,93 @@ mod tests {
             ),
             "positions should be stored in the dedicated position cache"
         );
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_with_v2_positions_preserves_shared_stream_codec() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let format_version = InvertedListFormatVersion::V2;
+        let posting_tail_codec = format_version.posting_tail_codec();
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            format_version,
+        );
+        builder.tokens.add("body".to_owned());
+
+        let mut posting_list =
+            PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec);
+        let expected = (0..(BLOCK_SIZE + 5) as u32)
+            .map(|doc_id| {
+                let positions = vec![doc_id % 3, doc_id % 3 + 2, doc_id % 3 + 5];
+                posting_list.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+                builder.docs.append(30_000 + doc_id as u64, 20 + doc_id % 7);
+                (doc_id, positions.len() as u32, positions)
+            })
+            .collect::<Vec<_>>();
+        builder.posting_lists.push(posting_list);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                POSITIONS_LAYOUT_KEY.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
+            ),
+            (
+                POSITIONS_CODEC_KEY.to_owned(),
+                PositionStreamCodec::PackedDelta.as_str().to_owned(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::new().with_position(true))
+            .await
+            .unwrap();
+
+        let actual = index.partitions[0]
+            .inverted_list
+            .posting_list(0, true, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(doc_id, freq, positions)| {
+                (doc_id as u32, freq, positions.unwrap().collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
