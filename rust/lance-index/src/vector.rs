@@ -274,6 +274,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// The default implementation searches each partition sequentially with
     /// [`VectorIndex::search_in_partition`]. Implementations can override this
     /// to use a more efficient execution strategy.
+    #[allow(clippy::too_many_arguments)]
     async fn search_partitions(
         self: Arc<Self>,
         query: Query,

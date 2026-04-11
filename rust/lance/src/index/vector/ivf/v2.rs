@@ -13,8 +13,8 @@ use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
@@ -581,14 +581,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::internal(
                 "failed to downcast partition entry".to_string(),
             ))?;
-        let batch = part.index.search(
-            query.key,
-            k,
-            param,
-            &part.storage,
-            pre_filter,
-            metrics,
-        )?;
+        let batch = part
+            .index
+            .search(query.key, k, param, &part.storage, pre_filter, metrics)?;
         Ok(batch)
     }
 
@@ -1050,6 +1045,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search_partitions(
         self: Arc<Self>,
         query: Query,
@@ -1090,7 +1086,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let metrics = prepare_metrics.clone();
                     async move {
                         index
-                            .prepare_partition(part_id as usize, &query, pre_filter, metrics.as_ref())
+                            .prepare_partition(
+                                part_id as usize,
+                                &query,
+                                pre_filter,
+                                metrics.as_ref(),
+                            )
                             .await
                     }
                 })
@@ -1100,7 +1101,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
             let distance_type = self.distance_type;
             let search_metrics = metrics.clone();
-            let merged_batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
+            let batches = spawn_cpu(move || -> DataFusionResult<Vec<RecordBatch>> {
                 let mut batches = Vec::with_capacity(prepared.len());
                 for prepared in prepared {
                     let batch = Self::run_prepared_partition_search(
@@ -1109,28 +1110,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                         search_metrics.as_ref(),
                     )
                     .map_err(DataFusionError::from)?;
-                    if batch.num_rows() > 0 {
-                        batches.push(batch);
-                    }
+                    batches.push(batch);
                 }
-
-                match batches.len() {
-                    0 => Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone())),
-                    1 => Ok(batches.pop().expect("length checked")),
-                    _ => concat_batches(batches[0].schema_ref(), batches.iter())
-                        .map_err(DataFusionError::from),
-                }
+                Ok(batches)
             })
             .await?;
 
-            let stream = stream::iter(vec![Ok(merged_batch)]);
+            let stream = stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>));
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 VECTOR_RESULT_SCHEMA.clone(),
                 stream,
             )));
         }
 
-        let (prepared_tx, mut prepared_rx) = mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(1);
+        let (prepared_tx, mut prepared_rx) =
+            mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(1);
         let (batch_tx, batch_rx) = mpsc::channel::<DataFusionResult<RecordBatch>>(1);
 
         let prepare_index = self.clone();
@@ -1146,7 +1140,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let metrics = prepare_metrics.clone();
                     async move {
                         index
-                            .prepare_partition(part_id as usize, &query, pre_filter, metrics.as_ref())
+                            .prepare_partition(
+                                part_id as usize,
+                                &query,
+                                pre_filter,
+                                metrics.as_ref(),
+                            )
                             .await
                     }
                 })
@@ -1171,8 +1170,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let prepared = match prepared {
                         Ok(prepared) => prepared,
                         Err(err) => {
-                            let _ = batch_tx_for_search
-                                .blocking_send(Err(DataFusionError::from(err)));
+                            let _ =
+                                batch_tx_for_search.blocking_send(Err(DataFusionError::from(err)));
                             return Ok(());
                         }
                     };
@@ -1210,7 +1209,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .await;
 
             if let Err(err) = search_result {
-                let _ = batch_tx.send(Err(DataFusionError::from(err))).await;
+                let _ = batch_tx.send(Err(err)).await;
             }
         });
 

@@ -114,6 +114,19 @@ async fn find_partitions_on_cpu(
         .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {}", e)))
 }
 
+fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusionResult<Query> {
+    if index.metric_type() != DistanceType::Cosine {
+        return Ok(query);
+    }
+
+    let mut query = query;
+    let key = normalize_arrow(&query.key)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to normalize query: {e}")))?
+        .0;
+    query.key = key;
+    Ok(query)
+}
+
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
 /// Preconditions:
@@ -517,13 +530,8 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     let index = ds
                         .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                         .await?;
-                    let mut query = query.clone();
-                    // Normalize cosine queries once at the outermost IVF stage and
-                    // reuse the normalized key for all downstream partition work.
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
+                    // Normalize cosine queries once before partition ranking.
+                    let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
@@ -807,13 +815,12 @@ impl ANNIvfSubIndexExec {
             .map(move |batch| {
                 let metrics = metrics.clone();
                 let state = state.clone();
-                batch.map(move |batch| {
+                batch.inspect(move |batch| {
                     metrics.partitions_searched.add(1);
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     if record_initial {
-                        state.record_batch(&batch);
+                        state.record_batch(batch);
                     }
-                    batch
                 })
             })
             .boxed()
@@ -1016,7 +1023,12 @@ impl ANNIvfSubIndexExec {
                         DataFusionError::Execution(format!("Failed to search partitions: {e}"))
                     })?;
                 Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
-                    Self::instrument_sequential_partition_stream(stream.boxed(), metrics, state, true),
+                    Self::instrument_sequential_partition_stream(
+                        stream.boxed(),
+                        metrics,
+                        state,
+                        true,
+                    ),
                 )
             })
             .try_flatten()
@@ -1218,6 +1230,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
+                        let query = normalize_query_for_index(raw_index.as_ref(), query)?;
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -1522,9 +1535,9 @@ mod tests {
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use async_trait::async_trait;
-    use deepsize::DeepSizeOf;
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
@@ -1798,6 +1811,7 @@ mod tests {
             true
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn search_partitions(
             self: Arc<Self>,
             _query: Query,
@@ -1853,9 +1867,7 @@ mod tests {
                 .await;
 
                 if let Err(err) = search_result {
-                    let _ = batch_tx
-                        .send(Err(datafusion::error::DataFusionError::from(err)))
-                        .await;
+                    let _ = batch_tx.send(Err(err)).await;
                 }
             });
 
@@ -1958,14 +1970,14 @@ mod tests {
         Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
     }
 
-    fn prepared_index(
-        row_ids: Vec<u64>,
-    ) -> (
+    type PreparedIndexState = (
         Arc<dyn VectorIndex>,
         Arc<Mutex<Vec<usize>>>,
         Arc<Mutex<Vec<usize>>>,
         Arc<Mutex<Vec<String>>>,
-    ) {
+    );
+
+    fn prepared_index(row_ids: Vec<u64>) -> PreparedIndexState {
         let prepared_partitions = Arc::new(Mutex::new(Vec::new()));
         let searched_partitions = Arc::new(Mutex::new(Vec::new()));
         let search_threads = Arc::new(Mutex::new(Vec::new()));
