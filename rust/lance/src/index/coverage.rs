@@ -8,7 +8,7 @@ use roaring::RoaringBitmap;
 use crate::{Error, Result, dataset::Dataset, index::DatasetIndexExt};
 
 #[async_recursion]
-pub(crate) async fn fragments_covered_by_scalar_index_query(
+pub async fn fragments_covered_by_scalar_index_query(
     dataset: &Dataset,
     index_expr: &ScalarIndexExpr,
 ) -> Result<RoaringBitmap> {
