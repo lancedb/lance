@@ -9,6 +9,7 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::scalar_count::try_count_rows_with_exact_scalar_index;
 use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
 use crate::{Dataset, Error, Result};
@@ -236,7 +237,7 @@ async fn test_create_and_fill_empty_dataset(
     ];
     write_params.mode = WriteMode::Append;
     let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    Dataset::write(batches, &test_uri, Some(write_params))
+    Dataset::write(batches, &test_uri, Some(write_params.clone()))
         .await
         .unwrap();
 
@@ -1396,23 +1397,23 @@ async fn test_fast_count_rows(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
-    let test_uri = TempStrDir::default();
-
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "i",
         DataType::Int32,
         false,
     )]));
 
-    let batches: Vec<RecordBatch> = (0..20)
-        .map(|i| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
-            )
-            .unwrap()
-        })
-        .collect();
+    let make_batches = || {
+        (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
 
     let write_params = WriteParams {
         max_rows_per_file: 40,
@@ -1420,19 +1421,65 @@ async fn test_fast_count_rows(
         data_storage_version: Some(data_storage_version),
         ..Default::default()
     };
-    let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    Dataset::write(batches, &test_uri, Some(write_params))
+    let test_uri = TempStrDir::default();
+    let batches = RecordBatchIterator::new(make_batches().into_iter().map(Ok), schema.clone());
+    Dataset::write(batches, &test_uri, Some(write_params.clone()))
         .await
         .unwrap();
 
-    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
     dataset.validate().await.unwrap();
     assert_eq!(10, dataset.fragments().len());
     assert_eq!(400, dataset.count_rows(None).await.unwrap());
     assert_eq!(
+        None,
+        try_count_rows_with_exact_scalar_index(&dataset, "i < 200")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
         200,
         dataset
             .count_rows(Some("i < 200".to_string()))
+            .await
+            .unwrap()
+    );
+
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            Some("i_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(200),
+        try_count_rows_with_exact_scalar_index(&dataset, "i < 200")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        200,
+        dataset
+            .count_rows(Some("i < 200".to_string()))
+            .await
+            .unwrap()
+    );
+
+    dataset.delete("i >= 250 AND i < 300").await.unwrap();
+    assert_eq!(
+        Some(150),
+        try_count_rows_with_exact_scalar_index(&dataset, "NOT (i < 200)")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        150,
+        dataset
+            .count_rows(Some("NOT (i < 200)".to_string()))
             .await
             .unwrap()
     );

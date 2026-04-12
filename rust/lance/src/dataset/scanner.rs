@@ -81,6 +81,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::coverage::fragments_covered_by_scalar_index_query;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -3797,32 +3798,6 @@ impl Scanner {
         Ok(knn_node)
     }
 
-    #[async_recursion]
-    async fn fragments_covered_by_index_query(
-        &self,
-        index_expr: &ScalarIndexExpr,
-    ) -> Result<RoaringBitmap> {
-        match index_expr {
-            ScalarIndexExpr::And(lhs, rhs) => {
-                Ok(self.fragments_covered_by_index_query(lhs).await?
-                    & self.fragments_covered_by_index_query(rhs).await?)
-            }
-            ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
-                & self.fragments_covered_by_index_query(rhs).await?),
-            ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(search) => {
-                let idx = self
-                    .dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search.index_name))
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
-            }
-        }
-    }
-
     /// Given an index query, split the fragments into two sets
     ///
     /// The first set is the relevant fragments, which are covered by ALL indices in the query
@@ -3835,7 +3810,8 @@ impl Scanner {
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
-        let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
+        let covered_frags =
+            fragments_covered_by_scalar_index_query(self.dataset.as_ref(), index_expr).await?;
         let mut relevant_frags = Vec::with_capacity(fragments.len());
         let mut missing_frags = Vec::with_capacity(fragments.len());
         for fragment in fragments.iter() {

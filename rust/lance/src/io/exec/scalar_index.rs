@@ -7,11 +7,13 @@ use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
-    index::{DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter},
+    index::{
+        DatasetIndexExt, DatasetIndexInternalExt,
+        coverage::fragments_covered_by_scalar_index_query, prefilter::DatasetPreFilter,
+    },
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
     common::{Statistics, stats::Precision},
@@ -24,6 +26,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
+use deepsize::DeepSizeOf;
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
@@ -39,11 +42,12 @@ use lance_datafusion::{
         ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
     },
 };
+use lance_index::Index;
 use lance_index::{
-    IndexCriteria,
+    IndexCriteria, IndexType,
     metrics::MetricsCollector,
     scalar::{
-        SargableQuery, ScalarIndex,
+        SargableQuery, ScalarIndex, SearchResult,
         expression::{
             INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
             ScalarIndexSearch,
@@ -52,7 +56,159 @@ use lance_index::{
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
+use serde_json::json;
 use tracing::{debug_span, instrument};
+
+#[derive(Debug, DeepSizeOf)]
+struct LogicalScalarIndex {
+    segments: Vec<Arc<dyn ScalarIndex>>,
+    index_type: IndexType,
+}
+
+impl LogicalScalarIndex {
+    fn try_new(segments: Vec<Arc<dyn ScalarIndex>>) -> Result<Self> {
+        let Some(index_type) = segments.first().map(|segment| segment.index_type()) else {
+            return Err(Error::internal(
+                "Logical scalar index requires at least one segment".to_string(),
+            ));
+        };
+        if !segments
+            .iter()
+            .all(|segment| segment.index_type() == index_type)
+        {
+            return Err(Error::internal(
+                "Logical scalar index segments must all have the same index type".to_string(),
+            ));
+        }
+        Ok(Self {
+            segments,
+            index_type,
+        })
+    }
+
+    fn combine_search_results(results: &[SearchResult]) -> SearchResult {
+        use lance_core::utils::mask::NullableRowAddrSet;
+
+        let lower = NullableRowAddrSet::union_all(
+            &results
+                .iter()
+                .filter_map(|result| match result {
+                    SearchResult::Exact(rows) | SearchResult::AtLeast(rows) => Some(rows.clone()),
+                    SearchResult::AtMost(_) => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let upper = results
+            .iter()
+            .map(|result| match result {
+                SearchResult::Exact(rows) | SearchResult::AtMost(rows) => Some(rows.clone()),
+                SearchResult::AtLeast(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|rows| NullableRowAddrSet::union_all(&rows));
+
+        match upper {
+            Some(upper) if lower == upper => SearchResult::Exact(upper),
+            Some(upper) => SearchResult::AtMost(upper),
+            None => SearchResult::AtLeast(lower),
+        }
+    }
+}
+
+#[async_trait]
+impl Index for LogicalScalarIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn lance_index::vector::VectorIndex>> {
+        Err(Error::invalid_input(
+            "Logical scalar index cannot be used as a vector index".to_string(),
+        ))
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "num_segments": self.segments.len(),
+            "segments": self.segments.iter().map(|segment| segment.statistics()).collect::<Result<Vec<_>>>()?,
+        }))
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        for segment in &self.segments {
+            segment.prewarm().await?;
+        }
+        Ok(())
+    }
+
+    fn index_type(&self) -> IndexType {
+        self.index_type
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut fragments = RoaringBitmap::new();
+        for segment in &self.segments {
+            fragments |= segment.calculate_included_frags().await?;
+        }
+        Ok(fragments)
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for LogicalScalarIndex {
+    async fn search(
+        &self,
+        query: &dyn lance_index::scalar::AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let mut results = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            results.push(segment.search(query, metrics).await?);
+        }
+        Ok(Self::combine_search_results(&results))
+    }
+
+    fn can_remap(&self) -> bool {
+        false
+    }
+
+    async fn remap(
+        &self,
+        _mapping: &std::collections::HashMap<u64, Option<u64>>,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+    ) -> Result<lance_index::scalar::CreatedIndex> {
+        Err(Error::not_supported(
+            "Logical scalar index is query-only".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _new_data: datafusion::execution::SendableRecordBatchStream,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+        _old_data_filter: Option<lance_index::scalar::OldIndexDataFilter>,
+    ) -> Result<lance_index::scalar::CreatedIndex> {
+        Err(Error::not_supported(
+            "Logical scalar index is query-only".to_string(),
+        ))
+    }
+
+    fn update_criteria(&self) -> lance_index::scalar::UpdateCriteria {
+        lance_index::scalar::UpdateCriteria::requires_old_data(
+            lance_index::scalar::registry::TrainingCriteria::new(
+                lance_index::scalar::registry::TrainingOrdering::None,
+            ),
+        )
+    }
+
+    fn derive_index_params(&self) -> Result<lance_index::scalar::ScalarIndexParams> {
+        self.segments[0].derive_index_params()
+    }
+}
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
@@ -62,12 +218,27 @@ impl ScalarIndexLoader for Dataset {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let idx = self
-            .load_scalar_index(IndexCriteria::default().with_name(index_name))
-            .await?
-            .ok_or_else(|| Error::internal(format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column)))?;
-        self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
-            .await
+        let indices = self.load_indices_by_name(index_name).await?;
+        match indices.len() {
+            0 => Err(Error::internal(format!(
+                "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
+                index_name, column
+            ))),
+            1 => {
+                self.open_scalar_index(column, &indices[0].uuid.to_string(), metrics)
+                    .await
+            }
+            _ => {
+                let mut segments = Vec::with_capacity(indices.len());
+                for index in indices {
+                    segments.push(
+                        self.open_scalar_index(column, &index.uuid.to_string(), metrics)
+                            .await?,
+                    );
+                }
+                Ok(Arc::new(LogicalScalarIndex::try_new(segments)?) as Arc<dyn ScalarIndex>)
+            }
+        }
     }
 }
 
@@ -115,35 +286,6 @@ impl ScalarIndexExec {
         }
     }
 
-    #[async_recursion]
-    async fn fragments_covered_by_index_query(
-        index_expr: &ScalarIndexExpr,
-        dataset: &Dataset,
-    ) -> Result<RoaringBitmap> {
-        match index_expr {
-            ScalarIndexExpr::And(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Or(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Not(expr) => {
-                Self::fragments_covered_by_index_query(expr, dataset).await
-            }
-            ScalarIndexExpr::Query(search_key) => {
-                let idx = dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search_key.index_name))
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
-            }
-        }
-    }
-
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
@@ -156,7 +298,7 @@ impl ScalarIndexExec {
             expr.evaluate(dataset.as_ref(), &metrics).await?
         };
         let fragments_covered_by_result =
-            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+            fragments_covered_by_scalar_index_query(dataset.as_ref(), &expr).await?;
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
@@ -731,32 +873,129 @@ impl ExecutionPlan for MaterializeIndexExec {
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Bound, sync::Arc};
+    use std::{any::Any, collections::HashMap, ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
+    use async_trait::async_trait;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
         scalar::ScalarValue,
     };
+    use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
+    use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
-        IndexType,
+        Index, IndexType,
+        metrics::{MetricsCollector, NoOpMetricsCollector},
         scalar::{
-            SargableQuery, ScalarIndexParams,
+            CreatedIndex, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+            UpdateCriteria,
             expression::{ScalarIndexExpr, ScalarIndexSearch},
+            registry::{TrainingCriteria, TrainingOrdering},
         },
     };
+    use roaring::RoaringBitmap;
+    use serde_json::json;
 
     use crate::{
-        Dataset,
+        Dataset, Error, Result,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
-    use super::{MapIndexExec, ScalarIndexExec};
+    use super::{LogicalScalarIndex, MapIndexExec, ScalarIndexExec};
+
+    #[derive(Debug, DeepSizeOf)]
+    struct StubScalarIndex {
+        row_addrs: RowAddrTreeMap,
+        index_type: IndexType,
+    }
+
+    #[async_trait]
+    impl Index for StubScalarIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn lance_index::vector::VectorIndex>> {
+            Err(Error::invalid_input(
+                "Stub scalar index cannot be used as a vector index".to_string(),
+            ))
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(json!({ "num_rows": self.row_addrs.len() }))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            self.index_type
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(self
+                .row_addrs
+                .iter()
+                .map(|(fragment_id, _)| *fragment_id)
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndex for StubScalarIndex {
+        async fn search(
+            &self,
+            _query: &dyn lance_index::scalar::AnyQuery,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            Ok(SearchResult::exact(self.row_addrs.clone()))
+        }
+
+        fn can_remap(&self) -> bool {
+            false
+        }
+
+        async fn remap(
+            &self,
+            _mapping: &HashMap<u64, Option<u64>>,
+            _dest_store: &dyn lance_index::scalar::IndexStore,
+        ) -> Result<CreatedIndex> {
+            Err(Error::not_supported(
+                "Stub scalar index cannot be remapped".to_string(),
+            ))
+        }
+
+        async fn update(
+            &self,
+            _new_data: datafusion::execution::SendableRecordBatchStream,
+            _dest_store: &dyn lance_index::scalar::IndexStore,
+            _old_data_filter: Option<lance_index::scalar::OldIndexDataFilter>,
+        ) -> Result<CreatedIndex> {
+            Err(Error::not_supported(
+                "Stub scalar index cannot be updated".to_string(),
+            ))
+        }
+
+        fn update_criteria(&self) -> UpdateCriteria {
+            UpdateCriteria::requires_old_data(TrainingCriteria::new(TrainingOrdering::None))
+        }
+
+        fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+            Ok(ScalarIndexParams::for_builtin(
+                self.index_type.try_into().unwrap(),
+            ))
+        }
+    }
 
     struct TestFixture {
         dataset: Arc<Dataset>,
@@ -865,5 +1104,43 @@ mod tests {
         let plan =
             MaterializeIndexExec::new(arc_dasaset.clone(), query, arc_dasaset.fragments().clone());
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_logical_scalar_index_search_unions_all_segments() {
+        let logical_index = LogicalScalarIndex::try_new(vec![
+            Arc::new(StubScalarIndex {
+                row_addrs: [0_u64, 1_u64, (1_u64 << 32) | 3].into_iter().collect(),
+                index_type: IndexType::BTree,
+            }) as Arc<dyn ScalarIndex>,
+            Arc::new(StubScalarIndex {
+                row_addrs: [(2_u64 << 32) | 5, (3_u64 << 32) | 7].into_iter().collect(),
+                index_type: IndexType::BTree,
+            }) as Arc<dyn ScalarIndex>,
+        ])
+        .unwrap();
+
+        let result = logical_index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(row_addrs) = result else {
+            panic!("logical scalar index should preserve exact segment results");
+        };
+        let row_addrs = row_addrs.true_rows();
+
+        for row_addr in [
+            0_u64,
+            1_u64,
+            (1_u64 << 32) | 3,
+            (2_u64 << 32) | 5,
+            (3_u64 << 32) | 7,
+        ] {
+            assert!(
+                row_addrs.contains(row_addr),
+                "missing row address {row_addr}"
+            );
+        }
+        assert_eq!(row_addrs.len(), Some(5));
     }
 }

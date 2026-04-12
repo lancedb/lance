@@ -80,6 +80,7 @@ pub mod optimize;
 pub mod progress;
 pub mod refs;
 pub(crate) mod rowids;
+mod scalar_count;
 pub mod scanner;
 mod schema_evolution;
 pub mod sql;
@@ -103,6 +104,7 @@ use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
+use crate::dataset::scalar_count::try_count_rows_with_exact_scalar_index;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
@@ -1361,6 +1363,10 @@ impl Dataset {
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         // TODO: consolidate the count_rows into Scanner plan.
         if let Some(filter) = filter {
+            if let Some(index_count) = try_count_rows_with_exact_scalar_index(self, &filter).await?
+            {
+                return Ok(index_count);
+            }
             let mut scanner = self.scan();
             scanner.filter(&filter)?;
             Ok(scanner
