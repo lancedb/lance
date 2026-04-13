@@ -1964,8 +1964,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeSample(
     mut env: JNIEnv,
     java_dataset: JObject,
     n: jlong,
-    columns_obj: JObject,       // List<String>
-    fragment_ids_obj: JObject,   // Optional<List<Integer>>
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
 ) -> jbyteArray {
     match inner_sample(&mut env, java_dataset, n, columns_obj, fragment_ids_obj) {
         Ok(byte_array) => byte_array,
@@ -1980,8 +1980,8 @@ fn inner_sample(
     env: &mut JNIEnv,
     java_dataset: JObject,
     n: jlong,
-    columns_obj: JObject,       // List<String>
-    fragment_ids_obj: JObject,   // Optional<List<Integer>>
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
 ) -> Result<jbyteArray> {
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
     let fragment_ids: Option<Vec<i32>> = env.get_ints_opt(&fragment_ids_obj)?;
@@ -1998,11 +1998,7 @@ fn inner_sample(
             .project_preserve_system_columns(&columns)
             .map_err(|e| Error::runtime_error(e.to_string()))?;
 
-        match RT.block_on(dataset.sample(
-            n as usize,
-            &projection,
-            fragment_ids_u32.as_deref(),
-        )) {
+        match RT.block_on(dataset.sample(n as usize, &projection, fragment_ids_u32.as_deref())) {
             Ok(res) => res,
             Err(e) => {
                 return Err(e.into());
