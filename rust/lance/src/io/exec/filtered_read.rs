@@ -59,7 +59,7 @@ use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
 };
 
-use super::utils::{ChopBatchesStream, IoMetrics};
+use super::utils::IoMetrics;
 
 #[derive(Debug)]
 pub struct EvaluatedIndex {
@@ -1738,10 +1738,22 @@ impl FilteredReadExec {
                 *running_stream = Some(new_running_stream);
                 first_stream
             };
-            DataFusionResult::<SendableRecordBatchStream>::Ok(ChopBatchesStream::wrap_if_needed(
-                inner,
-                batch_size_bytes,
-            ))
+            let stream: SendableRecordBatchStream = match batch_size_bytes {
+                Some(target) => {
+                    let schema = inner.schema();
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema.clone(),
+                        lance_arrow::stream::rechunk_stream_by_size(
+                            inner,
+                            schema,
+                            0,
+                            target as usize,
+                        ),
+                    ))
+                }
+                None => inner,
+            };
+            DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
 
