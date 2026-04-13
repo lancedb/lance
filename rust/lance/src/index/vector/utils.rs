@@ -100,7 +100,7 @@ async fn estimate_multivector_vectors_per_row(
     let sample_batch_size = std::cmp::min(64, num_rows);
     for _ in 0..8 {
         let batch = dataset
-            .sample(sample_batch_size, &projection, fragments)
+            .sample(sample_batch_size, &projection, fragments, None)
             .await?;
         let array = get_column_from_batch(&batch, column)?;
         let list_array = array.as_list::<i32>();
@@ -438,7 +438,7 @@ async fn sample_training_data(
         if !is_nullable {
             let projection = dataset.schema().project(&[column])?;
             let batch = dataset
-                .sample(sample_size_hint, &projection, Some(fragment_ids))
+                .sample(sample_size_hint, &projection, Some(fragment_ids), None)
                 .await?;
             return vector_column_to_fsl(&batch, column);
         }

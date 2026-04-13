@@ -840,6 +840,75 @@ public class DatasetTest {
   }
 
   @Test
+  void testSample(@TempDir Path tempDir) throws IOException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 20)) {
+        // Sample without fragment filter
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.sample(5, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(5, result.getRowCount());
+          assertEquals(2, result.getSchema().getFields().size());
+        }
+
+        // Sample with fragment filter
+        List<Fragment> fragments = dataset2.getFragments();
+        assertFalse(fragments.isEmpty());
+        List<Integer> fragmentIds =
+            fragments.stream().map(f -> f.getId()).collect(Collectors.toList());
+        try (ArrowReader reader = dataset2.sample(3, columns, Optional.of(fragmentIds))) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(3, result.getRowCount());
+        }
+
+        // Sample more than available rows returns all rows
+        try (ArrowReader reader = dataset2.sample(100, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(20, result.getRowCount());
+        }
+
+        // Deterministic sampling with seed: same seed produces same results
+        long seed = 42L;
+        List<Integer> firstSampleIds;
+        try (ArrowReader reader =
+            dataset2.sample(5, columns, Optional.empty(), Optional.of(seed))) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(5, result.getRowCount());
+          firstSampleIds = new ArrayList<>();
+          for (int i = 0; i < result.getRowCount(); i++) {
+            firstSampleIds.add((Integer) result.getVector("id").getObject(i));
+          }
+        }
+        List<Integer> secondSampleIds;
+        try (ArrowReader reader =
+            dataset2.sample(5, columns, Optional.empty(), Optional.of(seed))) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(5, result.getRowCount());
+          secondSampleIds = new ArrayList<>();
+          for (int i = 0; i < result.getRowCount(); i++) {
+            secondSampleIds.add((Integer) result.getVector("id").getObject(i));
+          }
+        }
+        assertEquals(firstSampleIds, secondSampleIds);
+      }
+    }
+  }
+
+  @Test
   void testCountRows(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
