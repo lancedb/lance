@@ -20,7 +20,7 @@ fn main() -> Result<()> {
         &[
             "./protos/table_identifier.proto",
             "./protos/filtered_read.proto",
-            "./protos/ann_ivf.proto",
+            "./protos/ann.proto",
         ],
         &["./protos"],
     )?;

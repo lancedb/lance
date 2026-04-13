@@ -12,7 +12,7 @@ pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
 #[cfg(feature = "substrait")]
-pub mod knn_proto;
+pub mod ann_proto;
 mod optimizer;
 mod projection;
 mod pushdown_scan;
