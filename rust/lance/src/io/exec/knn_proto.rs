@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Protobuf serialization for [`ANNIvfPartitionExec`] and [`ANNIvfSubIndexExec`].
+//! Protobuf serialization for [`ANNIvfSubIndexExec`].
 //!
 //! Proto message definitions live in `lance-datafusion` (see `pb`).
-//! Conversion functions live here because they need access to `ANNIvfPartitionExec`,
-//! `ANNIvfSubIndexExec`, and `Dataset`, which are defined in this crate.
+//! Conversion functions live here because they need access to `ANNIvfSubIndexExec`
+//! and `Dataset`, which are defined in this crate.
 //!
 //! A DataFusion `PhysicalExtensionCodec` can call these functions in `try_encode`
 //! and `try_decode` to support distributed execution (planner → executor).
@@ -20,11 +20,10 @@ use lance_index::vector::Query;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
-use prost::Message;
 
 use crate::Dataset;
 
-use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
+use super::knn::ANNIvfSubIndexExec;
 use super::table_identifier::{open_dataset_from_table_identifier, table_identifier_from_dataset};
 use super::utils::PreFilterSource;
 
@@ -123,39 +122,6 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
 }
 
 // =============================================================================
-// ANNIvfPartitionExec <-> Proto
-// =============================================================================
-
-/// Convert an [`ANNIvfPartitionExec`] to proto for serialization.
-pub async fn ann_ivf_partition_exec_to_proto(
-    exec: &ANNIvfPartitionExec,
-) -> Result<pb::AnnIvfPartitionExecProto> {
-    let table = table_identifier_from_dataset(&exec.dataset).await?;
-    let query = query_to_proto(&exec.query)?;
-
-    Ok(pb::AnnIvfPartitionExecProto {
-        query: Some(query),
-        table: Some(table),
-        index_uuids: exec.index_uuids.clone(),
-    })
-}
-
-/// Reconstruct an [`ANNIvfPartitionExec`] from proto.
-pub async fn ann_ivf_partition_exec_from_proto(
-    proto: pb::AnnIvfPartitionExecProto,
-    dataset: Option<Arc<Dataset>>,
-) -> Result<ANNIvfPartitionExec> {
-    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
-
-    let query_proto = proto.query.ok_or_else(|| {
-        Error::invalid_input_source("Missing VectorQueryProto in ANNIvfPartitionExecProto".into())
-    })?;
-    let query = query_from_proto(query_proto)?;
-
-    ANNIvfPartitionExec::try_new(dataset, proto.index_uuids, query)
-}
-
-// =============================================================================
 // ANNIvfSubIndexExec <-> Proto
 // =============================================================================
 
@@ -166,13 +132,10 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     let query = query_to_proto(exec.query())?;
 
-    let indices: Vec<Vec<u8>> = exec
+    let indices: Vec<table_pb::IndexMetadata> = exec
         .indices()
         .iter()
-        .map(|idx| {
-            let idx_proto: table_pb::IndexMetadata = idx.into();
-            idx_proto.encode_to_vec()
-        })
+        .map(|idx| idx.into())
         .collect();
 
     Ok(pb::AnnIvfSubIndexExecProto {
@@ -185,7 +148,7 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
 /// Reconstruct an [`ANNIvfSubIndexExec`] from proto.
 ///
 /// The caller (codec) is responsible for extracting child inputs:
-/// - `input`: the child ANNIvfPartitionExec
+/// - `input`: the child execution plan (e.g. partition exec)
 /// - `prefilter_source`: optional prefilter input
 pub async fn ann_ivf_sub_index_exec_from_proto(
     proto: pb::AnnIvfSubIndexExecProto,
@@ -202,12 +165,8 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
 
     let indices: Vec<IndexMetadata> = proto
         .indices
-        .iter()
-        .map(|bytes| {
-            let idx_proto = table_pb::IndexMetadata::decode(bytes.as_slice())
-                .map_err(|e| Error::internal(format!("Failed to decode IndexMetadata: {e}")))?;
-            IndexMetadata::try_from(idx_proto)
-        })
+        .into_iter()
+        .map(IndexMetadata::try_from)
         .collect::<Result<Vec<_>>>()?;
 
     if indices.is_empty() {
@@ -249,6 +208,7 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
+    use datafusion_physical_plan::test::TestMemoryExec;
     use lance_index::IndexType;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -385,47 +345,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ann_ivf_partition_proto_roundtrip() {
-        let (dataset, _dir) = make_vector_dataset().await;
-
-        let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
-        let query = Query {
-            column: "vector".to_string(),
-            key,
-            k: 10,
-            lower_bound: None,
-            upper_bound: None,
-            minimum_nprobes: 4,
-            maximum_nprobes: Some(20),
-            ef: None,
-            refine_factor: None,
-            metric_type: Some(DistanceType::L2),
-            use_index: true,
-            dist_q_c: 0.0,
-        };
-
-        let exec =
-            ANNIvfPartitionExec::try_new(dataset.clone(), vec!["uuid-1".into()], query).unwrap();
-
-        let proto = ann_ivf_partition_exec_to_proto(&exec).await.unwrap();
-
-        // Check table identifier
-        let table = proto.table.as_ref().unwrap();
-        assert_eq!(table.uri, dataset.uri());
-        assert_eq!(table.version, dataset.manifest.version);
-
-        // Roundtrip
-        let back = ann_ivf_partition_exec_from_proto(proto, Some(dataset.clone()))
-            .await
-            .unwrap();
-        assert_eq!(back.query.column, "vector");
-        assert_eq!(back.query.k, 10);
-        assert_eq!(back.query.minimum_nprobes, 4);
-        assert_eq!(back.query.maximum_nprobes, Some(20));
-        assert_eq!(back.index_uuids, vec!["uuid-1".to_string()]);
-    }
-
-    #[tokio::test]
     async fn test_ann_ivf_sub_index_proto_roundtrip() {
         let (dataset, _dir) = make_indexed_dataset().await;
 
@@ -449,16 +368,17 @@ mod tests {
             dist_q_c: 0.0,
         };
 
-        // Build the partition exec as input child
-        let partition_exec = ANNIvfPartitionExec::try_new(
-            dataset.clone(),
-            indices.iter().map(|idx| idx.uuid.to_string()).collect(),
-            query.clone(),
-        )
-        .unwrap();
+        // Use a TestMemoryExec as a mock input child (provides the KNN_PARTITION_SCHEMA)
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
 
         let exec = ANNIvfSubIndexExec::try_new(
-            Arc::new(partition_exec),
+            input.clone(),
             dataset.clone(),
             indices.clone(),
             query,
@@ -470,19 +390,11 @@ mod tests {
         let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
         assert_eq!(proto.indices.len(), indices.len());
 
-        // Decode — need a partition exec as input child
-        let input_query = query_from_proto(proto.query.clone().unwrap()).unwrap();
-        let input_partition = ANNIvfPartitionExec::try_new(
-            dataset.clone(),
-            indices.iter().map(|idx| idx.uuid.to_string()).collect(),
-            input_query,
-        )
-        .unwrap();
-
+        // Decode
         let back = ann_ivf_sub_index_exec_from_proto(
             proto,
             Some(dataset.clone()),
-            Arc::new(input_partition),
+            input,
             PreFilterSource::None,
         )
         .await

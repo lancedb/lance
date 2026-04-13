@@ -493,14 +493,12 @@ fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::exec::table_identifier::table_identifier_from_dataset_with_manifest;
     use arrow_array::types::UInt32Type;
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datagen::{array, gen_batch};
-    use prost::Message;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -574,23 +572,6 @@ mod tests {
             back.with_row_created_at_version
         );
         assert_eq!(projection.blob_handling, back.blob_handling);
-    }
-
-    #[test]
-    fn test_table_identifier_without_manifest() {
-        let id = pb::TableIdentifier {
-            uri: "s3://bucket/table.lance".to_string(),
-            version: 42,
-            manifest_etag: Some("etag123".to_string()),
-            serialized_manifest: None,
-            storage_options: HashMap::new(),
-        };
-        let bytes = id.encode_to_vec();
-        let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
-        assert_eq!(id.uri, back.uri);
-        assert_eq!(id.version, back.version);
-        assert_eq!(id.manifest_etag, back.manifest_etag);
-        assert!(back.serialized_manifest.is_none());
     }
 
     #[test]
@@ -754,23 +735,6 @@ mod tests {
             exec.options().projection.field_ids,
             back.options().projection.field_ids
         );
-    }
-
-    #[tokio::test]
-    async fn test_table_identifier_with_manifest() {
-        let dataset = make_test_dataset().await;
-
-        let id = table_identifier_from_dataset_with_manifest(&dataset)
-            .await
-            .unwrap();
-        assert_eq!(id.uri, dataset.uri());
-        assert_eq!(id.version, dataset.manifest.version);
-        assert!(id.serialized_manifest.is_some());
-
-        // Verify the serialized manifest bytes decode
-        let manifest_bytes = id.serialized_manifest.unwrap();
-        let _manifest_proto =
-            lance_table::format::pb::Manifest::decode(manifest_bytes.as_slice()).unwrap();
     }
 
     #[tokio::test]

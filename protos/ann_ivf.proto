@@ -6,6 +6,7 @@ syntax = "proto3";
 package lance.datafusion;
 
 import "table_identifier.proto";
+import "table.proto";
 
 // Serialized vector query parameters.
 message VectorQueryProto {
@@ -26,16 +27,8 @@ message VectorQueryProto {
   float dist_q_c = 12;
 }
 
-message ANNIvfPartitionExecProto {
-  VectorQueryProto query = 1;
-  TableIdentifier table = 2;
-  repeated string index_uuids = 3;
-}
-
 message ANNIvfSubIndexExecProto {
   VectorQueryProto query = 1;
   TableIdentifier table = 2;
-  // Each element is a prost-encoded lance.table.IndexMetadata message.
-  // We use raw bytes to avoid a cross-package proto import.
-  repeated bytes indices = 3;
+  repeated lance.table.IndexMetadata indices = 3;
 }

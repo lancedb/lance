@@ -4804,6 +4804,7 @@ dependencies = [
  "lance-core",
  "lance-datagen",
  "lance-geo",
+ "lance-table",
  "log",
  "pin-project",
  "prost",
