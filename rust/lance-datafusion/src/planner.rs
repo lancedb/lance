@@ -40,7 +40,6 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::{
     common::Column,
     logical_expr::{Between, BinaryExpr, Like, Operator},
-    physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
     scalar::ScalarValue,
@@ -340,7 +339,7 @@ impl Planner {
 
     fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
         Ok(match op {
-            UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
 
@@ -920,8 +919,9 @@ impl Planner {
 
         // DataFusion needs the simplify and coerce passes to be applied before
         // expressions can be handled by the physical planner.
-        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-        let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
+        let simplify_context = SimplifyContext::default()
+            .with_schema(df_schema.clone())
+            .with_query_execution_start_time(Some(Utc::now()));
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 

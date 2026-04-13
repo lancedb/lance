@@ -61,7 +61,7 @@ tests = [
     # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
-    "datafusion>=52,<53; python_version >= '3.10'",
+    "datafusion>=53,<54; python_version >= '3.10'",
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]

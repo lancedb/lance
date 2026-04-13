@@ -397,7 +397,7 @@ pub struct TakeExec {
     // The schema of the output
     output_schema: SchemaRef,
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -477,10 +477,13 @@ impl TakeExec {
             &projection,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
-        let properties = input
-            .properties()
-            .clone()
-            .with_eq_properties(EquivalenceProperties::new(output_arrow.clone()));
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
+        );
 
         Ok(Some(Self {
             dataset,
@@ -651,7 +654,7 @@ impl ExecutionPlan for TakeExec {
         })
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

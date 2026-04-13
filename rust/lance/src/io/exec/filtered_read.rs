@@ -1475,7 +1475,7 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     // Precomputed internal plan
@@ -1574,12 +1574,12 @@ impl FilteredReadExec {
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         let metrics = ExecutionPlanMetricsSet::new();
 
@@ -1863,7 +1863,7 @@ impl ExecutionPlan for FilteredReadExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -47,7 +47,7 @@ pub struct AddRowAddrExec {
     /// Position in the output schema where to insert the row address
     rowaddr_pos: usize,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -106,10 +106,13 @@ impl AddRowAddrExec {
 
         // Is just a simple projections, so it inherits the partitioning and
         // execution mode from parent.
-        let properties = input
-            .properties()
-            .clone()
-            .with_eq_properties(EquivalenceProperties::new(output_schema.clone()));
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+        );
 
         Ok(Self {
             input,
@@ -326,7 +329,7 @@ impl ExecutionPlan for AddRowAddrExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 }
@@ -347,7 +350,7 @@ pub struct AddRowOffsetExec {
     input: Arc<dyn ExecutionPlan>,
     row_addr_pos: usize,
     frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl AddRowOffsetExec {
@@ -374,9 +377,15 @@ impl AddRowOffsetExec {
             input.schema().metadata().clone(),
         ));
 
-        let new_eq_props =
-            EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone())?;
-        let properties = input.properties().clone().with_eq_properties(new_eq_props);
+        let new_eq_props = EquivalenceProperties::new(schema)
+            .extend(input.properties().eq_properties.clone())?;
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(new_eq_props),
+        );
 
         Ok(Self {
             input,
@@ -496,7 +505,7 @@ impl ExecutionPlan for AddRowOffsetExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

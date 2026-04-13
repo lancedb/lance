@@ -755,6 +755,7 @@ impl MergeInsertJob {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNull,
+                false,
             )
             .unwrap(),
         );
@@ -938,7 +939,7 @@ impl MergeInsertJob {
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let task_limit = dataset.object_store().io_parallelism();
-        let mut reservation =
+        let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
         while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {

@@ -2071,7 +2071,6 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
-    use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
@@ -2134,8 +2133,9 @@ mod tests {
         let state = ctx.state();
         let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
         if optimize {
-            let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+            let simplify_context = SimplifyContext::default()
+                .with_schema(Arc::new(df_schema))
+                .with_query_execution_start_time(Some(Utc::now()));
             let simplifier =
                 datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
             expr = simplifier.simplify(expr).unwrap();
@@ -2888,8 +2888,9 @@ mod tests {
             .unwrap();
 
         // Apply DataFusion simplification (this may convert starts_with to LIKE)
-        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-        let simplify_context = SimplifyContext::new(&props).with_schema(Arc::new(df_schema));
+        let simplify_context = SimplifyContext::default()
+            .with_schema(Arc::new(df_schema))
+            .with_query_execution_start_time(Some(Utc::now()));
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
         let simplified_expr = simplifier.simplify(expr).unwrap();
