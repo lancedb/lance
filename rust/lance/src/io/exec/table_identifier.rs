@@ -66,6 +66,26 @@ pub async fn open_dataset_from_table_identifier(
     Ok(Arc::new(builder.load().await?))
 }
 
+/// Resolve a dataset from an optional pre-loaded instance or from a table identifier.
+///
+/// If `dataset` is `Some`, returns it directly. Otherwise, opens the dataset
+/// from the table identifier proto.
+pub async fn resolve_dataset(
+    dataset: Option<Arc<Dataset>>,
+    table_id: Option<&pb::TableIdentifier>,
+) -> Result<Arc<Dataset>> {
+    use lance_core::Error;
+    match dataset {
+        Some(ds) => Ok(ds),
+        None => {
+            let table_id = table_id.ok_or_else(|| {
+                Error::invalid_input_source("Missing TableIdentifier in proto".into())
+            })?;
+            open_dataset_from_table_identifier(table_id).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

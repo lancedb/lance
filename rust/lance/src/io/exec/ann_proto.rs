@@ -24,7 +24,7 @@ use lance_table::format::pb as table_pb;
 use crate::Dataset;
 
 use super::knn::ANNIvfSubIndexExec;
-use super::table_identifier::{open_dataset_from_table_identifier, table_identifier_from_dataset};
+use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 use super::utils::PreFilterSource;
 
 // =============================================================================
@@ -178,26 +178,6 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
     ANNIvfSubIndexExec::try_new(input, dataset, indices, query, prefilter_source)
 }
 
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/// Resolve a dataset from an optional pre-loaded instance or from the table identifier.
-async fn resolve_dataset(
-    dataset: Option<Arc<Dataset>>,
-    table_id: Option<&pb::TableIdentifier>,
-) -> Result<Arc<Dataset>> {
-    match dataset {
-        Some(ds) => Ok(ds),
-        None => {
-            let table_id = table_id.ok_or_else(|| {
-                Error::invalid_input_source("Missing TableIdentifier in proto".into())
-            })?;
-            open_dataset_from_table_identifier(table_id).await
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +194,7 @@ mod tests {
     use lance_index::vector::pq::PQBuildParams;
 
     #[test]
-    fn test_array_ipc_roundtrip_f32() {
+    fn test_query_key_ipc_roundtrip_f32() {
         let arr: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0]));
         let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
         let back = query_key_from_ipc_bytes(&bytes).unwrap();
@@ -223,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ipc_roundtrip_f64() {
+    fn test_query_key_ipc_roundtrip_f64() {
         let arr: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
         let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
         let back = query_key_from_ipc_bytes(&bytes).unwrap();
@@ -232,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ipc_roundtrip_f16() {
+    fn test_query_key_ipc_roundtrip_f16() {
         let arr: ArrayRef = Arc::new(arrow_array::Float16Array::from(vec![
             f16::from_f32(1.0),
             f16::from_f32(2.0),

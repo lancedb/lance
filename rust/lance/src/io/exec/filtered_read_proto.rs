@@ -31,7 +31,7 @@ use crate::Dataset;
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
 };
-use super::table_identifier::{open_dataset_from_table_identifier, table_identifier_from_dataset};
+use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 
 // =============================================================================
 // FilteredReadExec <-> Proto
@@ -72,17 +72,7 @@ pub async fn filtered_read_exec_from_proto(
     index_input: Option<Arc<dyn ExecutionPlan>>,
     state: &SessionState,
 ) -> Result<FilteredReadExec> {
-    let dataset = match dataset {
-        Some(ds) => ds, // dataset could be opened or cached by the caller
-        None => {
-            let table_id = proto.table.as_ref().ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Missing table identifier in FilteredReadExecProto".into(),
-                )
-            })?;
-            open_dataset_from_table_identifier(table_id).await?
-        }
-    };
+    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
 
     let options_proto = proto.options.ok_or_else(|| {
         Error::invalid_input_source("Missing options in FilteredReadExecProto".into())
