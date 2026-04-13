@@ -13,9 +13,10 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::common::stats::Precision;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::future::BoxFuture;
@@ -707,6 +708,32 @@ impl ExecutionPlan for LanceScanExec {
             self.schema(),
             lance_stream,
         )))
+    }
+
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> Result<Statistics> {
+        // Some fragments from older datasets might have the row count stats missing.
+        let (row_count, is_exact) =
+            self.fragments
+                .iter()
+                .fold(
+                    (0, true),
+                    |(row_count, is_exact), fragment| match fragment.num_rows() {
+                        Some(num_rows) => (row_count + num_rows, is_exact),
+                        None => (row_count, false),
+                    },
+                );
+        let num_rows = match is_exact {
+            true => Precision::Exact(row_count),
+            false => Precision::Absent,
+        };
+
+        Ok(Statistics {
+            num_rows,
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

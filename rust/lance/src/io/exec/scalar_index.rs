@@ -214,6 +214,16 @@ impl ExecutionPlan for ScalarIndexExec {
         )))
     }
 
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
+        Ok(datafusion::physical_plan::Statistics {
+            num_rows: datafusion::common::stats::Precision::Exact(2),
+            ..datafusion::physical_plan::Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
+        })
+    }
+
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }

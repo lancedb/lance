@@ -456,6 +456,16 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> DataFusionResult<Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(self.query.minimum_nprobes),
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
+    }
+
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
