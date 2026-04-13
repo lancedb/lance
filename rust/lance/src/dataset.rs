@@ -1509,15 +1509,17 @@ impl Dataset {
         fragment_ids: Option<&[u32]>,
         seed: Option<u64>,
     ) -> Result<RecordBatch> {
-        use rand::seq::IteratorRandom;
-        use rand::rngs::StdRng;
         use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand::seq::IteratorRandom;
 
         match fragment_ids {
             None => {
                 let num_rows = self.count_rows(None).await?;
                 let mut ids = match seed {
-                    Some(s) => (0..num_rows as u64).choose_multiple(&mut StdRng::seed_from_u64(s), n),
+                    Some(s) => {
+                        (0..num_rows as u64).choose_multiple(&mut StdRng::seed_from_u64(s), n)
+                    }
                     None => (0..num_rows as u64).choose_multiple(&mut rand::rng(), n),
                 };
                 ids.sort_unstable();

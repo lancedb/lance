@@ -1504,7 +1504,10 @@ async fn test_sample_with_empty_fragment_ids_rejected(
     .unwrap();
 
     let projection = dataset.schema().project(&["i"]).unwrap();
-    let err = dataset.sample(1, &projection, Some(&[]), None).await.unwrap_err();
+    let err = dataset
+        .sample(1, &projection, Some(&[]), None)
+        .await
+        .unwrap_err();
 
     assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(

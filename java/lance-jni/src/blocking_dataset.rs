@@ -1964,11 +1964,18 @@ pub extern "system" fn Java_org_lance_Dataset_nativeSample(
     mut env: JNIEnv,
     java_dataset: JObject,
     n: jlong,
-    columns_obj: JObject,       // List<String>
-    fragment_ids_obj: JObject,   // Optional<List<Integer>>
-    seed_obj: JObject,           // Optional<Long>
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
+    seed_obj: JObject,         // Optional<Long>
 ) -> jbyteArray {
-    match inner_sample(&mut env, java_dataset, n, columns_obj, fragment_ids_obj, seed_obj) {
+    match inner_sample(
+        &mut env,
+        java_dataset,
+        n,
+        columns_obj,
+        fragment_ids_obj,
+        seed_obj,
+    ) {
         Ok(byte_array) => byte_array,
         Err(e) => {
             let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
@@ -1981,9 +1988,9 @@ fn inner_sample(
     env: &mut JNIEnv,
     java_dataset: JObject,
     n: jlong,
-    columns_obj: JObject,       // List<String>
-    fragment_ids_obj: JObject,   // Optional<List<Integer>>
-    seed_obj: JObject,           // Optional<Long>
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
+    seed_obj: JObject,         // Optional<Long>
 ) -> Result<jbyteArray> {
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
     let fragment_ids: Option<Vec<i32>> = env.get_ints_opt(&fragment_ids_obj)?;
