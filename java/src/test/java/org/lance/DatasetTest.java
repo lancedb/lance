@@ -878,6 +878,32 @@ public class DatasetTest {
           assertNotNull(result);
           assertEquals(20, result.getRowCount());
         }
+
+        // Deterministic sampling with seed: same seed produces same results
+        long seed = 42L;
+        List<Integer> firstSampleIds;
+        try (ArrowReader reader =
+            dataset2.sample(5, columns, Optional.empty(), Optional.of(seed))) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(5, result.getRowCount());
+          firstSampleIds = new ArrayList<>();
+          for (int i = 0; i < result.getRowCount(); i++) {
+            firstSampleIds.add((Integer) result.getVector("id").getObject(i));
+          }
+        }
+        List<Integer> secondSampleIds;
+        try (ArrowReader reader =
+            dataset2.sample(5, columns, Optional.empty(), Optional.of(seed))) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(5, result.getRowCount());
+          secondSampleIds = new ArrayList<>();
+          for (int i = 0; i < result.getRowCount(); i++) {
+            secondSampleIds.add((Integer) result.getVector("id").getObject(i));
+          }
+        }
+        assertEquals(firstSampleIds, secondSampleIds);
       }
     }
   }

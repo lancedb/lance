@@ -1465,7 +1465,7 @@ async fn test_sample_with_fragment_ids(
 
     let projection = dataset.schema().project(&["i"]).unwrap();
     let sampled = dataset
-        .sample(8, &projection, Some(&[0, 0, 2]))
+        .sample(8, &projection, Some(&[0, 0, 2]), None)
         .await
         .unwrap();
     let sampled_values = sampled
@@ -1504,7 +1504,7 @@ async fn test_sample_with_empty_fragment_ids_rejected(
     .unwrap();
 
     let projection = dataset.schema().project(&["i"]).unwrap();
-    let err = dataset.sample(1, &projection, Some(&[])).await.unwrap_err();
+    let err = dataset.sample(1, &projection, Some(&[]), None).await.unwrap_err();
 
     assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(
@@ -1538,7 +1538,7 @@ async fn test_sample_with_unknown_fragment_ids_rejected(
 
     let projection = dataset.schema().project(&["i"]).unwrap();
     let err = dataset
-        .sample(1, &projection, Some(&[0, 999]))
+        .sample(1, &projection, Some(&[0, 999]), None)
         .await
         .unwrap_err();
 
@@ -1548,6 +1548,51 @@ async fn test_sample_with_unknown_fragment_ids_rejected(
             .contains("not part of the current dataset version")
     );
     assert!(err.to_string().contains("999"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sample_deterministic_with_seed(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 50,
+            max_rows_per_group: 25,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let seed = 42u64;
+
+    let first = dataset
+        .sample(10, &projection, None, Some(seed))
+        .await
+        .unwrap();
+    let second = dataset
+        .sample(10, &projection, None, Some(seed))
+        .await
+        .unwrap();
+
+    assert_eq!(first, second);
+
+    // Different seed should (very likely) produce different results
+    let third = dataset
+        .sample(10, &projection, None, Some(123))
+        .await
+        .unwrap();
+    assert_ne!(first, third);
 }
 
 #[rstest]

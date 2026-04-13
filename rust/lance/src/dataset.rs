@@ -1497,6 +1497,9 @@ impl Dataset {
     /// If `fragment_ids` is provided, sampling is limited to rows from those
     /// fragments in the current dataset version.
     ///
+    /// If `seed` is provided, the sampling is deterministic: the same seed
+    /// with the same dataset state will always produce the same result.
+    ///
     /// The returned rows are in row-id order (not random order), which allows
     /// the underlying take operation to use an efficient sorted code path.
     pub async fn sample(
@@ -1504,13 +1507,19 @@ impl Dataset {
         n: usize,
         projection: &Schema,
         fragment_ids: Option<&[u32]>,
+        seed: Option<u64>,
     ) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
 
         match fragment_ids {
             None => {
                 let num_rows = self.count_rows(None).await?;
-                let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
+                let mut ids = match seed {
+                    Some(s) => (0..num_rows as u64).choose_multiple(&mut StdRng::seed_from_u64(s), n),
+                    None => (0..num_rows as u64).choose_multiple(&mut rand::rng(), n),
+                };
                 ids.sort_unstable();
                 self.take(&ids, projection.clone()).await
             }
@@ -1548,7 +1557,10 @@ impl Dataset {
                     .try_fold(0_u64, |acc, rows| async move { Ok(acc + rows as u64) })
                     .await?;
 
-                let mut offsets = (0..num_rows).choose_multiple(&mut rand::rng(), n);
+                let mut offsets = match seed {
+                    Some(s) => (0..num_rows).choose_multiple(&mut StdRng::seed_from_u64(s), n),
+                    None => (0..num_rows).choose_multiple(&mut rand::rng(), n),
+                };
                 offsets.sort_unstable();
 
                 let row_addrs = row_offsets_to_row_addresses(&selected_fragments, &offsets).await?;

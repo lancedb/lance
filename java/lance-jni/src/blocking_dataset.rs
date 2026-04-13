@@ -1966,8 +1966,9 @@ pub extern "system" fn Java_org_lance_Dataset_nativeSample(
     n: jlong,
     columns_obj: JObject,       // List<String>
     fragment_ids_obj: JObject,   // Optional<List<Integer>>
+    seed_obj: JObject,           // Optional<Long>
 ) -> jbyteArray {
-    match inner_sample(&mut env, java_dataset, n, columns_obj, fragment_ids_obj) {
+    match inner_sample(&mut env, java_dataset, n, columns_obj, fragment_ids_obj, seed_obj) {
         Ok(byte_array) => byte_array,
         Err(e) => {
             let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
@@ -1982,11 +1983,13 @@ fn inner_sample(
     n: jlong,
     columns_obj: JObject,       // List<String>
     fragment_ids_obj: JObject,   // Optional<List<Integer>>
+    seed_obj: JObject,           // Optional<Long>
 ) -> Result<jbyteArray> {
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
     let fragment_ids: Option<Vec<i32>> = env.get_ints_opt(&fragment_ids_obj)?;
     let fragment_ids_u32: Option<Vec<u32>> =
         fragment_ids.map(|ids| ids.iter().map(|&id| id as u32).collect());
+    let seed: Option<u64> = env.get_u64_opt(&seed_obj)?;
 
     let result = {
         let dataset_guard =
@@ -2002,6 +2005,7 @@ fn inner_sample(
             n as usize,
             &projection,
             fragment_ids_u32.as_deref(),
+            seed,
         )) {
             Ok(res) => res,
             Err(e) => {

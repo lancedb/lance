@@ -760,7 +760,7 @@ public class Dataset implements Closeable {
    * @throws IOException if an I/O error occurs
    */
   public ArrowReader sample(long n, List<String> columns) throws IOException {
-    return sample(n, columns, Optional.empty());
+    return sample(n, columns, Optional.empty(), Optional.empty());
   }
 
   /**
@@ -777,12 +777,35 @@ public class Dataset implements Closeable {
    */
   public ArrowReader sample(long n, List<String> columns, Optional<List<Integer>> fragmentIds)
       throws IOException {
+    return sample(n, columns, fragmentIds, Optional.empty());
+  }
+
+  /**
+   * Randomly sample n rows from specific fragments of the dataset with an optional seed for
+   * deterministic sampling.
+   *
+   * <p>The returned rows are in row-id order (not random order), which allows the underlying take
+   * operation to use an efficient sorted code path.
+   *
+   * <p>When a seed is provided, the same seed with the same dataset state will always produce the
+   * same result, which is useful for reproducible ML training/validation splits.
+   *
+   * @param n the number of rows to sample
+   * @param columns the columns to include in the result
+   * @param fragmentIds optional list of fragment IDs to restrict sampling to
+   * @param seed optional random seed for deterministic sampling
+   * @return an ArrowReader containing the sampled rows
+   * @throws IOException if an I/O error occurs
+   */
+  public ArrowReader sample(
+      long n, List<String> columns, Optional<List<Integer>> fragmentIds, Optional<Long> seed)
+      throws IOException {
     Preconditions.checkArgument(n > 0, "n must be greater than 0");
     Preconditions.checkNotNull(columns, "columns cannot be null");
     Preconditions.checkArgument(!columns.isEmpty(), "columns cannot be empty");
     Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      byte[] arrowData = nativeSample(n, columns, fragmentIds);
+      byte[] arrowData = nativeSample(n, columns, fragmentIds, seed);
       ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
       ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
       return new ArrowStreamReader(readChannel, allocator) {
@@ -797,7 +820,7 @@ public class Dataset implements Closeable {
   }
 
   private native byte[] nativeSample(
-      long n, List<String> columns, Optional<List<Integer>> fragmentIds);
+      long n, List<String> columns, Optional<List<Integer>> fragmentIds, Optional<Long> seed);
 
   /**
    * Delete rows of data by predicate.

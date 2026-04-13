@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -233,33 +232,96 @@ impl TryFrom<pb::DataFile> for DataFile {
     }
 }
 
-/// Interns `fields` and `column_indices` slices so that `DataFile` instances
-/// with identical content share a single `Arc<[i32]>` allocation.
+/// Interns repeated data so that fragments with identical content share a
+/// single heap allocation via `Arc`.
 ///
 /// At 20M fragments the deduplication typically saves multiple GB of heap
-/// because every fragment in a homogeneous table carries the same field list.
+/// because every fragment in a homogeneous table carries the same field list,
+/// and post-compaction fragments share identical version metadata bytes.
+///
+/// Uses a small `Vec` of `Arc` entries instead of `HashMap` because the
+/// number of unique values is typically 1-3 (homogeneous tables). Linear
+/// scan over a few entries is faster than hashing every input slice.
 #[derive(Default)]
 pub struct DataFileFieldInterner {
-    fields: HashMap<Vec<i32>, Arc<[i32]>>,
-    column_indices: HashMap<Vec<i32>, Arc<[i32]>>,
+    fields: Vec<Arc<[i32]>>,
+    column_indices: Vec<Arc<[i32]>>,
+    inline_bytes: Vec<Arc<[u8]>>,
 }
 
 impl DataFileFieldInterner {
     /// Intern a `Vec<i32>`: if the same content was seen before, return a
     /// clone of the existing `Arc`; otherwise store and return a new one.
-    fn intern(cache: &mut HashMap<Vec<i32>, Arc<[i32]>>, v: Vec<i32>) -> Arc<[i32]> {
-        cache
-            .entry(v)
-            .or_insert_with_key(|k| Arc::from(k.as_slice()))
-            .clone()
+    fn intern_i32(cache: &mut Vec<Arc<[i32]>>, v: Vec<i32>) -> Arc<[i32]> {
+        for existing in cache.iter() {
+            if existing.as_ref() == v.as_slice() {
+                return existing.clone();
+            }
+        }
+        let arc: Arc<[i32]> = Arc::from(v);
+        cache.push(arc.clone());
+        arc
+    }
+
+    /// Intern a `Vec<u8>`: if the same content was seen before, return a
+    /// clone of the existing `Arc`; otherwise store and return a new one.
+    fn intern_u8(cache: &mut Vec<Arc<[u8]>>, v: Vec<u8>) -> Arc<[u8]> {
+        for existing in cache.iter() {
+            if existing.as_ref() == v.as_slice() {
+                return existing.clone();
+            }
+        }
+        let arc: Arc<[u8]> = Arc::from(v);
+        cache.push(arc.clone());
+        arc
+    }
+
+    /// Intern a `RowDatasetVersionMeta`, deduplicating inline byte payloads.
+    /// Accepts the protobuf oneof value directly to avoid an intermediate
+    /// `Arc<[u8]>` allocation that would need to be `.to_vec()`'d for the key lookup.
+    fn intern_last_updated_version_meta(
+        cache: &mut Vec<Arc<[u8]>>,
+        pb: pb::data_fragment::LastUpdatedAtVersionSequence,
+    ) -> Result<RowDatasetVersionMeta> {
+        match pb {
+            pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
+                Ok(RowDatasetVersionMeta::Inline(Self::intern_u8(cache, data)))
+            }
+            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
+                file,
+            ) => Ok(RowDatasetVersionMeta::External(ExternalFile {
+                path: file.path,
+                offset: file.offset,
+                size: file.size,
+            })),
+        }
+    }
+
+    /// Intern a `RowDatasetVersionMeta`, deduplicating inline byte payloads.
+    fn intern_created_version_meta(
+        cache: &mut Vec<Arc<[u8]>>,
+        pb: pb::data_fragment::CreatedAtVersionSequence,
+    ) -> Result<RowDatasetVersionMeta> {
+        match pb {
+            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
+                Ok(RowDatasetVersionMeta::Inline(Self::intern_u8(cache, data)))
+            }
+            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
+                Ok(RowDatasetVersionMeta::External(ExternalFile {
+                    path: file.path,
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
     }
 
     /// Convert a protobuf `DataFile`, interning `fields` and `column_indices`.
     pub fn intern_data_file(&mut self, proto: pb::DataFile) -> Result<DataFile> {
         Ok(DataFile {
             path: proto.path,
-            fields: Self::intern(&mut self.fields, proto.fields),
-            column_indices: Self::intern(&mut self.column_indices, proto.column_indices),
+            fields: Self::intern_i32(&mut self.fields, proto.fields),
+            column_indices: Self::intern_i32(&mut self.column_indices, proto.column_indices),
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
@@ -267,13 +329,21 @@ impl DataFileFieldInterner {
         })
     }
 
-    /// Convert a protobuf `DataFragment`, interning fields within its data files.
+    /// Convert a protobuf `DataFragment`, interning fields and version metadata.
     pub fn intern_fragment(&mut self, p: pb::DataFragment) -> Result<Fragment> {
         let physical_rows = if p.physical_rows > 0 {
             Some(p.physical_rows as usize)
         } else {
             None
         };
+        let last_updated_at_version_meta = p
+            .last_updated_at_version_sequence
+            .map(|pb| Self::intern_last_updated_version_meta(&mut self.inline_bytes, pb))
+            .transpose()?;
+        let created_at_version_meta = p
+            .created_at_version_sequence
+            .map(|pb| Self::intern_created_version_meta(&mut self.inline_bytes, pb))
+            .transpose()?;
         Ok(Fragment {
             id: p.id,
             files: p
@@ -284,14 +354,8 @@ impl DataFileFieldInterner {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
-            last_updated_at_version_meta: p
-                .last_updated_at_version_sequence
-                .map(RowDatasetVersionMeta::try_from)
-                .transpose()?,
-            created_at_version_meta: p
-                .created_at_version_sequence
-                .map(RowDatasetVersionMeta::try_from)
-                .transpose()?,
+            last_updated_at_version_meta,
+            created_at_version_meta,
         })
     }
 }
