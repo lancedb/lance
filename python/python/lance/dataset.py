@@ -834,6 +834,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_size: Optional[int] = None,
+        batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
@@ -929,9 +930,16 @@ class LanceDataset(pa.dataset.Dataset):
                 }
 
         batch_size: int, default None
-            The target size of batches returned.  In some cases batches can be up to
-            twice this size (but never larger than this).  In some cases batches can
-            be smaller than this size.
+            The maximum number of rows per batch.  In some cases batches can be
+            smaller than this size.  Note: this can be overridden by
+            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
+            configured via ``FileReaderOptions``.
+        batch_size_bytes: int, default None
+            If set, the scanner will produce batches whose total size in bytes
+            is approximately this value, overriding the row-based ``batch_size``.
+            This can also be configured at the dataset level via
+            ``FileReaderOptions``.  A scanner-level setting takes precedence
+            over the dataset-level default.
         io_buffer_size: int, default None
             The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
             for more information.
@@ -1067,6 +1075,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.limit, limit)
         setopt(builder.offset, offset)
         setopt(builder.batch_size, batch_size)
+        setopt(builder.batch_size_bytes, batch_size_bytes)
         setopt(builder.io_buffer_size, io_buffer_size)
         setopt(builder.batch_readahead, batch_readahead)
         setopt(builder.fragment_readahead, fragment_readahead)
@@ -1150,6 +1159,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_size: Optional[int] = None,
+        batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
@@ -1277,6 +1287,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
@@ -1720,6 +1731,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_size: Optional[int] = None,
+        batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
@@ -1756,6 +1768,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
@@ -5189,6 +5202,7 @@ class ScannerBuilder:
         self._columns_with_transform = None
         self._nearest = None
         self._batch_size: Optional[int] = None
+        self._batch_size_bytes: Optional[int] = None
         self._io_buffer_size: Optional[int] = None
         self._batch_readahead: Optional[int] = None
         self._fragment_readahead: Optional[int] = None
@@ -5219,8 +5233,26 @@ class ScannerBuilder:
         return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
-        """Set batch size for Scanner"""
+        """Set the maximum number of rows per batch.
+
+        Note: this can be overridden by ``batch_size_bytes`` or by a
+        dataset-level ``batch_size_bytes`` configured via
+        ``FileReaderOptions``.
+        """
         self._batch_size = batch_size
+        return self
+
+    def batch_size_bytes(self, batch_size_bytes: int) -> ScannerBuilder:
+        """Set the target batch size in bytes.
+
+        When set, the scanner will produce batches whose total size in bytes
+        is approximately this value, overriding the row-based ``batch_size``.
+
+        This can also be configured at the dataset level via
+        ``FileReaderOptions``.  A scanner-level setting takes precedence
+        over the dataset-level default.
+        """
+        self._batch_size_bytes = batch_size_bytes
         return self
 
     def io_buffer_size(self, io_buffer_size: int) -> ScannerBuilder:
@@ -5607,6 +5639,7 @@ class ScannerBuilder:
             self._offset,
             self._nearest,
             self._batch_size,
+            self._batch_size_bytes,
             self._io_buffer_size,
             self._batch_readahead,
             self._fragment_readahead,

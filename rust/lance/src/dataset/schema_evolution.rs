@@ -12,6 +12,7 @@ use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
+use arrow_cast::cast_with_options;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
@@ -635,7 +636,7 @@ pub(super) async fn alter_columns(
             let mut columns = Vec::with_capacity(batch.num_columns());
             for (old, new) in &cast_fields {
                 let old_column = batch[&old.name].clone();
-                let new_column = lance_arrow::cast::cast_with_options(
+                let new_column = cast_with_options(
                     &old_column,
                     &new.data_type(),
                     // Safe: false means it will error if the cast is lossy.
@@ -1963,7 +1964,7 @@ mod test {
                 Arc::new(Float16Array::from_iter_values(
                     (0..nrows).map(|i| f16::from_f32(i as f32)),
                 )),
-                lance_arrow::cast::cast_with_options(
+                cast_with_options(
                     batch["vec"].as_ref(),
                     &DataType::FixedSizeList(
                         Arc::new(ArrowField::new("item", DataType::Float16, true)),

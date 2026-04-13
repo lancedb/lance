@@ -3021,13 +3021,7 @@ mod tests {
                 )
                 .await;
 
-                let index_type = params.index_type();
-                // *_FLAT doesn't support float16/float64
-                if !(index_type == IndexType::IvfFlat
-                    || (index_type == IndexType::IvfHnswFlat && params.stages.len() == 2)) // IVF_HNSW_FLAT
-                    && dataset.is_none()
-                // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
-                {
+                if dataset.is_none() {
                     test_index_impl::<Float64Type>(
                         params,
                         nlist,
@@ -3106,13 +3100,23 @@ mod tests {
                 .await;
             }
             _ => {
+                let index_type = params.index_type();
                 Box::pin(test_remap_impl::<Float32Type>(
-                    params,
+                    params.clone(),
                     nlist,
                     recall_requirement,
                     0.0..1.0,
                 ))
                 .await;
+                if matches!(index_type, IndexType::IvfFlat | IndexType::IvfHnswFlat) {
+                    Box::pin(test_remap_impl::<Float64Type>(
+                        params,
+                        nlist,
+                        recall_requirement,
+                        0.0..1.0,
+                    ))
+                    .await;
+                }
             }
         }
     }

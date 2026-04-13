@@ -257,6 +257,9 @@ pub struct ReadParams {
     /// File reader options to use when reading data files.
     ///
     /// This allows control over features like caching repetition indices and validation.
+    /// Options set here act as dataset-level defaults and can be overridden on a
+    /// per-scan basis via [`Scanner::batch_size_bytes`](crate::dataset::scanner::Scanner::batch_size_bytes) or
+    /// [`Scanner::with_file_reader_options`](crate::dataset::scanner::Scanner::with_file_reader_options).
     pub file_reader_options: Option<FileReaderOptions>,
 }
 

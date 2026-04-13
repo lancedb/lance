@@ -14,6 +14,7 @@ use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
+use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
 use datafusion::common::DFSchema;
@@ -45,7 +46,6 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 
