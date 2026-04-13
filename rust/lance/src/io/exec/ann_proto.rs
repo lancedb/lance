@@ -31,11 +31,11 @@ use super::utils::PreFilterSource;
 // VectorQueryProto helpers
 // =============================================================================
 
-/// Serialize an Arrow array to IPC file-format bytes.
+/// Serialize a query key (vector) array to IPC file-format bytes.
 ///
 /// Wraps the array in a single-column RecordBatch so that the IPC format
 /// preserves the full data type (Float16, Float32, Float64, UInt8, etc.).
-fn array_to_ipc_bytes(array: &dyn arrow_array::Array) -> Result<Vec<u8>> {
+fn query_key_to_ipc_bytes(array: &dyn arrow_array::Array) -> Result<Vec<u8>> {
     let field = Field::new("key", array.data_type().clone(), true);
     let schema = Arc::new(ArrowSchema::new(vec![field]));
     let batch = RecordBatch::try_new(schema, vec![arrow_array::make_array(array.to_data())])
@@ -55,8 +55,8 @@ fn array_to_ipc_bytes(array: &dyn arrow_array::Array) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Deserialize an Arrow array from IPC file-format bytes.
-fn array_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
+/// Deserialize a query key (vector) array from IPC file-format bytes.
+fn query_key_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
     let cursor = std::io::Cursor::new(bytes);
     let reader = arrow_ipc::reader::FileReader::try_new(cursor, None)
         .map_err(|e| Error::internal(format!("Failed to create IPC reader: {e}")))?;
@@ -75,7 +75,7 @@ fn array_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
 }
 
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
-    let key_arrow_ipc = array_to_ipc_bytes(query.key.as_ref())?;
+    let key_arrow_ipc = query_key_to_ipc_bytes(query.key.as_ref())?;
 
     let metric_type = query.metric_type.map(|dt| dt.to_string());
 
@@ -96,7 +96,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
 }
 
 pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
-    let key = array_from_ipc_bytes(&proto.key_arrow_ipc)?;
+    let key = query_key_from_ipc_bytes(&proto.key_arrow_ipc)?;
 
     let metric_type = proto
         .metric_type
@@ -216,8 +216,8 @@ mod tests {
     #[test]
     fn test_array_ipc_roundtrip_f32() {
         let arr: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0]));
-        let bytes = array_to_ipc_bytes(arr.as_ref()).unwrap();
-        let back = array_from_ipc_bytes(&bytes).unwrap();
+        let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
+        let back = query_key_from_ipc_bytes(&bytes).unwrap();
         assert_eq!(arr.data_type(), back.data_type());
         assert_eq!(arr.len(), back.len());
     }
@@ -225,8 +225,8 @@ mod tests {
     #[test]
     fn test_array_ipc_roundtrip_f64() {
         let arr: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
-        let bytes = array_to_ipc_bytes(arr.as_ref()).unwrap();
-        let back = array_from_ipc_bytes(&bytes).unwrap();
+        let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
+        let back = query_key_from_ipc_bytes(&bytes).unwrap();
         assert_eq!(arr.data_type(), back.data_type());
         assert_eq!(&*arr, &*back);
     }
@@ -237,8 +237,8 @@ mod tests {
             f16::from_f32(1.0),
             f16::from_f32(2.0),
         ]));
-        let bytes = array_to_ipc_bytes(arr.as_ref()).unwrap();
-        let back = array_from_ipc_bytes(&bytes).unwrap();
+        let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
+        let back = query_key_from_ipc_bytes(&bytes).unwrap();
         assert_eq!(arr.data_type(), back.data_type());
         assert_eq!(arr.len(), back.len());
     }
