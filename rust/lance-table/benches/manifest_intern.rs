@@ -90,6 +90,66 @@ fn deserialize_with_interning(protos: &[pb::DataFragment]) -> Vec<Fragment> {
         .collect()
 }
 
+/// Build fragments where each group shares the same version metadata,
+/// simulating many small appends without compaction.
+fn make_diverse_pb_fragments(
+    n: u64,
+    num_fields: usize,
+    unique_versions: u64,
+) -> Vec<pb::DataFragment> {
+    let fields: Vec<i32> = (0..num_fields as i32).collect();
+    let column_indices: Vec<i32> = (0..num_fields as i32).collect();
+    let group_size = n / unique_versions;
+
+    let version_payloads: Vec<Vec<u8>> = (0..unique_versions)
+        .map(|v| {
+            let seq = pb::RowDatasetVersionSequence {
+                runs: vec![pb::RowDatasetVersionRun {
+                    span: Some(pb::U64Segment {
+                        segment: Some(pb::u64_segment::Segment::Range(pb::u64_segment::Range {
+                            start: 0,
+                            end: 1000,
+                        })),
+                    }),
+                    version: v,
+                }],
+            };
+            seq.encode_to_vec()
+        })
+        .collect();
+
+    (0..n)
+        .map(|i| {
+            let version_idx = (i / group_size).min(unique_versions - 1) as usize;
+            pb::DataFragment {
+                id: i,
+                files: vec![pb::DataFile {
+                    path: format!("data/{i}.lance"),
+                    fields: fields.clone(),
+                    column_indices: column_indices.clone(),
+                    file_major_version: 2,
+                    file_minor_version: 0,
+                    file_size_bytes: 0,
+                    base_id: None,
+                }],
+                deletion_file: None,
+                row_id_sequence: None,
+                physical_rows: 1000,
+                last_updated_at_version_sequence: Some(
+                    pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
+                        version_payloads[version_idx].clone(),
+                    ),
+                ),
+                created_at_version_sequence: Some(
+                    pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(
+                        version_payloads[version_idx].clone(),
+                    ),
+                ),
+            }
+        })
+        .collect()
+}
+
 fn bench_deserialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("manifest_intern");
     let n = num_fragments();
@@ -108,6 +168,27 @@ fn bench_deserialization(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("deserialize_with_intern", num_fields),
             &num_fields,
+            |b, _| {
+                b.iter(|| deserialize_with_interning(&protos));
+            },
+        );
+    }
+
+    // Benchmark with many unique version payloads
+    for unique_versions in [10, 100, 500] {
+        let protos = make_diverse_pb_fragments(n, 10, unique_versions);
+
+        group.bench_with_input(
+            BenchmarkId::new("deserialize_no_intern_diverse", unique_versions),
+            &unique_versions,
+            |b, _| {
+                b.iter(|| deserialize_without_interning(&protos));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("deserialize_with_intern_diverse", unique_versions),
+            &unique_versions,
             |b, _| {
                 b.iter(|| deserialize_with_interning(&protos));
             },
