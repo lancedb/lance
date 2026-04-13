@@ -265,6 +265,25 @@ def test_sample_batches_with_filter(tmp_path: Path):
     assert randomized_ids == all_ids
 
 
+def test_row_id_uint64_converts_to_int64(tmp_path: Path):
+    """Regression test for #2803: _rowid (uint64) must convert to int64 tensor."""
+    arr = pa.array(range(100))
+    tbl = pa.Table.from_arrays([arr], ["ids"])
+
+    lance.write_dataset(tbl, tmp_path / "data.lance")
+
+    ds = LanceDataset(
+        tmp_path / "data.lance",
+        batch_size=10,
+        columns=["ids"],
+        with_row_id=True,
+    )
+
+    batch = next(iter(ds))
+    assert "_rowid" in batch
+    assert batch["_rowid"].dtype == torch.int64
+
+
 @pytest.mark.parametrize("dtype", [np.uint8, np.int64])
 def test_convert_int_tensors(tmp_path: Path, dtype):
     data = np.random.randint(0, 256, size=128 * 32, dtype=dtype)

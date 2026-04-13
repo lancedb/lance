@@ -163,10 +163,12 @@ def _to_tensor(
             or pa.types.is_floating(arr.type)
             or pa.types.is_boolean(arr.type)
         ):
-            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
-
-            if uint64_as_int64 and tensor.dtype == torch.uint64:
-                tensor = tensor.to(torch.int64)
+            nparr = arr.to_numpy(zero_copy_only=False)
+            # PyTorch < 2.1 does not support torch.from_numpy with uint64.
+            # Cast to int64 in numpy before conversion to avoid RuntimeError.
+            if uint64_as_int64 and nparr.dtype == np.uint64:
+                nparr = nparr.astype(np.int64)
+            tensor = torch.from_numpy(nparr)
         elif _is_bfloat16_type(arr.type):
             tensor = _bf16_to_tensor(arr)
         elif hf_converter is not None:
