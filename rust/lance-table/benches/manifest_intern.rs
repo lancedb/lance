@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// Benchmarks use eprintln! to report memory stats alongside criterion output.
+#![allow(clippy::print_stderr)]
+
 //! Benchmark for manifest fragment interning.
 //!
 //! Measures memory savings and deserialization throughput when interning
