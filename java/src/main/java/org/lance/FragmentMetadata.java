@@ -123,6 +123,18 @@ public class FragmentMetadata implements Serializable {
   }
 
   @Override
+  public int hashCode() {
+    return Objects.hash(
+        id,
+        physicalRows,
+        files,
+        deletionFile,
+        rowIdMeta,
+        createdAtVersionMeta,
+        lastUpdatedAtVersionMeta);
+  }
+
+  @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("id", id)

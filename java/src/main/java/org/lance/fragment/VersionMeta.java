@@ -21,6 +21,9 @@ import java.util.Objects;
 /**
  * Metadata for per-row dataset version sequences (created_at / last_updated_at). Wraps the
  * JSON-serialized Rust RowDatasetVersionMeta enum.
+ *
+ * <p>Structurally identical to {@link RowIdMeta} — kept separate because the two map to distinct
+ * Rust types with different serialization formats and evolution paths.
  */
 public class VersionMeta implements Serializable {
   private static final long serialVersionUID = 1L;

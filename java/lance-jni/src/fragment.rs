@@ -8,14 +8,15 @@ use arrow_schema::DataType;
 use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
     JNIEnv,
-    objects::{JObject, JString},
-    sys::{jint, jlong},
+    objects::{JClass, JLongArray, JObject, JString},
+    sys::{jint, jlong, jstring},
 };
 use lance::datatypes::Schema;
 use lance::table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_io::utils::CachedFileSize;
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
@@ -486,6 +487,32 @@ fn inner_update_column<'local>(
         fields_modified,
     };
     result.into_java(env)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_RowIdMeta_nativeEncodeRowIds(
+    mut env: JNIEnv,
+    _cls: JClass,
+    row_ids: JLongArray,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        inner_encode_row_ids(&mut env, &row_ids)
+            .and_then(|json| env.new_string(json).map_err(Error::from)),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String> {
+    let len = env.get_array_length(row_ids)?;
+    let mut buf: Vec<i64> = vec![0; len as usize];
+    env.get_long_array_region(row_ids, 0, buf.as_mut_slice())?;
+    let ids: Vec<u64> = buf.into_iter().map(|x| x as u64).collect();
+    let seq = RowIdSequence::from(ids.as_slice());
+    let meta = RowIdMeta::Inline(write_row_ids(&seq));
+    let json = serde_json::to_string(&meta)?;
+    Ok(json)
 }
 
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";

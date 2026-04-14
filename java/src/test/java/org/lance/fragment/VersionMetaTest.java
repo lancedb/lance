@@ -72,7 +72,7 @@ public class VersionMetaTest {
   }
 
   @Test
-  void testJsonMetadataRoundTrip() {
+  void testJsonMetadataPreservation() {
     String json = "{\"Inline\":[10,20,30]}";
     VersionMeta meta = new VersionMeta(json);
     assertEquals(json, meta.getMetadata());

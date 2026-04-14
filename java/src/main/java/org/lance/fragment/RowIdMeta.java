@@ -13,14 +13,19 @@
  */
 package org.lance.fragment;
 
+import org.lance.JniLoader;
+
 import com.google.common.base.MoreObjects;
 
-import java.io.ByteArrayOutputStream;
 import java.io.Serializable;
 import java.util.Objects;
 
 public class RowIdMeta implements Serializable {
   private static final long serialVersionUID = -6532828695072614148L;
+
+  static {
+    JniLoader.ensureLoaded();
+  }
 
   private final String metadata;
 
@@ -29,47 +34,18 @@ public class RowIdMeta implements Serializable {
   }
 
   /**
-   * Creates a RowIdMeta from an array of stable row IDs. Encodes them as an inline RowIdSequence
-   * protobuf wrapped in the JSON format expected by lance-core.
+   * Creates a RowIdMeta from an array of stable row IDs by delegating to the Rust {@code
+   * write_row_ids} encoder via JNI. The returned metadata is a JSON string wrapping the
+   * protobuf-encoded RowIdSequence, matching the format expected by lance-core.
+   *
+   * @param rowIds stable row IDs to encode
+   * @return RowIdMeta containing the serialized inline representation
    */
   public static RowIdMeta fromRowIds(long[] rowIds) {
-    byte[] values = new byte[rowIds.length * 8];
-    for (int r = 0; r < rowIds.length; r++) {
-      long id = rowIds[r];
-      int base = r * 8;
-      for (int i = 0; i < 8; i++) {
-        values[base + i] = (byte) ((id >>> (8 * i)) & 0xFF);
-      }
-    }
-    // RowIdSequence protobuf nesting:
-    // segment(1) > encoded(5) > u64array(3) > bytes(2)
-    byte[] proto = lenDelimited(1, lenDelimited(5, lenDelimited(3, lenDelimited(2, values))));
-    StringBuilder sb = new StringBuilder(12 + proto.length * 4);
-    sb.append("{\"Inline\":[");
-    for (int i = 0; i < proto.length; i++) {
-      if (i > 0) sb.append(',');
-      sb.append(proto[i] & 0xFF);
-    }
-    sb.append("]}");
-    return new RowIdMeta(sb.toString());
+    return new RowIdMeta(nativeEncodeRowIds(rowIds));
   }
 
-  private static byte[] lenDelimited(int fieldNumber, byte[] data) {
-    int tag = (fieldNumber << 3) | 2;
-    ByteArrayOutputStream out = new ByteArrayOutputStream(1 + 5 + data.length);
-    writeVarint(out, tag);
-    writeVarint(out, data.length);
-    out.write(data, 0, data.length);
-    return out.toByteArray();
-  }
-
-  private static void writeVarint(ByteArrayOutputStream out, int value) {
-    while ((value & ~0x7F) != 0) {
-      out.write((value & 0x7F) | 0x80);
-      value >>>= 7;
-    }
-    out.write(value);
-  }
+  private static native String nativeEncodeRowIds(long[] rowIds);
 
   public String getMetadata() {
     return metadata;

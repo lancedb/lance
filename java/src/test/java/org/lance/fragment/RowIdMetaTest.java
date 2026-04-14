@@ -62,52 +62,6 @@ class RowIdMetaTest {
   }
 
   @Test
-  void testFromRowIdsProtoStructure() {
-    long[] rowIds = {1};
-    String json = RowIdMeta.fromRowIds(rowIds).getMetadata();
-
-    int start = json.indexOf('[') + 1;
-    int end = json.lastIndexOf(']');
-    String[] parts = json.substring(start, end).split(",");
-    byte[] proto = new byte[parts.length];
-    for (int i = 0; i < parts.length; i++) {
-      proto[i] = (byte) Integer.parseInt(parts[i].trim());
-    }
-
-    // Outermost: field 1, wire type 2 (length-delimited) → tag byte = 0x0a
-    assertEquals((byte) 0x0a, proto[0]);
-
-    // Walk 4 nested length-delimited fields to reach the payload
-    int pos = 0;
-    for (int level = 0; level < 4; level++) {
-      int tag = proto[pos++] & 0xFF;
-      assertEquals(2, tag & 0x07, "wire type must be 2 (length-delimited) at level " + level);
-      // decode varint length
-      int len = 0;
-      int shift = 0;
-      while (true) {
-        int b = proto[pos++] & 0xFF;
-        len |= (b & 0x7F) << shift;
-        if ((b & 0x80) == 0) break;
-        shift += 7;
-      }
-      if (level < 3) {
-        assertEquals(
-            proto.length - pos, len, "length at level " + level + " should span remaining bytes");
-      } else {
-        // innermost: payload is exactly rowIds.length * 8 bytes
-        assertEquals(rowIds.length * 8, len);
-      }
-    }
-
-    // Verify the last 8 bytes are little-endian encoding of 1
-    byte[] expected = {1, 0, 0, 0, 0, 0, 0, 0};
-    byte[] actual = new byte[8];
-    System.arraycopy(proto, proto.length - 8, actual, 0, 8);
-    assertArrayEquals(expected, actual);
-  }
-
-  @Test
   void testEquals() {
     RowIdMeta a = new RowIdMeta("test");
     RowIdMeta b = new RowIdMeta("test");
