@@ -187,6 +187,11 @@ pub struct DirectoryNamespaceBuilder {
     /// When true, table versions are stored in the `__manifest` table instead of
     /// relying on Lance's native version management.
     table_version_storage_enabled: bool,
+    /// When true, enables migration mode where the namespace checks the manifest first
+    /// before falling back to directory listing for root-level tables. When false (default),
+    /// root-level tables use directory listing directly without checking the manifest,
+    /// avoiding extra object store calls.
+    dir_listing_to_manifest_migration_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
@@ -222,6 +227,10 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
                 &self.table_version_storage_enabled,
             )
             .field(
+                "dir_listing_to_manifest_migration_enabled",
+                &self.dir_listing_to_manifest_migration_enabled,
+            )
+            .field(
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
             )
@@ -254,6 +263,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled: true,
             table_version_tracking_enabled: false, // Default to disabled
             table_version_storage_enabled: false,  // Default to disabled
+            dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
             commit_retries: None,
@@ -278,6 +288,17 @@ impl DirectoryNamespaceBuilder {
     /// When disabled, only consults the manifest table.
     pub fn dir_listing_enabled(mut self, enabled: bool) -> Self {
         self.dir_listing_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable migration mode from directory listing to manifest.
+    ///
+    /// When enabled, root-level table operations check the manifest first before
+    /// falling back to directory listing. When disabled (default), root-level tables
+    /// use directory listing directly, avoiding extra object store calls.
+    /// Only relevant when both `manifest_enabled` and `dir_listing_enabled` are true.
+    pub fn dir_listing_to_manifest_migration_enabled(mut self, enabled: bool) -> Self {
+        self.dir_listing_to_manifest_migration_enabled = enabled;
         self
     }
 
@@ -436,6 +457,12 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
+        // Extract dir_listing_to_manifest_migration_enabled (default: false)
+        let dir_listing_to_manifest_migration_enabled = properties
+            .get("dir_listing_to_manifest_migration_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
         // The prefix is stripped to get short property names
         // The build() method will check if enabled=true before creating the vendor
@@ -477,6 +504,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled,
             table_version_tracking_enabled,
             table_version_storage_enabled,
+            dir_listing_to_manifest_migration_enabled,
             credential_vendor_properties,
             context_provider: None,
             commit_retries,
@@ -715,6 +743,8 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns,
             dir_listing_enabled: self.dir_listing_enabled,
+            dir_listing_to_manifest_migration_enabled: self
+                .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
             table_version_storage_enabled: self.table_version_storage_enabled,
             credential_vendor,
@@ -792,6 +822,10 @@ pub struct DirectoryNamespace {
     base_path: Path,
     manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
     dir_listing_enabled: bool,
+    /// When true, root-level table operations check the manifest first before
+    /// falling back to directory listing. When false, root-level tables skip
+    /// the manifest check and use directory listing directly.
+    dir_listing_to_manifest_migration_enabled: bool,
     /// When true, `describe_table` returns `managed_versioning: true` to indicate
     /// commits should go through namespace table version APIs.
     table_version_tracking_enabled: bool,
@@ -976,7 +1010,13 @@ impl DirectoryNamespace {
         &self,
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !skip_manifest_for_root
+        {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
                     if let Some(ref table_uri) = response.table_uri {
@@ -993,10 +1033,7 @@ impl DirectoryNamespace {
                     }
                     return Ok(response);
                 }
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
+                Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
@@ -1963,6 +2000,16 @@ impl DirectoryNamespace {
             metrics.increment(operation);
         }
     }
+
+    #[cfg(test)]
+    fn wrap_inner_object_store(
+        &mut self,
+        wrapper: impl FnOnce(Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>,
+    ) {
+        let mut os = (*self.object_store).clone();
+        os.inner = wrapper(os.inner.clone());
+        self.object_store = Arc::new(os);
+    }
 }
 
 #[async_trait]
@@ -2085,8 +2132,12 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.list_tables(request).await;
         }
 
-        // When both manifest and directory listing are enabled, we need to merge and deduplicate
-        let mut tables = if self.manifest_ns.is_some() && self.dir_listing_enabled {
+        // When both manifest and directory listing are enabled with migration mode,
+        // we need to merge and deduplicate
+        let mut tables = if self.manifest_ns.is_some()
+            && self.dir_listing_enabled
+            && self.dir_listing_to_manifest_migration_enabled
+        {
             // Get all manifest table locations (for deduplication)
             let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
                 manifest_ns.list_manifest_table_locations().await?
@@ -2141,13 +2192,16 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         self.record_op("table_exists");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !skip_manifest_for_root
+        {
             match manifest_ns.table_exists(request.clone()).await {
                 Ok(()) => return Ok(()),
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
+                Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
@@ -5387,6 +5441,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_to_manifest_migration_enabled(true)
             .build()
             .await
             .unwrap();
@@ -8331,6 +8386,219 @@ mod tests {
                 "metrics=[output_rows=",
             ],
             "Filtered analyze plan should preserve late materialization and filter pushdown",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dir_listing_no_extra_calls_without_migration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingObjectStore {
+            inner: Arc<dyn OSObjectStore>,
+            list_with_delimiter_count: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Display for CountingObjectStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "CountingObjectStore({})", self.inner)
+            }
+        }
+
+        use std::pin::Pin;
+
+        impl CountingObjectStore {
+            fn delegate_list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> Pin<
+                Box<
+                    dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>>
+                        + Send,
+                >,
+            > {
+                self.inner.list(prefix)
+            }
+        }
+
+        #[async_trait]
+        impl OSObjectStore for CountingObjectStore {
+            async fn put(
+                &self,
+                location: &Path,
+                payload: object_store::PutPayload,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put(location, payload).await
+            }
+
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart(
+                &self,
+                location: &Path,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart(location).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            async fn get(&self, location: &Path) -> object_store::Result<object_store::GetResult> {
+                self.inner.get(location).await
+            }
+
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+
+            async fn get_range(
+                &self,
+                location: &Path,
+                range: std::ops::Range<u64>,
+            ) -> object_store::Result<bytes::Bytes> {
+                self.inner.get_range(location, range).await
+            }
+
+            async fn get_ranges(
+                &self,
+                location: &Path,
+                ranges: &[std::ops::Range<u64>],
+            ) -> object_store::Result<Vec<bytes::Bytes>> {
+                self.inner.get_ranges(location, ranges).await
+            }
+
+            async fn head(
+                &self,
+                location: &Path,
+            ) -> object_store::Result<object_store::ObjectMeta> {
+                self.inner.head(location).await
+            }
+
+            async fn delete(&self, location: &Path) -> object_store::Result<()> {
+                self.inner.delete(location).await
+            }
+
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> Pin<
+                Box<
+                    dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>>
+                        + Send,
+                >,
+            > {
+                self.delegate_list(prefix)
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.list_with_delimiter_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+                self.inner.copy(from, to).await
+            }
+
+            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+                self.inner.copy_if_not_exists(from, to).await
+            }
+
+            async fn rename_if_not_exists(
+                &self,
+                from: &Path,
+                to: &Path,
+            ) -> object_store::Result<()> {
+                self.inner.rename_if_not_exists(from, to).await
+            }
+        }
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Create a table using dir-listing-only namespace
+        let dir_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        dir_only_ns
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Build a namespace with both enabled but migration disabled (default)
+        let mut hybrid_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let list_count = Arc::new(AtomicUsize::new(0));
+        let list_count_clone = list_count.clone();
+        hybrid_ns.wrap_inner_object_store(move |inner| {
+            Arc::new(CountingObjectStore {
+                inner,
+                list_with_delimiter_count: list_count_clone,
+            })
+        });
+
+        // Reset counter before the operation we want to measure
+        list_count.store(0, Ordering::SeqCst);
+
+        // table_exists should use dir listing directly, making only 1 list call
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.table_exists(exists_req).await.unwrap();
+
+        let count = list_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 list_with_delimiter call for table_exists \
+             without migration mode, but got {}",
+            count
+        );
+
+        // Reset and test describe_table
+        list_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.describe_table(describe_req).await.unwrap();
+
+        let count = list_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 list_with_delimiter call for describe_table \
+             without migration mode, but got {}",
+            count
         );
     }
 }
