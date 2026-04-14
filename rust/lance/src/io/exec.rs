@@ -5,23 +5,23 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+#[cfg(feature = "substrait")]
+pub mod ann_proto;
 mod filter;
 pub mod filtered_read;
 #[cfg(feature = "substrait")]
 pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
-#[cfg(feature = "substrait")]
-pub mod ann_proto;
 mod optimizer;
 mod projection;
 mod pushdown_scan;
 mod rowids;
 pub mod scalar_index;
 mod scan;
-mod take;
 #[cfg(feature = "substrait")]
 pub mod table_identifier;
+mod take;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;

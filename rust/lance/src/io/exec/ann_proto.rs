@@ -132,11 +132,8 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     let query = query_to_proto(exec.query())?;
 
-    let indices: Vec<table_pb::IndexMetadata> = exec
-        .indices()
-        .iter()
-        .map(|idx| idx.into())
-        .collect();
+    let indices: Vec<table_pb::IndexMetadata> =
+        exec.indices().iter().map(|idx| idx.into()).collect();
 
     Ok(pb::AnnIvfSubIndexExecProto {
         query: Some(query),
