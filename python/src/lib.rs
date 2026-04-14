@@ -368,7 +368,12 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     ))
 }
 
-#[pyclass(name = "FFILanceTableProvider", module = "lance", subclass)]
+#[pyclass(
+    name = "FFILanceTableProvider",
+    module = "lance",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 struct FFILanceTableProvider {
     dataset: Arc<::lance::Dataset>,
@@ -424,8 +429,9 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
         obj
     };
 
-    let capsule = capsule.downcast::<PyCapsule>()?;
-    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+    let capsule = capsule.cast::<PyCapsule>()?;
+    let ptr = capsule.pointer_checked(None)?;
+    let codec = unsafe { ptr.cast::<FFI_LogicalExtensionCodec>().as_ref() };
 
     Ok(codec.clone())
 }

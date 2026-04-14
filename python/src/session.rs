@@ -13,7 +13,7 @@ use crate::rt;
 /// The Session holds stateful information for a dataset.
 ///
 /// The session contains caches for opened indices and file metadata.
-#[pyclass(name = "_Session", module = "_lib")]
+#[pyclass(name = "_Session", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct Session {
     pub inner: Arc<LanceSession>,

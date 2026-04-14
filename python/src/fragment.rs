@@ -42,7 +42,7 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
-#[pyclass(name = "_Fragment", module = "_lib")]
+#[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct FileFragment {
     fragment: LanceFragment,
@@ -741,7 +741,12 @@ impl PyRowDatasetVersionMeta {
     }
 }
 
-#[pyclass(name = "FragmentSession", module = "_lib", subclass)]
+#[pyclass(
+    name = "FragmentSession",
+    module = "_lib",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct FragmentSession {
     session: Arc<lance::dataset::fragment::session::FragmentSession>,
@@ -762,8 +767,9 @@ impl FragmentSession {
     }
 }
 
-impl FromPyObject<'_> for PyLance<Fragment> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<Fragment> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let files = extract_vec(&ob.getattr("files")?)?;
 
         let deletion_file: Option<PyRef<PyDeletionFile>> =
@@ -842,8 +848,9 @@ impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<DataFile> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<DataFile> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;

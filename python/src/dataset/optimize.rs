@@ -86,7 +86,8 @@ fn parse_compaction_options(
 }
 
 fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
-    dataset.getattr("_ds")?.extract()
+    let ds = dataset.getattr("_ds")?;
+    Ok(ds.cast::<Dataset>()?.clone())
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
@@ -229,7 +230,7 @@ impl PyCompactionPlan {
     }
 }
 
-#[pyclass(name = "CompactionTask", module = "lance.optimize")]
+#[pyclass(name = "CompactionTask", module = "lance.optimize", from_py_object)]
 #[derive(Clone)]
 pub struct PyCompactionTask(CompactionTask);
 
@@ -347,7 +348,7 @@ impl PyCompactionTask {
 ///
 /// This result is pickle-able, so it can be serialized and sent back to the
 /// main process to be passed to :py:meth:`lance.optimize.Compaction.commit`.
-#[pyclass(name = "RewriteResult", module = "lance.optimize")]
+#[pyclass(name = "RewriteResult", module = "lance.optimize", from_py_object)]
 #[derive(Clone)]
 pub struct PyRewriteResult(RewriteResult);
 
@@ -491,7 +492,7 @@ impl PyCompaction {
         let dataset = dataset_ref.borrow().clone();
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
-        let options = options.downcast::<PyDict>()?;
+        let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
         let opts = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
@@ -525,7 +526,7 @@ impl PyCompaction {
         let dataset = dataset.borrow().clone();
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
-        let options = options.downcast::<PyDict>()?;
+        let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
         let opts = parse_compaction_options(options, &config)?;
         let plan = rt()

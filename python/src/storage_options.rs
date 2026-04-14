@@ -12,7 +12,7 @@ use crate::rt;
 /// Python wrapper for StorageOptionsAccessor
 ///
 /// This wraps a Rust StorageOptionsAccessor and exposes it to Python.
-#[pyclass(name = "StorageOptionsAccessor")]
+#[pyclass(name = "StorageOptionsAccessor", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyStorageOptionsAccessor {
     inner: Arc<StorageOptionsAccessor>,
