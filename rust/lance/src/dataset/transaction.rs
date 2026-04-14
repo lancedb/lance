@@ -83,17 +83,21 @@ fn resolve_update_version_metadata(
     // ~24 bytes per entry (u64 key + &Fragment pointer + usize offset + hash metadata).
     // For a 1M-row dataset this is ~24 MB — acceptable for a transient transaction structure.
     let mut row_id_to_source: HashMap<u64, (&Fragment, usize)> = HashMap::new();
-    for frag in existing_fragments.iter() {
+    // Stable row IDs must be globally unique among *live* rows, but after a rewrite-style
+    // update the same stable ID can appear twice in `existing_fragments`: once in an older
+    // fragment's inline `row_id_meta` at the original row offset (rows may be soft-deleted
+    // via a deletion vector) and again in a newer fragment holding rewritten data. For
+    // `created_at` we need the mapping from the original fragment/offset; that is always the
+    // first occurrence when fragments are processed in ascending `id` order.
+    let mut frag_indices: Vec<usize> = (0..existing_fragments.len()).collect();
+    frag_indices.sort_by_key(|&i| existing_fragments[i].id);
+    for &i in &frag_indices {
+        let frag = &existing_fragments[i];
         if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
             && let Ok(seq) = read_row_ids(data)
         {
             for (offset, rid) in seq.iter().enumerate() {
-                let prev = row_id_to_source.insert(rid, (frag, offset));
-                debug_assert!(
-                    prev.is_none(),
-                    "duplicate row ID {rid} in fragment {}",
-                    frag.id,
-                );
+                row_id_to_source.entry(rid).or_insert((frag, offset));
             }
         }
     }
@@ -2173,9 +2177,16 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
+            // Internal operations (e.g. CreateIndex) use ManifestWriteConfig::default()
+            // which has use_stable_row_ids = false. Without inheriting from the previous
+            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
+            let inherited = current_manifest
+                .map(|m| m.uses_stable_row_ids())
+                .unwrap_or(false);
+            let stable_row_ids = config.use_stable_row_ids || inherited;
             apply_feature_flags(
                 &mut manifest,
-                config.use_stable_row_ids,
+                stable_row_ids,
                 config.disable_transaction_file,
             )?;
         }
