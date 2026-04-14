@@ -6,6 +6,13 @@ use std::ops::{Range, RangeInclusive};
 use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
 use deepsize::DeepSizeOf;
 
+/// Convert an estimated serialized byte cost from `u128` to `usize`, saturating
+/// at [`usize::MAX`] when the value does not fit (infeasible encodings).
+#[inline]
+fn u128_byte_cost_to_usize(v: u128) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
 /// Different ways to represent a sequence of distinct u64s.
 ///
 /// This is designed to be especially efficient for sequences that are sorted,
@@ -167,9 +174,9 @@ impl U64Segment {
         let sorted_array = 24u128.saturating_add(2u128.saturating_mul(stats.count as u128));
 
         [
-            usize::try_from(range_with_holes).unwrap_or(usize::MAX),
-            usize::try_from(range_with_bitmap).unwrap_or(usize::MAX),
-            usize::try_from(sorted_array).unwrap_or(usize::MAX),
+            u128_byte_cost_to_usize(range_with_holes),
+            u128_byte_cost_to_usize(range_with_bitmap),
+            u128_byte_cost_to_usize(sorted_array),
         ]
     }
 
@@ -806,6 +813,56 @@ mod test {
         );
         assert_eq!(segment.len(), 5);
         assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+    }
+
+    #[test]
+    fn test_u128_byte_cost_to_usize() {
+        assert_eq!(super::u128_byte_cost_to_usize(0), 0);
+        assert_eq!(super::u128_byte_cost_to_usize(42), 42);
+        assert_eq!(super::u128_byte_cost_to_usize(usize::MAX as u128), usize::MAX);
+        assert_eq!(super::u128_byte_cost_to_usize(u128::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn test_sorted_sequence_sizes_sparse_span_saturates_range_with_holes_cost() {
+        let stats = super::SegmentStats {
+            min: 0,
+            max: i64::MAX as u64,
+            count: 5,
+            sorted: true,
+        };
+        let sizes = U64Segment::sorted_sequence_sizes(&stats);
+        assert_eq!(sizes[0], usize::MAX);
+        assert!(sizes[2] < sizes[0]);
+    }
+
+    #[test]
+    fn test_sorted_sequence_sizes_sorted_array_cost_saturates() {
+        // Nearly full [0, u64::MAX] with one hole: count = u64::MAX, n_holes = 1.
+        // SortedArray cost 24 + 2 * u64::MAX does not fit in usize on 64-bit.
+        let stats = super::SegmentStats {
+            min: 0,
+            max: u64::MAX,
+            count: u64::MAX,
+            sorted: true,
+        };
+        let sizes = U64Segment::sorted_sequence_sizes(&stats);
+        assert_eq!(sizes[2], usize::MAX);
+    }
+
+    #[test]
+    fn test_sorted_sequence_sizes_full_span_bitmap_cost() {
+        // Synthetic stats: full [0, u64::MAX] slot space; exercises `range_with_bitmap`
+        // cost path (always fits in `usize` on 64-bit targets).
+        let stats = super::SegmentStats {
+            min: 0,
+            max: u64::MAX,
+            count: 1,
+            sorted: true,
+        };
+        let sizes = U64Segment::sorted_sequence_sizes(&stats);
+        assert!(sizes[1] < sizes[0]);
+        assert!(sizes[1] < usize::MAX);
     }
 
     #[test]
