@@ -1297,7 +1297,11 @@ impl Dataset {
         preserve_order: Option<bool>,
     ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
         let builder = configure_read_blobs_builder(
-            self_.ds.read_blobs(blob_column).infer_error()?.with_row_ids(row_ids),
+            self_
+                .ds
+                .read_blobs(blob_column)
+                .infer_error()?
+                .with_row_ids(row_ids),
             target_request_bytes,
             max_gap_bytes,
             max_concurrency,
