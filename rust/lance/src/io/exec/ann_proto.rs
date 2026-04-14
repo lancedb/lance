@@ -32,15 +32,19 @@ use super::utils::PreFilterSource;
 // VectorQueryProto helpers
 // =============================================================================
 
-/// Serialize a query key (vector) array to IPC file-format bytes.
+/// Serialize a query vector array to IPC file-format bytes.
 ///
 /// Wraps the array in a single-column RecordBatch so that the IPC format
 /// preserves the full data type (Float16, Float32, Float64, UInt8, etc.).
-fn query_key_to_ipc_bytes(array: &dyn arrow_array::Array) -> Result<Vec<u8>> {
-    let field = Field::new("key", array.data_type().clone(), true);
+fn query_vector_to_ipc_bytes(array: &dyn arrow_array::Array) -> Result<Vec<u8>> {
+    let field = Field::new("query_vector", array.data_type().clone(), true);
     let schema = Arc::new(ArrowSchema::new(vec![field]));
     let batch = RecordBatch::try_new(schema, vec![arrow_array::make_array(array.to_data())])
-        .map_err(|e| Error::internal(format!("Failed to create RecordBatch for query key: {e}")))?;
+        .map_err(|e| {
+            Error::internal(format!(
+                "Failed to create RecordBatch for query vector: {e}"
+            ))
+        })?;
 
     let mut buf = Vec::new();
     {
@@ -56,8 +60,8 @@ fn query_key_to_ipc_bytes(array: &dyn arrow_array::Array) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Deserialize a query key (vector) array from IPC file-format bytes.
-fn query_key_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
+/// Deserialize a query vector array from IPC file-format bytes.
+fn query_vector_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
     let cursor = std::io::Cursor::new(bytes);
     let reader = arrow_ipc::reader::FileReader::try_new(cursor, None)
         .map_err(|e| Error::internal(format!("Failed to create IPC reader: {e}")))?;
@@ -68,7 +72,7 @@ fn query_key_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
 
     if batches.is_empty() || batches[0].num_columns() == 0 {
         return Err(Error::internal(
-            "IPC bytes contain no data for query key".to_string(),
+            "IPC bytes contain no data for query vector".to_string(),
         ));
     }
 
@@ -76,7 +80,7 @@ fn query_key_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
 }
 
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
-    let query_vector_arrow_ipc = query_key_to_ipc_bytes(query.key.as_ref())?;
+    let query_vector_arrow_ipc = query_vector_to_ipc_bytes(query.key.as_ref())?;
 
     let metric_type = query
         .metric_type
@@ -99,7 +103,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
 }
 
 pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
-    let key = query_key_from_ipc_bytes(&proto.query_vector_arrow_ipc)?;
+    let key = query_vector_from_ipc_bytes(&proto.query_vector_arrow_ipc)?;
 
     let metric_type = proto
         .metric_type
@@ -196,31 +200,31 @@ mod tests {
     use lance_index::vector::pq::PQBuildParams;
 
     #[test]
-    fn test_query_key_ipc_roundtrip_f32() {
+    fn test_query_vector_ipc_roundtrip_f32() {
         let arr: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0]));
-        let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
-        let back = query_key_from_ipc_bytes(&bytes).unwrap();
+        let bytes = query_vector_to_ipc_bytes(arr.as_ref()).unwrap();
+        let back = query_vector_from_ipc_bytes(&bytes).unwrap();
         assert_eq!(arr.data_type(), back.data_type());
         assert_eq!(arr.len(), back.len());
     }
 
     #[test]
-    fn test_query_key_ipc_roundtrip_f64() {
+    fn test_query_vector_ipc_roundtrip_f64() {
         let arr: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
-        let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
-        let back = query_key_from_ipc_bytes(&bytes).unwrap();
+        let bytes = query_vector_to_ipc_bytes(arr.as_ref()).unwrap();
+        let back = query_vector_from_ipc_bytes(&bytes).unwrap();
         assert_eq!(arr.data_type(), back.data_type());
         assert_eq!(&*arr, &*back);
     }
 
     #[test]
-    fn test_query_key_ipc_roundtrip_f16() {
+    fn test_query_vector_ipc_roundtrip_f16() {
         let arr: ArrayRef = Arc::new(arrow_array::Float16Array::from(vec![
             f16::from_f32(1.0),
             f16::from_f32(2.0),
         ]));
-        let bytes = query_key_to_ipc_bytes(arr.as_ref()).unwrap();
-        let back = query_key_from_ipc_bytes(&bytes).unwrap();
+        let bytes = query_vector_to_ipc_bytes(arr.as_ref()).unwrap();
+        let back = query_vector_from_ipc_bytes(&bytes).unwrap();
         assert_eq!(arr.data_type(), back.data_type());
         assert_eq!(arr.len(), back.len());
     }
