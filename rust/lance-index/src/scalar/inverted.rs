@@ -14,6 +14,7 @@ mod wand;
 
 use std::sync::Arc;
 
+pub use lance_tokenizer::Language;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
@@ -21,7 +22,6 @@ use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use scorer::MemBM25Scorer;
-use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
 use lance_core::Error;

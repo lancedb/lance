@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
+use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
-use crate::scalar::inverted::lance_tokenizer::DocType;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexStore, OldIndexDataFilter};
@@ -2158,7 +2158,7 @@ mod tests {
 
         let params = InvertedIndexParams::new(
             "whitespace".to_string(),
-            tantivy::tokenizer::Language::English,
+            lance_tokenizer::Language::English,
         )
         .with_position(false)
         .remove_stop_words(false)
