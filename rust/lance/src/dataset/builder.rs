@@ -454,8 +454,10 @@ impl DatasetBuilder {
 
     /// Set runtime-only object store params for a specific registered base path.
     ///
-    /// These params are not persisted in the manifest. They are used whenever
-    /// the dataset resolves an object store for the given `BasePath.path`.
+    /// These params are not persisted in the manifest. They are used as-is
+    /// whenever the dataset resolves an object store for the given
+    /// `BasePath.path`. Dataset-level store params remain the fallback for bases
+    /// without an explicit binding.
     pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,

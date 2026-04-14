@@ -354,6 +354,9 @@ impl WriteParams {
     }
 
     /// Set exact runtime object store params for a registered base path.
+    ///
+    /// These params are used as-is for that base. The write-level default
+    /// `store_params` remain the fallback for bases without an explicit binding.
     pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,

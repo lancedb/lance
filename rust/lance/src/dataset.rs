@@ -1641,9 +1641,9 @@ impl Dataset {
         &self,
         base_path: Option<&lance_table::format::BasePath>,
     ) -> ObjectStoreParams {
-        // Most datasets only use the dataset-level store params. When a base path
-        // has a runtime override, builder precomputes the merged ObjectStoreParams
-        // for that exact `BasePath.path` so reads can do a single lookup here.
+        // Base-specific bindings are exact ObjectStoreParams keyed by
+        // `BasePath.path`. If a base has no explicit binding then reads fall back
+        // to the dataset-level default store params.
         base_path
             .and_then(|base_path| {
                 self.base_store_params
