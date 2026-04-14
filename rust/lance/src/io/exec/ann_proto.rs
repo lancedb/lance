@@ -98,7 +98,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         refine_factor: query.refine_factor,
         metric_type,
         use_index: query.use_index,
-        dist_q_c: query.dist_q_c,
+        dist_q_c: Some(query.dist_q_c),
     })
 }
 
@@ -126,7 +126,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
-        dist_q_c: proto.dist_q_c,
+        dist_q_c: proto.dist_q_c.unwrap_or(0.0),
     })
 }
 
