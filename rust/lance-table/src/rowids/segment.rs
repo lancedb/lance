@@ -819,7 +819,10 @@ mod test {
     fn test_u128_byte_cost_to_usize() {
         assert_eq!(super::u128_byte_cost_to_usize(0), 0);
         assert_eq!(super::u128_byte_cost_to_usize(42), 42);
-        assert_eq!(super::u128_byte_cost_to_usize(usize::MAX as u128), usize::MAX);
+        assert_eq!(
+            super::u128_byte_cost_to_usize(usize::MAX as u128),
+            usize::MAX
+        );
         assert_eq!(super::u128_byte_cost_to_usize(u128::MAX), usize::MAX);
     }
 
