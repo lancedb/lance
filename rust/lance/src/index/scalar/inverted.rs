@@ -112,6 +112,7 @@ pub(crate) async fn build_segment(
         dataset.object_store(),
         &index_dir,
         store,
+        lance_index::progress::noop_progress(),
     )
     .await?;
     Ok(built_segment)
