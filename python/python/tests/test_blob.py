@@ -33,7 +33,10 @@ def _out_of_order_blob_selection(dataset_with_blobs, selection_kind):
     expected = [(addresses[4], b"quux"), (addresses[0], b"foo")]
 
     if selection_kind == "ids":
-        return [_blob_row_ids(dataset_with_blobs)[4], _blob_row_ids(dataset_with_blobs)[0]], expected
+        return [
+            _blob_row_ids(dataset_with_blobs)[4],
+            _blob_row_ids(dataset_with_blobs)[0],
+        ], expected
     if selection_kind == "addresses":
         return [addresses[4], addresses[0]], expected
     return [4, 0], expected
@@ -319,9 +322,21 @@ def test_read_blobs_rejects_non_blob_column(dataset_with_blobs):
 @pytest.mark.parametrize(
     ("selection_kind", "selection_values", "expected"),
     [
-        ("ids", pa.array([0, (1 << 32) + 1], type=pa.uint64()), [(0, b"foo"), ((1 << 32) + 1, b"quux")]),
-        ("addresses", pa.array([0, (1 << 32) + 1], type=pa.uint64()), [(0, b"foo"), ((1 << 32) + 1, b"quux")]),
-        ("indices", pa.array([0, 4], type=pa.uint64()), [(0, b"foo"), ((1 << 32) + 1, b"quux")]),
+        (
+            "ids",
+            pa.array([0, (1 << 32) + 1], type=pa.uint64()),
+            [(0, b"foo"), ((1 << 32) + 1, b"quux")],
+        ),
+        (
+            "addresses",
+            pa.array([0, (1 << 32) + 1], type=pa.uint64()),
+            [(0, b"foo"), ((1 << 32) + 1, b"quux")],
+        ),
+        (
+            "indices",
+            pa.array([0, 4], type=pa.uint64()),
+            [(0, b"foo"), ((1 << 32) + 1, b"quux")],
+        ),
     ],
 )
 def test_read_blobs_accepts_arrow_array_selectors(
@@ -697,6 +712,7 @@ def test_blob_extension_take_blobs_multi_base(payload, is_dataset_root, tmp_path
         assert f.read() == payload
 
     assert ds.read_blobs("blob", indices=[0]) == [(0, payload)]
+
 
 @pytest.fixture
 def dataset_for_pandas_blob_tests(tmp_path):

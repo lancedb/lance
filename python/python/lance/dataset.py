@@ -1927,7 +1927,9 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         blob_files : List[BlobFile]
         """
-        selection_kind, selection_values = _resolve_blob_selection(ids, addresses, indices)
+        selection_kind, selection_values = _resolve_blob_selection(
+            ids, addresses, indices
+        )
 
         if selection_kind == "ids":
             lance_blob_files = self._ds.take_blobs(selection_values, blob_column)
@@ -1987,7 +1989,9 @@ class LanceDataset(pa.dataset.Dataset):
         blobs : List[Tuple[int, bytes]]
             A list of ``(row_address, blob_bytes)`` pairs.
         """
-        selection_kind, selection_values = _resolve_blob_selection(ids, addresses, indices)
+        selection_kind, selection_values = _resolve_blob_selection(
+            ids, addresses, indices
+        )
 
         kwargs = {
             "target_request_bytes": target_request_bytes,
