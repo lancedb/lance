@@ -150,7 +150,7 @@ humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 io-uring = "0.7"
 itertools = "0.13"
-jieba-rs = { version = "0.8.1", default-features = false }
+jieba-rs = { version = "0.9.0", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
 libm = "0.2.15"
 log = "0.4"
