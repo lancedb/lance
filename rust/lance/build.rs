@@ -14,15 +14,11 @@ fn main() -> Result<()> {
 
     let mut prost_build = prost_build::Config::new();
     prost_build.extern_path(".lance.table", "::lance_table::format::pb");
+    prost_build.extern_path(".lance.index.pb", "::lance_index::pb");
+    prost_build.extern_path(".lance.datafusion", "::lance_datafusion::pb");
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.enable_type_names();
-    prost_build.compile_protos(
-        &[
-            "./protos/table_identifier.proto",
-            "./protos/filtered_read.proto",
-        ],
-        &["./protos"],
-    )?;
+    prost_build.compile_protos(&["./protos/ann.proto"], &["./protos"])?;
 
     Ok(())
 }

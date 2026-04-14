@@ -3,7 +3,7 @@
 
 //! Protobuf serialization for [`ANNIvfSubIndexExec`].
 //!
-//! Proto message definitions live in `lance-datafusion` (see `pb`).
+//! Proto message definitions live in `crate::pb` (compiled from `ann.proto`).
 //! Conversion functions live here because they need access to `ANNIvfSubIndexExec`
 //! and `Dataset`, which are defined in this crate.
 //!
@@ -15,13 +15,14 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
-use lance_datafusion::pb;
+use lance_index::pb as index_pb;
 use lance_index::vector::Query;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
 
 use crate::Dataset;
+use crate::pb;
 
 use super::knn::ANNIvfSubIndexExec;
 use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
@@ -75,35 +76,39 @@ fn query_key_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
 }
 
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
-    let key_arrow_ipc = query_key_to_ipc_bytes(query.key.as_ref())?;
+    let query_vector_arrow_ipc = query_key_to_ipc_bytes(query.key.as_ref())?;
 
-    let metric_type = query.metric_type.map(|dt| dt.to_string());
+    let metric_type = query
+        .metric_type
+        .map(|dt| index_pb::VectorMetricType::from(dt) as i32);
 
     Ok(pb::VectorQueryProto {
-        key_arrow_ipc,
+        query_vector_arrow_ipc,
         column: query.column.clone(),
         k: query.k as u32,
         lower_bound: query.lower_bound,
         upper_bound: query.upper_bound,
-        minimum_nprobes: query.minimum_nprobes as u32,
+        minimum_nprobes: Some(query.minimum_nprobes as u32),
         maximum_nprobes: query.maximum_nprobes.map(|n| n as u32),
         ef: query.ef.map(|n| n as u32),
         refine_factor: query.refine_factor,
         metric_type,
         use_index: query.use_index,
-        dist_q_c: query.dist_q_c,
+        dist_q_c: Some(query.dist_q_c),
     })
 }
 
 pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
-    let key = query_key_from_ipc_bytes(&proto.key_arrow_ipc)?;
+    let key = query_key_from_ipc_bytes(&proto.query_vector_arrow_ipc)?;
 
     let metric_type = proto
         .metric_type
-        .as_deref()
-        .map(DistanceType::try_from)
-        .transpose()
-        .map_err(|e| Error::internal(format!("Invalid distance type: {e}")))?;
+        .map(|v| {
+            index_pb::VectorMetricType::try_from(v)
+                .map(DistanceType::from)
+                .map_err(|_| Error::internal(format!("Invalid VectorMetricType value: {v}")))
+        })
+        .transpose()?;
 
     Ok(Query {
         column: proto.column,
@@ -111,13 +116,13 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         k: proto.k as usize,
         lower_bound: proto.lower_bound,
         upper_bound: proto.upper_bound,
-        minimum_nprobes: proto.minimum_nprobes as usize,
+        minimum_nprobes: proto.minimum_nprobes.unwrap_or(0) as usize,
         maximum_nprobes: proto.maximum_nprobes.map(|n| n as usize),
         ef: proto.ef.map(|n| n as usize),
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
-        dist_q_c: proto.dist_q_c,
+        dist_q_c: proto.dist_q_c.unwrap_or(0.0),
     })
 }
 
