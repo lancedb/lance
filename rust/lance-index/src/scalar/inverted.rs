@@ -14,13 +14,13 @@ mod wand;
 
 use std::sync::Arc;
 
-pub use lance_tokenizer::Language;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
+pub use lance_tokenizer::Language;
 pub use scorer::MemBM25Scorer;
 pub use tokenizer::*;
 

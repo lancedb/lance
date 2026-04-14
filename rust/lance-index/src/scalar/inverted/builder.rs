@@ -2156,14 +2156,12 @@ mod tests {
         let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
         let stream = Box::pin(stream);
 
-        let params = InvertedIndexParams::new(
-            "whitespace".to_string(),
-            lance_tokenizer::Language::English,
-        )
-        .with_position(false)
-        .remove_stop_words(false)
-        .stem(false)
-        .max_token_length(None);
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder.update(stream, store.as_ref(), None).await?;

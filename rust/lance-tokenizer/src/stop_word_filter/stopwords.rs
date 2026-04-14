@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 // SPDX-License-Identifier: BSD-3-Clause
 // Vendored stop-word lists from Tantivy v0.24.2 / Snowball.
 /*

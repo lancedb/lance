@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 // SPDX-License-Identifier: MIT
 // Adapted from Tantivy v0.24.2 ngram tokenizer.
 // Copyright (c) 2017-present Tantivy contributors.
@@ -200,16 +202,15 @@ impl Iterator for CodepointFrontiers<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_offset.map(|offset| {
-            if self.text.is_empty() {
-                self.next_offset = None;
-            } else {
-                let width = utf8_codepoint_width(self.text.as_bytes()[0]);
-                self.text = &self.text[width..];
-                self.next_offset = Some(offset + width);
-            }
-            offset
-        })
+        let offset = self.next_offset?;
+        if self.text.is_empty() {
+            self.next_offset = None;
+        } else {
+            let width = utf8_codepoint_width(self.text.as_bytes()[0]);
+            self.text = &self.text[width..];
+            self.next_offset = Some(offset + width);
+        }
+        Some(offset)
     }
 }
 

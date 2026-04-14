@@ -19,8 +19,10 @@ serde = { workspace = true, features = ["derive"] }
 unicode-normalization = "0.1.25"
 
 [features]
-tokenizer-jieba = ["dep:jieba-rs"]
-tokenizer-lindera = ["dep:lindera"]
+jieba-rs = ["dep:jieba-rs"]
+lindera = ["dep:lindera"]
+tokenizer-jieba = ["jieba-rs"]
+tokenizer-lindera = ["lindera"]
 
 [lints]
 workspace = true
