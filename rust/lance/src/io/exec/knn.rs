@@ -654,6 +654,11 @@ impl ANNIvfSubIndexExec {
     pub fn indices(&self) -> &[IndexMetadata] {
         &self.indices
     }
+
+    /// Returns a reference to the prefilter source.
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
 }
 
 impl DisplayAs for ANNIvfSubIndexExec {
