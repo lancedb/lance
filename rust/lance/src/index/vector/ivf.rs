@@ -2195,8 +2195,15 @@ pub(crate) async fn merge_segments_with_progress(
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
     let final_dir = indices_dir.child(segment_uuid.to_string());
-    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments, None, progress)
-        .await?;
+    merge_segments_to_dir(
+        object_store,
+        indices_dir,
+        &final_dir,
+        &segments,
+        None,
+        progress,
+    )
+    .await?;
     let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
     merged_segment = TableIndexMetadata {
@@ -2222,7 +2229,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
-    requested_index_type: Option<IndexType>,
+    _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
