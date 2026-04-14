@@ -98,7 +98,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         refine_factor: query.refine_factor,
         metric_type,
         use_index: query.use_index,
-        dist_q_c: Some(query.dist_q_c),
+        dist_q_c: query.dist_q_c,
     })
 }
 
@@ -120,13 +120,13 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         k: proto.k as usize,
         lower_bound: proto.lower_bound,
         upper_bound: proto.upper_bound,
-        minimum_nprobes: proto.minimum_nprobes.unwrap_or(0) as usize,
+        minimum_nprobes: proto.minimum_nprobes.unwrap_or(1) as usize,
         maximum_nprobes: proto.maximum_nprobes.map(|n| n as usize),
         ef: proto.ef.map(|n| n as usize),
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
-        dist_q_c: proto.dist_q_c.unwrap_or(0.0),
+        dist_q_c: proto.dist_q_c,
     })
 }
 
