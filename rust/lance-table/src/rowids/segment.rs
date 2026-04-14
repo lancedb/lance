@@ -153,7 +153,7 @@ impl U64Segment {
         let n_holes = stats.n_holes();
         let total_slots = stats.max - stats.min + 1;
 
-        let range_with_holes = 24 + 4 * n_holes as usize;
+        let range_with_holes = 24usize.saturating_add(4usize.saturating_mul(n_holes as usize));
         let range_with_bitmap = 24 + (total_slots as f64 / 8.0).ceil() as usize;
         let sorted_array = 24 + 2 * stats.count as usize;
 
