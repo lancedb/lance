@@ -1532,9 +1532,9 @@ fn merge_ranges(left: &Range<u64>, right: &Range<u64>) -> Range<u64> {
 /// Overlapping or touching ranges report a gap of zero.
 fn gap_between_ranges(left: &Range<u64>, right: &Range<u64>) -> u64 {
     if left.end < right.start {
-        right.start - left.end
+        right.start.saturating_sub(left.end)
     } else if right.end < left.start {
-        left.start - right.end
+        left.start.saturating_sub(right.end)
     } else {
         0
     }
@@ -1649,7 +1649,7 @@ pub async fn take_blobs_by_addresses(
 }
 
 /// Validate that `column` exists and is a blob column, returning its field id.
-pub(crate) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
+pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
     let projection = dataset.schema().project(&[column])?;
     let blob_field = &projection.fields[0];
     if !blob_field.is_blob() {
