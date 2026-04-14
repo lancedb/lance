@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 
 use std::ffi::CString;
-
+use std::ptr::NonNull;
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
@@ -53,6 +53,7 @@ use file::{
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
+use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
@@ -430,8 +431,10 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
     };
 
     let capsule = capsule.cast::<PyCapsule>()?;
-    let ptr = capsule.pointer_checked(None)?;
-    let codec = unsafe { ptr.cast::<FFI_LogicalExtensionCodec>().as_ref() };
+    let data: NonNull<FFI_LogicalExtensionCodec> = capsule
+        .pointer_checked(Some(c_str!("datafusion_logical_extension_codec")))?
+        .cast();
+    let codec = unsafe { data.as_ref() };
 
     Ok(codec.clone())
 }
