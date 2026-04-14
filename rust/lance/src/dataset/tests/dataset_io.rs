@@ -42,7 +42,7 @@ use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
@@ -171,7 +171,7 @@ async fn test_with_object_store_enables_isolated_per_request_io_tracking() {
 
 #[cfg(feature = "azure")]
 #[tokio::test]
-async fn test_object_store_for_base_uses_runtime_base_storage_options() {
+async fn test_object_store_for_base_uses_runtime_base_store_params() {
     let test_dir = TempStdDir::default();
     create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
     let uri = test_dir.to_str().unwrap();
@@ -194,21 +194,28 @@ async fn test_object_store_for_base_uses_runtime_base_storage_options() {
         .await
         .unwrap();
 
-    let dataset = DatasetBuilder::from_uri(uri)
-        .with_base_storage_options(
-            &base_a.path,
+    let base_a_store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             HashMap::from([
                 ("account_name".to_string(), "account-a".to_string()),
                 ("account_key".to_string(), "dGVzdA==".to_string()),
             ]),
-        )
-        .with_base_storage_options(
-            &base_b.path,
+        ))),
+        ..Default::default()
+    };
+    let default_store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
             HashMap::from([
                 ("account_name".to_string(), "account-b".to_string()),
                 ("account_key".to_string(), "dGVzdA==".to_string()),
             ]),
-        )
+        ))),
+        ..Default::default()
+    };
+
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_store_params(default_store_params)
+        .with_base_store_params(&base_a.path, base_a_store_params)
         .load()
         .await
         .unwrap();

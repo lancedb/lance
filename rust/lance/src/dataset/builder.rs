@@ -51,8 +51,8 @@ pub struct DatasetBuilder {
     file_reader_options: Option<FileReaderOptions>,
     /// Storage options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
-    /// Runtime-only per-base storage options keyed by base path URI.
-    base_storage_options_overrides: HashMap<String, HashMap<String, String>>,
+    /// Runtime-only exact object store bindings keyed by base path URI.
+    base_store_params: HashMap<String, ObjectStoreParams>,
 }
 
 impl std::fmt::Debug for DatasetBuilder {
@@ -70,10 +70,7 @@ impl std::fmt::Debug for DatasetBuilder {
                 "storage_options_override",
                 &self.storage_options_override.is_some(),
             )
-            .field(
-                "base_storage_options_overrides",
-                &!self.base_storage_options_overrides.is_empty(),
-            )
+            .field("base_store_params", &!self.base_store_params.is_empty())
             .finish()
     }
 }
@@ -92,7 +89,7 @@ impl DatasetBuilder {
             manifest: None,
             file_reader_options: None,
             storage_options_override: None,
-            base_storage_options_overrides: HashMap::new(),
+            base_store_params: HashMap::new(),
         }
     }
 
@@ -455,17 +452,17 @@ impl DatasetBuilder {
         self
     }
 
-    /// Set runtime-only storage options for a specific registered base path.
+    /// Set runtime-only object store params for a specific registered base path.
     ///
-    /// These options are not persisted in the manifest. They are applied whenever
+    /// These params are not persisted in the manifest. They are used whenever
     /// the dataset resolves an object store for the given `BasePath.path`.
-    pub fn with_base_storage_options(
+    pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,
-        storage_options: HashMap<String, String>,
+        store_params: ObjectStoreParams,
     ) -> Self {
-        self.base_storage_options_overrides
-            .insert(base_path.as_ref().to_string(), storage_options);
+        self.base_store_params
+            .insert(base_path.as_ref().to_string(), store_params);
         self
     }
 
@@ -514,6 +511,12 @@ impl DatasetBuilder {
     /// If this is set, then `with_index_cache_size` and `with_metadata_cache_size` are ignored.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Set exact object store params used as the dataset-level default binding.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.options = store_params;
         self
     }
 
@@ -649,22 +652,8 @@ impl DatasetBuilder {
 
         let file_reader_options = self.file_reader_options.clone();
         let store_params = self.options.clone();
-        let base_store_params = (!self.base_storage_options_overrides.is_empty()).then(|| {
-            Arc::new(
-                self.base_storage_options_overrides
-                    .iter()
-                    .map(|(base_path, storage_options)| {
-                        (
-                            base_path.clone(),
-                            Self::merge_store_params_with_storage_options(
-                                &store_params,
-                                storage_options,
-                            ),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>(),
-            )
-        });
+        let base_store_params = (!self.base_store_params.is_empty())
+            .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         // Two cases that need to check out after loading the manifest:
