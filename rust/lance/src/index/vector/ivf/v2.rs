@@ -2875,8 +2875,15 @@ mod tests {
         )
         .await
         .unwrap();
+        let merged_segment = dataset
+            .create_index_segment_builder()
+            .with_index_type(params.index_type())
+            .with_segments(vec![merged_segment])
+            .build_all()
+            .await
+            .unwrap();
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
+            .commit_existing_index_segments(INDEX_NAME, "vector", merged_segment)
             .await
             .unwrap();
 

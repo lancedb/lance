@@ -162,26 +162,30 @@ async fn search_segments(
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     let mut candidates = std::collections::BinaryHeap::new();
-    let searches = stream::iter(indices.iter().cloned().map(|index| {
-        let tokens = tokens.clone();
-        let params = params.clone();
-        let pre_filter = pre_filter.clone();
-        let metrics = metrics.clone();
-        let base_scorer = base_scorer.clone();
-        async move {
-            index
-                .bm25_search(
-                    tokens,
-                    params,
-                    operator,
-                    pre_filter,
-                    metrics,
-                    Some(base_scorer.as_ref()),
-                )
-                .await
-        }
-    }))
-    .buffer_unordered(get_num_compute_intensive_cpus());
+    let searches = indices
+        .iter()
+        .map(|index| {
+            let index = Arc::clone(index);
+            let tokens = tokens.clone();
+            let params = params.clone();
+            let pre_filter = pre_filter.clone();
+            let metrics = metrics.clone();
+            let base_scorer = base_scorer.clone();
+            async move {
+                index
+                    .bm25_search(
+                        tokens,
+                        params,
+                        operator,
+                        pre_filter,
+                        metrics,
+                        Some(base_scorer.as_ref()),
+                    )
+                    .await
+            }
+        })
+        .collect::<Vec<_>>();
+    let searches = stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus());
     let mut searches = searches;
 
     while let Some((doc_ids, scores)) = searches.try_next().await? {

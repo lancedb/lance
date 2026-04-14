@@ -241,7 +241,7 @@ mod tests {
                 .unwrap();
         }
 
-        let segments = vec![
+        let segments = [
             IndexMetadata {
                 uuid: first_segment_uuid,
                 fragment_bitmap: Some(std::iter::once(target_fragments[0].id() as u32).collect()),

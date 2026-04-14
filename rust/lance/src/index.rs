@@ -2521,6 +2521,13 @@ mod tests {
             .iter()
             .map(|segment| segment.uuid)
             .collect::<Vec<_>>();
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_index_type(params.index_type())
+            .with_segments(segments)
+            .build_all()
+            .await
+            .unwrap();
         dataset
             .commit_existing_index_segments(index_name, column, segments)
             .await
