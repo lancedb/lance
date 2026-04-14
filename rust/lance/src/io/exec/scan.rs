@@ -9,11 +9,11 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::common::stats::Precision;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -710,10 +710,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn partition_statistics(
-        &self,
-        _partition: Option<usize>,
-    ) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments

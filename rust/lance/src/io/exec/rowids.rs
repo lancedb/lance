@@ -377,8 +377,8 @@ impl AddRowOffsetExec {
             input.schema().metadata().clone(),
         ));
 
-        let new_eq_props = EquivalenceProperties::new(schema)
-            .extend(input.properties().eq_properties.clone())?;
+        let new_eq_props =
+            EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone())?;
         let properties = Arc::new(
             input
                 .properties()
