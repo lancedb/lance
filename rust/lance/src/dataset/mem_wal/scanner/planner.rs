@@ -14,6 +14,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::Expr;
 use lance_core::Result;
+use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
@@ -75,6 +76,7 @@ impl LsmScanPlanner {
     /// - SortPreservingMergeExec is O(N log K) where K is the number of sources
     /// - Memory usage is bounded by the sum of K sort buffers rather than all data
     /// - No extra column for _memtable_gen in the common case
+    #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
         projection: Option<&[String]>,
