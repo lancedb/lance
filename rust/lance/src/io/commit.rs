@@ -118,7 +118,7 @@ pub(crate) async fn write_transaction_file(
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
     let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
 
-    let message = pb::Transaction::from(transaction);
+    let message = pb::Transaction::try_from(transaction)?;
     let buf = message.encode_to_vec();
     object_store.inner.put(&path, buf.into()).await?;
 

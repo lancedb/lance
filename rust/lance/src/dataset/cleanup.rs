@@ -1582,6 +1582,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            invalidated_fragment_bitmap: None,
         }
     }
 

@@ -76,6 +76,16 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// Fragment IDs that were removed from `fragment_bitmap` because indexed
+    /// column values changed but the index data was not rewritten. The index
+    /// still contains stale entries for these fragments; readers must treat
+    /// all rows from them as deleted when querying the index.
+    ///
+    /// `None` means no fragments have been invalidated. Always cleared on a
+    /// full index rebuild. An optimize may or may not clear this depending
+    /// on the index type (see proto comment for details).
+    pub invalidated_fragment_bitmap: Option<RoaringBitmap>,
 }
 
 impl IndexMetadata {
@@ -132,6 +142,11 @@ impl DeepSizeOf for IndexMetadata {
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
             + self.files.deep_size_of_children(context)
+            + self
+                .invalidated_fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.serialized_size())
+                .unwrap_or(0)
     }
 }
 
@@ -162,6 +177,14 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             )
         };
 
+        let invalidated_fragment_bitmap = if proto.invalidated_fragment_bitmap.is_empty() {
+            None
+        } else {
+            Some(RoaringBitmap::deserialize_from(
+                &mut proto.invalidated_fragment_bitmap.as_slice(),
+            )?)
+        };
+
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
@@ -178,20 +201,18 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            invalidated_fragment_bitmap,
         })
     }
 }
 
-impl From<&IndexMetadata> for pb::IndexMetadata {
-    fn from(idx: &IndexMetadata) -> Self {
+impl TryFrom<&IndexMetadata> for pb::IndexMetadata {
+    type Error = Error;
+
+    fn try_from(idx: &IndexMetadata) -> Result<Self> {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap
-            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
-        {
-            // In theory, this should never error. But if we do, just
-            // recover gracefully.
-            log::error!("Failed to serialize fragment bitmap: {}", e);
-            fragment_bitmap.clear();
+        if let Some(bitmap) = &idx.fragment_bitmap {
+            bitmap.serialize_into(&mut fragment_bitmap)?;
         }
 
         let files = idx
@@ -208,7 +229,12 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             })
             .unwrap_or_default();
 
-        Self {
+        let mut invalidated_fragment_bitmap = Vec::new();
+        if let Some(bitmap) = &idx.invalidated_fragment_bitmap {
+            bitmap.serialize_into(&mut invalidated_fragment_bitmap)?;
+        }
+
+        Ok(Self {
             uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
@@ -222,7 +248,8 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
-        }
+            invalidated_fragment_bitmap,
+        })
     }
 }
 
@@ -244,7 +271,10 @@ fn serialize_index_metadata(
         .downcast_ref::<Vec<IndexMetadata>>()
         .expect("index_metadata_codec: wrong type (this is a bug in the cache layer)");
     let section = pb::IndexSection {
-        indices: vec.iter().map(pb::IndexMetadata::from).collect(),
+        indices: vec
+            .iter()
+            .map(pb::IndexMetadata::try_from)
+            .collect::<lance_core::Result<_>>()?,
     };
     writer.write_all(&section.encode_to_vec())?;
     Ok(())
@@ -319,6 +349,7 @@ mod tests {
                     path: "index.idx".to_string(),
                     size_bytes: 1024,
                 }]),
+                invalidated_fragment_bitmap: Some(RoaringBitmap::from_iter([4, 5])),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -331,6 +362,7 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                invalidated_fragment_bitmap: None,
             },
         ];
 

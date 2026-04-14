@@ -1795,6 +1795,7 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        invalidated_fragment_bitmap: None,
     };
 
     let transaction = Transaction::new(

@@ -342,11 +342,24 @@ impl MapIndexExec {
             .unwrap();
         let deletion_mask_fut =
             DatasetPreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
-        let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
+        let mut deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {
             None
         };
+        // Block rows from invalidated fragments — fragments whose indexed
+        // column values changed but whose index data was not rewritten.
+        if let Some(invalidated) = &index.invalidated_fragment_bitmap {
+            let mut block_list = lance_core::utils::mask::RowAddrTreeMap::new();
+            for frag_id in invalidated.iter() {
+                block_list.insert_fragment(frag_id);
+            }
+            let inv_mask = Arc::new(lance_core::utils::mask::RowAddrMask::from_block(block_list));
+            deletion_mask = Some(match deletion_mask {
+                Some(existing) => Arc::new((*existing).clone() & (*inv_mask).clone()),
+                None => inv_mask,
+            });
+        }
         Ok(input.and_then(move |res| {
             let column_name = column_name.clone();
             let index_name = index_name.clone();

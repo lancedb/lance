@@ -102,6 +102,7 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            invalidated_fragment_bitmap: None,
         }))
     }
 }

@@ -286,6 +286,36 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // A bitmap of fragment IDs that were removed from fragment_bitmap because
+  // the indexed column values changed in those fragments but the index data
+  // was not rewritten to reflect the change. The index data still contains
+  // stale entries for these fragments and readers must mask out any index
+  // results from these fragments when querying the index.
+  //
+  // Several operations can introduce invalidated fragments:
+  //
+  //  - A partial-schema merge_insert modifies indexed column values in a
+  //    fragment without rewriting the index.
+  //  - A data replacement operation changes column values without
+  //    rewriting the index.
+  //  - Some index types do not rewrite the full index during incremental
+  //    updates (e.g. the FTS inverted index), so stale entries for
+  //    replaced fragments may persist after an optimize.
+  //
+  // Future operations that modify indexed data without a full index
+  // rebuild may also add entries here.
+  //
+  // When absent, there are no invalidated fragments. Always cleared when
+  // the index is fully rebuilt. An optimize operation may or may not clear
+  // this depending on the index type — index types that rewrite all data
+  // during optimize (e.g. btree) will clear it, while index types that
+  // perform incremental merges (e.g. FTS) may retain invalidated
+  // fragments that were not reprocessed.
+  //
+  // The bitmap is stored as a 32-bit Roaring bitmap (same encoding as
+  // fragment_bitmap).
+  bytes invalidated_fragment_bitmap = 11;
 }
 
 // Metadata about a single file within an index segment.

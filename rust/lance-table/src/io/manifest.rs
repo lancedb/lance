@@ -143,7 +143,10 @@ async fn do_write_manifest(
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
         let section = pb::IndexSection {
-            indices: indices.iter().map(|i| i.into()).collect(),
+            indices: indices
+                .iter()
+                .map(pb::IndexMetadata::try_from)
+                .collect::<Result<_>>()?,
         };
         let pos = writer.write_protobuf(&section).await?;
         manifest.index_section = Some(pos);

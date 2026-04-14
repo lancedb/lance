@@ -74,10 +74,24 @@ impl DatasetPreFilter {
             Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
+        // Block rows from invalidated fragments — fragments whose indexed column
+        // values changed but whose index data was not rewritten (see
+        // IndexMetadata::invalidated_fragment_bitmap for details).
+        let mut invalidated = RoaringBitmap::new();
+        for idx in indices {
+            if let Some(inv) = &idx.invalidated_fragment_bitmap {
+                invalidated |= inv;
+            }
+        }
+        let deleted_fragments = if invalidated.is_empty() {
+            None
+        } else {
+            Some(invalidated)
+        };
         Self {
             deleted_ids,
             filtered_ids,
-            deleted_fragments: None,
+            deleted_fragments,
             final_mask: Mutex::new(OnceCell::new()),
         }
     }
@@ -183,7 +197,11 @@ impl DatasetPreFilter {
     /// Used by FTS indices which track fragments that have been removed from the
     /// dataset but whose data is still present in the index (merge-on-read).
     pub fn set_deleted_fragments(&mut self, fragments: RoaringBitmap) {
-        self.deleted_fragments = Some(fragments);
+        if let Some(existing) = &mut self.deleted_fragments {
+            *existing |= fragments;
+        } else {
+            self.deleted_fragments = Some(fragments);
+        }
     }
 
     /// Creates a task to load mask to filter out deleted rows.

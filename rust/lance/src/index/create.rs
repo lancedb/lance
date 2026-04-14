@@ -455,6 +455,7 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: created_index.files,
+            invalidated_fragment_bitmap: None,
         })
     }
 

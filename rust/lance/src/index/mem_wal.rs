@@ -113,6 +113,7 @@ pub(crate) fn new_mem_wal_index_meta(
         base_id: None,
         // Memory WAL index is inline (no files)
         files: None,
+        invalidated_fragment_bitmap: None,
     })
 }
 

@@ -215,6 +215,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files: None,
+            invalidated_fragment_bitmap: None,
         })
     }
 }

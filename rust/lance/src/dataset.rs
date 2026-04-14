@@ -3196,7 +3196,7 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
-            transaction.take().map(|tx| tx.into()),
+            transaction.take().map(|tx| tx.try_into()).transpose()?,
         )
         .await
 }

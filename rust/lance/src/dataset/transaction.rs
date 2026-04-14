@@ -292,12 +292,14 @@ impl std::fmt::Display for Operation {
     }
 }
 
-impl From<&Transaction> for lance_table::format::Transaction {
-    fn from(value: &Transaction) -> Self {
-        let pb_transaction: pb::Transaction = value.into();
-        Self {
+impl TryFrom<&Transaction> for lance_table::format::Transaction {
+    type Error = lance_core::Error;
+
+    fn try_from(value: &Transaction) -> lance_core::Result<Self> {
+        let pb_transaction: pb::Transaction = value.try_into()?;
+        Ok(Self {
             inner: pb_transaction,
-        }
+        })
     }
 }
 
@@ -2329,7 +2331,14 @@ impl Transaction {
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
                 for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                    fragment_bitmap.remove(fragment_id);
+                    if fragment_bitmap.remove(fragment_id) {
+                        // The fragment was indexed but is now stale. Track it so
+                        // query-time deletion masks can block rows from it.
+                        index
+                            .invalidated_fragment_bitmap
+                            .get_or_insert_with(RoaringBitmap::new)
+                            .insert(fragment_id);
+                    }
                 }
             }
         }
@@ -3076,8 +3085,10 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
-impl From<&Transaction> for pb::Transaction {
-    fn from(value: &Transaction) -> Self {
+impl TryFrom<&Transaction> for pb::Transaction {
+    type Error = lance_core::Error;
+
+    fn try_from(value: &Transaction) -> lance_core::Result<Self> {
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
@@ -3158,11 +3169,14 @@ impl From<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                new_indices: new_indices
+                    .iter()
+                    .map(pb::IndexMetadata::try_from)
+                    .collect::<lance_core::Result<_>>()?,
                 removed_indices: removed_indices
                     .iter()
-                    .map(pb::IndexMetadata::from)
-                    .collect(),
+                    .map(pb::IndexMetadata::try_from)
+                    .collect::<lance_core::Result<_>>()?,
             }),
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -3269,13 +3283,13 @@ impl From<&Transaction> for pb::Transaction {
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-        }
+        })
     }
 }
 
@@ -3514,6 +3528,7 @@ mod tests {
             created_at: Some(Utc::now()),
             base_id: None,
             files: None,
+            invalidated_fragment_bitmap: None,
         }
     }
 
@@ -4021,6 +4036,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            invalidated_fragment_bitmap: None,
         }
     }
 
@@ -4043,6 +4059,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            invalidated_fragment_bitmap: None,
         }
     }
 
