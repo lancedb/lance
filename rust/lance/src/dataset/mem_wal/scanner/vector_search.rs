@@ -18,6 +18,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use lance_core::Result;
 use lance_index::scalar::bloomfilter::sbbf::Sbbf;
+use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
@@ -144,6 +145,7 @@ impl LsmVectorSearchPlanner {
     ///
     /// An execution plan that returns the top-K nearest neighbors across all
     /// LSM levels, with stale results filtered out.
+    #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
     pub async fn plan_search(
         &self,
         query_vector: &FixedSizeListArray,
