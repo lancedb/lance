@@ -106,3 +106,95 @@ def test_replacement_after_index(tmp_path: str):
             ),
             read_version=ds3.version,
         )
+
+
+def test_data_file_create_basic(tmp_path: str):
+    """DataFile.create should read file metadata and produce correct fields/indices."""
+    table = pa.table({"a": range(10), "b": range(10, 20)})
+    ds = lance.write_dataset(table, tmp_path)
+
+    # Write a lance file with both columns
+    new_file_name = f"{uuid.uuid4()}.lance"
+    new_file_path = f"{tmp_path}/data/{new_file_name}"
+    with LanceFileWriter(new_file_path) as writer:
+        writer.write_batch(table)
+
+    df = DataFile.create(ds, new_file_name)
+
+    # Should have both field IDs from the dataset
+    frag = ds.get_fragments()[0]
+    expected_fields = frag.data_files()[0].fields
+    assert df.fields == expected_fields
+    assert df.column_indices == [0, 1]
+    assert df.file_major_version == int(stable_version().split(".")[0])
+    assert df.file_minor_version == int(stable_version().split(".")[1])
+    assert df.file_size_bytes is not None and df.file_size_bytes > 0
+
+
+def test_data_file_create_subset_columns(tmp_path: str):
+    """DataFile.create should work for a file with a subset of dataset columns."""
+    table = pa.table({"a": range(10), "b": range(10, 20)})
+    ds = lance.write_dataset(table, tmp_path)
+    ds.add_columns({"c": "a + b"})
+    ds = lance.dataset(tmp_path)
+
+    # Write a file with only column b
+    new_file_name = f"{uuid.uuid4()}.lance"
+    new_file_path = f"{tmp_path}/data/{new_file_name}"
+    with LanceFileWriter(new_file_path, pa.schema([("b", pa.int64())])) as writer:
+        writer.write_batch(pa.table({"b": range(100, 110)}))
+
+    df = DataFile.create(ds, new_file_name)
+
+    # Should only have b's field ID
+    frag = ds.get_fragments()[0]
+    all_fields = frag.data_files()[0].fields
+    # b is the second field in the original data file
+    b_field_id = all_fields[1]
+    assert df.fields == [b_field_id]
+    assert df.column_indices == [0]
+
+
+def test_data_file_create_end_to_end(tmp_path: str):
+    """DataFile.create should work end-to-end with DataReplacement."""
+    table = pa.table({"a": range(100)})
+    ds = lance.write_dataset(table, tmp_path)
+    ds.add_columns({"b": "a + 1"})
+    ds = lance.dataset(tmp_path)
+
+    # Write a replacement file for column b
+    new_file_name = f"{uuid.uuid4()}.lance"
+    new_file_path = f"{tmp_path}/data/{new_file_name}"
+    replacement_data = pa.table({"b": range(200, 300)})
+    with LanceFileWriter(new_file_path, pa.schema([("b", pa.int64())])) as writer:
+        writer.write_batch(replacement_data)
+
+    # Use DataFile.create instead of manual construction
+    df = DataFile.create(ds, new_file_name)
+
+    ds.commit(
+        ds.uri,
+        lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(0, df)]
+        ),
+        read_version=ds.version,
+    )
+
+    result = lance.dataset(tmp_path).to_table()
+    assert result.column("b").to_pylist() == list(range(200, 300))
+    assert result.column("a").to_pylist() == list(range(100))
+
+
+def test_data_file_create_unknown_column(tmp_path: str):
+    """DataFile.create should raise an error for a file with unknown columns."""
+    table = pa.table({"a": range(10)})
+    ds = lance.write_dataset(table, tmp_path)
+
+    # Write a file with a column not in the dataset
+    new_file_name = f"{uuid.uuid4()}.lance"
+    new_file_path = f"{tmp_path}/data/{new_file_name}"
+    with LanceFileWriter(new_file_path) as writer:
+        writer.write_batch(pa.table({"z": range(10)}))
+
+    with pytest.raises(Exception, match="z"):
+        DataFile.create(ds, new_file_name)

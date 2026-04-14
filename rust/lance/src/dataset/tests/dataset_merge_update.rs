@@ -376,7 +376,7 @@ async fn test_insert_subschema() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
 
     // When reading back, columns that are missing are null
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -424,7 +424,7 @@ async fn test_insert_subschema() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 1]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0, 1]);
 
     // Can scan and get expected data.
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -480,8 +480,11 @@ async fn test_insert_nested_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[2, 1]);
-    assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[2, 1]);
+    assert_eq!(
+        fragments[0].metadata.files[0].column_indices.as_ref(),
+        &[0, 1]
+    );
 
     // Can insert c, b
     let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -508,8 +511,11 @@ async fn test_insert_nested_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(&fragments[1].metadata.files[0].fields, &[3, 2]);
-    assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1]);
+    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[3, 2]);
+    assert_eq!(
+        fragments[1].metadata.files[0].column_indices.as_ref(),
+        &[0, 1]
+    );
 
     // Can't insert a, c (b is non-nullable)
     let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -612,7 +618,7 @@ async fn test_insert_balanced_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
 
     // Insert right side
     let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
@@ -628,7 +634,7 @@ async fn test_insert_balanced_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(&fragments[1].metadata.files[0].fields, &[1]);
+    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[1]);
 
     let data = dataset
         .take(
@@ -860,9 +866,9 @@ async fn test_datafile_partial_replacement() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the second column in the dataset
-        fields: vec![1],
+        fields: Arc::from([1]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
@@ -886,8 +892,14 @@ async fn test_datafile_partial_replacement() {
     assert_eq!(dataset.version().version, 4);
     assert_eq!(dataset.get_fragments().len(), 1);
     assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
-    assert_eq!(dataset.get_fragments()[0].metadata.files[0].fields, vec![0]);
-    assert_eq!(dataset.get_fragments()[0].metadata.files[1].fields, vec![1]);
+    assert_eq!(
+        dataset.get_fragments()[0].metadata.files[0].fields.as_ref(),
+        &[0]
+    );
+    assert_eq!(
+        dataset.get_fragments()[0].metadata.files[1].fields.as_ref(),
+        &[1]
+    );
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -915,9 +927,9 @@ async fn test_datafile_partial_replacement() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the first column in the dataset
-        fields: vec![0],
+        fields: Arc::from([0]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
@@ -1014,9 +1026,9 @@ async fn test_datafile_replacement_error() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the second column in the dataset
-        fields: vec![1],
+        fields: Arc::from([1]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: 2,
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
@@ -1024,7 +1036,7 @@ async fn test_datafile_replacement_error() {
     };
 
     let new_data_file = DataFile {
-        fields: vec![0, 1],
+        fields: Arc::from([0, 1]),
         ..new_data_file
     };
 
@@ -2071,4 +2083,133 @@ async fn test_fts_index_incremental_reindex_after_in_place_update() {
         "Expected 1 result for 'cat' (new text for id=1), got {}",
         results.num_rows()
     );
+}
+
+/// Regression test for https://github.com/lance-format/lance/issues/6338
+/// Sub-schema merge_insert with binary columns on v2.2 causes data corruption
+/// when the binary values are >= 256 bytes.
+#[tokio::test]
+async fn test_sub_schema_merge_insert_binary_v2_2() {
+    use crate::dataset::write::merge_insert::WhenMatched;
+    use arrow_array::BinaryArray;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("a", DataType::Binary, true),
+        ArrowField::new("b", DataType::Utf8, true),
+    ]));
+
+    let test_uri = TempStrDir::default();
+
+    // Initial write: 2 rows with null binary values
+    let initial_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![0, 1])),
+            Arc::new(BinaryArray::from(vec![None::<&[u8]>, None])),
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+        ],
+    )
+    .unwrap();
+
+    let write_params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let batches = RecordBatchIterator::new(vec![initial_batch].into_iter().map(Ok), schema.clone());
+    Dataset::write(batches, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+
+    let sub_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("a", DataType::Binary, true),
+    ]));
+
+    // Sub-schema merge_insert for row 0 (binary value >= 256 bytes)
+    let data_a: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+    {
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0])),
+                Arc::new(BinaryArray::from(vec![Some(data_a.as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![update_batch].into_iter().map(Ok),
+            sub_schema.clone(),
+        ));
+        MergeInsertBuilder::try_new(dataset.into(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+    }
+
+    // Read back and verify first merge worked
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let table = dataset
+        .scan()
+        .project(&["id", "a"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let table = concat_batches(&table[0].schema(), &table).unwrap();
+    assert_eq!(table.num_rows(), 2);
+
+    // Sub-schema merge_insert for row 1 (binary value >= 256 bytes)
+    let data_b: Vec<u8> = (0..256).map(|i| ((i + 100) % 251) as u8).collect();
+    {
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![Some(data_b.as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![update_batch].into_iter().map(Ok),
+            sub_schema.clone(),
+        ));
+        MergeInsertBuilder::try_new(dataset.into(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+    }
+
+    // Read back and verify - this is where the bug manifests
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    let table = dataset
+        .scan()
+        .project(&["id", "a"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let table = concat_batches(&table[0].schema(), &table).unwrap();
+    assert_eq!(table.num_rows(), 2);
+
+    let a_col = table.column_by_name("a").unwrap();
+    let binary_arr = a_col.as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(binary_arr.value(0), data_a.as_slice());
+    assert_eq!(binary_arr.value(1), data_b.as_slice());
 }

@@ -11,6 +11,9 @@ on:
         default: ''
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   push-module:
     runs-on: ubuntu-latest

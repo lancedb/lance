@@ -9,17 +9,48 @@
 //! values. Define a [`CacheKey`] (or [`UnsizedCacheKey`] for trait objects) to
 //! describe what you're caching and its type.
 //!
+//! To make a value type serializable (so persistent backends can store it),
+//! implement [`CacheCodecImpl`] on the type, then override [`CacheKey::codec`]:
+//!
+//! ```ignore
+//! impl CacheCodecImpl for MyData {
+//!     fn serialize(&self, w: &mut dyn Write) -> Result<()> { /* ... */ }
+//!     fn deserialize(data: &Bytes) -> Result<Self> { /* ... */ }
+//! }
+//!
+//! impl CacheKey for MyDataKey {
+//!     type ValueType = MyData;
+//!     fn key(&self) -> Cow<'_, str> { /* ... */ }
+//!     fn type_name() -> &'static str { "MyData" }
+//!     fn codec() -> Option<CacheCodec> {
+//!         Some(CacheCodec::from_impl::<MyData>())
+//!     }
+//! }
+//! ```
+//!
 //! ## For backend implementors
 //!
 //! Implement [`CacheBackend`] to provide a custom storage layer (disk, Redis,
 //! etc.). Backends receive [`InternalCacheKey`] keys and type-erased
 //! [`CacheEntry`] values — the typed wrapping is handled by [`LanceCache`].
 //! See the [`backend`] module for details.
+//!
+//! ## Serialization flow
+//!
+//! When a [`CacheKey`] provides a codec via [`CacheKey::codec`]:
+//!
+//! 1. [`LanceCache`] wraps the [`CacheCodec`] and passes it to the backend
+//!    alongside the entry on `insert` and `get` calls.
+//! 2. In-memory backends (like [`MokaCacheBackend`]) ignore the codec.
+//! 3. Persistent backends use `codec.serialize(entry, writer)` on insert and
+//!    `codec.deserialize(reader)` on get to persist entries across restarts.
 
 pub mod backend;
+pub mod codec;
 mod moka;
 
 pub use backend::{CacheBackend, CacheEntry, InternalCacheKey};
+pub use codec::{CacheCodec, CacheCodecImpl};
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;
@@ -70,12 +101,27 @@ pub trait CacheKey {
     /// `std::any::type_name` — the latter is not guaranteed stable across
     /// compiler versions or build configurations.
     fn type_name() -> &'static str;
+
+    /// Optional codec for serializing/deserializing this key's value type.
+    ///
+    /// Returns `None` by default. Cache backends that support persistence
+    /// (e.g. disk-backed caches) use this to serialize entries on insert and
+    /// deserialize on get. Types without a codec will only be stored in-memory.
+    ///
+    /// [`CacheCodec`] is `Copy` (two plain function pointers), so returning it
+    /// by value is cheap — no allocation needed.
+    fn codec() -> Option<CacheCodec> {
+        None
+    }
 }
 
 /// Like [`CacheKey`] but for unsized value types (e.g. `dyn Trait`).
 ///
 /// The cache wraps values in an extra `Arc` layer internally; callers pass
 /// and receive `Arc<T>` where `T: ?Sized`.
+///
+/// Unsized cache entries are always in-memory only (no serialization codec).
+/// For serializable entries, use a sized [`CacheKey`] instead.
 pub trait UnsizedCacheKey {
     type ValueType: 'static + ?Sized;
 
@@ -205,20 +251,22 @@ impl LanceCache {
         &self,
         key: &str,
         type_name: &'static str,
+        codec: Option<CacheCodec>,
         metadata: Arc<T>,
     ) {
         let size = cache_entry_size(&*metadata);
         let cache_key = build_key(&self.prefix, key, type_name);
-        self.cache.insert(&cache_key, metadata, size).await;
+        self.cache.insert(&cache_key, metadata, size, codec).await;
     }
 
     async fn get_with_id<T: Send + Sync + 'static>(
         &self,
         key: &str,
         type_name: &'static str,
+        codec: Option<CacheCodec>,
     ) -> Option<Arc<T>> {
         let cache_key = build_key(&self.prefix, key, type_name);
-        if let Some(entry) = self.cache.get(&cache_key).await {
+        if let Some(entry) = self.cache.get(&cache_key, codec).await {
             match entry.downcast::<T>() {
                 Ok(val) => {
                     self.hits.fetch_add(1, Ordering::Relaxed);
@@ -262,7 +310,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_with_id(&cache_key.key(), K::type_name(), metadata)
+        self.insert_with_id(&cache_key.key(), K::type_name(), K::codec(), metadata)
             .boxed()
             .await
     }
@@ -272,7 +320,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get_with_id::<K::ValueType>(&cache_key.key(), K::type_name())
+        self.get_with_id::<K::ValueType>(&cache_key.key(), K::type_name(), K::codec())
             .boxed()
             .await
     }
@@ -297,7 +345,10 @@ impl LanceCache {
             Ok((arc as CacheEntry, size))
         });
 
-        let (entry, was_cached) = self.cache.get_or_insert(&key, typed_loader).await?;
+        let (entry, was_cached) = self
+            .cache
+            .get_or_insert(&key, typed_loader, K::codec())
+            .await?;
 
         if was_cached {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +364,7 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_with_id(&cache_key.key(), K::type_name(), Arc::new(metadata))
+        self.insert_with_id(&cache_key.key(), K::type_name(), None, Arc::new(metadata))
             .boxed()
             .await
     }
@@ -324,7 +375,7 @@ impl LanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let outer = self
-            .get_with_id::<Arc<K::ValueType>>(&cache_key.key(), K::type_name())
+            .get_with_id::<Arc<K::ValueType>>(&cache_key.key(), K::type_name(), None)
             .boxed()
             .await?;
         Some(outer.as_ref().clone())
@@ -376,7 +427,7 @@ impl WeakLanceCache {
     {
         let cache = self.inner.upgrade()?;
         let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-        if let Some(entry) = cache.get(&key).await {
+        if let Some(entry) = cache.get(&key, K::codec()).await {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.downcast::<K::ValueType>().unwrap())
         } else {
@@ -393,7 +444,7 @@ impl WeakLanceCache {
         if let Some(cache) = self.inner.upgrade() {
             let size = cache_entry_size(&*value);
             let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            cache.insert(&key, value, size).await;
+            cache.insert(&key, value, size, K::codec()).await;
             true
         } else {
             log::warn!("WeakLanceCache: cache no longer available, unable to insert item");
@@ -423,7 +474,7 @@ impl WeakLanceCache {
                 let size = cache_entry_size(&*arc);
                 Ok((arc as CacheEntry, size))
             });
-            let (entry, was_cached) = cache.get_or_insert(&key, typed_loader).await?;
+            let (entry, was_cached) = cache.get_or_insert(&key, typed_loader, K::codec()).await?;
             if was_cached {
                 self.hits.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -443,7 +494,7 @@ impl WeakLanceCache {
     {
         let cache = self.inner.upgrade()?;
         let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-        if let Some(entry) = cache.get(&key).await {
+        if let Some(entry) = cache.get(&key, None).await {
             entry
                 .downcast::<Arc<K::ValueType>>()
                 .ok()
@@ -462,7 +513,7 @@ impl WeakLanceCache {
             let wrapper = Arc::new(value);
             let size = cache_entry_size(&*wrapper);
             let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            cache.insert(&key, wrapper, size).await;
+            cache.insert(&key, wrapper, size, None).await;
         } else {
             log::warn!("WeakLanceCache: cache no longer available, unable to insert unsized item");
         }
@@ -712,10 +763,20 @@ mod tests {
 
         #[async_trait]
         impl CacheBackend for HashMapBackend {
-            async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+            async fn get(
+                &self,
+                key: &InternalCacheKey,
+                _codec: Option<CacheCodec>,
+            ) -> Option<CacheEntry> {
                 self.map.lock().await.get(key).map(|(e, _)| e.clone())
             }
-            async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize) {
+            async fn insert(
+                &self,
+                key: &InternalCacheKey,
+                entry: CacheEntry,
+                size_bytes: usize,
+                _codec: Option<CacheCodec>,
+            ) {
                 self.map
                     .lock()
                     .await
@@ -727,6 +788,7 @@ mod tests {
                 loader: std::pin::Pin<
                     Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
                 >,
+                _codec: Option<CacheCodec>,
             ) -> Result<(CacheEntry, bool)> {
                 if let Some((entry, _)) = self.map.lock().await.get(key) {
                     Ok((entry.clone(), true))

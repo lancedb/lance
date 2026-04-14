@@ -13,6 +13,9 @@ on:
       - docs/**
       - .github/workflows/docs-check.yml
 
+permissions:
+  contents: read
+
 env:
   RUSTFLAGS: "-C debuginfo=0"
   # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html

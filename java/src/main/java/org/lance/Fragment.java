@@ -279,7 +279,8 @@ public class Fragment {
           params.getDataStorageVersion(),
           params.getStorageOptions(),
           namespaceClient,
-          tableId);
+          tableId,
+          params.getAllowExternalBlobOutsideBases());
     }
   }
 
@@ -304,7 +305,8 @@ public class Fragment {
         params.getDataStorageVersion(),
         params.getStorageOptions(),
         namespaceClient,
-        tableId);
+        tableId,
+        params.getAllowExternalBlobOutsideBases());
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -320,7 +322,8 @@ public class Fragment {
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
       LanceNamespace namespaceClient,
-      List<String> tableId);
+      List<String> tableId,
+      Optional<Boolean> allowExternalBlobOutsideBases);
 
   /** Create a fragment from the given arrow stream. */
   private static native List<FragmentMetadata> createWithFfiStream(
@@ -334,5 +337,6 @@ public class Fragment {
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
       LanceNamespace namespaceClient,
-      List<String> tableId);
+      List<String> tableId,
+      Optional<Boolean> allowExternalBlobOutsideBases);
 }

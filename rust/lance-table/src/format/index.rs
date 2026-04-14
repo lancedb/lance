@@ -226,6 +226,45 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
     }
 }
 
+/// Returns a [`CacheCodec`](lance_core::cache::CacheCodec) for `Vec<IndexMetadata>`.
+///
+/// Uses `pb::IndexSection` (which wraps `repeated IndexMetadata`) as the wire
+/// format, reusing the existing `TryFrom`/`From` conversions.
+///
+/// Uses [`CacheCodec::new`](lance_core::cache::CacheCodec::new) because the
+/// orphan rule prevents `impl CacheCodecImpl for Vec<IndexMetadata>`.
+type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
+
+fn serialize_index_metadata(
+    any: &ArcAny,
+    writer: &mut dyn std::io::Write,
+) -> lance_core::Result<()> {
+    use prost::Message;
+    let vec = any
+        .downcast_ref::<Vec<IndexMetadata>>()
+        .expect("index_metadata_codec: wrong type (this is a bug in the cache layer)");
+    let section = pb::IndexSection {
+        indices: vec.iter().map(pb::IndexMetadata::from).collect(),
+    };
+    writer.write_all(&section.encode_to_vec())?;
+    Ok(())
+}
+
+fn deserialize_index_metadata(data: &bytes::Bytes) -> lance_core::Result<ArcAny> {
+    use prost::Message;
+    let section = pb::IndexSection::decode(data.as_ref())?;
+    let indices: Vec<IndexMetadata> = section
+        .indices
+        .into_iter()
+        .map(IndexMetadata::try_from)
+        .collect::<lance_core::Result<_>>()?;
+    Ok(Arc::new(indices))
+}
+
+pub fn index_metadata_codec() -> lance_core::cache::CacheCodec {
+    lance_core::cache::CacheCodec::new(serialize_index_metadata, deserialize_index_metadata)
+}
+
 /// List all files in an index directory with their sizes.
 ///
 /// Returns a list of `IndexFile` structs containing relative paths and sizes.
@@ -251,4 +290,79 @@ pub async fn list_index_files_with_sizes(
         });
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Demonstrates the pattern a disk-backed cache backend would use:
+    /// serialize entries to bytes, store in a key-value map, then
+    /// deserialize on retrieval.
+    #[test]
+    fn test_index_metadata_codec_roundtrip() {
+        let codec = index_metadata_codec();
+
+        let original = vec![
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "my_index".to_string(),
+                fields: vec![0, 1],
+                dataset_version: 42,
+                fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2, 3])),
+                index_details: None,
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+                files: Some(vec![IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 1024,
+                }]),
+            },
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "second_index".to_string(),
+                fields: vec![2],
+                dataset_version: 43,
+                fragment_bitmap: None,
+                index_details: None,
+                index_version: 2,
+                created_at: None,
+                base_id: Some(7),
+                files: None,
+            },
+        ];
+
+        // Simulate a disk-backed store: HashMap<String, Vec<u8>>
+        let mut store: HashMap<String, Vec<u8>> = HashMap::new();
+
+        // Serialize into the store
+        let key = "dataset/v42/Vec<IndexMetadata>".to_string();
+        let mut buf = Vec::new();
+        let entry: Arc<dyn std::any::Any + Send + Sync> = Arc::new(original.clone());
+        codec.serialize(&entry, &mut buf).unwrap();
+        store.insert(key.clone(), buf);
+
+        // Deserialize from the store
+        let bytes = store.get(&key).unwrap();
+        let recovered = codec
+            .deserialize(&bytes::Bytes::copy_from_slice(bytes))
+            .unwrap();
+        let recovered = recovered
+            .downcast::<Vec<IndexMetadata>>()
+            .expect("downcast should succeed");
+
+        assert_eq!(original.len(), recovered.len());
+        for (orig, rec) in original.iter().zip(recovered.iter()) {
+            assert_eq!(orig.uuid, rec.uuid);
+            assert_eq!(orig.name, rec.name);
+            assert_eq!(orig.fields, rec.fields);
+            assert_eq!(orig.dataset_version, rec.dataset_version);
+            assert_eq!(orig.fragment_bitmap, rec.fragment_bitmap);
+            assert_eq!(orig.index_version, rec.index_version);
+            assert_eq!(orig.base_id, rec.base_id);
+            assert_eq!(orig.files, rec.files);
+        }
+    }
 }

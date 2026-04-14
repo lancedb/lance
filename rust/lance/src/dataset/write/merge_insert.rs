@@ -18,6 +18,23 @@
 
 // Internal column name for the merge action. Using "__action" to avoid collisions with user columns.
 const MERGE_ACTION_COLUMN: &str = "__action";
+// ## NULL-safe source row detection via sentinel column
+//
+// The merge join uses standard SQL equality for ON columns, which means NULL != NULL.
+// After an outer join we need to know for each output row whether it came from the
+// source side, the target side, or both.  The naive approach — checking whether an ON
+// column IS NOT NULL — is wrong: a source row whose ON column is legitimately NULL is
+// indistinguishable from a NULL introduced by the outer join on the target side.
+//
+// Solution: inject a `lit(true)` sentinel into every source row *before* the join.
+// After the join:
+//   - source rows (matched or unmatched)  → sentinel = true   (never NULL)
+//   - target-only rows                    → sentinel = NULL   (outer-join fill)
+//
+// `assign_action` then uses `sentinel IS NOT NULL` instead of key-column IS NOT NULL
+// to determine which side each row came from.  The sentinel is stripped by
+// `prepare_stream_schema` and never written to the dataset.
+pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 
 pub mod inserted_rows;
 
@@ -847,25 +864,28 @@ impl MergeInsertJob {
         &self,
         source: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
-        // We need to do a full index scan if we're deleting source data
-        let can_use_scalar_index = matches!(
-            self.params.delete_not_matched_by_source, // this value marks behavior for rows in target that are not matched by the source. Value assigned earlier.
-            WhenNotMatchedBySource::Keep
-        ) && self.params.use_index;
-
-        if can_use_scalar_index {
+        if self.params.use_index
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            )
+        {
             // keeping unmatched rows, no deletion
             if let Some(index) = self.join_key_as_scalar_index().await? {
-                self.create_indexed_scan_joined_stream(source, index).await
-            } else {
-                self.create_full_table_joined_stream(source).await
+                return self.create_indexed_scan_joined_stream(source, index).await;
             }
-        } else {
+        }
+
+        if !matches!(
+            self.params.delete_not_matched_by_source,
+            WhenNotMatchedBySource::Keep
+        ) {
             info!(
                 "The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan"
             );
-            self.create_full_table_joined_stream(source).await
         }
+
+        self.create_full_table_joined_stream(source).await
     }
 
     async fn update_fragments(
@@ -1244,12 +1264,19 @@ impl MergeInsertJob {
             let updated_fields = fragment.files.last().unwrap().fields.clone();
             all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
-                for field in &mut data_file.fields {
-                    if updated_fields.contains(field) {
-                        // Tombstone these fields
-                        *field = -2;
-                    }
-                }
+                let new_fields: Arc<[i32]> = data_file
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        if updated_fields.contains(field) {
+                            -2 // Tombstone
+                        } else {
+                            *field
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                data_file.fields = new_fields;
             }
         }
 
@@ -1336,6 +1363,13 @@ impl MergeInsertJob {
             .collect::<Vec<_>>();
         let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
+        // Inject a sentinel literal column so we can reliably determine, after the join,
+        // whether the source side contributed a row.  This is NULL-safe: even when every
+        // ON column is NULL the sentinel lets us distinguish a source-only row from a
+        // target-only row (where the sentinel is filled with NULL by the outer join).
+        let source_df = source_df
+            .with_column(MERGE_SOURCE_SENTINEL, logical_expr::lit(true))
+            .map_err(crate::Error::from)?;
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
@@ -1456,7 +1490,7 @@ impl MergeInsertJob {
     ///
     /// The fast path is only available for specific conditions:
     /// - when_matched is UpdateAll or UpdateIf or Fail
-    /// - Either use_index is false OR there's no scalar index on join key
+    /// - The execution will not use the legacy scalar-index join path
     /// - Source schema matches dataset schema exactly
     /// - when_not_matched_by_source is Keep, Delete, or DeleteIf
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
@@ -1475,7 +1509,15 @@ impl MergeInsertJob {
             },
         );
 
-        let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
+        let would_use_scalar_index = if self.params.use_index
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            ) {
+            self.join_key_as_scalar_index().await?.is_some()
+        } else {
+            false
+        };
 
         // Check if this is a delete-only operation (no update/insert writes needed from source)
         // For delete-only, we don't need the full source schema, just key columns for matching
@@ -1499,7 +1541,7 @@ impl MergeInsertJob {
                 | WhenMatched::UpdateIf(_)
                 | WhenMatched::Fail
                 | WhenMatched::Delete
-        ) && (!self.params.use_index || !has_scalar_index)
+        ) && !would_use_scalar_index
             && schema_ok
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -2236,7 +2278,6 @@ mod tests {
             assert_plan_node_equals, assert_string_matches,
         },
     };
-    use arrow_array::RecordBatch;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::types::Float32Type;
     use arrow_array::{
@@ -2244,6 +2285,7 @@ mod tests {
         RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
         types::{Int32Type, UInt32Type},
     };
+    use arrow_array::{RecordBatch, record_batch};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
@@ -3583,8 +3625,8 @@ mod tests {
                 let data_files = &frag.files;
                 // Updated columns should be only columns in new data files
                 // -2 field ids are tombstoned.
-                assert_eq!(&data_files[0].fields, &[0, -2, -2]);
-                assert_eq!(&data_files[1].fields, &[2, 1]);
+                assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
+                assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
             };
             has_added_files(&fragments_after[1]);
             has_added_files(&fragments_after[2]);
@@ -4209,21 +4251,22 @@ mod tests {
         // Assert the plan structure using portable plan matching
         // The optimized plan should have:
         // 1. FullSchemaMergeInsertExec at the top
-        // 2. ProjectionExec that creates action with key validation (source.key IS NOT NULL)
-        // 3. ProjectionExec that creates the common expression for key validation
-        // 4. HashJoin with projection optimization
-        // 5. LanceScan that only reads the key column (projection pushdown working!)
+        // 2. ProjectionExec that creates action based on _rowaddr nullness (sentinel is constant
+        //    true so DataFusion folds `sentinel IS NOT NULL` away from the CASE expression)
+        // 3. HashJoin with projection that includes the sentinel column
+        // 4. LanceScan that only reads the key column (projection pushdown working!)
+        // 5. ProjectionExec on the source side that materializes the sentinel literal
         assert_plan_node_equals(
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, value@3 as value, key@4 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@2 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@2 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
-        HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          CooperativeExec
-            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-            row_id=true, row_addr=true, full_filter=--, refine_filter=--
-          RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
+      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        CooperativeExec
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+          row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+          ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
@@ -4259,18 +4302,20 @@ mod tests {
         // This should use the fast path (execute_uncommitted_v2)
         let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
 
-        // The optimized plan should use Inner join instead of Right join
-        // since we're not inserting unmatched rows
+        // The optimized plan should use Inner join instead of Right join since we're not
+        // inserting unmatched rows.  The sentinel IS NOT NULL condition is folded away by
+        // DataFusion because the sentinel is lit(true), so the CASE only checks _rowaddr.
         assert_plan_node_equals(
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
         CooperativeExec
           LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
-          StreamingTableExec: partition_sizes=1, projection=[value, key]"
+          ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
@@ -4306,17 +4351,19 @@ mod tests {
 
         let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
 
-        // The optimized plan should use Inner join and include the UpdateIf condition
+        // The optimized plan should use Inner join and include the UpdateIf condition.
+        // The sentinel IS NOT NULL condition is folded away (sentinel is lit(true)).
         assert_plan_node_equals(
             plan,
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
         CooperativeExec
           LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
-          StreamingTableExec: partition_sizes=1, projection=[value, key]"
+          ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
@@ -5420,6 +5467,76 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     }
 
     #[tokio::test]
+    async fn test_explain_plan_full_schema_delete_by_source_with_fsl_and_scalar_index() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![
+                            1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3, 3.0, 3.1, 3.2, 3.3,
+                        ]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(dataset_batch)],
+                schema.clone(),
+            )),
+            "memory://test_explain_plan_full_schema_delete_by_source_with_fsl_and_scalar_index",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::Scalar, None, &scalar_params, false)
+            .await
+            .unwrap();
+
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .try_build()
+                .unwrap();
+
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
+        assert!(plan.contains("HashJoinExec"));
+        assert!(plan.contains("join_type=Full"));
+        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
+            "target-side scan should prune the FSL payload from the join build side even when a scalar index exists: {plan}"
+        );
+        assert!(
+            !plan.contains(
+                "LanceRead: uri=test_explain_plan_full_schema_delete_by_source_with_fsl_and_scalar_index/data, projection=[id, vec]"
+            ),
+            "target-side scan should not include the FSL payload in the join build side: {plan}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_merge_insert_full_schema_delete_by_source_with_fsl() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -5457,6 +5574,98 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         )
         .await
         .unwrap();
+
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![20.0, 20.1, 20.2, 20.3, 40.0, 40.1, 40.2, 40.3]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let (merged_dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(source_batch)],
+                    schema.clone(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_deleted_rows, 2);
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        let merged = merged_dataset.scan().try_into_batch().await.unwrap();
+        let ids = merged["id"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(ids, vec![2, 4]);
+
+        let vecs = merged["vec"].as_fixed_size_list();
+        let actual = vecs
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(actual, vec![20.0, 20.1, 20.2, 20.3, 40.0, 40.1, 40.2, 40.3]);
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_full_schema_delete_by_source_with_fsl_and_scalar_index() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![
+                            1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3, 3.0, 3.1, 3.2, 3.3,
+                        ]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(dataset_batch)],
+                schema.clone(),
+            )),
+            "memory://test_merge_insert_full_schema_delete_by_source_with_fsl_and_scalar_index",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::Scalar, None, &scalar_params, false)
+            .await
+            .unwrap();
 
         let source_batch = RecordBatch::try_new(
             schema.clone(),
@@ -6443,6 +6652,194 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             999,
             "Value for id=2 should be updated to 999"
         );
+    }
+
+    /// Test case for Issue #4644: merge_insert should NOT skip source rows whose ON
+    /// columns contain NULL.
+    ///
+    /// With standard SQL equality NULL != NULL, so a source row with a NULL key will
+    /// never match any target row.  It must therefore be treated as "not matched" and
+    /// inserted when `when_not_matched = InsertAll`.  The previous implementation
+    /// incorrectly required all ON columns to be non-null before even considering the
+    /// row, causing it to be silently dropped (Action::Nothing).
+    #[tokio::test]
+    async fn test_merge_insert_null_on_column_inserts() {
+        // Initial dataset: one row with a NULL record_type.
+        let initial_data = record_batch!(
+            ("id", Int32, [0]),
+            ("record_type", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [10])
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
+            "memory://test_null_on_column",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // New data: a row with a different id AND a NULL record_type.
+        // Because id differs (2 vs 0) no match should be found even with NULL-safe
+        // semantics, so this row must be INSERTED.
+        let new_data = record_batch!(
+            ("id", Int32, [Some(2)]),
+            ("record_type", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(99)])
+        )
+        .unwrap();
+
+        let (merged_dataset, stats) = MergeInsertBuilder::try_new(
+            Arc::new(dataset),
+            vec!["id".to_string(), "record_type".to_string()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(new_data.clone())],
+            new_data.schema(),
+        )))
+        .await
+        .unwrap();
+
+        // The source row (id=2, record_type=NULL) must be inserted, NOT silently skipped.
+        assert_eq!(
+            stats.num_inserted_rows, 1,
+            "row with NULL ON column should be inserted"
+        );
+        assert_eq!(stats.num_updated_rows, 0, "no row should be updated");
+
+        let count = merged_dataset.count_rows(None).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "dataset should have the original row plus the newly inserted row"
+        );
+    }
+
+    /// Partial composite key match: the non-null part of the ON key (id) matches an
+    /// existing target row, but the second ON column (record_type) is NULL in the source.
+    /// Standard SQL equality treats NULL != NULL, so the composite key does NOT match
+    /// and the source row must be inserted, not updated and not silently dropped.
+    #[tokio::test]
+    async fn test_merge_insert_partial_composite_key_null() {
+        // Target: one row where id=1 and record_type="A".
+        let initial_data = record_batch!(
+            ("id", Int32, [Some(1)]),
+            ("record_type", Utf8, [Some("A")]),
+            ("value", Int32, [Some(10)])
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
+            "memory://test_partial_composite_null",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Source: one row where id=1 (matches target) but record_type=NULL.
+        // The composite key (1, NULL) does NOT match (1, "A") under standard equality,
+        // so this is a "not matched" row that should be inserted.
+        let new_data = record_batch!(
+            ("id", Int32, [Some(1)]),
+            ("record_type", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(99)])
+        )
+        .unwrap();
+
+        let (merged_dataset, stats) = MergeInsertBuilder::try_new(
+            Arc::new(dataset),
+            vec!["id".to_string(), "record_type".to_string()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(new_data.clone())],
+            new_data.schema(),
+        )))
+        .await
+        .unwrap();
+
+        // Source row (id=1, record_type=NULL) must be inserted, not updated and not dropped.
+        assert_eq!(
+            stats.num_inserted_rows, 1,
+            "row with partial NULL composite key should be inserted"
+        );
+        assert_eq!(
+            stats.num_updated_rows, 0,
+            "existing (id=1, record_type=A) row must not be updated"
+        );
+
+        // Dataset: original (1, "A") row + newly inserted (1, NULL) row = 2 rows.
+        let count = merged_dataset.count_rows(None).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "both the original and the new row must be present"
+        );
+    }
+
+    /// Variant of test_merge_insert_null_on_column_inserts with a single ON column
+    /// that is entirely NULL, and a target row that also has a NULL in that column.
+    /// Since standard SQL equality treats NULL != NULL, the source row must not match
+    /// the existing target row and must be inserted separately.
+    #[tokio::test]
+    async fn test_merge_insert_null_single_on_column() {
+        // Dataset with a single row where id is NULL.
+        let initial_data = record_batch!(
+            ("id", Int32, [Option::<i32>::None]),
+            ("value", Int32, [Some(1)])
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
+            "memory://test_null_single_on_column",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Source has two rows: one with id=NULL and one with id=5.
+        // id=NULL should not match the existing id=NULL row (standard equality), so it
+        // gets inserted.  id=5 is a brand-new key and also gets inserted.
+        let new_data = record_batch!(
+            ("id", Int32, [Option::<i32>::None, Some(5)]),
+            ("value", Int32, [Some(99), Some(50)])
+        )
+        .unwrap();
+
+        let (merged_dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(new_data.clone())],
+                    new_data.schema(),
+                )))
+                .await
+                .unwrap();
+
+        // Both source rows must be inserted (not silently dropped).
+        assert_eq!(
+            stats.num_inserted_rows, 2,
+            "both rows with NULL ON column should be inserted"
+        );
+        assert_eq!(stats.num_updated_rows, 0);
+
+        // Dataset now has: original NULL-id row + 2 newly inserted rows = 3 total.
+        let count = merged_dataset.count_rows(None).await.unwrap();
+        assert_eq!(count, 3);
     }
 
     /// Test case for Issue #3634: merge_insert should provide a helpful error

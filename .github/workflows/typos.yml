@@ -5,6 +5,9 @@ on:
       - main
       - release/**
 
+permissions:
+  contents: read
+
 jobs:
   run:
     name: Spell Check with Typos

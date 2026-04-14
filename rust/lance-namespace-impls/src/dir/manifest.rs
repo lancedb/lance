@@ -481,7 +481,7 @@ impl ManifestNamespace {
             base_url.set_path(&format!("{}/", base_url.path()));
         }
 
-        let full_url = base_url.join(relative_location).map_err(|e| {
+        let mut full_url = base_url.join(relative_location).map_err(|e| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: format!(
                     "Failed to join URI '{}' with '{}': {:?}",
@@ -489,6 +489,11 @@ impl ManifestNamespace {
                 ),
             })
         })?;
+
+        // Clear any query string to avoid trailing "?" in the URL.
+        // Use set_query(None) instead of set_query("") because the latter
+        // would still add a trailing '?' to the URL when serialized.
+        full_url.set_query(None);
 
         Ok(full_url.to_string())
     }
@@ -1684,6 +1689,46 @@ impl ManifestNamespace {
             }
         }
     }
+
+    /// Sorts names alphabetically and applies pagination using page_token (start_after) and limit.
+    ///
+    /// Returns the next page token (last item in this page) if more results exist beyond the limit,
+    /// or `None` if this is the last page.
+    fn apply_pagination(
+        names: &mut Vec<String>,
+        page_token: Option<String>,
+        limit: Option<i32>,
+    ) -> Option<String> {
+        names.sort();
+
+        if let Some(start_after) = page_token {
+            if let Some(index) = names
+                .iter()
+                .position(|name| name.as_str() > start_after.as_str())
+            {
+                names.drain(0..index);
+            } else {
+                names.clear();
+            }
+        }
+
+        if let Some(limit) = limit
+            && limit >= 0
+        {
+            let limit = limit as usize;
+            if names.len() > limit {
+                let next_page_token = if limit > 0 {
+                    Some(names[limit - 1].clone())
+                } else {
+                    None
+                };
+                names.truncate(limit);
+                return next_page_token;
+            }
+        }
+
+        None
+    }
 }
 
 #[async_trait]
@@ -1742,7 +1787,11 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
-        Ok(ListTablesResponse::new(tables))
+        let next_page_token =
+            Self::apply_pagination(&mut tables, request.page_token, request.limit);
+        let mut response = ListTablesResponse::new(tables);
+        response.page_token = next_page_token;
+        Ok(response)
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
@@ -2086,7 +2135,11 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
-        Ok(ListNamespacesResponse::new(namespaces))
+        let next_page_token =
+            Self::apply_pagination(&mut namespaces, request.page_token, request.limit);
+        let mut response = ListNamespacesResponse::new(namespaces);
+        response.page_token = next_page_token;
+        Ok(response)
     }
 
     async fn describe_namespace(
@@ -2681,6 +2734,37 @@ mod tests {
         request.id = Some(vec![]);
         let response = dir_namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_tables_pagination_limit_zero() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let buffer = create_test_ipc_data();
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["alpha".to_string()]);
+        dir_namespace
+            .create_table(create_request, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        let response = dir_namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                limit: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(response.tables.is_empty());
+        assert!(response.page_token.is_none());
     }
 
     #[rstest]
@@ -3472,6 +3556,25 @@ mod tests {
             trailing_slash_result, "s3://bucket/path/subdir/table.lance",
             "URL with existing trailing slash should still work"
         );
+
+        // Test that URLs with empty query string don't include trailing "?"
+        // This is important because URL::to_string() can add "?" for empty queries
+        let empty_query_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path?", "table.lance").unwrap();
+        assert_eq!(
+            empty_query_result, "s3://bucket/path/table.lance",
+            "URL with empty query string should not include trailing '?'"
+        );
+
+        // Test that URLs with actual query parameters have them stripped
+        // (query parameters are not meaningful for storage paths)
+        let query_param_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path?param=value", "table.lance")
+                .unwrap();
+        assert_eq!(
+            query_param_result, "s3://bucket/path/table.lance",
+            "URL with query parameters should have them stripped"
+        );
     }
 
     /// Test that concurrent create_table calls for the same table name don't
@@ -3551,5 +3654,60 @@ mod tests {
             "describe_table should not fail with duplicate entries: {:?}",
             describe_result
         );
+    }
+
+    // --- apply_pagination unit tests ---
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_apply_pagination_no_token_no_limit() {
+        let mut n = names(&["b", "a", "c"]);
+        let next = ManifestNamespace::apply_pagination(&mut n, None, None);
+        assert_eq!(n, names(&["a", "b", "c"]));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_apply_pagination_limit_truncates_and_returns_token() {
+        let mut n = names(&["c", "a", "b"]);
+        let next = ManifestNamespace::apply_pagination(&mut n, None, Some(2));
+        assert_eq!(n, names(&["a", "b"]));
+        assert_eq!(next, Some("b".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pagination_limit_zero_returns_empty_no_token() {
+        let mut n = names(&["a", "b", "c"]);
+        let next = ManifestNamespace::apply_pagination(&mut n, None, Some(0));
+        assert!(n.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_apply_pagination_page_token_in_list() {
+        // "b" is in the list; should start from "c" (strict >)
+        let mut n = names(&["a", "b", "c", "d"]);
+        let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), None);
+        assert_eq!(n, names(&["c", "d"]));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_apply_pagination_page_token_past_all_items() {
+        let mut n = names(&["a", "b", "c"]);
+        let next = ManifestNamespace::apply_pagination(&mut n, Some("z".to_string()), None);
+        assert!(n.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_apply_pagination_token_and_limit_combined() {
+        let mut n = names(&["a", "b", "c", "d", "e"]);
+        let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
+        assert_eq!(n, names(&["c", "d"]));
+        assert_eq!(next, Some("d".to_string()));
     }
 }

@@ -90,10 +90,8 @@ impl SimpleIndex {
         }
 
         let store = match (centroids.data_type(), distance_type) {
-            (DataType::Float16 | DataType::Float32, _) => {
-                let f32_centroids = cast(&centroids, &DataType::Float32)
-                    .map_err(|e| Error::index(e.to_string()))?;
-                let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
+            (DataType::Float16 | DataType::Float32 | DataType::Float64, _) => {
+                let fsl = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
                 SimpleStore::Float(FlatFloatStorage::new(fsl, distance_type))
             }
             (DataType::UInt8, DistanceType::Hamming) => {
@@ -113,11 +111,7 @@ impl SimpleIndex {
             dist_q_c: 0.0,
         };
         let res = match &self.store {
-            SimpleStore::Float(store) => {
-                let query =
-                    cast(&query, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?;
-                self.index.search_basic(query, 1, &params, None, store)?
-            }
+            SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
             SimpleStore::Binary(store) => {
                 let query = if query.data_type() == &DataType::UInt8 {
                     query

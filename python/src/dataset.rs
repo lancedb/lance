@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::str;
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
@@ -11,6 +12,7 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
 use arrow_array::{RecordBatch, RecordBatchReader, make_array};
+use arrow_cast::cast_with_options;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -46,9 +48,10 @@ use lance::dataset::{
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
-    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
-    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, WriteMode, WriteParams,
+    Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
+    MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
+    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -67,8 +70,9 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
 use lance_index::{
-    IndexParams, IndexType,
+    FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
+    progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         Query as VectorQuery, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams,
@@ -113,6 +117,7 @@ pub mod stats;
 
 const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
+const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -896,7 +901,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -908,6 +913,7 @@ impl Dataset {
         offset: Option<i64>,
         nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
+        batch_size_bytes: Option<u64>,
         io_buffer_size: Option<u64>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
@@ -1051,6 +1057,9 @@ impl Dataset {
 
         if let Some(batch_size) = batch_size {
             scanner.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
         }
         if let Some(io_buffer_size) = io_buffer_size {
             scanner.io_buffer_size(io_buffer_size);
@@ -2082,6 +2091,7 @@ impl Dataset {
         let replace = replace.unwrap_or(true);
         let train = train.unwrap_or(true); // Default to true for backward compatibility
 
+        let mut progress_handler = Self::make_index_progress_handler_from_kwargs(kwargs)?;
         let mut new_self = self.ds.as_ref().clone();
         let mut builder = new_self
             .create_index_builder(&columns, idx_type, params.as_ref())
@@ -2118,6 +2128,9 @@ impl Dataset {
         if let Some(index_uuid) = index_uuid {
             builder = builder.index_uuid(index_uuid);
         }
+        if let Some(progress_handler) = progress_handler.as_ref() {
+            builder = builder.progress(progress_handler.progress.clone());
+        }
 
         use std::future::IntoFuture;
 
@@ -2125,11 +2138,13 @@ impl Dataset {
         let index_metadata = if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
             // Note: We don't update self.ds here as the index is not committed
-            rt().block_on(None, builder.execute_uncommitted())?
+            Self::run_index_future(builder.execute_uncommitted(), progress_handler.as_mut())?
                 .infer_error()?
         } else {
             // For regular indexing, use the standard execute path
-            let index_metadata = rt().block_on(None, builder.into_future())?.infer_error()?;
+            let index_metadata =
+                Self::run_index_future(builder.into_future(), progress_handler.as_mut())?
+                    .infer_error()?;
             self.ds = Arc::new(new_self);
             index_metadata
         };
@@ -2189,23 +2204,51 @@ impl Dataset {
         Ok(())
     }
 
-    fn prewarm_index(&self, name: &str) -> PyResult<()> {
-        rt().block_on(None, self.ds.prewarm_index(name))?
-            .infer_error()
+    #[pyo3(signature = (name, *, with_position = false))]
+    fn prewarm_index(&self, name: &str, with_position: bool) -> PyResult<()> {
+        rt().block_on(None, async {
+            if with_position {
+                self.ds
+                    .prewarm_index_with_options(
+                        name,
+                        &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+                    )
+                    .await
+            } else {
+                self.ds.prewarm_index(name).await
+            }
+        })?
+        .infer_error()
     }
 
-    #[pyo3(signature = (index_uuid, index_type, batch_readhead=None))]
+    #[pyo3(signature = (index_uuid, index_type, batch_readhead=None, progress_callback=None))]
     fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: &str,
         batch_readhead: Option<usize>,
+        progress_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        rt().block_on(None, async {
-            self.ds
-                .merge_index_metadata(index_uuid, IndexType::try_from(index_type)?, batch_readhead)
-                .await
-        })?
+        let mut progress_handler =
+            Self::make_index_progress_handler_from_callback(progress_callback)?;
+        let progress: Arc<dyn IndexBuildProgress> = progress_handler
+            .as_ref()
+            .map(|handler| handler.progress.clone() as Arc<dyn IndexBuildProgress>)
+            .unwrap_or_else(|| Arc::new(NoopIndexBuildProgress));
+
+        Self::run_index_future(
+            async {
+                self.ds
+                    .merge_index_metadata(
+                        index_uuid,
+                        IndexType::try_from(index_type)?,
+                        batch_readhead,
+                        progress,
+                    )
+                    .await
+            },
+            progress_handler.as_mut(),
+        )?
         .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
@@ -3043,6 +3086,190 @@ impl PyWriteDest {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IndexProgressEventType {
+    Start,
+    Progress,
+    Complete,
+}
+
+impl IndexProgressEventType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Progress => "progress",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexProgressEvent {
+    event: IndexProgressEventType,
+    stage: String,
+    completed: Option<u64>,
+    total: Option<u64>,
+    unit: String,
+}
+
+#[derive(Debug, Default)]
+struct ActiveIndexProgressStage {
+    stage: Option<String>,
+    completed: Option<u64>,
+    total: Option<u64>,
+    unit: String,
+}
+
+#[derive(Debug)]
+struct PyIndexBuildProgress {
+    sender: SyncSender<IndexProgressEvent>,
+    active_stage: Mutex<ActiveIndexProgressStage>,
+}
+
+impl PyIndexBuildProgress {
+    fn new(sender: SyncSender<IndexProgressEvent>) -> Self {
+        Self {
+            sender,
+            active_stage: Mutex::new(ActiveIndexProgressStage::default()),
+        }
+    }
+
+    /// Send a lifecycle event (start/complete) with blocking semantics.
+    ///
+    /// These events are rare relative to the channel capacity
+    /// (`INDEX_PROGRESS_QUEUE_SIZE`), so blocking here will not stall
+    /// the tokio runtime in practice.  Progress events use the
+    /// non-blocking `try_send_progress_event` instead.
+    fn send_event(&self, event: IndexProgressEvent) -> lance::Result<()> {
+        self.sender.send(event).map_err(|_| {
+            Error::invalid_input("Index progress callback receiver disconnected".to_string())
+        })
+    }
+
+    fn try_send_progress_event(&self, event: IndexProgressEvent) -> lance::Result<()> {
+        match self.sender.try_send(event) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err(Error::invalid_input(
+                "Index progress callback receiver disconnected".to_string(),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl IndexBuildProgress for PyIndexBuildProgress {
+    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
+        {
+            let mut active_stage = self.active_stage.lock().unwrap();
+            *active_stage = ActiveIndexProgressStage {
+                stage: Some(stage.to_string()),
+                completed: Some(0),
+                total,
+                unit: unit.to_string(),
+            };
+        }
+
+        self.send_event(IndexProgressEvent {
+            event: IndexProgressEventType::Start,
+            stage: stage.to_string(),
+            completed: Some(0),
+            total,
+            unit: unit.to_string(),
+        })
+    }
+
+    async fn stage_progress(&self, stage: &str, completed: u64) -> lance::Result<()> {
+        let event = {
+            let mut active_stage = self.active_stage.lock().unwrap();
+            if active_stage.stage.is_none() {
+                active_stage.stage = Some(stage.to_string());
+            }
+            active_stage.completed = Some(completed);
+            IndexProgressEvent {
+                event: IndexProgressEventType::Progress,
+                stage: stage.to_string(),
+                completed: Some(completed),
+                total: active_stage.total,
+                unit: active_stage.unit.clone(),
+            }
+        };
+
+        self.try_send_progress_event(event)
+    }
+
+    async fn stage_complete(&self, stage: &str) -> lance::Result<()> {
+        let event = {
+            let mut active_stage = self.active_stage.lock().unwrap();
+            let completed = active_stage.completed.or(active_stage.total);
+            let total = active_stage.total;
+            let unit = active_stage.unit.clone();
+            *active_stage = ActiveIndexProgressStage::default();
+            IndexProgressEvent {
+                event: IndexProgressEventType::Complete,
+                stage: stage.to_string(),
+                completed,
+                total,
+                unit,
+            }
+        };
+
+        self.send_event(event)
+    }
+}
+
+struct IndexProgressDispatcher {
+    callback: Py<PyAny>,
+    index_progress_cls: Py<PyAny>,
+    receiver: Receiver<IndexProgressEvent>,
+}
+
+impl IndexProgressDispatcher {
+    fn new(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        receiver: Receiver<IndexProgressEvent>,
+    ) -> PyResult<Self> {
+        let index_progress_cls = py
+            .import("lance.progress")?
+            .getattr("IndexProgress")?
+            .unbind();
+        Ok(Self {
+            callback,
+            index_progress_cls,
+            receiver,
+        })
+    }
+
+    fn drain(&mut self) -> PyResult<()> {
+        while let Ok(event) = self.receiver.try_recv() {
+            self.dispatch(event)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch(&self, event: IndexProgressEvent) -> PyResult<()> {
+        Python::attach(|py| {
+            let progress = self.index_progress_cls.call1(
+                py,
+                (
+                    event.event.as_str(),
+                    event.stage,
+                    event.completed,
+                    event.total,
+                    event.unit,
+                ),
+            )?;
+            self.callback.call1(py, (progress,))?;
+            Ok(())
+        })
+    }
+}
+
+struct IndexProgressHandler {
+    progress: Arc<PyIndexBuildProgress>,
+    dispatcher: IndexProgressDispatcher,
+}
+
 impl Dataset {
     fn transform_ref(&self, reference: Option<Bound<PyAny>>) -> PyResult<Ref> {
         if let Some(reference) = reference {
@@ -3134,6 +3361,62 @@ impl Dataset {
                 }
             });
         }))
+    }
+
+    fn make_index_progress_handler(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+    ) -> PyResult<IndexProgressHandler> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyValueError::new_err("Progress callback must be callable"));
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(INDEX_PROGRESS_QUEUE_SIZE);
+        let progress = Arc::new(PyIndexBuildProgress::new(sender));
+        let dispatcher = IndexProgressDispatcher::new(py, callback, receiver)?;
+        Ok(IndexProgressHandler {
+            progress,
+            dispatcher,
+        })
+    }
+
+    fn make_index_progress_handler_from_kwargs(
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Option<IndexProgressHandler>> {
+        let Some(kwargs) = kwargs else {
+            return Ok(None);
+        };
+
+        let Some(callback) = get_dict_opt::<Py<PyAny>>(kwargs, "progress_callback")? else {
+            return Ok(None);
+        };
+
+        Self::make_index_progress_handler(kwargs.py(), callback).map(Some)
+    }
+
+    fn make_index_progress_handler_from_callback(
+        callback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<IndexProgressHandler>> {
+        let Some(callback) = callback else {
+            return Ok(None);
+        };
+
+        Self::make_index_progress_handler(callback.py(), callback.clone().unbind()).map(Some)
+    }
+
+    fn run_index_future<F>(
+        future: F,
+        progress_handler: Option<&mut IndexProgressHandler>,
+    ) -> PyResult<F::Output>
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if let Some(progress_handler) = progress_handler {
+            rt().block_on_pumping(None, future, || progress_handler.dispatcher.drain())
+        } else {
+            rt().block_on(None, future)
+        }
     }
 }
 
@@ -3336,6 +3619,11 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         {
             p = p.with_allow_external_blob_outside_bases(allow_external);
         }
+        if let Some(external_blob_mode) = get_dict_opt::<String>(options, "external_blob_mode")? {
+            p = p.with_external_blob_mode(
+                ExternalBlobMode::try_from(external_blob_mode.as_str()).infer_error()?,
+            );
+        }
 
         // Handle properties
         if let Some(props) =
@@ -3430,14 +3718,13 @@ fn prepare_vector_index_params(
             // as the vectors that will be indexed.
             let mut centroids: Arc<dyn Array> = batch.column(0).clone();
             if centroids.data_type() != column_type {
-                centroids = lance_arrow::cast::cast_with_options(
-                    centroids.as_ref(),
-                    column_type,
-                    &Default::default(),
-                )
-                .map_err(|e| {
-                    PyValueError::new_err(format!("Failed to cast centroids to column type: {}", e))
-                })?;
+                centroids = cast_with_options(centroids.as_ref(), column_type, &Default::default())
+                    .map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Failed to cast centroids to column type: {}",
+                            e
+                        ))
+                    })?;
             }
             let centroids = as_fixed_size_list_array(centroids.as_ref());
 

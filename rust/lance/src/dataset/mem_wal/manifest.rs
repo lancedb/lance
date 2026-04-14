@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Region manifest storage with bit-reversed versioned naming.
+//! Shard manifest storage with bit-reversed versioned naming.
 //!
-//! Region manifests are stored as versioned protobuf files using bit-reversed
+//! Shard manifests are stored as versioned protobuf files using bit-reversed
 //! naming scheme to distribute files across object store keyspace.
 //!
 //! ## File Layout
 //!
 //! ```text
-//! _mem_wal/{region_id}/manifest/
+//! _mem_wal/{shard_id}/manifest/
 //!   ├── {bit_reversed_version}.binpb  # Versioned manifest files
 //!   └── version_hint.json             # Best-effort version hint
 //! ```
@@ -33,7 +33,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::RegionManifest;
+use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
@@ -44,7 +44,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::util::{manifest_filename, parse_bit_reversed_filename, region_manifest_path};
+use super::util::{manifest_filename, parse_bit_reversed_filename, shard_manifest_path};
 
 /// Version hint file structure.
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,37 +52,37 @@ struct VersionHint {
     version: u64,
 }
 
-/// Store for reading and writing region manifests.
+/// Store for reading and writing shard manifests.
 ///
 /// Handles versioned manifest files with bit-reversed naming scheme
 /// and PUT-IF-NOT-EXISTS atomicity.
 #[derive(Debug)]
-pub struct RegionManifestStore {
+pub struct ShardManifestStore {
     object_store: Arc<ObjectStore>,
-    region_id: Uuid,
+    shard_id: Uuid,
     manifest_dir: Path,
     manifest_scan_batch_size: usize,
 }
 
-impl RegionManifestStore {
-    /// Create a new manifest store for the given region.
+impl ShardManifestStore {
+    /// Create a new manifest store for the given shard.
     ///
     /// # Arguments
     ///
     /// * `object_store` - Object store for reading/writing manifests
     /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
-    /// * `region_id` - Region UUID
+    /// * `shard_id` - Shard UUID
     /// * `manifest_scan_batch_size` - Batch size for parallel HEAD requests when scanning versions
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: &Path,
-        region_id: Uuid,
+        shard_id: Uuid,
         manifest_scan_batch_size: usize,
     ) -> Self {
-        let manifest_dir = region_manifest_path(base_path, &region_id);
+        let manifest_dir = shard_manifest_path(base_path, &shard_id);
         Self {
             object_store,
-            region_id,
+            shard_id,
             manifest_dir,
             manifest_scan_batch_size,
         }
@@ -90,8 +90,8 @@ impl RegionManifestStore {
 
     /// Read the latest manifest version.
     ///
-    /// Returns `None` if no manifest exists (new region).
-    pub async fn read_latest(&self) -> Result<Option<RegionManifest>> {
+    /// Returns `None` if no manifest exists (new shard).
+    pub async fn read_latest(&self) -> Result<Option<ShardManifest>> {
         let version = self.find_latest_version().await?;
         if version == 0 {
             return Ok(None);
@@ -101,14 +101,14 @@ impl RegionManifestStore {
     }
 
     /// Read a specific manifest version.
-    pub async fn read_version(&self, version: u64) -> Result<RegionManifest> {
+    pub async fn read_version(&self, version: u64) -> Result<ShardManifest> {
         let filename = manifest_filename(version);
         let path = self.manifest_dir.child(filename.as_str());
 
         let data = self.object_store.inner.get(&path).await.map_err(|e| {
             Error::io(format!(
-                "Failed to read manifest version {} for region {}: {}",
-                version, self.region_id, e
+                "Failed to read manifest version {} for shard {}: {}",
+                version, self.shard_id, e
             ))
         })?;
 
@@ -117,10 +117,10 @@ impl RegionManifestStore {
             .await
             .map_err(|e| Error::io(format!("Failed to read manifest bytes: {}", e)))?;
 
-        let pb_manifest = pb::RegionManifest::decode(bytes)
+        let pb_manifest = pb::ShardManifest::decode(bytes)
             .map_err(|e| Error::io(format!("Failed to decode manifest protobuf: {}", e)))?;
 
-        RegionManifest::try_from(pb_manifest)
+        ShardManifest::try_from(pb_manifest)
     }
 
     /// Write a new manifest version atomically.
@@ -134,12 +134,12 @@ impl RegionManifestStore {
     /// # Errors
     ///
     /// Returns `Error::AlreadyExists` if another writer already wrote this version.
-    pub async fn write(&self, manifest: &RegionManifest) -> Result<u64> {
+    pub async fn write(&self, manifest: &ShardManifest) -> Result<u64> {
         let version = manifest.version;
         let filename = manifest_filename(version);
         let path = self.manifest_dir.child(filename.as_str());
 
-        let pb_manifest = pb::RegionManifest::from(manifest);
+        let pb_manifest = pb::ShardManifest::from(manifest);
         let bytes = pb_manifest.encode_to_vec();
 
         if self.object_store.is_local() {
@@ -166,16 +166,16 @@ impl RegionManifestStore {
                     // Clean up temp file
                     let _ = self.object_store.delete(&temp_path).await;
                     return Err(Error::io(format!(
-                        "Manifest version {} already exists for region {}",
-                        version, self.region_id
+                        "Manifest version {} already exists for shard {}",
+                        version, self.shard_id
                     )));
                 }
                 Err(e) => {
                     // Clean up temp file
                     let _ = self.object_store.delete(&temp_path).await;
                     return Err(Error::io(format!(
-                        "Failed to write manifest version {} for region {}: {}",
-                        version, self.region_id, e
+                        "Failed to write manifest version {} for shard {}: {}",
+                        version, self.shard_id, e
                     )));
                 }
             }
@@ -193,13 +193,13 @@ impl RegionManifestStore {
                 .map_err(|e| {
                     if matches!(e, object_store::Error::AlreadyExists { .. }) {
                         Error::io(format!(
-                            "Manifest version {} already exists for region {}",
-                            version, self.region_id
+                            "Manifest version {} already exists for shard {}",
+                            version, self.shard_id
                         ))
                     } else {
                         Error::io(format!(
-                            "Failed to write manifest version {} for region {}: {}",
-                            version, self.region_id, e
+                            "Failed to write manifest version {} for shard {}: {}",
+                            version, self.shard_id, e
                         ))
                     }
                 })?;
@@ -299,8 +299,8 @@ impl RegionManifestStore {
                     .await
                 {
                     warn!(
-                        "Failed to write version hint for region {}: {}",
-                        self.region_id, e
+                        "Failed to write version hint for shard {}: {}",
+                        self.shard_id, e
                     );
                 }
             }
@@ -341,35 +341,35 @@ impl RegionManifestStore {
         Ok(versions)
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> Uuid {
-        self.region_id
+    /// Get the shard ID.
+    pub fn shard_id(&self) -> Uuid {
+        self.shard_id
     }
 
     // ========================================================================
     // Epoch-based Writer Fencing
     // ========================================================================
 
-    /// Claim a region by incrementing its writer epoch.
+    /// Claim a shard by incrementing its writer epoch.
     ///
     /// This establishes single-writer semantics by:
     /// 1. Loading the current manifest (or creating initial state)
     /// 2. Incrementing the writer epoch
     /// 3. Atomically writing the new manifest
     ///
-    /// If another writer has already claimed the region (version conflict),
+    /// If another writer has already claimed the shard (version conflict),
     /// this fails immediately rather than retrying. This prevents "epoch wars"
     /// where multiple writers keep fencing each other.
     ///
     /// # Returns
     ///
-    /// A tuple of `(epoch, RegionManifest)` where the manifest is the
+    /// A tuple of `(epoch, ShardManifest)` where the manifest is the
     /// claimed state (may be freshly created or loaded and epoch-bumped).
     ///
     /// # Errors
     ///
-    /// Returns an error if another writer already claimed the region.
-    pub async fn claim_epoch(&self, region_spec_id: u32) -> Result<(u64, RegionManifest)> {
+    /// Returns an error if another writer already claimed the shard.
+    pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
         let current = self.read_latest().await?;
 
         let (next_version, next_epoch, base_manifest) = match current {
@@ -378,16 +378,16 @@ impl RegionManifestStore {
         };
 
         let new_manifest = if let Some(base) = base_manifest {
-            RegionManifest {
+            ShardManifest {
                 version: next_version,
                 writer_epoch: next_epoch,
                 ..base
             }
         } else {
-            RegionManifest {
-                region_id: self.region_id,
+            ShardManifest {
+                shard_id: self.shard_id,
                 version: next_version,
-                region_spec_id,
+                shard_spec_id,
                 writer_epoch: next_epoch,
                 replay_after_wal_entry_position: 0,
                 wal_entry_position_last_seen: 0,
@@ -398,14 +398,14 @@ impl RegionManifestStore {
 
         self.write(&new_manifest).await.map_err(|e| {
             Error::io(format!(
-                "Failed to claim region {} (version {}): another writer may have claimed it: {}",
-                self.region_id, next_version, e
+                "Failed to claim shard {} (version {}): another writer may have claimed it: {}",
+                self.shard_id, next_version, e
             ))
         })?;
 
         info!(
-            "Claimed region {} with epoch {} (version {})",
-            self.region_id, next_epoch, next_version
+            "Claimed shard {} with epoch {} (version {})",
+            self.shard_id, next_epoch, next_version
         );
 
         Ok((next_epoch, new_manifest))
@@ -417,19 +417,19 @@ impl RegionManifestStore {
     /// is higher than the local epoch, the writer has been fenced.
     pub async fn check_fenced(&self, local_epoch: u64) -> Result<()> {
         let current = self.read_latest().await?;
-        Self::check_fenced_against(&current, local_epoch, self.region_id)
+        Self::check_fenced_against(&current, local_epoch, self.shard_id)
     }
 
     /// Check fencing against a pre-read manifest (avoids redundant read).
     fn check_fenced_against(
-        manifest: &Option<RegionManifest>,
+        manifest: &Option<ShardManifest>,
         local_epoch: u64,
-        region_id: Uuid,
+        shard_id: Uuid,
     ) -> Result<()> {
         match manifest {
             Some(m) if m.writer_epoch > local_epoch => Err(Error::io(format!(
-                "Writer fenced: local epoch {} < stored epoch {} for region {}",
-                local_epoch, m.writer_epoch, region_id
+                "Writer fenced: local epoch {} < stored epoch {} for shard {}",
+                local_epoch, m.writer_epoch, shard_id
             ))),
             _ => Ok(()),
         }
@@ -452,9 +452,9 @@ impl RegionManifestStore {
     /// # Returns
     ///
     /// The successfully written manifest.
-    pub async fn commit_update<F>(&self, local_epoch: u64, prepare_fn: F) -> Result<RegionManifest>
+    pub async fn commit_update<F>(&self, local_epoch: u64, prepare_fn: F) -> Result<ShardManifest>
     where
-        F: Fn(&RegionManifest) -> RegionManifest,
+        F: Fn(&ShardManifest) -> ShardManifest,
     {
         const MAX_RETRIES: usize = 10;
 
@@ -463,10 +463,10 @@ impl RegionManifestStore {
             let current = self
                 .read_latest()
                 .await?
-                .ok_or_else(|| Error::io("Region manifest not found"))?;
+                .ok_or_else(|| Error::io("Shard manifest not found"))?;
 
             // Step 2: Check fencing
-            Self::check_fenced_against(&Some(current.clone()), local_epoch, self.region_id)?;
+            Self::check_fenced_against(&Some(current.clone()), local_epoch, self.shard_id)?;
 
             // Step 3: Prepare new manifest
             let new_manifest = prepare_fn(&current);
@@ -498,8 +498,8 @@ impl RegionManifestStore {
         }
 
         Err(Error::io(format!(
-            "Failed to update manifest for region {} after {} attempts",
-            self.region_id, MAX_RETRIES
+            "Failed to update manifest for shard {} after {} attempts",
+            self.shard_id, MAX_RETRIES
         )))
     }
 }
@@ -516,11 +516,11 @@ mod tests {
         (store, path, temp_dir)
     }
 
-    fn create_test_manifest(region_id: Uuid, version: u64, epoch: u64) -> RegionManifest {
-        RegionManifest {
-            region_id,
+    fn create_test_manifest(shard_id: Uuid, version: u64, epoch: u64) -> ShardManifest {
+        ShardManifest {
+            shard_id,
             version,
-            region_spec_id: 0,
+            shard_spec_id: 0,
             writer_epoch: epoch,
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
@@ -532,8 +532,8 @@ mod tests {
     #[tokio::test]
     async fn test_read_latest_empty() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = RegionManifestStore::new(store, &base_path, region_id, 2);
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
 
         let result = manifest_store.read_latest().await.unwrap();
         assert!(result.is_none());
@@ -542,27 +542,27 @@ mod tests {
     #[tokio::test]
     async fn test_write_and_read_manifest() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = RegionManifestStore::new(store, &base_path, region_id, 2);
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
 
-        let manifest = create_test_manifest(region_id, 1, 1);
+        let manifest = create_test_manifest(shard_id, 1, 1);
         manifest_store.write(&manifest).await.unwrap();
 
         let loaded = manifest_store.read_latest().await.unwrap().unwrap();
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.writer_epoch, 1);
-        assert_eq!(loaded.region_id, region_id);
+        assert_eq!(loaded.shard_id, shard_id);
     }
 
     #[tokio::test]
     async fn test_multiple_versions() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = RegionManifestStore::new(store, &base_path, region_id, 2);
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
 
         // Write multiple versions
         for version in 1..=5 {
-            let manifest = create_test_manifest(region_id, version, version);
+            let manifest = create_test_manifest(shard_id, version, version);
             manifest_store.write(&manifest).await.unwrap();
         }
 
@@ -579,11 +579,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_specific_version() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = RegionManifestStore::new(store, &base_path, region_id, 2);
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
 
         for version in 1..=3 {
-            let manifest = create_test_manifest(region_id, version, version * 10);
+            let manifest = create_test_manifest(shard_id, version, version * 10);
             manifest_store.write(&manifest).await.unwrap();
         }
 
@@ -595,14 +595,14 @@ mod tests {
     #[tokio::test]
     async fn test_put_if_not_exists() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let manifest_store = RegionManifestStore::new(store, &base_path, region_id, 2);
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
 
-        let manifest1 = create_test_manifest(region_id, 1, 1);
+        let manifest1 = create_test_manifest(shard_id, 1, 1);
         manifest_store.write(&manifest1).await.unwrap();
 
         // Second write to same version should fail
-        let manifest2 = create_test_manifest(region_id, 1, 2);
+        let manifest2 = create_test_manifest(shard_id, 1, 2);
         let result = manifest_store.write(&manifest2).await;
         assert!(result.is_err());
     }

@@ -1515,16 +1515,23 @@ pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, METADATA_FILE)
 }
 
+const PARTITION_FILE_SUFFIXES: [&str; 3] = [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE];
+// Each remapped file is renamed twice: first to a temp path (phase 1), then to
+// its final path (phase 2). Keep in sync with the two rename loops below in
+// `merge_metadata_files`.
+const PARTITION_FILE_RENAME_PHASES: u64 = 2;
+
 pub async fn merge_index_files(
     object_store: &ObjectStore,
     index_dir: &Path,
     store: Arc<dyn IndexStore>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     // List all partition metadata files in the index directory
     let part_metadata_files = list_metadata_files(object_store, index_dir).await?;
 
     // Call merge_metadata_files function for inverted index
-    merge_metadata_files(store, &part_metadata_files).await
+    merge_metadata_files(store, &part_metadata_files, progress).await
 }
 
 /// List and filter metadata files from the index directory
@@ -1564,6 +1571,7 @@ async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Re
 async fn merge_metadata_files(
     store: Arc<dyn IndexStore>,
     part_metadata_files: &[String],
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
     // Collect all partition IDs and params
     let mut all_partitions = Vec::new();
@@ -1571,10 +1579,16 @@ async fn merge_metadata_files(
     let mut token_set_format = None;
     let mut format_version = None;
     let mut posting_tail_codec = None;
-
     let mut deleted_fragments = RoaringBitmap::new();
+    progress
+        .stage_start(
+            "read_partition_metadata",
+            Some(part_metadata_files.len() as u64),
+            "files",
+        )
+        .await?;
 
-    for file_name in part_metadata_files {
+    for (idx, file_name) in part_metadata_files.iter().enumerate() {
         let reader = store.open_index_file(file_name).await?;
         let metadata = &reader.schema().metadata;
 
@@ -1623,7 +1637,11 @@ async fn merge_metadata_files(
                 RoaringBitmap::deserialize_from(deleted_fragments_arr.value(0))?;
             deleted_fragments.extend(part_deleted_fragments);
         }
+        progress
+            .stage_progress("read_partition_metadata", idx as u64 + 1)
+            .await?;
     }
+    progress.stage_complete("read_partition_metadata").await?;
 
     // Create ID mapping: sorted original IDs -> 0,1,2...
     let mut sorted_ids = all_partitions.clone();
@@ -1642,12 +1660,24 @@ async fn merge_metadata_files(
         .unwrap()
         .as_secs();
 
+    let changed_partition_count = id_mapping
+        .iter()
+        .filter(|(old_id, new_id)| old_id != new_id)
+        .count() as u64;
+    let total_renames = changed_partition_count
+        * PARTITION_FILE_SUFFIXES.len() as u64
+        * PARTITION_FILE_RENAME_PHASES;
+    progress
+        .stage_start("remap_partition_files", Some(total_renames), "files")
+        .await?;
+
     // Phase 1: Move files to temporary locations
     let mut temp_files: Vec<(String, String, String)> = Vec::new(); // (temp_path, old_path, final_path)
+    let mut renamed_files = 0u64;
 
     for (&old_id, &new_id) in &id_mapping {
         if old_id != new_id {
-            for suffix in [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE] {
+            for suffix in PARTITION_FILE_SUFFIXES {
                 let old_path = format!("part_{}_{}", old_id, suffix);
                 let new_path = format!("part_{}_{}", new_id, suffix);
                 let temp_path = format!("temp_{}_{}", timestamp, old_path);
@@ -1664,6 +1694,10 @@ async fn merge_metadata_files(
                     )));
                 }
                 temp_files.push((temp_path, old_path, new_path));
+                renamed_files += 1;
+                progress
+                    .stage_progress("remap_partition_files", renamed_files)
+                    .await?;
             }
         }
     }
@@ -1689,7 +1723,12 @@ async fn merge_metadata_files(
             )));
         }
         completed_renames.push((final_path.clone(), temp_path.clone()));
+        renamed_files += 1;
+        progress
+            .stage_progress("remap_partition_files", renamed_files)
+            .await?;
     }
+    progress.stage_complete("remap_partition_files").await?;
 
     // Write merged metadata with remapped IDs
     let remapped_partitions: Vec<u64> = (0..id_mapping.len() as u64).collect();
@@ -1705,9 +1744,14 @@ async fn merge_metadata_files(
     )
     .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
     .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
+    progress
+        .stage_start("write_merged_metadata", Some(1), "files")
+        .await?;
     builder
         .write_metadata(&*store, &remapped_partitions)
         .await?;
+    progress.stage_progress("write_merged_metadata", 1).await?;
+    progress.stage_complete("write_merged_metadata").await?;
 
     // Cleanup partition metadata files
     for file_name in part_metadata_files {
@@ -1774,7 +1818,6 @@ mod tests {
     use std::any::Any;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::Mutex;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -2144,38 +2187,7 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Debug, Default)]
-    struct RecordingProgress {
-        events: Mutex<Vec<(String, String, u64)>>,
-    }
-
-    #[async_trait]
-    impl IndexBuildProgress for RecordingProgress {
-        async fn stage_start(&self, stage: &str, total: Option<u64>, _unit: &str) -> Result<()> {
-            self.events.lock().await.push((
-                "start".to_string(),
-                stage.to_string(),
-                total.unwrap_or(0),
-            ));
-            Ok(())
-        }
-
-        async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
-            self.events
-                .lock()
-                .await
-                .push(("progress".to_string(), stage.to_string(), completed));
-            Ok(())
-        }
-
-        async fn stage_complete(&self, stage: &str) -> Result<()> {
-            self.events
-                .lock()
-                .await
-                .push(("complete".to_string(), stage.to_string(), 0));
-            Ok(())
-        }
-    }
+    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     #[derive(Debug, Default)]
     struct FailingProgress;
@@ -2218,7 +2230,7 @@ mod tests {
             .with_progress(progress.clone());
         builder.update(stream, store.as_ref(), None).await?;
 
-        let events = progress.events.lock().await.clone();
+        let events = progress.recorded_events();
         let tags = events
             .iter()
             .map(|(kind, stage, _)| format!("{kind}:{stage}"))
@@ -2313,9 +2325,7 @@ mod tests {
         builder.update(stream, store.as_ref(), None).await?;
 
         let tags = progress
-            .events
-            .lock()
-            .await
+            .recorded_events()
             .iter()
             .map(|(kind, stage, _)| format!("{kind}:{stage}"))
             .collect::<Vec<_>>();
@@ -2328,6 +2338,100 @@ mod tests {
             !tags.iter().any(|e| e == "start:merge_partitions"),
             "default path should not run merge_partitions"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_reports_progress_stages() -> Result<()> {
+        let index_dir = TempDir::default();
+        let index_path = index_dir.obj_path();
+        let object_store = ObjectStore::local();
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.clone().into(),
+            index_path.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        for (fragment_id, row_id, doc) in [
+            (1_u64 << 32, 0_u64, "hello world"),
+            (2_u64 << 32, 1_u64, "goodbye world"),
+        ] {
+            let batch = make_doc_batch(doc, row_id);
+            let stream =
+                RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+            let stream = Box::pin(stream);
+            let mut builder = InvertedIndexBuilder::new_with_fragment_mask(
+                InvertedIndexParams::default(),
+                Some(fragment_id),
+            )
+            .with_progress(noop_progress());
+            builder.update(stream, store.as_ref(), None).await?;
+        }
+
+        let progress = Arc::new(RecordingProgress::default());
+        merge_index_files(&object_store, &index_path, store.clone(), progress.clone()).await?;
+
+        let events = progress.recorded_events();
+        let tags = events
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        let remap_progress = events
+            .iter()
+            .filter_map(|(kind, stage, completed)| {
+                if kind == "progress" && stage == "remap_partition_files" {
+                    Some(*completed)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let read_start = tags
+            .iter()
+            .position(|e| e == "start:read_partition_metadata")
+            .expect("missing read_partition_metadata start");
+        let read_complete = tags
+            .iter()
+            .position(|e| e == "complete:read_partition_metadata")
+            .expect("missing read_partition_metadata complete");
+        let remap_start = tags
+            .iter()
+            .position(|e| e == "start:remap_partition_files")
+            .expect("missing remap_partition_files start");
+        let remap_complete = tags
+            .iter()
+            .position(|e| e == "complete:remap_partition_files")
+            .expect("missing remap_partition_files complete");
+        let metadata_start = tags
+            .iter()
+            .position(|e| e == "start:write_merged_metadata")
+            .expect("missing write_merged_metadata start");
+        let metadata_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_merged_metadata")
+            .expect("missing write_merged_metadata complete");
+
+        assert!(read_start < read_complete);
+        assert!(read_complete < remap_start);
+        assert!(remap_start < remap_complete);
+        assert!(remap_complete < metadata_start);
+        assert!(metadata_start < metadata_complete);
+
+        assert!(
+            tags.iter().any(|e| e == "progress:read_partition_metadata"),
+            "expected progress callback for read_partition_metadata"
+        );
+        assert_eq!(
+            remap_progress.last().copied().unwrap_or_default(),
+            12,
+            "expected remap_partition_files progress to cover both rename phases"
+        );
+        assert!(
+            tags.iter().any(|e| e == "progress:write_merged_metadata"),
+            "expected progress callback for write_merged_metadata"
+        );
+
         Ok(())
     }
 

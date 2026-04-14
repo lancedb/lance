@@ -11,7 +11,6 @@ use lance::session::Session as LanceSession;
 use lance_io::object_store::ObjectStoreRegistry;
 
 use crate::error::{Error, Result};
-use crate::ok_or_throw_with_return;
 
 /// Creates a new Session and returns a handle to it.
 ///

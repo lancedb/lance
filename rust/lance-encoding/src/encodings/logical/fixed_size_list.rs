@@ -247,7 +247,11 @@ impl StructuralFixedSizeListDecodeTask {
 
 impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        let DecodedArray { array, mut repdef } = self.child_task.decode()?;
+        let DecodedArray {
+            array,
+            mut repdef,
+            data_size,
+        } = self.child_task.decode()?;
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
                 let num_rows = self.num_rows as usize;
@@ -261,6 +265,7 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
                 Ok(DecodedArray {
                     array: Arc::new(fsl_array),
                     repdef,
+                    data_size,
                 })
             }
             _ => Err(Error::internal(

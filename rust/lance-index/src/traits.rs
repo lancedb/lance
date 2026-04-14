@@ -52,6 +52,32 @@ impl<'a> IndexCriteria<'a> {
 #[deprecated(since = "0.39.0", note = "Use IndexCriteria instead")]
 pub type ScalarIndexCriteria<'a> = IndexCriteria<'a>;
 
+/// Options for prewarming an inverted index.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FtsPrewarmOptions {
+    /// If true, prewarm positions along with posting lists.
+    pub with_position: bool,
+}
+
+impl FtsPrewarmOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_position(mut self, with_position: bool) -> Self {
+        self.with_position = with_position;
+        self
+    }
+}
+
+/// Options for prewarming an index.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrewarmOptions {
+    Fts(FtsPrewarmOptions),
+}
+
 /// Additional information about an index
 ///
 /// Note that a single index might consist of multiple segments.  Each segment has its own

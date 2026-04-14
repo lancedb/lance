@@ -343,7 +343,7 @@ impl Quantization for FlatBinQuantizer {
     }
 
     fn quantization_type() -> QuantizationType {
-        QuantizationType::Flat
+        QuantizationType::FlatBin
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {

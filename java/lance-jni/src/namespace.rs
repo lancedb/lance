@@ -1860,6 +1860,23 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_declareTableN
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_renameTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.rename_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_insertIntoTableNative(
     mut env: JNIEnv,
     _obj: JObject,
@@ -2103,6 +2120,278 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_batchDeleteTa
         env,
         call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.batch_delete_table_versions(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableScalarIndexNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_scalar_index(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_dropTableIndexNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.drop_table_index(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listAllTablesNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_all_tables(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_restoreTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.restore_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_updateTableSchemaMetadataNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.update_table_schema_metadata(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_getTableStatsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.get_table_stats(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_explainTableQueryPlanNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_string_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.explain_table_query_plan(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_analyzeTableQueryPlanNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_string_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.analyze_table_query_plan(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTableAddColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_add_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTableAlterColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_alter_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTableDropColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_drop_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTableTagsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_table_tags(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_getTableTagVersionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.get_table_tag_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createTableTagNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_tag(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_deleteTableTagNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.delete_table_tag(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_updateTableTagNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.update_table_tag(req))
         }),
         std::ptr::null_mut()
     )
@@ -2737,6 +3026,288 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_batchDeleteTableVe
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableScalarIndexNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_scalar_index(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_dropTableIndexNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.drop_table_index(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_listAllTablesNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_all_tables(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_restoreTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.restore_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_updateTableSchemaMetadataNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.update_table_schema_metadata(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_getTableStatsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.get_table_stats(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_explainTableQueryPlanNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_string_method(
+            &mut env,
+            handle,
+            request_json,
+            |namespace_client, req| {
+                RT.block_on(namespace_client.inner.explain_table_query_plan(req))
+            }
+        ),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_analyzeTableQueryPlanNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_string_method(
+            &mut env,
+            handle,
+            request_json,
+            |namespace_client, req| {
+                RT.block_on(namespace_client.inner.analyze_table_query_plan(req))
+            }
+        ),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTableAddColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_add_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTableAlterColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_alter_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTableDropColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_drop_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_listTableTagsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.list_table_tags(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_getTableTagVersionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.get_table_tag_version(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createTableTagNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_table_tag(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_deleteTableTagNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.delete_table_tag(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_updateTableTagNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.update_table_tag(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_namespace_RestNamespace_retrieveOpsMetricsNative(
     mut env: JNIEnv,
     _obj: JObject,
@@ -2815,6 +3386,27 @@ where
     f(namespace, request).map_err(Error::from)?;
 
     Ok(())
+}
+
+/// Helper function for methods that return String directly (not JSON-serialized) (DirectoryNamespace)
+fn call_namespace_string_method<'local, Req, F>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    request_json: JString,
+    f: F,
+) -> Result<JString<'local>>
+where
+    Req: for<'de> Deserialize<'de>,
+    F: FnOnce(&BlockingDirectoryNamespace, Req) -> lance_core::Result<String>,
+{
+    let namespace = unsafe { &*(handle as *const BlockingDirectoryNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: Req = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    let response = f(namespace, request).map_err(Error::from)?;
+
+    env.new_string(response).map_err(Into::into)
 }
 
 /// Helper function for count methods (DirectoryNamespace)
@@ -2927,6 +3519,27 @@ where
     f(namespace, request).map_err(Error::from)?;
 
     Ok(())
+}
+
+/// Helper function for methods that return String directly (not JSON-serialized) (RestNamespace)
+fn call_rest_namespace_string_method<'local, Req, F>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    request_json: JString,
+    f: F,
+) -> Result<JString<'local>>
+where
+    Req: for<'de> Deserialize<'de>,
+    F: FnOnce(&BlockingRestNamespace, Req) -> lance_core::Result<String>,
+{
+    let namespace = unsafe { &*(handle as *const BlockingRestNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: Req = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    let response = f(namespace, request).map_err(Error::from)?;
+
+    env.new_string(response).map_err(Into::into)
 }
 
 /// Helper function for count methods (RestNamespace)

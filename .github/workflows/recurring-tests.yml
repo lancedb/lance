@@ -5,6 +5,9 @@ on:
     - cron: "0 0 * * 0" # Runs at 00:00 UTC every Sunday
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   get-pylance-versions:
     runs-on: ubuntu-latest

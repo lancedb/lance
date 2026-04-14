@@ -89,15 +89,16 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
-    namespace_obj: JObject,         // LanceNamespace (can be null)
-    table_id_obj: JObject,          // List<String> (can be null)
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    storage_options_obj: JObject,               // Map<String, String>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -115,6 +116,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             storage_options_obj,
             namespace_obj,
             table_id_obj,
+            allow_external_blob_outside_bases,
         ),
         JObject::default()
     )
@@ -126,15 +128,16 @@ fn inner_create_with_ffi_array<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
-    namespace_obj: JObject,         // LanceNamespace (can be null)
-    table_id_obj: JObject,          // List<String> (can be null)
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    storage_options_obj: JObject,               // Map<String, String>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -161,6 +164,7 @@ fn inner_create_with_ffi_array<'local>(
         storage_options_obj,
         namespace_obj,
         table_id_obj,
+        allow_external_blob_outside_bases,
         reader,
     )
 }
@@ -171,15 +175,16 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
-    namespace_obj: JObject,         // LanceNamespace (can be null)
-    table_id_obj: JObject,          // List<String> (can be null)
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    storage_options_obj: JObject,               // Map<String, String>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -196,6 +201,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             storage_options_obj,
             namespace_obj,
             table_id_obj,
+            allow_external_blob_outside_bases,
         ),
         JObject::null()
     )
@@ -206,15 +212,16 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
-    namespace_obj: JObject,         // LanceNamespace (can be null)
-    table_id_obj: JObject,          // List<String> (can be null)
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    storage_options_obj: JObject,               // Map<String, String>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -231,6 +238,7 @@ fn inner_create_with_ffi_stream<'local>(
         storage_options_obj,
         namespace_obj,
         table_id_obj,
+        allow_external_blob_outside_bases,
         reader,
     )
 }
@@ -239,15 +247,16 @@ fn inner_create_with_ffi_stream<'local>(
 fn create_fragment<'a>(
     env: &mut JNIEnv<'a>,
     dataset_uri: JString,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
-    namespace_obj: JObject,         // LanceNamespace (can be null)
-    table_id_obj: JObject,          // List<String> (can be null)
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    storage_options_obj: JObject,               // Map<String, String>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -264,6 +273,7 @@ fn create_fragment<'a>(
         &storage_options_obj,
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
+        &allow_external_blob_outside_bases,
     )?;
 
     // Set up storage options provider if namespace is provided
@@ -526,8 +536,8 @@ impl IntoJava for &FragmentUpdateResult {
 impl IntoJava for &DataFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let path = env.new_string(self.path.clone())?.into();
-        let fields = JLance(self.fields.clone()).into_java(env)?;
-        let column_indices = JLance(self.column_indices.clone()).into_java(env)?;
+        let fields = JLance(self.fields.to_vec()).into_java(env)?;
+        let column_indices = JLance(self.column_indices.to_vec()).into_java(env)?;
         let file_size_bytes = match self.file_size_bytes.get() {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
@@ -765,8 +775,8 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let base_id = get_base_id(env, self)?;
         Ok(DataFile {
             path,
-            fields,
-            column_indices,
+            fields: fields.into(),
+            column_indices: column_indices.into(),
             file_major_version,
             file_minor_version,
             file_size_bytes,

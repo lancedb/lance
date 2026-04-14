@@ -24,11 +24,15 @@ env:
   CARGO_INCREMENTAL: "0"
   RUSTFLAGS: "-C debuginfo=0"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     # Needs additional disk space for the full build.
     runs-on: ubuntu-24.04-8x
     permissions:
+      contents: read
       id-token: write
     timeout-minutes: 60
     env:

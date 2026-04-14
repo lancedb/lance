@@ -42,6 +42,7 @@ use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
+use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
@@ -118,6 +119,7 @@ struct ScopedFragmentRead {
     projection: Arc<Projection>,
     with_deleted_rows: bool,
     batch_size: u32,
+    file_reader_options: Option<FileReaderOptions>,
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
     filter: Option<Expr>,
@@ -127,13 +129,17 @@ struct ScopedFragmentRead {
 
 impl ScopedFragmentRead {
     fn frag_read_config(&self) -> FragReadConfig {
-        FragReadConfig::default()
+        let mut config = FragReadConfig::default()
             .with_row_id(self.with_deleted_rows || self.projection.with_row_id)
             .with_row_address(self.projection.with_row_addr)
             .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
-            .with_reader_priority(self.priority)
+            .with_reader_priority(self.priority);
+        if let Some(file_reader_options) = &self.file_reader_options {
+            config = config.with_file_reader_options(file_reader_options.clone());
+        }
+        config
     }
 }
 
@@ -669,6 +675,7 @@ impl FilteredReadStream {
                     projection: projection.clone(),
                     with_deleted_rows: options.with_deleted_rows,
                     batch_size: default_batch_size,
+                    file_reader_options: options.file_reader_options.clone(),
                     filter,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
@@ -1243,6 +1250,8 @@ pub struct FilteredReadOptions {
     pub with_deleted_rows: bool,
     /// The maximum number of rows per batch
     pub batch_size: Option<u32>,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
     /// Controls how many fragments to read ahead
     pub fragment_readahead: Option<usize>,
     /// The fragments to read
@@ -1281,6 +1290,7 @@ impl FilteredReadOptions {
             scan_range_after_filter: None,
             with_deleted_rows: false,
             batch_size: None,
+            file_reader_options: None,
             fragment_readahead: None,
             fragments: None,
             projection,
@@ -1366,6 +1376,12 @@ impl FilteredReadOptions {
     /// A CoalesceBatchesExec can (and often should) be used to merge together tiny batches
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Specify the file reader options to use when reading data files.
+    pub fn with_file_reader_options(mut self, file_reader_options: FileReaderOptions) -> Self {
+        self.file_reader_options = Some(file_reader_options);
         self
     }
 

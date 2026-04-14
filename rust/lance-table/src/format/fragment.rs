@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::num::NonZero;
+use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
 use lance_core::Error;
@@ -9,7 +11,7 @@ use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::format::pb;
 
@@ -22,12 +24,16 @@ use lance_core::error::Result;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
     /// The ids of fields in this file.
-    pub fields: Vec<i32>,
+    ///
+    /// When identical across many fragments (common case), multiple `DataFile`
+    /// instances share a single heap allocation via `Arc`, significantly
+    /// reducing manifest memory for large tables.
+    pub fields: Arc<[i32]>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
     ///
     /// Note that -1 is a possibility and it indices that the field has
@@ -37,13 +43,10 @@ pub struct DataFile {
     /// `column_indices`; such columns are ignored by field-id–based projection.
     /// For example, some fields, such as blob fields, occupy multiple
     /// columns in the file but only have a single field id.
-    #[serde(default)]
-    pub column_indices: Vec<i32>,
+    pub column_indices: Arc<[i32]>,
     /// The major version of the file format used to write this file.
-    #[serde(default)]
     pub file_major_version: u32,
     /// The minor version of the file format used to write this file.
-    #[serde(default)]
     pub file_minor_version: u32,
 
     /// The size of the file in bytes, if known.
@@ -51,6 +54,52 @@ pub struct DataFile {
 
     /// The base path of the datafile, when the datafile is outside the dataset.
     pub base_id: Option<u32>,
+}
+
+// Custom Serialize: convert Arc<[i32]> to slice for transparent JSON output
+impl Serialize for DataFile {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("DataFile", 7)?;
+        s.serialize_field("path", &self.path)?;
+        s.serialize_field("fields", self.fields.as_ref())?;
+        s.serialize_field("column_indices", self.column_indices.as_ref())?;
+        s.serialize_field("file_major_version", &self.file_major_version)?;
+        s.serialize_field("file_minor_version", &self.file_minor_version)?;
+        s.serialize_field("file_size_bytes", &self.file_size_bytes)?;
+        s.serialize_field("base_id", &self.base_id)?;
+        s.end()
+    }
+}
+
+// Custom Deserialize: read Vec<i32> and convert to Arc<[i32]>
+impl<'de> Deserialize<'de> for DataFile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct DataFileHelper {
+            path: String,
+            fields: Vec<i32>,
+            #[serde(default)]
+            column_indices: Vec<i32>,
+            #[serde(default)]
+            file_major_version: u32,
+            #[serde(default)]
+            file_minor_version: u32,
+            file_size_bytes: CachedFileSize,
+            base_id: Option<u32>,
+        }
+
+        let helper = DataFileHelper::deserialize(deserializer)?;
+        Ok(Self {
+            path: helper.path,
+            fields: Arc::from(helper.fields),
+            column_indices: Arc::from(helper.column_indices),
+            file_major_version: helper.file_major_version,
+            file_minor_version: helper.file_minor_version,
+            file_size_bytes: helper.file_size_bytes,
+            base_id: helper.base_id,
+        })
+    }
 }
 
 impl DataFile {
@@ -65,8 +114,8 @@ impl DataFile {
     ) -> Self {
         Self {
             path: path.into(),
-            fields,
-            column_indices,
+            fields: Arc::from(fields),
+            column_indices: Arc::from(column_indices),
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
@@ -82,8 +131,8 @@ impl DataFile {
     ) -> Self {
         Self {
             path: path.into(),
-            fields: vec![],
-            column_indices: vec![],
+            fields: Arc::from([]),
+            column_indices: Arc::from([]),
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
@@ -158,8 +207,8 @@ impl From<&DataFile> for pb::DataFile {
     fn from(df: &DataFile) -> Self {
         Self {
             path: df.path.clone(),
-            fields: df.fields.clone(),
-            column_indices: df.column_indices.clone(),
+            fields: df.fields.to_vec(),
+            column_indices: df.column_indices.to_vec(),
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
@@ -174,12 +223,163 @@ impl TryFrom<pb::DataFile> for DataFile {
     fn try_from(proto: pb::DataFile) -> Result<Self> {
         Ok(Self {
             path: proto.path,
-            fields: proto.fields,
-            column_indices: proto.column_indices,
+            fields: Arc::from(proto.fields),
+            column_indices: Arc::from(proto.column_indices),
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+        })
+    }
+}
+
+/// Interns repeated data so that fragments with identical content share a
+/// single heap allocation via `Arc`.
+///
+/// At 20M fragments the deduplication typically saves multiple GB of heap
+/// because every fragment in a homogeneous table carries the same field list,
+/// and post-compaction fragments share identical version metadata bytes.
+///
+/// Uses a `Vec`-based linear scan when the cache is small (<=16 entries)
+/// and upgrades to `HashMap` for larger caches. In the common homogeneous
+/// case (1-3 unique values), linear scan avoids per-fragment hashing overhead.
+#[derive(Default)]
+pub struct DataFileFieldInterner {
+    fields: InternCache<i32>,
+    column_indices: InternCache<i32>,
+    inline_bytes: InternCache<u8>,
+}
+
+/// A cache that uses linear scan for small sizes and HashMap for large.
+/// The threshold is chosen so that scan + compare is cheaper than hash for
+/// typical payload sizes (20-200 bytes).
+enum InternCache<T: Eq + std::hash::Hash + Clone> {
+    Small(Vec<Arc<[T]>>),
+    Large(HashMap<Arc<[T]>, ()>),
+}
+
+const INTERN_CACHE_UPGRADE_THRESHOLD: usize = 16;
+
+impl<T: Eq + std::hash::Hash + Clone> Default for InternCache<T> {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+impl<T: Eq + std::hash::Hash + Clone> InternCache<T> {
+    fn intern(&mut self, v: Vec<T>) -> Arc<[T]> {
+        match self {
+            Self::Small(entries) => {
+                for existing in entries.iter() {
+                    if existing.as_ref() == v.as_slice() {
+                        return existing.clone();
+                    }
+                }
+                let arc: Arc<[T]> = Arc::from(v);
+                entries.push(arc.clone());
+                if entries.len() > INTERN_CACHE_UPGRADE_THRESHOLD {
+                    let mut map = HashMap::with_capacity(entries.len());
+                    for e in entries.drain(..) {
+                        map.insert(e, ());
+                    }
+                    *self = Self::Large(map);
+                }
+                arc
+            }
+            Self::Large(map) => {
+                if let Some((existing, _)) = map.get_key_value(v.as_slice()) {
+                    existing.clone()
+                } else {
+                    let arc: Arc<[T]> = Arc::from(v);
+                    map.insert(arc.clone(), ());
+                    arc
+                }
+            }
+        }
+    }
+}
+
+impl DataFileFieldInterner {
+    /// Intern a `RowDatasetVersionMeta`, deduplicating inline byte payloads.
+    /// Accepts the protobuf oneof value directly to avoid an intermediate
+    /// `Arc<[u8]>` allocation that would need to be `.to_vec()`'d for the key lookup.
+    fn intern_last_updated_version_meta(
+        cache: &mut InternCache<u8>,
+        pb: pb::data_fragment::LastUpdatedAtVersionSequence,
+    ) -> Result<RowDatasetVersionMeta> {
+        match pb {
+            pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
+                Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
+            }
+            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
+                file,
+            ) => Ok(RowDatasetVersionMeta::External(ExternalFile {
+                path: file.path,
+                offset: file.offset,
+                size: file.size,
+            })),
+        }
+    }
+
+    /// Intern a `RowDatasetVersionMeta`, deduplicating inline byte payloads.
+    fn intern_created_version_meta(
+        cache: &mut InternCache<u8>,
+        pb: pb::data_fragment::CreatedAtVersionSequence,
+    ) -> Result<RowDatasetVersionMeta> {
+        match pb {
+            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
+                Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
+            }
+            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
+                Ok(RowDatasetVersionMeta::External(ExternalFile {
+                    path: file.path,
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
+    }
+
+    /// Convert a protobuf `DataFile`, interning `fields` and `column_indices`.
+    pub fn intern_data_file(&mut self, proto: pb::DataFile) -> Result<DataFile> {
+        Ok(DataFile {
+            path: proto.path,
+            fields: self.fields.intern(proto.fields),
+            column_indices: self.column_indices.intern(proto.column_indices),
+            file_major_version: proto.file_major_version,
+            file_minor_version: proto.file_minor_version,
+            file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
+            base_id: proto.base_id,
+        })
+    }
+
+    /// Convert a protobuf `DataFragment`, interning fields and version metadata.
+    pub fn intern_fragment(&mut self, p: pb::DataFragment) -> Result<Fragment> {
+        let physical_rows = if p.physical_rows > 0 {
+            Some(p.physical_rows as usize)
+        } else {
+            None
+        };
+        let last_updated_at_version_meta = p
+            .last_updated_at_version_sequence
+            .map(|pb| Self::intern_last_updated_version_meta(&mut self.inline_bytes, pb))
+            .transpose()?;
+        let created_at_version_meta = p
+            .created_at_version_sequence
+            .map(|pb| Self::intern_created_version_meta(&mut self.inline_bytes, pb))
+            .transpose()?;
+        Ok(Fragment {
+            id: p.id,
+            files: p
+                .files
+                .into_iter()
+                .map(|f| self.intern_data_file(f))
+                .collect::<Result<_>>()?,
+            deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
+            row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
+            physical_rows,
+            last_updated_at_version_meta,
+            created_at_version_meta,
         })
     }
 }
@@ -624,9 +824,9 @@ mod tests {
     fn data_file_validate_allows_extra_columns() {
         let data_file = DataFile {
             path: "foo.lance".to_string(),
-            fields: vec![1, 2],
+            fields: Arc::from([1, 2]),
             // One extra column without a field id mapping
-            column_indices: vec![0, 1, 2],
+            column_indices: Arc::from([0, 1, 2]),
             file_major_version: MAJOR_VERSION as u32,
             file_minor_version: MINOR_VERSION as u32,
             file_size_bytes: Default::default(),

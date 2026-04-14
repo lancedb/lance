@@ -17,6 +17,9 @@ on:
       - Cargo.lock
       - deny.toml
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -53,6 +56,7 @@ jobs:
 
   clippy:
     permissions:
+      contents: read
       checks: write
     runs-on: ubuntu-24.04
     steps:

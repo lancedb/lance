@@ -20,6 +20,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
+permissions:
+  contents: read
+
 jobs:
   rust-clippy-fmt:
     runs-on: ubuntu-24.04

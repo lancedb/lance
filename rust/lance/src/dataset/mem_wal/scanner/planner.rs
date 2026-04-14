@@ -387,7 +387,7 @@ impl LsmScanPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::mem_wal::scanner::data_source::RegionSnapshot;
+    use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
 
     fn create_test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -422,9 +422,9 @@ mod tests {
     }
 
     #[test]
-    fn test_region_snapshot() {
-        let region_id = uuid::Uuid::new_v4();
-        let snapshot = RegionSnapshot::new(region_id)
+    fn test_shard_snapshot() {
+        let shard_id = uuid::Uuid::new_v4();
+        let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(5)
             .with_flushed_generation(1, "gen_1".to_string())
             .with_flushed_generation(2, "gen_2".to_string());
@@ -452,7 +452,7 @@ mod integration_tests {
 
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
-    use crate::dataset::mem_wal::scanner::data_source::RegionSnapshot;
+    use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
@@ -513,7 +513,7 @@ mod integration_tests {
     /// - id=7: "active_7" (added in active)
     async fn setup_multi_level_lsm() -> (
         Arc<Dataset>,
-        Vec<RegionSnapshot>,
+        Vec<ShardSnapshot>,
         Option<(Uuid, ActiveMemTableRef)>,
         Vec<String>,
         String, // temp_dir path for cleanup
@@ -528,18 +528,18 @@ mod integration_tests {
         let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
 
         // Create flushed gen1 as a separate dataset
-        let region_id = Uuid::new_v4();
-        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, region_id);
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[3, 4], "gen1");
         create_dataset(&gen1_uri, vec![gen1_batch]).await;
 
         // Create flushed gen2 as a separate dataset
-        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, region_id);
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
         let gen2_batch = create_test_batch(&schema, &[4, 5, 6], "gen2");
         create_dataset(&gen2_uri, vec![gen2_batch]).await;
 
-        // Build region snapshot
-        let region_snapshot = RegionSnapshot::new(region_id)
+        // Build shard snapshot
+        let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(3)
             .with_flushed_generation(1, "gen_1".to_string())
             .with_flushed_generation(2, "gen_2".to_string());
@@ -564,8 +564,8 @@ mod integration_tests {
 
         (
             base_dataset,
-            vec![region_snapshot],
-            Some((region_id, active_memtable)),
+            vec![shard_snapshot],
+            Some((shard_id, active_memtable)),
             pk_columns,
             temp_path,
         )
@@ -573,13 +573,13 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_query_plan_without_memtable_gen() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner without requesting _memtable_gen
-        let mut scanner = LsmScanner::new(base_dataset, region_snapshots, pk_columns);
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -609,14 +609,14 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_query_plan_with_memtable_gen() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner requesting _memtable_gen
         let mut scanner =
-            LsmScanner::new(base_dataset, region_snapshots, pk_columns).with_memtable_gen();
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).with_memtable_gen();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -654,13 +654,13 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_deduplication_results() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner
-        let mut scanner = LsmScanner::new(base_dataset, region_snapshots, pk_columns);
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -714,14 +714,14 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_with_projection() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner with projection (only id column)
         let mut scanner =
-            LsmScanner::new(base_dataset, region_snapshots, pk_columns).project(&["id"]);
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&["id"]);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -745,14 +745,13 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_with_limit() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner with limit
-        let mut scanner =
-            LsmScanner::new(base_dataset, region_snapshots, pk_columns).limit(3, None);
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).limit(3, None);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -773,7 +772,7 @@ mod integration_tests {
     async fn test_lsm_scan_base_only() {
         let (base_dataset, _, _, pk_columns, _temp_path) = setup_multi_level_lsm().await;
 
-        // Create scanner with only base table (no region snapshots or active memtable)
+        // Create scanner with only base table (no shard snapshots or active memtable)
         let scanner = LsmScanner::new(base_dataset, vec![], pk_columns);
 
         let plan = scanner.create_plan().await.unwrap();
@@ -816,11 +815,11 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_flushed_only_no_active() {
-        let (base_dataset, region_snapshots, _, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, _, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner with base + flushed (no active memtable)
-        let scanner = LsmScanner::new(base_dataset, region_snapshots, pk_columns);
+        let scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
 
         // Execute and collect results
         let batches: Vec<RecordBatch> = scanner
@@ -867,14 +866,14 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_with_row_address() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner requesting _rowaddr
         let mut scanner =
-            LsmScanner::new(base_dataset, region_snapshots, pk_columns).with_row_address();
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).with_row_address();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -927,15 +926,15 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_with_both_memtable_gen_and_row_address() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner requesting both _memtable_gen and _rowaddr
-        let mut scanner = LsmScanner::new(base_dataset, region_snapshots, pk_columns)
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
             .with_memtable_gen()
             .with_row_address();
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -971,7 +970,7 @@ mod integration_tests {
     /// - Flushed datasets have BTree index created (enabling ScalarIndexQuery)
     async fn setup_multi_level_lsm_with_btree_index() -> (
         Arc<Dataset>,
-        Vec<RegionSnapshot>,
+        Vec<ShardSnapshot>,
         Option<(Uuid, ActiveMemTableRef)>,
         Vec<String>,
         String,
@@ -999,8 +998,8 @@ mod integration_tests {
         let base_dataset = Arc::new(Dataset::open(&base_uri).await.unwrap());
 
         // Create flushed gen1 with BTree index
-        let region_id = Uuid::new_v4();
-        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, region_id);
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[3, 4], "gen1");
         let mut gen1_dataset = create_dataset(&gen1_uri, vec![gen1_batch]).await;
         CreateIndexBuilder::new(&mut gen1_dataset, &["id"], IndexType::BTree, &params)
@@ -1008,15 +1007,15 @@ mod integration_tests {
             .unwrap();
 
         // Create flushed gen2 with BTree index
-        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, region_id);
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
         let gen2_batch = create_test_batch(&schema, &[4, 5, 6], "gen2");
         let mut gen2_dataset = create_dataset(&gen2_uri, vec![gen2_batch]).await;
         CreateIndexBuilder::new(&mut gen2_dataset, &["id"], IndexType::BTree, &params)
             .await
             .unwrap();
 
-        // Build region snapshot
-        let region_snapshot = RegionSnapshot::new(region_id)
+        // Build shard snapshot
+        let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(3)
             .with_flushed_generation(1, "gen_1".to_string())
             .with_flushed_generation(2, "gen_2".to_string());
@@ -1049,8 +1048,8 @@ mod integration_tests {
 
         (
             base_dataset,
-            vec![region_snapshot],
-            Some((region_id, active_memtable)),
+            vec![shard_snapshot],
+            Some((shard_id, active_memtable)),
             pk_columns,
             temp_path,
         )
@@ -1058,15 +1057,15 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_with_btree_index_filter() {
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm_with_btree_index().await;
 
         // Create scanner with filter on the indexed column
-        let mut scanner = LsmScanner::new(base_dataset, region_snapshots, pk_columns)
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
             .filter("id = 5")
             .unwrap();
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -1149,16 +1148,16 @@ mod integration_tests {
     #[tokio::test]
     async fn test_lsm_scan_with_filter_no_index() {
         // Test that filter still works correctly even without BTree index
-        let (base_dataset, region_snapshots, active_memtable, pk_columns, _temp_path) =
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
         // Create scanner with SQL filter
         // This tests that type coercion works correctly (Int64 literal -> Int32 column)
-        let mut scanner = LsmScanner::new(base_dataset, region_snapshots, pk_columns)
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
             .filter("id = 3")
             .unwrap();
-        if let Some((region_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(region_id, memtable);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
         }
 
         // Execute and verify result

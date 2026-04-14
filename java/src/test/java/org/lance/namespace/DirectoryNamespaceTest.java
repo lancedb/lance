@@ -22,9 +22,43 @@ import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.namespace.errors.ErrorCode;
 import org.lance.namespace.errors.LanceNamespaceException;
-import org.lance.namespace.model.*;
+import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CreateNamespaceRequest;
+import org.lance.namespace.model.CreateNamespaceResponse;
+import org.lance.namespace.model.CreateTableIndexRequest;
+import org.lance.namespace.model.CreateTableIndexResponse;
+import org.lance.namespace.model.CreateTableRequest;
+import org.lance.namespace.model.CreateTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
+import org.lance.namespace.model.DeregisterTableRequest;
+import org.lance.namespace.model.DeregisterTableResponse;
+import org.lance.namespace.model.DescribeNamespaceRequest;
+import org.lance.namespace.model.DescribeNamespaceResponse;
+import org.lance.namespace.model.DescribeTableRequest;
+import org.lance.namespace.model.DescribeTableResponse;
 import org.lance.namespace.model.DescribeTableVersionRequest;
 import org.lance.namespace.model.DescribeTableVersionResponse;
+import org.lance.namespace.model.DropNamespaceRequest;
+import org.lance.namespace.model.DropNamespaceResponse;
+import org.lance.namespace.model.DropTableRequest;
+import org.lance.namespace.model.DropTableResponse;
+import org.lance.namespace.model.InsertIntoTableRequest;
+import org.lance.namespace.model.InsertIntoTableResponse;
+import org.lance.namespace.model.ListNamespacesRequest;
+import org.lance.namespace.model.ListNamespacesResponse;
+import org.lance.namespace.model.ListTableIndicesRequest;
+import org.lance.namespace.model.ListTableIndicesResponse;
+import org.lance.namespace.model.ListTableVersionsRequest;
+import org.lance.namespace.model.ListTableVersionsResponse;
+import org.lance.namespace.model.ListTablesRequest;
+import org.lance.namespace.model.ListTablesResponse;
+import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableRequestVector;
+import org.lance.namespace.model.RegisterTableRequest;
+import org.lance.namespace.model.RegisterTableResponse;
+import org.lance.namespace.model.TableExistsRequest;
 import org.lance.operation.Append;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -1082,5 +1116,315 @@ public class DirectoryNamespaceTest {
 
     assertEquals(numTables, dropSuccessCount.get(), "All drops should succeed");
     assertEquals(0, dropFailCount.get(), "No drops should fail");
+  }
+
+  @Test
+  void testCountTableRows() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Count rows
+    CountTableRowsRequest countReq =
+        new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
+    long count = namespaceClient.countTableRows(countReq);
+    assertEquals(3, count);
+  }
+
+  @Test
+  void testCountTableRowsWithFilter() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows (ages: 30, 25, 35)
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Count rows with predicate
+    CountTableRowsRequest countReq =
+        new CountTableRowsRequest()
+            .id(Arrays.asList("workspace", "test_table"))
+            .predicate("age > 28");
+    long count = namespaceClient.countTableRows(countReq);
+    assertEquals(2, count); // Alice (30) and Charlie (35)
+  }
+
+  @Test
+  void testInsertIntoTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Insert more data
+    byte[] newData = createTestTableData(); // Another 3 rows
+    InsertIntoTableRequest insertReq =
+        new InsertIntoTableRequest().id(Arrays.asList("workspace", "test_table")).mode("append");
+    InsertIntoTableResponse insertResp = namespaceClient.insertIntoTable(insertReq, newData);
+    assertNotNull(insertResp);
+
+    // Verify row count increased
+    CountTableRowsRequest countReq =
+        new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
+    long count = namespaceClient.countTableRows(countReq);
+    assertEquals(6, count);
+  }
+
+  @Test
+  void testQueryTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Query table - just verify we can execute a simple query
+    QueryTableRequest queryReq =
+        new QueryTableRequest()
+            .id(Arrays.asList("workspace", "test_table"))
+            .k(10)
+            .vector(new QueryTableRequestVector());
+    byte[] resultBytes = namespaceClient.queryTable(queryReq);
+    assertNotNull(resultBytes);
+    assertTrue(resultBytes.length > 0);
+  }
+
+  @Test
+  void testListTableVersions() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // List versions
+    ListTableVersionsRequest listReq =
+        new ListTableVersionsRequest().id(Arrays.asList("workspace", "test_table"));
+    ListTableVersionsResponse listResp = namespaceClient.listTableVersions(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getVersions());
+    assertTrue(listResp.getVersions().size() >= 1);
+  }
+
+  @Test
+  void testRegisterTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // First create a table directly to get a valid location
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "source_table"));
+    CreateTableResponse createResp = namespaceClient.createTable(createReq, tableData);
+    String location = createResp.getLocation();
+
+    // Register the table under a new name (using relative path)
+    String relativePath = "source_table.lance";
+    RegisterTableRequest registerReq =
+        new RegisterTableRequest()
+            .id(Arrays.asList("workspace", "registered_table"))
+            .location(relativePath);
+    RegisterTableResponse registerResp = namespaceClient.registerTable(registerReq);
+    assertNotNull(registerResp);
+
+    // Verify the registered table exists
+    TableExistsRequest existsReq =
+        new TableExistsRequest().id(Arrays.asList("workspace", "registered_table"));
+    assertDoesNotThrow(() -> namespaceClient.tableExists(existsReq));
+  }
+
+  @Test
+  void testDeclareTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Declare a table
+    DeclareTableRequest declareReq =
+        new DeclareTableRequest().id(Arrays.asList("workspace", "declared_table"));
+    DeclareTableResponse declareResp = namespaceClient.declareTable(declareReq);
+    assertNotNull(declareResp);
+    assertNotNull(declareResp.getLocation());
+  }
+
+  @Test
+  void testDeregisterTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Deregister the table
+    DeregisterTableRequest deregisterReq =
+        new DeregisterTableRequest().id(Arrays.asList("workspace", "test_table"));
+    DeregisterTableResponse deregisterResp = namespaceClient.deregisterTable(deregisterReq);
+    assertNotNull(deregisterResp);
+
+    // Verify the table no longer exists
+    TableExistsRequest existsReq =
+        new TableExistsRequest().id(Arrays.asList("workspace", "test_table"));
+    assertThrows(LanceNamespaceException.class, () -> namespaceClient.tableExists(existsReq));
+  }
+
+  @Test
+  void testListTableIndices() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // List indices (should be empty initially)
+    ListTableIndicesRequest listReq =
+        new ListTableIndicesRequest().id(Arrays.asList("workspace", "test_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(0, listResp.getIndexes().size());
+  }
+
+  @Test
+  void testCreateScalarIndex() throws Exception {
+    // Create table at root level
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList("test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Create scalar index on 'id' column
+    CreateTableIndexRequest createIndexReq =
+        new CreateTableIndexRequest()
+            .id(Arrays.asList("test_table"))
+            .column("id")
+            .indexType("BTREE")
+            .name("id_idx");
+    CreateTableIndexResponse response = namespaceClient.createTableIndex(createIndexReq);
+    assertNotNull(response);
+
+    // List indices to verify
+    ListTableIndicesRequest listReq = new ListTableIndicesRequest().id(Arrays.asList("test_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(1, listResp.getIndexes().size());
+    assertEquals("id_idx", listResp.getIndexes().get(0).getIndexName());
+    assertTrue(listResp.getIndexes().get(0).getColumns().contains("id"));
+  }
+
+  @Test
+  void testCreateVectorIndex() throws Exception {
+    // Create table with vector data (256 rows with 8-dim vectors)
+    byte[] tableData = createVectorTableData(256, 8);
+    CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList("vector_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Create vector index using IVF_FLAT
+    CreateTableIndexRequest createIndexReq =
+        new CreateTableIndexRequest()
+            .id(Arrays.asList("vector_table"))
+            .column("vector")
+            .indexType("IVF_FLAT")
+            .name("vector_idx")
+            .distanceType("l2");
+    CreateTableIndexResponse response = namespaceClient.createTableIndex(createIndexReq);
+    assertNotNull(response);
+
+    // List indices to verify
+    ListTableIndicesRequest listReq =
+        new ListTableIndicesRequest().id(Arrays.asList("vector_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(1, listResp.getIndexes().size());
+    assertEquals("vector_idx", listResp.getIndexes().get(0).getIndexName());
+    assertTrue(listResp.getIndexes().get(0).getColumns().contains("vector"));
+  }
+
+  private byte[] createVectorTableData(int numRows, int dim) throws Exception {
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(
+                    "vector",
+                    FieldType.nullable(new ArrowType.FixedSizeList(dim)),
+                    Arrays.asList(
+                        new Field(
+                            "item",
+                            FieldType.nullable(
+                                new ArrowType.FloatingPoint(
+                                    org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE)),
+                            null)))));
+
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      IntVector idVector = (IntVector) root.getVector("id");
+      org.apache.arrow.vector.complex.FixedSizeListVector vectorCol =
+          (org.apache.arrow.vector.complex.FixedSizeListVector) root.getVector("vector");
+      org.apache.arrow.vector.Float4Vector itemsVector =
+          (org.apache.arrow.vector.Float4Vector) vectorCol.getDataVector();
+
+      idVector.allocateNew(numRows);
+      vectorCol.allocateNew();
+      itemsVector.allocateNew(numRows * dim);
+
+      for (int i = 0; i < numRows; i++) {
+        idVector.set(i, i);
+        for (int j = 0; j < dim; j++) {
+          itemsVector.set(i * dim + j, (float) (i * dim + j) * 0.01f);
+        }
+        vectorCol.setNotNull(i);
+      }
+
+      idVector.setValueCount(numRows);
+      itemsVector.setValueCount(numRows * dim);
+      vectorCol.setValueCount(numRows);
+      root.setRowCount(numRows);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.writeBatch();
+      }
+      return out.toByteArray();
+    }
   }
 }

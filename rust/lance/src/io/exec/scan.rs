@@ -27,6 +27,7 @@ use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
@@ -274,25 +275,31 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
+                let config = config_for_stream.clone();
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
                 > = tokio::spawn(
                     (async move {
+                        let mut frag_config = FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version);
+                        if let Some(file_reader_options) = config.file_reader_options {
+                            frag_config = frag_config.with_file_reader_options(file_reader_options);
+                        }
                         let reader = open_file(
                             file_fragment.fragment,
                             project_schema,
-                            FragReadConfig::default()
-                                .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address)
-                                .with_row_last_updated_at_version(
-                                    config.with_row_last_updated_at_version,
-                                )
-                                .with_row_created_at_version(config.with_row_created_at_version),
+                            frag_config,
                             config.with_make_deletions_null,
                             Some((scan_scheduler, priority as u32)),
                         )
@@ -499,6 +506,7 @@ pub struct LanceScanConfig {
     pub with_row_created_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 // This is mostly for testing purposes, end users are unlikely to create this
@@ -516,6 +524,7 @@ impl Default for LanceScanConfig {
             with_row_created_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
+            file_reader_options: None,
         }
     }
 }

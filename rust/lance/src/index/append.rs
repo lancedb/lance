@@ -9,6 +9,7 @@ use lance_core::{
     utils::mask::{RowAddrTreeMap, RowSetOps},
 };
 use lance_index::{
+    INDEX_FILE_NAME,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
@@ -19,7 +20,8 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::DatasetIndexInternalExt;
-use super::vector::ivf::optimize_vector_indices;
+use super::vector::LogicalVectorIndex;
+use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_rebalance};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
@@ -72,6 +74,18 @@ async fn build_stable_row_id_filter(
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
+async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
+    if let Some(files) = &index.files {
+        return Ok(files.iter().any(|file| file.path == INDEX_FILE_NAME));
+    }
+
+    let index_dir = dataset.indice_files_dir(index)?;
+    let index_file = index_dir
+        .child(index.uuid.to_string())
+        .child(INDEX_FILE_NAME);
+    dataset.object_store.exists(&index_file).await
+}
+
 /// Merge in-inflight unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
 ///
@@ -94,7 +108,13 @@ pub async fn merge_indices<'a>(
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
+    Box::pin(merge_indices_with_unindexed_frags(
+        dataset,
+        old_indices,
+        &unindexed,
+        options,
+    ))
+    .await
 }
 
 /// Merge a list of provided unindexed data, with a specific number of previous indices
@@ -120,130 +140,123 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         )))?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
-    let mut indices = Vec::with_capacity(old_indices.len());
-    for idx in old_indices {
-        match dataset
-            .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
-            .await
-        {
-            Ok(index) => indices.push(index),
-            Err(e) => {
-                log::warn!(
-                    "Cannot open index on column '{}': {}. \
-                     Skipping index merge for this column.",
-                    field_path,
-                    e
-                );
-                return Ok(None);
-            }
+    let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
+    for idx in old_indices.iter().skip(1) {
+        let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
+        if is_vector_index != first_is_vector_index {
+            return Err(Error::index(format!(
+                "Append index: invalid mixed index deltas: {:?}",
+                old_indices
+            )));
         }
     }
 
-    if indices
-        .windows(2)
-        .any(|w| w[0].index_type() != w[1].index_type())
-    {
-        return Err(Error::index(format!(
-            "Append index: invalid index deltas: {:?}",
-            old_indices
-        )));
-    }
-
-    let mut frag_bitmap = RoaringBitmap::new();
+    let mut base_unindexed_bitmap = RoaringBitmap::new();
     unindexed.iter().for_each(|frag| {
-        frag_bitmap.insert(frag.id as u32);
+        base_unindexed_bitmap.insert(frag.id as u32);
     });
 
-    let index_type = indices[0].index_type();
-    let (new_uuid, indices_merged, created_index) = match index_type {
-        it if it.is_scalar() => {
-            // Use effective bitmap (intersected with existing dataset fragments)
-            // to avoid carrying stale data from pruned indices.
-            let effective_old_frags: RoaringBitmap = old_indices
-                .iter()
-                .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
-                .fold(RoaringBitmap::new(), |mut acc, b| {
-                    acc |= &b;
-                    acc
-                });
-            let deleted_old_frags: RoaringBitmap = old_indices
-                .iter()
-                .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
-                .fold(RoaringBitmap::new(), |mut acc, b| {
-                    acc |= &b;
-                    acc
-                });
-            frag_bitmap |= &effective_old_frags;
-
-            let index = dataset
-                .open_scalar_index(
-                    &field_path,
-                    &old_indices[0].uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await?;
-
-            let update_criteria = index.update_criteria();
-
-            let fragments = if update_criteria.requires_old_data {
-                None
-            } else {
-                Some(unindexed.to_vec())
-            };
-            let new_data_stream = load_training_data(
-                dataset.as_ref(),
-                &field_path,
-                &update_criteria.data_criteria,
-                fragments,
-                true,
-                None,
-            )
+    let (new_uuid, removed_indices, new_fragment_bitmap, created_index) = if first_is_vector_index {
+        let full_logical_index = dataset
+            .open_logical_vector_index(&field_path, &old_indices[0].name)
             .await?;
-
-            let new_uuid = Uuid::new_v4();
-
-            let created_index = if effective_old_frags.is_empty() {
-                // Old data is fully stale (bitmap pruned to empty). Rebuild
-                // from scratch instead of merging stale entries.
-                let params = index.derive_index_params()?;
-                super::scalar::build_scalar_index(
-                    dataset.as_ref(),
-                    column.name.as_str(),
-                    &new_uuid.to_string(),
-                    &params,
-                    true,
-                    None,
-                    Some(new_data_stream),
-                    Arc::new(NoopIndexBuildProgress),
-                )
-                .await?
-            } else {
-                let new_store =
-                    LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-                let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
-                    // Stable row IDs are opaque IDs, so fragment-bit filtering on
-                    // (row_id >> 32) is invalid. Build an exact allow-list from retained
-                    // fragments' row-id sequences and use precise filtering.
-                    let valid_old_row_ids =
-                        build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
-                    Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
-                } else {
-                    // Address-style row IDs encode fragment_id in high 32 bits.
-                    // Fragment bitmap filtering is valid and cheaper in this mode.
-                    Some(OldIndexDataFilter::Fragments {
-                        to_keep: effective_old_frags,
-                        to_remove: deleted_old_frags,
-                    })
-                };
-                index
-                    .update(new_data_stream, &new_store, old_data_filter)
-                    .await?
-            };
-
-            // TODO: don't hard-code index version
-            Ok((new_uuid, 1, created_index))
+        let mut opened_indices_by_uuid = full_logical_index
+            .iter()
+            .map(|(metadata, index)| (metadata.uuid, (metadata.clone(), index.clone())))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut selected_metadatas = Vec::with_capacity(old_indices.len());
+        let mut selected_indices = Vec::with_capacity(old_indices.len());
+        for metadata in old_indices {
+            let (selected_metadata, selected_index) = opened_indices_by_uuid.remove(&metadata.uuid).ok_or_else(|| {
+                Error::index(format!(
+                    "Append index: logical vector index '{}' does not contain requested segment {}",
+                    old_indices[0].name, metadata.uuid
+                ))
+            })?;
+            selected_metadatas.push(selected_metadata);
+            selected_indices.push(selected_index);
         }
-        it if it.is_vector() => {
+        let logical_index = LogicalVectorIndex::try_new(
+            old_indices[0].name.clone(),
+            field_path.clone(),
+            selected_metadatas
+                .into_iter()
+                .zip(selected_indices)
+                .collect(),
+        )?;
+        let ivf_view = logical_index.as_ivf()?;
+
+        let use_single_segment_rebalance = logical_index.num_segments() > 1
+            && options.num_indices_to_merge.is_none()
+            && !options.retrain
+            && unindexed.is_empty();
+
+        if use_single_segment_rebalance {
+            let Some(selected_segment_id) = select_segment_for_single_rebalance(&ivf_view)? else {
+                return Ok(None);
+            };
+            let removed_segment = old_indices
+                .iter()
+                .copied()
+                .find(|metadata| metadata.uuid == selected_segment_id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Append index: logical vector index '{}' does not contain selected segment {}",
+                        old_indices[0].name, selected_segment_id
+                    ))
+                })?;
+            let (selected_metadata, selected_index) = logical_index
+                .iter()
+                .find(|(metadata, _)| metadata.uuid == selected_segment_id)
+                .map(|(metadata, index)| (metadata.clone(), index.clone()))
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Append index: failed to materialize selected segment {} from logical vector index '{}'",
+                        selected_segment_id, old_indices[0].name
+                    ))
+                })?;
+            let selected_logical_index = LogicalVectorIndex::try_new(
+                old_indices[0].name.clone(),
+                field_path.clone(),
+                vec![(selected_metadata, selected_index)],
+            )?;
+            let selected_ivf_view = selected_logical_index.as_ivf()?;
+            let (new_uuid, indices_merged) = Box::pin(optimize_vector_indices(
+                dataset.as_ref().clone(),
+                Option::<
+                    lance_io::stream::RecordBatchStreamAdapter<
+                        futures::stream::Empty<lance_core::Result<arrow_array::RecordBatch>>,
+                    >,
+                >::None,
+                &field_path,
+                &selected_ivf_view,
+                options,
+            ))
+            .await?;
+            if indices_merged == 0 {
+                return Ok(None);
+            }
+
+            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+            let new_fragment_bitmap = removed_segment
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .or_else(|| removed_segment.fragment_bitmap.clone())
+                .unwrap_or_default();
+
+            Ok((
+                new_uuid,
+                vec![removed_segment],
+                new_fragment_bitmap,
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: lance_index::IndexType::Vector.version() as u32,
+                    files: Some(files),
+                },
+            ))
+        } else {
+            let mut frag_bitmap = base_unindexed_bitmap.clone();
+
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -264,52 +277,174 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 dataset.as_ref().clone(),
                 new_data_stream,
                 &field_path,
-                &indices,
+                &ivf_view,
                 options,
             )
             .boxed()
             .await?;
 
-            old_indices[old_indices.len() - indices_merged..]
-                .iter()
-                .for_each(|idx| {
-                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-                });
+            let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
+            removed_indices.iter().for_each(|idx| {
+                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+            });
+            for removed in removed_indices.iter() {
+                if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                {
+                    frag_bitmap |= &effective;
+                }
+            }
 
-            // Capture file sizes for the new vector index
             let index_dir = dataset.indices_dir().child(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
             Ok((
                 new_uuid,
-                indices_merged,
+                removed_indices,
+                frag_bitmap,
                 CreatedIndex {
                     index_details: vector_index_details(),
-                    // retain_supported_indices guarantees all old_indices have
-                    // index_version <= our max supported version, so we can safely
-                    // write the current library's version for this index type.
-                    index_version: it.version() as u32,
+                    index_version: lance_index::IndexType::Vector.version() as u32,
                     files: Some(files),
                 },
             ))
         }
-        _ => Err(Error::index(format!(
-            "Append index: invalid index type: {:?}",
-            indices[0].index_type()
-        ))),
-    }?;
-
-    let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
-    for removed in removed_indices.iter() {
-        if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap) {
-            frag_bitmap |= &effective;
+    } else {
+        let mut frag_bitmap = base_unindexed_bitmap;
+        let mut indices = Vec::with_capacity(old_indices.len());
+        for idx in old_indices {
+            match dataset
+                .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
+                .await
+            {
+                Ok(index) => indices.push(index),
+                Err(e) => {
+                    log::warn!(
+                        "Cannot open index on column '{}': {}. \
+                         Skipping index merge for this column.",
+                        field_path,
+                        e
+                    );
+                    return Ok(None);
+                }
+            }
         }
-    }
+
+        if indices
+            .windows(2)
+            .any(|w| w[0].index_type() != w[1].index_type())
+        {
+            return Err(Error::index(format!(
+                "Append index: invalid index deltas: {:?}",
+                old_indices
+            )));
+        }
+
+        let index_type = indices[0].index_type();
+        match index_type {
+            it if it.is_scalar() => {
+                // Use effective bitmap (intersected with existing dataset fragments)
+                // to avoid carrying stale data from pruned indices.
+                let effective_old_frags: RoaringBitmap = old_indices
+                    .iter()
+                    .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
+                    .fold(RoaringBitmap::new(), |mut acc, b| {
+                        acc |= &b;
+                        acc
+                    });
+                let deleted_old_frags: RoaringBitmap = old_indices
+                    .iter()
+                    .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
+                    .fold(RoaringBitmap::new(), |mut acc, b| {
+                        acc |= &b;
+                        acc
+                    });
+                frag_bitmap |= &effective_old_frags;
+
+                let index = dataset
+                    .open_scalar_index(
+                        &field_path,
+                        &old_indices[0].uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+
+                let update_criteria = index.update_criteria();
+
+                let fragments = if update_criteria.requires_old_data {
+                    None
+                } else {
+                    Some(unindexed.to_vec())
+                };
+                let new_data_stream = load_training_data(
+                    dataset.as_ref(),
+                    &field_path,
+                    &update_criteria.data_criteria,
+                    fragments,
+                    true,
+                    None,
+                )
+                .await?;
+
+                let new_uuid = Uuid::new_v4();
+
+                let created_index = if effective_old_frags.is_empty() {
+                    // Old data is fully stale (bitmap pruned to empty). Rebuild
+                    // from scratch instead of merging stale entries.
+                    let params = index.derive_index_params()?;
+                    super::scalar::build_scalar_index(
+                        dataset.as_ref(),
+                        column.name.as_str(),
+                        &new_uuid.to_string(),
+                        &params,
+                        true,
+                        None,
+                        Some(new_data_stream),
+                        Arc::new(NoopIndexBuildProgress),
+                    )
+                    .await?
+                } else {
+                    let new_store =
+                        LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                    let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
+                        // Stable row IDs are opaque IDs, so fragment-bit filtering on
+                        // (row_id >> 32) is invalid. Build an exact allow-list from retained
+                        // fragments' row-id sequences and use precise filtering.
+                        let valid_old_row_ids =
+                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
+                                .await?;
+                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                    } else {
+                        // Address-style row IDs encode fragment_id in high 32 bits.
+                        // Fragment bitmap filtering is valid and cheaper in this mode.
+                        Some(OldIndexDataFilter::Fragments {
+                            to_keep: effective_old_frags,
+                            to_remove: deleted_old_frags,
+                        })
+                    };
+                    index
+                        .update(new_data_stream, &new_store, old_data_filter)
+                        .await?
+                };
+
+                // TODO: don't hard-code index version
+                Ok((
+                    new_uuid,
+                    vec![old_indices[old_indices.len() - 1]],
+                    frag_bitmap,
+                    created_index,
+                ))
+            }
+            _ => Err(Error::index(format!(
+                "Append index: invalid index type: {:?}",
+                indices[0].index_type()
+            ))),
+        }
+    }?;
 
     Ok(Some(IndexMergeResults {
         new_uuid,
         removed_indices,
-        new_fragment_bitmap: frag_bitmap,
+        new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
         files: created_index.files,
@@ -321,6 +456,7 @@ mod tests {
     use super::*;
 
     use crate::index::DatasetIndexExt;
+    use crate::index::DatasetIndexInternalExt;
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -554,6 +690,19 @@ mod tests {
         assert_eq!(stats["num_indices"], 2);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(logical_index.num_segments(), 2);
+        assert_eq!(
+            logical_index
+                .num_rows_per_segment()
+                .into_iter()
+                .map(|(_, num_rows)| num_rows)
+                .sum::<u64>(),
+            2000
+        );
 
         let results = dataset
             .scan()
@@ -713,6 +862,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_merge_indices_with_unindexed_frags_vector_subset() {
+        const DIM: usize = 64;
+        const TOTAL: usize = 1000;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let vectors = generate_random_array(TOTAL * DIM);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("id", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()),
+                Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
+            .await
+            .unwrap();
+
+        let next_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        generate_random_array(TOTAL * DIM),
+                        DIM as i32,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(UInt32Array::from_iter_values(
+                    TOTAL as u32..(TOTAL * 2) as u32,
+                )),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![next_batch].into_iter().map(Ok), schema);
+        dataset.append(batches, None).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2);
+        let subset = vec![&indices[1]];
+        let merge_result = merge_indices_with_unindexed_frags(
+            Arc::new(dataset),
+            &subset,
+            &[],
+            &OptimizeOptions::merge(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            merge_result.is_some(),
+            "subset merges should respect the caller-provided indices"
+        );
     }
 
     #[tokio::test]

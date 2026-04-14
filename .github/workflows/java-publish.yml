@@ -24,6 +24,9 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   linux-arm64:
     name: Build on Linux Arm64

@@ -103,17 +103,70 @@ pub struct CachedFileMetadata {
     pub num_footer_bytes: u64,
     pub major_version: u16,
     pub minor_version: u16,
+    /// The actual total file size in bytes, as reported by the object store.
+    pub file_size_bytes: u64,
+}
+
+impl CachedFileMetadata {
+    /// Total file size in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.file_size_bytes
+    }
 }
 
 impl DeepSizeOf for CachedFileMetadata {
-    // TODO: include size for `column_metadatas` and `column_infos`.
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.file_schema.deep_size_of_children(context)
-            + self
-                .file_buffers
-                .iter()
-                .map(|file_buffer| file_buffer.deep_size_of_children(context))
-                .sum::<usize>()
+        let schema_size = self.file_schema.deep_size_of_children(context);
+
+        let buffers_size: usize = self
+            .file_buffers
+            .iter()
+            .map(|fb| fb.deep_size_of_children(context))
+            .sum();
+
+        // column_metadatas is Vec<pbfile::ColumnMetadata> (protobuf generated,
+        // does not implement DeepSizeOf). We use prost::Message::encoded_len()
+        // as a proxy for in-memory size. The decoded representation is typically
+        // several times larger than the wire format due to heap-allocated
+        // repeated/string/bytes fields, so we apply a 4x multiplier.
+        let column_metadatas_size: usize = self
+            .column_metadatas
+            .iter()
+            .map(|cm| cm.encoded_len() * 4)
+            .sum::<usize>()
+            + std::mem::size_of_val(self.column_metadatas.as_slice());
+
+        // column_infos is Vec<Arc<ColumnInfo>>. Each ColumnInfo contains
+        // page_infos (with protobuf PageEncoding), buffer offsets, and a
+        // column-level ColumnEncoding protobuf.
+        let column_infos_size: usize = self
+            .column_infos
+            .iter()
+            .map(|ci| {
+                let pages_size: usize = ci
+                    .page_infos
+                    .iter()
+                    .map(|pi| {
+                        let enc_size = match &pi.encoding {
+                            lance_encoding::decoder::PageEncoding::Legacy(e) => e.encoded_len() * 4,
+                            lance_encoding::decoder::PageEncoding::Structural(e) => {
+                                e.encoded_len() * 4
+                            }
+                        };
+                        enc_size
+                            + std::mem::size_of_val(pi.buffer_offsets_and_sizes.as_ref())
+                            + std::mem::size_of::<u64>() * 2 // num_rows + priority
+                    })
+                    .sum();
+                pages_size
+                    + std::mem::size_of_val(ci.buffer_offsets_and_sizes.as_ref())
+                    + ci.encoding.encoded_len() * 4
+                    + std::mem::size_of::<u32>() // index
+                    + std::mem::size_of::<usize>() * 2 // Arc overhead
+            })
+            .sum();
+
+        schema_size + buffers_size + column_metadatas_size + column_infos_size
     }
 }
 
@@ -333,6 +386,13 @@ pub struct FileReaderOptions {
     /// will be read in multiple chunks to control memory usage.
     /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
     pub read_chunk_size: u64,
+    /// If set, the reader will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    ///
+    /// This can be set at the dataset level (via `ReadParams::file_reader_options`)
+    /// to provide a default for all scans, or at the scanner level (via
+    /// `Scanner::batch_size_bytes`) to override per scan.
+    pub batch_size_bytes: Option<u64>,
 }
 
 impl Default for FileReaderOptions {
@@ -340,11 +400,12 @@ impl Default for FileReaderOptions {
         Self {
             decoder_config: DecoderConfig::default(),
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+            batch_size_bytes: None,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileReader {
     scheduler: Arc<dyn EncodingsIo>,
     // The default projection to be applied to all reads
@@ -653,6 +714,7 @@ impl FileReader {
             file_buffers: gbo_table,
             major_version: footer.major_version,
             minor_version: footer.minor_version,
+            file_size_bytes: file_len,
         })
     }
 
@@ -861,6 +923,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        batch_size_bytes: Option<u64>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -877,6 +940,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
+            batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -910,6 +974,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
+            self.options.batch_size_bytes,
         )
     }
 
@@ -924,6 +989,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        batch_size_bytes: Option<u64>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -940,6 +1006,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
+            batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -971,6 +1038,7 @@ impl FileReader {
             projection,
             FilterExpression::no_filter(),
             self.options.decoder_config.clone(),
+            self.options.batch_size_bytes,
         )
     }
 
@@ -985,6 +1053,7 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
+        batch_size_bytes: Option<u64>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -1003,6 +1072,7 @@ impl FileReader {
             decoder_plugins,
             io,
             decoder_config,
+            batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1034,6 +1104,7 @@ impl FileReader {
             projection,
             filter,
             self.options.decoder_config.clone(),
+            self.options.batch_size_bytes,
         )
     }
 
@@ -1181,6 +1252,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
+            batch_size_bytes: self.options.batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1220,6 +1292,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
+            batch_size_bytes: self.options.batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1259,6 +1332,7 @@ impl FileReader {
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
             decoder_config: self.options.decoder_config.clone(),
+            batch_size_bytes: self.options.batch_size_bytes,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -2258,5 +2332,69 @@ mod tests {
 
         let buf = file_reader.read_global_buffer(1).await.unwrap();
         assert_eq!(buf, test_bytes);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_deep_size_of_includes_column_metadata(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        version: LanceFileVersion,
+    ) {
+        // Regression test: CachedFileMetadata::deep_size_of must account for
+        // column_metadatas and column_infos, otherwise the moka cache weigher
+        // dramatically underestimates entry sizes and never evicts, causing
+        // unbounded memory growth on random-access workloads.
+        use deepsize::DeepSizeOf;
+
+        let fs = FsFixture::default();
+        let _written = create_some_file(&fs, version).await;
+        let cache = test_cache();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = file_reader.metadata();
+        let deep_size = metadata.deep_size_of();
+
+        // The file has multiple columns (score, location, categories, binary,
+        // maybe large_bin). The deep_size_of must be substantially more than
+        // just the schema — it should include column_metadatas + column_infos.
+        // A naive implementation that ignores these fields reports < 1 KB;
+        // a correct one should report at least several KB for this test file.
+        assert!(
+            deep_size > 1024,
+            "deep_size_of ({deep_size}) is suspiciously small — \
+             column_metadatas and column_infos may not be accounted for"
+        );
+
+        // Verify column_metadatas is non-empty (sanity check).
+        assert!(
+            !metadata.column_metadatas.is_empty(),
+            "Expected non-empty column_metadatas"
+        );
+
+        // Verify the size scales with the number of columns: a file with more
+        // columns should have a larger deep_size_of.
+        let num_columns = metadata.column_metadatas.len();
+        assert!(
+            deep_size > num_columns * 50,
+            "deep_size_of ({deep_size}) should scale with column count ({num_columns})"
+        );
     }
 }
