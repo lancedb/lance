@@ -1073,56 +1073,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
 
-        if control.is_none() {
-            let prepare_index = self.clone();
-            let prepare_metrics = metrics.clone();
-            let prepared = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
-                    let index = prepare_index.clone();
-                    let pre_filter = pre_filter.clone();
-                    let metrics = prepare_metrics.clone();
-                    async move {
-                        index
-                            .prepare_partition(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                            )
-                            .await
-                    }
-                })
-                .buffered(prepare_parallelism)
-                .try_collect::<Vec<_>>()
-                .await?;
-
-            let distance_type = self.distance_type;
-            let search_metrics = metrics.clone();
-            let batches = spawn_cpu(move || -> DataFusionResult<Vec<RecordBatch>> {
-                let mut batches = Vec::with_capacity(prepared.len());
-                for prepared in prepared {
-                    let batch = Self::run_prepared_partition_search(
-                        distance_type,
-                        prepared,
-                        search_metrics.as_ref(),
-                    )
-                    .map_err(DataFusionError::from)?;
-                    batches.push(batch);
-                }
-                Ok(batches)
-            })
-            .await?;
-
-            let stream = stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>));
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                VECTOR_RESULT_SCHEMA.clone(),
-                stream,
-            )));
-        }
-
         let (prepared_tx, mut prepared_rx) =
             mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(1);
         let (batch_tx, batch_rx) = mpsc::channel::<DataFusionResult<RecordBatch>>(1);
