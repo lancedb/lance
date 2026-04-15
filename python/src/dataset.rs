@@ -82,9 +82,7 @@ use lance_index::{
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
-use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
-};
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
@@ -562,29 +560,26 @@ impl Dataset {
         }
 
         // Create builder: namespace path or URI path
-        let mut builder =
-            if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-                let ns_client = extract_namespace_arc(py, ns_client)?;
-                let namespace_client_table_context = namespace_client_table_context
-                    .map(|c| extract_namespace_client_table_context(c))
-                    .transpose()?;
-                rt().block_on(
-                    Some(py),
-                    DatasetBuilder::from_namespace(
-                        ns_client,
-                        tid.clone(),
-                        namespace_client_table_context.as_ref(),
-                    ),
-                )?
-                .map_err(|err| PyIOError::new_err(err.to_string()))?
-            } else {
-                let uri = uri.ok_or_else(|| {
-                    PyValueError::new_err(
-                        "uri is required when namespace_client is not provided",
-                    )
-                })?;
-                DatasetBuilder::from_uri(&uri)
-            };
+        let mut builder = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(py, ns_client)?;
+            let namespace_client_table_context = namespace_client_table_context
+                .map(|c| extract_namespace_client_table_context(c))
+                .transpose()?;
+            rt().block_on(
+                Some(py),
+                DatasetBuilder::from_namespace(
+                    ns_client,
+                    tid.clone(),
+                    namespace_client_table_context.as_ref(),
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        } else {
+            let uri = uri.ok_or_else(|| {
+                PyValueError::new_err("uri is required when namespace_client is not provided")
+            })?;
+            DatasetBuilder::from_uri(&uri)
+        };
         builder = builder.with_read_params(params);
 
         if let Some(ver) = version {
