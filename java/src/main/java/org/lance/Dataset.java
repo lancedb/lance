@@ -352,7 +352,6 @@ public class Dataset implements Closeable {
       LanceNamespace namespaceClient,
       List<String> tableId,
       NamespaceClientTableContext namespaceClientTableContext) {
-    Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
 

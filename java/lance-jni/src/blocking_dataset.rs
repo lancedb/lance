@@ -1232,7 +1232,11 @@ fn inner_open_native<'local>(
     table_id_obj: JObject,
     namespace_client_table_context_obj: JObject,
 ) -> Result<JObject<'local>> {
-    let path_str: String = path.extract(env)?;
+    let path_str: Option<String> = if path.is_null() {
+        None
+    } else {
+        Some(path.extract(env)?)
+    };
     let version = env.get_u64_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
@@ -1251,7 +1255,7 @@ fn inner_open_native<'local>(
     let session = session_from_handle(session_handle);
 
     let dataset = BlockingDataset::open(
-        Some(path_str.as_str()).filter(|s| !s.is_empty()),
+        path_str.as_deref(),
         version,
         block_size,
         index_cache_size_bytes,
