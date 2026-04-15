@@ -53,10 +53,12 @@ use lance_core::Result;
 
 pub mod file_ids;
 pub mod memory;
+#[cfg(unix)]
 pub mod ssd;
 
 use file_ids::FileIds;
 use memory::MemoryCache;
+#[cfg(unix)]
 use ssd::{SsdCache, SsdCacheConfig};
 
 // ─── Cache key ───────────────────────────────────────────────────────────────
@@ -320,6 +322,7 @@ impl DataCache for NoopDataCache {
 
 // ─── SsdWriter ───────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 /// Velox-style SSD write coordinator — implements [`memory::EvictionSink`].
 ///
 /// Follows `SsdCache::write()` / `startWrite()` / `finishWrite()` exactly:
@@ -330,6 +333,7 @@ impl DataCache for NoopDataCache {
 ///   round-trip, not a correctness failure.
 /// - `MAX_WRITE_RATIO` (70%): caps entries written per batch to avoid holding
 ///   too much memory during a single `insert_many` call.
+#[cfg(unix)]
 #[derive(Debug)]
 struct SsdWriter {
     ssd: Arc<SsdCache>,
@@ -337,10 +341,12 @@ struct SsdWriter {
     write_in_progress: Arc<AtomicBool>,
 }
 
+#[cfg(unix)]
 /// Maximum fraction of the eviction batch written per SSD write — Velox's
 /// `maxWriteRatio`. Entries beyond the cap are dropped (not buffered).
 const MAX_WRITE_RATIO: usize = 70;
 
+#[cfg(unix)]
 impl SsdWriter {
     fn new(ssd: Arc<SsdCache>) -> Arc<Self> {
         Arc::new(Self {
@@ -359,6 +365,7 @@ impl SsdWriter {
     }
 }
 
+#[cfg(unix)]
 impl memory::EvictionSink for SsdWriter {
     fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes)>, _total_cache_bytes: u64) {
         // CAS gate — if a write is already in flight, drop this batch.
@@ -397,8 +404,10 @@ impl memory::EvictionSink for SsdWriter {
 #[derive(Debug)]
 pub struct TieredDataCache {
     memory: Arc<MemoryCache>,
+    #[cfg(unix)]
     pub ssd: Option<Arc<SsdCache>>,
     /// SSD write coordinator — kept to expose `flush_ssd()` for testing.
+    #[cfg(unix)]
     ssd_writer: Option<Arc<SsdWriter>>,
     /// Maps file paths to stable `u64` IDs used in [`DataCacheKey`].
     file_ids: Arc<FileIds>,
@@ -416,6 +425,15 @@ impl TieredDataCache {
     /// size), at which point a batch write to [`SsdCache`] is spawned — no
     /// background task sits idle, and all writes are batched via `insert_many`.
     pub async fn new(config: &DataCacheConfig) -> Result<Arc<Self>> {
+        #[cfg(not(unix))]
+        if config.ssd_enabled {
+            return Err(lance_core::Error::invalid_input(
+                "data_cache_ssd_enabled=true is not supported on Windows — \
+                 SSD cache requires Unix pread/pwrite semantics",
+            ));
+        }
+
+        #[cfg(unix)]
         let ssd = if config.ssd_enabled {
             match &config.ssd_cache_dir {
                 Some(dir) => {
@@ -440,12 +458,16 @@ impl TieredDataCache {
         };
 
         // Wire the SsdWriter as the eviction sink when SSD is available.
+        #[cfg(unix)]
         let ssd_writer: Option<Arc<SsdWriter>> =
             ssd.as_ref().map(|ssd_arc| SsdWriter::new(ssd_arc.clone()));
 
+        #[cfg(unix)]
         let eviction_sink: Option<Arc<dyn memory::EvictionSink>> = ssd_writer
             .clone()
             .map(|w| w as Arc<dyn memory::EvictionSink>);
+        #[cfg(not(unix))]
+        let eviction_sink: Option<Arc<dyn memory::EvictionSink>> = None;
 
         let memory = memory::MemoryCache::with_eviction_sink(
             config.max_memory_bytes,
@@ -455,7 +477,9 @@ impl TieredDataCache {
 
         Ok(Arc::new(Self {
             memory,
+            #[cfg(unix)]
             ssd,
+            #[cfg(unix)]
             ssd_writer,
             file_ids: Arc::new(FileIds::new()),
         }))
@@ -499,6 +523,7 @@ impl TieredDataCache {
     /// Wait for any in-flight SSD write to complete — Velox's
     /// `waitForWriteToFinish()`. Use in tests after triggering evictions
     /// to ensure entries have reached the SSD tier before asserting.
+    #[cfg(unix)]
     pub async fn flush_ssd(&self) {
         if let Some(writer) = &self.ssd_writer {
             writer.wait_for_write().await;
@@ -523,6 +548,7 @@ impl DataCache for TieredDataCache {
         // If SSD tier is enabled, check L2 (SSD) on L1 (memory) miss before
         // falling back to the object store. SSD writes now happen lazily via
         // the eviction channel — NOT here on every fetch.
+        #[cfg(unix)]
         let effective_loader: BoxFuture<'a, Result<Bytes>> = if let Some(ssd) = &self.ssd {
             let key_for_ssd = key.clone();
             Box::pin(async move {
@@ -536,22 +562,31 @@ impl DataCache for TieredDataCache {
         } else {
             loader
         };
+        #[cfg(not(unix))]
+        let effective_loader = loader;
 
         Box::pin(self.memory.get_or_load(key, length, effective_loader))
     }
 
     fn cache_stats(&self) -> CacheStats {
         let mem = self.memory.stats();
-        let ssd = self.ssd.as_ref().map(|s| s.stats()).unwrap_or_default();
+        #[cfg(unix)]
+        let (ssd_hits, ssd_bytes_written, ssd_stale_misses) = {
+            let ssd = self.ssd.as_ref().map(|s| s.stats()).unwrap_or_default();
+            (ssd.entries_read, ssd.bytes_written, ssd.stale_misses)
+        };
+        #[cfg(not(unix))]
+        let (ssd_hits, ssd_bytes_written, ssd_stale_misses) = (0u64, 0u64, 0u64);
+
         CacheStats {
             memory_hits: mem.hits,
             memory_misses: mem.misses,
             memory_evictions: mem.evictions,
             memory_current_bytes: mem.current_bytes,
             memory_stale_evictions: mem.stale_evictions,
-            ssd_hits: ssd.entries_read,
-            ssd_bytes_written: ssd.bytes_written,
-            ssd_stale_misses: ssd.stale_misses,
+            ssd_hits,
+            ssd_bytes_written,
+            ssd_stale_misses,
         }
     }
 }
