@@ -42,6 +42,7 @@
 //! )
 //! ```
 
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -82,6 +83,9 @@ pub struct DataCacheKey {
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
+/// Default number of SSD shard files. Must be a power of two.
+pub const DEFAULT_NUM_SSD_SHARDS: usize = 4;
+
 /// Configuration for the two-tier async data cache.
 ///
 /// Parsed from `storage_options` when opening a dataset:
@@ -120,7 +124,7 @@ pub struct DataCacheConfig {
     pub ssd_max_bytes: u64,
 
     /// Number of SSD shard files. Must be a positive power of two.
-    /// Advanced — defaults to [`ssd::DEFAULT_NUM_SSD_SHARDS`] (4).
+    /// Advanced — defaults to [`DEFAULT_NUM_SSD_SHARDS`] (4).
     pub ssd_num_shards: usize,
 
     /// When `true`, every cache hit is verified by re-fetching the same byte
@@ -200,7 +204,7 @@ impl DataCacheConfig {
         let ssd_num_shards = opts
             .get(Self::KEY_SSD_SHARDS)
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(ssd::DEFAULT_NUM_SSD_SHARDS);
+            .unwrap_or(DEFAULT_NUM_SSD_SHARDS);
 
         let verify = opts
             .get(Self::KEY_VERIFY)
@@ -703,7 +707,7 @@ mod tests {
             ssd_enabled: false,
             ssd_cache_dir: None,
             ssd_max_bytes: 0,
-            ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
+            ssd_num_shards: DEFAULT_NUM_SSD_SHARDS,
             verify: false,
             ssd_crc32_enabled: false,
         };
