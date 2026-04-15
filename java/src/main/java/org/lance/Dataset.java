@@ -288,7 +288,6 @@ public class Dataset implements Closeable {
       NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
-    Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
     Dataset dataset =
         createWithFfiStream(

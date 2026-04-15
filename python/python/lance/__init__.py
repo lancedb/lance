@@ -33,11 +33,6 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
-from .namespace import (
-    DescribeTableRequest,
-    LanceNamespace,
-    NamespaceClientTableContext,
-)
 from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
@@ -48,6 +43,8 @@ if TYPE_CHECKING:
 
     from lance.commit import CommitLock
     from lance.dependencies import pandas as pd
+
+    from .namespace import LanceNamespace, NamespaceClientTableContext
 
     ts_types = Union[datetime, pd.Timestamp, str]
 
