@@ -21,7 +21,6 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.HashMap;
 import java.util.List;
@@ -65,7 +64,6 @@ public class WriteDatasetBuilder {
   private List<String> tableId;
   private NamespaceClientTableContext namespaceClientTableContext;
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
-  private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
   private Optional<Integer> maxRowsPerFile = Optional.empty();
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
@@ -190,19 +188,6 @@ public class WriteDatasetBuilder {
   public WriteDatasetBuilder mode(WriteParams.WriteMode mode) {
     Preconditions.checkNotNull(mode);
     this.mode = mode;
-    return this;
-  }
-
-  /**
-   * Sets the schema for the dataset.
-   *
-   * <p>If the reader and stream not provided, this is used to create an empty dataset
-   *
-   * @param schema The dataset schema
-   * @return this builder instance
-   */
-  public WriteDatasetBuilder schema(Schema schema) {
-    this.schema = schema;
     return this;
   }
 
@@ -364,19 +349,12 @@ public class WriteDatasetBuilder {
       }
     }
 
-    int dataSourceCount = 0;
-    if (reader != null) dataSourceCount++;
-    if (stream != null) dataSourceCount++;
-    if (schema != null && reader == null && stream == null) dataSourceCount++;
-
-    if (dataSourceCount == 0) {
-      throw new IllegalArgumentException(
-          "Must provide data via reader(), stream(), or schema() (for empty tables).");
+    if (reader == null && stream == null) {
+      throw new IllegalArgumentException("Must provide data via reader() or stream().");
     }
-    if (dataSourceCount > 1) {
+    if (reader != null && stream != null) {
       throw new IllegalArgumentException(
-          "Cannot specify multiple data sources. "
-              + "Use only one of: reader(), stream(), or schema().");
+          "Cannot specify both reader() and stream(). Use only one.");
     }
 
     if (hasNamespaceClient) {
@@ -448,10 +426,6 @@ public class WriteDatasetBuilder {
             tableId,
             namespaceClientTableContext);
       }
-    }
-
-    if (schema != null) {
-      return Dataset.create(allocator, path, schema, params);
     }
 
     throw new IllegalStateException("No data source provided");
