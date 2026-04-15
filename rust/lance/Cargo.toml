@@ -25,6 +25,7 @@ lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
+lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-geo = { workspace = true, optional = true }
 arrow-arith = { workspace = true }
@@ -76,7 +77,6 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 moka.workspace = true
 permutation = { version = "0.4.0" }
-tantivy.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
 humantime = { workspace = true }
