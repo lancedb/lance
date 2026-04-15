@@ -851,7 +851,7 @@ mod test {
         projection.fields[0].unloaded_mut();
 
         let projection = ProjectionRequest::from_schema(projection)
-            .into_projection_plan(Arc::new(dataset.clone()))
+            .into_projection_plan(Arc::new(dataset))
             .unwrap();
 
         let output_schema = projection.output_schema().unwrap();
