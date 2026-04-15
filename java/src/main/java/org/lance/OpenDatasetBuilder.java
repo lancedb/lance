@@ -14,8 +14,6 @@
 package org.lance;
 
 import org.lance.namespace.LanceNamespace;
-import org.lance.namespace.model.DescribeTableRequest;
-import org.lance.namespace.model.DescribeTableResponse;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -202,10 +200,6 @@ public class OpenDatasetBuilder {
       selfManagedAllocator = true;
     }
 
-    if (hasContext) {
-      return buildFromContext();
-    }
-
     if (hasNamespaceClient) {
       return buildFromNamespaceClient();
     }
@@ -213,62 +207,12 @@ public class OpenDatasetBuilder {
     return Dataset.open(allocator, selfManagedAllocator, uri, options, session);
   }
 
-  private Dataset buildFromContext() {
-    NamespaceClientTableContext namespaceClientTableContext = this.namespaceClientTableContext;
-
-    ReadOptions.Builder optionsBuilder =
-        new ReadOptions.Builder()
-            .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
-            .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
-
-    options.getVersion().ifPresent(optionsBuilder::setVersion);
-    options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
-    options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
-    optionsBuilder.setStorageOptions(options.getStorageOptions());
-
-    return Dataset.open(
-        allocator,
-        selfManagedAllocator,
-        namespaceClientTableContext.getLocation(),
-        optionsBuilder.build(),
-        session,
-        namespaceClient,
-        tableId,
-        namespaceClientTableContext);
-  }
-
   private Dataset buildFromNamespaceClient() {
-    // Call describe_table to get location and storage options
-    DescribeTableRequest request = new DescribeTableRequest();
-    request.setId(tableId);
-    // Only set version if present
-    options.getVersion().ifPresent(v -> request.setVersion(Long.valueOf(v)));
-
-    DescribeTableResponse response = namespaceClient.describeTable(request);
-
-    String location = response.getLocation();
-    if (location == null || location.isEmpty()) {
-      throw new IllegalArgumentException("Namespace client did not return a table location");
-    }
-
-    NamespaceClientTableContext namespaceClientTableContext =
-        NamespaceClientTableContext.fromDescribeTableResponse(response);
-
-    ReadOptions.Builder optionsBuilder =
-        new ReadOptions.Builder()
-            .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
-            .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
-
-    options.getVersion().ifPresent(optionsBuilder::setVersion);
-    options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
-    options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
-    optionsBuilder.setStorageOptions(options.getStorageOptions());
-
     return Dataset.open(
         allocator,
         selfManagedAllocator,
-        location,
-        optionsBuilder.build(),
+        null,
+        options,
         session,
         namespaceClient,
         tableId,

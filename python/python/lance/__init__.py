@@ -214,22 +214,6 @@ def dataset(
             raise ValueError(
                 "Both 'namespace_client' and 'table_id' must be provided together."
             )
-
-        if has_context:
-            uri = namespace_client_table_context.location
-        else:
-            from .namespace import DescribeTableResponse
-
-            request = DescribeTableRequest(id=table_id, version=version)
-            response = namespace_client.describe_table(request)
-            uri = response.location
-            if uri is None:
-                raise ValueError(
-                    "Namespace did not return a 'location' for the table"
-                )
-            namespace_client_table_context = (
-                NamespaceClientTableContext.from_describe_table_response(response)
-            )
     elif table_id is not None:
         raise ValueError(
             "Both 'namespace_client' and 'table_id' must be provided together."

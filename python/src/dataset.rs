@@ -489,10 +489,10 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_table_context=None))]
+    #[pyo3(signature=(uri=None, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_table_context=None))]
     fn new(
         py: Python,
-        uri: String,
+        uri: Option<String>,
         version: Option<Bound<PyAny>>,
         block_size: Option<usize>,
         index_cache_size: Option<usize>,
@@ -561,7 +561,31 @@ impl Dataset {
             params.file_reader_options = Some(file_reader_options);
         }
 
-        let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
+        // Create builder: namespace path or URI path
+        let mut builder =
+            if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+                let ns_client = extract_namespace_arc(py, ns_client)?;
+                let namespace_client_table_context = namespace_client_table_context
+                    .map(|c| extract_namespace_client_table_context(c))
+                    .transpose()?;
+                rt().block_on(
+                    Some(py),
+                    DatasetBuilder::from_namespace(
+                        ns_client,
+                        tid.clone(),
+                        namespace_client_table_context.as_ref(),
+                    ),
+                )?
+                .map_err(|err| PyIOError::new_err(err.to_string()))?
+            } else {
+                let uri = uri.ok_or_else(|| {
+                    PyValueError::new_err(
+                        "uri is required when namespace_client is not provided",
+                    )
+                })?;
+                DatasetBuilder::from_uri(&uri)
+            };
+        builder = builder.with_read_params(params);
 
         if let Some(ver) = version {
             if let Ok(i) = ver.downcast::<PyInt>() {
@@ -576,8 +600,6 @@ impl Dataset {
                 ));
             };
         }
-        // Save a copy of storage options for potential namespace-based credential refresh
-        let initial_storage_options = storage_options.clone();
 
         if let Some(mut storage_options) = storage_options {
             if let Some(user_agent) = storage_options.get_mut("user_agent") {
@@ -599,47 +621,16 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        // Set up namespace-based features if namespace_client and table_id are provided
-        if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-            let ns_client = extract_namespace_arc(py, ns_client)?;
-            let namespace_client_table_context = namespace_client_table_context
-                .map(|c| extract_namespace_client_table_context(c))
-                .transpose()?;
-
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
-            );
-            let initial_opts = namespace_client_table_context
-                .as_ref()
-                .and_then(|c| c.storage_options.clone())
-                .or(initial_storage_options.clone())
-                .unwrap_or_default();
-            let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                initial_opts, provider,
-            ));
-            builder = builder.with_storage_options_accessor(accessor);
-
-            if namespace_client_table_context
-                .as_ref()
-                .is_some_and(|c| c.managed_versioning)
-            {
-                let external_store =
-                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
-                let commit_handler: Arc<dyn CommitHandler> =
-                    Arc::new(ExternalManifestCommitHandler {
-                        external_manifest_store: Arc::new(external_store),
-                    });
-                builder = builder.with_commit_handler(commit_handler);
-            }
-        }
-
         let dataset = rt().block_on(Some(py), builder.load())?;
 
         match dataset {
-            Ok(ds) => Ok(Self {
-                uri,
-                ds: Arc::new(ds),
-            }),
+            Ok(ds) => {
+                let resolved_uri = ds.uri().to_string();
+                Ok(Self {
+                    uri: resolved_uri,
+                    ds: Arc::new(ds),
+                })
+            }
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
@@ -3321,29 +3312,77 @@ impl Dataset {
 #[pyfunction(name = "_write_dataset")]
 pub fn write_dataset(
     reader: &Bound<'_, PyAny>,
-    dest: PyWriteDest,
+    dest: Option<PyWriteDest>,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
-    let ds = if reader.is_instance_of::<Scanner>() {
-        let scanner: Scanner = reader.extract()?;
-        let batches = rt()
-            .block_on(Some(py), scanner.to_reader())?
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        rt().block_on(
-            Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?
+    let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
+    let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+    let namespace_client_table_context_opt =
+        get_dict_opt::<Bound<PyAny>>(options, "namespace_client_table_context")?;
+
+    let ds = if let (Some(ns_client), Some(table_id)) =
+        (namespace_client_opt.as_ref(), table_id_opt.as_ref())
+    {
+        let ns_client = extract_namespace_arc(py, ns_client)?;
+        let namespace_client_table_context = namespace_client_table_context_opt
+            .map(|c| extract_namespace_client_table_context(&c))
+            .transpose()?;
+
+        if reader.is_instance_of::<Scanner>() {
+            let scanner: Scanner = reader.extract()?;
+            let batches = rt()
+                .block_on(Some(py), scanner.to_reader())?
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write_into_namespace(
+                    batches,
+                    ns_client,
+                    table_id.clone(),
+                    namespace_client_table_context.as_ref(),
+                    params,
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        } else {
+            let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write_into_namespace(
+                    batches,
+                    ns_client,
+                    table_id.clone(),
+                    namespace_client_table_context.as_ref(),
+                    params,
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        }
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        rt().block_on(
-            Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?
+        let dest = dest.ok_or_else(|| {
+            PyValueError::new_err("dest is required when namespace_client is not provided")
+        })?;
+        if reader.is_instance_of::<Scanner>() {
+            let scanner: Scanner = reader.extract()?;
+            let batches = rt()
+                .block_on(Some(py), scanner.to_reader())?
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write(batches, dest.as_dest(), params),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        } else {
+            let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write(batches, dest.as_dest(), params),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        }
     };
     Ok(Dataset {
         uri: ds.uri().to_string(),
@@ -3421,34 +3460,7 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
 
-        let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
-        let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
-        let namespace_client_table_context_opt =
-            get_dict_opt::<Bound<PyAny>>(options, "namespace_client_table_context")?;
-        let namespace_client_table_context = namespace_client_table_context_opt
-            .map(|c| extract_namespace_client_table_context(&c))
-            .transpose()?;
-
-        if let (Some(ns_client), Some(table_id)) =
-            (namespace_client_opt.as_ref(), table_id_opt.as_ref())
-        {
-            let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
-            );
-            let initial_opts = namespace_client_table_context
-                .as_ref()
-                .and_then(|c| c.storage_options.clone())
-                .or(storage_options.clone())
-                .unwrap_or_default();
-            let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                initial_opts, provider,
-            ));
-            p.store_params = Some(ObjectStoreParams {
-                storage_options_accessor: Some(accessor),
-                ..Default::default()
-            });
-        } else if let Some(so) = storage_options.clone() {
+        if let Some(so) = storage_options {
             let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
             p.store_params = Some(ObjectStoreParams {
                 storage_options_accessor: Some(accessor),
@@ -3544,22 +3556,6 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 new_props.insert(key, value);
             }
             p.transaction_properties = Some(Arc::new(new_props));
-        }
-
-        if p.commit_handler.is_none()
-            && namespace_client_table_context
-                .as_ref()
-                .is_some_and(|c| c.managed_versioning)
-            && let (Some(ns_client), Some(table_id)) =
-                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
-        {
-            let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            p.commit_handler = Some(commit_handler);
         }
 
         Some(p)

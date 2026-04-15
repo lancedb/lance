@@ -550,7 +550,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def __init__(
         self,
-        uri: Union[str, Path],
+        uri: Optional[Union[str, Path]] = None,
         version: Optional[int | str] = None,
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
@@ -570,7 +570,6 @@ class LanceDataset(pa.dataset.Dataset):
         ] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
-        self._uri = uri
         self._storage_options = storage_options
 
         if index_cache_size is not None:
@@ -603,6 +602,8 @@ class LanceDataset(pa.dataset.Dataset):
             table_id=table_id,
             namespace_client_table_context=namespace_client_table_context,
         )
+        self._uri = self._ds.uri
+        self._storage_options = storage_options
         self._default_scan_options = default_scan_options
         self._read_params = read_params
 
@@ -6445,40 +6446,6 @@ def write_dataset(
             raise ValueError(
                 "Both 'namespace_client' and 'table_id' must be provided together."
             )
-
-        if has_context:
-            uri = namespace_client_table_context.location
-        else:
-            from .namespace import (
-                DeclareTableRequest,
-                DescribeTableRequest,
-            )
-
-            if mode == "create":
-                declare_request = DeclareTableRequest(id=table_id, location=None)
-                response = namespace_client.declare_table(declare_request)
-            elif mode in ("append", "overwrite"):
-                request = DescribeTableRequest(id=table_id, version=None)
-                response = namespace_client.describe_table(request)
-            else:
-                raise ValueError(f"Invalid mode: {mode}")
-
-            uri = response.location
-            if not uri:
-                raise ValueError(
-                    f"Namespace did not return a table location in {mode} response"
-                )
-
-            from .namespace import NamespaceClientTableContext
-
-            if mode == "create":
-                namespace_client_table_context = (
-                    NamespaceClientTableContext.from_declare_table_response(response)
-                )
-            else:
-                namespace_client_table_context = (
-                    NamespaceClientTableContext.from_describe_table_response(response)
-                )
     elif table_id is not None:
         raise ValueError(
             "Both 'namespace_client' and 'table_id' must be provided together."
@@ -6538,7 +6505,7 @@ def write_dataset(
         uri = os.fspath(uri)
     elif isinstance(uri, LanceDataset):
         uri = uri._ds
-    elif not isinstance(uri, str):
+    elif uri is not None and not isinstance(uri, str):
         raise TypeError(f"dest must be a str, Path, or LanceDataset. Got {type(uri)}")
 
     inner_ds = _write_dataset(reader, uri, params)

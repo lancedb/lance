@@ -14,10 +14,6 @@
 package org.lance;
 
 import org.lance.namespace.LanceNamespace;
-import org.lance.namespace.model.DeclareTableRequest;
-import org.lance.namespace.model.DeclareTableResponse;
-import org.lance.namespace.model.DescribeTableRequest;
-import org.lance.namespace.model.DescribeTableResponse;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -384,10 +380,6 @@ public class WriteDatasetBuilder {
               + "Use only one of: reader(), stream(), or schema().");
     }
 
-    if (hasContext) {
-      return executeWithContext();
-    }
-
     if (hasNamespaceClient) {
       return executeWithNamespaceClient();
     }
@@ -395,62 +387,7 @@ public class WriteDatasetBuilder {
     return executeWithUri();
   }
 
-  private Dataset executeWithContext() {
-    NamespaceClientTableContext namespaceClientTableContext = this.namespaceClientTableContext;
-
-    WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
-
-    maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
-    maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
-    maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
-    enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
-    dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    initialBases.ifPresent(paramsBuilder::withInitialBases);
-    targetBases.ifPresent(paramsBuilder::withTargetBases);
-    allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
-    blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
-
-    WriteParams params = paramsBuilder.build();
-
-    return createDatasetWithStreamAndNamespaceClient(
-        namespaceClientTableContext.getLocation(),
-        params,
-        namespaceClient,
-        tableId,
-        namespaceClientTableContext);
-  }
-
   private Dataset executeWithNamespaceClient() {
-    String tableUri;
-    NamespaceClientTableContext namespaceClientTableContext;
-
-    if (mode == WriteParams.WriteMode.CREATE) {
-      DeclareTableRequest declareRequest = new DeclareTableRequest();
-      declareRequest.setId(tableId);
-      DeclareTableResponse declareResponse = namespaceClient.declareTable(declareRequest);
-
-      tableUri = declareResponse.getLocation();
-      if (tableUri == null || tableUri.isEmpty()) {
-        throw new IllegalArgumentException("Namespace client did not return a table location");
-      }
-
-      namespaceClientTableContext =
-          NamespaceClientTableContext.fromDeclareTableResponse(declareResponse);
-    } else {
-      DescribeTableRequest request = new DescribeTableRequest();
-      request.setId(tableId);
-
-      DescribeTableResponse response = namespaceClient.describeTable(request);
-
-      tableUri = response.getLocation();
-      if (tableUri == null || tableUri.isEmpty()) {
-        throw new IllegalArgumentException("Namespace client did not return a table location");
-      }
-
-      namespaceClientTableContext = NamespaceClientTableContext.fromDescribeTableResponse(response);
-    }
-
     WriteParams.Builder paramsBuilder =
         new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
 
@@ -459,7 +396,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
     allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
@@ -468,7 +404,7 @@ public class WriteDatasetBuilder {
     WriteParams params = paramsBuilder.build();
 
     return createDatasetWithStreamAndNamespaceClient(
-        tableUri, params, namespaceClient, tableId, namespaceClientTableContext);
+        null, params, namespaceClient, tableId, namespaceClientTableContext);
   }
 
   private Dataset executeWithUri() {
