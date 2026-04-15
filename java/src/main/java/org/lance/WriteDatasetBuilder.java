@@ -20,7 +20,6 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -452,18 +451,7 @@ public class WriteDatasetBuilder {
     }
 
     if (schema != null) {
-      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
-          ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
-        Data.exportArrayStream(allocator, root, tempStream);
-        return Dataset.create(
-            allocator,
-            tempStream,
-            path,
-            params,
-            namespaceClient,
-            tableId,
-            namespaceClientTableContext);
-      }
+      return Dataset.create(allocator, path, schema, new WriteParams.Builder().build());
     }
 
     throw new IllegalStateException("No data source provided");

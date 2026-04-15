@@ -31,7 +31,8 @@ import java.util.Map;
  *
  * <pre>{@code
  * DescribeTableResponse response = namespaceClient.describeTable(request);
- * NamespaceClientTableContext namespaceClientTableContext = NamespaceClientTableContext.fromDescribeTableResponse(response);
+ * NamespaceClientTableContext namespaceClientTableContext =
+ *     NamespaceClientTableContext.fromDescribeTableResponse(response);
  *
  * Dataset dataset = Dataset.open()
  *     .namespaceClient(namespaceClient)

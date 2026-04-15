@@ -565,9 +565,7 @@ class LanceDataset(pa.dataset.Dataset):
         session: Optional[Session] = None,
         namespace_client: Optional[Any] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            "NamespaceClientTableContext"
-        ] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._storage_options = storage_options
@@ -677,9 +675,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
-        ds._namespace_client_table_context = (
-            self._namespace_client_table_context
-        )
+        ds._namespace_client_table_context = self._namespace_client_table_context
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params.copy() if self._read_params else None
@@ -3849,9 +3845,7 @@ class LanceDataset(pa.dataset.Dataset):
         enable_stable_row_ids: Optional[bool] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            "NamespaceClientTableContext"
-        ] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -6424,9 +6418,7 @@ def write_dataset(
     has_context = namespace_client_table_context is not None
 
     if has_uri and has_namespace:
-        raise ValueError(
-            "Cannot specify both 'uri' and 'namespace_client'/'table_id'."
-        )
+        raise ValueError("Cannot specify both 'uri' and 'namespace_client'/'table_id'.")
     if has_uri and has_context:
         raise ValueError(
             "Cannot specify both 'uri' and 'namespace_client_table_context'."
@@ -6437,9 +6429,7 @@ def write_dataset(
             "'table_id' to be provided."
         )
     if not has_uri and not has_namespace:
-        raise ValueError(
-            "Must specify either 'uri' or 'namespace_client'+'table_id'."
-        )
+        raise ValueError("Must specify either 'uri' or 'namespace_client'+'table_id'.")
 
     if namespace_client is not None:
         if table_id is None:

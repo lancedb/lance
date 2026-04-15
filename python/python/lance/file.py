@@ -71,9 +71,7 @@ class LanceFileReader:
         *,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            "NamespaceClientTableContext"
-        ] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
         _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
@@ -230,9 +228,7 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            "NamespaceClientTableContext"
-        ] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
     ):
         """
         Creates a new file session
@@ -410,9 +406,7 @@ class LanceFileWriter:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            "NamespaceClientTableContext"
-        ] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
         max_page_bytes: Optional[int] = None,
         _inner_writer: Optional[_LanceFileWriter] = None,
         **kwargs,

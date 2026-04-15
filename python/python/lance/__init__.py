@@ -192,9 +192,7 @@ def dataset(
     has_context = namespace_client_table_context is not None
 
     if has_uri and has_namespace:
-        raise ValueError(
-            "Cannot specify both 'uri' and 'namespace_client'/'table_id'."
-        )
+        raise ValueError("Cannot specify both 'uri' and 'namespace_client'/'table_id'.")
     if has_uri and has_context:
         raise ValueError(
             "Cannot specify both 'uri' and 'namespace_client_table_context'."
@@ -205,9 +203,7 @@ def dataset(
             "'table_id' to be provided."
         )
     if not has_uri and not has_namespace:
-        raise ValueError(
-            "Must specify either 'uri' or 'namespace_client'+'table_id'."
-        )
+        raise ValueError("Must specify either 'uri' or 'namespace_client'+'table_id'.")
 
     if namespace_client is not None:
         if table_id is None:

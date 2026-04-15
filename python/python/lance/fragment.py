@@ -348,9 +348,7 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            "NamespaceClientTableContext"
-        ] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -1013,9 +1011,7 @@ if TYPE_CHECKING:
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            NamespaceClientTableContext
-        ] = None,
+        namespace_client_table_context: Optional[NamespaceClientTableContext] = None,
     ) -> Transaction: ...
 
     @overload
@@ -1038,9 +1034,7 @@ if TYPE_CHECKING:
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_table_context: Optional[
-            NamespaceClientTableContext
-        ] = None,
+        namespace_client_table_context: Optional[NamespaceClientTableContext] = None,
     ) -> List[FragmentMetadata]: ...
 
 

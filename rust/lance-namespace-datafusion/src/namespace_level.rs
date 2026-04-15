@@ -119,6 +119,7 @@ impl NamespaceLevel {
         DatasetBuilder::from_namespace(
             Arc::clone(&self.root),
             self.child_id(table_name.to_string()),
+            None,
         )
         .await?
         .load()

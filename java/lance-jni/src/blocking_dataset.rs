@@ -400,6 +400,98 @@ pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
     JObject::null()
 }
 
+///////////////////
+// Write Methods //
+///////////////////
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    arrow_schema_addr: jlong,
+    path: JString,
+    max_rows_per_file: JObject,
+    max_rows_per_group: JObject,
+    max_bytes_per_file: JObject,
+    mode: JObject,
+    enable_stable_row_ids: JObject,
+    data_storage_version: JObject,
+    enable_v2_manifest_paths: JObject,
+    storage_options_obj: JObject,
+    initial_bases: JObject,
+    target_bases: JObject,
+    allow_external_blob_outside_bases: JObject,
+    blob_pack_file_size_threshold: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_with_ffi_schema(
+            &mut env,
+            arrow_schema_addr,
+            path,
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            mode,
+            enable_stable_row_ids,
+            data_storage_version,
+            enable_v2_manifest_paths,
+            storage_options_obj,
+            initial_bases,
+            target_bases,
+            allow_external_blob_outside_bases,
+            blob_pack_file_size_threshold,
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_create_with_ffi_schema<'local>(
+    env: &mut JNIEnv<'local>,
+    arrow_schema_addr: jlong,
+    path: JString,
+    max_rows_per_file: JObject,
+    max_rows_per_group: JObject,
+    max_bytes_per_file: JObject,
+    mode: JObject,
+    enable_stable_row_ids: JObject,
+    data_storage_version: JObject,
+    enable_v2_manifest_paths: JObject,
+    storage_options_obj: JObject,
+    initial_bases: JObject,
+    target_bases: JObject,
+    allow_external_blob_outside_bases: JObject,
+    blob_pack_file_size_threshold: JObject,
+) -> Result<JObject<'local>> {
+    use arrow::ffi::FFI_ArrowSchema;
+    use arrow_schema::Schema;
+    use std::iter::empty;
+
+    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let schema = Schema::try_from(&c_schema)?;
+
+    let reader = arrow::record_batch::RecordBatchIterator::new(empty(), Arc::new(schema));
+    create_dataset(
+        env,
+        path,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        mode,
+        enable_stable_row_ids,
+        data_storage_version,
+        enable_v2_manifest_paths,
+        storage_options_obj,
+        initial_bases,
+        target_bases,
+        allow_external_blob_outside_bases,
+        blob_pack_file_size_threshold,
+        reader,
+        None,
+        None,
+    )
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeMigrateManifestPathsV2(
     mut env: JNIEnv,
