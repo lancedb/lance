@@ -117,6 +117,11 @@ replace = 'lance-testing = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-tokenizer = {{ version = "={current_version}"'
+replace = 'lance-tokenizer = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'fsst = {{ version = "={current_version}"'
 replace = 'fsst = {{ version = "={new_version}"'
 
@@ -145,4 +150,3 @@ replace = 'version = "{new_version}"'
 filename = "java/pom.xml"
 search = "<version>{current_version}</version>"
 replace = "<version>{new_version}</version>"
-
