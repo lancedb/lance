@@ -32,6 +32,7 @@ async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
 byteorder.workspace = true
+crc32fast = "1.5"
 bytes.workspace = true
 chrono.workspace = true
 deepsize.workspace = true

@@ -10,6 +10,7 @@ use arrow_array::{PrimitiveArray, UInt32Array};
 
 use lance_core::{Error, Result};
 
+pub mod data_cache;
 pub mod encodings;
 pub mod ffi;
 pub mod local;

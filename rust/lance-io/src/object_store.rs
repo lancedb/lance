@@ -39,7 +39,7 @@ pub mod providers;
 pub mod storage_options;
 pub mod throttle;
 mod tracing;
-use crate::object_reader::SmallReader;
+use crate::object_reader::{CachedObjectReader, SmallReader};
 use crate::object_writer::{LocalWriter, WriteResult};
 use crate::traits::Writer;
 use crate::utils::tracking_store::{IOTracker, IoStats};
@@ -132,6 +132,10 @@ pub struct ObjectStore {
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
+    /// Optional data cache shared across all readers opened from this store.
+    pub data_cache: Option<Arc<dyn crate::data_cache::DataCache>>,
+    /// When true, every cache hit is re-verified against the object store.
+    pub data_cache_verify: bool,
     /// The datastore prefix that uniquely identifies this object store. It encodes information
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
@@ -466,6 +470,8 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                data_cache: None,
+                data_cache_verify: false,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -530,6 +536,20 @@ impl ObjectStore {
             .now_or_never()
             .unwrap()
             .unwrap()
+    }
+
+    /// Attach a data cache to this object store.
+    ///
+    /// All [`CloudObjectReader`]s opened from this store will use the cache to
+    /// serve reads without hitting the remote object store on a hit.
+    pub fn with_data_cache(mut self, cache: Arc<dyn crate::data_cache::DataCache>) -> Self {
+        self.data_cache = Some(cache);
+        self
+    }
+
+    /// Return the data cache attached to this object store, if any.
+    pub fn data_cache(&self) -> Option<&Arc<dyn crate::data_cache::DataCache>> {
+        self.data_cache.as_ref()
     }
 
     /// Returns true if the object store pointed to a local file system.
@@ -597,7 +617,7 @@ impl ObjectStore {
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
-        match self.scheme.as_str() {
+        let raw: Box<dyn Reader> = match self.scheme.as_str() {
             "file" => {
                 LocalObjectReader::open_with_tracker(
                     path,
@@ -605,7 +625,7 @@ impl ObjectStore {
                     None,
                     Arc::new(self.io_tracker.clone()),
                 )
-                .await
+                .await?
             }
             #[cfg(target_os = "linux")]
             "file+uring" => {
@@ -621,7 +641,7 @@ impl ObjectStore {
                         None,
                         Arc::new(self.io_tracker.clone()),
                     )
-                    .await
+                    .await?
                 } else {
                     UringReader::open(
                         path,
@@ -629,16 +649,26 @@ impl ObjectStore {
                         None,
                         Arc::new(self.io_tracker.clone()),
                     )
-                    .await
+                    .await?
                 }
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
                 None,
                 self.download_retry_count,
-            )?)),
+            )?),
+        };
+
+        if let Some(cache) = &self.data_cache {
+            Ok(Box::new(CachedObjectReader::new(
+                Arc::from(raw),
+                cache.clone(),
+                self.data_cache_verify,
+            )))
+        } else {
+            Ok(raw)
         }
     }
 
@@ -651,15 +681,24 @@ impl ObjectStore {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
+            let small: Box<dyn crate::traits::Reader> = Box::new(SmallReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.download_retry_count,
                 known_size,
-            )));
+            ));
+            return if let Some(cache) = &self.data_cache {
+                Ok(Box::new(CachedObjectReader::new(
+                    Arc::from(small),
+                    cache.clone(),
+                    self.data_cache_verify,
+                )))
+            } else {
+                Ok(small)
+            };
         }
 
-        match self.scheme.as_str() {
+        let raw: Box<dyn Reader> = match self.scheme.as_str() {
             "file" => {
                 LocalObjectReader::open_with_tracker(
                     path,
@@ -667,7 +706,7 @@ impl ObjectStore {
                     Some(known_size),
                     Arc::new(self.io_tracker.clone()),
                 )
-                .await
+                .await?
             }
             #[cfg(target_os = "linux")]
             "file+uring" => {
@@ -683,7 +722,7 @@ impl ObjectStore {
                         Some(known_size),
                         Arc::new(self.io_tracker.clone()),
                     )
-                    .await
+                    .await?
                 } else {
                     UringReader::open(
                         path,
@@ -691,16 +730,26 @@ impl ObjectStore {
                         Some(known_size),
                         Arc::new(self.io_tracker.clone()),
                     )
-                    .await
+                    .await?
                 }
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
                 Some(known_size),
                 self.download_retry_count,
-            )?)),
+            )?),
+        };
+
+        if let Some(cache) = &self.data_cache {
+            Ok(Box::new(CachedObjectReader::new(
+                Arc::from(raw),
+                cache.clone(),
+                self.data_cache_verify,
+            )))
+        } else {
+            Ok(raw)
         }
     }
 
@@ -1045,6 +1094,8 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            data_cache: None,
+            data_cache_verify: false,
         }
     }
 }

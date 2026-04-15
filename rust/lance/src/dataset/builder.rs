@@ -13,6 +13,7 @@ use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
+use lance_io::data_cache::{DataCacheConfig, TieredDataCache};
 use lance_io::object_store::{
     DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
     ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
@@ -630,20 +631,42 @@ impl DatasetBuilder {
         }
 
         let index_cache_backend = self.index_cache_backend.take();
+
+        // Parse data cache config from the merged storage options before the
+        // object store consumes them.  Keys are Lance-specific and not forwarded
+        // to cloud SDKs.
+        let data_cache_config = self
+            .options
+            .storage_options()
+            .and_then(DataCacheConfig::from_storage_options);
+
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
-            None => match index_cache_backend {
-                Some(backend) => Arc::new(Session::with_index_cache_backend(
-                    backend,
-                    self.metadata_cache_size_bytes,
-                    Default::default(),
-                )),
-                None => Arc::new(Session::new(
-                    self.index_cache_size_bytes,
-                    self.metadata_cache_size_bytes,
-                    Default::default(),
-                )),
-            },
+            None => {
+                let s = match index_cache_backend {
+                    Some(backend) => Session::with_index_cache_backend(
+                        backend,
+                        self.metadata_cache_size_bytes,
+                        Default::default(),
+                    ),
+                    None => Session::new(
+                        self.index_cache_size_bytes,
+                        self.metadata_cache_size_bytes,
+                        Default::default(),
+                    ),
+                };
+                // Attach data cache when configured.
+                let s = if let Some(cfg) = data_cache_config {
+                    let data_cache = TieredDataCache::new(&cfg).await.map_err(|e| {
+                        Error::invalid_input(format!("failed to initialise data cache: {e}"))
+                    })?;
+                    s.with_data_cache(data_cache)
+                     .with_data_cache_verify(cfg.verify)
+                } else {
+                    s
+                };
+                std::sync::Arc::new(s)
+            }
         };
 
         let target_ref = self.version.clone();
@@ -656,7 +679,22 @@ impl DatasetBuilder {
         let store_params = self.options.clone();
         let base_store_params = (!self.base_store_params.is_empty())
             .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let (mut object_store, base_path, commit_handler) = self.build_object_store().await?;
+
+        // Wire the session's data cache into the object store so that every
+        // CloudObjectReader opened from this store transparently serves cached
+        // byte ranges — no per-scanner wiring needed.
+        //
+        // Note: `Arc::get_mut` would fail here because the ObjectStoreRegistry
+        // keeps a weak reference to the store. We clone the ObjectStore value
+        // (cheap — all heavy fields are Arc-wrapped) to get an exclusive copy
+        // with the cache set.
+        if let Some(cache) = session.data_cache.as_ref() {
+            let mut store_with_cache = (*object_store).clone();
+            store_with_cache.data_cache = Some(cache.clone());
+            store_with_cache.data_cache_verify = session.data_cache_verify;
+            object_store = Arc::new(store_with_cache);
+        }
 
         // Two cases that need to check out after loading the manifest:
         // 1. If the target is configured as a branch, we need to check the branch field in the manifest
