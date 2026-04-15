@@ -133,14 +133,12 @@ public class DatasetTest {
 
       // Test LEGACY version
       String legacyPath = tempDir.resolve("legacy_version").toString();
+      WriteParams legacyParams =
+          new WriteParams.Builder()
+              .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_LEGACY)
+              .build();
       try (Dataset legacyDataset =
-          Dataset.write()
-              .allocator(allocator)
-              .uri(legacyPath)
-              .schema(testDataset.getSchema())
-              .mode(WriteParams.WriteMode.CREATE)
-              .dataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_LEGACY)
-              .execute()) {
+          Dataset.create(allocator, legacyPath, testDataset.getSchema(), legacyParams)) {
         assertEquals(
             LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
       }

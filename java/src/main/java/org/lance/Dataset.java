@@ -120,9 +120,12 @@ public class Dataset implements Closeable {
   /**
    * Creates an empty dataset with the given schema.
    *
-   * @deprecated Use {@link #write()} builder instead.
+   * @param allocator the buffer allocator
+   * @param path dataset uri
+   * @param schema dataset schema
+   * @param params write params
+   * @return Dataset
    */
-  @Deprecated
   public static Dataset create(
       BufferAllocator allocator, String path, Schema schema, WriteParams params) {
     Preconditions.checkNotNull(allocator);
@@ -168,54 +171,29 @@ public class Dataset implements Closeable {
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold);
 
-  /**
-   * Create a dataset with given stream.
-   *
-   * @deprecated Use {@link #write()} builder instead.
-   */
-  @Deprecated
+  /** Create a dataset with given stream. */
   public static Dataset create(
       BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
     return create(allocator, stream, path, params, null, null, null);
   }
 
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @deprecated Use {@link #open()} builder instead.
-   */
-  @Deprecated
+  /** Open a dataset from the specified path. */
   public static Dataset open(String path) {
     return open(
         new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
   }
 
-  /**
-   * Open a dataset from the specified path with options.
-   *
-   * @deprecated Use {@link #open()} builder instead.
-   */
-  @Deprecated
+  /** Open a dataset from the specified path with options. */
   public static Dataset open(String path, ReadOptions options) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
   }
 
-  /**
-   * Open a dataset from the specified path with allocator.
-   *
-   * @deprecated Use {@link #open()} builder instead.
-   */
-  @Deprecated
+  /** Open a dataset from the specified path with allocator. */
   public static Dataset open(String path, BufferAllocator allocator) {
     return open(allocator, path, new ReadOptions.Builder().build());
   }
 
-  /**
-   * Open a dataset from the specified path with allocator and options.
-   *
-   * @deprecated Use {@link #open()} builder instead.
-   */
-  @Deprecated
+  /** Open a dataset from the specified path with allocator and options. */
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
     return open(allocator, false, path, options, null);
   }
