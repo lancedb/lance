@@ -168,20 +168,32 @@ impl BlockingDataset {
         };
 
         let mut builder = if let (Some(namespace_client), Some(tid)) = (namespace, table_id) {
-            RT.block_on(DatasetBuilder::from_namespace(
+            // from_namespace sets up storage_options_accessor and commit_handler.
+            // Apply read params first on a temp builder so from_namespace's setup
+            // takes precedence (with_read_params overwrites store_options).
+            let mut b = RT.block_on(DatasetBuilder::from_namespace(
                 namespace_client,
                 tid,
                 namespace_client_table_context.as_ref(),
-            ))?
+            ))?;
+            b = b
+                .with_index_cache_size_bytes(params.index_cache_size_bytes)
+                .with_metadata_cache_size_bytes(params.metadata_cache_size_bytes);
+            if let Some(session) = params.session {
+                b = b.with_session(session);
+            }
+            if let Some(block_size) = block_size {
+                b = b.with_block_size(block_size as usize);
+            }
+            b
         } else {
             let uri = uri.ok_or_else(|| {
                 Error::input_error(
                     "uri is required when namespace_client is not provided".to_string(),
                 )
             })?;
-            DatasetBuilder::from_uri(uri)
+            DatasetBuilder::from_uri(uri).with_read_params(params)
         };
-        builder = builder.with_read_params(params);
 
         if let Some(ver) = version {
             builder = builder.with_version(ver);

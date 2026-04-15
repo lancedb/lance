@@ -565,22 +565,37 @@ impl Dataset {
             let namespace_client_table_context = namespace_client_table_context
                 .map(|c| extract_namespace_client_table_context(c))
                 .transpose()?;
-            rt().block_on(
-                Some(py),
-                DatasetBuilder::from_namespace(
-                    ns_client,
-                    tid.clone(),
-                    namespace_client_table_context.as_ref(),
-                ),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?
+            let mut b = rt()
+                .block_on(
+                    Some(py),
+                    DatasetBuilder::from_namespace(
+                        ns_client,
+                        tid.clone(),
+                        namespace_client_table_context.as_ref(),
+                    ),
+                )?
+                .map_err(|err| PyIOError::new_err(err.to_string()))?
+                .with_index_cache_size_bytes(params.index_cache_size_bytes)
+                .with_metadata_cache_size_bytes(params.metadata_cache_size_bytes);
+            if let Some(session) = params.session {
+                b = b.with_session(session);
+            }
+            if params.file_reader_options.is_some() {
+                // file_reader_options doesn't have a public setter, apply via with_read_params
+                // but strip store_options to preserve the namespace accessor
+                let fro_params = ReadParams {
+                    file_reader_options: params.file_reader_options,
+                    ..Default::default()
+                };
+                b = b.with_read_params(fro_params);
+            }
+            b
         } else {
             let uri = uri.ok_or_else(|| {
                 PyValueError::new_err("uri is required when namespace_client is not provided")
             })?;
-            DatasetBuilder::from_uri(&uri)
+            DatasetBuilder::from_uri(&uri).with_read_params(params)
         };
-        builder = builder.with_read_params(params);
 
         if let Some(ver) = version {
             if let Ok(i) = ver.downcast::<PyInt>() {
