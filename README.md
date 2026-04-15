@@ -26,6 +26,8 @@
 [![crates.io badge]][crates.io]
 [![Python versions badge]][Python versions]
 
+**English** | [中文](README_zh_CN.md)
+
 </p>
 </div>
 
