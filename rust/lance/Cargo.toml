@@ -119,6 +119,7 @@ geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
