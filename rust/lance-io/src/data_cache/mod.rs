@@ -42,8 +42,8 @@
 //! )
 //! ```
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -405,9 +405,9 @@ pub struct TieredDataCache {
 }
 
 impl TieredDataCache {
- /// Build a `TieredDataCache` from `config`.
- ///
- /// When the SSD tier is enabled:
+    /// Build a `TieredDataCache` from `config`.
+    ///
+    /// When the SSD tier is enabled:
     /// Build a `TieredDataCache` from `config`.
     ///
     /// When the SSD tier is enabled, an [`SsdWriter`] is wired into the memory
@@ -443,8 +443,9 @@ impl TieredDataCache {
         let ssd_writer: Option<Arc<SsdWriter>> =
             ssd.as_ref().map(|ssd_arc| SsdWriter::new(ssd_arc.clone()));
 
-        let eviction_sink: Option<Arc<dyn memory::EvictionSink>> =
-            ssd_writer.clone().map(|w| w as Arc<dyn memory::EvictionSink>);
+        let eviction_sink: Option<Arc<dyn memory::EvictionSink>> = ssd_writer
+            .clone()
+            .map(|w| w as Arc<dyn memory::EvictionSink>);
 
         let memory = memory::MemoryCache::with_eviction_sink(
             config.max_memory_bytes,
@@ -460,7 +461,7 @@ impl TieredDataCache {
         }))
     }
 
- /// Return a snapshot of the memory tier statistics.
+    /// Return a snapshot of the memory tier statistics.
     pub fn memory_stats(&self) -> memory::MemoryCacheStats {
         self.memory.stats()
     }
@@ -563,10 +564,13 @@ mod tests {
 
     #[test]
     fn test_config_absent_when_no_keys() {
- // No keys → None
+        // No keys → None
         assert!(DataCacheConfig::from_storage_options(&HashMap::new()).is_none());
- // Keys present but master switch absent → None
-        let opts = HashMap::from([(DataCacheConfig::KEY_MEMORY_BYTES.to_string(), "1000000".to_string())]);
+        // Keys present but master switch absent → None
+        let opts = HashMap::from([(
+            DataCacheConfig::KEY_MEMORY_BYTES.to_string(),
+            "1000000".to_string(),
+        )]);
         assert!(DataCacheConfig::from_storage_options(&opts).is_none());
     }
 
@@ -574,7 +578,10 @@ mod tests {
     fn test_config_memory_only() {
         let opts = HashMap::from([
             (DataCacheConfig::KEY_ENABLED.to_string(), "true".to_string()),
-            (DataCacheConfig::KEY_MEMORY_BYTES.to_string(), (512 * 1024 * 1024u64).to_string()),
+            (
+                DataCacheConfig::KEY_MEMORY_BYTES.to_string(),
+                (512 * 1024 * 1024u64).to_string(),
+            ),
         ]);
         let cfg = DataCacheConfig::from_storage_options(&opts).unwrap();
         assert_eq!(cfg.max_memory_bytes, 512 * 1024 * 1024);
@@ -585,11 +592,23 @@ mod tests {
     fn test_config_full() {
         let ssd_bytes: u64 = 100_000 * 1024 * 1024;
         let opts = HashMap::from([
-            (DataCacheConfig::KEY_ENABLED.to_string(),      "true".to_string()),
-            (DataCacheConfig::KEY_MEMORY_BYTES.to_string(), (1000 * 1024 * 1024u64).to_string()),
-            (DataCacheConfig::KEY_SSD_ENABLED.to_string(),  "true".to_string()),
-            (DataCacheConfig::KEY_SSD_DIR.to_string(),      "/mnt/nvme/cache".to_string()),
-            (DataCacheConfig::KEY_SSD_BYTES.to_string(),    ssd_bytes.to_string()),
+            (DataCacheConfig::KEY_ENABLED.to_string(), "true".to_string()),
+            (
+                DataCacheConfig::KEY_MEMORY_BYTES.to_string(),
+                (1000 * 1024 * 1024u64).to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_SSD_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_SSD_DIR.to_string(),
+                "/mnt/nvme/cache".to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_SSD_BYTES.to_string(),
+                ssd_bytes.to_string(),
+            ),
         ]);
         let cfg = DataCacheConfig::from_storage_options(&opts).unwrap();
         assert_eq!(cfg.max_memory_bytes, 1000 * 1024 * 1024);
@@ -602,11 +621,23 @@ mod tests {
         // ssd_enabled=false is stored in the struct; the constructor
         // uses it to skip SSD creation even when ssd_cache_dir is present.
         let opts = HashMap::from([
-            (DataCacheConfig::KEY_ENABLED.to_string(),      "true".to_string()),
-            (DataCacheConfig::KEY_MEMORY_BYTES.to_string(), "1073741824".to_string()),
-            (DataCacheConfig::KEY_SSD_ENABLED.to_string(),  "false".to_string()),
-            (DataCacheConfig::KEY_SSD_DIR.to_string(),      "/mnt/nvme/cache".to_string()),
-            (DataCacheConfig::KEY_SSD_BYTES.to_string(),    "107374182400".to_string()),
+            (DataCacheConfig::KEY_ENABLED.to_string(), "true".to_string()),
+            (
+                DataCacheConfig::KEY_MEMORY_BYTES.to_string(),
+                "1073741824".to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_SSD_ENABLED.to_string(),
+                "false".to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_SSD_DIR.to_string(),
+                "/mnt/nvme/cache".to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_SSD_BYTES.to_string(),
+                "107374182400".to_string(),
+            ),
         ]);
         let cfg = DataCacheConfig::from_storage_options(&opts).unwrap();
         assert!(!cfg.ssd_enabled, "ssd_enabled flag must be false");
@@ -617,8 +648,14 @@ mod tests {
     #[test]
     fn test_config_master_switch_false() {
         let opts = HashMap::from([
-            (DataCacheConfig::KEY_ENABLED.to_string(),      "false".to_string()),
-            (DataCacheConfig::KEY_MEMORY_BYTES.to_string(), "1073741824".to_string()),
+            (
+                DataCacheConfig::KEY_ENABLED.to_string(),
+                "false".to_string(),
+            ),
+            (
+                DataCacheConfig::KEY_MEMORY_BYTES.to_string(),
+                "1073741824".to_string(),
+            ),
         ]);
         assert!(DataCacheConfig::from_storage_options(&opts).is_none());
     }
@@ -638,7 +675,7 @@ mod tests {
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test/file.lance");
 
- // First call — miss, loads.
+        // First call — miss, loads.
         let result = cache
             .get_or_load(
                 &path,
@@ -650,7 +687,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, Bytes::from_static(b"hello"));
 
- // Second call — memory hit, loader not called.
+        // Second call — memory hit, loader not called.
         let result2 = cache
             .get_or_load(
                 &path,
@@ -665,15 +702,15 @@ mod tests {
         assert_eq!(cache.memory_stats().hits, 1);
     }
 
- // ── Two-tier integration tests (DISABLED_ssd equivalent) ──────
+    // ── Two-tier integration tests (DISABLED_ssd equivalent) ──────
 
- /// DISABLED_ssd — simplified two-tier data integrity
- /// test: bytes loaded from the object store are eventually persisted to
- /// SSD on memory eviction. Verifies byte-for-byte integrity across tiers.
- ///
- /// Because SSD writes are lazy (background task), the test allows a small
- /// number of object-store re-fetches for entries that haven't reached SSD
- /// yet. The primary assertion is data correctness, not tier membership.
+    /// DISABLED_ssd — simplified two-tier data integrity
+    /// test: bytes loaded from the object store are eventually persisted to
+    /// SSD on memory eviction. Verifies byte-for-byte integrity across tiers.
+    ///
+    /// Because SSD writes are lazy (background task), the test allows a small
+    /// number of object-store re-fetches for entries that haven't reached SSD
+    /// yet. The primary assertion is data correctness, not tier membership.
     #[tokio::test]
     async fn test_two_tier_ssd_fallback_data_integrity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -694,8 +731,8 @@ mod tests {
         let entry_size = 256 * 1024u64; // 256 KiB
         let n = 4u64; // 4 entries — well above the 512 KiB memory limit
 
- // Load all entries — they go to memory first. With lazy writes, SSD
- // receives them only when memory evicts (via the background channel).
+        // Load all entries — they go to memory first. With lazy writes, SSD
+        // receives them only when memory evicts (via the background channel).
         for i in 0..n {
             let pattern = Bytes::from(vec![(i * 37 % 256) as u8; entry_size as usize]);
             let p = pattern.clone();
@@ -710,13 +747,13 @@ mod tests {
                 .unwrap();
         }
 
- // Give the background SSD writer time to drain the eviction channel.
+        // Give the background SSD writer time to drain the eviction channel.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
- // Verify all entries return correct bytes regardless of which tier
- // serves them. Track re-fetches (object-store calls) — these happen
- // for entries not yet on SSD; we allow a small number since writes
- // are lazy. Data integrity is the primary assertion.
+        // Verify all entries return correct bytes regardless of which tier
+        // serves them. Track re-fetches (object-store calls) — these happen
+        // for entries not yet on SSD; we allow a small number since writes
+        // are lazy. Data integrity is the primary assertion.
         let refetch_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         for i in 0..n {
             let expected = (i * 37 % 256) as u8;
@@ -750,8 +787,8 @@ mod tests {
         tracing::debug!("two-tier test: {refetches}/{n} re-fetches from object store");
     }
 
- /// cacheStatsWithSsd: two-tier cache exposes accurate
- /// SSD statistics via the memory tier stats interface.
+    /// cacheStatsWithSsd: two-tier cache exposes accurate
+    /// SSD statistics via the memory tier stats interface.
     #[tokio::test]
     async fn test_tiered_cache_stats_accumulate() {
         let tmp = tempfile::tempdir().unwrap();
@@ -768,16 +805,11 @@ mod tests {
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test.lance");
 
- // 5 misses populate both tiers.
+        // 5 misses populate both tiers.
         for i in 0u64..5 {
             let data = Bytes::from(vec![i as u8; 4096]);
             cache
-                .get_or_load(
-                    &path,
-                    i * 4096,
-                    4096,
-                    Box::pin(async move { Ok(data) }),
-                )
+                .get_or_load(&path, i * 4096, 4096, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -786,7 +818,7 @@ mod tests {
         assert_eq!(stats.misses, 5);
         assert_eq!(stats.current_bytes, 5 * 4096);
 
- // 5 hits from memory.
+        // 5 hits from memory.
         for i in 0u64..5 {
             cache
                 .get_or_load(
@@ -901,17 +933,22 @@ mod tests {
                 ssd_max_bytes: ssd::REGION_SIZE * 2,
                 ssd_num_shards: 1,
                 verify: false,
-            ssd_crc32_enabled: false,
+                ssd_crc32_enabled: false,
             };
             let cache = TieredDataCache::new(&config).await.unwrap();
             let path = Path::from("s3://bucket/data.lance");
 
             for i in 0..4u64 {
                 let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
-                cache.get_or_load(
-                    &path, i * entry_size, entry_size,
-                    Box::pin(async move { Ok(data) }),
-                ).await.unwrap();
+                cache
+                    .get_or_load(
+                        &path,
+                        i * entry_size,
+                        entry_size,
+                        Box::pin(async move { Ok(data) }),
+                    )
+                    .await
+                    .unwrap();
             }
             cache.flush_ssd().await;
             assert!(cache.ssd.as_ref().unwrap().stats().entries_written > 0);
@@ -921,7 +958,10 @@ mod tests {
         #[cfg(unix)]
         {
             let cache_file = ssd_dir.join("cache_0.bin");
-            let f = std::fs::OpenOptions::new().write(true).open(&cache_file).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&cache_file)
+                .unwrap();
             f.write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
         }
 
@@ -942,16 +982,25 @@ mod tests {
         // Read entry 0 — SSD returns bytes, but they may be corrupted.
         // Without checksum there is no detection — caller gets whatever is on disk.
         // This is the attack surface that data_cache_check_rtt_enabled defends against.
-        let result = cache.get_or_load(
-            &path, 0, entry_size,
-            Box::pin(async move {
-                Ok(Bytes::from(vec![correct_pattern; entry_size as usize]))
-            }),
-        ).await.unwrap();
+        let result = cache
+            .get_or_load(
+                &path,
+                0,
+                entry_size,
+                Box::pin(
+                    async move { Ok(Bytes::from(vec![correct_pattern; entry_size as usize])) },
+                ),
+            )
+            .await
+            .unwrap();
 
         // The SSD returned *something* — we can't assert it's correct without checksum.
         // What we CAN assert: the SSD layer did serve a response (no panic/error).
-        assert_eq!(result.len(), entry_size as usize, "SSD should return correct length");
+        assert_eq!(
+            result.len(),
+            entry_size as usize,
+            "SSD should return correct length"
+        );
         // Document: without checksum, corruption goes undetected.
         // With data_cache_check_rtt_enabled=true the scheduler verify path catches this.
     }
@@ -984,17 +1033,22 @@ mod tests {
                 ssd_max_bytes: ssd::REGION_SIZE * 2,
                 ssd_num_shards: 1,
                 verify: false,
-            ssd_crc32_enabled: false,
+                ssd_crc32_enabled: false,
             };
             let cache = TieredDataCache::new(&config).await.unwrap();
             let path = Path::from("s3://bucket/data.lance");
 
             for i in 0..4u64 {
                 let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
-                cache.get_or_load(
-                    &path, i * entry_size, entry_size,
-                    Box::pin(async move { Ok(data) }),
-                ).await.unwrap();
+                cache
+                    .get_or_load(
+                        &path,
+                        i * entry_size,
+                        entry_size,
+                        Box::pin(async move { Ok(data) }),
+                    )
+                    .await
+                    .unwrap();
             }
             cache.flush_ssd().await;
 
@@ -1006,7 +1060,10 @@ mod tests {
         #[cfg(unix)]
         {
             let cache_file = ssd_dir.join("cache_0.bin");
-            let f = std::fs::OpenOptions::new().write(true).open(&cache_file).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&cache_file)
+                .unwrap();
             f.write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
         }
 
@@ -1026,12 +1083,17 @@ mod tests {
 
         // Step 4: read — mock loader is the "object store" source of truth.
         // verify path detects mismatch and returns source bytes (not corrupt).
-        let result = cache_v.get_or_load(
-            &path, 0, entry_size,
-            Box::pin(async move {
-                Ok(Bytes::from(vec![correct_pattern; entry_size as usize]))
-            }),
-        ).await.unwrap();
+        let result = cache_v
+            .get_or_load(
+                &path,
+                0,
+                entry_size,
+                Box::pin(
+                    async move { Ok(Bytes::from(vec![correct_pattern; entry_size as usize])) },
+                ),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), entry_size as usize);
         assert!(

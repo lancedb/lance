@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use object_store::path::Path;
 
@@ -38,8 +38,8 @@ impl FileIds {
         }
     }
 
- /// Return the stable numeric ID for `path`, registering it if this is the
- /// first time it is seen.
+    /// Return the stable numeric ID for `path`, registering it if this is the
+    /// first time it is seen.
     pub fn get_or_intern(&self, path: &Path) -> u64 {
         let key = path.as_ref();
         let mut map = self.map.lock().unwrap();

@@ -43,7 +43,9 @@ async fn create_test_dataset(uri: &str, n_rows: usize) -> Dataset {
         data_storage_version: Some(LanceFileVersion::V2_1),
         ..Default::default()
     };
-    Dataset::write(reader, uri, Some(write_params)).await.unwrap()
+    Dataset::write(reader, uri, Some(write_params))
+        .await
+        .unwrap()
 }
 
 /// Open `uri` with the given `TieredDataCache` wired into the session.
@@ -188,7 +190,11 @@ async fn test_cache_data_integrity_across_scans() {
     assert_eq!(scan1.len(), scan2.len(), "batch count mismatch");
     for (i, (b1, b2)) in scan1.iter().zip(scan2.iter()).enumerate() {
         assert_eq!(b1.schema(), b2.schema(), "batch {i}: schema mismatch");
-        assert_eq!(b1.num_rows(), b2.num_rows(), "batch {i}: row count mismatch");
+        assert_eq!(
+            b1.num_rows(),
+            b2.num_rows(),
+            "batch {i}: row count mismatch"
+        );
         for col in 0..b1.num_columns() {
             assert_eq!(
                 b1.column(col).as_ref(),
@@ -202,7 +208,10 @@ async fn test_cache_data_integrity_across_scans() {
     let total_rows: usize = scan2.iter().map(|b| b.num_rows()).sum();
     println!(
         "Data integrity: {} batches × {} rows match. hits={}, misses={}",
-        scan2.len(), total_rows, stats.hits, stats.misses
+        scan2.len(),
+        total_rows,
+        stats.hits,
+        stats.misses
     );
     assert!(stats.hits > 0, "warm scan must have cache hits");
 }

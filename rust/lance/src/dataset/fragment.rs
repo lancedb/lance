@@ -977,10 +977,7 @@ impl FileFragment {
             } else {
                 let config = SchedulerConfig::max_bandwidth(&self.dataset.object_store);
                 (
-                    ScanScheduler::new(
-                        self.dataset.object_store.clone(),
-                        config,
-                    ),
+                    ScanScheduler::new(self.dataset.object_store.clone(), config),
                     0,
                 )
             };

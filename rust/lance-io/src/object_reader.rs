@@ -187,8 +187,6 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let offset = range.start as u64;
-        let length = (range.end - range.start) as u64;
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
@@ -207,7 +205,7 @@ impl Reader for CloudObjectReader {
         Box::pin(do_get_with_outer_retry(
             self.download_retry_count,
             get_request,
-            move || format!("range {}..{}", offset, offset + length),
+            move || format!("range {:?}", range),
         ))
     }
 
@@ -341,13 +339,12 @@ impl Reader for CachedObjectReader {
             // Build a loader that fetches the range from the inner reader on cache miss.
             let inner_for_loader = inner.clone();
             let range_for_loader = range.clone();
-            let loader: BoxFuture<'static, lance_core::Result<Bytes>> =
-                Box::pin(async move {
-                    inner_for_loader
-                        .get_range(range_for_loader)
-                        .await
-                        .map_err(|e| lance_core::Error::io(e.to_string()))
-                });
+            let loader: BoxFuture<'static, lance_core::Result<Bytes>> = Box::pin(async move {
+                inner_for_loader
+                    .get_range(range_for_loader)
+                    .await
+                    .map_err(|e| lance_core::Error::io(e.to_string()))
+            });
 
             let cached = cache
                 .get_or_load_by_id(file_id, offset, length, loader)
@@ -359,13 +356,14 @@ impl Reader for CachedObjectReader {
 
             if verify {
                 // Re-fetch from the inner reader and compare byte-for-byte.
-                let source = inner
-                    .get_range(range)
-                    .await
-                    .map_err(|e| object_store::Error::Generic {
-                        store: "data_cache_verify",
-                        source: Box::new(e),
-                    })?;
+                let source =
+                    inner
+                        .get_range(range)
+                        .await
+                        .map_err(|e| object_store::Error::Generic {
+                            store: "data_cache_verify",
+                            source: Box::new(e),
+                        })?;
 
                 if cached != source {
                     let msg = format!(
