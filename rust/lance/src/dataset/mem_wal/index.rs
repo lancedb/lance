@@ -31,6 +31,7 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use prost::Message as _;
+use tracing::instrument;
 
 /// Row position in MemTable.
 ///
@@ -331,6 +332,7 @@ impl IndexStore {
     }
 
     /// Insert a batch into all indexes with batch position tracking.
+    #[instrument(name = "idx_insert_batch", level = "debug", skip_all, fields(num_rows = batch.num_rows(), row_offset, batch_position))]
     pub fn insert_with_batch_position(
         &self,
         batch: &RecordBatch,
@@ -378,6 +380,7 @@ impl IndexStore {
     /// For IVF-PQ indexes, this enables vectorized partition assignment and
     /// PQ encoding across all batches, improving performance through better
     /// SIMD utilization.
+    #[instrument(name = "idx_insert_batches", level = "debug", skip_all, fields(batch_count = batches.len()))]
     pub fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
         if batches.is_empty() {
             return Ok(());
@@ -419,6 +422,7 @@ impl IndexStore {
     ///
     /// Returns a map of index names to their update durations for performance tracking.
     #[allow(clippy::print_stderr)]
+    #[instrument(name = "idx_insert_batches_parallel", level = "debug", skip_all, fields(batch_count = batches.len()))]
     pub fn insert_batches_parallel(
         &self,
         batches: &[StoredBatch],

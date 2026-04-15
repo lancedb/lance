@@ -308,12 +308,16 @@ impl BlobPreprocessor {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
+        pack_file_size_threshold: Option<usize>,
     ) -> Self {
-        let pack_writer = PackWriter::new(
+        let mut pack_writer = PackWriter::new(
             object_store.clone(),
             data_dir.clone(),
             data_file_key.clone(),
         );
+        if let Some(max_bytes) = pack_file_size_threshold {
+            pack_writer.max_pack_size = max_bytes;
+        }
         let arrow_schema = arrow_schema::Schema::from(schema);
         let fields = arrow_schema.fields();
         let blob_v2_cols = fields.iter().map(|field| field.is_blob_v2()).collect();
@@ -2399,6 +2403,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         let mut blob_builder = BlobArrayBuilder::new(1);

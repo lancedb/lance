@@ -298,6 +298,11 @@ pub struct WriteParams {
 
     /// The strategy used when writing external blob URIs.
     pub external_blob_mode: ExternalBlobMode,
+
+    /// Maximum size in bytes for blob v2 pack (.blob) sidecar files.
+    /// When a pack file reaches this size, a new one is started.
+    /// If not set, defaults to 1 GiB.
+    pub blob_pack_file_size_threshold: Option<usize>,
 }
 
 impl Default for WriteParams {
@@ -325,6 +330,7 @@ impl Default for WriteParams {
             target_base_names_or_paths: None,
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
+            blob_pack_file_size_threshold: None,
         }
     }
 }
@@ -419,6 +425,14 @@ impl WriteParams {
             ..self
         }
     }
+
+    /// Set the maximum size in bytes for blob v2 pack (.blob) sidecar files.
+    pub fn with_blob_pack_file_size_threshold(self, max_bytes: usize) -> Self {
+        Self {
+            blob_pack_file_size_threshold: Some(max_bytes),
+            ..self
+        }
+    }
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -491,6 +505,7 @@ pub async fn do_write_fragments(
         params.external_blob_mode,
         source_store_registry,
         source_store_params,
+        params.blob_pack_file_size_threshold,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -999,6 +1014,7 @@ struct WriterOptions {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    blob_pack_file_size_threshold: Option<usize>,
 }
 
 async fn open_writer_with_options(
@@ -1016,6 +1032,7 @@ async fn open_writer_with_options(
         external_blob_mode,
         source_store_registry,
         source_store_params,
+        blob_pack_file_size_threshold,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -1063,6 +1080,7 @@ async fn open_writer_with_options(
                 external_blob_mode,
                 source_store_registry,
                 source_store_params,
+                blob_pack_file_size_threshold,
             ))
         } else {
             None
@@ -1105,6 +1123,7 @@ struct WriterGenerator {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    blob_pack_file_size_threshold: Option<usize>,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -1122,6 +1141,7 @@ impl WriterGenerator {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
+        blob_pack_file_size_threshold: Option<usize>,
     ) -> Self {
         Self {
             object_store,
@@ -1134,6 +1154,7 @@ impl WriterGenerator {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            blob_pack_file_size_threshold,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1167,6 +1188,7 @@ impl WriterGenerator {
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                 },
             )
             .await?
@@ -1184,6 +1206,7 @@ impl WriterGenerator {
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                 },
             )
             .await?
@@ -1820,6 +1843,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         // Create a writer
@@ -1937,6 +1961,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         // Create test batch

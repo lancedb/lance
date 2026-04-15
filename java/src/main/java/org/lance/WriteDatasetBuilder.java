@@ -78,6 +78,8 @@ public class WriteDatasetBuilder {
   private Optional<String> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
+  private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
+  private Optional<Long> blobPackFileSizeThreshold = Optional.empty();
   private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
@@ -283,6 +285,30 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Sets whether to allow external blob URIs outside registered base paths.
+   *
+   * @param allowExternalBlobOutsideBases Whether to allow external blob URIs outside bases
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder allowExternalBlobOutsideBases(boolean allowExternalBlobOutsideBases) {
+    this.allowExternalBlobOutsideBases = Optional.of(allowExternalBlobOutsideBases);
+    return this;
+  }
+
+  /**
+   * Sets the maximum size in bytes for blob v2 pack (.blob) sidecar files.
+   *
+   * <p>When a pack file reaches this size, a new one is started. If not set, defaults to 1 GiB.
+   *
+   * @param blobPackFileSizeThreshold maximum pack file size in bytes
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder blobPackFileSizeThreshold(long blobPackFileSizeThreshold) {
+    this.blobPackFileSizeThreshold = Optional.of(blobPackFileSizeThreshold);
+    return this;
+  }
+
+  /**
    * Sets the session to share caches with other datasets.
    *
    * <p>Note: For write operations, the session is currently not used during the write itself, but
@@ -414,6 +440,8 @@ public class WriteDatasetBuilder {
 
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
+    allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
+    blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
 
     WriteParams params = paramsBuilder.build();
 
@@ -446,6 +474,8 @@ public class WriteDatasetBuilder {
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
+    allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
+    blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
 
     WriteParams params = paramsBuilder.build();
 

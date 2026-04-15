@@ -15,6 +15,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
 use object_store::path::Path;
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::super::index::MemIndexConfig;
@@ -77,6 +78,7 @@ impl MemTableFlusher {
     }
 
     /// Flush the MemTable to storage (data files, indexes, bloom filter).
+    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
     pub async fn flush(&self, memtable: &MemTable, epoch: u64) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
 
@@ -134,6 +136,7 @@ impl MemTableFlusher {
     ///
     /// Returns the total number of rows written, which is needed for
     /// reversing row positions in indexes.
+    #[instrument(name = "mt_write_data_file", level = "debug", skip_all, fields(path = %path))]
     async fn write_data_file(&self, path: &Path, memtable: &MemTable) -> Result<usize> {
         use arrow_array::RecordBatchIterator;
 
@@ -180,6 +183,7 @@ impl MemTableFlusher {
     }
 
     /// Flush the MemTable to storage with indexes.
+    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
     pub async fn flush_with_indexes(
         &self,
         memtable: &MemTable,
