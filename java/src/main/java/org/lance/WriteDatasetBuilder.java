@@ -451,7 +451,7 @@ public class WriteDatasetBuilder {
     }
 
     if (schema != null) {
-      return Dataset.create(allocator, path, schema, new WriteParams.Builder().build());
+      return Dataset.create(allocator, path, schema, params);
     }
 
     throw new IllegalStateException("No data source provided");

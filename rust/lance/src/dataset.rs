@@ -814,23 +814,27 @@ impl Dataset {
             write_params.commit_handler = Some(commit_handler);
         }
 
-        if let Some(ref namespace_storage_options) = namespace_client_table_context.storage_options
         {
             let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
             );
 
-            let mut merged_options = write_params
-                .store_params
-                .as_ref()
-                .and_then(|p| p.storage_options().cloned())
-                .unwrap_or_default();
-            merged_options.extend(namespace_storage_options.clone());
-
-            let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                merged_options,
-                provider,
-            ));
+            let accessor = if let Some(ref namespace_storage_options) =
+                namespace_client_table_context.storage_options
+            {
+                let mut merged_options = write_params
+                    .store_params
+                    .as_ref()
+                    .and_then(|p| p.storage_options().cloned())
+                    .unwrap_or_default();
+                merged_options.extend(namespace_storage_options.clone());
+                Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                    merged_options,
+                    provider,
+                ))
+            } else {
+                Arc::new(StorageOptionsAccessor::with_provider(provider))
+            };
 
             let existing_params = write_params.store_params.take().unwrap_or_default();
             write_params.store_params = Some(ObjectStoreParams {
@@ -855,6 +859,9 @@ impl Dataset {
                     && let Some(accessor) = &store_params.storage_options_accessor
                 {
                     builder = builder.with_storage_options_accessor(accessor.clone());
+                }
+                if let Some(ref commit_handler) = write_params.commit_handler {
+                    builder = builder.with_commit_handler(commit_handler.clone());
                 }
                 let dataset = Arc::new(builder.load().await?);
                 Self::write(batches, dataset, Some(write_params)).await

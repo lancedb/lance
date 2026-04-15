@@ -134,14 +134,15 @@ impl DatasetBuilder {
 
         builder.storage_options_override = namespace_client_table_context.storage_options.clone();
 
-        if let Some(initial_opts) = &namespace_client_table_context.storage_options {
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
-            );
-            builder.options.storage_options_accessor = Some(Arc::new(
-                StorageOptionsAccessor::with_initial_and_provider(initial_opts.clone(), provider),
-            ));
-        }
+        let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+            LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
+        );
+        let accessor = if let Some(initial_opts) = &namespace_client_table_context.storage_options {
+            StorageOptionsAccessor::with_initial_and_provider(initial_opts.clone(), provider)
+        } else {
+            StorageOptionsAccessor::with_provider(provider)
+        };
+        builder.options.storage_options_accessor = Some(Arc::new(accessor));
 
         Ok(builder)
     }
