@@ -295,13 +295,15 @@ impl std::fmt::Debug for ManifestNamespace {
 fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option<&str>) -> Error {
     match e {
         // CommitConflict: version collision retries exhausted -> Throttled (safe to retry)
-        LanceError::CommitConflict { .. } => NamespaceError::Throttled {
-            message: format!("Too many concurrent writes, please retry later: {:?}", e),
+        // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> Throttled (safe to retry)
+        LanceError::CommitConflict { .. } | LanceError::TooMuchWriteContention { .. } => {
+            NamespaceError::Throttled {
+                message: format!("Too many concurrent writes, please retry later: {:?}", e),
+            }
+            .into()
         }
-        .into(),
-        // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
         // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification
-        LanceError::TooMuchWriteContention { .. } | LanceError::IncompatibleTransaction { .. } => {
+        LanceError::IncompatibleTransaction { .. } => {
             let message = if let Some(id) = object_id {
                 format!(
                     "Object '{}' was concurrently modified by another operation: {:?}",
