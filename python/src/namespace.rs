@@ -1512,6 +1512,13 @@ impl LanceNamespaceTrait for PyLanceNamespace {
         call_py_method(self.py_namespace.clone(), "describe_table", request).await
     }
 
+    async fn declare_table(
+        &self,
+        request: lance_namespace::models::DeclareTableRequest,
+    ) -> lance_core::Result<lance_namespace::models::DeclareTableResponse> {
+        call_py_method(self.py_namespace.clone(), "declare_table", request).await
+    }
+
     async fn describe_table_version(
         &self,
         request: DescribeTableVersionRequest,
