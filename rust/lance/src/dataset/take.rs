@@ -824,6 +824,46 @@ mod test {
         assert_eq!(struct_arr.fields()[4].name(), "blob_uri");
     }
 
+    #[tokio::test]
+    async fn test_projection_plan_accepts_unloaded_legacy_blob_schema() {
+        let mut metadata = HashMap::new();
+        metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from(vec![Some(
+                b"hello".as_slice(),
+            )]))],
+        )
+        .unwrap();
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        let mut projection = dataset.schema().project(&["blob"]).unwrap();
+        projection.fields[0].unloaded_mut();
+
+        let projection = ProjectionRequest::from_schema(projection)
+            .into_projection_plan(Arc::new(dataset))
+            .unwrap();
+
+        let output_schema = projection.output_schema().unwrap();
+        let blob_field = output_schema.field_with_name("blob").unwrap();
+        let DataType::Struct(fields) = blob_field.data_type() else {
+            panic!("expected blob output schema to be a struct, got {blob_field:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "position");
+        assert_eq!(fields[1].name(), "size");
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_take_rowid_rowaddr_with_projection_enable_stable_row_ids_projection_from_sql(
