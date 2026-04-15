@@ -424,6 +424,18 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
+def test_has_stable_row_ids_property(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+
+    stable_path = tmp_path / "stable"
+    lance.write_dataset(table, stable_path, enable_stable_row_ids=True)
+    assert lance.dataset(stable_path).has_stable_row_ids is True
+
+    non_stable_path = tmp_path / "non_stable"
+    lance.write_dataset(table, non_stable_path, enable_stable_row_ids=False)
+    assert lance.dataset(non_stable_path).has_stable_row_ids is False
+
+
 def test_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
