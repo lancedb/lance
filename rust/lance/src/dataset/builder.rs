@@ -90,64 +90,38 @@ impl DatasetBuilder {
         }
     }
 
-    /// Create a DatasetBuilder from a LanceNamespace client
+    /// Create a DatasetBuilder from a LanceNamespace client.
     ///
-    /// This will automatically fetch the table location and storage options from the namespace
-    /// client via `describe_table()`.
-    ///
-    /// Storage options from the namespace client will override any user-provided storage options
-    /// set via `.with_storage_options()`. This ensures the namespace client is always the source
-    /// of truth for storage options.
-    ///
-    /// # Arguments
-    /// * `namespace_client` - The namespace client implementation to fetch table info from
-    /// * `table_id` - The table identifier (e.g., vec!["my_table"])
-    ///
-    /// # Example
-    /// ```ignore
-    /// use lance_namespace_impls::ConnectBuilder;
-    /// use lance::dataset::DatasetBuilder;
-    ///
-    /// // Connect to a REST namespace
-    /// let namespace_client = ConnectBuilder::new("rest")
-    ///     .property("uri", "http://localhost:8080")
-    ///     .connect()
-    ///     .await?;
-    ///
-    /// // Load a dataset using storage options from namespace client
-    /// let dataset = DatasetBuilder::from_namespace(
-    ///     namespace_client,
-    ///     vec!["my_table".to_string()],
-    /// )
-    /// .await?
-    /// .load()
-    /// .await?;
-    /// ```
+    /// When `namespace_client_table_context` is `None`, calls `describe_table()`
+    /// to fetch the table location, storage options, and managed-versioning flag.
+    /// When provided, uses the cached values directly without making a namespace call.
     #[allow(deprecated)]
     pub async fn from_namespace(
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
+        namespace_client_table_context: Option<&NamespaceClientTableContext>,
     ) -> Result<Self> {
-        let request = DescribeTableRequest {
-            id: Some(table_id.clone()),
-            ..Default::default()
+        let owned_context;
+        let namespace_client_table_context = match namespace_client_table_context {
+            Some(c) => c,
+            None => {
+                let request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                };
+                let response = namespace_client
+                    .describe_table(request)
+                    .await
+                    .map_err(|e| Error::namespace_source(Box::new(e)))?;
+                owned_context = NamespaceClientTableContext::from_describe_table_response(response)
+                    .map_err(|e| Error::namespace_source(Box::new(std::io::Error::other(e))))?;
+                &owned_context
+            }
         };
 
-        let response = namespace_client
-            .describe_table(request)
-            .await
-            .map_err(|e| Error::namespace_source(Box::new(e)))?;
+        let mut builder = Self::from_uri(&namespace_client_table_context.location);
 
-        let table_uri = response.location.ok_or_else(|| {
-            Error::namespace_source(Box::new(std::io::Error::other(
-                "Table location not found in namespace response",
-            )))
-        })?;
-
-        let mut builder = Self::from_uri(&table_uri);
-
-        // Check managed_versioning flag to determine if namespace-managed commits should be used
-        if response.managed_versioning == Some(true) {
+        if namespace_client_table_context.managed_versioning {
             let external_store = LanceNamespaceExternalManifestStore::new(
                 namespace_client.clone(),
                 table_id.clone(),
@@ -158,64 +132,9 @@ impl DatasetBuilder {
             builder.commit_handler = Some(commit_handler);
         }
 
-        // Use namespace storage options if available
-        let namespace_storage_options = response.storage_options;
+        builder.storage_options_override = namespace_client_table_context.storage_options.clone();
 
-        builder.storage_options_override = namespace_storage_options.clone();
-
-        if let Some(initial_opts) = namespace_storage_options {
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
-            );
-            builder.options.storage_options_accessor = Some(Arc::new(
-                StorageOptionsAccessor::with_initial_and_provider(initial_opts, provider),
-            ));
-        }
-
-        Ok(builder)
-    }
-
-    /// Create a DatasetBuilder from a cached [`NamespaceClientTableContext`].
-    ///
-    /// Unlike [`from_namespace`](Self::from_namespace), this method does **not** make
-    /// a `describe_table` call — it uses the location, storage options, and
-    /// managed-versioning flag that were already cached in `ctx`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use lance_namespace::NamespaceClientTableContext;
-    /// use lance::dataset::DatasetBuilder;
-    ///
-    /// let dataset = DatasetBuilder::from_namespace_context(
-    ///     namespace_client,
-    ///     vec!["my_table".to_string()],
-    ///     &ctx,
-    /// )
-    /// .load()
-    /// .await?;
-    /// ```
-    #[allow(deprecated)]
-    pub fn from_namespace_context(
-        namespace_client: Arc<dyn LanceNamespace>,
-        table_id: Vec<String>,
-        ctx: &NamespaceClientTableContext,
-    ) -> Self {
-        let mut builder = Self::from_uri(&ctx.location);
-
-        if ctx.managed_versioning {
-            let external_store = LanceNamespaceExternalManifestStore::new(
-                namespace_client.clone(),
-                table_id.clone(),
-            );
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            builder.commit_handler = Some(commit_handler);
-        }
-
-        builder.storage_options_override = ctx.storage_options.clone();
-
-        if let Some(initial_opts) = &ctx.storage_options {
+        if let Some(initial_opts) = &namespace_client_table_context.storage_options {
             let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
             );
@@ -224,7 +143,7 @@ impl DatasetBuilder {
             ));
         }
 
-        builder
+        Ok(builder)
     }
 }
 

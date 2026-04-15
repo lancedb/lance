@@ -754,92 +754,56 @@ impl Dataset {
 
     /// Write into a namespace client-managed table with automatic credential vending.
     ///
-    /// For CREATE mode, calls declare_table() to initialize the table.
-    /// For other modes, calls describe_table() and opens dataset with namespace client credentials.
+    /// When `namespace_client_table_context` is `None`, calls `declare_table()`
+    /// (CREATE) or `describe_table()` (APPEND/OVERWRITE) to resolve table info.
+    /// When provided, uses the cached values directly.
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
+        namespace_client_table_context: Option<&NamespaceClientTableContext>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
-        let write_params = params.take().unwrap_or_default();
+        let mut write_params = params.take().unwrap_or_default();
 
-        match write_params.mode {
-            WriteMode::Create => {
-                let declare_request = DeclareTableRequest {
-                    id: Some(table_id.clone()),
-                    ..Default::default()
+        let owned_context;
+        let namespace_client_table_context = match namespace_client_table_context {
+            Some(c) => c,
+            None => {
+                owned_context = match write_params.mode {
+                    WriteMode::Create => {
+                        let declare_request = DeclareTableRequest {
+                            id: Some(table_id.clone()),
+                            ..Default::default()
+                        };
+                        let response = namespace_client
+                            .declare_table(declare_request)
+                            .await
+                            .map_err(|e| Error::namespace_source(Box::new(e)))?;
+                        NamespaceClientTableContext::from_declare_table_response(response).map_err(
+                            |e| Error::namespace_source(Box::new(std::io::Error::other(e))),
+                        )?
+                    }
+                    WriteMode::Append | WriteMode::Overwrite => {
+                        let request = DescribeTableRequest {
+                            id: Some(table_id.clone()),
+                            ..Default::default()
+                        };
+                        let response = namespace_client
+                            .describe_table(request)
+                            .await
+                            .map_err(|e| Error::namespace_source(Box::new(e)))?;
+                        NamespaceClientTableContext::from_describe_table_response(response)
+                            .map_err(|e| {
+                                Error::namespace_source(Box::new(std::io::Error::other(e)))
+                            })?
+                    }
                 };
-                let response = namespace_client
-                    .declare_table(declare_request)
-                    .await
-                    .map_err(|e| Error::namespace_source(Box::new(e)))?;
-
-                let ctx = NamespaceClientTableContext::from_declare_table_response(response)
-                    .map_err(|e| Error::namespace_source(Box::new(std::io::Error::other(e))))?;
-
-                Self::write_with_namespace_context(
-                    batches,
-                    namespace_client,
-                    table_id,
-                    &ctx,
-                    write_params,
-                )
-                .await
+                &owned_context
             }
-            WriteMode::Append | WriteMode::Overwrite => {
-                let request = DescribeTableRequest {
-                    id: Some(table_id.clone()),
-                    ..Default::default()
-                };
-                let response = namespace_client
-                    .describe_table(request)
-                    .await
-                    .map_err(|e| Error::namespace_source(Box::new(e)))?;
+        };
 
-                let ctx = NamespaceClientTableContext::from_describe_table_response(response)
-                    .map_err(|e| Error::namespace_source(Box::new(std::io::Error::other(e))))?;
-
-                Self::write_with_namespace_context(
-                    batches,
-                    namespace_client,
-                    table_id,
-                    &ctx,
-                    write_params,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Write into a namespace client-managed table using a cached
-    /// [`NamespaceClientTableContext`].
-    ///
-    /// Unlike [`write_into_namespace`](Self::write_into_namespace), this method
-    /// does **not** call `declare_table` or `describe_table` — it uses the
-    /// location, storage options, and managed-versioning flag already cached in
-    /// `ctx`.
-    pub async fn write_into_namespace_context(
-        batches: impl RecordBatchReader + Send + 'static,
-        namespace_client: Arc<dyn LanceNamespace>,
-        table_id: Vec<String>,
-        ctx: &NamespaceClientTableContext,
-        params: Option<WriteParams>,
-    ) -> Result<Self> {
-        let write_params = params.unwrap_or_default();
-        Self::write_with_namespace_context(batches, namespace_client, table_id, ctx, write_params)
-            .await
-    }
-
-    /// Shared implementation for writing with a [`NamespaceClientTableContext`].
-    async fn write_with_namespace_context(
-        batches: impl RecordBatchReader + Send + 'static,
-        namespace_client: Arc<dyn LanceNamespace>,
-        table_id: Vec<String>,
-        ctx: &NamespaceClientTableContext,
-        mut write_params: WriteParams,
-    ) -> Result<Self> {
-        if ctx.managed_versioning {
+        if namespace_client_table_context.managed_versioning {
             let external_store = LanceNamespaceExternalManifestStore::new(
                 namespace_client.clone(),
                 table_id.clone(),
@@ -850,7 +814,8 @@ impl Dataset {
             write_params.commit_handler = Some(commit_handler);
         }
 
-        if let Some(ref namespace_storage_options) = ctx.storage_options {
+        if let Some(ref namespace_storage_options) = namespace_client_table_context.storage_options
+        {
             let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
             );
@@ -876,10 +841,16 @@ impl Dataset {
 
         match write_params.mode {
             WriteMode::Create => {
-                Self::write(batches, ctx.location.as_str(), Some(write_params)).await
+                Self::write(
+                    batches,
+                    namespace_client_table_context.location.as_str(),
+                    Some(write_params),
+                )
+                .await
             }
             WriteMode::Append | WriteMode::Overwrite => {
-                let mut builder = DatasetBuilder::from_uri(ctx.location.as_str());
+                let mut builder =
+                    DatasetBuilder::from_uri(namespace_client_table_context.location.as_str());
                 if let Some(ref store_params) = write_params.store_params
                     && let Some(accessor) = &store_params.storage_options_accessor
                 {

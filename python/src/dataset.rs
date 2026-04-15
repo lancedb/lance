@@ -602,15 +602,14 @@ impl Dataset {
         // Set up namespace-based features if namespace_client and table_id are provided
         if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
             let ns_client = extract_namespace_arc(py, ns_client)?;
-            let ctx = namespace_client_table_context
+            let namespace_client_table_context = namespace_client_table_context
                 .map(|c| extract_namespace_client_table_context(c))
                 .transpose()?;
 
-            // Create storage options provider for credential refresh
             let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
             );
-            let initial_opts = ctx
+            let initial_opts = namespace_client_table_context
                 .as_ref()
                 .and_then(|c| c.storage_options.clone())
                 .or(initial_storage_options.clone())
@@ -620,7 +619,10 @@ impl Dataset {
             ));
             builder = builder.with_storage_options_accessor(accessor);
 
-            if ctx.as_ref().is_some_and(|c| c.managed_versioning) {
+            if namespace_client_table_context
+                .as_ref()
+                .is_some_and(|c| c.managed_versioning)
+            {
                 let external_store =
                     LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
                 let commit_handler: Arc<dyn CommitHandler> =
@@ -2306,7 +2308,7 @@ impl Dataset {
             None
         };
 
-        let ctx = namespace_client_table_context
+        let namespace_client_table_context = namespace_client_table_context
             .map(|c| extract_namespace_client_table_context(c))
             .transpose()?;
 
@@ -2317,7 +2319,9 @@ impl Dataset {
                         .into_py_any(commit_lock.py())
                         .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
                 )
-            } else if ctx.as_ref().is_some_and(|c| c.managed_versioning)
+            } else if namespace_client_table_context
+                .as_ref()
+                .is_some_and(|c| c.managed_versioning)
                 && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
             {
                 let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
@@ -3419,8 +3423,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
         let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
-        let ctx_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client_table_context")?;
-        let ctx = ctx_opt
+        let namespace_client_table_context_opt =
+            get_dict_opt::<Bound<PyAny>>(options, "namespace_client_table_context")?;
+        let namespace_client_table_context = namespace_client_table_context_opt
             .map(|c| extract_namespace_client_table_context(&c))
             .transpose()?;
 
@@ -3431,7 +3436,7 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
                 LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
             );
-            let initial_opts = ctx
+            let initial_opts = namespace_client_table_context
                 .as_ref()
                 .and_then(|c| c.storage_options.clone())
                 .or(storage_options.clone())
@@ -3542,7 +3547,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         if p.commit_handler.is_none()
-            && ctx.as_ref().is_some_and(|c| c.managed_versioning)
+            && namespace_client_table_context
+                .as_ref()
+                .is_some_and(|c| c.managed_versioning)
             && let (Some(ns_client), Some(table_id)) =
                 (namespace_client_opt.as_ref(), table_id_opt.as_ref())
         {

@@ -396,7 +396,7 @@ public class WriteDatasetBuilder {
   }
 
   private Dataset executeWithContext() {
-    NamespaceClientTableContext ctx = this.namespaceClientTableContext;
+    NamespaceClientTableContext namespaceClientTableContext = this.namespaceClientTableContext;
 
     WriteParams.Builder paramsBuilder =
         new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
@@ -414,12 +414,16 @@ public class WriteDatasetBuilder {
     WriteParams params = paramsBuilder.build();
 
     return createDatasetWithStreamAndNamespaceClient(
-        ctx.getLocation(), params, namespaceClient, tableId, ctx);
+        namespaceClientTableContext.getLocation(),
+        params,
+        namespaceClient,
+        tableId,
+        namespaceClientTableContext);
   }
 
   private Dataset executeWithNamespaceClient() {
     String tableUri;
-    NamespaceClientTableContext ctx;
+    NamespaceClientTableContext namespaceClientTableContext;
 
     if (mode == WriteParams.WriteMode.CREATE) {
       DeclareTableRequest declareRequest = new DeclareTableRequest();
@@ -431,7 +435,8 @@ public class WriteDatasetBuilder {
         throw new IllegalArgumentException("Namespace client did not return a table location");
       }
 
-      ctx = NamespaceClientTableContext.fromDeclareTableResponse(declareResponse);
+      namespaceClientTableContext =
+          NamespaceClientTableContext.fromDeclareTableResponse(declareResponse);
     } else {
       DescribeTableRequest request = new DescribeTableRequest();
       request.setId(tableId);
@@ -443,7 +448,7 @@ public class WriteDatasetBuilder {
         throw new IllegalArgumentException("Namespace client did not return a table location");
       }
 
-      ctx = NamespaceClientTableContext.fromDescribeTableResponse(response);
+      namespaceClientTableContext = NamespaceClientTableContext.fromDescribeTableResponse(response);
     }
 
     WriteParams.Builder paramsBuilder =
@@ -463,7 +468,7 @@ public class WriteDatasetBuilder {
     WriteParams params = paramsBuilder.build();
 
     return createDatasetWithStreamAndNamespaceClient(
-        tableUri, params, namespaceClient, tableId, ctx);
+        tableUri, params, namespaceClient, tableId, namespaceClientTableContext);
   }
 
   private Dataset executeWithUri() {

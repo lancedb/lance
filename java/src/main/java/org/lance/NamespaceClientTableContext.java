@@ -31,12 +31,12 @@ import java.util.Map;
  *
  * <pre>{@code
  * DescribeTableResponse response = namespaceClient.describeTable(request);
- * NamespaceClientTableContext ctx = NamespaceClientTableContext.fromDescribeTableResponse(response);
+ * NamespaceClientTableContext namespaceClientTableContext = NamespaceClientTableContext.fromDescribeTableResponse(response);
  *
  * Dataset dataset = Dataset.open()
  *     .namespaceClient(namespaceClient)
  *     .tableId(tableId)
- *     .namespaceClientTableContext(ctx)
+ *     .namespaceClientTableContext(namespaceClientTableContext)
  *     .build();
  * }</pre>
  */

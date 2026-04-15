@@ -214,7 +214,7 @@ public class OpenDatasetBuilder {
   }
 
   private Dataset buildFromContext() {
-    NamespaceClientTableContext ctx = this.namespaceClientTableContext;
+    NamespaceClientTableContext namespaceClientTableContext = this.namespaceClientTableContext;
 
     ReadOptions.Builder optionsBuilder =
         new ReadOptions.Builder()
@@ -229,12 +229,12 @@ public class OpenDatasetBuilder {
     return Dataset.open(
         allocator,
         selfManagedAllocator,
-        ctx.getLocation(),
+        namespaceClientTableContext.getLocation(),
         optionsBuilder.build(),
         session,
         namespaceClient,
         tableId,
-        ctx);
+        namespaceClientTableContext);
   }
 
   private Dataset buildFromNamespaceClient() {
@@ -251,7 +251,7 @@ public class OpenDatasetBuilder {
       throw new IllegalArgumentException("Namespace client did not return a table location");
     }
 
-    NamespaceClientTableContext ctx =
+    NamespaceClientTableContext namespaceClientTableContext =
         NamespaceClientTableContext.fromDescribeTableResponse(response);
 
     ReadOptions.Builder optionsBuilder =
@@ -272,6 +272,6 @@ public class OpenDatasetBuilder {
         session,
         namespaceClient,
         tableId,
-        ctx);
+        namespaceClientTableContext);
   }
 }

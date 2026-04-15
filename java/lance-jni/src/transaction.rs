@@ -756,8 +756,12 @@ fn inner_commit_to_dataset<'local>(
     )?;
 
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
-    let commit_handler = if ctx.as_ref().is_some_and(|c| c.managed_versioning) {
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let commit_handler = if namespace_client_table_context
+        .as_ref()
+        .is_some_and(|c| c.managed_versioning)
+    {
         namespace_info.map(|(ns, tid)| {
             let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
             Arc::new(ExternalManifestCommitHandler {
@@ -1490,7 +1494,8 @@ fn inner_commit_to_uri<'local>(
 
     // Open the read dataset using the same storage options (and provider, if any) so that
     // `convert_to_rust_transaction` can derive schema/field ids based on the target dataset.
-    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
     let mut ds = BlockingDataset::open(
         &uri_str,
@@ -1504,7 +1509,7 @@ fn inner_commit_to_uri<'local>(
         None,
         open_namespace,
         open_table_id,
-        ctx.clone(),
+        namespace_client_table_context.clone(),
     )
     .ok();
 
@@ -1534,7 +1539,9 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_skip_auto_cleanup(true);
     }
 
-    if ctx.as_ref().is_some_and(|c| c.managed_versioning)
+    if namespace_client_table_context
+        .as_ref()
+        .is_some_and(|c| c.managed_versioning)
         && let Some((namespace_client, tid)) = namespace_info
     {
         let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);

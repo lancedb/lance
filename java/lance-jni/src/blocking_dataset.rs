@@ -148,7 +148,7 @@ impl BlockingDataset {
         session: Option<Arc<LanceSession>>,
         namespace: Option<Arc<dyn LanceNamespace>>,
         table_id: Option<Vec<String>>,
-        ctx: Option<lance_namespace::NamespaceClientTableContext>,
+        namespace_client_table_context: Option<lance_namespace::NamespaceClientTableContext>,
     ) -> Result<Self> {
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
             (false, Some(provider)) => Some(Arc::new(
@@ -189,7 +189,9 @@ impl BlockingDataset {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
         }
 
-        if ctx.as_ref().is_some_and(|c| c.managed_versioning)
+        if namespace_client_table_context
+            .as_ref()
+            .is_some_and(|c| c.managed_versioning)
             && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
         {
             let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
@@ -499,7 +501,8 @@ fn inner_create_with_ffi_stream<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
 
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
     create_dataset(
         env,
@@ -518,7 +521,7 @@ fn inner_create_with_ffi_stream<'local>(
         blob_pack_file_size_threshold,
         reader,
         namespace_info,
-        ctx,
+        namespace_client_table_context,
     )
 }
 
@@ -545,7 +548,7 @@ fn create_dataset<'local>(
     blob_pack_file_size_threshold: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
-    ctx: Option<lance_namespace::NamespaceClientTableContext>,
+    namespace_client_table_context: Option<lance_namespace::NamespaceClientTableContext>,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
@@ -566,7 +569,10 @@ fn create_dataset<'local>(
     )?;
 
     if let Some((namespace, table_id)) = namespace_info {
-        if ctx.as_ref().is_some_and(|c| c.managed_versioning) {
+        if namespace_client_table_context
+            .as_ref()
+            .is_some_and(|c| c.managed_versioning)
+        {
             let external_store =
                 LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
@@ -579,7 +585,7 @@ fn create_dataset<'local>(
             LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
         );
 
-        let initial_opts = ctx
+        let initial_opts = namespace_client_table_context
             .as_ref()
             .and_then(|c| c.storage_options.clone())
             .unwrap_or_else(|| {
@@ -1185,7 +1191,8 @@ fn inner_open_native<'local>(
         None => (None, None),
     };
 
-    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
     let storage_options_provider_arc: Option<Arc<dyn StorageOptionsProvider>> =
         if let (Some(ns), Some(tid)) = (namespace.clone(), table_id.clone()) {
@@ -1209,7 +1216,7 @@ fn inner_open_native<'local>(
         session,
         namespace,
         table_id,
-        ctx,
+        namespace_client_table_context,
     )?;
     dataset.into_java(env)
 }
