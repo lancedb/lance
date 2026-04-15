@@ -28,8 +28,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 
-use std::ffi::CString;
-use std::ptr::NonNull;
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
@@ -58,6 +56,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
+use std::ffi::CString;
+use std::ptr::NonNull;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
