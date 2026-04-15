@@ -376,7 +376,7 @@ async fn test_insert_subschema() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
 
     // When reading back, columns that are missing are null
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -424,7 +424,7 @@ async fn test_insert_subschema() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 1]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0, 1]);
 
     // Can scan and get expected data.
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -480,8 +480,11 @@ async fn test_insert_nested_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[2, 1]);
-    assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[2, 1]);
+    assert_eq!(
+        fragments[0].metadata.files[0].column_indices.as_ref(),
+        &[0, 1]
+    );
 
     // Can insert c, b
     let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -508,8 +511,11 @@ async fn test_insert_nested_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(&fragments[1].metadata.files[0].fields, &[3, 2]);
-    assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1]);
+    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[3, 2]);
+    assert_eq!(
+        fragments[1].metadata.files[0].column_indices.as_ref(),
+        &[0, 1]
+    );
 
     // Can't insert a, c (b is non-nullable)
     let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -612,7 +618,7 @@ async fn test_insert_balanced_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
 
     // Insert right side
     let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
@@ -628,7 +634,7 @@ async fn test_insert_balanced_subschemas() {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(&fragments[1].metadata.files[0].fields, &[1]);
+    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[1]);
 
     let data = dataset
         .take(
@@ -860,9 +866,9 @@ async fn test_datafile_partial_replacement() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the second column in the dataset
-        fields: vec![1],
+        fields: Arc::from([1]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
@@ -886,8 +892,14 @@ async fn test_datafile_partial_replacement() {
     assert_eq!(dataset.version().version, 4);
     assert_eq!(dataset.get_fragments().len(), 1);
     assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
-    assert_eq!(dataset.get_fragments()[0].metadata.files[0].fields, vec![0]);
-    assert_eq!(dataset.get_fragments()[0].metadata.files[1].fields, vec![1]);
+    assert_eq!(
+        dataset.get_fragments()[0].metadata.files[0].fields.as_ref(),
+        &[0]
+    );
+    assert_eq!(
+        dataset.get_fragments()[0].metadata.files[1].fields.as_ref(),
+        &[1]
+    );
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -915,9 +927,9 @@ async fn test_datafile_partial_replacement() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the first column in the dataset
-        fields: vec![0],
+        fields: Arc::from([0]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
@@ -1014,9 +1026,9 @@ async fn test_datafile_replacement_error() {
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
         // the second column in the dataset
-        fields: vec![1],
+        fields: Arc::from([1]),
         // is located in the first column of this datafile
-        column_indices: vec![0],
+        column_indices: Arc::from([0]),
         file_major_version: 2,
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
@@ -1024,7 +1036,7 @@ async fn test_datafile_replacement_error() {
     };
 
     let new_data_file = DataFile {
-        fields: vec![0, 1],
+        fields: Arc::from([0, 1]),
         ..new_data_file
     };
 

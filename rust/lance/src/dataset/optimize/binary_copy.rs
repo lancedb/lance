@@ -136,9 +136,10 @@ async fn finalize_current_output_file(
     // Register the newly closed output file as a fragment data file
     let (maj, min) = version.to_numbers();
     let mut fragment = Fragment::new(0);
+    let field_column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
     let mut data_file = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-    data_file.fields = full_field_ids.to_vec();
-    data_file.column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
+    data_file.fields = full_field_ids.to_vec().into();
+    data_file.column_indices = field_column_indices.into();
     fragment.files.push(data_file);
     fragment.physical_rows = Some(total_rows_in_current as usize);
     Ok(fragment)

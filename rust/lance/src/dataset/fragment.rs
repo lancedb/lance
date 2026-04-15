@@ -1209,7 +1209,7 @@ impl FileFragment {
         let mut seen_fields = HashSet::new();
         for data_file in &self.metadata.files {
             let last = -1;
-            for field_id in &data_file.fields {
+            for field_id in data_file.fields.iter() {
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
@@ -1666,12 +1666,19 @@ impl FileFragment {
         // Mark fields in updated data files as obsolete ("tombstone").
         let updated_fields = updated_fragment.files.last().unwrap().fields.clone();
         for data_file in &mut updated_fragment.files.iter_mut().rev().skip(1) {
-            for field in &mut data_file.fields {
-                if updated_fields.contains(field) {
-                    // Tombstone these fields
-                    *field = -2;
-                }
-            }
+            let new_fields: Arc<[i32]> = data_file
+                .fields
+                .iter()
+                .map(|field| {
+                    if updated_fields.contains(field) {
+                        -2 // Tombstone
+                    } else {
+                        *field
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
+            data_file.fields = new_fields;
         }
         // Remove data files that have become entirely tombstoned.
         updated_fragment

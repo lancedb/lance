@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use super::Fragment;
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
@@ -426,7 +427,7 @@ impl Manifest {
         let fragment_max_id = self
             .fragments
             .iter()
-            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.as_slice()))
+            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.iter()))
             .max()
             .copied();
         let fragment_max_id = fragment_max_id.unwrap_or(-1);
@@ -863,10 +864,11 @@ impl TryFrom<pb::Manifest> for Manifest {
             }),
             _ => None,
         };
+        let mut interner = DataFileFieldInterner::default();
         let fragments = Arc::new(
             p.fragments
                 .into_iter()
-                .map(Fragment::try_from)
+                .map(|f| interner.intern_fragment(f))
                 .collect::<Result<Vec<_>>>()?,
         );
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());

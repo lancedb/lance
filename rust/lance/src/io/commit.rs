@@ -492,17 +492,22 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We iterate over files in reverse order so that we only map the last field id
     seen_fields.clear();
     for fragment in fragments.iter_mut() {
-        for field_id in fragment
-            .files
-            .iter_mut()
-            .rev()
-            .flat_map(|file| file.fields.iter_mut())
-        {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
-                && seen_fields.insert(*field_id)
-            {
-                *field_id = *new_field_id;
-            }
+        for file in fragment.files.iter_mut().rev() {
+            let new_fields: Arc<[i32]> = file
+                .fields
+                .iter()
+                .map(|field_id| {
+                    if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                        && seen_fields.insert(*field_id)
+                    {
+                        *new_field_id
+                    } else {
+                        *field_id
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
+            file.fields = new_fields;
         }
         seen_fields.clear();
     }

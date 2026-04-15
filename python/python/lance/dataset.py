@@ -6283,6 +6283,7 @@ def write_dataset(
     target_bases: Optional[List[str]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -6388,6 +6389,9 @@ def write_dataset(
         If False, external blob URIs must map to the dataset root or a registered
         base path. If True, external blob URIs outside registered bases are allowed.
         This option only applies when ``external_blob_mode="reference"``.
+    blob_pack_file_size_threshold: optional, int, default None
+        Maximum size in bytes for blob v2 pack (.blob) sidecar files. When a pack
+        file reaches this size, a new one is started. If not set, defaults to 1 GiB.
     namespace_client : optional, LanceNamespace
         A namespace client from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
@@ -6516,6 +6520,7 @@ def write_dataset(
         "target_bases": target_bases,
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
+        "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
     }
 
     # Add namespace_client and table_id for storage options provider and managed

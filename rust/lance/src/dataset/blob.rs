@@ -45,25 +45,23 @@ pub(super) struct ExternalBaseCandidate {
     pub base_id: u32,
     pub store_prefix: String,
     pub base_path: Path,
+    pub store_params: ObjectStoreParams,
 }
 
 #[derive(Debug)]
 pub(super) struct ExternalBaseResolver {
     candidates: Vec<ExternalBaseCandidate>,
     store_registry: Arc<ObjectStoreRegistry>,
-    store_params: ObjectStoreParams,
 }
 
 impl ExternalBaseResolver {
     pub(super) fn new(
         candidates: Vec<ExternalBaseCandidate>,
         store_registry: Arc<ObjectStoreRegistry>,
-        store_params: ObjectStoreParams,
     ) -> Self {
         Self {
             candidates,
             store_registry,
-            store_params,
         }
     }
 
@@ -71,13 +69,13 @@ impl ExternalBaseResolver {
         &self,
         uri: &str,
     ) -> Result<Option<ResolvedExternalBase>> {
-        let uri_store_prefix = self
-            .store_registry
-            .calculate_object_store_prefix(uri, self.store_params.storage_options())?;
         let uri_path = ObjectStore::extract_path_from_uri(self.store_registry.clone(), uri)?;
 
         let mut best_match: Option<(usize, ResolvedExternalBase)> = None;
         for candidate in &self.candidates {
+            let uri_store_prefix = self
+                .store_registry
+                .calculate_object_store_prefix(uri, candidate.store_params.storage_options())?;
             if candidate.store_prefix != uri_store_prefix {
                 continue;
             }
@@ -308,12 +306,16 @@ impl BlobPreprocessor {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
+        pack_file_size_threshold: Option<usize>,
     ) -> Self {
-        let pack_writer = PackWriter::new(
+        let mut pack_writer = PackWriter::new(
             object_store.clone(),
             data_dir.clone(),
             data_file_key.clone(),
         );
+        if let Some(max_bytes) = pack_file_size_threshold {
+            pack_writer.max_pack_size = max_bytes;
+        }
         let arrow_schema = arrow_schema::Schema::from(schema);
         let fields = arrow_schema.fields();
         let blob_v2_cols = fields.iter().map(|field| field.is_blob_v2()).collect();
@@ -1321,6 +1323,7 @@ fn data_file_key_from_path(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::{
@@ -1338,7 +1341,9 @@ mod tests {
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     };
     use lance_core::datatypes::BlobKind;
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+    use lance_io::object_store::{
+        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
+    };
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
     use object_store::{
@@ -1354,7 +1359,7 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::version::LanceFileVersion;
 
-    use super::{BlobFile, data_file_key_from_path};
+    use super::{BlobFile, ExternalBaseCandidate, ExternalBaseResolver, data_file_key_from_path};
     use crate::{
         Dataset,
         blob::{BlobArrayBuilder, blob_field},
@@ -1374,8 +1379,85 @@ mod tests {
         expected: Vec<u8>,
     }
 
+    #[cfg(feature = "azure")]
+    fn azure_store_params(account_name: &str) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), account_name.to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        }
+    }
+
     #[derive(Debug)]
     struct RejectEmptyRangeObjectStore;
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_external_base_resolver_uses_candidate_store_params() {
+        let store_registry = Arc::new(ObjectStoreRegistry::default());
+        let base_a = BasePath::new(
+            1,
+            "az://container/path-a".to_string(),
+            Some("base-a".to_string()),
+            false,
+        );
+        let base_b = BasePath::new(
+            2,
+            "az://container/path-b".to_string(),
+            Some("base-b".to_string()),
+            false,
+        );
+
+        let base_a_params = azure_store_params("account-a");
+        let base_b_params = azure_store_params("account-b");
+
+        let (store_a, extracted_a) =
+            ObjectStore::from_uri_and_params(store_registry.clone(), &base_a.path, &base_a_params)
+                .await
+                .unwrap();
+        let (store_b, extracted_b) =
+            ObjectStore::from_uri_and_params(store_registry.clone(), &base_b.path, &base_b_params)
+                .await
+                .unwrap();
+
+        let resolver = ExternalBaseResolver::new(
+            vec![
+                ExternalBaseCandidate {
+                    base_id: base_a.id,
+                    store_prefix: store_a.store_prefix.clone(),
+                    base_path: extracted_a,
+                    store_params: base_a_params,
+                },
+                ExternalBaseCandidate {
+                    base_id: base_b.id,
+                    store_prefix: store_b.store_prefix.clone(),
+                    base_path: extracted_b,
+                    store_params: base_b_params,
+                },
+            ],
+            store_registry,
+        );
+
+        let resolved_a = resolver
+            .resolve_external_uri("az://container/path-a/file.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved_b = resolver
+            .resolve_external_uri("az://container/path-b/file.bin")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved_a.base_id, 1);
+        assert_eq!(resolved_a.relative_path, "file.bin");
+        assert_eq!(resolved_b.base_id, 2);
+        assert_eq!(resolved_b.relative_path, "file.bin");
+    }
 
     impl std::fmt::Display for RejectEmptyRangeObjectStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2399,6 +2481,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         let mut blob_builder = BlobArrayBuilder::new(1);

@@ -115,14 +115,58 @@ impl CachedFileMetadata {
 }
 
 impl DeepSizeOf for CachedFileMetadata {
-    // TODO: include size for `column_metadatas` and `column_infos`.
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.file_schema.deep_size_of_children(context)
-            + self
-                .file_buffers
-                .iter()
-                .map(|file_buffer| file_buffer.deep_size_of_children(context))
-                .sum::<usize>()
+        let schema_size = self.file_schema.deep_size_of_children(context);
+
+        let buffers_size: usize = self
+            .file_buffers
+            .iter()
+            .map(|fb| fb.deep_size_of_children(context))
+            .sum();
+
+        // column_metadatas is Vec<pbfile::ColumnMetadata> (protobuf generated,
+        // does not implement DeepSizeOf). We use prost::Message::encoded_len()
+        // as a proxy for in-memory size. The decoded representation is typically
+        // several times larger than the wire format due to heap-allocated
+        // repeated/string/bytes fields, so we apply a 4x multiplier.
+        let column_metadatas_size: usize = self
+            .column_metadatas
+            .iter()
+            .map(|cm| cm.encoded_len() * 4)
+            .sum::<usize>()
+            + std::mem::size_of_val(self.column_metadatas.as_slice());
+
+        // column_infos is Vec<Arc<ColumnInfo>>. Each ColumnInfo contains
+        // page_infos (with protobuf PageEncoding), buffer offsets, and a
+        // column-level ColumnEncoding protobuf.
+        let column_infos_size: usize = self
+            .column_infos
+            .iter()
+            .map(|ci| {
+                let pages_size: usize = ci
+                    .page_infos
+                    .iter()
+                    .map(|pi| {
+                        let enc_size = match &pi.encoding {
+                            lance_encoding::decoder::PageEncoding::Legacy(e) => e.encoded_len() * 4,
+                            lance_encoding::decoder::PageEncoding::Structural(e) => {
+                                e.encoded_len() * 4
+                            }
+                        };
+                        enc_size
+                            + std::mem::size_of_val(pi.buffer_offsets_and_sizes.as_ref())
+                            + std::mem::size_of::<u64>() * 2 // num_rows + priority
+                    })
+                    .sum();
+                pages_size
+                    + std::mem::size_of_val(ci.buffer_offsets_and_sizes.as_ref())
+                    + ci.encoding.encoded_len() * 4
+                    + std::mem::size_of::<u32>() // index
+                    + std::mem::size_of::<usize>() * 2 // Arc overhead
+            })
+            .sum();
+
+        schema_size + buffers_size + column_metadatas_size + column_infos_size
     }
 }
 
@@ -2288,5 +2332,69 @@ mod tests {
 
         let buf = file_reader.read_global_buffer(1).await.unwrap();
         assert_eq!(buf, test_bytes);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_deep_size_of_includes_column_metadata(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        version: LanceFileVersion,
+    ) {
+        // Regression test: CachedFileMetadata::deep_size_of must account for
+        // column_metadatas and column_infos, otherwise the moka cache weigher
+        // dramatically underestimates entry sizes and never evicts, causing
+        // unbounded memory growth on random-access workloads.
+        use deepsize::DeepSizeOf;
+
+        let fs = FsFixture::default();
+        let _written = create_some_file(&fs, version).await;
+        let cache = test_cache();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = file_reader.metadata();
+        let deep_size = metadata.deep_size_of();
+
+        // The file has multiple columns (score, location, categories, binary,
+        // maybe large_bin). The deep_size_of must be substantially more than
+        // just the schema — it should include column_metadatas + column_infos.
+        // A naive implementation that ignores these fields reports < 1 KB;
+        // a correct one should report at least several KB for this test file.
+        assert!(
+            deep_size > 1024,
+            "deep_size_of ({deep_size}) is suspiciously small — \
+             column_metadatas and column_infos may not be accounted for"
+        );
+
+        // Verify column_metadatas is non-empty (sanity check).
+        assert!(
+            !metadata.column_metadatas.is_empty(),
+            "Expected non-empty column_metadatas"
+        );
+
+        // Verify the size scales with the number of columns: a file with more
+        // columns should have a larger deep_size_of.
+        let num_columns = metadata.column_metadatas.len();
+        assert!(
+            deep_size > num_columns * 50,
+            "deep_size_of ({deep_size}) should scale with column count ({num_columns})"
+        );
     }
 }

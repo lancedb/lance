@@ -2067,8 +2067,8 @@ impl Transaction {
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
                         new_frag.add_file(
                             new_file.path.clone(),
-                            new_file.fields.clone(),
-                            new_file.column_indices.clone(),
+                            new_file.fields.to_vec(),
+                            new_file.column_indices.to_vec(),
                             &LanceFileVersion::try_from_major_minor(
                                 new_file.file_major_version,
                                 new_file.file_minor_version,
@@ -3730,8 +3730,8 @@ mod tests {
         // Add a normal data file with valid field IDs
         fragment.files.push(DataFile {
             path: "normal.lance".to_string(),
-            fields: vec![1, 2, 3],
-            column_indices: vec![],
+            fields: Arc::from([1, 2, 3]),
+            column_indices: Arc::from([]),
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
@@ -3741,8 +3741,8 @@ mod tests {
         // Add a data file with all fields tombstoned
         fragment.files.push(DataFile {
             path: "all_tombstoned.lance".to_string(),
-            fields: vec![-2, -2, -2],
-            column_indices: vec![],
+            fields: Arc::from([-2, -2, -2]),
+            column_indices: Arc::from([]),
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
@@ -3752,8 +3752,8 @@ mod tests {
         // Add a data file with mixed tombstoned and valid fields
         fragment.files.push(DataFile {
             path: "mixed.lance".to_string(),
-            fields: vec![4, -2, 5],
-            column_indices: vec![],
+            fields: Arc::from([4, -2, 5]),
+            column_indices: Arc::from([]),
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
@@ -3763,8 +3763,8 @@ mod tests {
         // Add another fully tombstoned file
         fragment.files.push(DataFile {
             path: "another_tombstoned.lance".to_string(),
-            fields: vec![-2],
-            column_indices: vec![],
+            fields: Arc::from([-2_i32]),
+            column_indices: Arc::from([]),
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),

@@ -93,7 +93,7 @@ pub fn l2_scalar<
 impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        l2_distance_uint_scalar(x, y)
+        super::l2_u8::l2_u8(x, y) as f32
     }
 }
 

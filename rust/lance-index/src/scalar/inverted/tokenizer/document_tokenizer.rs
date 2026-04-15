@@ -4,8 +4,8 @@
 use arrow_schema::{DataType, Field};
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_arrow::json::JSON_EXT_NAME;
+use lance_tokenizer::{BoxTokenStream, TextAnalyzer, Token, TokenStream};
 use serde_json::Value;
-use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 /// Document type for full text search.
 #[derive(Debug, Clone)]
@@ -92,7 +92,7 @@ impl Clone for Box<dyn LanceTokenizer> {
 
 #[derive(Clone)]
 pub struct TextTokenizer {
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: TextAnalyzer,
 }
 
 impl std::fmt::Debug for TextTokenizer {
@@ -102,7 +102,7 @@ impl std::fmt::Debug for TextTokenizer {
 }
 
 impl TextTokenizer {
-    pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
+    pub fn new(tokenizer: TextAnalyzer) -> Self {
         Self { tokenizer }
     }
 }
@@ -127,11 +127,11 @@ impl LanceTokenizer for TextTokenizer {
 
 #[derive(Clone)]
 pub struct JsonTokenizer {
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: TextAnalyzer,
 }
 
 impl JsonTokenizer {
-    pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
+    pub fn new(tokenizer: TextAnalyzer) -> Self {
         Self { tokenizer }
     }
 }
@@ -170,10 +170,7 @@ impl LanceTokenizer for JsonTokenizer {
     }
 }
 
-fn flatten_triplet(
-    text: &str,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
-) -> lance_core::Result<Vec<Token>> {
+fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> lance_core::Result<Vec<Token>> {
     let mut token_vec = Vec::new();
     let mut idx = 0;
 
@@ -228,7 +225,7 @@ fn flatten_json(
     prefix: &str,
     out: &mut Vec<Token>,
     position: &mut usize,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    tokenizer: &mut TextAnalyzer,
 ) {
     match value {
         Value::Object(map) => {
@@ -306,11 +303,11 @@ impl TokenStream for TTStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::inverted::tokenizer::lance_tokenizer::{
+    use crate::scalar::inverted::tokenizer::document_tokenizer::{
         JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
+    use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
     use serde_json::Value;
-    use tantivy::tokenizer::{SimpleTokenizer, Token};
 
     #[test]
     fn test_json_tokenizer() {
@@ -321,9 +318,8 @@ mod tests {
             {"c": "e"}
           ]
         }"#;
-        let mut tokenizer = JsonTokenizer::new(
-            tantivy::tokenizer::TextAnalyzer::builder(SimpleTokenizer::default()).build(),
-        );
+        let mut tokenizer =
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build());
         let mut stream = tokenizer.token_stream_for_doc(text);
 
         let mut tokens: Vec<Token> = vec![];
@@ -354,8 +350,7 @@ mod tests {
         let value: Value = serde_json::from_str(json).unwrap();
 
         let mut tokens = vec![];
-        let mut tokenizer =
-            tantivy::tokenizer::TextAnalyzer::builder(SimpleTokenizer::default()).build();
+        let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default()).build();
         let mut position = 0;
         flatten_json(&value, "", &mut tokens, &mut position, &mut tokenizer);
 
@@ -372,8 +367,7 @@ mod tests {
     #[test]
     fn test_flatten_triplet() {
         let text = r#"a,number,1;b.c,str,d;b.c,str,e;d,str,hello world;e,number,1.0"#;
-        let mut tokenizer =
-            tantivy::tokenizer::TextAnalyzer::builder(SimpleTokenizer::default()).build();
+        let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default()).build();
         let tokens = flatten_triplet(text, &mut tokenizer).unwrap();
 
         assert_eq!(tokens.len(), 6);

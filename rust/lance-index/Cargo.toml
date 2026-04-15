@@ -45,6 +45,7 @@ lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
 lance-linalg.workspace = true
+lance-tokenizer.workspace = true
 lance-table.workspace = true
 libm.workspace = true
 log.workspace = true
@@ -60,9 +61,6 @@ serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
 smallvec = "1.15"
-tantivy.workspace = true
-lindera = { workspace = true, optional = true }
-lindera-tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
@@ -92,8 +90,10 @@ chrono.workspace = true
 [features]
 geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-schema", "dep:geo-types"]
 protoc = ["dep:protobuf-src"]
-tokenizer-lindera = ["dep:lindera", "dep:lindera-tantivy"]
-tokenizer-jieba = ["dep:jieba-rs"]
+jieba-rs = ["tokenizer-jieba"]
+lindera = ["tokenizer-lindera"]
+tokenizer-lindera = ["lance-tokenizer/tokenizer-lindera"]
+tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 
 [build-dependencies]
 prost-build.workspace = true
