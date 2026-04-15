@@ -64,15 +64,16 @@ use super::{
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
+use crate::scalar::inverted::document_tokenizer::TextTokenizer;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
@@ -4126,10 +4127,7 @@ pub async fn flat_bm25_search_stream(
     let mut tokenizer = match index {
         Some(index) => index.tokenizer(),
         None => Box::new(TextTokenizer::new(
-            tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default(),
-            )
-            .build(),
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
         )),
     };
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
@@ -4182,7 +4180,7 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::inverted::lance_tokenizer::DocType;
+    use crate::scalar::inverted::document_tokenizer::DocType;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::cache::LanceCache;
