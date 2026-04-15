@@ -291,9 +291,7 @@ def test_read_blobs(dataset_with_blobs, selection_kind, selection_values, expect
     blobs = dataset_with_blobs.read_blobs(
         "blobs",
         **kwargs,
-        target_request_bytes=1024,
-        max_gap_bytes=64,
-        max_concurrency=2,
+        io_buffer_size=1024,
         preserve_order=True,
     )
 
@@ -371,8 +369,7 @@ def test_read_blobs_accepts_empty_selection(
 @pytest.mark.parametrize(
     ("planner_kwargs", "error_message"),
     [
-        ({"target_request_bytes": 0}, "target_request_bytes must be greater than 0"),
-        ({"max_concurrency": 0}, "max_concurrency must be greater than 0"),
+        ({"io_buffer_size": 0}, "io_buffer_size must be greater than 0"),
     ],
 )
 def test_read_blobs_rejects_invalid_planner_options(

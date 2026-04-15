@@ -1950,9 +1950,7 @@ class LanceDataset(pa.dataset.Dataset):
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
         *,
-        target_request_bytes: Optional[int] = None,
-        max_gap_bytes: Optional[int] = None,
-        max_concurrency: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]:
         """
@@ -1974,15 +1972,10 @@ class LanceDataset(pa.dataset.Dataset):
             The (unstable) row addresses to read in the dataset.
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
-        target_request_bytes : int, optional
-            Target maximum size of each merged object-store read.
-        max_gap_bytes : int, optional
-            Maximum gap allowed between neighboring blob ranges when merging.
-        max_concurrency : int, optional
-            Maximum number of merged blob read tasks to execute concurrently.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing blobs.
         preserve_order : bool, optional
-            If False, Lance may reorder reads by physical layout to reduce object
-            store requests.
+            If True, returned rows follow the requested selection order.
 
         Returns
         -------
@@ -1994,9 +1987,7 @@ class LanceDataset(pa.dataset.Dataset):
         )
 
         kwargs = {
-            "target_request_bytes": target_request_bytes,
-            "max_gap_bytes": max_gap_bytes,
-            "max_concurrency": max_concurrency,
+            "io_buffer_size": io_buffer_size,
             "preserve_order": preserve_order,
         }
         if selection_kind == "ids":

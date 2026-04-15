@@ -292,27 +292,21 @@ class _Dataset:
         self,
         row_ids: List[int],
         blob_column: str,
-        target_request_bytes: Optional[int] = None,
-        max_gap_bytes: Optional[int] = None,
-        max_concurrency: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]: ...
     def read_blobs_by_addresses(
         self,
         row_addresses: List[int],
         blob_column: str,
-        target_request_bytes: Optional[int] = None,
-        max_gap_bytes: Optional[int] = None,
-        max_concurrency: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]: ...
     def read_blobs_by_indices(
         self,
         row_indices: List[int],
         blob_column: str,
-        target_request_bytes: Optional[int] = None,
-        max_gap_bytes: Optional[int] = None,
-        max_concurrency: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]: ...
     def take_scan(

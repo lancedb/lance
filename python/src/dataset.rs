@@ -131,19 +131,11 @@ fn read_blobs_to_python(
 
 fn configure_read_blobs_builder(
     mut builder: lance::dataset::ReadBlobsBuilder,
-    target_request_bytes: Option<usize>,
-    max_gap_bytes: Option<usize>,
-    max_concurrency: Option<usize>,
+    io_buffer_size: Option<u64>,
     preserve_order: Option<bool>,
 ) -> lance::dataset::ReadBlobsBuilder {
-    if let Some(bytes) = target_request_bytes {
-        builder = builder.with_target_request_bytes(bytes);
-    }
-    if let Some(bytes) = max_gap_bytes {
-        builder = builder.with_max_gap_bytes(bytes);
-    }
-    if let Some(concurrency) = max_concurrency {
-        builder = builder.with_max_concurrency(concurrency);
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
     }
     if let Some(preserve) = preserve_order {
         builder = builder.preserve_order(preserve);
@@ -1282,18 +1274,14 @@ impl Dataset {
     #[pyo3(signature=(
         row_ids,
         blob_column,
-        target_request_bytes=None,
-        max_gap_bytes=None,
-        max_concurrency=None,
+        io_buffer_size=None,
         preserve_order=None
     ))]
     fn read_blobs(
         self_: PyRef<'_, Self>,
         row_ids: Vec<u64>,
         blob_column: &str,
-        target_request_bytes: Option<usize>,
-        max_gap_bytes: Option<usize>,
-        max_concurrency: Option<usize>,
+        io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
     ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
         let builder = configure_read_blobs_builder(
@@ -1302,9 +1290,7 @@ impl Dataset {
                 .read_blobs(blob_column)
                 .infer_error()?
                 .with_row_ids(row_ids),
-            target_request_bytes,
-            max_gap_bytes,
-            max_concurrency,
+            io_buffer_size,
             preserve_order,
         );
         let blobs = rt()
@@ -1316,18 +1302,14 @@ impl Dataset {
     #[pyo3(signature=(
         row_addresses,
         blob_column,
-        target_request_bytes=None,
-        max_gap_bytes=None,
-        max_concurrency=None,
+        io_buffer_size=None,
         preserve_order=None
     ))]
     fn read_blobs_by_addresses(
         self_: PyRef<'_, Self>,
         row_addresses: Vec<u64>,
         blob_column: &str,
-        target_request_bytes: Option<usize>,
-        max_gap_bytes: Option<usize>,
-        max_concurrency: Option<usize>,
+        io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
     ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
         let builder = configure_read_blobs_builder(
@@ -1336,9 +1318,7 @@ impl Dataset {
                 .read_blobs(blob_column)
                 .infer_error()?
                 .with_row_addresses(row_addresses),
-            target_request_bytes,
-            max_gap_bytes,
-            max_concurrency,
+            io_buffer_size,
             preserve_order,
         );
         let blobs = rt()
@@ -1350,18 +1330,14 @@ impl Dataset {
     #[pyo3(signature=(
         row_indices,
         blob_column,
-        target_request_bytes=None,
-        max_gap_bytes=None,
-        max_concurrency=None,
+        io_buffer_size=None,
         preserve_order=None
     ))]
     fn read_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         blob_column: &str,
-        target_request_bytes: Option<usize>,
-        max_gap_bytes: Option<usize>,
-        max_concurrency: Option<usize>,
+        io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
     ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
         let builder = configure_read_blobs_builder(
@@ -1370,9 +1346,7 @@ impl Dataset {
                 .read_blobs(blob_column)
                 .infer_error()?
                 .with_row_indices(row_indices),
-            target_request_bytes,
-            max_gap_bytes,
-            max_concurrency,
+            io_buffer_size,
             preserve_order,
         );
         let blobs = rt()
