@@ -66,7 +66,7 @@ public class CommitBuilder {
   private Map<String, String> writeParams;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
-  private boolean namespaceClientManagedVersioning = false;
+  private NamespaceClientTableContext namespaceClientTableContext;
   private boolean enableV2ManifestPaths = true;
   private boolean detached = false;
   private Boolean useStableRowIds;
@@ -138,17 +138,14 @@ public class CommitBuilder {
   }
 
   /**
-   * Set whether namespace manages versioning.
+   * Sets a cached namespace context from a prior {@code describeTable} or {@code declareTable}
+   * call. Rust uses this to determine managed versioning and storage options.
    *
-   * <p>When true and namespaceClient/tableId are set, commits are routed through the namespace
-   * client's create_table_version API. This is typically set based on the managed_versioning field
-   * from describe_table or declare_table responses.
-   *
-   * @param namespaceClientManagedVersioning whether namespace manages versioning
+   * @param context the cached namespace context
    * @return this builder instance
    */
-  public CommitBuilder namespaceClientManagedVersioning(boolean namespaceClientManagedVersioning) {
-    this.namespaceClientManagedVersioning = namespaceClientManagedVersioning;
+  public CommitBuilder namespaceClientTableContext(NamespaceClientTableContext context) {
+    this.namespaceClientTableContext = context;
     return this;
   }
 
@@ -246,6 +243,7 @@ public class CommitBuilder {
    */
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
+
     if (dataset != null) {
       Dataset result =
           nativeCommitToDataset(
@@ -260,7 +258,7 @@ public class CommitBuilder {
               skipAutoCleanup,
               namespaceClient,
               tableId,
-              namespaceClientManagedVersioning);
+              namespaceClientTableContext);
       result.setAllocator(dataset.allocator());
       return result;
     }
@@ -279,7 +277,7 @@ public class CommitBuilder {
               storageFormat,
               maxRetries,
               skipAutoCleanup,
-              namespaceClientManagedVersioning);
+              namespaceClientTableContext);
       result.setAllocator(allocator);
       return result;
     }
@@ -298,7 +296,7 @@ public class CommitBuilder {
       boolean skipAutoCleanup,
       Object namespace,
       Object tableId,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -313,5 +311,5 @@ public class CommitBuilder {
       String storageFormat,
       int maxRetries,
       boolean skipAutoCleanup,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 }

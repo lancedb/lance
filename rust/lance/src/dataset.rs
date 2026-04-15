@@ -40,7 +40,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
-use lance_namespace::LanceNamespace;
+use lance_namespace::{LanceNamespace, NamespaceClientTableContext};
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
 };
@@ -756,20 +756,13 @@ impl Dataset {
     ///
     /// For CREATE mode, calls declare_table() to initialize the table.
     /// For other modes, calls describe_table() and opens dataset with namespace client credentials.
-    ///
-    /// # Arguments
-    ///
-    /// * `batches` - The record batches to write
-    /// * `namespace_client` - The namespace client to use for table management
-    /// * `table_id` - The table identifier
-    /// * `params` - Write parameters
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
-        let mut write_params = params.take().unwrap_or_default();
+        let write_params = params.take().unwrap_or_default();
 
         match write_params.mode {
             WriteMode::Create => {
@@ -782,52 +775,17 @@ impl Dataset {
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
 
-                let uri = response.location.ok_or_else(|| {
-                    Error::namespace_source(Box::new(std::io::Error::other(
-                        "Table location not found in declare_table response",
-                    )))
-                })?;
+                let ctx = NamespaceClientTableContext::from_declare_table_response(response)
+                    .map_err(|e| Error::namespace_source(Box::new(std::io::Error::other(e))))?;
 
-                // Set up commit handler when managed_versioning is enabled
-                if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace_client.clone(),
-                        table_id.clone(),
-                    );
-                    let commit_handler: Arc<dyn CommitHandler> =
-                        Arc::new(ExternalManifestCommitHandler {
-                            external_manifest_store: Arc::new(external_store),
-                        });
-                    write_params.commit_handler = Some(commit_handler);
-                }
-
-                // Set initial credentials and provider from namespace_client
-                if let Some(namespace_storage_options) = response.storage_options {
-                    let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
-                        LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
-                    );
-
-                    // Merge namespace client storage options with any existing options
-                    let mut merged_options = write_params
-                        .store_params
-                        .as_ref()
-                        .and_then(|p| p.storage_options().cloned())
-                        .unwrap_or_default();
-                    merged_options.extend(namespace_storage_options);
-
-                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                        merged_options,
-                        provider,
-                    ));
-
-                    let existing_params = write_params.store_params.take().unwrap_or_default();
-                    write_params.store_params = Some(ObjectStoreParams {
-                        storage_options_accessor: Some(accessor),
-                        ..existing_params
-                    });
-                }
-
-                Self::write(batches, uri.as_str(), Some(write_params)).await
+                Self::write_with_namespace_context(
+                    batches,
+                    namespace_client,
+                    table_id,
+                    &ctx,
+                    write_params,
+                )
+                .await
             }
             WriteMode::Append | WriteMode::Overwrite => {
                 let request = DescribeTableRequest {
@@ -839,64 +797,95 @@ impl Dataset {
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
 
-                let uri = response.location.ok_or_else(|| {
-                    Error::namespace_source(Box::new(std::io::Error::other(
-                        "Table location not found in describe_table response",
-                    )))
-                })?;
+                let ctx = NamespaceClientTableContext::from_describe_table_response(response)
+                    .map_err(|e| Error::namespace_source(Box::new(std::io::Error::other(e))))?;
 
-                // Set up commit handler when managed_versioning is enabled
-                if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace_client.clone(),
-                        table_id.clone(),
-                    );
-                    let commit_handler: Arc<dyn CommitHandler> =
-                        Arc::new(ExternalManifestCommitHandler {
-                            external_manifest_store: Arc::new(external_store),
-                        });
-                    write_params.commit_handler = Some(commit_handler);
-                }
+                Self::write_with_namespace_context(
+                    batches,
+                    namespace_client,
+                    table_id,
+                    &ctx,
+                    write_params,
+                )
+                .await
+            }
+        }
+    }
 
-                // Set initial credentials and provider from namespace_client
-                if let Some(namespace_storage_options) = response.storage_options {
-                    let provider: Arc<dyn StorageOptionsProvider> =
-                        Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace_client.clone(),
-                            table_id.clone(),
-                        ));
+    /// Write into a namespace client-managed table using a cached
+    /// [`NamespaceClientTableContext`].
+    ///
+    /// Unlike [`write_into_namespace`](Self::write_into_namespace), this method
+    /// does **not** call `declare_table` or `describe_table` — it uses the
+    /// location, storage options, and managed-versioning flag already cached in
+    /// `ctx`.
+    pub async fn write_into_namespace_context(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        ctx: &NamespaceClientTableContext,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        let write_params = params.unwrap_or_default();
+        Self::write_with_namespace_context(batches, namespace_client, table_id, ctx, write_params)
+            .await
+    }
 
-                    // Merge namespace client storage options with any existing options
-                    let mut merged_options = write_params
-                        .store_params
-                        .as_ref()
-                        .and_then(|p| p.storage_options().cloned())
-                        .unwrap_or_default();
-                    merged_options.extend(namespace_storage_options);
+    /// Shared implementation for writing with a [`NamespaceClientTableContext`].
+    async fn write_with_namespace_context(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        ctx: &NamespaceClientTableContext,
+        mut write_params: WriteParams,
+    ) -> Result<Self> {
+        if ctx.managed_versioning {
+            let external_store = LanceNamespaceExternalManifestStore::new(
+                namespace_client.clone(),
+                table_id.clone(),
+            );
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            write_params.commit_handler = Some(commit_handler);
+        }
 
-                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                        merged_options,
-                        provider,
-                    ));
+        if let Some(ref namespace_storage_options) = ctx.storage_options {
+            let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
+                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
+            );
 
-                    let existing_params = write_params.store_params.take().unwrap_or_default();
-                    write_params.store_params = Some(ObjectStoreParams {
-                        storage_options_accessor: Some(accessor),
-                        ..existing_params
-                    });
-                }
+            let mut merged_options = write_params
+                .store_params
+                .as_ref()
+                .and_then(|p| p.storage_options().cloned())
+                .unwrap_or_default();
+            merged_options.extend(namespace_storage_options.clone());
 
-                // For APPEND/OVERWRITE modes, we must open the existing dataset first
-                // and pass it to InsertBuilder. If we pass just the URI, InsertBuilder
-                // assumes no dataset exists and converts the mode to CREATE.
-                let mut builder = DatasetBuilder::from_uri(uri.as_str());
+            let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                merged_options,
+                provider,
+            ));
+
+            let existing_params = write_params.store_params.take().unwrap_or_default();
+            write_params.store_params = Some(ObjectStoreParams {
+                storage_options_accessor: Some(accessor),
+                ..existing_params
+            });
+        }
+
+        match write_params.mode {
+            WriteMode::Create => {
+                Self::write(batches, ctx.location.as_str(), Some(write_params)).await
+            }
+            WriteMode::Append | WriteMode::Overwrite => {
+                let mut builder = DatasetBuilder::from_uri(ctx.location.as_str());
                 if let Some(ref store_params) = write_params.store_params
                     && let Some(accessor) = &store_params.storage_options_accessor
                 {
                     builder = builder.with_storage_options_accessor(accessor.clone());
                 }
                 let dataset = Arc::new(builder.load().await?);
-
                 Self::write(batches, dataset, Some(write_params)).await
             }
         }

@@ -106,10 +106,81 @@ except ImportError:
 
 __all__ = [
     "DirectoryNamespace",
+    "NamespaceClientTableContext",
     "RestNamespace",
     "RestAdapter",
     "DynamicContextProvider",
 ]
+
+
+# =============================================================================
+# Cached Table Context
+# =============================================================================
+
+
+class NamespaceClientTableContext:
+    """Cached context from a namespace client's ``describe_table`` or
+    ``declare_table`` response.
+
+    Contains only the resolved table metadata (location, storage options,
+    managed-versioning flag).  The namespace client and table ID are **not**
+    part of this class — they are still passed separately.
+
+    Parameters
+    ----------
+    location : str
+        The table's storage location (URI).
+    storage_options : Optional[Dict[str, str]]
+        Storage options returned by the namespace (e.g. temporary credentials).
+    managed_versioning : bool
+        Whether commits should go through the namespace's version API.
+    """
+
+    def __init__(
+        self,
+        location: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        managed_versioning: bool = False,
+    ):
+        self.location = location
+        self.storage_options = storage_options
+        self.managed_versioning = managed_versioning
+
+    @classmethod
+    def from_describe_table_response(
+        cls,
+        response: DescribeTableResponse,
+    ) -> "NamespaceClientTableContext":
+        """Build a context from a ``DescribeTableResponse``.
+
+        Raises ``ValueError`` if the response does not contain a location.
+        """
+        location = response.location
+        if not location:
+            raise ValueError("DescribeTableResponse missing location")
+        return cls(
+            location=location,
+            storage_options=response.storage_options,
+            managed_versioning=getattr(response, "managed_versioning", None) is True,
+        )
+
+    @classmethod
+    def from_declare_table_response(
+        cls,
+        response: DeclareTableResponse,
+    ) -> "NamespaceClientTableContext":
+        """Build a context from a ``DeclareTableResponse``.
+
+        Raises ``ValueError`` if the response does not contain a location.
+        """
+        location = response.location
+        if not location:
+            raise ValueError("DeclareTableResponse missing location")
+        return cls(
+            location=location,
+            storage_options=response.storage_options,
+            managed_versioning=getattr(response, "managed_versioning", None) is True,
+        )
 
 
 # =============================================================================

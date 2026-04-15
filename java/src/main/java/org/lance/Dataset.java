@@ -118,92 +118,6 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Creates an empty dataset.
-   *
-   * @param allocator the buffer allocator
-   * @param path dataset uri
-   * @param schema dataset schema
-   * @param params write params
-   * @return Dataset
-   * @deprecated Use {@link #write()} builder instead. For example: {@code
-   *     Dataset.write().allocator(allocator).schema(schema).uri(path)
-   *     .mode(WriteMode.CREATE).execute()}
-   */
-  @Deprecated
-  public static Dataset create(
-      BufferAllocator allocator, String path, Schema schema, WriteParams params) {
-    Preconditions.checkNotNull(allocator);
-    Preconditions.checkNotNull(path);
-    Preconditions.checkNotNull(schema);
-    Preconditions.checkNotNull(params);
-    try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
-      Data.exportSchema(allocator, schema, null, arrowSchema);
-      Dataset dataset =
-          createWithFfiSchema(
-              arrowSchema.memoryAddress(),
-              path,
-              params.getMaxRowsPerFile(),
-              params.getMaxRowsPerGroup(),
-              params.getMaxBytesPerFile(),
-              params.getMode(),
-              params.getEnableStableRowIds(),
-              params.getDataStorageVersion(),
-              params.getEnableV2ManifestPaths(),
-              params.getStorageOptions(),
-              params.getInitialBases(),
-              params.getTargetBases(),
-              params.getAllowExternalBlobOutsideBases(),
-              params.getBlobPackFileSizeThreshold());
-      dataset.allocator = allocator;
-      return dataset;
-    }
-  }
-
-  /**
-   * Create a dataset with given stream.
-   *
-   * @param allocator buffer allocator
-   * @param stream arrow stream
-   * @param path dataset uri
-   * @param params write parameters
-   * @return Dataset
-   * @deprecated Use {@link #write()} builder instead. For example: {@code
-   *     Dataset.write().allocator(allocator).stream(stream).uri(path)
-   *     .mode(WriteMode.CREATE).execute()}
-   */
-  /**
-   * Create a dataset with given stream.
-   *
-   * @param allocator buffer allocator
-   * @param stream arrow stream
-   * @param path dataset uri
-   * @param params write parameters
-   * @return Dataset
-   * @deprecated Use {@link #write()} builder instead.
-   */
-  @Deprecated
-  public static Dataset create(
-      BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
-    return create(allocator, stream, path, params, null, null, false);
-  }
-
-  private static native Dataset createWithFfiSchema(
-      long arrowSchemaMemoryAddress,
-      String path,
-      Optional<Integer> maxRowsPerFile,
-      Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile,
-      Optional<String> mode,
-      Optional<Boolean> enableStableRowIds,
-      Optional<String> dataStorageVersion,
-      Optional<Boolean> enableV2ManifestPaths,
-      Map<String, String> storageOptions,
-      Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases,
-      Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
-
-  /**
    * Creates a dataset from an FFI arrow stream.
    *
    * @param arrowStreamMemoryAddress memory address of the arrow stream
@@ -240,7 +154,7 @@ public class Dataset implements Closeable {
       Optional<Long> blobPackFileSizeThreshold,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 
   /**
    * Creates a dataset with optional namespace client support for managed versioning.
@@ -268,7 +182,7 @@ public class Dataset implements Closeable {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
+      NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
@@ -294,62 +208,6 @@ public class Dataset implements Closeable {
             namespaceClientManagedVersioning);
     dataset.allocator = allocator;
     return dataset;
-  }
-
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @param path file path
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code Dataset.open().uri(path).build()}
-   */
-  @Deprecated
-  public static Dataset open(String path) {
-    return open(
-        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
-  }
-
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @param path file path
-   * @param options the open options
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code
-   *     Dataset.open().uri(path).readOptions(options).build()}
-   */
-  @Deprecated
-  public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
-  }
-
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @param path file path
-   * @param allocator Arrow buffer allocator
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code
-   *     Dataset.open().allocator(allocator).uri(path).build()}
-   */
-  @Deprecated
-  public static Dataset open(String path, BufferAllocator allocator) {
-    return open(allocator, path, new ReadOptions.Builder().build());
-  }
-
-  /**
-   * Open a dataset from the specified path with additional options.
-   *
-   * @param allocator Arrow buffer allocator
-   * @param path file path
-   * @param options the open options
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code
-   *     Dataset.open().allocator(allocator).uri(path).readOptions(options).build()}
-   */
-  @Deprecated
-  public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options, null);
   }
 
   /**
@@ -391,7 +249,7 @@ public class Dataset implements Closeable {
       Session session,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
+      NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
@@ -437,7 +295,7 @@ public class Dataset implements Closeable {
       long sessionHandle,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 
   /**
    * Creates a builder for opening a dataset.

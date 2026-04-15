@@ -76,7 +76,7 @@ from .util import _target_partition_size_to_num_partitions, td_to_micros
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
-    from lance.namespace import LanceNamespace
+    from lance.namespace import LanceNamespace, NamespaceClientTableContext
 
     from .commit import CommitLock
     from .lance.indices import IndexDescription
@@ -565,13 +565,14 @@ class LanceDataset(pa.dataset.Dataset):
         session: Optional[Session] = None,
         namespace_client: Optional[Any] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_managed_versioning: bool = False,
+        namespace_client_table_context: Optional[
+            "NamespaceClientTableContext"
+        ] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
 
-        # Handle deprecation warning for index_cache_size
         if index_cache_size is not None:
             warnings.warn(
                 "The 'index_cache_size' parameter is deprecated. "
@@ -581,13 +582,10 @@ class LanceDataset(pa.dataset.Dataset):
                 stacklevel=2,
             )
 
-        # Store namespace_client and table_id for credential refresh in file operations
         self._namespace_client = namespace_client
         self._table_id = table_id
-        self._namespace_client_managed_versioning = namespace_client_managed_versioning
+        self._namespace_client_table_context = namespace_client_table_context
 
-        # Storage options provider is automatically created in Rust when
-        # namespace_client and table_id are provided
         self._ds = _Dataset(
             uri,
             version,
@@ -603,7 +601,7 @@ class LanceDataset(pa.dataset.Dataset):
             session=session,
             namespace_client=namespace_client,
             table_id=table_id,
-            namespace_client_managed_versioning=namespace_client_managed_versioning,
+            namespace_client_table_context=namespace_client_table_context,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -670,7 +668,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._read_params = read_params
         self._namespace_client = None
         self._table_id = None
-        self._namespace_client_managed_versioning = False
+        self._namespace_client_table_context = False
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -678,8 +676,8 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
-        ds._namespace_client_managed_versioning = (
-            self._namespace_client_managed_versioning
+        ds._namespace_client_table_context = (
+            self._namespace_client_table_context
         )
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
@@ -3850,7 +3848,9 @@ class LanceDataset(pa.dataset.Dataset):
         enable_stable_row_ids: Optional[bool] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
-        namespace_client_managed_versioning: bool = False,
+        namespace_client_table_context: Optional[
+            "NamespaceClientTableContext"
+        ] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3995,7 +3995,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_stable_row_ids=enable_stable_row_ids,
                 namespace_client=namespace_client,
                 table_id=table_id,
-                namespace_client_managed_versioning=namespace_client_managed_versioning,
+                namespace_client_table_context=namespace_client_table_context,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -4011,7 +4011,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_stable_row_ids=enable_stable_row_ids,
                 namespace_client=namespace_client,
                 table_id=table_id,
-                namespace_client_managed_versioning=namespace_client_managed_versioning,
+                namespace_client_table_context=namespace_client_table_context,
             )
         else:
             raise TypeError(
@@ -4023,7 +4023,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = storage_options
         ds._namespace_client = namespace_client
         ds._table_id = table_id
-        ds._namespace_client_managed_versioning = namespace_client_managed_versioning
+        ds._namespace_client_table_context = namespace_client_table_context
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
@@ -6286,6 +6286,7 @@ def write_dataset(
     blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -6401,6 +6402,12 @@ def write_dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`. Cannot be used with `uri`.
+    namespace_client_table_context : optional, NamespaceClientTableContext
+        A cached context from a prior ``describe_table`` or ``declare_table``
+        call.  When provided with ``namespace_client`` + ``table_id``, skips
+        the namespace call and uses the cached location, storage options, and
+        managed-versioning flag directly.  Cannot be used with ``uri``.
+        Must be used together with ``namespace_client`` and ``table_id``.
 
     Notes
     -----
@@ -6411,79 +6418,71 @@ def write_dataset(
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
     """
-    # Validate that user provides either uri OR (namespace_client + table_id), not both
     has_uri = uri is not None
     has_namespace = namespace_client is not None or table_id is not None
+    has_context = namespace_client_table_context is not None
 
     if has_uri and has_namespace:
         raise ValueError(
-            "Cannot specify both 'uri' and 'namespace_client/table_id'. "
-            "Please provide either 'uri' or both 'namespace_client' and 'table_id'."
+            "Cannot specify both 'uri' and 'namespace_client'/'table_id'."
         )
-    elif not has_uri and not has_namespace:
+    if has_uri and has_context:
         raise ValueError(
-            "Must specify either 'uri' or both 'namespace_client' and 'table_id'."
+            "Cannot specify both 'uri' and 'namespace_client_table_context'."
+        )
+    if has_context and not has_namespace:
+        raise ValueError(
+            "'namespace_client_table_context' requires 'namespace_client' and "
+            "'table_id' to be provided."
+        )
+    if not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or 'namespace_client'+'table_id'."
         )
 
-    # Handle namespace-based dataset writing
     if namespace_client is not None:
         if table_id is None:
             raise ValueError(
                 "Both 'namespace_client' and 'table_id' must be provided together."
             )
 
-        # Implement write_into_namespace logic in Python
-        # This follows the same pattern as the Rust implementation:
-        # - CREATE mode: calls namespace.declare_table()
-        # - APPEND/OVERWRITE mode: calls namespace.describe_table()
-        # - Both modes: create storage options provider and merge storage options
-
-        from .namespace import (
-            DeclareTableRequest,
-            DescribeTableRequest,
-        )
-
-        # Determine which namespace method to call based on mode
-        if mode == "create":
-            declare_request = DeclareTableRequest(id=table_id, location=None)
-            response = namespace_client.declare_table(declare_request)
-        elif mode in ("append", "overwrite"):
-            request = DescribeTableRequest(id=table_id, version=None)
-            response = namespace_client.describe_table(request)
+        if has_context:
+            uri = namespace_client_table_context.location
         else:
-            raise ValueError(f"Invalid mode: {mode}")
-
-        # Get table location from response
-        uri = response.location
-        if not uri:
-            raise ValueError(
-                f"Namespace did not return a table location in {mode} response"
+            from .namespace import (
+                DeclareTableRequest,
+                DescribeTableRequest,
             )
 
-        # Check if namespace manages versioning (commits go through namespace API)
-        namespace_client_managed_versioning = (
-            getattr(response, "managed_versioning", None) is True
-        )
-
-        # Use namespace storage options
-        namespace_storage_options = response.storage_options
-
-        # Merge namespace storage options with any existing options
-        # Namespace options take precedence (same as Rust implementation)
-        # Storage options provider will be created automatically in Rust
-        if namespace_storage_options is not None:
-            if storage_options is None:
-                storage_options = dict(namespace_storage_options)
+            if mode == "create":
+                declare_request = DeclareTableRequest(id=table_id, location=None)
+                response = namespace_client.declare_table(declare_request)
+            elif mode in ("append", "overwrite"):
+                request = DescribeTableRequest(id=table_id, version=None)
+                response = namespace_client.describe_table(request)
             else:
-                merged_options = dict(storage_options)
-                merged_options.update(namespace_storage_options)
-                storage_options = merged_options
+                raise ValueError(f"Invalid mode: {mode}")
+
+            uri = response.location
+            if not uri:
+                raise ValueError(
+                    f"Namespace did not return a table location in {mode} response"
+                )
+
+            from .namespace import NamespaceClientTableContext
+
+            if mode == "create":
+                namespace_client_table_context = (
+                    NamespaceClientTableContext.from_declare_table_response(response)
+                )
+            else:
+                namespace_client_table_context = (
+                    NamespaceClientTableContext.from_describe_table_response(response)
+                )
     elif table_id is not None:
         raise ValueError(
             "Both 'namespace_client' and 'table_id' must be provided together."
         )
-    else:
-        namespace_client_managed_versioning = False
 
     if use_legacy_format is not None:
         warnings.warn(
@@ -6528,9 +6527,7 @@ def write_dataset(
     if namespace_client is not None and table_id is not None:
         params["namespace_client"] = namespace_client
         params["table_id"] = table_id
-        params["namespace_client_managed_versioning"] = (
-            namespace_client_managed_versioning
-        )
+        params["namespace_client_table_context"] = namespace_client_table_context
 
     if commit_lock:
         if not callable(commit_lock):
@@ -6550,7 +6547,7 @@ def write_dataset(
     ds._storage_options = storage_options
     ds._namespace_client = namespace_client
     ds._table_id = table_id
-    ds._namespace_client_managed_versioning = namespace_client_managed_versioning
+    ds._namespace_client_table_context = namespace_client_table_context
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None

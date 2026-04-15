@@ -15,11 +15,13 @@
 //! See [`error::ErrorCode`] for the list of error codes and
 //! [`error::NamespaceError`] for the error types.
 
+pub mod context;
 pub mod error;
 pub mod namespace;
 pub mod schema;
 
 // Re-export the trait at the crate root
+pub use context::NamespaceClientTableContext;
 pub use lance_core::{Error, Result};
 pub use namespace::LanceNamespace;
 

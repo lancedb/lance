@@ -25,7 +25,7 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
-    from .namespace import LanceNamespace
+    from .namespace import LanceNamespace, NamespaceClientTableContext
 
 
 class ReaderResults:
@@ -71,6 +71,9 @@ class LanceFileReader:
         *,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional[
+            "NamespaceClientTableContext"
+        ] = None,
         _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
@@ -91,10 +94,15 @@ class LanceFileReader:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. When provided,
+            ``namespace_client`` and ``table_id`` are extracted from the
+            context. Cannot be used with ``namespace_client``/``table_id``.
         columns: list of str, default None
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
         """
+
         if _inner_reader is not None:
             self._reader = _inner_reader
         else:
@@ -222,6 +230,9 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional[
+            "NamespaceClientTableContext"
+        ] = None,
     ):
         """
         Creates a new file session
@@ -241,7 +252,12 @@ class LanceFileSession:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. When provided,
+            ``namespace_client`` and ``table_id`` are extracted from the
+            context. Cannot be used with ``namespace_client``/``table_id``.
         """
+
         if isinstance(base_path, Path):
             base_path = str(base_path)
         self._session = _LanceFileSession(
@@ -394,6 +410,9 @@ class LanceFileWriter:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional[
+            "NamespaceClientTableContext"
+        ] = None,
         max_page_bytes: Optional[int] = None,
         _inner_writer: Optional[_LanceFileWriter] = None,
         **kwargs,
@@ -426,11 +445,16 @@ class LanceFileWriter:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. When provided,
+            ``namespace_client`` and ``table_id`` are extracted from the
+            context. Cannot be used with ``namespace_client``/``table_id``.
         max_page_bytes : optional, int
             The maximum size of a page in bytes, if a single array would create a
             page larger than this then it will be split into multiple pages. The
             default value is 32MB.
         """
+
         if _inner_writer is not None:
             self._writer = _inner_writer
         else:

@@ -19,7 +19,6 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatchIterator;
 use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
@@ -57,7 +56,7 @@ use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
-use std::iter::empty;
+
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -149,9 +148,8 @@ impl BlockingDataset {
         session: Option<Arc<LanceSession>>,
         namespace: Option<Arc<dyn LanceNamespace>>,
         table_id: Option<Vec<String>>,
-        namespace_client_managed_versioning: bool,
+        ctx: Option<lance_namespace::NamespaceClientTableContext>,
     ) -> Result<Self> {
-        // Create storage options accessor from storage_options and provider
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
             (false, Some(provider)) => Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_initial_and_provider(
@@ -191,8 +189,7 @@ impl BlockingDataset {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
         }
 
-        // Set up namespace commit handler only if namespace manages versioning
-        if namespace_client_managed_versioning
+        if ctx.as_ref().is_some_and(|c| c.managed_versioning)
             && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
         {
             let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
@@ -398,91 +395,6 @@ impl BlockingDataset {
 // Write Methods //
 ///////////////////
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
-    mut env: JNIEnv<'local>,
-    _obj: JObject,
-    arrow_schema_addr: jlong,
-    path: JString,
-    max_rows_per_file: JObject,        // Optional<Integer>
-    max_rows_per_group: JObject,       // Optional<Integer>
-    max_bytes_per_file: JObject,       // Optional<Long>
-    mode: JObject,                     // Optional<String>
-    enable_stable_row_ids: JObject,    // Optional<Boolean>
-    data_storage_version: JObject,     // Optional<String>
-    enable_v2_manifest_paths: JObject, // Optional<Boolean>
-    storage_options_obj: JObject,      // Map<String, String>
-    initial_bases: JObject,
-    target_bases: JObject,
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
-) -> JObject<'local> {
-    ok_or_throw!(
-        env,
-        inner_create_with_ffi_schema(
-            &mut env,
-            arrow_schema_addr,
-            path,
-            max_rows_per_file,
-            max_rows_per_group,
-            max_bytes_per_file,
-            mode,
-            enable_stable_row_ids,
-            data_storage_version,
-            enable_v2_manifest_paths,
-            storage_options_obj,
-            initial_bases,
-            target_bases,
-            allow_external_blob_outside_bases,
-            blob_pack_file_size_threshold,
-        )
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn inner_create_with_ffi_schema<'local>(
-    env: &mut JNIEnv<'local>,
-    arrow_schema_addr: jlong,
-    path: JString,
-    max_rows_per_file: JObject,        // Optional<Integer>
-    max_rows_per_group: JObject,       // Optional<Integer>
-    max_bytes_per_file: JObject,       // Optional<Long>
-    mode: JObject,                     // Optional<String>
-    enable_stable_row_ids: JObject,    // Optional<Boolean>
-    data_storage_version: JObject,     // Optional<String>
-    enable_v2_manifest_paths: JObject, // Optional<Boolean>
-    storage_options_obj: JObject,      // Map<String, String>
-    initial_bases: JObject,
-    target_bases: JObject,
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
-) -> Result<JObject<'local>> {
-    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
-    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let schema = Schema::try_from(&c_schema)?;
-
-    let reader = RecordBatchIterator::new(empty(), Arc::new(schema));
-    create_dataset(
-        env,
-        path,
-        max_rows_per_file,
-        max_rows_per_group,
-        max_bytes_per_file,
-        mode,
-        enable_stable_row_ids,
-        data_storage_version,
-        enable_v2_manifest_paths,
-        storage_options_obj,
-        initial_bases,
-        target_bases,
-        allow_external_blob_outside_bases,
-        blob_pack_file_size_threshold,
-        reader,
-        None,  // No namespace for schema-only creation
-        false, // No managed versioning for schema-only creation
-    )
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
@@ -521,21 +433,21 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     _obj: JObject,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,                    // Optional<Integer>
-    max_rows_per_group: JObject,                   // Optional<Integer>
-    max_bytes_per_file: JObject,                   // Optional<Long>
-    mode: JObject,                                 // Optional<String>
-    enable_stable_row_ids: JObject,                // Optional<Boolean>
-    data_storage_version: JObject,                 // Optional<String>
-    enable_v2_manifest_paths: JObject,             // Optional<Boolean>
-    storage_options_obj: JObject,                  // Map<String, String>
-    initial_bases: JObject,                        // Optional<List<BasePath>>
-    target_bases: JObject,                         // Optional<List<String>>
-    allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,        // Optional<Long>
-    namespace_obj: JObject,                        // LanceNamespace (can be null)
-    table_id_obj: JObject,                         // List<String> (can be null)
-    namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
+    max_rows_per_file: JObject,                  // Optional<Integer>
+    max_rows_per_group: JObject,                 // Optional<Integer>
+    max_bytes_per_file: JObject,                 // Optional<Long>
+    mode: JObject,                               // Optional<String>
+    enable_stable_row_ids: JObject,              // Optional<Boolean>
+    data_storage_version: JObject,               // Optional<String>
+    enable_v2_manifest_paths: JObject,           // Optional<Boolean>
+    storage_options_obj: JObject,                // Map<String, String>
+    initial_bases: JObject,                      // Optional<List<BasePath>>
+    target_bases: JObject,                       // Optional<List<String>>
+    allow_external_blob_outside_bases: JObject,  // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,      // Optional<Long>
+    namespace_obj: JObject,                      // LanceNamespace (can be null)
+    table_id_obj: JObject,                       // List<String> (can be null)
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -557,7 +469,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             blob_pack_file_size_threshold,
             namespace_obj,
             table_id_obj,
-            namespace_client_managed_versioning != 0,
+            namespace_client_table_context_obj,
         )
     )
 }
@@ -567,27 +479,27 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,                 // Optional<Integer>
-    max_rows_per_group: JObject,                // Optional<Integer>
-    max_bytes_per_file: JObject,                // Optional<Long>
-    mode: JObject,                              // Optional<String>
-    enable_stable_row_ids: JObject,             // Optional<Boolean>
-    data_storage_version: JObject,              // Optional<String>
-    enable_v2_manifest_paths: JObject,          // Optional<Boolean>
-    storage_options_obj: JObject,               // Map<String, String>
-    initial_bases: JObject,                     // Optional<List<BasePath>>
-    target_bases: JObject,                      // Optional<List<String>>
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
+    max_rows_per_file: JObject,
+    max_rows_per_group: JObject,
+    max_bytes_per_file: JObject,
+    mode: JObject,
+    enable_stable_row_ids: JObject,
+    data_storage_version: JObject,
+    enable_v2_manifest_paths: JObject,
+    storage_options_obj: JObject,
+    initial_bases: JObject,
+    target_bases: JObject,
+    allow_external_blob_outside_bases: JObject,
+    blob_pack_file_size_threshold: JObject,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    namespace_client_table_context_obj: JObject,
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
 
-    // Create the namespace wrapper for commit handling (if provided)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
     create_dataset(
         env,
@@ -606,14 +518,14 @@ fn inner_create_with_ffi_stream<'local>(
         blob_pack_file_size_threshold,
         reader,
         namespace_info,
-        namespace_client_managed_versioning,
+        ctx,
     )
 }
 
 /// Creates a dataset from a record batch reader.
 ///
 /// When `namespace_info` is provided, sets up the storage options provider for
-/// credential refresh. When `namespace_client_managed_versioning` is true, also sets up the
+/// credential refresh. When `ctx` has `managed_versioning`, also sets up the
 /// commit handler for namespace-managed versioning.
 #[allow(clippy::too_many_arguments)]
 fn create_dataset<'local>(
@@ -633,7 +545,7 @@ fn create_dataset<'local>(
     blob_pack_file_size_threshold: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
-    namespace_client_managed_versioning: bool,
+    ctx: Option<lance_namespace::NamespaceClientTableContext>,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
@@ -653,10 +565,8 @@ fn create_dataset<'local>(
         &blob_pack_file_size_threshold,
     )?;
 
-    // Set up namespace commit handler and storage options provider if namespace is provided
     if let Some((namespace, table_id)) = namespace_info {
-        // Set up commit handler only if namespace manages versioning
-        if namespace_client_managed_versioning {
+        if ctx.as_ref().is_some_and(|c| c.managed_versioning) {
             let external_store =
                 LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
@@ -665,21 +575,23 @@ fn create_dataset<'local>(
             write_params.commit_handler = Some(commit_handler);
         }
 
-        // Set up storage options provider for credential refresh
         let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
             LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
         );
 
-        // Get existing storage options to combine with provider
-        let storage_options: HashMap<String, String> =
-            extract_storage_options(env, &storage_options_obj)?;
+        let initial_opts = ctx
+            .as_ref()
+            .and_then(|c| c.storage_options.clone())
+            .unwrap_or_else(|| {
+                extract_storage_options(env, &storage_options_obj).unwrap_or_default()
+            });
 
-        let accessor = if storage_options.is_empty() {
+        let accessor = if initial_opts.is_empty() {
             Arc::new(lance::io::StorageOptionsAccessor::with_provider(provider))
         } else {
             Arc::new(
                 lance::io::StorageOptionsAccessor::with_initial_and_provider(
-                    storage_options,
+                    initial_opts,
                     provider,
                 ),
             )
@@ -1220,12 +1132,12 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
-    storage_options_obj: JObject,                  // Map<String, String>
-    serialized_manifest: JObject,                  // Optional<ByteBuffer>
-    session_handle: jlong,                         // Session handle, 0 means no session
-    namespace_obj: JObject,                        // LanceNamespace object, null if no namespace
-    table_id_obj: JObject,                         // List<String>, null if no namespace
-    namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
+    storage_options_obj: JObject,                // Map<String, String>
+    serialized_manifest: JObject,                // Optional<ByteBuffer>
+    session_handle: jlong,                       // Session handle, 0 means no session
+    namespace_obj: JObject,                      // LanceNamespace object, null if no namespace
+    table_id_obj: JObject,                       // List<String>, null if no namespace
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1241,7 +1153,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             session_handle,
             namespace_obj,
             table_id_obj,
-            namespace_client_managed_versioning != 0,
+            namespace_client_table_context_obj,
         )
     )
 }
@@ -1250,16 +1162,16 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
-    version_obj: JObject,    // Optional<Long>
-    block_size_obj: JObject, // Optional<Integer>
+    version_obj: JObject,
+    block_size_obj: JObject,
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
-    storage_options_obj: JObject,              // Map<String, String>
-    serialized_manifest: JObject,              // Optional<ByteBuffer>
-    session_handle: jlong,                     // Session handle, 0 means no session
-    namespace_obj: JObject,                    // LanceNamespace object, null if no namespace
-    table_id_obj: JObject,                     // List<String>, null if no namespace
-    namespace_client_managed_versioning: bool, // Whether namespace manages versioning
+    storage_options_obj: JObject,
+    serialized_manifest: JObject,
+    session_handle: jlong,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    namespace_client_table_context_obj: JObject,
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
@@ -1267,15 +1179,14 @@ fn inner_open_native<'local>(
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
 
-    // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
     let (namespace, table_id) = match namespace_info {
         Some((ns, tid)) => (Some(ns), Some(tid)),
         None => (None, None),
     };
 
-    // When namespace is provided, automatically create a storage options provider
-    // for credential refresh
+    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+
     let storage_options_provider_arc: Option<Arc<dyn StorageOptionsProvider>> =
         if let (Some(ns), Some(tid)) = (namespace.clone(), table_id.clone()) {
             Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(ns, tid)))
@@ -1284,8 +1195,6 @@ fn inner_open_native<'local>(
         };
 
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
-
-    // Convert session handle to Arc<LanceSession> if provided
     let session = session_from_handle(session_handle);
 
     let dataset = BlockingDataset::open(
@@ -1300,7 +1209,7 @@ fn inner_open_native<'local>(
         session,
         namespace,
         table_id,
-        namespace_client_managed_versioning,
+        ctx,
     )?;
     dataset.into_java(env)
 }
@@ -1362,6 +1271,48 @@ pub(crate) fn extract_namespace_info(
 
     let table_id = env.get_strings(table_id_obj)?;
     Ok(Some((namespace_client, table_id)))
+}
+
+/// Extract a [`NamespaceClientTableContext`] from a Java
+/// `org.lance.NamespaceClientTableContext` object.
+///
+/// Returns `None` if the object is null.
+pub(crate) fn extract_namespace_client_table_context(
+    env: &mut JNIEnv,
+    ctx_obj: &JObject,
+) -> Result<Option<lance_namespace::NamespaceClientTableContext>> {
+    if ctx_obj.is_null() {
+        return Ok(None);
+    }
+    let location: String = env
+        .call_method(ctx_obj, "getLocation", "()Ljava/lang/String;", &[])?
+        .l()
+        .and_then(|obj| env.get_string(&JString::from(obj)).map(|s| s.into()))
+        .map_err(|e| Error::runtime_error(e.to_string()))?;
+
+    let managed_versioning: bool = env
+        .call_method(ctx_obj, "isManagedVersioning", "()Z", &[])?
+        .z()
+        .map_err(|e| Error::runtime_error(e.to_string()))?;
+
+    let storage_opts_obj = env
+        .call_method(ctx_obj, "getStorageOptions", "()Ljava/util/Map;", &[])?
+        .l()
+        .map_err(|e| Error::runtime_error(e.to_string()))?;
+
+    let storage_options = if storage_opts_obj.is_null() {
+        None
+    } else {
+        let jmap = JMap::from_env(env, &storage_opts_obj)?;
+        let map: HashMap<String, String> = to_rust_map(env, &jmap)?;
+        if map.is_empty() { None } else { Some(map) }
+    };
+
+    Ok(Some(lance_namespace::NamespaceClientTableContext {
+        location,
+        storage_options,
+        managed_versioning,
+    }))
 }
 
 #[unsafe(no_mangle)]

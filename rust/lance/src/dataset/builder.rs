@@ -18,6 +18,7 @@ use lance_io::object_store::{
     ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
 };
 use lance_namespace::LanceNamespace;
+use lance_namespace::NamespaceClientTableContext;
 use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
     format::Manifest,
@@ -172,6 +173,58 @@ impl DatasetBuilder {
         }
 
         Ok(builder)
+    }
+
+    /// Create a DatasetBuilder from a cached [`NamespaceClientTableContext`].
+    ///
+    /// Unlike [`from_namespace`](Self::from_namespace), this method does **not** make
+    /// a `describe_table` call — it uses the location, storage options, and
+    /// managed-versioning flag that were already cached in `ctx`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use lance_namespace::NamespaceClientTableContext;
+    /// use lance::dataset::DatasetBuilder;
+    ///
+    /// let dataset = DatasetBuilder::from_namespace_context(
+    ///     namespace_client,
+    ///     vec!["my_table".to_string()],
+    ///     &ctx,
+    /// )
+    /// .load()
+    /// .await?;
+    /// ```
+    #[allow(deprecated)]
+    pub fn from_namespace_context(
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        ctx: &NamespaceClientTableContext,
+    ) -> Self {
+        let mut builder = Self::from_uri(&ctx.location);
+
+        if ctx.managed_versioning {
+            let external_store = LanceNamespaceExternalManifestStore::new(
+                namespace_client.clone(),
+                table_id.clone(),
+            );
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder.commit_handler = Some(commit_handler);
+        }
+
+        builder.storage_options_override = ctx.storage_options.clone();
+
+        if let Some(initial_opts) = &ctx.storage_options {
+            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
+            );
+            builder.options.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(initial_opts.clone(), provider),
+            ));
+        }
+
+        builder
     }
 }
 

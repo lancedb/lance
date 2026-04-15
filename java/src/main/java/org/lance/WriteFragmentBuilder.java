@@ -49,6 +49,7 @@ public class WriteFragmentBuilder {
   private WriteParams.Builder writeParamsBuilder;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private NamespaceClientTableContext namespaceClientTableContext;
 
   WriteFragmentBuilder() {}
 
@@ -128,7 +129,7 @@ public class WriteFragmentBuilder {
    *
    * <p>When provided with `tableId`, a storage options provider will be created automatically to
    * refresh credentials via the namespace client. Must be provided together with `tableId`. The
-   * caller should provide initial/merged storage options via the `storageOptions` method.
+   * caller should provide storage options via the `storageOptions` method.
    *
    * @param namespaceClient the LanceNamespace client instance
    * @return this builder
@@ -148,6 +149,21 @@ public class WriteFragmentBuilder {
    */
   public WriteFragmentBuilder tableId(List<String> tableId) {
     this.tableId = tableId;
+    return this;
+  }
+
+  /**
+   * Sets a cached namespace context from a prior {@code describeTable} or {@code declareTable}
+   * call. When provided, the namespace client and table ID are extracted from the context, and
+   * storage options are merged.
+   *
+   * <p>Cannot be used with {@code namespaceClient()}/{@code tableId()}.
+   *
+   * @param context the cached namespace context
+   * @return this builder
+   */
+  public WriteFragmentBuilder namespaceClientTableContext(NamespaceClientTableContext context) {
+    this.namespaceClientTableContext = context;
     return this;
   }
 
@@ -231,11 +247,8 @@ public class WriteFragmentBuilder {
   public List<FragmentMetadata> execute() {
     validate();
 
-    // Build the write params
     WriteParams finalWriteParams = buildWriteParams();
 
-    // Pass namespaceClient and tableId to JNI - Rust will automatically create a
-    // storage options provider when these are non-null for credential refresh
     if (vectorSchemaRoot != null) {
       return Fragment.create(
           datasetUri, allocator, vectorSchemaRoot, finalWriteParams, namespaceClient, tableId);

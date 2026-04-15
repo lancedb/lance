@@ -36,6 +36,7 @@ from .lance import (
 from .namespace import (
     DescribeTableRequest,
     LanceNamespace,
+    NamespaceClientTableContext,
 )
 from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
@@ -101,6 +102,7 @@ def dataset(
     session: Optional[Session] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    namespace_client_table_context: Optional[NamespaceClientTableContext] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -169,6 +171,12 @@ def dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`. Cannot be used with `uri`.
+    namespace_client_table_context : optional, NamespaceClientTableContext
+        A cached context from a prior ``describe_table`` or ``declare_table``
+        call.  When provided with ``namespace_client`` + ``table_id``, skips
+        the namespace call and uses the cached location, storage options, and
+        managed-versioning flag directly.  Cannot be used with ``uri``.
+        Must be used together with ``namespace_client`` and ``table_id``.
 
     Notes
     -----
@@ -179,51 +187,49 @@ def dataset(
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
     """
-    # Validate that user provides either uri OR (namespace_client + table_id), not both
     has_uri = uri is not None
     has_namespace = namespace_client is not None or table_id is not None
+    has_context = namespace_client_table_context is not None
 
     if has_uri and has_namespace:
         raise ValueError(
-            "Cannot specify both 'uri' and 'namespace_client/table_id'. "
-            "Please provide either 'uri' or both 'namespace_client' and 'table_id'."
+            "Cannot specify both 'uri' and 'namespace_client'/'table_id'."
         )
-    elif not has_uri and not has_namespace:
+    if has_uri and has_context:
         raise ValueError(
-            "Must specify either 'uri' or both 'namespace_client' and 'table_id'."
+            "Cannot specify both 'uri' and 'namespace_client_table_context'."
+        )
+    if has_context and not has_namespace:
+        raise ValueError(
+            "'namespace_client_table_context' requires 'namespace_client' and "
+            "'table_id' to be provided."
+        )
+    if not has_uri and not has_namespace:
+        raise ValueError(
+            "Must specify either 'uri' or 'namespace_client'+'table_id'."
         )
 
-    # Handle namespace resolution in Python
-    namespace_client_managed_versioning = False
     if namespace_client is not None:
         if table_id is None:
             raise ValueError(
                 "Both 'namespace_client' and 'table_id' must be provided together."
             )
 
-        request = DescribeTableRequest(id=table_id, version=version)
-        response = namespace_client.describe_table(request)
+        if has_context:
+            uri = namespace_client_table_context.location
+        else:
+            from .namespace import DescribeTableResponse
 
-        uri = response.location
-        if uri is None:
-            raise ValueError("Namespace did not return a 'location' for the table")
-
-        # Check if namespace manages versioning (commits go through namespace API)
-        namespace_client_managed_versioning = (
-            getattr(response, "managed_versioning", None) is True
-        )
-
-        namespace_storage_options = response.storage_options
-
-        # Merge namespace storage options with user-provided options
-        # Namespace options take precedence
-        if namespace_storage_options is not None:
-            if storage_options is None:
-                storage_options = namespace_storage_options
-            else:
-                merged_options = dict(storage_options)
-                merged_options.update(namespace_storage_options)
-                storage_options = merged_options
+            request = DescribeTableRequest(id=table_id, version=version)
+            response = namespace_client.describe_table(request)
+            uri = response.location
+            if uri is None:
+                raise ValueError(
+                    "Namespace did not return a 'location' for the table"
+                )
+            namespace_client_table_context = (
+                NamespaceClientTableContext.from_describe_table_response(response)
+            )
     elif table_id is not None:
         raise ValueError(
             "Both 'namespace_client' and 'table_id' must be provided together."
@@ -243,7 +249,7 @@ def dataset(
         session=session,
         namespace_client=namespace_client,
         table_id=table_id,
-        namespace_client_managed_versioning=namespace_client_managed_versioning,
+        namespace_client_table_context=namespace_client_table_context,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -269,7 +275,7 @@ def dataset(
                 session=session,
                 namespace_client=namespace_client,
                 table_id=table_id,
-                namespace_client_managed_versioning=namespace_client_managed_versioning,
+                namespace_client_table_context=namespace_client_table_context,
             )
     else:
         return ds

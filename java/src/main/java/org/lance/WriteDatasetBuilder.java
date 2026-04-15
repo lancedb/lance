@@ -24,6 +24,7 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -67,10 +68,10 @@ public class WriteDatasetBuilder {
   private String uri;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private NamespaceClientTableContext namespaceClientTableContext;
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
-  private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
   private Optional<Long> maxBytesPerFile = Optional.empty();
@@ -171,6 +172,21 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Sets a cached namespace context from a prior {@code describeTable} or {@code declareTable}
+   * call. When provided, skips the namespace call and uses the cached location, storage options,
+   * and managed-versioning flag directly.
+   *
+   * <p>Cannot be used with {@code uri()} or {@code namespaceClient()}/{@code tableId()}.
+   *
+   * @param context the cached namespace context
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder namespaceClientTableContext(NamespaceClientTableContext context) {
+    this.namespaceClientTableContext = context;
+    return this;
+  }
+
+  /**
    * Sets the write mode.
    *
    * @param mode The write mode (CREATE, APPEND, or OVERWRITE)
@@ -203,19 +219,6 @@ public class WriteDatasetBuilder {
    */
   public WriteDatasetBuilder storageOptions(Map<String, String> storageOptions) {
     this.storageOptions = new HashMap<>(storageOptions);
-    return this;
-  }
-
-  /**
-   * Sets whether to ignore storage options from the namespace client's describeTable() or
-   * declareTable().
-   *
-   * @param ignoreNamespaceStorageOptions If true, storage options returned from namespace client
-   *     will be ignored
-   * @return this builder instance
-   */
-  public WriteDatasetBuilder ignoreNamespaceStorageOptions(boolean ignoreNamespaceStorageOptions) {
-    this.ignoreNamespaceStorageOptions = ignoreNamespaceStorageOptions;
     return this;
   }
 
@@ -334,33 +337,38 @@ public class WriteDatasetBuilder {
    * @throws IllegalArgumentException if required parameters are missing or invalid
    */
   public Dataset execute() {
-    // Auto-create allocator if not provided
     if (allocator == null) {
       allocator = new RootAllocator(Long.MAX_VALUE);
     }
 
-    // Validate that exactly one of uri or namespaceClient is provided
     boolean hasUri = uri != null;
-    boolean hasNamespaceClient = namespaceClient != null && tableId != null;
+    boolean hasNamespaceClient = namespaceClient != null || tableId != null;
+    boolean hasContext = namespaceClientTableContext != null;
 
     if (hasUri && hasNamespaceClient) {
       throw new IllegalArgumentException(
-          "Cannot specify both uri() and namespaceClient()+tableId(). Use one or the other.");
+          "Cannot specify both uri() and namespaceClient()+tableId().");
+    }
+    if (hasContext && !hasNamespaceClient) {
+      throw new IllegalArgumentException(
+          "namespaceClientTableContext() requires namespaceClient() and tableId().");
     }
     if (!hasUri && !hasNamespaceClient) {
-      if (namespaceClient != null) {
-        throw new IllegalArgumentException(
-            "namespaceClient() is set but tableId() is missing. Both must be provided together.");
-      } else if (tableId != null) {
+      throw new IllegalArgumentException(
+          "Either uri() or namespaceClient()+tableId() must be called.");
+    }
+
+    if (hasNamespaceClient) {
+      if (namespaceClient == null) {
         throw new IllegalArgumentException(
             "tableId() is set but namespaceClient() is missing. Both must be provided together.");
-      } else {
+      }
+      if (tableId == null) {
         throw new IllegalArgumentException(
-            "Either uri() or namespaceClient()+tableId() must be called.");
+            "namespaceClient() is set but tableId() is missing. Both must be provided together.");
       }
     }
 
-    // Validate data source - exactly one of reader, stream, or schema must be provided
     int dataSourceCount = 0;
     if (reader != null) dataSourceCount++;
     if (stream != null) dataSourceCount++;
@@ -376,21 +384,43 @@ public class WriteDatasetBuilder {
               + "Use only one of: reader(), stream(), or schema().");
     }
 
-    // Handle namespace client-based writing
+    if (hasContext) {
+      return executeWithContext();
+    }
+
     if (hasNamespaceClient) {
       return executeWithNamespaceClient();
     }
 
-    // Handle URI-based writing
     return executeWithUri();
+  }
+
+  private Dataset executeWithContext() {
+    NamespaceClientTableContext ctx = this.namespaceClientTableContext;
+
+    WriteParams.Builder paramsBuilder =
+        new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
+
+    maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
+    maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
+    maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
+    enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
+    dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
+    initialBases.ifPresent(paramsBuilder::withInitialBases);
+    targetBases.ifPresent(paramsBuilder::withTargetBases);
+    allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
+    blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
+
+    WriteParams params = paramsBuilder.build();
+
+    return createDatasetWithStreamAndNamespaceClient(
+        ctx.getLocation(), params, namespaceClient, tableId, ctx);
   }
 
   private Dataset executeWithNamespaceClient() {
     String tableUri;
-    Map<String, String> namespaceStorageOptions = null;
-    boolean namespaceClientManagedVersioning = false;
+    NamespaceClientTableContext ctx;
 
-    // Mode-specific namespace client operations
     if (mode == WriteParams.WriteMode.CREATE) {
       DeclareTableRequest declareRequest = new DeclareTableRequest();
       declareRequest.setId(tableId);
@@ -401,12 +431,8 @@ public class WriteDatasetBuilder {
         throw new IllegalArgumentException("Namespace client did not return a table location");
       }
 
-      namespaceClientManagedVersioning =
-          Boolean.TRUE.equals(declareResponse.getManagedVersioning());
-      namespaceStorageOptions =
-          ignoreNamespaceStorageOptions ? null : declareResponse.getStorageOptions();
+      ctx = NamespaceClientTableContext.fromDeclareTableResponse(declareResponse);
     } else {
-      // For APPEND/OVERWRITE modes, call namespaceClient.describeTable()
       DescribeTableRequest request = new DescribeTableRequest();
       request.setId(tableId);
 
@@ -417,20 +443,11 @@ public class WriteDatasetBuilder {
         throw new IllegalArgumentException("Namespace client did not return a table location");
       }
 
-      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
-      namespaceClientManagedVersioning = Boolean.TRUE.equals(response.getManagedVersioning());
+      ctx = NamespaceClientTableContext.fromDescribeTableResponse(response);
     }
 
-    // Merge storage options (namespace client options + user options, with namespace client taking
-    // precedence)
-    Map<String, String> mergedStorageOptions = new HashMap<>(storageOptions);
-    if (namespaceStorageOptions != null && !namespaceStorageOptions.isEmpty()) {
-      mergedStorageOptions.putAll(namespaceStorageOptions);
-    }
-
-    // Build WriteParams with merged storage options
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(mergedStorageOptions);
+        new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
@@ -445,22 +462,8 @@ public class WriteDatasetBuilder {
 
     WriteParams params = paramsBuilder.build();
 
-    // Pass namespaceClient, tableId, and namespaceClientManagedVersioning to JNI
-    // Rust will automatically create a storage options provider when namespaceClient/tableId
-    // are non-null for credential refresh, and will create an external manifest commit handler
-    // when namespaceClientManagedVersioning is true
-    if (namespaceClientManagedVersioning) {
-      return createDatasetWithStreamAndNamespaceClient(
-          tableUri, params, namespaceClient, tableId, true);
-    } else {
-      // Even without managed versioning, pass namespaceClient for credential refresh
-      // when namespace client vends credentials (storage options was non-null)
-      if (!ignoreNamespaceStorageOptions && namespaceStorageOptions != null) {
-        return createDatasetWithStreamAndNamespaceClient(
-            tableUri, params, namespaceClient, tableId, false);
-      }
-      return createDatasetWithStream(tableUri, params);
-    }
+    return createDatasetWithStreamAndNamespaceClient(
+        tableUri, params, namespaceClient, tableId, ctx);
   }
 
   private Dataset executeWithUri() {
@@ -479,29 +482,7 @@ public class WriteDatasetBuilder {
 
     WriteParams params = paramsBuilder.build();
 
-    return createDatasetWithStream(uri, params);
-  }
-
-  private Dataset createDatasetWithStream(String path, WriteParams params) {
-    // If stream is directly provided, use it
-    if (stream != null) {
-      return Dataset.create(allocator, stream, path, params);
-    }
-
-    // If reader is provided, convert to stream
-    if (reader != null) {
-      try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
-        Data.exportArrayStream(allocator, reader, tempStream);
-        return Dataset.create(allocator, tempStream, path, params);
-      }
-    }
-
-    // If only schema is provided (empty table), use Dataset.create with schema
-    if (schema != null) {
-      return Dataset.create(allocator, path, schema, params);
-    }
-
-    throw new IllegalStateException("No data source provided");
+    return createDatasetWithStreamAndNamespaceClient(uri, params, null, null, null);
   }
 
   private Dataset createDatasetWithStreamAndNamespaceClient(
@@ -509,20 +490,12 @@ public class WriteDatasetBuilder {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
-    // If stream is directly provided, use it
+      NamespaceClientTableContext namespaceClientTableContext) {
     if (stream != null) {
       return Dataset.create(
-          allocator,
-          stream,
-          path,
-          params,
-          namespaceClient,
-          tableId,
-          namespaceClientManagedVersioning);
+          allocator, stream, path, params, namespaceClient, tableId, namespaceClientTableContext);
     }
 
-    // If reader is provided, convert to stream
     if (reader != null) {
       try (ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, tempStream);
@@ -533,14 +506,23 @@ public class WriteDatasetBuilder {
             params,
             namespaceClient,
             tableId,
-            namespaceClientManagedVersioning);
+            namespaceClientTableContext);
       }
     }
 
-    // If only schema is provided (empty table), use Dataset.create with schema
-    // Note: Schema-only creation doesn't support namespace client-based commit handling
     if (schema != null) {
-      return Dataset.create(allocator, path, schema, params);
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+          ArrowArrayStream tempStream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, root, tempStream);
+        return Dataset.create(
+            allocator,
+            tempStream,
+            path,
+            params,
+            namespaceClient,
+            tableId,
+            namespaceClientTableContext);
+      }
     }
 
     throw new IllegalStateException("No data source provided");

@@ -1581,6 +1581,24 @@ pub fn extract_namespace_arc(
     PyLanceNamespace::create_arc(py, namespace_client)
 }
 
+/// Extract a [`NamespaceClientTableContext`] from a Python object.
+///
+/// Reads the `location`, `storage_options`, and `managed_versioning`
+/// attributes from the Python `NamespaceClientTableContext` instance.
+pub fn extract_namespace_client_table_context(
+    ctx: &Bound<'_, PyAny>,
+) -> PyResult<lance_namespace::NamespaceClientTableContext> {
+    let location: String = ctx.getattr("location")?.extract()?;
+    let storage_options: Option<HashMap<String, String>> =
+        ctx.getattr("storage_options")?.extract()?;
+    let managed_versioning: bool = ctx.getattr("managed_versioning")?.extract()?;
+    Ok(lance_namespace::NamespaceClientTableContext {
+        location,
+        storage_options,
+        managed_versioning,
+    })
+}
+
 /// Python wrapper for REST adapter server
 #[pyclass(name = "PyRestAdapter", module = "lance.lance")]
 pub struct PyRestAdapter {

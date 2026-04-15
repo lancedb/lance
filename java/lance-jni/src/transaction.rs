@@ -4,7 +4,9 @@
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::RT;
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::blocking_dataset::{
+    BlockingDataset, NATIVE_DATASET, extract_namespace_client_table_context, extract_namespace_info,
+};
 use crate::error::Result;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
@@ -624,7 +626,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     skip_auto_cleanup: jboolean,
     namespace_obj: JObject,
     table_id_obj: JObject,
-    namespace_client_managed_versioning: jboolean,
+    namespace_client_table_context_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -641,7 +643,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             skip_auto_cleanup != 0,
             namespace_obj,
             table_id_obj,
-            namespace_client_managed_versioning != 0,
+            namespace_client_table_context_obj,
         )
     )
 }
@@ -660,7 +662,7 @@ fn inner_commit_to_dataset<'local>(
     skip_auto_cleanup: bool,
     namespace_obj: JObject,
     table_id_obj: JObject,
-    namespace_client_managed_versioning: bool,
+    namespace_client_table_context_obj: JObject,
 ) -> Result<JObject<'local>> {
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
@@ -753,9 +755,9 @@ fn inner_commit_to_dataset<'local>(
         Some(&mut java_blocking_ds),
     )?;
 
-    // Set namespace commit handler only if namespace_client_managed_versioning is true
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let commit_handler = if namespace_client_managed_versioning {
+    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let commit_handler = if ctx.as_ref().is_some_and(|c| c.managed_versioning) {
         namespace_info.map(|(ns, tid)| {
             let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
             Arc::new(ExternalManifestCommitHandler {
@@ -1380,7 +1382,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     storage_format_obj: JObject,
     max_retries: jint,
     skip_auto_cleanup: jboolean,
-    namespace_client_managed_versioning: jboolean,
+    namespace_client_table_context_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1398,7 +1400,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             storage_format_obj,
             max_retries as u32,
             skip_auto_cleanup != 0,
-            namespace_client_managed_versioning != 0,
+            namespace_client_table_context_obj,
         )
     )
 }
@@ -1418,7 +1420,7 @@ fn inner_commit_to_uri<'local>(
     storage_format_obj: JObject,
     max_retries: u32,
     skip_auto_cleanup: bool,
-    namespace_client_managed_versioning: bool,
+    namespace_client_table_context_obj: JObject,
 ) -> Result<JObject<'local>> {
     let uri_str: String = uri.extract(env)?;
 
@@ -1488,6 +1490,8 @@ fn inner_commit_to_uri<'local>(
 
     // Open the read dataset using the same storage options (and provider, if any) so that
     // `convert_to_rust_transaction` can derive schema/field ids based on the target dataset.
+    let ctx = extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+
     let mut ds = BlockingDataset::open(
         &uri_str,
         None,
@@ -1500,11 +1504,10 @@ fn inner_commit_to_uri<'local>(
         None,
         open_namespace,
         open_table_id,
-        namespace_client_managed_versioning,
+        ctx.clone(),
     )
     .ok();
 
-    // Convert Java transaction to Rust
     let allocator_ref = if allocator_obj.is_null() {
         None
     } else {
@@ -1513,7 +1516,6 @@ fn inner_commit_to_uri<'local>(
     let transaction =
         convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref(), ds.as_mut())?;
 
-    // Build CommitBuilder with URI
     let mut builder = CommitBuilder::new(&*uri_str)
         .with_store_params(store_params)
         .with_detached(detached)
@@ -1532,8 +1534,9 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_skip_auto_cleanup(true);
     }
 
-    // Set namespace commit handler only if namespace_client_managed_versioning is true
-    if namespace_client_managed_versioning && let Some((namespace_client, tid)) = namespace_info {
+    if ctx.as_ref().is_some_and(|c| c.managed_versioning)
+        && let Some((namespace_client, tid)) = namespace_info
+    {
         let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
         let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(external_store),
