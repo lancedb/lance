@@ -37,7 +37,6 @@ use lance::dataset::{
     Version, WriteParams,
 };
 use lance::index::DatasetIndexExt;
-use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
@@ -50,10 +49,8 @@ use lance_index::progress::noop_progress;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 
@@ -137,33 +134,24 @@ impl BlockingDataset {
 
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        uri: &str,
+        uri: Option<&str>,
         version: Option<u64>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
         serialized_manifest: Option<&[u8]>,
-        storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
         namespace: Option<Arc<dyn LanceNamespace>>,
         table_id: Option<Vec<String>>,
         namespace_client_table_context: Option<lance_namespace::NamespaceClientTableContext>,
     ) -> Result<Self> {
-        let accessor = match (storage_options.is_empty(), storage_options_provider) {
-            (false, Some(provider)) => Some(Arc::new(
-                lance::io::StorageOptionsAccessor::with_initial_and_provider(
-                    storage_options,
-                    provider,
-                ),
-            )),
-            (false, None) => Some(Arc::new(
+        let accessor = if !storage_options.is_empty() {
+            Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
-            )),
-            (true, Some(provider)) => Some(Arc::new(
-                lance::io::StorageOptionsAccessor::with_provider(provider),
-            )),
-            (true, None) => None,
+            ))
+        } else {
+            None
         };
 
         let store_params = ObjectStoreParams {
@@ -179,7 +167,21 @@ impl BlockingDataset {
             ..Default::default()
         };
 
-        let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
+        let mut builder = if let (Some(namespace_client), Some(tid)) = (namespace, table_id) {
+            RT.block_on(DatasetBuilder::from_namespace(
+                namespace_client,
+                tid,
+                namespace_client_table_context.as_ref(),
+            ))?
+        } else {
+            let uri = uri.ok_or_else(|| {
+                Error::input_error(
+                    "uri is required when namespace_client is not provided".to_string(),
+                )
+            })?;
+            DatasetBuilder::from_uri(uri)
+        };
+        builder = builder.with_read_params(params);
 
         if let Some(ver) = version {
             builder = builder.with_version(ver);
@@ -187,18 +189,6 @@ impl BlockingDataset {
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
-        }
-
-        if namespace_client_table_context
-            .as_ref()
-            .is_some_and(|c| c.managed_versioning)
-            && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
-        {
-            let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            builder = builder.with_commit_handler(commit_handler);
         }
 
         let inner = RT.block_on(builder.load())?;
@@ -527,9 +517,10 @@ fn inner_create_with_ffi_stream<'local>(
 
 /// Creates a dataset from a record batch reader.
 ///
-/// When `namespace_info` is provided, sets up the storage options provider for
-/// credential refresh. When `ctx` has `managed_versioning`, also sets up the
-/// commit handler for namespace-managed versioning.
+/// Creates a dataset from a record batch reader.
+///
+/// When `namespace_info` is provided, uses `write_into_namespace` which handles
+/// storage options provider and commit handler setup internally.
 #[allow(clippy::too_many_arguments)]
 fn create_dataset<'local>(
     env: &mut JNIEnv<'local>,
@@ -550,9 +541,7 @@ fn create_dataset<'local>(
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_table_context: Option<lance_namespace::NamespaceClientTableContext>,
 ) -> Result<JObject<'local>> {
-    let path_str = path.extract(env)?;
-
-    let mut write_params = extract_write_params(
+    let write_params = extract_write_params(
         env,
         &max_rows_per_file,
         &max_rows_per_group,
@@ -568,47 +557,19 @@ fn create_dataset<'local>(
         &blob_pack_file_size_threshold,
     )?;
 
-    if let Some((namespace, table_id)) = namespace_info {
-        if namespace_client_table_context
-            .as_ref()
-            .is_some_and(|c| c.managed_versioning)
-        {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            write_params.commit_handler = Some(commit_handler);
-        }
-
-        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
-            LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
-        );
-
-        let initial_opts = namespace_client_table_context
-            .as_ref()
-            .and_then(|c| c.storage_options.clone())
-            .unwrap_or_else(|| {
-                extract_storage_options(env, &storage_options_obj).unwrap_or_default()
-            });
-
-        let accessor = if initial_opts.is_empty() {
-            Arc::new(lance::io::StorageOptionsAccessor::with_provider(provider))
-        } else {
-            Arc::new(
-                lance::io::StorageOptionsAccessor::with_initial_and_provider(
-                    initial_opts,
-                    provider,
-                ),
-            )
-        };
-        write_params.store_params = Some(ObjectStoreParams {
-            storage_options_accessor: Some(accessor),
-            ..Default::default()
-        });
-    }
-
-    let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
+    let dataset = if let Some((namespace_client, table_id)) = namespace_info {
+        let inner = RT.block_on(Dataset::write_into_namespace(
+            reader,
+            namespace_client,
+            table_id,
+            namespace_client_table_context.as_ref(),
+            Some(write_params),
+        ))?;
+        BlockingDataset { inner }
+    } else {
+        let path_str = path.extract(env)?;
+        BlockingDataset::write(reader, &path_str, Some(write_params))?
+    };
     dataset.into_java(env)
 }
 
@@ -1194,25 +1155,17 @@ fn inner_open_native<'local>(
     let namespace_client_table_context =
         extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
-    let storage_options_provider_arc: Option<Arc<dyn StorageOptionsProvider>> =
-        if let (Some(ns), Some(tid)) = (namespace.clone(), table_id.clone()) {
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(ns, tid)))
-        } else {
-            None
-        };
-
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let session = session_from_handle(session_handle);
 
     let dataset = BlockingDataset::open(
-        &path_str,
+        Some(path_str.as_str()).filter(|s| !s.is_empty()),
         version,
         block_size,
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
         serialized_manifest,
-        storage_options_provider_arc,
         session,
         namespace,
         table_id,

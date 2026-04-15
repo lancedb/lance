@@ -29,7 +29,6 @@ use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
@@ -1454,58 +1453,36 @@ fn inner_commit_to_uri<'local>(
         Some(parse_storage_format(&format_str)?)
     };
 
-    // Extract namespace info and create storage options provider if namespace is provided
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> =
-        if let Some((ref ns, ref tid)) = namespace_info {
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                ns.clone(),
-                tid.clone(),
-            )))
-        } else {
-            None
-        };
-
-    // Keep a copy of initial options for opening the read dataset.
-    let initial_storage_options = write_param.clone();
-
-    let accessor = match (write_param.is_empty(), storage_options_provider.clone()) {
-        (false, Some(provider)) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_initial_and_provider(write_param, provider),
-        )),
-        (false, None) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_static_options(write_param),
-        )),
-        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
-            provider,
-        ))),
-        (true, None) => None,
-    };
-
-    let store_params = ObjectStoreParams {
-        storage_options_accessor: accessor,
-        ..Default::default()
-    };
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
     let (open_namespace, open_table_id) = match &namespace_info {
         Some((namespace_client, tid)) => (Some(namespace_client.clone()), Some(tid.clone())),
         None => (None, None),
     };
 
-    // Open the read dataset using the same storage options (and provider, if any) so that
-    // `convert_to_rust_transaction` can derive schema/field ids based on the target dataset.
-    let namespace_client_table_context =
-        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let accessor = if !write_param.is_empty() {
+        Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(write_param),
+        ))
+    } else {
+        None
+    };
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: accessor,
+        ..Default::default()
+    };
 
+    // Open the read dataset so that convert_to_rust_transaction can derive schema/field ids.
     let mut ds = BlockingDataset::open(
-        &uri_str,
+        Some(&*uri_str),
         None,
         None,
         6 * 1024 * 1024,
         1024 * 1024,
-        initial_storage_options,
+        HashMap::new(),
         None,
-        storage_options_provider,
         None,
         open_namespace,
         open_table_id,
