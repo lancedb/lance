@@ -34,6 +34,8 @@ cc = "1.0.83"
 # This requires GCC 12 / Clang 6 or later. (To get AVX-512 support,
 # you need Clang 11 or later.)
 fp16kernels = []
+# Enable nightly-only features like loongarch64 SIMD intrinsics.
+nightly = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

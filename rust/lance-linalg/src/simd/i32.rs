@@ -6,11 +6,11 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
-#[cfg(target_arch = "loongarch64")]
+#[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
 use std::arch::loongarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-#[cfg(target_arch = "loongarch64")]
+#[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
 use std::mem::transmute;
 
 use super::SIMD;
@@ -26,9 +26,18 @@ pub struct i32x8(pub(crate) __m256i);
 pub struct i32x8(int32x4x2_t);
 
 #[allow(non_camel_case_types)]
-#[cfg(target_arch = "loongarch64")]
+#[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
 #[derive(Clone, Copy)]
 pub struct i32x8(v8i32);
+
+#[allow(non_camel_case_types)]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "loongarch64", feature = "nightly")
+)))]
+#[derive(Clone, Copy)]
+pub struct i32x8([i32; 8]);
 
 impl std::fmt::Debug for i32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -63,9 +72,17 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             Self(int32x4x2_t(vdupq_n_s32(val), vdupq_n_s32(val)))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             Self(lasx_xvreplgr2vr_w(val))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            Self([val; 8])
         }
     }
 
@@ -79,7 +96,15 @@ impl SIMD<i32, 8> for i32x8 {
         {
             Self::splat(0)
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        {
+            Self::splat(0)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             Self::splat(0)
         }
@@ -95,9 +120,17 @@ impl SIMD<i32, 8> for i32x8 {
         {
             Self(vld1q_s32_x2(ptr))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        unsafe {
+            Self(std::ptr::read(ptr as *const [i32; 8]))
         }
     }
 
@@ -111,9 +144,17 @@ impl SIMD<i32, 8> for i32x8 {
         {
             Self(vld1q_s32_x2(ptr))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        unsafe {
+            Self(std::ptr::read(ptr as *const [i32; 8]))
         }
     }
 
@@ -131,9 +172,17 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             vst1q_s32_x2(ptr, self.0)
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.0.as_ptr(), ptr, 8)
         }
     }
 
@@ -147,9 +196,17 @@ impl SIMD<i32, 8> for i32x8 {
             let sum = vaddq_s32(self.0.0, self.0.1);
             vaddvq_s32(sum)
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         {
             self.as_array().iter().sum()
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            self.0.iter().sum()
         }
     }
 
@@ -169,9 +226,21 @@ impl SIMD<i32, 8> for i32x8 {
                 vminq_s32(self.0.1, rhs.0.1),
             ))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             Self(lasx_xvmin_w(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            let mut res = [0i32; 8];
+            for i in 0..8 {
+                res[i] = self.0[i].min(rhs.0[i]);
+            }
+            Self(res)
         }
     }
 
@@ -198,10 +267,22 @@ impl SIMD<i32, 8> for i32x8 {
                 }
             }
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             for i in 0..8 {
                 if self.as_array().get_unchecked(i) == &val {
+                    return Some(i as i32);
+                }
+            }
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        unsafe {
+            for (i, &val_) in self.0.iter().enumerate() {
+                if val_ == val {
                     return Some(i as i32);
                 }
             }
@@ -226,9 +307,21 @@ impl Add for i32x8 {
                 vaddq_s32(self.0.1, rhs.0.1),
             ))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             Self(lasx_xvadd_w(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            let mut res = [0i32; 8];
+            for i in 0..8 {
+                res[i] = self.0[i] + rhs.0[i];
+            }
+            Self(res)
         }
     }
 }
@@ -245,9 +338,19 @@ impl AddAssign for i32x8 {
             self.0.0 = vaddq_s32(self.0.0, rhs.0.0);
             self.0.1 = vaddq_s32(self.0.1, rhs.0.1);
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             self.0 = lasx_xvadd_w(self.0, rhs.0);
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            for i in 0..8 {
+                self.0[i] += rhs.0[i];
+            }
         }
     }
 }
@@ -268,9 +371,21 @@ impl Sub for i32x8 {
                 vsubq_s32(self.0.1, rhs.0.1),
             ))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             Self(lasx_xvsub_w(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            let mut res = [0i32; 8];
+            for i in 0..8 {
+                res[i] = self.0[i] - rhs.0[i];
+            }
+            Self(res)
         }
     }
 }
@@ -287,9 +402,19 @@ impl SubAssign for i32x8 {
             self.0.0 = vsubq_s32(self.0.0, rhs.0.0);
             self.0.1 = vsubq_s32(self.0.1, rhs.0.1);
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             self.0 = lasx_xvsub_w(self.0, rhs.0);
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            for i in 0..8 {
+                self.0[i] -= rhs.0[i];
+            }
         }
     }
 }
@@ -310,9 +435,21 @@ impl Mul for i32x8 {
                 vmulq_s32(self.0.1, rhs.0.1),
             ))
         }
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
         unsafe {
             Self(lasx_xvmul_w(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
+        {
+            let mut res = [0i32; 8];
+            for i in 0..8 {
+                res[i] = self.0[i] * rhs.0[i];
+            }
+            Self(res)
         }
     }
 }

@@ -7,6 +7,8 @@ use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+use std::arch::loongarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
@@ -25,7 +27,17 @@ pub struct u8x16(pub __m128i);
 #[derive(Clone, Copy)]
 pub struct u8x16(pub uint8x16_t);
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+/// 16 of 8-bit `u8` values.
+#[allow(non_camel_case_types)]
+#[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+#[derive(Clone, Copy)]
+pub struct u8x16(pub v32i8);
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "loongarch64", feature = "nightly")
+)))]
 #[derive(Clone, Copy)]
 pub struct u8x16(pub [u8; 16]);
 
@@ -40,7 +52,15 @@ impl u8x16 {
         unsafe {
             Self(vandq_u8(self.0, vdupq_n_u8(mask)))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvand_v(self.0, lasx_xvreplgr2vr_b(mask as i32)))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = self.0;
             for i in 0..16 {
@@ -51,18 +71,26 @@ impl u8x16 {
     }
 
     #[inline]
-    pub fn right_shift<const N: i32>(self) -> Self {
+    pub fn right_shift<const N: u32>(self) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let shifted = _mm_srli_epi16(self.0, N);
-            let mask = _mm_set1_epi8((1_i8 << (8 - N)) - 1);
+            let shifted = _mm_srli_epi16(self.0, N as i32);
+            let mask = _mm_set1_epi8((1_i8 << (8 - N as i32)) - 1);
             Self(_mm_and_si128(shifted, mask))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(vshrq_n_u8::<N>(self.0))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvsrli_b::<N>(self.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -106,7 +134,15 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             Self(vdupq_n_u8(val))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvreplgr2vr_b(val as i32))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -126,7 +162,15 @@ impl SIMD<u8, 16> for u8x16 {
         {
             Self::splat(0)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        {
+            Self::splat(0)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             Self([0; 16])
         }
@@ -142,7 +186,15 @@ impl SIMD<u8, 16> for u8x16 {
         {
             Self::load_unaligned(ptr)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        {
+            Self::load_unaligned(ptr)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             Self::load_unaligned(ptr)
         }
@@ -158,7 +210,16 @@ impl SIMD<u8, 16> for u8x16 {
         {
             Self(vld1q_u8(ptr))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            use std::mem::transmute;
+            Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -178,7 +239,15 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             vst1q_u8(ptr, self.0)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            self.store_unaligned(ptr);
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             self.store_unaligned(ptr);
         }
@@ -194,7 +263,16 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             vst1q_u8(ptr, self.0)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            use std::mem::transmute;
+            lasx_xvst::<0>(transmute(self.0), transmute(ptr));
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             for i in 0..16 {
                 *ptr.add(i) = self.0[i];
@@ -222,7 +300,17 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             vminvq_u8(self.0)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        {
+            let mut arr = [0u8; 16];
+            unsafe { self.store_unaligned(arr.as_mut_ptr()); }
+            arr.iter().min().copied().unwrap()
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut min = self.0[0];
             for i in 1..16 {
@@ -242,7 +330,15 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             Self(vminq_u8(self.0, rhs.0))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvmin_b(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -267,7 +363,25 @@ impl Shuffle for u8x16 {
         unsafe {
             Self(vqtbl1q_u8(self.0, indices.0))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        {
+            let mut arr_self = [0u8; 16];
+            let mut arr_indices = [0u8; 16];
+            unsafe {
+                self.store_unaligned(arr_self.as_mut_ptr());
+                indices.store_unaligned(arr_indices.as_mut_ptr());
+            }
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = arr_self[arr_indices[i] as usize];
+            }
+            unsafe { Self::load_unaligned(result.as_ptr()) }
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -291,7 +405,15 @@ impl Add for u8x16 {
         unsafe {
             Self(vqaddq_u8(self.0, rhs.0))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvadd_b(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -313,7 +435,15 @@ impl AddAssign for u8x16 {
         unsafe {
             self.0 = vqaddq_u8(self.0, rhs.0)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            self.0 = lasx_xvadd_b(self.0, rhs.0)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             for i in 0..16 {
                 self.0[i] = self.0[i].saturating_add(rhs.0[i]);
@@ -343,7 +473,15 @@ impl Mul for u8x16 {
         unsafe {
             Self(vmulq_u8(self.0, rhs.0))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvmul_b(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -367,7 +505,15 @@ impl Sub for u8x16 {
         unsafe {
             Self(vsubq_u8(self.0, rhs.0))
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            Self(lasx_xvsub_b(self.0, rhs.0))
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
@@ -389,7 +535,15 @@ impl SubAssign for u8x16 {
         unsafe {
             self.0 = vsubq_u8(self.0, rhs.0)
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
+        unsafe {
+            self.0 = lasx_xvsub_b(self.0, rhs.0)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "loongarch64", feature = "nightly")
+        )))]
         {
             for i in 0..16 {
                 self.0[i] = self.0[i].wrapping_sub(rhs.0[i]);
@@ -424,6 +578,8 @@ mod tests {
             assert_eq!(std::cmp::min(x * (x + 16), 255_i32) as u8, y);
             #[cfg(target_arch = "aarch64")]
             assert_eq!((x * (x + 16_i32)) as u8, y);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let _ = (x, y);
         });
     }
 

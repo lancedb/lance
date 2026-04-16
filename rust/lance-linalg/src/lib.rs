@@ -4,7 +4,7 @@
 //! High-performance [Apache Arrow](https://docs.rs/arrow/latest/arrow/) native Linear Algebra algorithms.
 
 #![deny(clippy::unused_async)]
-#![cfg_attr(target_arch = "loongarch64", feature(stdarch_loongarch))]
+#![cfg_attr(all(target_arch = "loongarch64", feature = "nightly"), feature(stdarch_loongarch))]
 
 use arrow_schema::ArrowError;
 
