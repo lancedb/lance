@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     future::Future,
     ops::{DerefMut, Range},
+    panic::AssertUnwindSafe,
     sync::Arc,
 };
 
@@ -17,7 +18,7 @@ use arrow_schema::DataType as ArrowDataType;
 use bytes::Bytes;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, FieldExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -25,6 +26,9 @@ use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OnceCell, oneshot};
 use url::Url;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
@@ -745,6 +749,8 @@ struct BlobSource {
     file_size: CachedFileSize,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
+    #[cfg(test)]
+    panic_on_next_drain: AtomicBool,
 }
 
 impl BlobSource {
@@ -756,6 +762,8 @@ impl BlobSource {
             file_size: CachedFileSize::unknown(),
             scheduler: OnceCell::new(),
             pending_reads: Mutex::new(PendingBlobReads::default()),
+            #[cfg(test)]
+            panic_on_next_drain: AtomicBool::new(false),
         }
     }
 
@@ -801,7 +809,13 @@ impl BlobSource {
             let source = self.clone();
             let scheduler = scheduler.clone();
             tokio::spawn(async move {
-                source.drain_pending_reads(scheduler).await;
+                let result = AssertUnwindSafe(source.clone().drain_pending_reads(scheduler))
+                    .catch_unwind()
+                    .await;
+                if let Err(panic) = result {
+                    source.reset_pending_read_drain().await;
+                    std::panic::resume_unwind(panic);
+                }
             });
         }
 
@@ -824,9 +838,31 @@ impl BlobSource {
                 }
                 std::mem::take(&mut pending_reads.requests)
             };
+            self.maybe_panic_drain_for_test();
             fulfill_pending_blob_reads(&scheduler, batch).await;
         }
     }
+
+    /// Clear the drain-leader flag after an unexpected task failure.
+    async fn reset_pending_read_drain(&self) {
+        let mut pending_reads = self.pending_reads.lock().await;
+        pending_reads.is_draining = false;
+    }
+
+    #[cfg(test)]
+    fn request_panic_on_next_drain_for_test(&self) {
+        self.panic_on_next_drain.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn maybe_panic_drain_for_test(&self) {
+        if self.panic_on_next_drain.swap(false, Ordering::SeqCst) {
+            panic!("panic requested by blob read test");
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_panic_drain_for_test(&self) {}
 }
 
 /// Queue of pending logical blob reads for one [`BlobSource`].
@@ -1741,8 +1777,7 @@ fn collect_blob_entries_v1(
     let positions = descriptions.column(0).as_primitive::<UInt64Type>();
     let sizes = descriptions.column(1).as_primitive::<UInt64Type>();
     let mut source_cache = HashMap::<BlobSourceKey, Arc<BlobSource>>::new();
-
-    Ok(row_addrs
+    row_addrs
         .values()
         .iter()
         .zip(positions.iter())
@@ -1755,10 +1790,20 @@ fn collect_blob_entries_v1(
         })
         .map(|(selection_index, row_addr, position, size)| {
             let frag_id = RowAddress::from(row_addr).fragment_id();
-            let frag = dataset.get_fragment(frag_id as usize).unwrap();
-            let data_file = frag.data_file_for_field(blob_field_id).unwrap();
+            let frag = dataset.get_fragment(frag_id as usize).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Blob row address {} references missing fragment {}",
+                    row_addr, frag_id
+                ))
+            })?;
+            let data_file = frag.data_file_for_field(blob_field_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Blob field {} has no data file in fragment {} for row address {}",
+                    blob_field_id, frag_id, row_addr
+                ))
+            })?;
             let data_file_path = dataset.data_dir().child(data_file.path.as_str());
-            BlobEntry {
+            Ok(BlobEntry {
                 selection_index,
                 row_address: row_addr,
                 file: BlobFile::with_source(
@@ -1772,9 +1817,9 @@ fn collect_blob_entries_v1(
                     BlobKind::Inline,
                     None,
                 ),
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Convert blob v2 descriptors into logical blob entries.
@@ -2050,7 +2095,8 @@ mod tests {
 
     use super::{
         BlobEntry, BlobFile, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ReadBlobsExecution, data_file_key_from_path, execute_blob_read_plan, plan_blob_read_plans,
+        ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path,
+        execute_blob_read_plan, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -2626,6 +2672,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_collect_blob_entries_v1_rejects_missing_fragment() {
+        let fixture = BlobTestFixture::new().await;
+        let blob_field_id =
+            fixture.dataset.schema().project(&["blobs"]).unwrap().fields[0].id as u32;
+        let descriptions = StructArray::from(vec![
+            (
+                Arc::new(Field::new("position", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("size", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![3])) as ArrayRef,
+            ),
+        ]);
+        let row_addrs = UInt64Array::from(vec![(999_u64 << 32) | 7]);
+
+        let err =
+            collect_blob_entries_v1(&fixture.dataset, blob_field_id, &descriptions, &row_addrs)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("references missing fragment"));
+    }
+
+    #[tokio::test]
     pub async fn test_take_blob_not_blob_col() {
         let fixture = BlobTestFixture::new().await;
 
@@ -2886,6 +2956,21 @@ mod tests {
         assert_eq!(data1.unwrap().as_ref(), b"bcd");
         assert_eq!(data2.unwrap().as_ref(), b"efg");
         assert_eq!(inner.requested_ranges(), vec![1..7]);
+    }
+
+    #[tokio::test]
+    async fn test_blob_source_recovers_after_drain_panic() {
+        let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
+        let blob = BlobFile::with_source(source.clone(), 1, 3, BlobKind::Packed, None);
+
+        source.request_panic_on_next_drain_for_test();
+        let err = blob.read().await.unwrap_err();
+        assert!(err.to_string().contains("dropped the response"));
+
+        let data = blob.read().await.unwrap();
+        assert_eq!(data.as_ref(), b"bcd");
+        assert_eq!(inner.requested_ranges(), vec![1..4]);
     }
 
     #[tokio::test]
