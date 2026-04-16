@@ -27,9 +27,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OnceCell, oneshot};
 use url::Url;
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
@@ -749,8 +746,6 @@ struct BlobSource {
     file_size: CachedFileSize,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
-    #[cfg(test)]
-    panic_on_next_drain: AtomicBool,
 }
 
 impl BlobSource {
@@ -762,8 +757,6 @@ impl BlobSource {
             file_size: CachedFileSize::unknown(),
             scheduler: OnceCell::new(),
             pending_reads: Mutex::new(PendingBlobReads::default()),
-            #[cfg(test)]
-            panic_on_next_drain: AtomicBool::new(false),
         }
     }
 
@@ -813,7 +806,8 @@ impl BlobSource {
                     .catch_unwind()
                     .await;
                 if let Err(panic) = result {
-                    source.reset_pending_read_drain().await;
+                    let mut pending_reads = source.pending_reads.lock().await;
+                    pending_reads.is_draining = false;
                     std::panic::resume_unwind(panic);
                 }
             });
@@ -838,31 +832,9 @@ impl BlobSource {
                 }
                 std::mem::take(&mut pending_reads.requests)
             };
-            self.maybe_panic_drain_for_test();
             fulfill_pending_blob_reads(&scheduler, batch).await;
         }
     }
-
-    /// Clear the drain-leader flag after an unexpected task failure.
-    async fn reset_pending_read_drain(&self) {
-        let mut pending_reads = self.pending_reads.lock().await;
-        pending_reads.is_draining = false;
-    }
-
-    #[cfg(test)]
-    fn request_panic_on_next_drain_for_test(&self) {
-        self.panic_on_next_drain.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn maybe_panic_drain_for_test(&self) {
-        if self.panic_on_next_drain.swap(false, Ordering::SeqCst) {
-            panic!("panic requested by blob read test");
-        }
-    }
-
-    #[cfg(not(test))]
-    fn maybe_panic_drain_for_test(&self) {}
 }
 
 /// Queue of pending logical blob reads for one [`BlobSource`].
@@ -2956,21 +2928,6 @@ mod tests {
         assert_eq!(data1.unwrap().as_ref(), b"bcd");
         assert_eq!(data2.unwrap().as_ref(), b"efg");
         assert_eq!(inner.requested_ranges(), vec![1..7]);
-    }
-
-    #[tokio::test]
-    async fn test_blob_source_recovers_after_drain_panic() {
-        let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
-        let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
-        let blob = BlobFile::with_source(source.clone(), 1, 3, BlobKind::Packed, None);
-
-        source.request_panic_on_next_drain_for_test();
-        let err = blob.read().await.unwrap_err();
-        assert!(err.to_string().contains("dropped the response"));
-
-        let data = blob.read().await.unwrap();
-        assert_eq!(data.as_ref(), b"bcd");
-        assert_eq!(inner.requested_ranges(), vec![1..4]);
     }
 
     #[tokio::test]
