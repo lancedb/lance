@@ -810,34 +810,6 @@ impl BlobSource {
         })?
     }
 
-    /// Read physical ranges with a scheduler configuration chosen by the caller.
-    ///
-    /// `read_blobs` uses this to align its public tuning knob with
-    /// [`SchedulerConfig`] instead of re-implementing merge or concurrency policy
-    /// above the scheduler layer.
-    async fn read_ranges_with_buffer_size(
-        self: &Arc<Self>,
-        ranges: Vec<Range<u64>>,
-        io_buffer_size_bytes: Option<u64>,
-    ) -> Result<Vec<Bytes>> {
-        if ranges.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if let Some(io_buffer_size_bytes) = io_buffer_size_bytes {
-            let scheduler = ScanScheduler::new(
-                self.object_store.clone(),
-                SchedulerConfig::new(io_buffer_size_bytes),
-            )
-            .open_file(&self.path, &self.file_size)
-            .await?;
-            let priority = ranges[0].start;
-            scheduler.submit_request(ranges, priority).await
-        } else {
-            self.read_ranges(ranges).await
-        }
-    }
-
     /// Drain currently queued requests and submit them as scheduler batches.
     ///
     /// Each loop iteration grabs the queued requests with a short mutex hold and
@@ -1424,10 +1396,11 @@ impl ReadBlobsBuilder {
         )
         .await?;
         let plans = plan_blob_read_plans(entries);
+        let execution = Arc::new(ReadBlobsExecution::new(self.options.io_buffer_size_bytes));
         let mut blobs = try_join_all(
             plans
                 .into_iter()
-                .map(|plan| execute_blob_read_plan(plan, self.options.io_buffer_size_bytes)),
+                .map(|plan| execute_blob_read_plan(plan, execution.clone())),
         )
         .await?
         .into_iter()
@@ -1487,6 +1460,41 @@ struct BlobReadPlan {
     source_key: BlobSourceKey,
     source: Arc<BlobSource>,
     reads: Vec<PlannedBlobRead>,
+}
+
+/// Operation-scoped scheduler cache for one [`ReadBlobsBuilder`] execution.
+///
+/// We reuse one [`ScanScheduler`] per object store during a single `read_blobs`
+/// operation and still submit exactly one request per physical file.
+#[derive(Debug)]
+struct ReadBlobsExecution {
+    io_buffer_size_bytes: Option<u64>,
+    schedulers: std::sync::Mutex<HashMap<String, Arc<ScanScheduler>>>,
+}
+
+impl ReadBlobsExecution {
+    fn new(io_buffer_size_bytes: Option<u64>) -> Self {
+        Self {
+            io_buffer_size_bytes,
+            schedulers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn scheduler_for(&self, source: &BlobSource) -> Arc<ScanScheduler> {
+        let mut schedulers = self.schedulers.lock().unwrap();
+        schedulers
+            .entry(source.object_store.store_prefix.clone())
+            .or_insert_with(|| {
+                let config = self
+                    .io_buffer_size_bytes
+                    .map(SchedulerConfig::new)
+                    .unwrap_or_else(|| {
+                        SchedulerConfig::max_bandwidth(source.object_store.as_ref())
+                    });
+                ScanScheduler::new(source.object_store.clone(), config)
+            })
+            .clone()
+    }
 }
 
 /// Materialized blob bytes plus the original selection index used to restore
@@ -1549,17 +1557,19 @@ fn plan_blob_read_plans(entries: Vec<BlobEntry>) -> Vec<BlobReadPlan> {
 /// Execute one per-source blob read plan with a single scheduler submission.
 async fn execute_blob_read_plan(
     task: BlobReadPlan,
-    io_buffer_size_bytes: Option<u64>,
+    execution: Arc<ReadBlobsExecution>,
 ) -> Result<Vec<IndexedReadBlob>> {
     let ranges = task
         .reads
         .iter()
         .map(|read| read.physical_range.clone())
         .collect::<Vec<_>>();
-    let bytes = task
-        .source
-        .read_ranges_with_buffer_size(ranges, io_buffer_size_bytes)
+    let scheduler = execution.scheduler_for(&task.source);
+    let file_scheduler = scheduler
+        .open_file(&task.source.path, &task.source.file_size)
         .await?;
+    let priority = ranges[0].start;
+    let bytes = file_scheduler.submit_request(ranges, priority).await?;
 
     Ok(task
         .reads
@@ -2040,7 +2050,7 @@ mod tests {
 
     use super::{
         BlobEntry, BlobFile, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        data_file_key_from_path, execute_blob_read_plan, plan_blob_read_plans,
+        ReadBlobsExecution, data_file_key_from_path, execute_blob_read_plan, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -2894,10 +2904,11 @@ mod tests {
                 file: BlobFile::with_source(source, 1, 3, BlobKind::Packed, None),
             },
         ];
+        let execution = Arc::new(ReadBlobsExecution::new(None));
         let blobs = try_join_all(
             plan_blob_read_plans(entries)
                 .into_iter()
-                .map(|plan| execute_blob_read_plan(plan, None)),
+                .map(|plan| execute_blob_read_plan(plan, execution.clone())),
         )
         .await
         .unwrap();
