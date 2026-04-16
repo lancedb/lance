@@ -22,9 +22,9 @@
 //!
 //! # Region eviction
 //!
-//! [`RegionTracker`] accumulates bytes read per region (SsdFileTracker).
+//! `RegionTracker` accumulates bytes read per region.
 //! Scores decay periodically to age out old hot-spots. When the SSD is full,
-//! the [`NUM_EVICTION_CANDIDATES`] least-read regions are evicted as a unit —
+//! the N least-read regions are evicted as a unit —
 //! all their entries are removed from the index and the regions become writable
 //! again.
 //!
@@ -92,9 +92,9 @@ impl SsdRun {
 /// SsdFileTracker:
 /// * `region_read()` — accumulate bytes read from a region.
 /// * `region_filled()` — boost a region when it transitions writable → full,
-/// preventing newly-filled regions from being immediately evicted.
+///   preventing newly-filled regions from being immediately evicted.
 /// * `file_touched()` — increment the event counter; decay scores every
-/// [`DECAY_INTERVAL`] events so old hot-spots age out.
+///   [`DECAY_INTERVAL`] events so old hot-spots age out.
 /// * `find_eviction_candidates()` — return the N least-read regions.
 struct RegionTracker {
     /// Cumulative bytes-read score per region. Lower = better eviction candidate.
@@ -137,7 +137,7 @@ impl RegionTracker {
     /// fileTouched().
     fn file_touched(&mut self) {
         self.event_count += 1;
-        if self.event_count % DECAY_INTERVAL == 0 {
+        if self.event_count.is_multiple_of(DECAY_INTERVAL) {
             for s in self.scores.iter_mut() {
                 *s *= DECAY_FACTOR;
             }
@@ -261,6 +261,7 @@ impl SsdFileState {
     ///   - `next_i`      — first entry index not packed (start for next call)
     ///
     /// Returns `None` when the SSD is full and nothing can be evicted.
+    #[allow(clippy::type_complexity)]
     fn pack_region(
         &mut self,
         entries: &[(DataCacheKey, Bytes)],
@@ -270,7 +271,7 @@ impl SsdFileState {
     ) -> std::io::Result<Option<(u64, Vec<u8>, Vec<(usize, SsdRun)>, usize)>> {
         loop {
             // Ensure a writable region exists — grow or evict if needed.
-            while self.writable_regions.first().is_none() {
+            while self.writable_regions.is_empty() {
                 if !self.grow_or_evict(file, max_regions)? {
                     return Ok(None); // SSD full
                 }
@@ -564,8 +565,8 @@ pub struct SsdCacheStats {
 
 // ─── SsdCache ────────────────────────────────────────────────────────────────
 
-/// SSD cache tier — coordinates [`DEFAULT_NUM_SSD_SHARDS`] independent
-/// [`SsdFile`] instances sharded by `file_id`.
+/// SSD cache tier — coordinates `DEFAULT_NUM_SSD_SHARDS` independent
+/// `SsdFile` instances sharded by `file_id`.
 ///
 /// Entry distribution mirrors : `file_idx = file_id & file_mask`.
 #[derive(Debug)]

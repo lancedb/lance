@@ -262,11 +262,11 @@ pub trait DataCache: Send + Sync + std::fmt::Debug {
     /// Intern `path` and return a stable `u64` file ID.
     ///
     /// Call once when a reader is opened; store the result; pass it to every
-    /// [`get_or_load_by_id`] call for that reader.
+    /// [`Self::get_or_load_by_id`] call for that reader.
     fn intern_file(&self, path: &Path) -> u64;
 
     /// Fetch the byte range `offset..offset+length` for the file identified by
-    /// `file_id` (previously returned by [`intern_file`]).
+    /// `file_id` (previously returned by [`Self::intern_file`]).
     ///
     /// Checks L1 (memory) and L2 (SSD) before falling back to `loader`.
     /// Concurrent requests for the same `(file_id, offset)` are deduplicated —
@@ -279,9 +279,9 @@ pub trait DataCache: Send + Sync + std::fmt::Debug {
         loader: BoxFuture<'a, Result<Bytes>>,
     ) -> BoxFuture<'a, Result<Bytes>>;
 
-    /// Convenience wrapper: intern `path` then call [`get_or_load_by_id`].
+    /// Convenience wrapper: intern `path` then call [`Self::get_or_load_by_id`].
     ///
-    /// Prefer [`get_or_load_by_id`] when the same file is read many times.
+    /// Prefer [`Self::get_or_load_by_id`] when the same file is read many times.
     fn get_or_load<'a>(
         &'a self,
         path: &'a Path,
@@ -423,7 +423,7 @@ impl TieredDataCache {
     /// When the SSD tier is enabled:
     /// Build a `TieredDataCache` from `config`.
     ///
-    /// When the SSD tier is enabled, an [`SsdWriter`] is wired into the memory
+    /// When the SSD tier is enabled, an `SsdWriter` is wired into the memory
     /// tier as an [`memory::EvictionSink`].  Evicted entries accumulate in the
     /// writer until a threshold is exceeded (16 MiB absolute or 12.5% of cache
     /// size), at which point a batch write to [`SsdCache`] is spawned — no
@@ -750,6 +750,7 @@ mod tests {
     /// Because SSD writes are lazy (background task), the test allows a small
     /// number of object-store re-fetches for entries that haven't reached SSD
     /// yet. The primary assertion is data correctness, not tier membership.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_two_tier_ssd_fallback_data_integrity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -828,6 +829,7 @@ mod tests {
 
     /// cacheStatsWithSsd: two-tier cache exposes accurate
     /// SSD statistics via the memory tier stats interface.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_tiered_cache_stats_accumulate() {
         let tmp = tempfile::tempdir().unwrap();
@@ -877,6 +879,7 @@ mod tests {
     ///
     /// Uses flush_ssd() (Velox's waitForWriteToFinish()) to deterministically
     /// wait for the in-flight write task before asserting SSD state.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_ssd_writer_fires_on_eviction() {
         let tmp = tempfile::tempdir().unwrap();
@@ -929,7 +932,7 @@ mod tests {
                     entry_size,
                     Box::pin(async move {
                         // CAS-drop: some batches dropped if gate was busy.
-                        rc.fetch_add(1, Ordering::Relaxed);
+                        rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Ok(Bytes::from(vec![(i % 256) as u8; entry_size as usize]))
                     }),
                 )
@@ -952,9 +955,9 @@ mod tests {
     ///   - Without checksum: corrupted bytes are silently returned to the caller.
     ///   - With checksum (scheduler path): mismatch → Error returned to caller,
     ///     no bytes served. Covered end-to-end by test_cache_oci.py Test 3.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_ssd_corruption_silently_returned_without_checksum() {
-        #[cfg(unix)]
         use std::os::unix::fs::FileExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -994,7 +997,6 @@ mod tests {
         } // file handles released
 
         // Corrupt the SSD file — overwrite first 4 KiB with 0xFF.
-        #[cfg(unix)]
         {
             let cache_file = ssd_dir.join("cache_0.bin");
             let f = std::fs::OpenOptions::new()
@@ -1052,9 +1054,9 @@ mod tests {
     ///   3. Re-open the cache with verify=true.
     ///   4. Read — verify path fetches from "object store" (mock loader),
     ///      detects mismatch, returns the correct source bytes (not corrupt).
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_ssd_corruption_detected_by_checksum() {
-        #[cfg(unix)]
         use std::os::unix::fs::FileExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1096,7 +1098,6 @@ mod tests {
         } // cache dropped — file handles released
 
         // Step 2: corrupt the SSD file on disk.
-        #[cfg(unix)]
         {
             let cache_file = ssd_dir.join("cache_0.bin");
             let f = std::fs::OpenOptions::new()

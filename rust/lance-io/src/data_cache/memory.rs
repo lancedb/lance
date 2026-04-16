@@ -6,25 +6,25 @@
 //! Design mirrors exactly:
 //!
 //! * **16 independent shards** — `HashMap` + clock-hand eviction ring per shard,
-//! each protected by a `std::sync::Mutex`. Shards eliminate contention for the
-//! common case where different tasks access different files.
+//!   each protected by a `std::sync::Mutex`. Shards eliminate contention for the
+//!   common case where different tasks access different files.
 //!
 //! * **Load deduplication** — a `tokio::sync::watch` channel replaces
-//! `folly::SharedPromise`. The first task to miss the cache transitions the
-//! entry from `Loading` to `Loaded(bytes)` or `Failed`; all concurrent tasks
-//! wait on the channel and receive the result without issuing a second fetch.
+//!   `folly::SharedPromise`. The first task to miss the cache transitions the
+//!   entry from `Loading` to `Loaded(bytes)` or `Failed`; all concurrent tasks
+//!   wait on the channel and receive the result without issuing a second fetch.
 //!
 //! * **Clock-hand eviction with percentile threshold** — follows
-//! `CacheShard::evict` / `calibrateThreshold` exactly. Every `ring_len/4`
-//! insertions the shard samples `NUM_EVICTION_SAMPLES` (10) entries, sorts
-//! their scores, and sets the eviction threshold to the
-//! `EVICTION_PERCENTILE`th (80th) percentile. Only entries scoring *above*
-//! the threshold are candidates, which prevents thrashing when the cache
-//! hovers at capacity.
+//!   `CacheShard::evict` / `calibrateThreshold` exactly. Every `ring_len/4`
+//!   insertions the shard samples `NUM_EVICTION_SAMPLES` (10) entries, sorts
+//!   their scores, and sets the eviction threshold to the
+//!   `EVICTION_PERCENTILE`th (80th) percentile. Only entries scoring *above*
+//!   the threshold are candidates, which prevents thrashing when the cache
+//!   hovers at capacity.
 //!
 //! * **Score formula** — `(now_ms - last_use_ms) / (1 + num_uses)`. Older,
-//! less-frequently-accessed entries score higher and are evicted first.
-//! An entry that has never been accessed scores `u64::MAX` (evict immediately).
+//!   less-frequently-accessed entries score higher and are evicted first.
+//!   An entry that has never been accessed scores `u64::MAX` (evict immediately).
 
 use std::collections::HashMap;
 use std::sync::{
@@ -554,13 +554,6 @@ impl MemoryCache {
         }
     }
 
-    /// Fetch the bytes for `key`, calling `loader` on a cache miss.
-    ///
-    /// If multiple tasks request the same key concurrently, only the first
-    /// triggers `loader`; all others wait for it to complete via the entry's
-    /// `watch` channel — exactly CoalescedLoad::loadOrFuture.
-    ///
-
     /// Fetch bytes for `key`, calling `loader` on a cache miss.
     ///
     /// `length` is the number of bytes requested. If the cache holds a larger
@@ -710,24 +703,24 @@ impl MemoryCache {
                 })
                 .ok();
         }
-        if !evicted.is_empty() {
-            if let Some(sink) = &self.eviction_sink {
-                sink.on_evicted(evicted, self.total_bytes.load(Ordering::Relaxed));
-            }
+        if !evicted.is_empty()
+            && let Some(sink) = &self.eviction_sink
+        {
+            sink.on_evicted(evicted, self.total_bytes.load(Ordering::Relaxed));
         }
         (entry, is_new)
     }
 
     fn remove_entry(&self, key: &DataCacheKey) {
         let idx = shard_idx(key, self.shard_mask);
-        if let Some(size) = self.shards[idx].remove(key) {
-            if size > 0 {
-                self.total_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(size))
-                    })
-                    .ok();
-            }
+        if let Some(size) = self.shards[idx].remove(key)
+            && size > 0
+        {
+            self.total_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(size))
+                })
+                .ok();
         }
     }
 }
