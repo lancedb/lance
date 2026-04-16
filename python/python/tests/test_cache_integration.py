@@ -21,7 +21,9 @@ def make_dataset(path: str, n_rows: int = 50_000) -> lance.LanceDataset:
     table = pa.table(
         {
             "id": pa.array(range(n_rows), type=pa.int32()),
-            "value": pa.array([float(i) * 0.5 for i in range(n_rows)], type=pa.float32()),
+            "value": pa.array(
+                [float(i) * 0.5 for i in range(n_rows)], type=pa.float32()
+            ),
             "label": pa.array([f"label_{i % 100}" for i in range(n_rows)]),
         }
     )
@@ -71,9 +73,7 @@ def test_cache_reduces_bytes_read_on_warm_scan():
         assert cold_stats.bytes_read > 0, (
             "Expected bytes to be read from disk on the first (cold) scan"
         )
-        assert cold_stats.iops > 0, (
-            "Expected I/O operations on the first (cold) scan"
-        )
+        assert cold_stats.iops > 0, "Expected I/O operations on the first (cold) scan"
 
         cold_bytes = cold_stats.bytes_read
 
@@ -133,10 +133,7 @@ def test_cache_global_iops_counter():
         cold_iops = iops_after_cold - iops_before
         cold_bytes = bytes_after_cold - bytes_before
 
-        print(
-            f"\nCold scan:  iops={cold_iops:,}  "
-            f"bytes={cold_bytes:,}"
-        )
+        print(f"\nCold scan:  iops={cold_iops:,}  bytes={cold_bytes:,}")
         assert cold_iops > 0, "Expected I/O operations on cold scan"
 
         # Warm scan — should hit cache, not object store.
@@ -148,19 +145,14 @@ def test_cache_global_iops_counter():
         warm_iops = lance.iops_counter() - iops_before_warm
         warm_bytes = lance.bytes_read_counter() - bytes_before_warm
 
+        print(f"Warm scan:  iops={warm_iops:,}  bytes={warm_bytes:,}")
         print(
-            f"Warm scan:  iops={warm_iops:,}  "
-            f"bytes={warm_bytes:,}"
-        )
-        print(
-            f"Cache hit: {100 * (1 - warm_iops / max(cold_iops, 1)):.1f}% "
-            f"of IOPS saved"
+            f"Cache hit: {100 * (1 - warm_iops / max(cold_iops, 1)):.1f}% of IOPS saved"
         )
 
         # Warm scan should do far fewer (ideally zero) object-store IOPS.
         assert warm_iops < cold_iops * 0.1, (
-            f"Expected warm scan IOPS <10% of cold. "
-            f"cold={cold_iops}, warm={warm_iops}"
+            f"Expected warm scan IOPS <10% of cold. cold={cold_iops}, warm={warm_iops}"
         )
 
 
@@ -202,12 +194,8 @@ if __name__ == "__main__":
         cold_iops_delta = lance.iops_counter() - iops_before
         cold_bytes_delta = lance.bytes_read_counter() - bytes_before
 
-        print(
-            f"  scan_stats: iops={cold_stats.iops:,} bytes={cold_stats.bytes_read:,}"
-        )
-        print(
-            f"  global counters: iops={cold_iops_delta:,} bytes={cold_bytes_delta:,}"
-        )
+        print(f"  scan_stats: iops={cold_stats.iops:,} bytes={cold_stats.bytes_read:,}")
+        print(f"  global counters: iops={cold_iops_delta:,} bytes={cold_bytes_delta:,}")
 
         print("\nRunning warm scan (should hit cache)...")
         iops_before = lance.iops_counter()
@@ -218,12 +206,8 @@ if __name__ == "__main__":
         warm_iops_delta = lance.iops_counter() - iops_before
         warm_bytes_delta = lance.bytes_read_counter() - bytes_before
 
-        print(
-            f"  scan_stats: iops={warm_stats.iops:,} bytes={warm_stats.bytes_read:,}"
-        )
-        print(
-            f"  global counters: iops={warm_iops_delta:,} bytes={warm_bytes_delta:,}"
-        )
+        print(f"  scan_stats: iops={warm_stats.iops:,} bytes={warm_stats.bytes_read:,}")
+        print(f"  global counters: iops={warm_iops_delta:,} bytes={warm_bytes_delta:,}")
 
         if cold_iops_delta > 0:
             savings = 100 * (1 - warm_iops_delta / cold_iops_delta)
@@ -234,4 +218,6 @@ if __name__ == "__main__":
                 print("✗ Cache does not appear to be working")
                 sys.exit(1)
         else:
-            print("(No I/O on cold scan — dataset may be too small or already cached by OS)")
+            print(
+                "(No I/O on cold scan — dataset may be too small or already cached by OS)"
+            )
