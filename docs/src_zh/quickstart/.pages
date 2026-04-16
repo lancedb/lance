@@ -1,0 +1,5 @@
+nav:
+  - Lance 入门: index.md
+  - 版本管理: versioning.md
+  - 向量搜索: vector-search.md
+  - 全文搜索: full-text-search.md

@@ -1,0 +1,6 @@
+title: 索引
+nav:
+  - index.md
+  - 标量索引: scalar
+  - 向量索引: vector
+  - 系统索引: system

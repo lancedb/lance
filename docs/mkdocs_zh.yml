@@ -1,7 +1,7 @@
-site_name: Lance
-site_description: "Documentation for Lance, an open lakehouse format for Multimodal AI"
-site_url: https://lance.org/
-docs_dir: src
+site_name: Lance 文档
+site_description: "Lance 文档 - 面向多模态 AI 的开放湖仓格式"
+site_url: https://lance.org/zh/
+docs_dir: src_zh
 
 repo_name: lance-format/lance
 repo_url: https://github.com/lance-format/lance
@@ -9,6 +9,7 @@ repo_url: https://github.com/lance-format/lance
 theme:
   name: material
   custom_dir: overrides
+  language: zh
   logo: logo/white.png
   favicon: logo/logo.png
   palette:
@@ -17,13 +18,13 @@ theme:
       accent: custom
       toggle:
         icon: material/brightness-7
-        name: Switch to dark mode
+        name: 切换到深色模式
     - scheme: slate
       primary: custom
       accent: custom
       toggle:
         icon: material/brightness-4
-        name: Switch to light mode
+        name: 切换到浅色模式
   features:
     - navigation.tabs
     - navigation.sections
@@ -63,8 +64,6 @@ markdown_extensions:
 plugins:
   - search
   - awesome-pages
-  - mkdocs_protobuf:
-      proto_dir: ../protos
 
 extra:
   generator: false
@@ -81,8 +80,7 @@ extra:
     - icon: fontawesome/brands/discord
       link: https://discord.gg/lance
 
-copyright: © 2025 Lance Format. All rights reserved.
+copyright: © 2025 Lance Format. 保留所有权利。
 
 extra_css:
   - assets/stylesheets/home.css
-

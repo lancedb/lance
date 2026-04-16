@@ -1,0 +1,9 @@
+nav:
+  - index.md
+  - 维护者: maintainers.md
+  - PMC: pmc.md
+  - 沟通: communication.md
+  - 投票: voting.md
+  - 贡献指南: contributing.md
+  - 发布: release.md
+  - 项目特定指南: project-specific

@@ -1,0 +1,281 @@
+{% extends "main.html" %}
+
+{% block tabs %}
+  {{ super() }}
+
+  <style>
+    /* Prevent horizontal overflow */
+    body {
+      overflow-x: hidden;
+    }
+
+    /* Hide main content for home page */
+    .md-content {
+      display: none;
+    }
+
+    /* Hide table of contents */
+    @media screen and (min-width: 60em) {
+      .md-sidebar--secondary {
+        display: none;
+      }
+    }
+
+    /* Hide navigation */
+    @media screen and (min-width: 76.25em) {
+      .md-sidebar--primary {
+        display: none;
+      }
+    }
+
+    /* Make header static */
+    .md-header {
+      position: initial;
+    }
+
+    .md-main__inner {
+      margin: 0;
+    }
+
+    /* Style Learn More and View Integrations links */
+    .lance-feature-section .md-button,
+    .lance-intro-section .md-button:not(.md-button--primary) {
+      background-color: transparent;
+      color: inherit;
+      text-decoration: none;
+      border: none;
+      box-shadow: none;
+    }
+
+    .lance-feature-section .md-button:hover,
+    .lance-intro-section .md-button:not(.md-button--primary):hover {
+      background-color: transparent;
+      color: #625EFF;
+      text-decoration: none;
+    }
+  </style>
+
+  <script>
+    // Fix palette toggle jumping to bottom of page
+    (function() {
+      let savedScrollY = 0;
+      let isTogglingPalette = false;
+
+      if ('scrollRestoration' in history) {
+        history.scrollRestoration = 'manual';
+      }
+
+      const preventScroll = function() {
+        if (isTogglingPalette) {
+          window.scrollTo(0, savedScrollY);
+        }
+      };
+
+      document.addEventListener('click', function(e) {
+        const paletteLabel = e.target.closest('[for^="__palette"]');
+        if (paletteLabel) {
+          savedScrollY = window.scrollY;
+          isTogglingPalette = true;
+          window.addEventListener('scroll', preventScroll, { passive: false });
+          setTimeout(function() {
+            isTogglingPalette = false;
+            window.removeEventListener('scroll', preventScroll);
+          }, 100);
+        }
+      }, true);
+
+      window.addEventListener('hashchange', function(e) {
+        if (window.location.hash.startsWith('#__palette')) {
+          e.preventDefault();
+          window.scrollTo(0, savedScrollY);
+          history.replaceState(null, null, window.location.pathname);
+        }
+      }, false);
+
+      document.addEventListener('DOMContentLoaded', function() {
+        const paletteInputs = document.querySelectorAll('input[name="__palette"]');
+        paletteInputs.forEach(function(input) {
+          input.addEventListener('change', function() {
+            window.scrollTo(0, savedScrollY);
+          });
+        });
+      });
+    })();
+  </script>
+
+  <!-- Hero Section -->
+  <section class="mdx-container">
+    <div class="container">
+      <div class="intro-message">
+        <div class="hero-logo">
+          <img src="logo/white.png" alt="Lance Logo">
+          <h1>Lance<sup>™</sup></h1>
+        </div>
+        <h3>面向多模态 AI 的开放湖仓格式</h3>
+        <hr class="intro-divider" />
+        <ul class="list-inline">
+          <li>
+            <a href="quickstart" class="md-button md-button--primary">快速开始</a>
+          </li>
+          <li>
+            <a href="format" class="md-button">阅读规范</a>
+          </li>
+          <li>
+            <a href="examples/python/llm_training" class="md-button">训练 LLM</a>
+          </li>
+          <li>
+            <a href="https://discord.gg/lance" class="md-button" target="_blank" rel="noopener">加入 Discord</a>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- What is Lance Section -->
+  <section class="lance-intro-section">
+    <div class="container">
+      <div class="lance-intro-content">
+        <h2>什么是 Lance？</h2>
+        <p>
+          Lance 是一种现代、开源的面向多模态 AI 的湖仓格式。它包含文件格式、表格式和目录规范，
+          允许你在对象存储之上构建完整的开放湖仓，为你的 AI 工作流提供动力。
+          Lance 为湖仓带来了高性能向量搜索、全文搜索、随机访问和特征工程能力，
+          同时你仍然可以享受现有湖仓的所有优势，如 SQL 分析、ACID 事务、时间旅行，
+          以及与开放引擎（Apache Spark、Ray、PyTorch、Trino、DuckDB 等）
+          和开放目录（Apache Polaris、Unity Catalog、Apache Gravitino、Hive Metastore 等）的集成。
+        </p>
+        <p>
+          阅读我们在 <em>VLDB 2025</em> 上发表的
+          <a href="https://arxiv.org/abs/2504.15247" class="lance-paper-link" target="_blank" rel="noopener">研究论文</a>
+          了解更多 Lance 的技术细节。
+        </p>
+        <a href="quickstart" class="md-button md-button--primary">阅读文档</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 1: Expressive Hybrid Search -->
+  <section class="lance-feature-section">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>表达力强的混合搜索</h2>
+          <p>
+            Lance 支持强大的混合搜索，将向量相似性搜索、全文搜索和 SQL 分析组合在同一数据集上。
+            所有查询类型都通过相应的二级索引进行加速，这是 Lance 规范的一部分。
+          </p>
+          <p>
+            在嵌入向量上运行语义搜索，在关键词上进行 BM25 搜索，并应用复杂的 SQL 谓词 ——
+            所有这些都使用单个表和统一的接口。
+          </p>
+          <a href="quickstart/vector-search" class="md-button">了解更多</a>
+        </div>
+        <div class="lance-feature-demo">
+          <img src="assets/images/hybrid-search.png" alt="混合搜索示例" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 2: Lightning-fast Random Access -->
+  <section class="lance-feature-section reverse">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>极速随机访问</h2>
+          <p>
+            Lance 的随机访问速度比 Parquet 或 Iceberg 快 100 倍。
+            与传统格式不同，Lance 即使在整个数据集中随机访问分散的行时也能保持高性能。
+          </p>
+          <p>
+            凭借高度优化的文件格式，加上表级别高效的行寻址和二级索引，
+            你可以跨多个文件即时访问单条记录，非常适合实时 ML 服务、随机采样和交互式应用。
+          </p>
+          <a href="guide/read_and_write#random-access" class="md-button">了解更多</a>
+        </div>
+        <div class="lance-feature-demo">
+          <img src="assets/images/random-access.png" alt="随机访问示例" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 3: Native Multimodal Data Support -->
+  <section class="lance-feature-section">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>原生多模态数据支持</h2>
+          <p>
+            在单一统一格式中存储图像、视频、音频、文本和嵌入向量，与传统表格数据并存。
+            Lance 的 blob 编码高效处理大型二进制对象并支持延迟加载，
+            同时优化的向量存储加速相似性搜索。
+          </p>
+          <p>
+            非常适合 AI/ML 工作负载，你可以将原始数据、ML 特征、生成的标题和嵌入向量
+            全部存储在一起，用于多模态检索和生成式 AI 工作流。
+          </p>
+          <a href="guide/blob" class="md-button">了解更多</a>
+        </div>
+        <div class="lance-feature-demo">
+          <img src="assets/images/multimodal-data.png" alt="多模态数据示例" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 4: Data Evolution -->
+  <section class="lance-feature-section reverse">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>数据演进 > Schema 演进</h2>
+          <p>
+            大多数开放表格式中的 Schema 演进仅限于元数据变更，速度很快。
+            但当尝试回填现有行中的列值时，通常需要完整的表重写。
+            Lance 支持数据演进（带回填的高效 Schema 演进），非常适合 ML
+            特征工程、嵌入向量和媒体内容管理。
+          </p>
+          <p>
+            添加带数据的新列就像向 Lance 表写入新的 Lance 文件一样简单 ——
+            无需重写整个数据集。
+          </p>
+          <a href="guide/data_evolution" class="md-button">了解更多</a>
+        </div>
+        <div class="lance-feature-demo">
+          <img src="assets/images/data-evolution.png" alt="数据演进示例" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 5: Rich Ecosystem Integration -->
+  <section class="lance-feature-section">
+    <div class="container">
+      <div class="lance-feature-content">
+        <div class="lance-feature-text">
+          <h2>丰富的生态系统集成</h2>
+          <p>
+            作为开放格式，Lance 与 Python 数据生态系统和现代数据平台无缝集成。
+            使用你喜爱的工具，包括 Pandas、Polars、Ray 和 PyTorch 进行数据处理和机器学习。
+          </p>
+          <p>
+            连接领先的查询引擎，如 Apache DataFusion、DuckDB、Apache Spark、Trino 和 Apache Flink/Fluss，
+            在你的 Lance 数据集上运行 SQL 分析和分布式处理。
+          </p>
+          <a href="integrations/datafusion" class="md-button">查看集成</a>
+        </div>
+        <div class="lance-feature-demo">
+          <img src="assets/images/ecosystem-integrations.png" alt="Lance 生态系统集成" style="max-width: 500px; width: 100%; height: auto; border-radius: 8px;">
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+{% endblock %}
+
+{% block content %}{% endblock %}
+{% block footer %}
+  {{ super() }}
+{% endblock %}

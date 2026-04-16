@@ -1,0 +1,6 @@
+nav:
+  - LLM 数据集创建: llm_dataset_creation.md
+  - LLM 训练: llm_training.md
+  - 多模态数据集创建: flickr8k_dataset_creation.md
+  - 多模态训练: clip_training.md
+  - 深度学习制品管理: artifact_management.md
