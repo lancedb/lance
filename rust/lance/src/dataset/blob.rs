@@ -2,11 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     ops::{DerefMut, Range},
     panic::AssertUnwindSafe,
     sync::Arc,
+    task::Poll,
 };
 
 use arrow::array::AsArray;
@@ -16,7 +17,6 @@ use arrow_array::RecordBatch;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_schema::DataType as ArrowDataType;
 use bytes::Bytes;
-use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::{BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, FieldExt};
@@ -724,7 +724,8 @@ pub async fn preprocess_blob_batches(
 /// Mutable state for a [`BlobFile`] cursor.
 ///
 /// The cursor is logical to the blob slice, not the backing object. Once closed,
-/// all cursor-based and range-based reads are rejected.
+/// subsequent cursor-based and range-based reads are rejected, but reads that
+/// were already in flight may still complete.
 #[derive(Debug)]
 enum BlobFileState {
     Open(u64),
@@ -1403,28 +1404,66 @@ impl ReadBlobsBuilder {
             &self.selection,
         )
         .await?;
+        let expected_selection_indices = entries
+            .iter()
+            .map(|entry| entry.selection_index)
+            .collect::<VecDeque<_>>();
         let plans = plan_blob_read_plans(entries);
         let execution = Arc::new(ReadBlobsExecution::new(self.options.io_buffer_size_bytes));
-        let mut blobs = try_join_all(
-            plans
-                .into_iter()
-                .map(|plan| execute_blob_read_plan(plan, execution.clone())),
-        )
-        .await?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-        if self.options.preserve_order {
-            blobs.sort_by_key(|blob| blob.selection_index);
+        if plans.is_empty() {
+            return Ok(stream::empty().boxed());
         }
 
-        Ok(stream::iter(blobs.into_iter().map(|blob| {
-            Ok::<ReadBlob, Error>(ReadBlob {
-                row_address: blob.row_address,
-                data: blob.data,
-            })
+        let plan_stream = stream::iter(plans.into_iter().map(move |plan| {
+            let execution = execution.clone();
+            execute_blob_read_plan(plan, execution)
         }))
+        .buffer_unordered(self.dataset.object_store.io_parallelism().max(1));
+
+        if !self.options.preserve_order {
+            return Ok(plan_stream
+                .map_ok(|blobs| {
+                    stream::iter(blobs.into_iter().map(|blob| Ok(into_read_blob(blob))))
+                })
+                .try_flatten()
+                .boxed());
+        }
+
+        let mut plan_stream = plan_stream.boxed();
+        let mut expected_selection_indices = expected_selection_indices;
+        let mut ready = BTreeMap::<usize, ReadBlob>::new();
+
+        Ok(stream::poll_fn(move |cx| {
+            loop {
+                let Some(next_selection_index) = expected_selection_indices.front().copied() else {
+                    return Poll::Ready(None);
+                };
+
+                if let Some(blob) = ready.remove(&next_selection_index) {
+                    expected_selection_indices.pop_front();
+                    return Poll::Ready(Some(Ok(blob)));
+                }
+
+                match plan_stream.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Ok(blobs))) => {
+                        for blob in blobs {
+                            ready.insert(blob.selection_index, into_read_blob(blob));
+                        }
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Ready(None) => {
+                        let err = Error::internal(format!(
+                            "planned blob read stream completed before selection index {} was produced",
+                            next_selection_index
+                        ));
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
         .boxed())
     }
 
@@ -1512,6 +1551,13 @@ struct IndexedReadBlob {
     selection_index: usize,
     row_address: u64,
     data: Bytes,
+}
+
+fn into_read_blob(blob: IndexedReadBlob) -> ReadBlob {
+    ReadBlob {
+        row_address: blob.row_address,
+        data: blob.data,
+    }
 }
 
 /// Group selected blobs by physical source and sort each group's ranges by
@@ -2029,6 +2075,7 @@ mod tests {
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow::{
         array::AsArray,
@@ -2056,6 +2103,7 @@ mod tests {
         Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
         ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
     };
+    use tokio::sync::Notify;
     use url::Url;
 
     use lance_core::{
@@ -2282,6 +2330,7 @@ mod tests {
     #[derive(Debug)]
     struct RecordingRangeObjectStore {
         data: Bytes,
+        gate: Option<Arc<Notify>>,
         requested_ranges: std::sync::Mutex<Vec<Range<u64>>>,
     }
 
@@ -2289,6 +2338,15 @@ mod tests {
         fn new(data: Bytes) -> Self {
             Self {
                 data,
+                gate: None,
+                requested_ranges: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_gate(data: Bytes, gate: Arc<Notify>) -> Self {
+            Self {
+                data,
+                gate: Some(gate),
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -2366,6 +2424,9 @@ mod tests {
                     });
                 }
             };
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
             self.requested_ranges.lock().unwrap().push(range.clone());
             let bytes = self.data.slice(range.start as usize..range.end as usize);
             Ok(GetResult {
@@ -2409,14 +2470,17 @@ mod tests {
         }
     }
 
-    fn recording_range_store(data: Bytes) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
+    fn recording_range_store_with_url(
+        data: Bytes,
+        url: &str,
+    ) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
         const TEST_RANGE_STORE_SIZE: usize = 128 * 1024;
         let mut padded = vec![0; TEST_RANGE_STORE_SIZE.max(data.len())];
         padded[..data.len()].copy_from_slice(data.as_ref());
         let inner = Arc::new(RecordingRangeObjectStore::new(Bytes::from(padded)));
         let store = Arc::new(ObjectStore::new(
             inner.clone() as Arc<dyn object_store::ObjectStore>,
-            Url::parse("mock:///blob-range-tests").unwrap(),
+            Url::parse(url).unwrap(),
             None,
             None,
             false,
@@ -2426,6 +2490,40 @@ mod tests {
             None,
         ));
         (store, inner)
+    }
+
+    fn recording_range_store(data: Bytes) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
+        recording_range_store_with_url(data, "mock://recording/blob-range-tests")
+    }
+
+    fn gated_range_store(
+        data: Bytes,
+        url: &str,
+    ) -> (
+        Arc<ObjectStore>,
+        Arc<RecordingRangeObjectStore>,
+        Arc<Notify>,
+    ) {
+        const TEST_RANGE_STORE_SIZE: usize = 128 * 1024;
+        let mut padded = vec![0; TEST_RANGE_STORE_SIZE.max(data.len())];
+        padded[..data.len()].copy_from_slice(data.as_ref());
+        let gate = Arc::new(Notify::new());
+        let inner = Arc::new(RecordingRangeObjectStore::with_gate(
+            Bytes::from(padded),
+            gate.clone(),
+        ));
+        let store = Arc::new(ObjectStore::new(
+            inner.clone() as Arc<dyn object_store::ObjectStore>,
+            Url::parse(url).unwrap(),
+            None,
+            None,
+            false,
+            true,
+            lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        (store, inner, gate)
     }
 
     impl BlobTestFixture {
@@ -2963,6 +3061,75 @@ mod tests {
         assert_eq!(blobs[1].row_address, 11);
         assert_eq!(blobs[1].data.as_ref(), b"bcd");
         assert_eq!(inner.requested_ranges(), vec![1..7]);
+    }
+
+    #[tokio::test]
+    async fn test_read_blobs_stream_emits_ready_plan_without_waiting_for_slower_ones() {
+        let (slow_store, _, slow_gate) = gated_range_store(
+            Bytes::from_static(b"abcdef"),
+            "mock://slow/blob-range-tests",
+        );
+        let (fast_store, _) = recording_range_store_with_url(
+            Bytes::from_static(b"uvwxyz"),
+            "mock://fast/blob-range-tests",
+        );
+        let entries = vec![
+            BlobEntry {
+                selection_index: 0,
+                row_address: 10,
+                file: BlobFile::with_source(
+                    Arc::new(BlobSource::new(slow_store, Path::from("blobs/slow.bin"))),
+                    0,
+                    3,
+                    BlobKind::Packed,
+                    None,
+                ),
+            },
+            BlobEntry {
+                selection_index: 1,
+                row_address: 11,
+                file: BlobFile::with_source(
+                    Arc::new(BlobSource::new(fast_store, Path::from("blobs/fast.bin"))),
+                    0,
+                    3,
+                    BlobKind::Packed,
+                    None,
+                ),
+            },
+        ];
+        let execution = Arc::new(ReadBlobsExecution::new(None));
+        let mut stream: super::ReadBlobsStream = futures::stream::iter(
+            plan_blob_read_plans(entries)
+                .into_iter()
+                .map(move |plan| execute_blob_read_plan(plan, execution.clone())),
+        )
+        .buffer_unordered(2)
+        .map_ok(|blobs: Vec<super::IndexedReadBlob>| {
+            futures::stream::iter(
+                blobs
+                    .into_iter()
+                    .map(|blob| Ok::<super::ReadBlob, Error>(super::into_read_blob(blob))),
+            )
+        })
+        .try_flatten()
+        .boxed();
+
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.row_address, 11);
+        assert_eq!(first.data.as_ref(), b"uvw");
+
+        slow_gate.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.row_address, 10);
+        assert_eq!(second.data.as_ref(), b"abc");
     }
 
     #[tokio::test]
