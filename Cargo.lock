@@ -621,9 +621,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.2"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a054912289d18629dc78375ba2c3726a3afe3ff71b4edba9dedfca0e3446d1fc"
+checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -631,9 +631,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.39.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a25cf98105baa966497416dbd42565ce3a8cf8dbfd59803ec9ad46f3126399"
+checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
 dependencies = [
  "cc",
  "cmake",
@@ -1549,9 +1549,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
+checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -1571,9 +1571,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3231,7 +3231,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4426,7 +4426,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4499,7 +4499,9 @@ dependencies = [
  "pprof",
  "pretty_assertions",
  "prost",
+ "prost-build",
  "prost-types",
+ "protobuf-src",
  "rand 0.9.4",
  "rand_distr",
  "roaring",
@@ -4523,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4573,7 +4575,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrayref",
  "paste",
@@ -4582,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4622,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4657,7 +4659,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4677,7 +4679,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4725,7 +4727,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4751,7 +4753,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4794,7 +4796,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4808,7 +4810,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "approx",
  "arrow",
@@ -4887,7 +4889,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4938,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4959,7 +4961,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4974,7 +4976,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4992,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5051,7 +5053,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5097,7 +5099,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5106,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5117,7 +5119,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5128,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "clap",
  "lance-core",

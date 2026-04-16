@@ -1707,16 +1707,18 @@ impl FilteredReadExec {
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
         let options = self.options.clone();
+        let batch_size_bytes = options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
         let index_input = self.index_input.clone();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
-            if let Some(running_stream) = &*running_stream {
-                DataFusionResult::<SendableRecordBatchStream>::Ok(
-                    running_stream.get_stream(&metrics, partition),
-                )
+            let inner = if let Some(running_stream) = &*running_stream {
+                running_stream.get_stream(&metrics, partition)
             } else {
                 let plan = Self::get_or_create_plan_impl(
                     &plan_cell,
@@ -1726,13 +1728,32 @@ impl FilteredReadExec {
                     partition,
                     context.clone(),
                 )
-                .await?;
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone()).await?;
+                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
+                        .await
+                        .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
-                DataFusionResult::Ok(first_stream)
-            }
+                first_stream
+            };
+            let stream: SendableRecordBatchStream = match batch_size_bytes {
+                Some(target) => {
+                    let schema = inner.schema();
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema.clone(),
+                        lance_arrow::stream::rechunk_stream_by_size(
+                            inner,
+                            schema,
+                            0,
+                            target as usize,
+                        ),
+                    ))
+                }
+                None => inner,
+            };
+            DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
 

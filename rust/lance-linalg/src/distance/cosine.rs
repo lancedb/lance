@@ -65,7 +65,12 @@ pub trait Cosine: Dot + Normalize {
     }
 }
 
-impl Cosine for u8 {}
+impl Cosine for u8 {
+    #[inline]
+    fn cosine(x: &[Self], other: &[Self]) -> f32 {
+        super::cosine_u8::cosine_u8(x, other)
+    }
+}
 
 impl Cosine for bf16 {}
 

@@ -595,9 +595,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.2"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a054912289d18629dc78375ba2c3726a3afe3ff71b4edba9dedfca0e3446d1fc"
+checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -605,9 +605,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.39.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a25cf98105baa966497416dbd42565ce3a8cf8dbfd59803ec9ad46f3126399"
+checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
 dependencies = [
  "cc",
  "cmake",
@@ -2709,7 +2709,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -2881,9 +2881,9 @@ dependencies = [
 
 [[package]]
 name = "geo-types"
-version = "0.7.18"
+version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24f8647af4005fa11da47cd56252c6ef030be8fa97bdbf355e7dfb6348f0a82c"
+checksum = "94776032c45f950d30a13af6113c2ad5625316c9abfbccee4dd5a6695f8fe0f5"
 dependencies = [
  "approx",
  "num-traits",
@@ -3247,9 +3247,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.8"
+version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b52f86d1d4bc0d6b4e6826d960b1b333217e07d36b882dca570a5e1c48895b"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http 1.4.0",
  "hyper",
@@ -3710,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3761,6 +3761,7 @@ dependencies = [
  "permutation",
  "pin-project",
  "prost",
+ "prost-build",
  "prost-types",
  "rand 0.9.4",
  "roaring",
@@ -3778,7 +3779,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3799,7 +3800,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrayref",
  "paste",
@@ -3808,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3845,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3879,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3897,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3934,7 +3935,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3966,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3980,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4049,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4093,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4109,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4122,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4167,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4206,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5412,7 +5413,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "5.1.0-beta.3"
+version = "6.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6863,9 +6864,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.51.1"
+version = "1.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
+checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
 dependencies = [
  "bytes",
  "libc",
@@ -7138,9 +7139,9 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "typewit"
-version = "1.15.1"
+version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc19094686c694eb41b3b99dcc2f2975d4b078512fa22ae6c63f7ca318bdcff7"
+checksum = "214ca0b2191785cbc06209b9ca1861e048e39b5ba33574b3cedd58363d5bb5f6"
 
 [[package]]
 name = "typify"

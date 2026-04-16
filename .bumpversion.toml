@@ -1,5 +1,5 @@
 [tool.bumpversion]
-current_version = "5.1.0-beta.3"
+current_version = "6.0.0-beta.1"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(-(?P<prerelease>(beta|rc))\\.(?P<prerelease_num>\\d+))?"
 serialize = [
     "{major}.{minor}.{patch}-{prerelease}.{prerelease_num}",
@@ -117,6 +117,11 @@ replace = 'lance-testing = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-tokenizer = {{ version = "={current_version}"'
+replace = 'lance-tokenizer = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'fsst = {{ version = "={current_version}"'
 replace = 'fsst = {{ version = "={new_version}"'
 
@@ -145,4 +150,3 @@ replace = 'version = "{new_version}"'
 filename = "java/pom.xml"
 search = "<version>{current_version}</version>"
 replace = "<version>{new_version}</version>"
-

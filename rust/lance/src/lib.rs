@@ -85,6 +85,11 @@ pub mod session;
 pub mod table;
 pub mod utils;
 
+pub mod pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
+}
+
 pub use blob::{BlobArrayBuilder, blob_field};
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
