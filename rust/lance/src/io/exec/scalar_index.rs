@@ -340,13 +340,28 @@ impl MapIndexExec {
             .load_scalar_index(IndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
+        let fragment_bitmap = index.fragment_bitmap.unwrap();
         let deletion_mask_fut =
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
-        let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
+            DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap.clone());
+        let mut deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {
             None
         };
+        // Apply allow-list: only keep rows from fragments covered by the index.
+        // This filters out stale index entries from fragments whose data changed
+        // but whose index data was not rewritten.
+        {
+            let mut allow_list = RowAddrTreeMap::new();
+            for frag_id in fragment_bitmap.iter() {
+                allow_list.insert_fragment(frag_id);
+            }
+            let allow_mask = Arc::new(RowAddrMask::from_allowed(allow_list));
+            deletion_mask = Some(match deletion_mask {
+                Some(existing) => Arc::new((*existing).clone() & (*allow_mask).clone()),
+                None => allow_mask,
+            });
+        }
         Ok(input.and_then(move |res| {
             let column_name = column_name.clone();
             let index_name = index_name.clone();

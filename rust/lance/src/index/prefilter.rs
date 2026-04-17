@@ -52,6 +52,11 @@ pub struct DatasetPreFilter {
     // Fragment IDs whose data is still in the index but has been removed from the dataset.
     // Used by FTS merge-on-read to prune stale fragments at search time.
     pub(super) deleted_fragments: Option<RoaringBitmap>,
+    // Fragment IDs whose data is covered by the index. Any row returned by the
+    // index that belongs to a fragment NOT in this set is stale and must be
+    // filtered out. When None, no allow-list filtering is applied (all fragments
+    // are assumed to be covered).
+    pub(super) allowed_fragments: Option<RoaringBitmap>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -63,13 +68,19 @@ impl DatasetPreFilter {
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
-        if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
+        let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
+        if !all_have_bitmaps {
             fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
             });
         }
+        let allowed_fragments = if all_have_bitmaps {
+            Some(fragments.clone())
+        } else {
+            None
+        };
         let deleted_ids =
             Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
@@ -78,6 +89,7 @@ impl DatasetPreFilter {
             deleted_ids,
             filtered_ids,
             deleted_fragments: None,
+            allowed_fragments,
             final_mask: Mutex::new(OnceCell::new()),
         }
     }
@@ -263,6 +275,13 @@ impl PreFilter for DatasetPreFilter {
                 }
                 combined = combined & RowAddrMask::from_block(block_list);
             }
+            if let Some(allowed) = &self.allowed_fragments {
+                let mut allow_list = RowAddrTreeMap::new();
+                for frag_id in allowed.iter() {
+                    allow_list.insert_fragment(frag_id);
+                }
+                combined = combined & RowAddrMask::from_allowed(allow_list);
+            }
             Arc::new(combined)
         });
 
@@ -273,6 +292,7 @@ impl PreFilter for DatasetPreFilter {
         self.deleted_ids.is_none()
             && self.filtered_ids.is_none()
             && self.deleted_fragments.is_none()
+            && self.allowed_fragments.is_none()
     }
 
     /// Get the row id mask for this prefilter
