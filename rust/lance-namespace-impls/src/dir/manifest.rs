@@ -428,6 +428,10 @@ impl ManifestNamespace {
         object_id.join(DELIMITER)
     }
 
+    fn format_table_id(table_id: &[String]) -> String {
+        format!("table id '{}'", Self::str_object_id(table_id))
+    }
+
     /// Format a version number as a zero-padded lexicographically sortable string.
     ///
     /// Versions are stored as 20-digit zero-padded integers (e.g., `00000000000000000001`
@@ -1903,7 +1907,7 @@ impl LanceNamespace for ManifestNamespace {
                 }
             }
             None => Err(NamespaceError::TableNotFound {
-                message: object_id.to_string(),
+                message: Self::format_table_id(table_id),
             }
             .into()),
         }
@@ -1923,14 +1927,13 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        let (namespace, table_name) = Self::split_object_id(table_id);
-        let object_id = Self::build_object_id(&namespace, &table_name);
+        let object_id = Self::str_object_id(table_id);
         let exists = self.manifest_contains_object(&object_id).await?;
         if exists {
             Ok(())
         } else {
             Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: Self::format_table_id(table_id),
             }
             .into())
         }

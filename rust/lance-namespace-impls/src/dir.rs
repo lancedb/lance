@@ -988,6 +988,19 @@ impl DirectoryNamespace {
         Ok(id[0].clone())
     }
 
+    fn format_table_id(table_id: &[String]) -> String {
+        format!(
+            "table id '{}'",
+            manifest::ManifestNamespace::str_object_id(table_id)
+        )
+    }
+
+    fn format_table_id_from_request(id: &Option<Vec<String>>) -> String {
+        id.as_ref()
+            .map(|table_id| Self::format_table_id(table_id))
+            .unwrap_or_else(|| "table id '<unknown>'".to_string())
+    }
+
     async fn resolve_table_location(&self, id: &Option<Vec<String>>) -> Result<String> {
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = id.clone();
@@ -1041,6 +1054,7 @@ impl DirectoryNamespace {
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
+        let table_id = Self::format_table_id_from_request(&request.id);
         let table_uri = self.table_full_uri(&table_name);
 
         // Atomically check table existence and deregistration status
@@ -1048,14 +1062,14 @@ impl DirectoryNamespace {
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_id.clone(),
             }
             .into());
         }
 
         if status.is_deregistered {
             return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
+                message: format!("Table is deregistered: {}", table_id),
             }
             .into());
         }
@@ -2000,16 +2014,6 @@ impl DirectoryNamespace {
             metrics.increment(operation);
         }
     }
-
-    #[cfg(test)]
-    fn wrap_inner_object_store(
-        &mut self,
-        wrapper: impl FnOnce(Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>,
-    ) {
-        let mut os = (*self.object_store).clone();
-        os.inner = wrapper(os.inner.clone());
-        self.object_store = Arc::new(os);
-    }
 }
 
 #[async_trait]
@@ -2209,20 +2213,21 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
+        let table_id = Self::format_table_id_from_request(&request.id);
 
         // Atomically check table existence and deregistration status
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_id.clone(),
             }
             .into());
         }
 
         if status.is_deregistered {
             return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
+                message: format!("Table is deregistered: {}", table_id),
             }
             .into());
         }
@@ -3781,13 +3786,19 @@ mod tests {
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_io::object_store::providers::local::FileStoreProvider;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
         QueryTableRequestColumns,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::pin::Pin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use url::Url;
 
     fn assert_plan_contains_all(plan: &str, expected_fragments: &[&str], context: &str) {
         for expected_fragment in expected_fragments {
@@ -3810,6 +3821,191 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
+    }
+
+    #[derive(Debug)]
+    struct CountingObjectStore {
+        inner: Arc<dyn OSObjectStore>,
+        listing_count: Arc<AtomicUsize>,
+    }
+
+    impl CountingObjectStore {
+        fn new(inner: Arc<dyn OSObjectStore>, listing_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner,
+                listing_count,
+            }
+        }
+
+        fn record_listing(&self) {
+            self.listing_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn delegate_list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>> + Send>,
+        > {
+            self.inner.list(prefix)
+        }
+    }
+
+    impl std::fmt::Display for CountingObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CountingObjectStore {
+        async fn put(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put(location, payload).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart(
+            &self,
+            location: &Path,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get(&self, location: &Path) -> object_store::Result<object_store::GetResult> {
+            self.inner.get(location).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_range(
+            &self,
+            location: &Path,
+            range: std::ops::Range<u64>,
+        ) -> object_store::Result<bytes::Bytes> {
+            self.inner.get_range(location, range).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<object_store::ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>> + Send>,
+        > {
+            self.record_listing();
+            self.delegate_list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.record_listing();
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.rename_if_not_exists(from, to).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingFileStoreProvider {
+        listing_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl lance_io::object_store::ObjectStoreProvider for CountingFileStoreProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let provider = FileStoreProvider;
+            let mut store = provider.new_store(base_path, params).await?;
+            store.inner = Arc::new(CountingObjectStore::new(
+                store.inner.clone(),
+                self.listing_count.clone(),
+            ));
+            Ok(store)
+        }
+
+        fn extract_path(&self, url: &Url) -> Result<Path> {
+            let provider = FileStoreProvider;
+            provider.extract_path(url)
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            url: &Url,
+            storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            let provider = FileStoreProvider;
+            provider.calculate_object_store_prefix(url, storage_options)
+        }
+    }
+
+    fn file_object_store_uri(path: &str) -> String {
+        let path_prefix = if path.starts_with('/') { "" } else { "/" };
+        format!("file-object-store://{path_prefix}{path}")
+    }
+
+    fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Session> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "file-object-store",
+            Arc::new(CountingFileStoreProvider { listing_count }),
+        );
+        Arc::new(Session::new(0, 0, registry))
     }
 
     /// Helper to create test IPC data from a schema
@@ -6142,7 +6338,11 @@ mod tests {
         // Describe should fail after deregistration
         let result = namespace.describe_table(describe_req).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("deregistered"));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("deregistered"));
+        assert!(err_msg.contains("table id 'test_table'"));
     }
 
     #[tokio::test]
@@ -6182,7 +6382,11 @@ mod tests {
         // Table exists should fail after deregistration
         let result = namespace.table_exists(exists_req).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("deregistered"));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("deregistered"));
+        assert!(err_msg.contains("table id 'test_table'"));
     }
 
     #[tokio::test]
@@ -8391,152 +8595,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_dir_listing_no_extra_calls_without_migration() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        #[derive(Debug)]
-        struct CountingObjectStore {
-            inner: Arc<dyn OSObjectStore>,
-            list_with_delimiter_count: Arc<AtomicUsize>,
-        }
-
-        impl std::fmt::Display for CountingObjectStore {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "CountingObjectStore({})", self.inner)
-            }
-        }
-
-        use std::pin::Pin;
-
-        impl CountingObjectStore {
-            fn delegate_list(
-                &self,
-                prefix: Option<&Path>,
-            ) -> Pin<
-                Box<
-                    dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>>
-                        + Send,
-                >,
-            > {
-                self.inner.list(prefix)
-            }
-        }
-
-        #[async_trait]
-        impl OSObjectStore for CountingObjectStore {
-            async fn put(
-                &self,
-                location: &Path,
-                payload: object_store::PutPayload,
-            ) -> object_store::Result<object_store::PutResult> {
-                self.inner.put(location, payload).await
-            }
-
-            async fn put_opts(
-                &self,
-                location: &Path,
-                payload: object_store::PutPayload,
-                opts: object_store::PutOptions,
-            ) -> object_store::Result<object_store::PutResult> {
-                self.inner.put_opts(location, payload, opts).await
-            }
-
-            async fn put_multipart(
-                &self,
-                location: &Path,
-            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-                self.inner.put_multipart(location).await
-            }
-
-            async fn put_multipart_opts(
-                &self,
-                location: &Path,
-                opts: object_store::PutMultipartOptions,
-            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-                self.inner.put_multipart_opts(location, opts).await
-            }
-
-            async fn get(&self, location: &Path) -> object_store::Result<object_store::GetResult> {
-                self.inner.get(location).await
-            }
-
-            async fn get_opts(
-                &self,
-                location: &Path,
-                options: object_store::GetOptions,
-            ) -> object_store::Result<object_store::GetResult> {
-                self.inner.get_opts(location, options).await
-            }
-
-            async fn get_range(
-                &self,
-                location: &Path,
-                range: std::ops::Range<u64>,
-            ) -> object_store::Result<bytes::Bytes> {
-                self.inner.get_range(location, range).await
-            }
-
-            async fn get_ranges(
-                &self,
-                location: &Path,
-                ranges: &[std::ops::Range<u64>],
-            ) -> object_store::Result<Vec<bytes::Bytes>> {
-                self.inner.get_ranges(location, ranges).await
-            }
-
-            async fn head(
-                &self,
-                location: &Path,
-            ) -> object_store::Result<object_store::ObjectMeta> {
-                self.inner.head(location).await
-            }
-
-            async fn delete(&self, location: &Path) -> object_store::Result<()> {
-                self.inner.delete(location).await
-            }
-
-            fn list(
-                &self,
-                prefix: Option<&Path>,
-            ) -> Pin<
-                Box<
-                    dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>>
-                        + Send,
-                >,
-            > {
-                self.delegate_list(prefix)
-            }
-
-            async fn list_with_delimiter(
-                &self,
-                prefix: Option<&Path>,
-            ) -> object_store::Result<object_store::ListResult> {
-                self.list_with_delimiter_count
-                    .fetch_add(1, Ordering::SeqCst);
-                self.inner.list_with_delimiter(prefix).await
-            }
-
-            async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-                self.inner.copy(from, to).await
-            }
-
-            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-                self.inner.copy_if_not_exists(from, to).await
-            }
-
-            async fn rename_if_not_exists(
-                &self,
-                from: &Path,
-                to: &Path,
-            ) -> object_store::Result<()> {
-                self.inner.rename_if_not_exists(from, to).await
-            }
-        }
-
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
 
         // Create a table using dir-listing-only namespace
-        let dir_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+        let dir_only_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
             .manifest_enabled(false)
             .dir_listing_enabled(true)
             .build()
@@ -8553,7 +8620,8 @@ mod tests {
             .unwrap();
 
         // Build a namespace with both enabled but migration disabled (default)
-        let mut hybrid_ns = DirectoryNamespaceBuilder::new(temp_path)
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
             .manifest_enabled(true)
             .dir_listing_enabled(true)
             .dir_listing_to_manifest_migration_enabled(false)
@@ -8561,44 +8629,169 @@ mod tests {
             .await
             .unwrap();
 
-        let list_count = Arc::new(AtomicUsize::new(0));
-        let list_count_clone = list_count.clone();
-        hybrid_ns.wrap_inner_object_store(move |inner| {
-            Arc::new(CountingObjectStore {
-                inner,
-                list_with_delimiter_count: list_count_clone,
-            })
-        });
-
         // Reset counter before the operation we want to measure
-        list_count.store(0, Ordering::SeqCst);
+        listing_count.store(0, Ordering::SeqCst);
 
-        // table_exists should use dir listing directly, making only 1 list call
+        // table_exists should use dir listing directly, making only 1 listing call
         let mut exists_req = TableExistsRequest::new();
         exists_req.id = Some(vec!["test_table".to_string()]);
         hybrid_ns.table_exists(exists_req).await.unwrap();
 
-        let count = list_count.load(Ordering::SeqCst);
+        let count = listing_count.load(Ordering::SeqCst);
         assert_eq!(
             count, 1,
-            "Expected exactly 1 list_with_delimiter call for table_exists \
+            "Expected exactly 1 listing call for table_exists \
              without migration mode, but got {}",
             count
         );
 
         // Reset and test describe_table
-        list_count.store(0, Ordering::SeqCst);
+        listing_count.store(0, Ordering::SeqCst);
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
         hybrid_ns.describe_table(describe_req).await.unwrap();
 
-        let count = list_count.load(Ordering::SeqCst);
+        let count = listing_count.load(Ordering::SeqCst);
         assert_eq!(
             count, 1,
-            "Expected exactly 1 list_with_delimiter call for describe_table \
+            "Expected exactly 1 listing call for describe_table \
              without migration mode, but got {}",
             count
         );
+    }
+
+    #[tokio::test]
+    async fn test_dir_listing_extra_calls_with_migration() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        // Create a table using dir-listing-only namespace so it exists physically but is absent from __manifest.
+        let dir_only_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        dir_only_ns
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // table_exists first checks __manifest (one list on __manifest/_versions),
+        // then falls back to the table directory (one list_with_delimiter on test_table.lance).
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.table_exists(exists_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "Expected exactly 2 listing calls for table_exists with migration mode \
+             (manifest reload + table directory fallback), but got {}",
+            count
+        );
+
+        // describe_table follows the same path when the table is not yet registered in __manifest.
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.describe_table(describe_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "Expected exactly 2 listing calls for describe_table with migration mode \
+             (manifest reload + table directory fallback), but got {}",
+            count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_not_found_errors_include_table_id() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["missing_table".to_string()]);
+        let err = namespace.table_exists(exists_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'missing_table'"));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["missing_table".to_string()]);
+        let err = namespace.describe_table(describe_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'missing_table'"));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_not_found_errors_include_full_table_id() {
+        use lance_namespace::models::CreateNamespaceRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        let missing_table_id = vec!["workspace".to_string(), "missing_table".to_string()];
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(missing_table_id.clone());
+        let err = namespace.table_exists(exists_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'workspace$missing_table'"));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(missing_table_id);
+        let err = namespace.describe_table(describe_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'workspace$missing_table'"));
     }
 }
