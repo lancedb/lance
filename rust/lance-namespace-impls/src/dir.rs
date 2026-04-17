@@ -3786,6 +3786,7 @@ mod tests {
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_core::utils::testing::CountingObjectStore;
     use lance_io::object_store::providers::local::FileStoreProvider;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
@@ -3793,7 +3794,6 @@ mod tests {
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
-    use std::pin::Pin;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -3821,141 +3821,6 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
-    }
-
-    #[derive(Debug)]
-    struct CountingObjectStore {
-        inner: Arc<dyn OSObjectStore>,
-        listing_count: Arc<AtomicUsize>,
-    }
-
-    impl CountingObjectStore {
-        fn new(inner: Arc<dyn OSObjectStore>, listing_count: Arc<AtomicUsize>) -> Self {
-            Self {
-                inner,
-                listing_count,
-            }
-        }
-
-        fn record_listing(&self) {
-            self.listing_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn delegate_list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> Pin<
-            Box<dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>> + Send>,
-        > {
-            self.inner.list(prefix)
-        }
-    }
-
-    impl std::fmt::Display for CountingObjectStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "CountingObjectStore({})", self.inner)
-        }
-    }
-
-    #[async_trait]
-    impl OSObjectStore for CountingObjectStore {
-        async fn put(
-            &self,
-            location: &Path,
-            payload: object_store::PutPayload,
-        ) -> object_store::Result<object_store::PutResult> {
-            self.inner.put(location, payload).await
-        }
-
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart(
-            &self,
-            location: &Path,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart(location).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get(&self, location: &Path) -> object_store::Result<object_store::GetResult> {
-            self.inner.get(location).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        async fn get_range(
-            &self,
-            location: &Path,
-            range: std::ops::Range<u64>,
-        ) -> object_store::Result<bytes::Bytes> {
-            self.inner.get_range(location, range).await
-        }
-
-        async fn get_ranges(
-            &self,
-            location: &Path,
-            ranges: &[std::ops::Range<u64>],
-        ) -> object_store::Result<Vec<bytes::Bytes>> {
-            self.inner.get_ranges(location, ranges).await
-        }
-
-        async fn head(&self, location: &Path) -> object_store::Result<object_store::ObjectMeta> {
-            self.inner.head(location).await
-        }
-
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> Pin<
-            Box<dyn futures::Stream<Item = object_store::Result<object_store::ObjectMeta>> + Send>,
-        > {
-            self.record_listing();
-            self.delegate_list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.record_listing();
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
-        }
-
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
     }
 
     #[derive(Debug)]
