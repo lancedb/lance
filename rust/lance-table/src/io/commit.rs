@@ -417,7 +417,11 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     if let Some((version, entry)) = latest_entry {
         let path = Path::from_filesystem_path(entry.path())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        let metadata = entry.metadata()?;
+        // Use std::fs::metadata() rather than DirEntry::metadata() to follow
+        // symlinks — on Unix, DirEntry::metadata() is equivalent to
+        // symlink_metadata() and returns the size of the symlink itself
+        // (a few dozen bytes), not the target file.
+        let metadata = std::fs::metadata(entry.path())?;
         Ok(Some(ManifestLocation {
             version,
             path,
@@ -1351,5 +1355,31 @@ mod tests {
         let mut expected_versions = detached_versions.clone();
         expected_versions.sort();
         assert_eq!(found_versions, expected_versions);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_current_manifest_local_with_symlink() {
+        use lance_core::utils::tempfile::TempDir;
+
+        let tempdir = TempDir::default();
+        let base_path = tempdir.std_path().join("base");
+        let versions_dir = base_path.join("_versions");
+        std::fs::create_dir_all(&versions_dir).unwrap();
+
+        // Write a real manifest file with non-trivial content (larger than any symlink path)
+        let real_file = versions_dir.join("1.manifest");
+        std::fs::write(&real_file, vec![0u8; 1024]).unwrap();
+
+        // Create a symlink with a higher version number so it becomes the latest
+        let link_file = versions_dir.join("2.manifest");
+        std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+        let base = Path::from_filesystem_path(&base_path).unwrap();
+        let location = current_manifest_local(&base).unwrap().unwrap();
+
+        assert_eq!(location.version, 2);
+        // Must report the target file's size (1024), not the symlink path length (~20-60 bytes)
+        assert_eq!(location.size, Some(1024));
     }
 }
