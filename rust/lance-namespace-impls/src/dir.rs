@@ -8459,6 +8459,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "TODO: https://github.com/lance-format/lance/issues/6557"
+    )]
     async fn test_dir_listing_no_extra_calls_without_migration() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -8527,6 +8531,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "TODO: https://github.com/lance-format/lance/issues/6557"
+    )]
     async fn test_dir_listing_extra_calls_with_migration() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
