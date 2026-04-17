@@ -313,21 +313,22 @@ impl std::fmt::Debug for LanceExecutionOptions {
     }
 }
 
-const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
+        let num_partitions = self.target_partition.unwrap_or(1) as u64;
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
                 .map(|s| match s.parse::<u64>() {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
-                        DEFAULT_LANCE_MEM_POOL_SIZE
+                        DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
                     }
                 })
-                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE)
+                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
         })
     }
 
@@ -1050,5 +1051,36 @@ mod tests {
                 "new config should be cached"
             );
         }
+    }
+
+    #[test]
+    fn test_mem_pool_size_scales_with_partitions() {
+        let default_per_partition = DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION;
+
+        // No partitions specified → defaults to 1 partition
+        let opts = LanceExecutionOptions::default();
+        assert_eq!(opts.mem_pool_size(), default_per_partition);
+
+        // 4 partitions → 4x the per-partition size
+        let opts = LanceExecutionOptions {
+            target_partition: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(opts.mem_pool_size(), default_per_partition * 4);
+
+        // 8 partitions → 8x the per-partition size
+        let opts = LanceExecutionOptions {
+            target_partition: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(opts.mem_pool_size(), default_per_partition * 8);
+
+        // Explicit mem_pool_size is not scaled
+        let opts = LanceExecutionOptions {
+            mem_pool_size: Some(50 * 1024 * 1024),
+            target_partition: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
     }
 }
