@@ -63,15 +63,20 @@ impl DatasetPreFilter {
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
-        if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
+        let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
+        if !all_have_bitmaps {
             fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
             });
         }
-        let deleted_ids =
-            Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
+        let deleted_ids = if all_have_bitmaps {
+            Self::create_restricted_deletion_mask(dataset, fragments)
+        } else {
+            Self::create_deletion_mask(dataset, fragments)
+        }
+        .map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
@@ -186,16 +191,42 @@ impl DatasetPreFilter {
         self.deleted_fragments = Some(fragments);
     }
 
-    /// Creates a task to load a mask that filters out rows not covered by the
-    /// index and rows that have been deleted.
+    /// Creates a task to load a mask that filters out deleted rows and,
+    /// when `restrict_to_fragments` is true, also restricts results to only
+    /// the given `fragments`.
     ///
-    /// The mask always restricts results to `fragments` (the index's fragment
-    /// bitmap). Within those fragments, deleted rows are also masked out —
-    /// either as a block list (from deletion files) or an allow list (when
-    /// stable row ids are in use and fragments have been removed).
+    /// The fragment restriction blocks stale index entries from fragments
+    /// whose data changed but whose index was not rewritten. It should be
+    /// enabled when `fragments` represents a real index fragment bitmap. It
+    /// should be disabled when `fragments` is a conservative fallback (e.g.
+    /// when the index has no fragment bitmap).
+    ///
+    /// The deletion mask is built as a block list (from deletion files) or
+    /// an allow list (when stable row ids are in use and fragments have
+    /// been removed).
+    ///
+    /// Returns `None` if it can be synchronously determined that no
+    /// filtering is needed.
     pub fn create_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+        Self::create_deletion_mask_impl(dataset, fragments, false)
+    }
+
+    /// Like [`create_deletion_mask`] but also restricts results to the given
+    /// `fragments`, blocking any row from a fragment not in the set.
+    pub fn create_restricted_deletion_mask(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+        Self::create_deletion_mask_impl(dataset, fragments, true)
+    }
+
+    fn create_deletion_mask_impl(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        restrict_to_fragments: bool,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
@@ -206,11 +237,16 @@ impl DatasetPreFilter {
                 .iter()
                 .map(|frag| (frag.id as u32, frag)),
         );
-        // Check if the index covers fragments that are not in the dataset.
-        // This can happen when a fragment's data was modified but the index
-        // was not rewritten (e.g. after DataReplacement or partial merge_insert).
-        let dataset_frag_ids: RoaringBitmap = frag_map.keys().copied().collect();
-        let has_extra_dataset_frags = !dataset_frag_ids.is_subset(&fragments);
+        // When restrict_to_fragments is set, check if the dataset has fragments
+        // outside the index bitmap. This can happen when a fragment's data was
+        // modified but the index was not rewritten (e.g. after DataReplacement
+        // or partial merge_insert).
+        let needs_allow_list = if restrict_to_fragments {
+            let dataset_frag_ids: RoaringBitmap = frag_map.keys().copied().collect();
+            !dataset_frag_ids.is_subset(&fragments)
+        } else {
+            false
+        };
         for frag_id in fragments.iter() {
             let frag = frag_map.get(&frag_id);
             if let Some(frag) = frag {
@@ -221,10 +257,7 @@ impl DatasetPreFilter {
                 missing_frags.push(frag_id);
             }
         }
-        if missing_frags.is_empty()
-            && frags_with_deletion_files.is_empty()
-            && !has_extra_dataset_frags
-        {
+        if missing_frags.is_empty() && frags_with_deletion_files.is_empty() && !needs_allow_list {
             None
         } else if dataset.manifest.uses_stable_row_ids() {
             Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
@@ -237,11 +270,11 @@ impl DatasetPreFilter {
             }
             Some(async move { Ok(Arc::new(RowAddrMask::from_allowed(allow_list))) }.boxed())
         } else {
-            // There are deletions/missing frags AND extra dataset frags.
-            // Build the deletion mask and combine it with the allow-list.
+            // There are deletions/missing frags. Build the deletion mask and
+            // optionally combine it with the fragment allow-list.
             let fut =
                 Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files);
-            if has_extra_dataset_frags {
+            if needs_allow_list {
                 Some(
                     async move {
                         let deletion_mask = fut.await?;
@@ -416,22 +449,14 @@ mod test {
         expected.insert_fragment(1);
         assert_eq!(mask.block_list(), Some(&expected));
 
-        // If we only pass fragment 2, we should get a mask that also blocks
-        // rows from fragment 0 (not in the allow-list) in addition to the
-        // deleted row in fragment 2.
+        // If we don't pass the missing fragment id, we should get a smaller mask.
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.deletions_missing_frags.clone(),
             RoaringBitmap::from_iter(2..3),
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        // Fragment 0 rows should be blocked (not in allow-list)
-        assert!(!mask.selected(0)); // frag 0, row 0
-                                    // Fragment 2 deleted row should be blocked
-        assert!(!mask.selected((2 << 32) + 2)); // frag 2, row 2 (x=8)
-                                                // Fragment 2 non-deleted rows should be allowed
-        assert!(mask.selected((2 << 32) + 0)); // frag 2, row 0 (x=6)
-        assert!(mask.selected((2 << 32) + 1)); // frag 2, row 1 (x=7)
+        assert_eq!(mask.block_list().and_then(|x| x.len()), Some(1));
 
         // If there are only missing fragments, we should still get a mask
         let mask = DatasetPreFilter::create_deletion_mask(
