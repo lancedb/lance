@@ -2690,6 +2690,39 @@ def test_merge_insert_large():
     )
 
 
+def test_merge_insert_large_rows():
+    # Verify that merge_insert succeeds when a single batch is ~200 MiB.
+    # This exercises the HardCapBatchSizeExec node which rechunks oversized
+    # batches before the DataFusion sort.
+    nrows = 1000
+    # ~200 KiB per row → ~200 MiB total in one batch
+    blob_size = 200 * 1024
+    ids = pa.array(range(nrows), type=pa.int64())
+    blobs = pa.array([b"x" * blob_size] * nrows, type=pa.large_binary())
+    data = pa.table({"id": ids, "blob": blobs})
+
+    ds = lance.write_dataset(data, "memory://")
+
+    # Update every row (matched path).
+    new_blobs = pa.array([b"y" * blob_size] * nrows, type=pa.large_binary())
+    new_data = pa.table({"id": ids, "blob": new_blobs})
+
+    stats = (
+        ds.merge_insert(on="id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+
+    assert stats["num_updated_rows"] == nrows
+    assert stats["num_inserted_rows"] == 0
+
+    result = ds.to_table()
+    assert result.num_rows == nrows
+    # Spot-check that the blobs were actually updated.
+    assert result.column("blob")[0].as_py() == b"y" * blob_size
+
+
 def test_merge_insert_empty_index():
     # Reported in https://github.com/lancedb/lancedb/issues/2285
     empty_table = pa.table({"id": pa.array([], type=pa.float64())})

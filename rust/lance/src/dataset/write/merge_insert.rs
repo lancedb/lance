@@ -103,13 +103,12 @@ use lance_core::{
 };
 use lance_datafusion::{
     chunker::chunk_stream,
-    dataframe::DataFrameExt,
-    exec::{LanceExecutionOptions, analyze_plan, get_session_context},
-    utils::reader_to_stream,
-};
-use lance_datafusion::{
-    exec::{OneShotExec, execute_plan},
-    utils::StreamingWriteSource,
+    dataframe::BatchStreamGrouper,
+    exec::{
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan, execute_plan,
+        get_session_context,
+    },
+    utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
@@ -900,12 +899,25 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        let mut group_stream = session_ctx
+        // 25 MiB hard cap on batch size.  The sort may produce arbitrarily
+        // large batches which must be rechunked before we hand them to the
+        // per-fragment writers.
+        const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
+        let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
-            .sort(vec![col(ROW_ADDR).sort(true, true)])?
-            .group_by_stream(&["_fragment_id"])
-            .await?;
+            .sort(vec![col(ROW_ADDR).sort(true, true)])?;
+        let sorted_plan = sorted.create_physical_plan().await?;
+        let capped_plan = Arc::new(HardCapBatchSizeExec::new(sorted_plan, MAX_BATCH_BYTES));
+        let capped_stream = execute_plan(
+            capped_plan,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )?;
+        let mut group_stream =
+            BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
