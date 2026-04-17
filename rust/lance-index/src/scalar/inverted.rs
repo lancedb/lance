@@ -20,8 +20,8 @@ pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
+pub use lance_tokenizer::Language;
 pub use scorer::MemBM25Scorer;
-use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
 use lance_core::Error;

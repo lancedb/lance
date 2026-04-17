@@ -25,6 +25,7 @@ lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
+lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-geo = { workspace = true, optional = true }
 arrow-arith = { workspace = true }
@@ -76,7 +77,6 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 moka.workspace = true
 permutation = { version = "0.4.0" }
-tantivy.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
 humantime = { workspace = true }
@@ -84,6 +84,10 @@ async_cell = "0.2.2"
 semver.workspace = true
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+
+[build-dependencies]
+prost-build.workspace = true
+protobuf-src = { version = "2.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -129,6 +133,7 @@ dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
 protoc = [
+    "dep:protobuf-src",
     "lance-encoding/protoc",
     "lance-file/protoc",
     "lance-index/protoc",

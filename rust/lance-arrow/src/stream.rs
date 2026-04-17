@@ -41,7 +41,9 @@ where
             }
 
             // Pull batches until we reach the byte target or exhaust input.
-            while !state.done && state.acc_bytes < state.min_bytes {
+            // Always pull at least one batch so that min_bytes=0 works.
+            while !state.done && (state.accumulated.is_empty() || state.acc_bytes < state.min_bytes)
+            {
                 match state.input.next().await {
                     Some(Ok(batch)) => {
                         state.acc_bytes += batch.get_array_memory_size();
@@ -289,6 +291,30 @@ mod tests {
             .collect();
         let expected: Vec<i32> = (0..237).collect();
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn test_min_bytes_zero_still_yields_all_rows() {
+        // When min_bytes=0, the stream should still yield every batch.
+        // This is the "chop only, don't coalesce" use case.
+        let batches: Vec<_> = (0..5).map(|_| make_batch(100)).collect();
+        let batch_bytes = batches[0].get_array_memory_size();
+        let result = collect_rechunked(batches, 0, batch_bytes * 2);
+        assert_eq!(total_rows(&result), 500);
+    }
+
+    #[test]
+    fn test_min_bytes_zero_slices_oversized() {
+        // min_bytes=0 with a small max_bytes should still slice large batches.
+        let batch = make_batch(1000);
+        let bytes = batch.get_array_memory_size();
+        let result = collect_rechunked(vec![batch], 0, bytes / 4);
+        assert_eq!(total_rows(&result), 1000);
+        assert!(
+            result.len() >= 4,
+            "expected at least 4 slices, got {}",
+            result.len()
+        );
     }
 
     #[test]

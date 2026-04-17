@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
+use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
-use crate::scalar::inverted::lance_tokenizer::DocType;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexStore, OldIndexDataFilter};
@@ -2156,14 +2156,12 @@ mod tests {
         let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
         let stream = Box::pin(stream);
 
-        let params = InvertedIndexParams::new(
-            "whitespace".to_string(),
-            tantivy::tokenizer::Language::English,
-        )
-        .with_position(false)
-        .remove_stop_words(false)
-        .stem(false)
-        .max_token_length(None);
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder.update(stream, store.as_ref(), None).await?;

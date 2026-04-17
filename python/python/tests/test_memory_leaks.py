@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import gc
 import os
+import subprocess
+import sys
 from typing import Callable
 
 import lance
@@ -78,18 +80,40 @@ def assert_noleaks(
         )
 
 
+def run_isolated_probe(probe_name: str, *args: str) -> None:
+    result = subprocess.run(
+        [sys.executable, __file__, probe_name, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"Isolated probe '{probe_name}' failed.\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def probe_index_statistics_no_leak(dataset_path: str) -> None:
+    def access_index_stats() -> None:
+        d = lance.dataset(dataset_path)
+        for idx in d.describe_indices():
+            d.stats.index_stats(idx.name)
+
+    assert_noleaks(
+        access_index_stats, iterations=1000, threshold_mb=2.0, check_interval=25
+    )
+
+
 class TestMemoryLeaks:
     def test_index_statistics_no_leak(self, tmp_path) -> None:
         dataset_path = str(tmp_path / "dataset")
         data = pa.table({"id": [1]})
         ds = lance.write_dataset(data, dataset_path)
         ds.create_scalar_index("id", index_type="BTREE")
+        run_isolated_probe("index_statistics_no_leak", dataset_path)
 
-        def access_index_stats() -> None:
-            d = lance.dataset(dataset_path)
-            for idx in d.describe_indices():
-                d.stats.index_stats(idx.name)
 
-        assert_noleaks(
-            access_index_stats, iterations=1000, threshold_mb=2.0, check_interval=25
-        )
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "index_statistics_no_leak":
+        probe_index_statistics_no_leak(sys.argv[2])

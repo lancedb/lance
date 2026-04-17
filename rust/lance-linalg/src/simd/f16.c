@@ -22,7 +22,6 @@
 #define FUNC_CAT(A, B) FUNC_CAT_INNER(A, B)
 #define FUNC(N) FUNC_CAT(N, SUFFIX)
 
-// TODO: I wonder if we could re-purpose this macro to compile bf16 kernels?
 #if defined(__clang__)
 // Note: we use __fp16 instead of _Float16 because Clang < 15.0.0 does not
 // support it well for most targets. __fp16 works for our purposes here since

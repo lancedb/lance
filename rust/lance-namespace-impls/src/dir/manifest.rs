@@ -49,7 +49,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DELIMITER: &str = "$";
@@ -61,6 +61,9 @@ const OBJECT_ID_INDEX_NAME: &str = "object_id_btree";
 const OBJECT_TYPE_INDEX_NAME: &str = "object_type_bitmap";
 /// LabelList index on the base_objects column for view dependencies
 const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
+/// Inline maintenance on the manifest table is expensive relative to a single-row mutation.
+/// Wait until enough fragments accumulate before compacting files or merging indices.
+const MANIFEST_INLINE_OPTIMIZATION_FRAGMENT_THRESHOLD: usize = 8;
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +271,9 @@ pub struct ManifestNamespace {
     /// Number of retries for commit operations on the manifest table.
     /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
     commit_retries: Option<u32>,
+    /// Serialize manifest mutations within a single namespace instance so concurrent
+    /// create/drop calls do not compete with each other on the same in-memory snapshot.
+    manifest_mutation_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for ManifestNamespace {
@@ -374,6 +380,7 @@ impl ManifestNamespace {
             dir_listing_enabled,
             inline_optimization_enabled,
             commit_retries,
+            manifest_mutation_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -613,6 +620,13 @@ impl ManifestNamespace {
                     BASE_OBJECTS_INDEX_NAME
                 );
             }
+        }
+
+        let should_compact_and_optimize =
+            dataset.count_fragments() >= MANIFEST_INLINE_OPTIMIZATION_FRAGMENT_THRESHOLD;
+
+        if !should_compact_and_optimize {
+            return Ok(());
         }
 
         // Step 2: Run file compaction
@@ -933,6 +947,7 @@ impl ManifestNamespace {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         // Use MergeInsert to ensure uniqueness on object_id
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset_arc = Arc::new(dataset_guard.clone());
         drop(dataset_guard); // Drop read guard before merge insert
@@ -994,6 +1009,7 @@ impl ManifestNamespace {
         let predicate = format!("object_id = '{}'", object_id);
 
         // Get dataset and use DeleteBuilder with configured retries
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard); // Drop read guard before delete
@@ -1191,6 +1207,7 @@ impl ManifestNamespace {
         }
 
         // Execute a single bulk delete with the combined filter
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard);
@@ -1267,6 +1284,7 @@ impl ManifestNamespace {
         }
 
         // Execute a single atomic bulk delete covering all tables
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard);
@@ -1304,6 +1322,7 @@ impl ManifestNamespace {
     /// __manifest dataset's table metadata, rather than inserting a row.
     /// If the property already exists with the same value, this is a no-op.
     pub async fn set_property(&self, name: &str, value: &str) -> Result<()> {
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         if dataset_guard.metadata().get(name) == Some(&value.to_string()) {
             return Ok(());
