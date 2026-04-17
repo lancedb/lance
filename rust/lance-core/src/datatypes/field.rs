@@ -48,6 +48,12 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
 
+/// Use this config key in Arrow field metadata to specify the position of a clustering key column.
+/// The value is a 1-based integer indicating the order within the composite clustering key.
+/// Clustering key fields are ordered by this position value.
+pub const LANCE_UNENFORCED_CLUSTERING_KEY_POSITION: &str =
+    "lance-schema:unenforced-clustering-key:position";
+
 /// Use this config key in Arrow field metadata to specify the field id of the lance field.
 /// The value should be non-negative i32 value. Any negative value will be seen as -1.
 pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
@@ -144,6 +150,11 @@ pub struct Field {
     /// None means the field is not part of the primary key.
     /// Some(n) means this field is the nth column in the primary key.
     pub unenforced_primary_key_position: Option<u32>,
+
+    /// Position of this field in the clustering key (1-based).
+    /// None means the field is not part of the clustering key.
+    /// Some(n) means this field is the nth column in the clustering key.
+    pub unenforced_clustering_key_position: Option<u32>,
 }
 
 impl Field {
@@ -562,6 +573,7 @@ impl Field {
             children: vec![],
             dictionary: self.dictionary.clone(),
             unenforced_primary_key_position: self.unenforced_primary_key_position,
+            unenforced_clustering_key_position: self.unenforced_clustering_key_position,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -827,6 +839,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
+                unenforced_clustering_key_position: self.unenforced_clustering_key_position,
             };
             return Ok(f);
         }
@@ -887,6 +900,7 @@ impl Field {
                 children,
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
+                unenforced_clustering_key_position: self.unenforced_clustering_key_position,
             })
         }
     }
@@ -1018,6 +1032,10 @@ impl Field {
     pub fn is_unenforced_primary_key(&self) -> bool {
         self.unenforced_primary_key_position.is_some()
     }
+
+    pub fn is_unenforced_clustering_key(&self) -> bool {
+        self.unenforced_clustering_key_position.is_some()
+    }
 }
 
 impl fmt::Display for Field {
@@ -1108,6 +1126,9 @@ impl TryFrom<&ArrowField> for Field {
                     .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
                     .map(|_| 0)
             });
+        let unenforced_clustering_key_position = metadata
+            .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok());
         let is_blob_v2 = has_blob_v2_extension(field);
 
         if is_blob_v2 {
@@ -1145,6 +1166,7 @@ impl TryFrom<&ArrowField> for Field {
             children,
             dictionary: None,
             unenforced_primary_key_position,
+            unenforced_clustering_key_position,
         })
     }
 }
