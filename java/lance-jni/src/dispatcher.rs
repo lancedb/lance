@@ -35,10 +35,10 @@ impl Dispatcher {
         std::thread::Builder::new()
             .name("lance-jni-dispatcher".to_string())
             .spawn(move || {
-                // Attach ONCE and never detach - this is the key optimization
+                // Attach as daemon so this thread does not prevent JVM shutdown
                 let mut env = jvm
-                    .attach_current_thread_permanently()
-                    .expect("Failed to attach dispatcher to JVM");
+                    .attach_current_thread_as_daemon()
+                    .expect("Failed to attach dispatcher to JVM as daemon");
 
                 log::info!("JNI dispatcher thread started");
 

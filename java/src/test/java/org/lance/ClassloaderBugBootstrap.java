@@ -62,7 +62,6 @@ public class ClassloaderBugBootstrap {
       Method runMethod = helperClass.getMethod("run", String.class);
       runMethod.invoke(null, tempDir);
 
-      // Force exit: the JNI dispatcher thread is non-daemon and would keep the JVM alive
       System.exit(0);
 
     } catch (Throwable t) {
