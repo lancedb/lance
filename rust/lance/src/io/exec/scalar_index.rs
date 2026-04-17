@@ -5,33 +5,33 @@ use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
-    Dataset,
     dataset::rowids::load_row_id_sequences,
-    index::{DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter},
+    index::{prefilter::DatasetPreFilter, DatasetIndexExt, DatasetIndexInternalExt},
+    Dataset,
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
-    common::{Statistics, stats::Precision},
+    common::{stats::Precision, Statistics},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
-    Error, ROW_ID_FIELD, Result,
     utils::{
         address::RowAddress,
         mask::{RowAddrMask, RowAddrTreeMap},
     },
+    Error, Result, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::break_stream,
@@ -40,15 +40,15 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
-    IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
-        SargableQuery, ScalarIndex,
         expression::{
-            INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
-            ScalarIndexSearch,
+            IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch,
+            INDEX_EXPR_RESULT_SCHEMA,
         },
+        SargableQuery, ScalarIndex,
     },
+    IndexCriteria,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -340,28 +340,13 @@ impl MapIndexExec {
             .load_scalar_index(IndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
-        let fragment_bitmap = index.fragment_bitmap.unwrap();
         let deletion_mask_fut =
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap.clone());
-        let mut deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
+            DatasetPreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
+        let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {
             None
         };
-        // Apply allow-list: only keep rows from fragments covered by the index.
-        // This filters out stale index entries from fragments whose data changed
-        // but whose index data was not rewritten.
-        {
-            let mut allow_list = RowAddrTreeMap::new();
-            for frag_id in fragment_bitmap.iter() {
-                allow_list.insert_fragment(frag_id);
-            }
-            let allow_mask = Arc::new(RowAddrMask::from_allowed(allow_list));
-            deletion_mask = Some(match deletion_mask {
-                Some(existing) => Arc::new((*existing).clone() & (*allow_mask).clone()),
-                None => allow_mask,
-            });
-        }
         Ok(input.and_then(move |res| {
             let column_name = column_name.clone();
             let index_name = index_name.clone();
@@ -758,17 +743,17 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
-        IndexType,
         scalar::{
-            SargableQuery, ScalarIndexParams,
             expression::{ScalarIndexExpr, ScalarIndexSearch},
+            SargableQuery, ScalarIndexParams,
         },
+        IndexType,
     };
 
     use crate::{
-        Dataset,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
+        Dataset,
     };
 
     use super::{MapIndexExec, ScalarIndexExec};
