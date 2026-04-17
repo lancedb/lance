@@ -916,8 +916,7 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         )?;
-        let mut group_stream =
-            BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
+        let mut group_stream = BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
