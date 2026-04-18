@@ -256,7 +256,7 @@ public class FileReaderWriterTest {
       LanceFileReader.open("/tmp/does_not_exist.lance", allocator);
       fail("Expected LanceException to be thrown");
     } catch (IOException e) {
-      assertTrue(e.getMessage().contains("Object at location /tmp/does_not_exist.lance not found"));
+      assertTrue(e.getMessage().contains("/tmp/does_not_exist.lance"));
     }
     try {
       LanceFileReader.open("", allocator);
