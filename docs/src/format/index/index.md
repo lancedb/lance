@@ -80,7 +80,7 @@ Consider the example dataset in the figure above:
 
 ## Index Storage
 
-The content of each index is stored at the `_indices/{UUID}` directory under the [base path](../layout.md#base-path-system).
+The content of each index is stored at the `_indices/{UUID}` directory under the [base path](../table/layout.md#base-path-system).
 We call this location the **index directory**.
 The actual content stored in the index directory depends on the index type. These can be
 arbitrary files defined by the index implementation. However, often they are made up of
@@ -133,7 +133,7 @@ fragments that would have been covered by that segment.
 
 When loading an index:
 
-1. Get the offset to the index section from the `index_section` field in the [manifest](../index.md#manifest).
+1. Get the offset to the index section from the `index_section` field in the [manifest](../table/index.md#manifest).
 2. Read the index section from the manifest file. This is a protobuf message of type `IndexSection`, which
    contains a list of `IndexMetadata` messages, each describing an index segment.
 3. Read the index files from the `_indices/{UUID}` directory under the dataset directory,

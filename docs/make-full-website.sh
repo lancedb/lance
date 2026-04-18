@@ -67,6 +67,7 @@ copy_docs_dir() {
 
     if [ -d "$source_dir" ]; then
         mkdir -p "$(dirname "$target_dir")"
+        rm -rf "$target_dir"
         cp -R "$source_dir" "$target_dir"
         return 0
     fi
@@ -87,21 +88,7 @@ copy_file_if_exists() {
     return 1
 }
 
-resolve_required_repo_dir() {
-    local repo_label="$1"
-    local repo_path="$2"
-
-    repo_path=$(normalize_path "$repo_path")
-
-    if [ ! -d "$repo_path" ]; then
-        echo "Expected $repo_label repo at '$repo_path'. Override it with the matching --*-repo option or environment variable." >&2
-        exit 1
-    fi
-
-    (cd -- "$repo_path" && pwd)
-}
-
-resolve_optional_repo_dir() {
+resolve_repo_dir() {
     local repo_path="$1"
 
     repo_path=$(normalize_path "$repo_path")
@@ -114,59 +101,38 @@ resolve_optional_repo_dir() {
     printf '%s\n' "$repo_path"
 }
 
-require_dir() {
-    local required_dir="$1"
-    local message="$2"
+warn_missing_repo() {
+    local repo_label="$1"
+    local repo_path="$2"
 
-    if [ ! -d "$required_dir" ]; then
-        echo "$message" >&2
-        exit 1
-    fi
+    echo "Warning: $repo_label repo not found at '$repo_path'; keeping placeholder docs." >&2
 }
 
-namespace_repo=$(resolve_required_repo_dir "Lance Namespace" "$namespace_repo_input")
-namespace_impls_repo=$(resolve_required_repo_dir "Lance Namespace Impls" "$namespace_impls_repo_input")
-spark_repo=$(resolve_optional_repo_dir "$spark_repo_input")
-ray_repo=$(resolve_optional_repo_dir "$ray_repo_input")
-trino_repo=$(resolve_optional_repo_dir "$trino_repo_input")
-duckdb_repo=$(resolve_optional_repo_dir "$duckdb_repo_input")
-huggingface_repo=$(resolve_optional_repo_dir "$huggingface_repo_input")
+namespace_repo=$(resolve_repo_dir "$namespace_repo_input")
+namespace_impls_repo=$(resolve_repo_dir "$namespace_impls_repo_input")
+spark_repo=$(resolve_repo_dir "$spark_repo_input")
+ray_repo=$(resolve_repo_dir "$ray_repo_input")
+trino_repo=$(resolve_repo_dir "$trino_repo_input")
+duckdb_repo=$(resolve_repo_dir "$duckdb_repo_input")
+huggingface_repo=$(resolve_repo_dir "$huggingface_repo_input")
 
 "$script_dir/clean-full-website.sh"
 
-require_dir \
-    "$namespace_repo/docs/src/catalog" \
-    "Expected catalog docs at '$namespace_repo/docs/src/catalog'. Use a Lance Namespace checkout that contains split catalog docs, or override LANCE_NAMESPACE_REPO to point at one."
-require_dir \
-    "$namespace_repo/docs/src/namespace" \
-    "Expected namespace docs at '$namespace_repo/docs/src/namespace'. Use a Lance Namespace checkout that contains split namespace docs, or override LANCE_NAMESPACE_REPO to point at one."
-require_dir \
-    "$namespace_impls_repo/docs/src" \
-    "Expected namespace implementation docs at '$namespace_impls_repo/docs/src'. Override LANCE_NAMESPACE_IMPLS_REPO if needed."
+if copy_docs_dir "$namespace_repo/docs/src/catalog" "$docs_src/format/catalog"; then
+    :
+else
+    warn_missing_repo "Lance Namespace catalog docs" "$namespace_repo/docs/src/catalog"
+fi
 
-for optional_repo in \
-    "$spark_repo" \
-    "$ray_repo" \
-    "$trino_repo" \
-    "$duckdb_repo" \
-    "$huggingface_repo"; do
-    if [ ! -d "$optional_repo" ]; then
-        echo "Note: optional repo '$optional_repo' not found; skipping its docs." >&2
-    fi
-done
+if copy_docs_dir "$namespace_repo/docs/src/namespace" "$docs_src/format/namespace"; then
+    copy_file_if_exists "$namespace_repo/docs/src/overview.png" "$docs_src/format/overview.png"
+    copy_file_if_exists "$namespace_repo/docs/src/java-sdk-example.png" "$docs_src/format/java-sdk-example.png"
+    :
+else
+    warn_missing_repo "Lance Namespace namespace docs" "$namespace_repo/docs/src/namespace"
+fi
 
-copy_docs_dir "$namespace_repo/docs/src/catalog" "$docs_src/format/catalog"
-copy_docs_dir "$namespace_repo/docs/src/namespace" "$docs_src/format/namespace"
-
-cat > "$docs_src/format/.pages" <<'EOF'
-nav:
-  - Overview: index.md
-  - File Format: file
-  - Table Format: table
-  - Catalog Specs: catalog
-  - Namespace Client Spec: namespace
-EOF
-
+if [ -f "$docs_src/format/namespace/operations/index.md" ]; then
 python3 - <<'PY' "$docs_src/format/namespace/operations/index.md"
 from pathlib import Path
 import sys
@@ -175,7 +141,9 @@ path = Path(sys.argv[1])
 text = path.read_text()
 path.write_text(text.replace('[Models](models/)', '[Models](models/index.md)'))
 PY
+fi
 
+mkdir -p "$docs_src/format/namespace/operations/models"
 cat > "$docs_src/format/namespace/operations/models/index.md" <<'EOF'
 # Operation Models
 
@@ -185,6 +153,7 @@ These pages define the JSON schemas referenced by the [operations overview](../i
 EOF
 
 supported_catalogs_dir="$docs_src/format/namespace/supported-catalogs"
+if [ -d "$namespace_impls_repo/docs/src" ]; then
 while IFS= read -r -d '' source_file; do
     target_file="$supported_catalogs_dir/$(basename "$source_file")"
     if [ -e "$target_file" ]; then
@@ -227,6 +196,9 @@ if not inserted:
 
 target.write_text('\n'.join(output) + '\n')
 PY
+else
+    warn_missing_repo "Lance Namespace Impls docs" "$namespace_impls_repo/docs/src"
+fi
 
 integration_entries=(
 )
@@ -237,22 +209,41 @@ done < <(sed -n '2,$p' "$docs_src/integrations/.pages")
 
 if copy_docs_dir "$duckdb_repo/docs/src" "$docs_src/integrations/duckdb"; then
     integration_entries+=("  - DuckDB: duckdb")
+else
+    warn_missing_repo "Lance DuckDB docs" "$duckdb_repo/docs/src"
 fi
 
 if copy_docs_dir "$huggingface_repo/docs/src" "$docs_src/integrations/huggingface"; then
     integration_entries+=("  - Huggingface: huggingface")
+else
+    warn_missing_repo "Lance HuggingFace docs" "$huggingface_repo/docs/src"
 fi
 
 if copy_docs_dir "$spark_repo/docs/src" "$docs_src/integrations/spark"; then
+    python3 - <<'PY' "$docs_src/integrations/spark/operations/ddl/create-index.md"
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if path.exists():
+    text = path.read_text()
+    path.write_text(text.replace('https://lance.org/format/table/index/scalar/fts/#tokenizers', 'https://lance.org/format/index/scalar/fts/#tokenizers'))
+PY
     integration_entries+=("  - Apache Spark: spark")
+else
+    warn_missing_repo "Lance Spark docs" "$spark_repo/docs/src"
 fi
 
 if copy_docs_dir "$ray_repo/docs/src" "$docs_src/integrations/ray"; then
     integration_entries+=("  - Ray: ray")
+else
+    warn_missing_repo "Lance Ray docs" "$ray_repo/docs/src"
 fi
 
 if copy_docs_dir "$trino_repo/docs/src" "$docs_src/integrations/trino"; then
     integration_entries+=("  - Trino: trino")
+else
+    warn_missing_repo "Lance Trino docs" "$trino_repo/docs/src"
 fi
 
 {

@@ -192,7 +192,7 @@ See [Row ID & Lineage Specification](row_id_lineage.md)
 
 Vector indices, scalar indices, full-text search, and index management.
 
-See [Index Specification](index/index.md)
+See [Index Formats](../index/index.md)
 
 ### Versioning
 
