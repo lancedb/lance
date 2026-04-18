@@ -8,7 +8,7 @@ use std::{env, path::PathBuf};
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
 
-pub mod lance_tokenizer;
+pub mod document_tokenizer;
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;
 
@@ -19,8 +19,14 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::{
+use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
+};
+pub use lance_tokenizer::Language;
+use lance_tokenizer::{
+    AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
+    SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
+    WhitespaceTokenizer,
 };
 
 /// Tokenizer configs
@@ -43,7 +49,7 @@ pub struct InvertedIndexParams {
 
     /// language for stemming and stop words
     /// this is only used when `stem` or `remove_stop_words` is true
-    pub(crate) language: tantivy::tokenizer::Language,
+    pub(crate) language: Language,
 
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
@@ -177,7 +183,7 @@ fn default_max_ngram_length() -> u32 {
 
 impl Default for InvertedIndexParams {
     fn default() -> Self {
-        Self::new("simple".to_owned(), tantivy::tokenizer::Language::English)
+        Self::new("simple".to_owned(), Language::English)
     }
 }
 
@@ -195,7 +201,7 @@ impl InvertedIndexParams {
     /// The `language` is used for stemming and removing stop words,
     /// this is not used for `lindera/*` and `jieba/*` tokenizers.
     /// Default to `English`.
-    pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
+    pub fn new(base_tokenizer: String, language: Language) -> Self {
         Self {
             lance_tokenizer: None,
             base_tokenizer,
@@ -338,32 +344,28 @@ impl InvertedIndexParams {
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
-            builder = builder.filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(
-                max_token_length,
-            ));
+            builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
         }
         if self.lower_case {
-            builder = builder.filter_dynamic(tantivy::tokenizer::LowerCaser);
+            builder = builder.filter_dynamic(LowerCaser);
         }
         if self.stem {
-            builder = builder.filter_dynamic(tantivy::tokenizer::Stemmer::new(self.language));
+            builder = builder.filter_dynamic(Stemmer::new(self.language));
         }
         if self.remove_stop_words {
             let stop_word_filter = match &self.custom_stop_words {
-                Some(words) => tantivy::tokenizer::StopWordFilter::remove(words.iter().cloned()),
-                None => {
-                    tantivy::tokenizer::StopWordFilter::new(self.language).ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "removing stop words for language {:?} is not supported yet",
-                            self.language
-                        ))
-                    })?
-                }
+                Some(words) => StopWordFilter::remove(words.iter().cloned()),
+                None => StopWordFilter::new(self.language).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "removing stop words for language {:?} is not supported yet",
+                        self.language
+                    ))
+                })?,
             };
             builder = builder.filter_dynamic(stop_word_filter);
         }
         if self.ascii_folding {
-            builder = builder.filter_dynamic(tantivy::tokenizer::AsciiFoldingFilter);
+            builder = builder.filter_dynamic(AsciiFoldingFilter);
         }
         let tokenizer = builder.build();
 
@@ -378,29 +380,20 @@ impl InvertedIndexParams {
         }
     }
 
-    fn build_base_tokenizer(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+    fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
-            "simple" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default(),
-            )
-            .dynamic()),
-            "whitespace" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::WhitespaceTokenizer::default(),
-            )
-            .dynamic()),
-            "raw" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::RawTokenizer::default(),
-            )
-            .dynamic()),
-            "ngram" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::NgramTokenizer::new(
+            "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
+            "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
+            "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
+            "ngram" => {
+                let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
                     self.max_ngram_length as usize,
                     self.prefix_only,
                 )
-                .map_err(|e| Error::invalid_input(e.to_string()))?,
-            )
-            .dynamic()),
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+                Ok(TextAnalyzer::builder(tokenizer).dynamic())
+            }
             #[cfg(feature = "tokenizer-lindera")]
             s if s.starts_with("lindera/") => {
                 let Some(home) = language_model_home() else {

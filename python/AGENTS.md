@@ -4,15 +4,19 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 ## Commands
 
-* Environment: prefer `uv` for local Python environment setup; start with `uv sync --extra tests --extra dev`, and add other extras such as `benchmarks`, `torch`, or `geo` only when needed.
-* Command execution: after initializing the environment with `uv`, either activate the environment or use `uv run ...`; keep `Makefile` targets and CI commands environment-manager agnostic unless CI has been migrated explicitly.
-* Build time expectations: `uv sync` and `uv run maturin develop` build the local `pylance` Rust extension as part of the environment workflow. This can be slow, especially on the first run or after Rust dependency changes; treat that as expected and do not switch to a different environment manager just because the build takes time.
-* Build: `maturin develop` (required after Rust changes)
-* Test: `make test`
-* Run single test: `pytest python/tests/<test_file>.py::<test_name>`
-* Doctest: `make doctest`
-* Lint: `make lint`
-* Format: `make format`
+* Environment: use `uv` for all local Python environment setup in this repository.
+* First step in every new worktree or fresh checkout: run `uv sync --extra tests --extra dev` from `python/` before any Python command. Add other extras such as `benchmarks`, `torch`, or `geo` only when needed.
+* `uv sync` builds the local `pylance` Rust extension as part of environment setup. This can take a long time. Start it early, let it finish, and do not interrupt it or switch to a different setup path just because the build is slow.
+* Command execution: always use `uv run ...` for Python-related repository commands. Do not rely on a globally activated environment.
+* Never invoke bare `python`, `pytest`, `pip`, `maturin`, `make test`, `make doctest`, `make lint`, or `make format` for repository work.
+* If a Python command fails outside `uv run`, that does not count as a dependency or test failure. Fix the environment usage first and rerun correctly.
+* Build time expectations: `uv sync` and `uv run maturin develop` build the local `pylance` Rust extension as part of the environment workflow. This can be slow, especially on the first run or after Rust dependency changes; treat that as expected and do not switch to a different environment manager or shortcut around the build just because it takes time.
+* Build: `uv run maturin develop` (required after Rust changes)
+* Test: `uv run make test`
+* Run single test: `uv run pytest python/tests/<test_file>.py::<test_name>`
+* Doctest: `uv run make doctest`
+* Lint: `uv run make lint`
+* Format: `uv run make format`
 
 ## API Design
 
@@ -26,3 +30,8 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 - Use `@pytest.mark.parametrize` for tests that differ only in inputs — extract shared setup into helpers.
 - Add tests to existing `test_{module}.py` files rather than creating new test files for the same module.
 - Replace `print()` in tests with `assert` statements.
+
+## Common Failure Mode
+
+- A missing module or missing command error from bare `python`, `pytest`, `pip`, `maturin`, or `make` is usually an environment usage mistake, not a repository issue.
+- Before reporting a Python dependency as unavailable, verify that `uv sync --extra tests --extra dev` has been run in the current worktree and that the failing command was executed with `uv run ...`.

@@ -413,6 +413,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     storage_options_obj: JObject,      // Map<String, String>
     initial_bases: JObject,
     target_bases: JObject,
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -430,6 +432,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             storage_options_obj,
             initial_bases,
             target_bases,
+            allow_external_blob_outside_bases,
+            blob_pack_file_size_threshold,
         )
     )
 }
@@ -449,6 +453,8 @@ fn inner_create_with_ffi_schema<'local>(
     storage_options_obj: JObject,      // Map<String, String>
     initial_bases: JObject,
     target_bases: JObject,
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -468,6 +474,8 @@ fn inner_create_with_ffi_schema<'local>(
         storage_options_obj,
         initial_bases,
         target_bases,
+        allow_external_blob_outside_bases,
+        blob_pack_file_size_threshold,
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
@@ -523,6 +531,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     storage_options_obj: JObject,                  // Map<String, String>
     initial_bases: JObject,                        // Optional<List<BasePath>>
     target_bases: JObject,                         // Optional<List<String>>
+    allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,        // Optional<Long>
     namespace_obj: JObject,                        // LanceNamespace (can be null)
     table_id_obj: JObject,                         // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
@@ -543,6 +553,8 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             storage_options_obj,
             initial_bases,
             target_bases,
+            allow_external_blob_outside_bases,
+            blob_pack_file_size_threshold,
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
@@ -555,19 +567,21 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,                // Optional<Integer>
-    max_rows_per_group: JObject,               // Optional<Integer>
-    max_bytes_per_file: JObject,               // Optional<Long>
-    mode: JObject,                             // Optional<String>
-    enable_stable_row_ids: JObject,            // Optional<Boolean>
-    data_storage_version: JObject,             // Optional<String>
-    enable_v2_manifest_paths: JObject,         // Optional<Boolean>
-    storage_options_obj: JObject,              // Map<String, String>
-    initial_bases: JObject,                    // Optional<List<BasePath>>
-    target_bases: JObject,                     // Optional<List<String>>
-    namespace_obj: JObject,                    // LanceNamespace (can be null)
-    table_id_obj: JObject,                     // List<String> (can be null)
-    namespace_client_managed_versioning: bool, // Whether namespace manages versioning
+    max_rows_per_file: JObject,                 // Optional<Integer>
+    max_rows_per_group: JObject,                // Optional<Integer>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    mode: JObject,                              // Optional<String>
+    enable_stable_row_ids: JObject,             // Optional<Boolean>
+    data_storage_version: JObject,              // Optional<String>
+    enable_v2_manifest_paths: JObject,          // Optional<Boolean>
+    storage_options_obj: JObject,               // Map<String, String>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
+    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -588,6 +602,8 @@ fn inner_create_with_ffi_stream<'local>(
         storage_options_obj,
         initial_bases,
         target_bases,
+        allow_external_blob_outside_bases,
+        blob_pack_file_size_threshold,
         reader,
         namespace_info,
         namespace_client_managed_versioning,
@@ -613,6 +629,8 @@ fn create_dataset<'local>(
     storage_options_obj: JObject,
     initial_bases: JObject,
     target_bases: JObject,
+    allow_external_blob_outside_bases: JObject,
+    blob_pack_file_size_threshold: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
@@ -631,7 +649,8 @@ fn create_dataset<'local>(
         &storage_options_obj,
         &initial_bases,
         &target_bases,
-        &JObject::null(), // allow_external_blob_outside_bases not used for Dataset.write()
+        &allow_external_blob_outside_bases,
+        &blob_pack_file_size_threshold,
     )?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided

@@ -213,6 +213,8 @@ pub struct WriteParams {
 
     pub store_params: Option<ObjectStoreParams>,
 
+    pub base_store_params: Option<HashMap<String, ObjectStoreParams>>,
+
     pub progress: Arc<dyn WriteFragmentProgress>,
 
     /// Optional callback invoked after each batch is written.
@@ -298,6 +300,11 @@ pub struct WriteParams {
 
     /// The strategy used when writing external blob URIs.
     pub external_blob_mode: ExternalBlobMode,
+
+    /// Maximum size in bytes for blob v2 pack (.blob) sidecar files.
+    /// When a pack file reaches this size, a new one is started.
+    /// If not set, defaults to 1 GiB.
+    pub blob_pack_file_size_threshold: Option<usize>,
 }
 
 impl Default for WriteParams {
@@ -310,6 +317,7 @@ impl Default for WriteParams {
             max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
             mode: WriteMode::Create,
             store_params: None,
+            base_store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             write_progress: None,
             commit_handler: None,
@@ -325,6 +333,7 @@ impl Default for WriteParams {
             target_base_names_or_paths: None,
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
+            blob_pack_file_size_threshold: None,
         }
     }
 }
@@ -348,6 +357,21 @@ impl WriteParams {
             .as_ref()
             .map(|s| s.store_registry())
             .unwrap_or_default()
+    }
+
+    /// Set exact runtime object store params for a registered base path.
+    ///
+    /// These params are used as-is for that base. The write-level default
+    /// `store_params` remain the fallback for bases without an explicit binding.
+    pub fn with_base_store_params(
+        mut self,
+        base_path: impl AsRef<str>,
+        store_params: ObjectStoreParams,
+    ) -> Self {
+        self.base_store_params
+            .get_or_insert_with(HashMap::new)
+            .insert(base_path.as_ref().to_string(), store_params);
+        self
     }
 
     /// Set the properties for this WriteParams.
@@ -416,6 +440,14 @@ impl WriteParams {
     pub fn with_external_blob_mode(self, mode: ExternalBlobMode) -> Self {
         Self {
             external_blob_mode: mode,
+            ..self
+        }
+    }
+
+    /// Set the maximum size in bytes for blob v2 pack (.blob) sidecar files.
+    pub fn with_blob_pack_file_size_threshold(self, max_bytes: usize) -> Self {
+        Self {
+            blob_pack_file_size_threshold: Some(max_bytes),
             ..self
         }
     }
@@ -491,6 +523,7 @@ pub async fn do_write_fragments(
         params.external_blob_mode,
         source_store_registry,
         source_store_params,
+        params.blob_pack_file_size_threshold,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -627,7 +660,6 @@ pub async fn validate_and_resolve_target_bases(
         .unwrap_or_default();
 
     if let Some(target_bases) = &target_base_ids {
-        let store_params = params.store_params.clone().unwrap_or_default();
         let mut bases_info = Vec::new();
 
         for &target_base_id in target_bases {
@@ -638,6 +670,7 @@ pub async fn validate_and_resolve_target_bases(
                 ))
             })?;
 
+            let store_params = write_store_params_for_base(params, &base_path.path);
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -663,6 +696,7 @@ fn append_external_base_candidate(
     base_path: &BasePath,
     store_prefix: String,
     extracted_path: Path,
+    store_params: ObjectStoreParams,
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
 ) {
@@ -674,29 +708,50 @@ fn append_external_base_candidate(
             base_id: base_path.id,
             store_prefix,
             base_path: extracted_path,
+            store_params,
         });
     }
+}
+
+fn write_store_params_for_base(params: &WriteParams, base_path: &str) -> ObjectStoreParams {
+    params
+        .base_store_params
+        .as_ref()
+        .and_then(|base_store_params| base_store_params.get(base_path))
+        .cloned()
+        .unwrap_or_else(|| params.store_params.clone().unwrap_or_default())
+}
+
+fn dataset_store_params_for_base(dataset: &Dataset, base_path: &str) -> ObjectStoreParams {
+    dataset
+        .base_store_params
+        .as_ref()
+        .and_then(|base_store_params| base_store_params.get(base_path))
+        .cloned()
+        .unwrap_or_else(|| dataset.store_params.as_deref().cloned().unwrap_or_default())
 }
 
 async fn append_external_initial_bases(
     initial_bases: Option<&Vec<BasePath>>,
     store_registry: Arc<ObjectStoreRegistry>,
-    store_params: &ObjectStoreParams,
+    params: &WriteParams,
     candidates: &mut Vec<ExternalBaseCandidate>,
     seen_base_ids: &mut HashSet<u32>,
 ) -> Result<()> {
     if let Some(initial_bases) = initial_bases {
         for base_path in initial_bases {
+            let store_params = write_store_params_for_base(params, &base_path.path);
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
-                store_params,
+                &store_params,
             )
             .await?;
             append_external_base_candidate(
                 base_path,
                 store.store_prefix.clone(),
                 extracted_path,
+                store_params,
                 candidates,
                 seen_base_ids,
             );
@@ -712,13 +767,13 @@ async fn build_external_base_resolver(
     let store_registry = dataset
         .map(|ds| ds.session.store_registry())
         .unwrap_or_else(|| params.store_registry());
-    let store_params = params.store_params.clone().unwrap_or_default();
 
     let mut seen_base_ids = HashSet::new();
     let mut candidates = vec![];
 
     if let Some(dataset) = dataset {
         for base_path in dataset.manifest.base_paths.values() {
+            let store_params = dataset_store_params_for_base(dataset, &base_path.path);
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -729,6 +784,7 @@ async fn build_external_base_resolver(
                 base_path,
                 store.store_prefix.clone(),
                 extracted_path,
+                store_params,
                 &mut candidates,
                 &mut seen_base_ids,
             );
@@ -738,17 +794,13 @@ async fn build_external_base_resolver(
     append_external_initial_bases(
         params.initial_bases.as_ref(),
         store_registry.clone(),
-        &store_params,
+        params,
         &mut candidates,
         &mut seen_base_ids,
     )
     .await?;
 
-    Ok(ExternalBaseResolver::new(
-        candidates,
-        store_registry,
-        store_params,
-    ))
+    Ok(ExternalBaseResolver::new(candidates, store_registry))
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -999,6 +1051,7 @@ struct WriterOptions {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    blob_pack_file_size_threshold: Option<usize>,
 }
 
 async fn open_writer_with_options(
@@ -1016,6 +1069,7 @@ async fn open_writer_with_options(
         external_blob_mode,
         source_store_registry,
         source_store_params,
+        blob_pack_file_size_threshold,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -1063,6 +1117,7 @@ async fn open_writer_with_options(
                 external_blob_mode,
                 source_store_registry,
                 source_store_params,
+                blob_pack_file_size_threshold,
             ))
         } else {
             None
@@ -1105,6 +1160,7 @@ struct WriterGenerator {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    blob_pack_file_size_threshold: Option<usize>,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -1122,6 +1178,7 @@ impl WriterGenerator {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
+        blob_pack_file_size_threshold: Option<usize>,
     ) -> Self {
         Self {
             object_store,
@@ -1134,6 +1191,7 @@ impl WriterGenerator {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            blob_pack_file_size_threshold,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1167,6 +1225,7 @@ impl WriterGenerator {
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                 },
             )
             .await?
@@ -1184,6 +1243,7 @@ impl WriterGenerator {
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                 },
             )
             .await?
@@ -1330,6 +1390,7 @@ impl Iterator for SpillStreamIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1338,7 +1399,9 @@ mod tests {
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::previous::reader::FileReader as PreviousFileReader;
+    use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
+    use lance_table::format::BasePath;
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -1784,6 +1847,65 @@ mod tests {
         assert_eq!(batch, data);
     }
 
+    #[cfg(feature = "azure")]
+    fn azure_store_params(account_name: &str) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), account_name.to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_validate_and_resolve_target_bases_uses_base_store_params() {
+        let mut params = WriteParams::default()
+            .with_target_bases(vec![1, 2])
+            .with_base_store_params("az://container/path-a", azure_store_params("account-a"))
+            .with_base_store_params("az://container/path-b", azure_store_params("account-b"));
+
+        let existing_base_paths = HashMap::from([
+            (
+                1,
+                BasePath::new(
+                    1,
+                    "az://container/path-a".to_string(),
+                    Some("base-a".to_string()),
+                    false,
+                ),
+            ),
+            (
+                2,
+                BasePath::new(
+                    2,
+                    "az://container/path-b".to_string(),
+                    Some("base-b".to_string()),
+                    false,
+                ),
+            ),
+        ]);
+
+        let target_bases =
+            validate_and_resolve_target_bases(&mut params, Some(&existing_base_paths))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(target_bases.len(), 2);
+        assert_eq!(
+            target_bases[0].object_store.store_prefix,
+            "az$container@account-a"
+        );
+        assert_eq!(
+            target_bases[1].object_store.store_prefix,
+            "az$container@account-b"
+        );
+    }
+
     #[tokio::test]
     async fn test_explicit_data_file_bases_writer_generator() {
         use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -1820,6 +1942,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         // Create a writer
@@ -1937,6 +2060,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         // Create test batch

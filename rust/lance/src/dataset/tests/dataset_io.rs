@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -35,12 +36,13 @@ use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
+use lance_table::format::BasePath;
 
 use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
@@ -165,6 +167,67 @@ async fn test_with_object_store_enables_isolated_per_request_io_tracking() {
     drain_scan(&dataset).await;
     assert_eq!(tracker_a.incremental_stats().read_iops, 0);
     assert_eq!(tracker_b.incremental_stats().read_iops, 0);
+}
+
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn test_object_store_for_base_uses_runtime_base_store_params() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+
+    let base_a = BasePath::new(
+        1,
+        "az://container/path-a".to_string(),
+        Some("base-a".to_string()),
+        true,
+    );
+    let base_b = BasePath::new(
+        2,
+        "az://container/path-b".to_string(),
+        Some("base-b".to_string()),
+        true,
+    );
+    dataset
+        .add_bases(vec![base_a.clone(), base_b.clone()], None)
+        .await
+        .unwrap();
+
+    let base_a_store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("account_name".to_string(), "account-a".to_string()),
+                ("account_key".to_string(), "dGVzdA==".to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
+    let default_store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([
+                ("account_name".to_string(), "account-b".to_string()),
+                ("account_key".to_string(), "dGVzdA==".to_string()),
+            ]),
+        ))),
+        ..Default::default()
+    };
+
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_store_params(default_store_params)
+        .with_base_store_params(&base_a.path, base_a_store_params)
+        .load()
+        .await
+        .unwrap();
+
+    let store_a = dataset.object_store_for_base(1).await.unwrap();
+    let store_a_again = dataset.object_store_for_base(1).await.unwrap();
+    let store_b = dataset.object_store_for_base(2).await.unwrap();
+
+    assert!(Arc::ptr_eq(&store_a, &store_a_again));
+    assert!(!Arc::ptr_eq(&store_a, &store_b));
+    assert_eq!(store_a.store_prefix, "az$container@account-a");
+    assert_eq!(store_b.store_prefix, "az$container@account-b");
 }
 
 #[rstest]

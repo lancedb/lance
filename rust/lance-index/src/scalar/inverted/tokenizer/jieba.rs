@@ -4,6 +4,7 @@
 use std::{fs::File, io::BufReader, path::Path, path::PathBuf};
 
 use lance_core::{Error, Result};
+use lance_tokenizer::{JiebaTokenizer, TextAnalyzerBuilder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -37,7 +38,7 @@ pub trait JiebaTokenizerBuilder: Sized {
 
     fn new(config: Self::Config, root: &Path) -> Result<Self>;
 
-    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder>;
+    fn build(&self) -> Result<TextAnalyzerBuilder>;
 }
 
 pub struct JiebaBuilder {
@@ -71,7 +72,7 @@ impl JiebaTokenizerBuilder for JiebaBuilder {
         })
     }
 
-    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+    fn build(&self) -> Result<TextAnalyzerBuilder> {
         let main_dict_path = &self.main_dict_path();
         let file = std::fs::File::open(main_dict_path)?;
         let mut f = std::io::BufReader::new(file);
@@ -93,60 +94,6 @@ impl JiebaTokenizerBuilder for JiebaBuilder {
                 ))
             })?
         }
-        let tokenizer = JiebaTokenizer { jieba };
-        Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
-    }
-}
-
-#[derive(Clone)]
-struct JiebaTokenizer {
-    jieba: jieba_rs::Jieba,
-}
-
-struct JiebaTokenStream {
-    tokens: Vec<tantivy::tokenizer::Token>,
-    index: usize,
-}
-
-impl tantivy::tokenizer::TokenStream for JiebaTokenStream {
-    fn advance(&mut self) -> bool {
-        if self.index < self.tokens.len() {
-            self.index += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn token(&self) -> &tantivy::tokenizer::Token {
-        &self.tokens[self.index - 1]
-    }
-
-    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
-        &mut self.tokens[self.index - 1]
-    }
-}
-
-#[cfg(feature = "tokenizer-jieba")]
-impl tantivy::tokenizer::Tokenizer for JiebaTokenizer {
-    type TokenStream<'a> = JiebaTokenStream;
-
-    fn token_stream(&mut self, text: &str) -> JiebaTokenStream {
-        let mut indices = text.char_indices().collect::<Vec<_>>();
-        indices.push((text.len(), '\0'));
-        let orig_tokens = self
-            .jieba
-            .tokenize(text, jieba_rs::TokenizeMode::Search, true);
-        let mut tokens = Vec::new();
-        for token in orig_tokens {
-            tokens.push(tantivy::tokenizer::Token {
-                offset_from: indices[token.start].0,
-                offset_to: indices[token.end].0,
-                position: token.start,
-                text: String::from(&text[(indices[token.start].0)..(indices[token.end].0)]),
-                position_length: token.end - token.start,
-            });
-        }
-        JiebaTokenStream { tokens, index: 0 }
+        Ok(JiebaTokenizer::new(jieba).analyzer_builder())
     }
 }

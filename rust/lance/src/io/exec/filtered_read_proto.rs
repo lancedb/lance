@@ -24,73 +24,14 @@ use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
-use lance_io::object_store::StorageOptions;
 use lance_table::format::Fragment;
-use prost::Message;
 
 use crate::Dataset;
-use crate::dataset::builder::DatasetBuilder;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
 };
-
-// =============================================================================
-// TableIdentifier helpers (reusable by other execs)
-// =============================================================================
-
-/// Build a [`TableIdentifier`] from a [`Dataset`].
-///
-/// Default: lightweight mode (uri + version + etag only, no serialized manifest).
-/// Includes the dataset's latest storage options (if any) so the remote executor
-/// can open or cache the dataset with the correct storage configuration.
-pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::TableIdentifier> {
-    Ok(pb::TableIdentifier {
-        uri: dataset.uri().to_string(),
-        version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
-        serialized_manifest: None,
-        storage_options: dataset
-            .latest_storage_options()
-            .await?
-            .map(|StorageOptions(m)| m)
-            .unwrap_or_default(),
-    })
-}
-
-/// Build a [`TableIdentifier`] with serialized manifest bytes included.
-///
-/// Fast path: remote executor skips manifest read from storage.
-pub async fn table_identifier_from_dataset_with_manifest(
-    dataset: &Dataset,
-) -> Result<pb::TableIdentifier> {
-    let manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
-    Ok(pb::TableIdentifier {
-        uri: dataset.uri().to_string(),
-        version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
-        serialized_manifest: Some(manifest_proto.encode_to_vec()),
-        storage_options: dataset
-            .latest_storage_options()
-            .await?
-            .map(|StorageOptions(m)| m)
-            .unwrap_or_default(),
-    })
-}
-
-/// Open a dataset from a table identifier proto
-pub async fn open_dataset_from_table_identifier(
-    table_id: &pb::TableIdentifier,
-) -> Result<Arc<Dataset>> {
-    let mut builder = DatasetBuilder::from_uri(&table_id.uri).with_version(table_id.version);
-    if let Some(manifest_bytes) = &table_id.serialized_manifest {
-        builder = builder.with_serialized_manifest(manifest_bytes)?;
-    }
-    if !table_id.storage_options.is_empty() {
-        builder = builder.with_storage_options(table_id.storage_options.clone());
-    }
-    Ok(Arc::new(builder.load().await?))
-}
+use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 
 // =============================================================================
 // FilteredReadExec <-> Proto
@@ -131,17 +72,7 @@ pub async fn filtered_read_exec_from_proto(
     index_input: Option<Arc<dyn ExecutionPlan>>,
     state: &SessionState,
 ) -> Result<FilteredReadExec> {
-    let dataset = match dataset {
-        Some(ds) => ds, // dataset could be opened or cached by the caller
-        None => {
-            let table_id = proto.table.as_ref().ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Missing table identifier in FilteredReadExecProto".into(),
-                )
-            })?;
-            open_dataset_from_table_identifier(table_id).await?
-        }
-    };
+    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
 
     let options_proto = proto.options.ok_or_else(|| {
         Error::invalid_input_source("Missing options in FilteredReadExecProto".into())
@@ -559,6 +490,7 @@ mod tests {
     use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datagen::{array, gen_batch};
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
     use std::collections::HashSet;
 
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -630,23 +562,6 @@ mod tests {
             back.with_row_created_at_version
         );
         assert_eq!(projection.blob_handling, back.blob_handling);
-    }
-
-    #[test]
-    fn test_table_identifier_without_manifest() {
-        let id = pb::TableIdentifier {
-            uri: "s3://bucket/table.lance".to_string(),
-            version: 42,
-            manifest_etag: Some("etag123".to_string()),
-            serialized_manifest: None,
-            storage_options: HashMap::new(),
-        };
-        let bytes = id.encode_to_vec();
-        let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
-        assert_eq!(id.uri, back.uri);
-        assert_eq!(id.version, back.version);
-        assert_eq!(id.manifest_etag, back.manifest_etag);
-        assert!(back.serialized_manifest.is_none());
     }
 
     #[test]
@@ -810,23 +725,6 @@ mod tests {
             exec.options().projection.field_ids,
             back.options().projection.field_ids
         );
-    }
-
-    #[tokio::test]
-    async fn test_table_identifier_with_manifest() {
-        let dataset = make_test_dataset().await;
-
-        let id = table_identifier_from_dataset_with_manifest(&dataset)
-            .await
-            .unwrap();
-        assert_eq!(id.uri, dataset.uri());
-        assert_eq!(id.version, dataset.manifest.version);
-        assert!(id.serialized_manifest.is_some());
-
-        // Verify the serialized manifest bytes decode
-        let manifest_bytes = id.serialized_manifest.unwrap();
-        let _manifest_proto =
-            lance_table::format::pb::Manifest::decode(manifest_bytes.as_slice()).unwrap();
     }
 
     #[tokio::test]
