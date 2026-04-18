@@ -94,11 +94,12 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # pin the toolchain version to avoid surprises
+      # pin the toolchain version to avoid surprises (ethnum 1.5.2
+      # fails on nightly > 2026-04-16 due to a transmute size check)
       - name: Setup rust toolchain
         run: |
-          rustup toolchain install nightly
-          rustup default nightly
+          rustup toolchain install nightly-2026-04-16
+          rustup default nightly-2026-04-16
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
@@ -112,7 +113,7 @@ jobs:
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo +nightly-2026-04-16 llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
