@@ -317,9 +317,44 @@ impl<'a> FragmentCreateBuilder<'a> {
         if actual.fields().is_empty() {
             return Err(Error::invalid_input("Cannot write with an empty schema."));
         }
+        Self::check_for_zero_dimension_fsl(actual)?;
         let actual_lance = Schema::try_from(actual)?;
         actual_lance.check_compatible(expected, &Default::default())?;
 
+        Ok(())
+    }
+
+    /// Recursively check that no field uses a zero-dimension FixedSizeList,
+    /// which would cause a division-by-zero panic during encoding/decoding.
+    fn check_for_zero_dimension_fsl(schema: &ArrowSchema) -> Result<()> {
+        fn check_data_type(field_name: &str, dt: &arrow_schema::DataType) -> Result<()> {
+            match dt {
+                arrow_schema::DataType::FixedSizeList(child, dim) => {
+                    if *dim <= 0 {
+                        return Err(Error::invalid_input(format!(
+                            "Field '{}' has a FixedSizeList with dimension {}. \
+                             Only positive dimensions are supported.",
+                            field_name, dim
+                        )));
+                    }
+                    check_data_type(field_name, child.data_type())
+                }
+                arrow_schema::DataType::List(child)
+                | arrow_schema::DataType::LargeList(child) => {
+                    check_data_type(field_name, child.data_type())
+                }
+                arrow_schema::DataType::Struct(fields) => {
+                    for f in fields {
+                        check_data_type(f.name(), f.data_type())?;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        for field in schema.fields() {
+            check_data_type(field.name(), field.data_type())?;
+        }
         Ok(())
     }
 }
@@ -401,6 +436,68 @@ mod tests {
             "{:?}",
             &result
         );
+    }
+
+    #[test]
+    fn test_zero_dimension_fsl_rejected() {
+        // A FixedSizeList with dimension 0 should be rejected at schema validation
+        // to prevent division-by-zero panics during encoding/decoding.
+        // (https://github.com/lancedb/lance/issues/5102)
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    0,
+                ),
+                false,
+            ),
+        ]);
+        let result = FragmentCreateBuilder::check_for_zero_dimension_fsl(&schema);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("dimension 0"),
+            "Expected error about zero dimension, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("Only positive dimensions are supported"),
+            "Expected guidance about positive dimensions, got: {}",
+            err_msg
+        );
+
+        // Nested case: FSL inside a struct
+        let nested_schema = ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(
+                vec![ArrowField::new(
+                    "inner_vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        0,
+                    ),
+                    false,
+                )]
+                .into(),
+            ),
+            false,
+        )]);
+        let result = FragmentCreateBuilder::check_for_zero_dimension_fsl(&nested_schema);
+        assert!(result.is_err());
+
+        // Valid FSL should pass
+        let valid_schema = ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                128,
+            ),
+            false,
+        )]);
+        let result = FragmentCreateBuilder::check_for_zero_dimension_fsl(&valid_schema);
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
