@@ -66,6 +66,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::NullEquality;
 use datafusion::error::DataFusionError;
 use datafusion::{
@@ -80,6 +81,7 @@ use datafusion::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
+        sorts::sort::SortExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
     },
@@ -899,23 +901,36 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        // 25 MiB hard cap on batch size.  The sort may produce arbitrarily
-        // large batches which must be rechunked before we hand them to the
-        // per-fragment writers.
+        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
+        // single batch that is larger than the memory pool, so we must
+        // rechunk oversized batches before they reach the sort.
         const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
         let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
             .sort(vec![col(ROW_ADDR).sort(true, true)])?;
         let sorted_plan = sorted.create_physical_plan().await?;
-        let capped_plan = Arc::new(HardCapBatchSizeExec::new(sorted_plan, MAX_BATCH_BYTES));
-        let capped_stream = execute_plan(
-            capped_plan,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )?;
+        // Walk the physical plan and insert HardCapBatchSizeExec below every
+        // sort node so each input batch fits in the memory pool.
+        let capped_plan = sorted_plan
+            .transform_down(|node| {
+                if node.as_any().downcast_ref::<SortExec>().is_some() {
+                    let children = node.children();
+                    let new_children: Vec<Arc<dyn ExecutionPlan>> = children
+                        .into_iter()
+                        .map(|c| {
+                            Arc::new(HardCapBatchSizeExec::new(c.clone(), MAX_BATCH_BYTES))
+                                as Arc<dyn ExecutionPlan>
+                        })
+                        .collect();
+                    let new_node = node.with_new_children(new_children)?;
+                    Ok(Transformed::yes(new_node))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })?
+            .data;
+        let capped_stream = capped_plan.execute(0, session_ctx.task_ctx())?;
         let mut group_stream = BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.

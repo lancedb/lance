@@ -2691,27 +2691,61 @@ def test_merge_insert_large():
 
 
 def test_merge_insert_large_rows():
-    # Verify that merge_insert succeeds when a single batch is ~200 MiB.
-    # This exercises the HardCapBatchSizeExec node which rechunks oversized
-    # batches before the DataFusion sort.
-    nrows = 1000
-    # ~200 KiB per row → ~200 MiB total in one batch
+    # Verify that merge_insert succeeds when individual batches exceed the
+    # DataFusion memory pool size (100 MiB by default).  DataFusion's sort
+    # cannot spill a single batch that is larger than the pool, so the
+    # HardCapBatchSizeExec node must rechunk before the sort.
+    #
+    # The sort path (update_fragments) is only used for partial/subcolumn
+    # updates, so the source must have a subset of the target columns.
+    #
+    # One batch of ~400 MiB which exceeds the 300 MiB memory pool.
+    # Without HardCapBatchSizeExec rechunking it before the sort, the sort
+    # would fail because it cannot handle a single batch larger than the pool.
+    os.environ["LANCE_MEM_POOL_SIZE"] = str(1024 * 1024 * 1024)
+    rows_per_batch = 2000
+    num_batches = 1
+    nrows = rows_per_batch * num_batches
+    # ~200 KiB per row → ~400 MiB per batch
     blob_size = 200 * 1024
-    ids = pa.array(range(nrows), type=pa.int64())
-    blobs = pa.array([b"x" * blob_size] * nrows, type=pa.large_binary())
-    data = pa.table({"id": ids, "blob": blobs})
 
-    ds = lance.write_dataset(data, "memory://")
+    # Create dataset with id, blob, and an extra column so the source is partial.
+    full_schema = pa.schema(
+        [("id", pa.int64()), ("blob", pa.large_binary()), ("extra", pa.int32())]
+    )
 
-    # Update every row (matched path).
-    new_blobs = pa.array([b"y" * blob_size] * nrows, type=pa.large_binary())
-    new_data = pa.table({"id": ids, "blob": new_blobs})
+    def make_full_batches():
+        for i in range(num_batches):
+            start = i * rows_per_batch
+            ids = pa.array(range(start, start + rows_per_batch), type=pa.int64())
+            blobs = pa.array(
+                [b"x" * blob_size] * rows_per_batch, type=pa.large_binary()
+            )
+            extras = pa.array(range(start, start + rows_per_batch), type=pa.int32())
+            yield pa.record_batch([ids, blobs, extras], schema=full_schema)
+
+    reader = pa.RecordBatchReader.from_batches(full_schema, make_full_batches())
+    ds = lance.write_dataset(reader, "memory://")
+
+    # Partial update: only update the blob column (omit extra).
+    # This triggers the update_fragments path which uses the sort.
+    partial_schema = pa.schema([("id", pa.int64()), ("blob", pa.large_binary())])
+
+    def make_partial_batches():
+        for i in range(num_batches):
+            start = i * rows_per_batch
+            ids = pa.array(range(start, start + rows_per_batch), type=pa.int64())
+            blobs = pa.array(
+                [b"y" * blob_size] * rows_per_batch, type=pa.large_binary()
+            )
+            yield pa.record_batch([ids, blobs], schema=partial_schema)
+
+    new_reader = pa.RecordBatchReader.from_batches(partial_schema, make_partial_batches())
 
     stats = (
         ds.merge_insert(on="id")
         .when_matched_update_all()
-        .when_not_matched_insert_all()
-        .execute(new_data)
+        .execute(new_reader)
     )
 
     assert stats["num_updated_rows"] == nrows
@@ -2719,8 +2753,11 @@ def test_merge_insert_large_rows():
 
     result = ds.to_table()
     assert result.num_rows == nrows
-    # Spot-check that the blobs were actually updated.
+    # Spot-check that the blobs were updated and extra column preserved.
     assert result.column("blob")[0].as_py() == b"y" * blob_size
+    assert result.column("extra")[0].as_py() == 0
+
+    del os.environ["LANCE_MEM_POOL_SIZE"]
 
 
 def test_merge_insert_empty_index():
