@@ -339,8 +339,7 @@ impl<'a> FragmentCreateBuilder<'a> {
                     }
                     check_data_type(field_name, child.data_type())
                 }
-                arrow_schema::DataType::List(child)
-                | arrow_schema::DataType::LargeList(child) => {
+                arrow_schema::DataType::List(child) | arrow_schema::DataType::LargeList(child) => {
                     check_data_type(field_name, child.data_type())
                 }
                 arrow_schema::DataType::Struct(fields) => {
