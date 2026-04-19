@@ -10,11 +10,13 @@
 //! to allow for different implementations.
 //!
 //! The trait [CommitHandler] can be implemented to provide different commit
-//! strategies. The default implementation for most object stores is
-//! [RenameCommitHandler], which writes the manifest to a temporary path, then
-//! renames the temporary path to the final path if no object already exists
-//! at the final path. This is an atomic operation in most object stores, but
-//! not in AWS S3. So for AWS S3, the default commit handler is
+//! strategies. The default implementation for local filesystems on Linux/macOS is
+//! [ConditionalPutCommitHandler], which uses `hard_link` for atomic file creation.
+//! On Windows, [RenameCommitHandler] is used instead because `hard_link` is not
+//! reliable on all Windows filesystems. On Android, [UnsafeCommitHandler] is used
+//! because Android's filesystem/SELinux restricts `hard_link` with EACCES.
+//!
+//! For cloud object stores (AWS S3, GCS, Azure), the default is
 //! [UnsafeCommitHandler], which writes the manifest to the final path without
 //! any checks.
 //!
@@ -723,7 +725,13 @@ pub async fn commit_handler_from_url(
     // This looks unused if dynamodb feature disabled
     #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
 ) -> Result<Arc<dyn CommitHandler>> {
-    let local_handler: Arc<dyn CommitHandler> = if cfg!(windows) {
+    // On Android, both ConditionalPutCommitHandler and RenameCommitHandler rely
+    // on hard_link() internally, which is blocked by Android's filesystem/SELinux
+    // with EACCES. UnsafeCommitHandler uses ObjectWriter (temp file + rename via
+    // tempfile::persist) which works correctly on Android.
+    let local_handler: Arc<dyn CommitHandler> = if cfg!(target_os = "android") {
+        Arc::new(UnsafeCommitHandler)
+    } else if cfg!(windows) {
         Arc::new(RenameCommitHandler)
     } else {
         Arc::new(ConditionalPutCommitHandler)
