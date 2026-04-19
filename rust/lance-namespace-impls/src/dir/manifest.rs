@@ -182,7 +182,7 @@ impl DatasetConsistencyWrapper {
         );
         let latest_version = read_guard.latest_version_id().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to get latest version: {}", e),
+                message: format!("Failed to get latest version: {:?}", e),
             })
         })?;
         log::debug!(
@@ -205,14 +205,14 @@ impl DatasetConsistencyWrapper {
         // Double-check after acquiring write lock (someone else might have reloaded)
         let latest_version = write_guard.latest_version_id().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to get latest version: {}", e),
+                message: format!("Failed to get latest version: {:?}", e),
             })
         })?;
 
         if latest_version != write_guard.version().version {
             write_guard.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to checkout latest: {}", e),
+                    message: format!("Failed to checkout latest: {:?}", e),
                 })
             })?;
         }
@@ -293,15 +293,15 @@ impl std::fmt::Debug for ManifestNamespace {
 /// Convert a Lance commit error to an appropriate namespace error.
 ///
 /// Maps lance commit errors to namespace errors:
-/// - `CommitConflict`: version collision retries exhausted -> Throttled (safe to retry)
+/// - `CommitConflict`: version collision retries exhausted -> Throttling (safe to retry)
 /// - `TooMuchWriteContention`: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
 /// - `IncompatibleTransaction`: incompatible concurrent change -> ConcurrentModification
 /// - Errors containing "matched/duplicate/already exists": ConcurrentModification (from WhenMatched::Fail)
 /// - Other errors: IO error with the operation description
 fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option<&str>) -> Error {
     match e {
-        // CommitConflict: version collision retries exhausted -> Throttled (safe to retry)
-        LanceError::CommitConflict { .. } => NamespaceError::Throttled {
+        // CommitConflict: version collision retries exhausted -> Throttling (safe to retry)
+        LanceError::CommitConflict { .. } => NamespaceError::Throttling {
             message: format!("Too many concurrent writes, please retry later: {:?}", e),
         }
         .into(),
@@ -703,7 +703,7 @@ impl ManifestNamespace {
     async fn execute_scanner(scanner: Scanner) -> Result<Vec<RecordBatch>> {
         let mut stream = scanner.try_into_stream().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to create stream: {}", e),
+                message: format!("Failed to create stream: {:?}", e),
             })
         })?;
 
@@ -711,7 +711,7 @@ impl ManifestNamespace {
         while let Some(batch) = stream.next().await {
             batches.push(batch.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read batch: {}", e),
+                    message: format!("Failed to read batch: {:?}", e),
                 })
             })?);
         }
@@ -746,14 +746,14 @@ impl ManifestNamespace {
 
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
 
         // Project no columns and enable row IDs for count_rows to work
         scanner.project::<&str>(&[]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
 
@@ -761,7 +761,7 @@ impl ManifestNamespace {
 
         let count = scanner.count_rows().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to count rows: {}", e),
+                message: format!("Failed to count rows: {:?}", e),
             })
         })?;
 
@@ -775,12 +775,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id", "location"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         let batches = Self::execute_scanner(scanner).await?;
@@ -825,12 +825,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["location"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
 
@@ -944,7 +944,7 @@ impl ManifestNamespace {
         )
         .map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to create manifest entries: {}", e),
+                message: format!("Failed to create manifest entries: {:?}", e),
             })
         })?;
 
@@ -960,7 +960,7 @@ impl ManifestNamespace {
             MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()]).map_err(
                 |e| {
                     lance_core::Error::from(NamespaceError::Internal {
-                        message: format!("Failed to create merge builder: {}", e),
+                        message: format!("Failed to create merge builder: {:?}", e),
                     })
                 },
             )?;
@@ -985,7 +985,7 @@ impl ManifestNamespace {
             .try_build()
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to build merge: {}", e),
+                    message: format!("Failed to build merge: {:?}", e),
                 })
             })?
             .execute_reader(Box::new(reader))
@@ -1065,12 +1065,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id", "metadata"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         let batches = Self::execute_scanner(scanner).await?;
@@ -1133,12 +1133,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["metadata"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         let batches = Self::execute_scanner(scanner).await?;
@@ -1195,12 +1195,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         let batches = Self::execute_scanner(scanner).await?;
@@ -1272,12 +1272,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         let batches = Self::execute_scanner(scanner).await?;
@@ -1480,12 +1480,12 @@ impl ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id", "metadata"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         let batches = Self::execute_scanner(scanner).await?;
@@ -1594,13 +1594,16 @@ impl ManifestNamespace {
                     .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
                     .map_err(|e| {
                         lance_core::Error::from(NamespaceError::Internal {
-                            message: format!("Failed to find object_id field for migration: {}", e),
+                            message: format!(
+                                "Failed to find object_id field for migration: {:?}",
+                                e
+                            ),
                         })
                     })?
                     .await
                     .map_err(|e| {
                         lance_core::Error::from(NamespaceError::Internal {
-                            message: format!("Failed to migrate primary key metadata: {}", e),
+                            message: format!("Failed to migrate primary key metadata: {:?}", e),
                         })
                     })?;
             }
@@ -1707,7 +1710,7 @@ impl ManifestNamespace {
                     Ok(DatasetConsistencyWrapper::new(dataset))
                 }
                 Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create manifest dataset: {}", e),
+                    message: format!("Failed to create manifest dataset: {:?}", e),
                 })),
             }
         }
@@ -1785,12 +1788,12 @@ impl LanceNamespace for ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
 
@@ -1992,7 +1995,7 @@ impl LanceNamespace for ManifestNamespace {
         let cursor = Cursor::new(data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to read IPC stream: {}", e),
+                message: format!("Failed to read IPC stream: {:?}", e),
             })
         })?;
 
@@ -2000,7 +2003,7 @@ impl LanceNamespace for ManifestNamespace {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to collect batches: {}", e),
+                message: format!("Failed to collect batches: {:?}", e),
             })
         })?;
 
@@ -2035,7 +2038,7 @@ impl LanceNamespace for ManifestNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to write dataset: {}", e),
+                    message: format!("Failed to write dataset: {:?}", e),
                 })
             })?;
 
@@ -2087,7 +2090,7 @@ impl LanceNamespace for ManifestNamespace {
                     .await
                     .map_err(|e| {
                         lance_core::Error::from(NamespaceError::Internal {
-                            message: format!("Failed to delete table directory: {}", e),
+                            message: format!("Failed to delete table directory: {:?}", e),
                         })
                     })?;
 
@@ -2132,12 +2135,12 @@ impl LanceNamespace for ManifestNamespace {
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project(&["object_id"]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
 
@@ -2290,18 +2293,18 @@ impl LanceNamespace for ManifestNamespace {
         let mut scanner = self.manifest_scanner().boxed().await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {}", e),
+                message: format!("Failed to filter: {:?}", e),
             })
         })?;
         scanner.project::<&str>(&[]).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {}", e),
+                message: format!("Failed to project: {:?}", e),
             })
         })?;
         scanner.with_row_id();
         let count = scanner.count_rows().boxed().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to count rows: {}", e),
+                message: format!("Failed to count rows: {:?}", e),
             })
         })?;
 
