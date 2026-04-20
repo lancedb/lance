@@ -725,16 +725,23 @@ pub async fn commit_handler_from_url(
     // This looks unused if dynamodb feature disabled
     #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
 ) -> Result<Arc<dyn CommitHandler>> {
-    // On Android, both ConditionalPutCommitHandler and RenameCommitHandler rely
-    // on hard_link() internally, which is blocked by Android's filesystem/SELinux
-    // with EACCES. UnsafeCommitHandler uses ObjectWriter (temp file + rename via
-    // tempfile::persist) which works correctly on Android.
-    let local_handler: Arc<dyn CommitHandler> = if cfg!(target_os = "android") {
-        Arc::new(UnsafeCommitHandler)
-    } else if cfg!(windows) {
-        Arc::new(RenameCommitHandler)
-    } else {
-        Arc::new(ConditionalPutCommitHandler)
+    // Android's filesystem/SELinux restricts hard_link() with EACCES, which both
+    // ConditionalPutCommitHandler and RenameCommitHandler rely on internally.
+    // UnsafeCommitHandler uses ObjectWriter (temp file + rename via tempfile::persist)
+    // which works correctly on Android.
+    let local_handler: Arc<dyn CommitHandler> = {
+        #[cfg(target_os = "android")]
+        {
+            Arc::new(UnsafeCommitHandler)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            if cfg!(windows) {
+                Arc::new(RenameCommitHandler)
+            } else {
+                Arc::new(ConditionalPutCommitHandler)
+            }
+        }
     };
 
     let url = match Url::parse(url_or_path) {
