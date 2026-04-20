@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 use lance_core::Result;
@@ -119,7 +120,7 @@ impl SsdFileState {
         }
     }
 
-    fn grow_or_evict(&mut self, file: &std::fs::File, max_regions: u32) -> std::io::Result<bool> {
+    fn grow_or_evict(&mut self, file: &std::fs::File, max_regions: u32, region_pins: &[AtomicU32]) -> std::io::Result<bool> {
         if self.num_regions < max_regions {
             let new_len = (self.num_regions + 1) as u64 * REGION_SIZE;
             file.set_len(new_len)?;
@@ -136,9 +137,16 @@ impl SsdFileState {
             return Ok(true);
         }
 
-        let candidates = self
+        let candidates: Vec<u32> = self
             .tracker
-            .find_eviction_candidates(NUM_EVICTION_CANDIDATES, &[]);
+            .find_eviction_candidates(NUM_EVICTION_CANDIDATES, &[])
+            .into_iter()
+            .filter(|&r| {
+                region_pins
+                    .get(r as usize)
+                    .map_or(true, |p| p.load(Ordering::Acquire) == 0)
+            })
+            .collect();
         if candidates.is_empty() {
             tracing::warn!("SSD cache: no eviction candidates found, dropping write");
             return Ok(false);
@@ -167,10 +175,11 @@ impl SsdFileState {
         from: usize,
         file: &std::fs::File,
         max_regions: u32,
+        region_pins: &[AtomicU32],
     ) -> std::io::Result<Option<(u64, Vec<u8>, Vec<(usize, SsdRun)>, usize)>> {
         loop {
             while self.writable_regions.is_empty() {
-                if !self.grow_or_evict(file, max_regions)? {
+                if !self.grow_or_evict(file, max_regions, region_pins)? {
                     return Ok(None);
                 }
             }
@@ -231,6 +240,11 @@ struct SsdFile {
     max_regions: u32,
     crc32_enabled: bool,
     state: RwLock<SsdFileState>,
+    /// One pin counter per region, pre-allocated to max_regions.
+    /// Incremented in `get` while holding the read lock (before pread),
+    /// decremented after pread completes. `grow_or_evict` skips regions
+    /// with a non-zero pin, preventing a pwrite from racing a pread.
+    region_pins: Vec<AtomicU32>,
 }
 
 impl std::fmt::Debug for SsdFile {
@@ -259,33 +273,46 @@ impl SsdFile {
             max_regions,
             crc32_enabled,
             state: RwLock::new(SsdFileState::new()),
+            region_pins: (0..max_regions).map(|_| AtomicU32::new(0)).collect(),
         }))
     }
 
     fn get(&self, key: &DataCacheKey, length: u64) -> lance_core::Result<Option<Bytes>> {
         let run = {
             let state = self.state.read().unwrap();
-            match state.entries.get(key).copied() {
+            let run = match state.entries.get(key).copied() {
                 Some(r) => r,
                 None => return Ok(None),
-            }
-        };
+            };
 
-        if (run.size as u64) < length {
-            let mut state = self.state.write().unwrap();
-            state.stale_misses += 1;
-            return Ok(None);
-        }
+            if (run.size as u64) < length {
+                // Stale — need write lock for stat; no pin needed since no pread.
+                drop(state);
+                self.state.write().unwrap().stale_misses += 1;
+                return Ok(None);
+            }
+
+            // Pin the region while the read lock is still held.  grow_or_evict
+            // needs the write lock, so it cannot evict this region until after
+            // we release here — by then the pin is visible and it will skip us.
+            self.region_pins[run.region as usize].fetch_add(1, Ordering::Relaxed);
+            run
+        }; // read lock released; region is pinned
 
         let offset = run.file_offset();
         let size = run.size as usize;
         let mut buf = vec![0u8; size];
-        {
+        let read_ok = {
             #[cfg(unix)]
             use std::os::unix::fs::FileExt;
-            if self.file.read_exact_at(&mut buf, offset).is_err() {
-                return Ok(None);
-            }
+            self.file.read_exact_at(&mut buf, offset).is_ok()
+        };
+
+        // Unpin before any return path below.
+        self.region_pins[run.region as usize].fetch_sub(1, Ordering::Release);
+
+        if !read_ok {
+            return Ok(None);
         }
 
         if self.crc32_enabled && run.checksum != 0 {
@@ -328,7 +355,7 @@ impl SsdFile {
         while i < entries.len() {
             let (file_offset, buf, runs, next_i) = {
                 let mut state = self.state.write().unwrap();
-                match state.pack_region(&entries, i, &self.file, self.max_regions)? {
+                match state.pack_region(&entries, i, &self.file, self.max_regions, &self.region_pins)? {
                     Some(r) => r,
                     None => return Ok(()),
                 }
