@@ -269,7 +269,6 @@ impl Reader for CloudObjectReader {
 /// # Verify mode (`cache_verify = true`)
 /// On every cache hit the range is also fetched from the inner reader and
 /// compared byte-for-byte. Mismatches are logged and returned as errors.
-/// This is equivalent to `data_cache_check_rtt_enabled`.
 pub struct CachedObjectReader {
     inner: Arc<dyn Reader>,
     path: Path,
@@ -309,6 +308,41 @@ impl CachedObjectReader {
     }
 }
 
+/// Re-fetch `range` from `inner` and compare against `cached` byte-for-byte.
+/// Returns `cached` unchanged on match; errors on mismatch.
+async fn verify_cached_range(
+    inner: &Arc<dyn Reader>,
+    cached: Bytes,
+    range: Range<usize>,
+    path: &Path,
+    offset: u64,
+    length: u64,
+) -> OSResult<Bytes> {
+    let source = inner
+        .get_range(range)
+        .await
+        .map_err(|e| object_store::Error::Generic {
+            store: "data_cache_verify",
+            source: Box::new(e),
+        })?;
+
+    if cached != source {
+        let msg = format!(
+            "cache checksum mismatch at path={path} offset={offset} \
+             length={length}: cached {} bytes differ from source {} bytes",
+            cached.len(),
+            source.len()
+        );
+        tracing::error!(%msg, "CACHE CHECKSUM MISMATCH");
+        return Err(object_store::Error::Generic {
+            store: "data_cache",
+            source: msg.into(),
+        });
+    }
+    tracing::debug!(offset, length, "cache checksum OK");
+    Ok(cached)
+}
+
 impl Reader for CachedObjectReader {
     fn path(&self) -> &Path {
         &self.path
@@ -336,7 +370,6 @@ impl Reader for CachedObjectReader {
         let file_id = self.file_id;
 
         Box::pin(async move {
-            // Build a loader that fetches the range from the inner reader on cache miss.
             let inner_for_loader = inner.clone();
             let range_for_loader = range.clone();
             let loader: BoxFuture<'static, lance_core::Result<Bytes>> = Box::pin(async move {
@@ -355,30 +388,7 @@ impl Reader for CachedObjectReader {
                 })?;
 
             if verify {
-                // Re-fetch from the inner reader and compare byte-for-byte.
-                let source =
-                    inner
-                        .get_range(range)
-                        .await
-                        .map_err(|e| object_store::Error::Generic {
-                            store: "data_cache_verify",
-                            source: Box::new(e),
-                        })?;
-
-                if cached != source {
-                    let msg = format!(
-                        "cache checksum mismatch at path={path} offset={offset} \
-                         length={length}: cached {} bytes differ from source {} bytes",
-                        cached.len(),
-                        source.len()
-                    );
-                    tracing::error!(%msg, "CACHE CHECKSUM MISMATCH");
-                    return Err(object_store::Error::Generic {
-                        store: "data_cache",
-                        source: msg.into(),
-                    });
-                }
-                tracing::debug!(offset, length, "cache checksum OK");
+                return verify_cached_range(&inner, cached, range, &path, offset, length).await;
             }
             Ok(cached)
         })
