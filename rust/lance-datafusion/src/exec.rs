@@ -950,8 +950,8 @@ impl ExecutionPlan for StrictBatchSizeExec {
 /// # Why this exists
 ///
 /// DataFusion's sort operator cannot handle batches larger than the memory
-/// pool size.  When upstream operators produce very large batches (e.g. after
-/// a join) this can cause the sort to fail.  This node caps batch sizes
+/// pool size.  When upstream operators produce very large batches this can
+/// cause the sort to fail.  This node caps batch sizes
 /// *before* the sort so the operation succeeds.  The trade-off is a
 /// potentially expensive deep copy of the batch data — see below — but that
 /// is preferable to failing the operation entirely.  This workaround may
