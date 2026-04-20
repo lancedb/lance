@@ -2740,13 +2740,11 @@ def test_merge_insert_large_rows():
             )
             yield pa.record_batch([ids, blobs], schema=partial_schema)
 
-    new_reader = pa.RecordBatchReader.from_batches(partial_schema, make_partial_batches())
-
-    stats = (
-        ds.merge_insert(on="id")
-        .when_matched_update_all()
-        .execute(new_reader)
+    new_reader = pa.RecordBatchReader.from_batches(
+        partial_schema, make_partial_batches()
     )
+
+    stats = ds.merge_insert(on="id").when_matched_update_all().execute(new_reader)
 
     assert stats["num_updated_rows"] == nrows
     assert stats["num_inserted_rows"] == 0

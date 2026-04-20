@@ -66,8 +66,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::NullEquality;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::{
     execution::{
