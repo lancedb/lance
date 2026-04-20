@@ -155,7 +155,7 @@ impl RestAdapter {
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             log::error!("RestAdapter::start() failed to bind to {}: {}", addr, e);
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to bind to {}: {}", addr, e),
+                message: format!("Failed to bind to {}: {:?}", addr, e),
             })
         })?;
 
@@ -309,73 +309,46 @@ fn error_code_to_status(code: u32) -> StatusCode {
         | Some(lance_namespace::error::ErrorCode::TableIndexAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::TableTagAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::ConcurrentModification) => StatusCode::CONFLICT,
+        Some(lance_namespace::error::ErrorCode::NamespaceNotEmpty)
+        | Some(lance_namespace::error::ErrorCode::InvalidTableState) => StatusCode::CONFLICT,
         Some(lance_namespace::error::ErrorCode::InvalidInput)
-        | Some(lance_namespace::error::ErrorCode::InvalidTableState)
-        | Some(lance_namespace::error::ErrorCode::TableSchemaValidationError)
-        | Some(lance_namespace::error::ErrorCode::NamespaceNotEmpty) => StatusCode::BAD_REQUEST,
-        Some(lance_namespace::error::ErrorCode::Unsupported) => StatusCode::NOT_IMPLEMENTED,
+        | Some(lance_namespace::error::ErrorCode::TableSchemaValidationError) => {
+            StatusCode::BAD_REQUEST
+        }
+        Some(lance_namespace::error::ErrorCode::Unsupported) => StatusCode::NOT_ACCEPTABLE,
         Some(lance_namespace::error::ErrorCode::PermissionDenied) => StatusCode::FORBIDDEN,
         Some(lance_namespace::error::ErrorCode::Unauthenticated) => StatusCode::UNAUTHORIZED,
         Some(lance_namespace::error::ErrorCode::ServiceUnavailable) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        Some(lance_namespace::error::ErrorCode::Throttled) => StatusCode::TOO_MANY_REQUESTS,
+        Some(lance_namespace::error::ErrorCode::Throttling) => StatusCode::TOO_MANY_REQUESTS,
         Some(lance_namespace::error::ErrorCode::Internal) | None => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
 
-/// Convert Lance errors to HTTP responses
+/// Convert Lance errors to HTTP responses using the spec's `ErrorResponse` model.
 fn error_to_response(err: Error) -> Response {
     match err {
         Error::Namespace { source, .. } => {
             if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
                 let code = ns_err.code().as_u32();
                 let status = error_code_to_status(code);
-                (
-                    status,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": ns_err.message(),
-                            "code": code
-                        }
-                    })),
-                )
-                    .into_response()
+                let mut resp = ErrorResponse::new(code as i32);
+                resp.error = Some(ns_err.message().to_string());
+                (status, Json(resp)).into_response()
             } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": source.to_string(),
-                            "code": 18
-                        }
-                    })),
-                )
-                    .into_response()
+                let mut resp = ErrorResponse::new(18);
+                resp.error = Some(source.to_string());
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
             }
         }
-        Error::IO { source, .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": source.to_string(),
-                    "type": "InternalServerError"
-                }
-            })),
-        )
-            .into_response(),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": err.to_string(),
-                    "type": "InternalServerError"
-                }
-            })),
-        )
-            .into_response(),
+        _ => {
+            let mut resp = ErrorResponse::new(18);
+            resp.error = Some(err.to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
+        }
     }
 }
 
