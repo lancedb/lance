@@ -113,7 +113,7 @@ use crate::io::commit::{
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
-pub use blob::BlobFile;
+pub use blob::{BlobFile, ReadBlob, ReadBlobsBuilder, ReadBlobsStream};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
@@ -181,6 +181,8 @@ pub struct Dataset {
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
+    /// Optional runtime-only object store parameters keyed by base path URI.
+    pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -190,6 +192,7 @@ impl std::fmt::Debug for Dataset {
             .field("base", &self.base)
             .field("version", &self.manifest.version)
             .field("cache_num_items", &self.session.approx_num_items())
+            .field("base_store_params", &self.base_store_params.is_some())
             .finish()
     }
 }
@@ -584,6 +587,7 @@ impl Dataset {
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
             self.store_params.as_deref().cloned(),
+            self.base_store_params.clone(),
         )
     }
 
@@ -702,6 +706,7 @@ impl Dataset {
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
         store_params: Option<ObjectStoreParams>,
+        base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Self> {
         let refs = Refs::new(
             object_store.clone(),
@@ -729,6 +734,7 @@ impl Dataset {
             index_cache,
             file_reader_options,
             store_params: store_params.map(Box::new),
+            base_store_params,
         })
     }
 
@@ -1480,6 +1486,38 @@ impl Dataset {
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 
+    /// Create a planned blob reader for a blob column.
+    ///
+    /// This API complements [`Self::take_blobs`]. `take_blobs` returns
+    /// [`BlobFile`] handles for caller-driven random access, while
+    /// `read_blobs` builds a streaming read plan for sequential or batched blob
+    /// retrieval.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use futures::TryStreamExt;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let blobs = dataset
+    ///     .read_blobs("images")?
+    ///     .with_row_indices(vec![0, 1, 2])
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = blobs;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blobs(self: &Arc<Self>, column: impl AsRef<str>) -> Result<ReadBlobsBuilder> {
+        let column = column.as_ref();
+        let blob_field_id = blob::validate_blob_column(self, column)?;
+        Ok(ReadBlobsBuilder::new(
+            self.clone(),
+            column.to_string(),
+            blob_field_id,
+        ))
+    }
+
     /// Get a stream of batches based on iterator of ranges of row numbers.
     ///
     /// This is an experimental API. It may change at any time.
@@ -1636,6 +1674,23 @@ impl Dataset {
             cloned.store_params = Some(Box::new(store_params));
         }
         cloned
+    }
+
+    fn store_params_for_base(
+        &self,
+        base_path: Option<&lance_table::format::BasePath>,
+    ) -> ObjectStoreParams {
+        // Base-specific bindings are exact ObjectStoreParams keyed by
+        // `BasePath.path`. If a base has no explicit binding then reads fall back
+        // to the dataset-level default store params.
+        base_path
+            .and_then(|base_path| {
+                self.base_store_params
+                    .as_ref()
+                    .and_then(|params| params.get(&base_path.path))
+            })
+            .cloned()
+            .unwrap_or_else(|| self.store_params.as_deref().cloned().unwrap_or_default())
     }
 
     /// Returns the initial storage options used when opening this dataset, if any.
@@ -1848,11 +1903,12 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
+        let store_params = self.store_params_for_base(Some(base_path));
 
         let (store, _) = ObjectStore::from_uri_and_params(
             self.session.store_registry(),
             &base_path.path,
-            &self.store_params.as_deref().cloned().unwrap_or_default(),
+            &store_params,
         )
         .await?;
 
@@ -2673,6 +2729,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
                         dataset.store_params.as_deref().cloned(),
+                        dataset.base_store_params.clone(),
                     )?;
                     let loaded =
                         Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
@@ -2704,6 +2761,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
                 dataset.store_params.as_deref().cloned(),
+                dataset.base_store_params.clone(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset

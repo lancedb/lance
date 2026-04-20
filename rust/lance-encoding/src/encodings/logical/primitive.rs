@@ -2165,15 +2165,17 @@ impl FullZipScheduler {
     }
 
     fn create_page_load_task(
-        read_source: FullZipReadSource,
-        byte_ranges: Vec<Range<u64>>,
-        priority: u64,
+        io_future: BoxFuture<'static, Result<Vec<Bytes>>>,
         num_rows: u64,
         details: Arc<FullZipDecodeDetails>,
         bits_per_offset: u8,
     ) -> PageLoadTask {
         let load_task = async move {
-            let data = read_source.fetch(&byte_ranges, priority).await?;
+            let buffers = io_future.await?;
+            let data = buffers
+                .into_iter()
+                .map(|bytes| LanceBuffer::from_bytes(bytes, 1))
+                .collect::<VecDeque<_>>();
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
         .boxed();
@@ -2333,14 +2335,9 @@ impl FullZipScheduler {
                 rep_index.bytes_per_value,
                 data_buf_position,
             );
-            let page_load_task = Self::create_page_load_task(
-                FullZipReadSource::Remote(io.clone()),
-                byte_ranges,
-                priority,
-                num_rows,
-                details,
-                bits_per_offset,
-            );
+            let io_future = io.submit_request(byte_ranges, priority);
+            let page_load_task =
+                Self::create_page_load_task(io_future, num_rows, details, bits_per_offset);
             return Ok(vec![page_load_task]);
         }
 
@@ -2403,10 +2400,9 @@ impl FullZipScheduler {
             })
             .collect::<Vec<_>>();
 
+        let io_future = io.submit_request(byte_ranges, self.priority);
         let page_load_task = Self::create_page_load_task(
-            FullZipReadSource::Remote(io.clone()),
-            byte_ranges,
-            self.priority,
+            io_future,
             num_rows,
             self.details.clone(),
             self.bits_per_offset,

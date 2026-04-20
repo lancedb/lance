@@ -8,6 +8,7 @@ use arrow_array::{
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
 use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch};
+use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
@@ -76,6 +77,42 @@ fn bench_distance(c: &mut Criterion) {
             black_box(cosine_distance_batch(key.values(), target.values(), 8).collect::<Vec<_>>())
         })
     });
+
+    // u8 cosine benchmarks
+    {
+        use rand::Rng;
+        use std::iter::repeat_with;
+
+        const DIMENSION: usize = 1024;
+        const TOTAL: usize = 1024 * 1024;
+        let mut rng = rand::rng();
+        let key_u8: Vec<u8> = repeat_with(|| rng.random()).take(DIMENSION).collect();
+        let target_u8: Vec<u8> = repeat_with(|| rng.random())
+            .take(TOTAL * DIMENSION)
+            .collect();
+
+        c.bench_function("Cosine(u8, scalar)", |b| {
+            b.iter(|| {
+                black_box(
+                    target_u8
+                        .chunks_exact(DIMENSION)
+                        .map(|tgt| cosine_u8_scalar(&key_u8, tgt))
+                        .fold(0.0, |acc: f32, v| acc + v),
+                );
+            });
+        });
+
+        c.bench_function("Cosine(u8, SIMD)", |b| {
+            b.iter(|| {
+                black_box(
+                    target_u8
+                        .chunks_exact(DIMENSION)
+                        .map(|tgt| cosine_u8(&key_u8, tgt))
+                        .fold(0.0, |acc: f32, v| acc + v),
+                );
+            });
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -187,6 +187,11 @@ pub struct DirectoryNamespaceBuilder {
     /// When true, table versions are stored in the `__manifest` table instead of
     /// relying on Lance's native version management.
     table_version_storage_enabled: bool,
+    /// When true, enables migration mode where the namespace checks the manifest first
+    /// before falling back to directory listing for root-level tables. When false (default),
+    /// root-level tables use directory listing directly without checking the manifest,
+    /// avoiding extra object store calls.
+    dir_listing_to_manifest_migration_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
@@ -222,6 +227,10 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
                 &self.table_version_storage_enabled,
             )
             .field(
+                "dir_listing_to_manifest_migration_enabled",
+                &self.dir_listing_to_manifest_migration_enabled,
+            )
+            .field(
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
             )
@@ -254,6 +263,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled: true,
             table_version_tracking_enabled: false, // Default to disabled
             table_version_storage_enabled: false,  // Default to disabled
+            dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
             commit_retries: None,
@@ -278,6 +288,17 @@ impl DirectoryNamespaceBuilder {
     /// When disabled, only consults the manifest table.
     pub fn dir_listing_enabled(mut self, enabled: bool) -> Self {
         self.dir_listing_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable migration mode from directory listing to manifest.
+    ///
+    /// When enabled, root-level table operations check the manifest first before
+    /// falling back to directory listing. When disabled (default), root-level tables
+    /// use directory listing directly, avoiding extra object store calls.
+    /// Only relevant when both `manifest_enabled` and `dir_listing_enabled` are true.
+    pub fn dir_listing_to_manifest_migration_enabled(mut self, enabled: bool) -> Self {
+        self.dir_listing_to_manifest_migration_enabled = enabled;
         self
     }
 
@@ -436,6 +457,12 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
+        // Extract dir_listing_to_manifest_migration_enabled (default: false)
+        let dir_listing_to_manifest_migration_enabled = properties
+            .get("dir_listing_to_manifest_migration_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
         // The prefix is stripped to get short property names
         // The build() method will check if enabled=true before creating the vendor
@@ -477,6 +504,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled,
             table_version_tracking_enabled,
             table_version_storage_enabled,
+            dir_listing_to_manifest_migration_enabled,
             credential_vendor_properties,
             context_provider: None,
             commit_retries,
@@ -715,6 +743,8 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns,
             dir_listing_enabled: self.dir_listing_enabled,
+            dir_listing_to_manifest_migration_enabled: self
+                .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
             table_version_storage_enabled: self.table_version_storage_enabled,
             credential_vendor,
@@ -753,7 +783,7 @@ impl DirectoryNamespaceBuilder {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create object store: {}", e),
+                    message: format!("Failed to create object store: {:?}", e),
                 })
             })?;
 
@@ -792,6 +822,10 @@ pub struct DirectoryNamespace {
     base_path: Path,
     manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
     dir_listing_enabled: bool,
+    /// When true, root-level table operations check the manifest first before
+    /// falling back to directory listing. When false, root-level tables skip
+    /// the manifest check and use directory listing directly.
+    dir_listing_to_manifest_migration_enabled: bool,
     /// When true, `describe_table` returns `managed_versioning: true` to indicate
     /// commits should go through namespace table version APIs.
     table_version_tracking_enabled: bool,
@@ -893,7 +927,7 @@ impl DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {}", e),
+                    message: format!("Failed to list directory: {:?}", e),
                 })
             })?;
 
@@ -954,6 +988,19 @@ impl DirectoryNamespace {
         Ok(id[0].clone())
     }
 
+    fn format_table_id(table_id: &[String]) -> String {
+        format!(
+            "table id '{}'",
+            manifest::ManifestNamespace::str_object_id(table_id)
+        )
+    }
+
+    fn format_table_id_from_request(id: &Option<Vec<String>>) -> String {
+        id.as_ref()
+            .map(|table_id| Self::format_table_id(table_id))
+            .unwrap_or_else(|| "table id '<unknown>'".to_string())
+    }
+
     async fn resolve_table_location(&self, id: &Option<Vec<String>>) -> Result<String> {
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = id.clone();
@@ -976,7 +1023,13 @@ impl DirectoryNamespace {
         &self,
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !skip_manifest_for_root
+        {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
                     if let Some(ref table_uri) = response.table_uri {
@@ -993,10 +1046,7 @@ impl DirectoryNamespace {
                     }
                     return Ok(response);
                 }
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
+                Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
@@ -1004,6 +1054,7 @@ impl DirectoryNamespace {
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
+        let table_id = Self::format_table_id_from_request(&request.id);
         let table_uri = self.table_full_uri(&table_name);
 
         // Atomically check table existence and deregistration status
@@ -1011,14 +1062,14 @@ impl DirectoryNamespace {
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_id.clone(),
             }
             .into());
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_id),
             }
             .into());
         }
@@ -1067,7 +1118,17 @@ impl DirectoryNamespace {
             Ok(mut dataset) => {
                 // If a specific version is requested, checkout that version
                 if let Some(requested_version) = request.version {
-                    dataset = dataset.checkout_version(requested_version as u64).await?;
+                    dataset = dataset
+                        .checkout_version(requested_version as u64)
+                        .await
+                        .map_err(|e| {
+                            lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                                message: format!(
+                                    "Version {} not found for table '{}': {}",
+                                    requested_version, table_name, e
+                                ),
+                            })
+                        })?;
                 }
 
                 let version_info = dataset.version();
@@ -1472,7 +1533,7 @@ impl DirectoryNamespace {
                 .read_transaction_by_version(version)
                 .await
                 .map_err(|e| {
-                    lance_core::Error::from(NamespaceError::Internal {
+                    lance_core::Error::from(NamespaceError::TransactionNotFound {
                         message: format!(
                             "Failed to read transaction for version {}: {}",
                             version, e
@@ -1606,7 +1667,7 @@ impl DirectoryNamespace {
             | Err(ObjectStoreError::Precondition { .. }) => {
                 Err(format!("{} already exists", file_description))
             }
-            Err(e) => Err(format!("Failed to create {}: {}", file_description, e)),
+            Err(e) => Err(format!("Failed to create {}: {:?}", file_description, e)),
         }
     }
 
@@ -2085,8 +2146,12 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.list_tables(request).await;
         }
 
-        // When both manifest and directory listing are enabled, we need to merge and deduplicate
-        let mut tables = if self.manifest_ns.is_some() && self.dir_listing_enabled {
+        // When both manifest and directory listing are enabled with migration mode,
+        // we need to merge and deduplicate
+        let mut tables = if self.manifest_ns.is_some()
+            && self.dir_listing_enabled
+            && self.dir_listing_to_manifest_migration_enabled
+        {
             // Get all manifest table locations (for deduplication)
             let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
                 manifest_ns.list_manifest_table_locations().await?
@@ -2141,13 +2206,16 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         self.record_op("table_exists");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !skip_manifest_for_root
+        {
             match manifest_ns.table_exists(request.clone()).await {
                 Ok(()) => return Ok(()),
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
+                Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
@@ -2155,20 +2223,21 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
+        let table_id = Self::format_table_id_from_request(&request.id);
 
         // Atomically check table existence and deregistration status
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_id.clone(),
             }
             .into());
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_id),
             }
             .into());
         }
@@ -2191,7 +2260,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to drop table {}: {}", table_name, e),
+                    message: format!("Failed to drop table {}: {:?}", table_name, e),
                 })
             })?;
 
@@ -2225,7 +2294,7 @@ impl LanceNamespace for DirectoryNamespace {
         let cursor = Cursor::new(request_data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
             lance_core::Error::from(NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {}", e),
+                message: format!("Invalid Arrow IPC stream: {:?}", e),
             })
         })?;
         let arrow_schema = stream_reader.schema();
@@ -2235,7 +2304,7 @@ impl LanceNamespace for DirectoryNamespace {
         for batch_result in stream_reader {
             batches.push(batch_result.map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
-                    message: format!("Failed to read batch from IPC stream: {}", e),
+                    message: format!("Failed to read batch from IPC stream: {:?}", e),
                 })
             })?);
         }
@@ -2267,9 +2336,17 @@ impl LanceNamespace for DirectoryNamespace {
         Dataset::write(reader, &table_uri, Some(write_params))
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create Lance dataset: {}", e),
-                })
+                let err_msg = format!("{}", e);
+                let ns_err = if err_msg.contains("already exists") {
+                    NamespaceError::TableAlreadyExists {
+                        message: format!("Table already exists at '{}': {:?}", table_uri, e),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!("Failed to create Lance dataset: {:?}", e),
+                    }
+                };
+                lance_core::Error::from(ns_err)
             })?;
 
         Ok(CreateTableResponse {
@@ -2407,7 +2484,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
+            return Err(NamespaceError::TableNotFound {
                 message: format!("Table is already deregistered: {}", table_name),
             }
             .into());
@@ -2700,8 +2777,8 @@ impl LanceNamespace for DirectoryNamespace {
             builder = builder.with_session(sess.clone());
         }
         let mut dataset = builder.load().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to open table at '{}': {}", table_uri, e),
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!("Failed to open table at '{}': {:?}", table_uri, e),
             })
         })?;
 
@@ -2846,16 +2923,36 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to create {} index '{}' on column '{}' for table '{}': {}",
-                        request.index_type,
-                        request.name.as_deref().unwrap_or("<auto-generated>"),
-                        request.column,
-                        table_uri,
-                        e
-                    ),
-                })
+                let err_msg = format!("{}", e);
+                let ns_err = if err_msg.contains("already exists") {
+                    NamespaceError::TableIndexAlreadyExists {
+                        message: format!(
+                            "Index '{}' already exists on table '{}': {:?}",
+                            request.name.as_deref().unwrap_or("<auto-generated>"),
+                            table_uri,
+                            e
+                        ),
+                    }
+                } else if err_msg.contains("not found") || err_msg.contains("does not exist") {
+                    NamespaceError::TableColumnNotFound {
+                        message: format!(
+                            "Column '{}' not found for table '{}': {:?}",
+                            request.column, table_uri, e
+                        ),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!(
+                            "Failed to create {} index '{}' on column '{}' for table '{}': {:?}",
+                            request.index_type,
+                            request.name.as_deref().unwrap_or("<auto-generated>"),
+                            request.column,
+                            table_uri,
+                            e
+                        ),
+                    }
+                };
+                lance_core::Error::from(ns_err)
             })?;
 
         let transaction_id = dataset
@@ -2888,7 +2985,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to describe table indices for '{}': {}", table_uri, e),
+                    message: format!("Failed to describe table indices for '{}': {:?}", table_uri, e),
                 })
             })?
             .into_iter()
@@ -2959,7 +3056,7 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to load index '{}' metadata for table '{}': {}",
                         index_name, table_uri, e
@@ -2976,7 +3073,7 @@ impl LanceNamespace for DirectoryNamespace {
         let stats = <Dataset as DatasetIndexExt>::index_statistics(&dataset, index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to describe index statistics for '{}' on table '{}': {}",
                         index_name, table_uri, e
@@ -3067,7 +3164,7 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to load index '{}' before dropping it from table '{}': {}",
                         index_name, table_uri, e
@@ -3085,7 +3182,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         dataset.drop_index(index_name).await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
+            lance_core::Error::from(NamespaceError::TableIndexNotFound {
                 message: format!(
                     "Failed to drop index '{}' from table '{}': {}",
                     index_name, table_uri, e
@@ -3396,7 +3493,7 @@ impl LanceNamespace for DirectoryNamespace {
                 .count_rows(request.predicate)
                 .await
                 .map_err(|e| NamespaceError::Internal {
-                    message: format!("Failed to count rows for table at '{}': {}", table_uri, e),
+                    message: format!("Failed to count rows for table at '{}': {:?}", table_uri, e),
                 })?;
 
         Ok(count as i64)
@@ -3421,14 +3518,14 @@ impl LanceNamespace for DirectoryNamespace {
         let cursor = Cursor::new(request_data.as_ref());
         let stream_reader =
             StreamReader::try_new(cursor, None).map_err(|e| NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {}", e),
+                message: format!("Invalid Arrow IPC stream: {:?}", e),
             })?;
         let arrow_schema = stream_reader.schema();
 
         let mut batches = Vec::new();
         for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to read batch from IPC stream: {}", e),
+            batches.push(batch_result.map_err(|e| NamespaceError::InvalidInput {
+                message: format!("Failed to read batch from IPC stream: {:?}", e),
             })?);
         }
 
@@ -3472,8 +3569,20 @@ impl LanceNamespace for DirectoryNamespace {
 
         Dataset::write(reader, &table_uri, Some(write_params))
             .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to insert into table at '{}': {}", table_uri, e),
+            .map_err(|e| {
+                let err_msg = format!("{}", e);
+                if err_msg.contains("conflict") || err_msg.contains("CommitConflict") {
+                    NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Concurrent modification on table at '{}': {:?}",
+                            table_uri, e
+                        ),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!("Failed to insert into table at '{}': {:?}", table_uri, e),
+                    }
+                }
             })?;
 
         Ok(InsertIntoTableResponse {
@@ -3541,7 +3650,7 @@ impl LanceNamespace for DirectoryNamespace {
                 scanner
                     .nearest(vector_column, &query_array, k)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid vector search: {}", e),
+                        message: format!("Invalid vector search: {:?}", e),
                     })?;
 
                 // Apply distance type if specified
@@ -3606,14 +3715,14 @@ impl LanceNamespace for DirectoryNamespace {
                     fts = fts
                         .with_columns(columns)
                         .map_err(|e| NamespaceError::InvalidInput {
-                            message: format!("Invalid FTS columns: {}", e),
+                            message: format!("Invalid FTS columns: {:?}", e),
                         })?;
                 }
 
                 scanner
                     .full_text_search(fts)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid full text search: {}", e),
+                        message: format!("Invalid full text search: {:?}", e),
                     })?;
             }
             // Note: structured_query would require more complex parsing
@@ -3628,7 +3737,7 @@ impl LanceNamespace for DirectoryNamespace {
                 scanner
                     .project(column_names)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid column projection: {}", e),
+                        message: format!("Invalid column projection: {:?}", e),
                     })?;
             } else if let Some(ref column_aliases) = columns.column_aliases
                 && !column_aliases.is_empty()
@@ -3646,7 +3755,7 @@ impl LanceNamespace for DirectoryNamespace {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid column alias expression: {}", e),
+                        message: format!("Invalid column alias expression: {:?}", e),
                     })?;
             }
         }
@@ -3658,7 +3767,7 @@ impl LanceNamespace for DirectoryNamespace {
             scanner
                 .filter(filter)
                 .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid filter expression: {}", e),
+                    message: format!("Invalid filter expression: {:?}", e),
                 })?;
         }
 
@@ -3674,7 +3783,7 @@ impl LanceNamespace for DirectoryNamespace {
             let offset = request.offset.map(|o| o as i64);
             scanner.limit(Some(request.k as i64), offset).map_err(|e| {
                 NamespaceError::InvalidInput {
-                    message: format!("Invalid limit/offset: {}", e),
+                    message: format!("Invalid limit/offset: {:?}", e),
                 }
             })?;
         } else if has_vector_query && request.offset.is_some() {
@@ -3683,7 +3792,7 @@ impl LanceNamespace for DirectoryNamespace {
             scanner
                 .limit(None, offset)
                 .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid offset: {}", e),
+                    message: format!("Invalid offset: {:?}", e),
                 })?;
         }
 
@@ -3692,7 +3801,7 @@ impl LanceNamespace for DirectoryNamespace {
             .try_into_batch()
             .await
             .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to execute query: {}", e),
+                message: format!("Failed to execute query: {:?}", e),
             })?;
 
         // Serialize to Arrow IPC file format
@@ -3701,14 +3810,14 @@ impl LanceNamespace for DirectoryNamespace {
         {
             let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to create IPC writer: {}", e),
+                    message: format!("Failed to create IPC writer: {:?}", e),
                 }
             })?;
             writer.write(&batch).map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to write batch to IPC: {}", e),
+                message: format!("Failed to write batch to IPC: {:?}", e),
             })?;
             writer.finish().map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to finish IPC writer: {}", e),
+                message: format!("Failed to finish IPC writer: {:?}", e),
             })?;
         }
 
@@ -3727,13 +3836,19 @@ mod tests {
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_core::utils::testing::CountingObjectStore;
+    use lance_io::object_store::providers::local::FileStoreProvider;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
         QueryTableRequestColumns,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use url::Url;
 
     fn assert_plan_contains_all(plan: &str, expected_fragments: &[&str], context: &str) {
         for expected_fragment in expected_fragments {
@@ -3756,6 +3871,56 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
+    }
+
+    #[derive(Debug)]
+    struct CountingFileStoreProvider {
+        listing_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl lance_io::object_store::ObjectStoreProvider for CountingFileStoreProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let provider = FileStoreProvider;
+            let mut store = provider.new_store(base_path, params).await?;
+            store.inner = Arc::new(CountingObjectStore::new(
+                store.inner.clone(),
+                self.listing_count.clone(),
+            ));
+            Ok(store)
+        }
+
+        fn extract_path(&self, url: &Url) -> Result<Path> {
+            let provider = FileStoreProvider;
+            provider.extract_path(url)
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            url: &Url,
+            storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            let provider = FileStoreProvider;
+            provider.calculate_object_store_prefix(url, storage_options)
+        }
+    }
+
+    fn file_object_store_uri(path: &str) -> String {
+        let path_prefix = if path.starts_with('/') { "" } else { "/" };
+        format!("file-object-store://{path_prefix}{path}")
+    }
+
+    fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Session> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "file-object-store",
+            Arc::new(CountingFileStoreProvider { listing_count }),
+        );
+        Arc::new(Session::new(0, 0, registry))
     }
 
     /// Helper to create test IPC data from a schema
@@ -5387,6 +5552,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_to_manifest_migration_enabled(true)
             .build()
             .await
             .unwrap();
@@ -6087,7 +6253,11 @@ mod tests {
         // Describe should fail after deregistration
         let result = namespace.describe_table(describe_req).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("deregistered"));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("deregistered"));
+        assert!(err_msg.contains("table id 'test_table'"));
     }
 
     #[tokio::test]
@@ -6127,7 +6297,11 @@ mod tests {
         // Table exists should fail after deregistration
         let result = namespace.table_exists(exists_req).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("deregistered"));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("deregistered"));
+        assert!(err_msg.contains("table id 'test_table'"));
     }
 
     #[tokio::test]
@@ -8332,5 +8506,215 @@ mod tests {
             ],
             "Filtered analyze plan should preserve late materialization and filter pushdown",
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "TODO: https://github.com/lance-format/lance/issues/6557"
+    )]
+    async fn test_dir_listing_no_extra_calls_without_migration() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        // Create a table using dir-listing-only namespace
+        let dir_only_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        dir_only_ns
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Build a namespace with both enabled but migration disabled (default)
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Reset counter before the operation we want to measure
+        listing_count.store(0, Ordering::SeqCst);
+
+        // table_exists should use dir listing directly, making only 1 listing call
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.table_exists(exists_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 listing call for table_exists \
+             without migration mode, but got {}",
+            count
+        );
+
+        // Reset and test describe_table
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.describe_table(describe_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 listing call for describe_table \
+             without migration mode, but got {}",
+            count
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "TODO: https://github.com/lance-format/lance/issues/6557"
+    )]
+    async fn test_dir_listing_extra_calls_with_migration() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        // Create a table using dir-listing-only namespace so it exists physically but is absent from __manifest.
+        let dir_only_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        dir_only_ns
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // table_exists first checks __manifest (one list on __manifest/_versions),
+        // then falls back to the table directory (one list_with_delimiter on test_table.lance).
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.table_exists(exists_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "Expected exactly 2 listing calls for table_exists with migration mode \
+             (manifest reload + table directory fallback), but got {}",
+            count
+        );
+
+        // describe_table follows the same path when the table is not yet registered in __manifest.
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.describe_table(describe_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "Expected exactly 2 listing calls for describe_table with migration mode \
+             (manifest reload + table directory fallback), but got {}",
+            count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_not_found_errors_include_table_id() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["missing_table".to_string()]);
+        let err = namespace.table_exists(exists_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'missing_table'"));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["missing_table".to_string()]);
+        let err = namespace.describe_table(describe_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'missing_table'"));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_not_found_errors_include_full_table_id() {
+        use lance_namespace::models::CreateNamespaceRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        let missing_table_id = vec!["workspace".to_string(), "missing_table".to_string()];
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(missing_table_id.clone());
+        let err = namespace.table_exists(exists_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'workspace$missing_table'"));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(missing_table_id);
+        let err = namespace.describe_table(describe_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'workspace$missing_table'"));
     }
 }

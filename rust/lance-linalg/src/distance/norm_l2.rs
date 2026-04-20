@@ -80,10 +80,54 @@ impl Normalize for f16 {
     }
 }
 
+#[cfg(feature = "fp16kernels")]
+mod bf16_kernel {
+    use half::bf16;
+
+    unsafe extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn norm_l2_bf16_neon(ptr: *const bf16, len: u32) -> f32;
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        pub fn norm_l2_bf16_avx512(ptr: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn norm_l2_bf16_avx2(ptr: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn norm_l2_bf16_lsx(ptr: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn norm_l2_bf16_lasx(ptr: *const bf16, len: u32) -> f32;
+    }
+}
+
 impl Normalize for bf16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        norm_l2_impl::<Self, f32, 32>(vector)
+        match *SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                bf16_kernel::norm_l2_bf16_neon(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_support = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512FP16 => unsafe {
+                bf16_kernel::norm_l2_bf16_avx512(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+                bf16_kernel::norm_l2_bf16_avx2(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                bf16_kernel::norm_l2_bf16_lasx(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                bf16_kernel::norm_l2_bf16_lsx(vector.as_ptr(), vector.len() as u32)
+            },
+            _ => norm_l2_impl::<Self, f32, 32>(vector),
+        }
     }
 }
 
@@ -97,8 +141,40 @@ impl Normalize for f32 {
 impl Normalize for f64 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        norm_l2_impl::<Self, Self, 8>(vector) as f32
+        norm_l2_f64_simd(vector)
     }
+}
+
+/// Explicit SIMD implementation of L2 norm for f64.
+///
+/// Two-level unrolling: f64x8 main loop, f64x4 remainder, scalar tail.
+#[inline]
+pub fn norm_l2_f64_simd(vector: &[f64]) -> f32 {
+    use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::{FloatSimd, SIMD};
+
+    let dim = vector.len();
+    let unrolled_len = dim / 8 * 8;
+
+    let mut acc8 = f64x8::zeros();
+    for i in (0..unrolled_len).step_by(8) {
+        unsafe {
+            let v = f64x8::load_unaligned(vector.as_ptr().add(i));
+            acc8.multiply_add(v, v);
+        }
+    }
+
+    let aligned_len = dim / 4 * 4;
+    let mut acc4 = f64x4::zeros();
+    for i in (unrolled_len..aligned_len).step_by(4) {
+        unsafe {
+            let v = f64x4::load_unaligned(vector.as_ptr().add(i));
+            acc4.multiply_add(v, v);
+        }
+    }
+
+    let tail: f64 = vector[aligned_len..].iter().map(|&v| v * v).sum();
+    (acc8.reduce_sum() + acc4.reduce_sum() + tail).sqrt() as f32
 }
 
 /// NOTE: this is only pub for benchmarking purposes

@@ -348,17 +348,8 @@ impl DistCalculator for RabitDistCalculator<'_> {
         let id = id as usize;
         let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
         let num_vectors = self.codes.len() / code_len;
-        let code = get_rq_code(self.codes, id, num_vectors, code_len);
-        let dist = code
-            .zip(self.dist_table.chunks_exact(SEGMENT_NUM_CODES).tuples())
-            .map(|(code_byte, (dist_table, next_dist_table))| {
-                // code is a bit vector, we iterate over 8 bits at a time,
-                // every 4 bits is a sub-vector, we need to extract the bits
-                let current_code = (code_byte & 0x0F) as usize;
-                let next_code = (code_byte >> 4) as usize;
-                dist_table[current_code] + next_dist_table[next_code]
-            })
-            .sum::<f32>();
+        let dist =
+            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
 
         // distance between quantized vector and query vector
         let dist_vq_qr = (2.0 * dist - self.sum_q) / self.sqrt_d;
@@ -796,6 +787,60 @@ impl QuantizerStorage for RabitQuantizationStorage {
             scale_factors: self.scale_factors.clone(),
             row_ids: new_row_ids,
         })
+    }
+}
+
+/// Compute the raw distance for a single vector without allocating.
+///
+/// Fuses code extraction from the packed layout with distance accumulation
+/// in a single pass, avoiding the intermediate `Vec` allocation that
+/// `get_rq_code` + iterator would require.
+#[inline]
+fn compute_single_rq_distance(
+    codes: &[u8],
+    id: usize,
+    num_vectors: usize,
+    num_code_bytes: usize,
+    dist_table: &[f32],
+) -> f32 {
+    let remainder = num_vectors % BATCH_SIZE;
+    let mut dist_table_iter = dist_table.chunks_exact(SEGMENT_NUM_CODES).tuples();
+
+    if id < num_vectors - remainder {
+        let batch_codes = &codes[id / BATCH_SIZE * BATCH_SIZE * num_code_bytes
+            ..(id / BATCH_SIZE + 1) * BATCH_SIZE * num_code_bytes];
+
+        let id_in_batch = id % BATCH_SIZE;
+        let idx = PERM0_INVERSE[id_in_batch % 16];
+        let is_lower = id_in_batch < 16;
+
+        let mut dist = 0.0f32;
+        for block in batch_codes.chunks_exact(BATCH_SIZE) {
+            let code_byte = if is_lower {
+                (block[idx] & 0xF) | (block[idx + 16] << 4)
+            } else {
+                (block[idx] >> 4) | (block[idx + 16] & 0xF0)
+            };
+            if let Some((current_dt, next_dt)) = dist_table_iter.next() {
+                let current_code = (code_byte & 0x0F) as usize;
+                let next_code = (code_byte >> 4) as usize;
+                dist += current_dt[current_code] + next_dt[next_code];
+            }
+        }
+        dist
+    } else {
+        let offset_id = id - (num_vectors - remainder);
+        let remainder_codes = &codes[(num_vectors - remainder) * num_code_bytes..];
+
+        let mut dist = 0.0f32;
+        for &code_byte in remainder_codes.iter().skip(offset_id).step_by(remainder) {
+            if let Some((current_dt, next_dt)) = dist_table_iter.next() {
+                let current_code = (code_byte & 0x0F) as usize;
+                let next_code = (code_byte >> 4) as usize;
+                dist += current_dt[current_code] + next_dt[next_code];
+            }
+        }
+        dist
     }
 }
 

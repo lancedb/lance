@@ -639,6 +639,26 @@ impl ANNIvfSubIndexExec {
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+
+    /// Returns a reference to the vector query.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// Returns a reference to the dataset.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Returns a reference to the index metadata.
+    pub fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
+    /// Returns a reference to the prefilter source.
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
 }
 
 impl DisplayAs for ANNIvfSubIndexExec {

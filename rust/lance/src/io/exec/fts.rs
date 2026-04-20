@@ -35,16 +35,17 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
-use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
+use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, Tokens, collect_query_tokens,
     has_query_token,
 };
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, flat_bm25_search_stream,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 
 /// Open one FTS segment as an [`InvertedIndex`].
@@ -209,8 +210,7 @@ async fn search_segments(
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
 fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
     Box::new(TextTokenizer::new(
-        tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
-            .build(),
+        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
     ))
 }
 
@@ -442,9 +442,7 @@ impl ExecutionPlan for MatchQueryExec {
             let mut tokenizer = match is_fuzzy {
                 false => first_index.tokenizer(),
                 true => {
-                    let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
-                        tantivy::tokenizer::SimpleTokenizer::default(),
-                    );
+                    let tokenizer = TextAnalyzer::from(SimpleTokenizer::default());
                     match first_index.tokenizer().doc_type() {
                         DocType::Text => {
                             Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
@@ -560,7 +558,6 @@ impl FlatMatchFilterExec {
                 .await?
                 .tokenizer());
         }
-
         Ok(default_text_tokenizer())
     }
 
