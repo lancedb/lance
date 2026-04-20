@@ -1564,13 +1564,13 @@ mod tests {
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::inverted::InvertedIndex;
+    use lance_index::scalar::inverted::Language;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
         PhraseQuery, collect_query_tokens, has_query_token,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
-    use tantivy::tokenizer::Language;
 
     use crate::{
         dataset::transaction::{Operation, TransactionBuilder},

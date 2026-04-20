@@ -68,7 +68,6 @@ use super::{
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::inverted::document_tokenizer::TextTokenizer;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
@@ -77,7 +76,6 @@ use crate::scalar::{
 };
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
-use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
