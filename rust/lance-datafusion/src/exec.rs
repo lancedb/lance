@@ -946,6 +946,133 @@ impl ExecutionPlan for StrictBatchSizeExec {
     }
 }
 
+/// Exec node that rechunks batches so no output batch exceeds `max_bytes`.
+///
+/// # Why this exists
+///
+/// DataFusion's sort operator cannot handle batches larger than the memory
+/// pool size.  When upstream operators produce very large batches this can
+/// cause the sort to fail.  This node caps batch sizes
+/// *before* the sort so the operation succeeds.  The trade-off is a
+/// potentially expensive deep copy of the batch data — see below — but that
+/// is preferable to failing the operation entirely.  This workaround may
+/// become unnecessary if a fix is upstreamed to DataFusion.
+///
+/// # Deep copy
+///
+/// After slicing a RecordBatch, `get_array_memory_size` still reports the
+/// size of the *original* backing buffers, not the slice.  To get accurate
+/// sizes the slices must be deep-copied.  This is a last resort and can be
+/// expensive for large batches, but the deep copy is only performed when a
+/// batch actually needs to be sliced — batches that are already within the
+/// target range pass through at zero cost.
+///
+/// If a single row exceeds `max_bytes`, execution fails with an error.
+#[derive(Clone, Debug)]
+pub struct HardCapBatchSizeExec {
+    input: Arc<dyn ExecutionPlan>,
+    max_bytes: usize,
+}
+
+impl HardCapBatchSizeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, max_bytes: usize) -> Self {
+        Self { input, max_bytes }
+    }
+}
+
+impl DisplayAs for HardCapBatchSizeExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "HardCapBatchSizeExec(max_bytes={})", self.max_bytes)
+    }
+}
+
+impl ExecutionPlan for HardCapBatchSizeExec {
+    fn name(&self) -> &str {
+        "HardCapBatchSizeExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            max_bytes: self.max_bytes,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let max_bytes = self.max_bytes;
+        let rechunked = lance_arrow::stream::rechunk_stream_by_size_deep_copy(
+            stream,
+            schema.clone(),
+            0,
+            max_bytes,
+        );
+        // Check that no single-row batch exceeds the limit.
+        let validated = rechunked.map(move |result| {
+            let batch = result?;
+            if batch.num_rows() == 1 && batch.get_array_memory_size() > max_bytes {
+                return Err(DataFusionError::External(Box::new(Error::invalid_input(
+                    format!(
+                        "a single row is {} bytes which exceeds the maximum allowed batch \
+                         size of {} bytes",
+                        batch.get_array_memory_size(),
+                        max_bytes,
+                    ),
+                ))));
+            }
+            Ok(batch)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
