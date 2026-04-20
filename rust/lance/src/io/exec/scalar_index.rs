@@ -340,8 +340,10 @@ impl MapIndexExec {
             .load_scalar_index(IndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
-        let deletion_mask_fut =
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
+        let deletion_mask_fut = DatasetPreFilter::create_restricted_deletion_mask(
+            dataset.clone(),
+            index.fragment_bitmap.unwrap(),
+        );
         let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {

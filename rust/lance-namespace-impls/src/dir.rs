@@ -783,7 +783,7 @@ impl DirectoryNamespaceBuilder {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create object store: {}", e),
+                    message: format!("Failed to create object store: {:?}", e),
                 })
             })?;
 
@@ -927,7 +927,7 @@ impl DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {}", e),
+                    message: format!("Failed to list directory: {:?}", e),
                 })
             })?;
 
@@ -1068,7 +1068,7 @@ impl DirectoryNamespace {
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
+            return Err(NamespaceError::TableNotFound {
                 message: format!("Table is deregistered: {}", table_id),
             }
             .into());
@@ -1118,7 +1118,17 @@ impl DirectoryNamespace {
             Ok(mut dataset) => {
                 // If a specific version is requested, checkout that version
                 if let Some(requested_version) = request.version {
-                    dataset = dataset.checkout_version(requested_version as u64).await?;
+                    dataset = dataset
+                        .checkout_version(requested_version as u64)
+                        .await
+                        .map_err(|e| {
+                            lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                                message: format!(
+                                    "Version {} not found for table '{}': {}",
+                                    requested_version, table_name, e
+                                ),
+                            })
+                        })?;
                 }
 
                 let version_info = dataset.version();
@@ -1523,7 +1533,7 @@ impl DirectoryNamespace {
                 .read_transaction_by_version(version)
                 .await
                 .map_err(|e| {
-                    lance_core::Error::from(NamespaceError::Internal {
+                    lance_core::Error::from(NamespaceError::TransactionNotFound {
                         message: format!(
                             "Failed to read transaction for version {}: {}",
                             version, e
@@ -1657,7 +1667,7 @@ impl DirectoryNamespace {
             | Err(ObjectStoreError::Precondition { .. }) => {
                 Err(format!("{} already exists", file_description))
             }
-            Err(e) => Err(format!("Failed to create {}: {}", file_description, e)),
+            Err(e) => Err(format!("Failed to create {}: {:?}", file_description, e)),
         }
     }
 
@@ -2226,7 +2236,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
+            return Err(NamespaceError::TableNotFound {
                 message: format!("Table is deregistered: {}", table_id),
             }
             .into());
@@ -2250,7 +2260,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to drop table {}: {}", table_name, e),
+                    message: format!("Failed to drop table {}: {:?}", table_name, e),
                 })
             })?;
 
@@ -2284,7 +2294,7 @@ impl LanceNamespace for DirectoryNamespace {
         let cursor = Cursor::new(request_data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
             lance_core::Error::from(NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {}", e),
+                message: format!("Invalid Arrow IPC stream: {:?}", e),
             })
         })?;
         let arrow_schema = stream_reader.schema();
@@ -2294,7 +2304,7 @@ impl LanceNamespace for DirectoryNamespace {
         for batch_result in stream_reader {
             batches.push(batch_result.map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
-                    message: format!("Failed to read batch from IPC stream: {}", e),
+                    message: format!("Failed to read batch from IPC stream: {:?}", e),
                 })
             })?);
         }
@@ -2326,9 +2336,17 @@ impl LanceNamespace for DirectoryNamespace {
         Dataset::write(reader, &table_uri, Some(write_params))
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create Lance dataset: {}", e),
-                })
+                let err_msg = format!("{}", e);
+                let ns_err = if err_msg.contains("already exists") {
+                    NamespaceError::TableAlreadyExists {
+                        message: format!("Table already exists at '{}': {:?}", table_uri, e),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!("Failed to create Lance dataset: {:?}", e),
+                    }
+                };
+                lance_core::Error::from(ns_err)
             })?;
 
         Ok(CreateTableResponse {
@@ -2466,7 +2484,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
+            return Err(NamespaceError::TableNotFound {
                 message: format!("Table is already deregistered: {}", table_name),
             }
             .into());
@@ -2759,8 +2777,8 @@ impl LanceNamespace for DirectoryNamespace {
             builder = builder.with_session(sess.clone());
         }
         let mut dataset = builder.load().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to open table at '{}': {}", table_uri, e),
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!("Failed to open table at '{}': {:?}", table_uri, e),
             })
         })?;
 
@@ -2905,16 +2923,36 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to create {} index '{}' on column '{}' for table '{}': {}",
-                        request.index_type,
-                        request.name.as_deref().unwrap_or("<auto-generated>"),
-                        request.column,
-                        table_uri,
-                        e
-                    ),
-                })
+                let err_msg = format!("{}", e);
+                let ns_err = if err_msg.contains("already exists") {
+                    NamespaceError::TableIndexAlreadyExists {
+                        message: format!(
+                            "Index '{}' already exists on table '{}': {:?}",
+                            request.name.as_deref().unwrap_or("<auto-generated>"),
+                            table_uri,
+                            e
+                        ),
+                    }
+                } else if err_msg.contains("not found") || err_msg.contains("does not exist") {
+                    NamespaceError::TableColumnNotFound {
+                        message: format!(
+                            "Column '{}' not found for table '{}': {:?}",
+                            request.column, table_uri, e
+                        ),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!(
+                            "Failed to create {} index '{}' on column '{}' for table '{}': {:?}",
+                            request.index_type,
+                            request.name.as_deref().unwrap_or("<auto-generated>"),
+                            request.column,
+                            table_uri,
+                            e
+                        ),
+                    }
+                };
+                lance_core::Error::from(ns_err)
             })?;
 
         let transaction_id = dataset
@@ -2947,7 +2985,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to describe table indices for '{}': {}", table_uri, e),
+                    message: format!("Failed to describe table indices for '{}': {:?}", table_uri, e),
                 })
             })?
             .into_iter()
@@ -3018,7 +3056,7 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to load index '{}' metadata for table '{}': {}",
                         index_name, table_uri, e
@@ -3035,7 +3073,7 @@ impl LanceNamespace for DirectoryNamespace {
         let stats = <Dataset as DatasetIndexExt>::index_statistics(&dataset, index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to describe index statistics for '{}' on table '{}': {}",
                         index_name, table_uri, e
@@ -3126,7 +3164,7 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to load index '{}' before dropping it from table '{}': {}",
                         index_name, table_uri, e
@@ -3144,7 +3182,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         dataset.drop_index(index_name).await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
+            lance_core::Error::from(NamespaceError::TableIndexNotFound {
                 message: format!(
                     "Failed to drop index '{}' from table '{}': {}",
                     index_name, table_uri, e
@@ -3455,7 +3493,7 @@ impl LanceNamespace for DirectoryNamespace {
                 .count_rows(request.predicate)
                 .await
                 .map_err(|e| NamespaceError::Internal {
-                    message: format!("Failed to count rows for table at '{}': {}", table_uri, e),
+                    message: format!("Failed to count rows for table at '{}': {:?}", table_uri, e),
                 })?;
 
         Ok(count as i64)
@@ -3480,14 +3518,14 @@ impl LanceNamespace for DirectoryNamespace {
         let cursor = Cursor::new(request_data.as_ref());
         let stream_reader =
             StreamReader::try_new(cursor, None).map_err(|e| NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {}", e),
+                message: format!("Invalid Arrow IPC stream: {:?}", e),
             })?;
         let arrow_schema = stream_reader.schema();
 
         let mut batches = Vec::new();
         for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to read batch from IPC stream: {}", e),
+            batches.push(batch_result.map_err(|e| NamespaceError::InvalidInput {
+                message: format!("Failed to read batch from IPC stream: {:?}", e),
             })?);
         }
 
@@ -3531,8 +3569,20 @@ impl LanceNamespace for DirectoryNamespace {
 
         Dataset::write(reader, &table_uri, Some(write_params))
             .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to insert into table at '{}': {}", table_uri, e),
+            .map_err(|e| {
+                let err_msg = format!("{}", e);
+                if err_msg.contains("conflict") || err_msg.contains("CommitConflict") {
+                    NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Concurrent modification on table at '{}': {:?}",
+                            table_uri, e
+                        ),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!("Failed to insert into table at '{}': {:?}", table_uri, e),
+                    }
+                }
             })?;
 
         Ok(InsertIntoTableResponse {
@@ -3600,7 +3650,7 @@ impl LanceNamespace for DirectoryNamespace {
                 scanner
                     .nearest(vector_column, &query_array, k)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid vector search: {}", e),
+                        message: format!("Invalid vector search: {:?}", e),
                     })?;
 
                 // Apply distance type if specified
@@ -3665,14 +3715,14 @@ impl LanceNamespace for DirectoryNamespace {
                     fts = fts
                         .with_columns(columns)
                         .map_err(|e| NamespaceError::InvalidInput {
-                            message: format!("Invalid FTS columns: {}", e),
+                            message: format!("Invalid FTS columns: {:?}", e),
                         })?;
                 }
 
                 scanner
                     .full_text_search(fts)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid full text search: {}", e),
+                        message: format!("Invalid full text search: {:?}", e),
                     })?;
             }
             // Note: structured_query would require more complex parsing
@@ -3687,7 +3737,7 @@ impl LanceNamespace for DirectoryNamespace {
                 scanner
                     .project(column_names)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid column projection: {}", e),
+                        message: format!("Invalid column projection: {:?}", e),
                     })?;
             } else if let Some(ref column_aliases) = columns.column_aliases
                 && !column_aliases.is_empty()
@@ -3705,7 +3755,7 @@ impl LanceNamespace for DirectoryNamespace {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid column alias expression: {}", e),
+                        message: format!("Invalid column alias expression: {:?}", e),
                     })?;
             }
         }
@@ -3717,7 +3767,7 @@ impl LanceNamespace for DirectoryNamespace {
             scanner
                 .filter(filter)
                 .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid filter expression: {}", e),
+                    message: format!("Invalid filter expression: {:?}", e),
                 })?;
         }
 
@@ -3733,7 +3783,7 @@ impl LanceNamespace for DirectoryNamespace {
             let offset = request.offset.map(|o| o as i64);
             scanner.limit(Some(request.k as i64), offset).map_err(|e| {
                 NamespaceError::InvalidInput {
-                    message: format!("Invalid limit/offset: {}", e),
+                    message: format!("Invalid limit/offset: {:?}", e),
                 }
             })?;
         } else if has_vector_query && request.offset.is_some() {
@@ -3742,7 +3792,7 @@ impl LanceNamespace for DirectoryNamespace {
             scanner
                 .limit(None, offset)
                 .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid offset: {}", e),
+                    message: format!("Invalid offset: {:?}", e),
                 })?;
         }
 
@@ -3751,7 +3801,7 @@ impl LanceNamespace for DirectoryNamespace {
             .try_into_batch()
             .await
             .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to execute query: {}", e),
+                message: format!("Failed to execute query: {:?}", e),
             })?;
 
         // Serialize to Arrow IPC file format
@@ -3760,14 +3810,14 @@ impl LanceNamespace for DirectoryNamespace {
         {
             let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to create IPC writer: {}", e),
+                    message: format!("Failed to create IPC writer: {:?}", e),
                 }
             })?;
             writer.write(&batch).map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to write batch to IPC: {}", e),
+                message: format!("Failed to write batch to IPC: {:?}", e),
             })?;
             writer.finish().map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to finish IPC writer: {}", e),
+                message: format!("Failed to finish IPC writer: {:?}", e),
             })?;
         }
 

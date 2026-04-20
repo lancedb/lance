@@ -77,7 +77,7 @@ pub enum ErrorCode {
     /// Table schema validation failed
     TableSchemaValidationError = 20,
     /// Request was throttled due to rate limiting or too many concurrent operations
-    Throttled = 21,
+    Throttling = 21,
 }
 
 impl ErrorCode {
@@ -112,7 +112,7 @@ impl ErrorCode {
             18 => Some(Self::Internal),
             19 => Some(Self::InvalidTableState),
             20 => Some(Self::TableSchemaValidationError),
-            21 => Some(Self::Throttled),
+            21 => Some(Self::Throttling),
             _ => None,
         }
     }
@@ -142,7 +142,7 @@ impl std::fmt::Display for ErrorCode {
             Self::Internal => "Internal",
             Self::InvalidTableState => "InvalidTableState",
             Self::TableSchemaValidationError => "TableSchemaValidationError",
-            Self::Throttled => "Throttled",
+            Self::Throttling => "Throttling",
         };
         write!(f, "{}", name)
     }
@@ -258,8 +258,8 @@ pub enum NamespaceError {
     TableSchemaValidationError { message: String },
 
     /// Request was throttled due to rate limiting or too many concurrent operations.
-    #[snafu(display("Throttled: {message}"))]
-    Throttled { message: String },
+    #[snafu(display("Throttling: {message}"))]
+    Throttling { message: String },
 }
 
 impl NamespaceError {
@@ -291,7 +291,7 @@ impl NamespaceError {
             | Self::Internal { message }
             | Self::InvalidTableState { message }
             | Self::TableSchemaValidationError { message }
-            | Self::Throttled { message } => message,
+            | Self::Throttling { message } => message,
         }
     }
 
@@ -321,7 +321,7 @@ impl NamespaceError {
             Self::Internal { .. } => ErrorCode::Internal,
             Self::InvalidTableState { .. } => ErrorCode::InvalidTableState,
             Self::TableSchemaValidationError { .. } => ErrorCode::TableSchemaValidationError,
-            Self::Throttled { .. } => ErrorCode::Throttled,
+            Self::Throttling { .. } => ErrorCode::Throttling,
         }
     }
 
@@ -354,7 +354,7 @@ impl NamespaceError {
             Some(ErrorCode::TableSchemaValidationError) => {
                 Self::TableSchemaValidationError { message }
             }
-            Some(ErrorCode::Throttled) => Self::Throttled { message },
+            Some(ErrorCode::Throttling) => Self::Throttling { message },
             None => Self::Internal { message },
         }
     }
