@@ -577,19 +577,20 @@ impl DataCache for StandaloneMemoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
 
     fn key(file_id: u64, offset: u64) -> DataCacheKey {
         DataCacheKey { file_id, offset }
     }
 
+    /// Verifies the default shard count matches DEFAULT_NUM_SHARDS.
     #[test]
     fn test_default_shard_count() {
         let cache = MemoryCache::new(1024 * 1024);
         assert_eq!(cache.shards.len(), DEFAULT_NUM_SHARDS);
     }
 
+    /// Verifies shard count and mask are set correctly for all valid power-of-two counts.
     #[test]
     fn test_custom_shard_count_power_of_two() {
         for &n in &[1usize, 2, 4, 8, 32, 64] {
@@ -599,18 +600,21 @@ mod tests {
         }
     }
 
+    /// Construction must panic if num_shards is not a power of two.
     #[test]
     #[should_panic(expected = "power of two")]
     fn test_non_power_of_two_shards_panics() {
         MemoryCache::new_with_shards(1024 * 1024, 3);
     }
 
+    /// Construction must panic if num_shards is zero.
     #[test]
     #[should_panic(expected = "positive")]
     fn test_zero_shards_panics() {
         MemoryCache::new_with_shards(1024 * 1024, 0);
     }
 
+    /// Smoke test for single-shard mode: a miss loads and a subsequent request hits.
     #[tokio::test]
     async fn test_single_shard_cache_works() {
         let cache = MemoryCache::new_with_shards(10 * 1024 * 1024, 1);
@@ -632,6 +636,8 @@ mod tests {
         assert_eq!(cache.stats().hits, 1);
     }
 
+    /// First request misses and invokes the loader; second request hits and
+    /// returns the cached value without calling the loader again.
     #[tokio::test]
     async fn test_basic_hit_and_miss() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
@@ -668,6 +674,8 @@ mod tests {
         assert_eq!(stats.misses, 1);
     }
 
+    /// Eight concurrent requests for the same key must trigger the loader exactly
+    /// once — all waiters coalesce on the in-flight load.
     #[tokio::test]
     async fn test_load_deduplication() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
@@ -700,6 +708,8 @@ mod tests {
         assert_eq!(load_count.load(Ordering::Relaxed), 1);
     }
 
+    /// A failed load removes the entry so the next request can retry with a
+    /// fresh loader instead of being stuck with a permanent error.
     #[tokio::test]
     async fn test_loader_failure_allows_retry() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
@@ -725,17 +735,25 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"retry ok"));
     }
 
+    /// Verifies that the cache evicts entries when memory is full.
+    /// Loads 2x the cache capacity and checks that eviction fired
+    /// and memory stayed bounded.
     #[tokio::test]
     async fn test_eviction_under_pressure() {
-        let cache = MemoryCache::new_with_shards(4 * 1024 * 1024, 1);
-        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let cache_cap = 4 * 1024 * 1024;
+        let entry_size = 1024 * 1024;
+        // Load 2x the cache capacity — eviction must fire to keep memory bounded.
+        let num_entries = 8u64;
 
-        for i in 0..8u64 {
+        let cache = MemoryCache::new_with_shards(cache_cap, 1);
+        let chunk = Bytes::from(vec![0u8; entry_size]);
+
+        for i in 0..num_entries {
             let data = chunk.clone();
             cache
                 .get_or_load(
                     key(3, i),
-                    chunk.len() as u64,
+                    entry_size as u64,
                     Box::pin(async move { Ok(data) }),
                 )
                 .await
@@ -743,14 +761,16 @@ mod tests {
         }
 
         let stats = cache.stats();
+        assert!(stats.evictions > 0, "expected at least one eviction");
         assert!(
             stats.current_bytes <= stats.max_bytes * 2,
             "cache grew too large: {} bytes",
             stats.current_bytes
         );
-        assert!(stats.evictions > 0, "expected at least one eviction");
     }
 
+    /// When max_bytes is 0 the cache is disabled — every call invokes the
+    /// loader directly with no caching or deduplication.
     #[tokio::test]
     async fn test_disabled_cache_bypasses() {
         let cache = MemoryCache::new(0);
@@ -774,6 +794,10 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 
+    /// Three-phase lifecycle test:
+    /// 1. Fill the cache to exactly capacity.
+    /// 2. Re-request the same keys — all should hit, memory must stay bounded.
+    /// 3. Request new keys beyond capacity — eviction must fire to make room.
     #[tokio::test]
     async fn test_replace_hits_and_evictions() {
         let cap = 4 * 1024 * 1024u64;
@@ -830,6 +854,9 @@ mod tests {
         assert!(stats2.evictions > 0, "expected evictions beyond capacity");
     }
 
+    /// Guards against u64 underflow in total_bytes. If eviction double-subtracts,
+    /// total_bytes wraps to near u64::MAX (~18 exabytes). Loads 8x capacity to
+    /// maximise eviction pressure and asserts the counter stayed sane.
     #[tokio::test]
     async fn test_accounting_invariant_under_eviction() {
         let cap = 2 * 1024 * 1024u64;
@@ -858,59 +885,72 @@ mod tests {
         assert!(stats.evictions > 0, "expected evictions to fire");
     }
 
+    /// When the exclusive loader fails, all concurrent waiters receive the error
+    /// via the watch channel. A subsequent request after the failure succeeds.
     #[tokio::test]
     async fn test_concurrent_waiters_see_failure_and_retry() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
         let k = key(5, 0);
-        let load_count = Arc::new(AtomicUsize::new(0));
 
-        let first_call_done = Arc::new(AtomicBool::new(false));
-        let barrier = Arc::new(tokio::sync::Barrier::new(8));
-        let mut handles = Vec::new();
+        let (loading_tx, loading_rx) = tokio::sync::oneshot::channel::<()>();
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
 
-        for _ in 0..8usize {
-            let cache = cache.clone();
+        // Spawn the exclusive loader first and wait for it to signal it has started.
+        let cache_clone = cache.clone();
+        let k_clone = k.clone();
+        let exclusive = tokio::spawn(async move {
+            cache_clone
+                .get_or_load(
+                    k_clone,
+                    2,
+                    Box::pin(async move {
+                        loading_tx.send(()).ok(); // entry is in ring, load is in-flight
+                        fail_rx.await.ok(); // hold until test releases the failure
+                        Err(lance_core::Error::io("injected failure".to_string()))
+                    }),
+                )
+                .await
+        });
+
+        // Wait until the exclusive load is registered before spawning waiters.
+        loading_rx.await.ok();
+
+        // Spawn 7 waiters — all will subscribe to the Loading watch channel.
+        // Their loaders must never be called (deduplication guarantee).
+        let mut waiter_handles = Vec::new();
+        for _ in 0..7 {
+            let c = cache.clone();
             let k = k.clone();
-            let lc = load_count.clone();
-            let bar = barrier.clone();
-            let first = first_call_done.clone();
-
-            handles.push(tokio::spawn(async move {
-                bar.wait().await;
-                cache
-                    .get_or_load(
-                        k,
-                        2,
-                        Box::pin(async move {
-                            let call_idx = lc.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                            if call_idx == 0 {
-                                first.store(true, Ordering::SeqCst);
-                                Err(lance_core::Error::io("injected failure".to_string()))
-                            } else {
-                                Ok(Bytes::from_static(b"ok"))
-                            }
-                        }),
-                    )
-                    .await
+            waiter_handles.push(tokio::spawn(async move {
+                c.get_or_load(
+                    k,
+                    2,
+                    Box::pin(async { panic!("waiter loader must not run") }),
+                )
+                .await
             }));
         }
 
-        let results: Vec<_> = futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .map(|h| h.unwrap())
-            .collect();
+        // Yield once so all 7 waiters run their synchronous setup (find_or_create +
+        // subscribe) and park at rx.changed().await before the failure fires.
+        // This is deterministic on the default single-threaded tokio runtime.
+        tokio::task::yield_now().await;
+
+        // Release the exclusive loader to fail.
+        fail_tx.send(()).ok();
 
         assert!(
-            first_call_done.load(Ordering::SeqCst),
-            "first loader never ran"
+            exclusive.await.unwrap().is_err(),
+            "exclusive loader should propagate the error"
         );
-        assert!(
-            results.iter().all(|r| r.is_err()),
-            "all tasks should get an error when the exclusive load fails"
-        );
+        for h in waiter_handles {
+            assert!(
+                h.await.unwrap().is_err(),
+                "all waiters should see the failure"
+            );
+        }
 
+        // A fresh request after cleanup must succeed.
         let bytes = cache
             .get_or_load(k, 5, Box::pin(async { Ok(Bytes::from_static(b"fresh")) }))
             .await
@@ -918,6 +958,8 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"fresh"));
     }
 
+    /// 8 workers hammer a small key space for 500 ms. Verifies hits and misses
+    /// both occur and memory never exceeds the cap under concurrent eviction.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_fuzz_concurrent_access() {
         use rand::Rng;
@@ -965,6 +1007,8 @@ mod tests {
         );
     }
 
+    /// Verifies hits, misses, and current_bytes counters are exact after
+    /// N requests where only the first is a miss.
     #[tokio::test]
     async fn test_stats_accounting() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
@@ -992,6 +1036,8 @@ mod tests {
         assert_eq!(stats.current_bytes, 1);
     }
 
+    /// 8 threads concurrently insert unique keys into a small cache, forcing
+    /// continuous eviction. Checks that total_bytes never wraps (u64 underflow).
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_total_bytes_no_underflow_under_concurrent_eviction() {
         let cap = 512 * 1024u64;
@@ -1035,13 +1081,17 @@ mod tests {
         );
     }
 
+    /// Eviction sweep must not crash or double-count when the only ring entry
+    /// is still Loading (data_size == 0). Verifies accounting stays sane after
+    /// the load completes.
     #[tokio::test]
     async fn test_eviction_graceful_when_all_entries_loading() {
         let cap = 128 * 1024u64;
         let entry_size = 128 * 1024u64;
         let cache = Arc::new(MemoryCache::new(cap));
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let cache_clone = cache.clone();
 
         let loading = tokio::spawn(async move {
@@ -1050,7 +1100,8 @@ mod tests {
                     key(99, 0),
                     entry_size,
                     Box::pin(async move {
-                        rx.await.ok();
+                        started_tx.send(()).ok(); // entry is now in the ring
+                        release_rx.await.ok();
                         Ok(Bytes::from(vec![0u8; entry_size as usize]))
                     }),
                 )
@@ -1058,7 +1109,9 @@ mod tests {
                 .unwrap();
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Wait until the Loading entry is registered in the ring before inserting
+        // the second entry that triggers eviction. No sleep needed.
+        started_rx.await.ok();
 
         let data = Bytes::from(vec![1u8; entry_size as usize]);
         let _ = cache
@@ -1070,13 +1123,15 @@ mod tests {
             .await
             .unwrap();
 
-        tx.send(()).ok();
+        release_tx.send(()).ok();
         loading.await.unwrap();
 
         let one_tib = 1u64 << 40;
         assert!(cache.stats().current_bytes < one_tib);
     }
 
+    /// Eviction must skip size-0 entries (Loading or stale-evicted) and must
+    /// not double-account their bytes when they eventually complete.
     #[tokio::test]
     async fn test_eviction_skips_zero_size_entries() {
         let cap = 256 * 1024u64;
@@ -1118,6 +1173,8 @@ mod tests {
         assert!(cache.stats().evictions > 0);
     }
 
+    /// After sustained pressure (32x capacity), memory must converge to within
+    /// 2x cap — the batched eviction policy must not let the cache grow unboundedly.
     #[tokio::test]
     async fn test_eviction_converges_to_cap() {
         let cap = 1024 * 1024u64;
@@ -1152,6 +1209,7 @@ mod tests {
         assert!(stats.evictions > 0);
     }
 
+    /// A cache miss invokes the loader exactly once and records one miss, zero hits.
     #[tokio::test]
     async fn test_find_miss() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
@@ -1180,6 +1238,8 @@ mod tests {
         assert_eq!(cache.stats().hits, 0);
     }
 
+    /// A cache hit returns the exact same bytes (same Arc pointer) as the
+    /// original load — no copy, no data corruption.
     #[tokio::test]
     async fn test_find_hit_data_integrity() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
@@ -1218,6 +1278,8 @@ mod tests {
         assert_eq!(cache.stats().hits, 1);
     }
 
+    /// Verifies all stats fields (hits, misses, max_bytes, current_bytes) are
+    /// exact after a known load + hit pattern.
     #[tokio::test]
     async fn test_cache_stats_fields() {
         let cache = MemoryCache::new_with_shards(2 * 1024 * 1024, 1);
@@ -1254,6 +1316,9 @@ mod tests {
         assert_eq!(stats.current_bytes, 4 * entry_size, "current_bytes");
     }
 
+    /// While one task holds the exclusive load in-flight, a second task must
+    /// wait on the watch channel and receive the same bytes without calling its
+    /// own loader. Both results must point to the same Arc (zero-copy).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_exclusive_to_shared_transition() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
