@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use lance_core::Result;
@@ -91,6 +91,9 @@ impl RegionTracker {
     }
 }
 
+/// Output of `pack_region`: file offset, coalesced buffer, per-entry descriptors, next entry index.
+type PackedRegion = (u64, Vec<u8>, Vec<(usize, SsdRun)>, usize);
+
 struct SsdFileState {
     entries: HashMap<DataCacheKey, SsdRun>,
     region_sizes: Vec<u32>,
@@ -120,7 +123,12 @@ impl SsdFileState {
         }
     }
 
-    fn grow_or_evict(&mut self, file: &std::fs::File, max_regions: u32, region_pins: &[AtomicU32]) -> std::io::Result<bool> {
+    fn grow_or_evict(
+        &mut self,
+        file: &std::fs::File,
+        max_regions: u32,
+        region_pins: &[AtomicU32],
+    ) -> std::io::Result<bool> {
         if self.num_regions < max_regions {
             let new_len = (self.num_regions + 1) as u64 * REGION_SIZE;
             file.set_len(new_len)?;
@@ -168,7 +176,6 @@ impl SsdFileState {
         Ok(true)
     }
 
-    #[allow(clippy::type_complexity)]
     fn pack_region(
         &mut self,
         entries: &[(DataCacheKey, Bytes)],
@@ -176,7 +183,7 @@ impl SsdFileState {
         file: &std::fs::File,
         max_regions: u32,
         region_pins: &[AtomicU32],
-    ) -> std::io::Result<Option<(u64, Vec<u8>, Vec<(usize, SsdRun)>, usize)>> {
+    ) -> std::io::Result<Option<PackedRegion>> {
         loop {
             while self.writable_regions.is_empty() {
                 if !self.grow_or_evict(file, max_regions, region_pins)? {
@@ -355,7 +362,13 @@ impl SsdFile {
         while i < entries.len() {
             let (file_offset, buf, runs, next_i) = {
                 let mut state = self.state.write().unwrap();
-                match state.pack_region(&entries, i, &self.file, self.max_regions, &self.region_pins)? {
+                match state.pack_region(
+                    &entries,
+                    i,
+                    &self.file,
+                    self.max_regions,
+                    &self.region_pins,
+                )? {
                     Some(r) => r,
                     None => return Ok(()),
                 }

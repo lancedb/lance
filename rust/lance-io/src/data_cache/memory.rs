@@ -47,6 +47,9 @@ enum LoadState {
     Failed,
 }
 
+/// Return type of `find_or_create`: (entry, is_new, total_bytes, evicted).
+type FindOrCreateResult = (Arc<CacheEntry>, bool, u64, Vec<(DataCacheKey, Bytes, u32)>);
+
 struct CacheEntry {
     key: DataCacheKey,
     state_tx: watch::Sender<LoadState>,
@@ -203,10 +206,10 @@ impl CacheShardInner {
             }
 
             if self.entries.remove(&entry.key).is_some() {
-                    let num_uses = entry.num_uses.load(Ordering::Relaxed);
-                    if let LoadState::Loaded(bytes) = entry.state_tx.borrow().clone() {
-                        evicted.push((entry.key.clone(), bytes, num_uses));
-                    }
+                let num_uses = entry.num_uses.load(Ordering::Relaxed);
+                if let LoadState::Loaded(bytes) = entry.state_tx.borrow().clone() {
+                    evicted.push((entry.key.clone(), bytes, num_uses));
+                }
                 entry.data_size.store(0, Ordering::Relaxed);
                 self.ring_evict_slot(idx);
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(size);
@@ -242,11 +245,7 @@ impl CacheShard {
         }
     }
 
-    fn find_or_create(
-        &self,
-        key: &DataCacheKey,
-        min_size: u64,
-    ) -> (Arc<CacheEntry>, bool, u64, Vec<(DataCacheKey, Bytes, u32)>) {
+    fn find_or_create(&self, key: &DataCacheKey, min_size: u64) -> FindOrCreateResult {
         let mut inner = self.inner.lock().unwrap();
 
         if let Some(entry) = inner.entries.get(key).cloned() {

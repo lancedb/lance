@@ -588,9 +588,9 @@ impl ScanScheduler {
     /// # Arguments
     ///
     /// * path - the path to the file to open
-    /// * base_priority - the base priority for I/O requests submitted to this file scheduler
-    /// this will determine the upper 64 bits of priority (the lower 64 bits
-    /// come from `submit_request` and `submit_single`)
+    /// * base_priority - the base priority for I/O requests submitted to this file scheduler;
+    ///   this will determine the upper 64 bits of priority (the lower 64 bits
+    ///   come from `submit_request` and `submit_single`)
     pub async fn open_file_with_priority(
         self: &Arc<Self>,
         path: &Path,

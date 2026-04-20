@@ -13,7 +13,9 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lance_io::data_cache::{DataCacheConfig, TieredDataCache, ssd};
+#[cfg(unix)]
+use lance_io::data_cache::ssd;
+use lance_io::data_cache::{DataCacheConfig, TieredDataCache};
 
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
@@ -75,7 +77,10 @@ async fn test_cache_hit_rate_on_repeated_scans() {
         ssd_enabled: false,
         ssd_cache_dir: None,
         ssd_max_bytes: 0,
+        #[cfg(unix)]
         ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
+        #[cfg(not(unix))]
+        ssd_num_shards: 4,
         verify: false,
         ssd_crc32_enabled: false,
     };
@@ -160,7 +165,10 @@ async fn test_cache_data_integrity_across_scans() {
         ssd_enabled: false,
         ssd_cache_dir: None,
         ssd_max_bytes: 0,
+        #[cfg(unix)]
         ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
+        #[cfg(not(unix))]
+        ssd_num_shards: 4,
         verify: false,
         ssd_crc32_enabled: false,
     };
