@@ -157,7 +157,7 @@ impl CacheShardInner {
         self.eviction_threshold = scores.get(idx).copied().unwrap_or(0);
     }
 
-    fn evict(&mut self, target_bytes: u64) -> (u64, Vec<(DataCacheKey, Bytes)>) {
+    fn evict(&mut self, target_bytes: u64) -> (u64, Vec<(DataCacheKey, Bytes, u32)>) {
         let n = self.dense_ring.len();
         if n == 0 {
             return (0, Vec::new());
@@ -167,7 +167,7 @@ impl CacheShardInner {
         let mut freed = 0u64;
         let mut counter = 0usize;
         let mut num_checked = 0usize;
-        let mut evicted: Vec<(DataCacheKey, Bytes)> = Vec::new();
+        let mut evicted: Vec<(DataCacheKey, Bytes, u32)> = Vec::new();
 
         while counter < n {
             let idx = self.clock_hand % n;
@@ -203,9 +203,10 @@ impl CacheShardInner {
             }
 
             if self.entries.remove(&entry.key).is_some() {
-                if let LoadState::Loaded(bytes) = entry.state_tx.borrow().clone() {
-                    evicted.push((entry.key.clone(), bytes));
-                }
+                    let num_uses = entry.num_uses.load(Ordering::Relaxed);
+                    if let LoadState::Loaded(bytes) = entry.state_tx.borrow().clone() {
+                        evicted.push((entry.key.clone(), bytes, num_uses));
+                    }
                 entry.data_size.store(0, Ordering::Relaxed);
                 self.ring_evict_slot(idx);
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(size);
@@ -245,7 +246,7 @@ impl CacheShard {
         &self,
         key: &DataCacheKey,
         min_size: u64,
-    ) -> (Arc<CacheEntry>, bool, u64, Vec<(DataCacheKey, Bytes)>) {
+    ) -> (Arc<CacheEntry>, bool, u64, Vec<(DataCacheKey, Bytes, u32)>) {
         let mut inner = self.inner.lock().unwrap();
 
         if let Some(entry) = inner.entries.get(key).cloned() {
@@ -311,7 +312,7 @@ impl CacheShard {
 }
 
 pub trait EvictionSink: Send + Sync + std::fmt::Debug {
-    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes)>, total_cache_bytes: u64);
+    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes, u32)>, total_cache_bytes: u64);
 }
 
 #[derive(Debug, Default, Clone)]

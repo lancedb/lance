@@ -192,6 +192,12 @@ struct SsdWriter {
 #[cfg(unix)]
 const MAX_WRITE_RATIO: usize = 70;
 
+/// Minimum number of L1 hits an entry must have accumulated before it is
+/// eligible to be written to the SSD tier on eviction.  Entries below this
+/// threshold are one-hit wonders and are dropped rather than polluting SSD.
+#[cfg(unix)]
+const SSD_MIN_HITS: u32 = 3;
+
 #[cfg(unix)]
 impl SsdWriter {
     fn new(ssd: Arc<SsdCache>) -> Arc<Self> {
@@ -210,7 +216,7 @@ impl SsdWriter {
 
 #[cfg(unix)]
 impl memory::EvictionSink for SsdWriter {
-    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes)>, _total_cache_bytes: u64) {
+    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes, u32)>, _total_cache_bytes: u64) {
         if self
             .write_in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -219,8 +225,22 @@ impl memory::EvictionSink for SsdWriter {
             return;
         }
 
-        let max = (entries.len() * MAX_WRITE_RATIO / 100).max(1);
-        let batch: Vec<_> = entries.into_iter().take(max).collect();
+        // Only admit entries that have been accessed at least SSD_MIN_HITS times.
+        // Entries below the threshold are one-hit wonders and are dropped to
+        // prevent scan-once data from polluting the SSD tier.
+        let admitted: Vec<(DataCacheKey, Bytes)> = entries
+            .into_iter()
+            .filter(|(_, _, num_uses)| *num_uses >= SSD_MIN_HITS)
+            .map(|(key, bytes, _)| (key, bytes))
+            .collect();
+
+        let max = (admitted.len() * MAX_WRITE_RATIO / 100).max(1);
+        let batch: Vec<_> = admitted.into_iter().take(max).collect();
+
+        if batch.is_empty() {
+            self.write_in_progress.store(false, Ordering::Release);
+            return;
+        }
 
         let ssd = self.ssd.clone();
         let flag = self.write_in_progress.clone();
@@ -652,8 +672,36 @@ mod tests {
         let path = Path::from("s3://bucket/data.lance");
         let entry_size = 1024 * 1024u64;
         let n_load = 6u64;
-
-        for i in 0..n_load {
+        // L1 holds 2 entries (2 MiB limit, 1 MiB each). Load them first, then
+        // re-access enough times to reach SSD_MIN_HITS, then overflow L1 so the
+        // hot entries are evicted and admitted to SSD.
+        let l1_capacity = 2u64;
+        for i in 0..l1_capacity {
+            let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
+            cache
+                .get_or_load(
+                    &path,
+                    i * entry_size,
+                    entry_size,
+                    Box::pin(async move { Ok(data) }),
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..(SSD_MIN_HITS - 1) {
+            for i in 0..l1_capacity {
+                cache
+                    .get_or_load(
+                        &path,
+                        i * entry_size,
+                        entry_size,
+                        Box::pin(async { panic!("must hit L1") }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for i in l1_capacity..n_load {
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
             cache
                 .get_or_load(
@@ -720,7 +768,35 @@ mod tests {
             let cache = TieredDataCache::new(&config).await.unwrap();
             let path = Path::from("s3://bucket/data.lance");
 
-            for i in 0..4u64 {
+            // L1 holds 2 entries (128 KiB / 64 KiB). Load them, re-hit enough
+            // times to reach SSD_MIN_HITS, then overflow so they spill to SSD.
+            let l1_capacity = 2u64;
+            for i in 0..l1_capacity {
+                let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
+                cache
+                    .get_or_load(
+                        &path,
+                        i * entry_size,
+                        entry_size,
+                        Box::pin(async move { Ok(data) }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..(SSD_MIN_HITS - 1) {
+                for i in 0..l1_capacity {
+                    cache
+                        .get_or_load(
+                            &path,
+                            i * entry_size,
+                            entry_size,
+                            Box::pin(async { panic!("must hit L1") }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            for i in l1_capacity..4u64 {
                 let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
                 cache
                     .get_or_load(
@@ -801,7 +877,35 @@ mod tests {
             let cache = TieredDataCache::new(&config).await.unwrap();
             let path = Path::from("s3://bucket/data.lance");
 
-            for i in 0..4u64 {
+            // L1 holds 2 entries (128 KiB / 64 KiB). Load them, re-hit enough
+            // times to reach SSD_MIN_HITS, then overflow so they spill to SSD.
+            let l1_capacity = 2u64;
+            for i in 0..l1_capacity {
+                let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
+                cache
+                    .get_or_load(
+                        &path,
+                        i * entry_size,
+                        entry_size,
+                        Box::pin(async move { Ok(data) }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..(SSD_MIN_HITS - 1) {
+                for i in 0..l1_capacity {
+                    cache
+                        .get_or_load(
+                            &path,
+                            i * entry_size,
+                            entry_size,
+                            Box::pin(async { panic!("must hit L1") }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            for i in l1_capacity..4u64 {
                 let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
                 cache
                     .get_or_load(
