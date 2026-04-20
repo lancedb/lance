@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_index::{IndexParams, IndexType, optimize::OptimizeOptions};
+use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
 use lance_table::format::IndexMetadata;
 
 use crate::{Error, Result};
@@ -49,6 +49,17 @@ pub trait DatasetIndexExt {
     ///
     /// This will load the index into memory and cache it.
     async fn prewarm_index(&self, name: &str) -> Result<()>;
+
+    /// Prewarm an index by name with additional options.
+    async fn prewarm_index_with_options(
+        &self,
+        _name: &str,
+        _options: &PrewarmOptions,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "prewarm options are not supported by this dataset implementation".to_owned(),
+        ))
+    }
 
     /// Read all indices of this Dataset version.
     ///

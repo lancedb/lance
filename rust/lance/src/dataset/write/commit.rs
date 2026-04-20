@@ -404,6 +404,7 @@ impl<'a> CommitBuilder<'a> {
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
+                    base_store_params: None,
                 })
             }
         }
@@ -486,8 +487,8 @@ mod tests {
             id: 0,
             files: vec![DataFile {
                 path: "file.lance".to_string(),
-                fields: vec![0],
-                column_indices: vec![0],
+                fields: Arc::from([0]),
+                column_indices: Arc::from([0]),
                 file_major_version: major_version,
                 file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),

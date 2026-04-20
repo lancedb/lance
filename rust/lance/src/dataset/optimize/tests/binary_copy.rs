@@ -566,11 +566,13 @@ async fn test_can_use_binary_copy_schema_mismatch() {
         .collect();
     // Introduce a column index mismatch in the first data file
     if let Some(df) = frags.get_mut(0).and_then(|f| f.files.get_mut(0)) {
-        if let Some(first) = df.column_indices.get_mut(0) {
+        let mut indices = df.column_indices.to_vec();
+        if let Some(first) = indices.get_mut(0) {
             *first = -*first - 1;
         } else {
-            df.column_indices.push(-1);
+            indices.push(-1);
         }
+        df.column_indices = indices.into();
     }
     assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 

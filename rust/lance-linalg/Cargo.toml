@@ -62,5 +62,9 @@ harness = false
 name = "norm_l2"
 harness = false
 
+[[bench]]
+name = "dist_table"
+harness = false
+
 [lints]
 workspace = true

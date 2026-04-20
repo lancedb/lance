@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "5.0.0-beta.6"
+version = "6.0.0-beta.1"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 arrow = { version = "57.0.0", features = ["pyarrow"] }
 arrow-array = "57.0.0"
+arrow-cast = "57.0.0"
 arrow-data = "57.0.0"
 arrow-schema = "57.0.0"
 object_store = "0.12.4"

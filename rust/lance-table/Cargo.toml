@@ -72,5 +72,9 @@ features = ["protoc"]
 name = "row_id_index"
 harness = false
 
+[[bench]]
+name = "manifest_intern"
+harness = false
+
 [lints]
 workspace = true

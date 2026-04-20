@@ -63,15 +63,20 @@ impl DatasetPreFilter {
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
-        if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
+        let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
+        if !all_have_bitmaps {
             fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
             });
         }
-        let deleted_ids =
-            Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
+        let deleted_ids = if all_have_bitmaps {
+            Self::create_restricted_deletion_mask(dataset, fragments)
+        } else {
+            Self::create_deletion_mask(dataset, fragments)
+        }
+        .map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
@@ -186,18 +191,42 @@ impl DatasetPreFilter {
         self.deleted_fragments = Some(fragments);
     }
 
-    /// Creates a task to load mask to filter out deleted rows.
+    /// Creates a task to load a mask that filters out deleted rows and,
+    /// when `restrict_to_fragments` is true, also restricts results to only
+    /// the given `fragments`.
     ///
-    /// Sometimes this will be a block list of row ids that are deleted, based
-    /// on the deletion files in the fragments. If stable row ids are used and
-    /// there are missing fragments, this may instead be an allow list, since
-    /// we can't easily compute the block list.
+    /// The fragment restriction blocks stale index entries from fragments
+    /// whose data changed but whose index was not rewritten. It should be
+    /// enabled when `fragments` represents a real index fragment bitmap. It
+    /// should be disabled when `fragments` is a conservative fallback (e.g.
+    /// when the index has no fragment bitmap).
     ///
-    /// If it can be synchronously determined that there are no missing row ids then
-    /// this function return None
+    /// The deletion mask is built as a block list (from deletion files) or
+    /// an allow list (when stable row ids are in use and fragments have
+    /// been removed).
+    ///
+    /// Returns `None` if it can be synchronously determined that no
+    /// filtering is needed.
     pub fn create_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+        Self::create_deletion_mask_impl(dataset, fragments, false)
+    }
+
+    /// Like [`create_deletion_mask`] but also restricts results to the given
+    /// `fragments`, blocking any row from a fragment not in the set.
+    pub fn create_restricted_deletion_mask(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+        Self::create_deletion_mask_impl(dataset, fragments, true)
+    }
+
+    fn create_deletion_mask_impl(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        restrict_to_fragments: bool,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
@@ -208,6 +237,16 @@ impl DatasetPreFilter {
                 .iter()
                 .map(|frag| (frag.id as u32, frag)),
         );
+        // When restrict_to_fragments is set, check if the dataset has fragments
+        // outside the index bitmap. This can happen when a fragment's data was
+        // modified but the index was not rewritten (e.g. after DataReplacement
+        // or partial merge_insert).
+        let needs_allow_list = if restrict_to_fragments {
+            let dataset_frag_ids: RoaringBitmap = frag_map.keys().copied().collect();
+            !dataset_frag_ids.is_subset(&fragments)
+        } else {
+            false
+        };
         for frag_id in fragments.iter() {
             let frag = frag_map.get(&frag_id);
             if let Some(frag) = frag {
@@ -218,15 +257,40 @@ impl DatasetPreFilter {
                 missing_frags.push(frag_id);
             }
         }
-        if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
+        if missing_frags.is_empty() && frags_with_deletion_files.is_empty() && !needs_allow_list {
             None
         } else if dataset.manifest.uses_stable_row_ids() {
             Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
+        } else if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
+            // No deletions to load, but the dataset has fragments outside the
+            // index bitmap. Return a synchronous allow-list mask.
+            let mut allow_list = RowAddrTreeMap::new();
+            for frag_id in fragments.iter() {
+                allow_list.insert_fragment(frag_id);
+            }
+            Some(async move { Ok(Arc::new(RowAddrMask::from_allowed(allow_list))) }.boxed())
         } else {
-            Some(
-                Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files)
+            // There are deletions/missing frags. Build the deletion mask and
+            // optionally combine it with the fragment allow-list.
+            let fut =
+                Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files);
+            if needs_allow_list {
+                Some(
+                    async move {
+                        let deletion_mask = fut.await?;
+                        let mut allow_list = RowAddrTreeMap::new();
+                        for frag_id in fragments.iter() {
+                            allow_list.insert_fragment(frag_id);
+                        }
+                        Ok(Arc::new(
+                            (*deletion_mask).clone() & RowAddrMask::from_allowed(allow_list),
+                        ))
+                    }
                     .boxed(),
-            )
+                )
+            } else {
+                Some(fut.boxed())
+            }
         }
     }
 }

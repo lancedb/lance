@@ -62,17 +62,18 @@ use super::{
     builder::{InnerBuilder, PositionRecorder},
     iter::CompressedPostingListIterator,
 };
-use crate::Index;
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
+use crate::scalar::inverted::document_tokenizer::TextTokenizer;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
+use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
@@ -761,20 +762,8 @@ impl Index for InvertedIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let io_parallelism = self.store.io_parallelism();
-        let prewarm_futures = self
-            .partitions
-            .iter()
-            .map(Arc::clone)
-            .map(|part| async move {
-                part.inverted_list.prewarm().await?;
-                Result::Ok(())
-            });
-        stream::iter(prewarm_futures)
-            .buffer_unordered(io_parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(())
+        self.prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
     }
 
     fn index_type(&self) -> crate::IndexType {
@@ -787,6 +776,25 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
+    pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
+        let with_position = options.with_position;
+        let io_parallelism = self.store.io_parallelism();
+        let prewarm_futures = self
+            .partitions
+            .iter()
+            .map(Arc::clone)
+            .map(|part| async move {
+                part.inverted_list
+                    .prewarm_posting_lists(with_position)
+                    .await?;
+                Result::Ok(())
+            });
+        stream::iter(prewarm_futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
@@ -1670,7 +1678,7 @@ impl PostingListReader {
             .as_ref()
             .clone();
 
-        if is_phrase_query {
+        if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
             let positions = self.read_positions(token_id).await?;
             posting.set_positions(positions);
@@ -1684,9 +1692,15 @@ impl PostingListReader {
         max_score: Option<f32>,
         length: Option<u32>,
         posting_tail_codec: PostingTailCodec,
+        positions_layout: PositionsLayout,
     ) -> Result<PostingList> {
-        let posting_list =
-            PostingList::from_batch_with_tail_codec(batch, max_score, length, posting_tail_codec)?;
+        let posting_list = PostingList::from_batch_with_tail_codec_and_positions_layout(
+            batch,
+            max_score,
+            length,
+            posting_tail_codec,
+            positions_layout,
+        )?;
         Ok(posting_list)
     }
 
@@ -1704,6 +1718,7 @@ impl PostingListReader {
                 .as_ref()
                 .map(|lengths| lengths[token_id as usize]),
             self.posting_tail_codec,
+            self.positions_layout,
         )
     }
 
@@ -1713,6 +1728,7 @@ impl PostingListReader {
         max_scores: Option<Vec<f32>>,
         lengths: Option<Vec<u32>>,
         posting_tail_codec: PostingTailCodec,
+        positions_layout: PositionsLayout,
     ) -> Result<Vec<(u32, PostingList)>> {
         let token_count = if let Some(offsets) = offsets.as_ref() {
             offsets.len()
@@ -1741,6 +1757,7 @@ impl PostingListReader {
                 max_scores.as_ref().map(|scores| scores[token_id]),
                 lengths.as_ref().map(|lengths| lengths[token_id]),
                 posting_tail_codec,
+                positions_layout,
             )?;
             posting_lists.push((token_id as u32, posting_list));
         }
@@ -1748,9 +1765,15 @@ impl PostingListReader {
         Ok(posting_lists)
     }
 
-    async fn prewarm(&self) -> Result<()> {
+    async fn prewarm_posting_lists(&self, with_position: bool) -> Result<()> {
+        if with_position && !self.has_positions() {
+            return Err(Error::invalid_input(
+                "cannot prewarm positions for an inverted index that was built without positions; recreate the index with with_position=true".to_owned(),
+            ));
+        }
+
         let read_batch_start = Instant::now();
-        let batch = self.read_batch(false).await?;
+        let batch = self.read_batch(with_position).await?;
         let read_batch_elapsed = read_batch_start.elapsed();
 
         let legacy_layout = self.offsets.is_some();
@@ -1758,6 +1781,7 @@ impl PostingListReader {
         let max_scores = self.max_scores.clone();
         let lengths = self.lengths.clone();
         let posting_tail_codec = self.posting_tail_codec;
+        let positions_layout = self.positions_layout;
         let populate_start = Instant::now();
         let posting_lists = spawn_blocking(move || {
             Self::build_prewarm_posting_lists(
@@ -1766,6 +1790,7 @@ impl PostingListReader {
                 max_scores,
                 lengths,
                 posting_tail_codec,
+                positions_layout,
             )
         })
         .await
@@ -1774,7 +1799,12 @@ impl PostingListReader {
                 "Failed to build prewarm posting lists in blocking task: {err}"
             ))
         })??;
-        for (token_id, posting_list) in posting_lists {
+        for (token_id, mut posting_list) in posting_lists {
+            if with_position && let Some(positions) = posting_list.take_positions() {
+                self.index_cache
+                    .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                    .await;
+            }
             self.index_cache
                 .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
                 .await;
@@ -1783,6 +1813,7 @@ impl PostingListReader {
 
         info!(
             legacy_layout,
+            with_position,
             token_count = self.len(),
             read_batch_ms = read_batch_elapsed.as_secs_f64() * 1000.0,
             post_read_loop_ms = populate_elapsed.as_secs_f64() * 1000.0,
@@ -2042,14 +2073,44 @@ impl PostingList {
         length: Option<u32>,
         posting_tail_codec: PostingTailCodec,
     ) -> Result<Self> {
+        let positions_layout = if batch.column_by_name(COMPRESSED_POSITION_COL).is_some() {
+            PositionsLayout::SharedStream(parse_shared_position_codec(
+                batch.schema_ref().metadata(),
+            )?)
+        } else if batch.column_by_name(POSITION_COL).is_some() {
+            PositionsLayout::LegacyPerDoc
+        } else {
+            PositionsLayout::None
+        };
+        Self::from_batch_with_tail_codec_and_positions_layout(
+            batch,
+            max_score,
+            length,
+            posting_tail_codec,
+            positions_layout,
+        )
+    }
+
+    fn from_batch_with_tail_codec_and_positions_layout(
+        batch: &RecordBatch,
+        max_score: Option<f32>,
+        length: Option<u32>,
+        posting_tail_codec: PostingTailCodec,
+        positions_layout: PositionsLayout,
+    ) -> Result<Self> {
         match batch.column_by_name(POSTING_COL) {
             Some(_) => {
                 debug_assert!(max_score.is_some() && length.is_some());
+                let shared_position_codec = match positions_layout {
+                    PositionsLayout::SharedStream(codec) => Some(codec),
+                    _ => None,
+                };
                 let posting = CompressedPostingList::from_batch(
                     batch,
                     max_score.unwrap(),
                     length.unwrap(),
                     posting_tail_codec,
+                    shared_position_codec,
                 );
                 Ok(Self::Compressed(posting))
             }
@@ -2084,6 +2145,16 @@ impl PostingList {
             Self::Compressed(posting) => {
                 posting.positions = Some(positions);
             }
+        }
+    }
+
+    pub fn take_positions(&mut self) -> Option<CompressedPositionStorage> {
+        match self {
+            Self::Plain(posting) => posting
+                .positions
+                .take()
+                .map(CompressedPositionStorage::LegacyPerDoc),
+            Self::Compressed(posting) => posting.positions.take(),
         }
     }
 
@@ -2314,6 +2385,7 @@ impl CompressedPostingList {
         max_score: f32,
         length: u32,
         posting_tail_codec: PostingTailCodec,
+        shared_position_codec: Option<PositionStreamCodec>,
     ) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
         let blocks = batch[POSTING_COL]
@@ -2329,8 +2401,10 @@ impl CompressedPostingList {
                 .as_primitive::<UInt32Type>()
                 .values()
                 .to_vec();
-            let codec = parse_shared_position_codec(batch.schema_ref().metadata())
-                .expect("shared position stream codec metadata should be valid");
+            let codec = shared_position_codec.unwrap_or_else(|| {
+                parse_shared_position_codec(batch.schema_ref().metadata())
+                    .expect("shared position stream codec metadata should be valid")
+            });
             Some(CompressedPositionStorage::SharedStream(
                 SharedPositionStream::new(codec, block_offsets, bytes),
             ))
@@ -4053,10 +4127,7 @@ pub async fn flat_bm25_search_stream(
     let mut tokenizer = match index {
         Some(index) => index.tokenizer(),
         None => Box::new(TextTokenizer::new(
-            tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default(),
-            )
-            .build(),
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
         )),
     };
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
@@ -4109,7 +4180,7 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::inverted::lance_tokenizer::DocType;
+    use crate::scalar::inverted::document_tokenizer::DocType;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::cache::LanceCache;
@@ -4827,7 +4898,7 @@ mod tests {
             "test should use modern posting layout"
         );
 
-        inverted_list.prewarm().await.unwrap();
+        inverted_list.prewarm_posting_lists(false).await.unwrap();
 
         let alpha = inverted_list
             .index_cache
@@ -4853,6 +4924,186 @@ mod tests {
             "prewarm should not leave cached posting lists sharing the same values buffer"
         );
     }
+
+    #[tokio::test]
+    async fn test_prewarm_with_positions_populates_separate_position_cache() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V1,
+        );
+        builder.tokens.add("hello".to_owned());
+        builder.tokens.add("world".to_owned());
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                PostingTailCodec::Fixed32,
+            ));
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                PostingTailCodec::Fixed32,
+            ));
+        builder.posting_lists[0].add(0, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(0, PositionRecorder::Position(vec![1].into()));
+        builder.posting_lists[0].add(1, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(1, PositionRecorder::Position(vec![2].into()));
+        builder.docs.append(100, 2);
+        builder.docs.append(101, 2);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::new().with_position(true))
+            .await
+            .unwrap();
+
+        let inverted_list = &index.partitions[0].inverted_list;
+        let posting = inverted_list
+            .index_cache
+            .get_with_key(&PostingListKey { token_id: 0 })
+            .await
+            .unwrap();
+        assert!(
+            !posting.has_position(),
+            "posting cache should remain positions-free after prewarm"
+        );
+
+        let positions = inverted_list
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                positions.as_ref().0,
+                CompressedPositionStorage::LegacyPerDoc(_)
+            ),
+            "positions should be stored in the dedicated position cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_with_v2_positions_preserves_shared_stream_codec() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let format_version = InvertedListFormatVersion::V2;
+        let posting_tail_codec = format_version.posting_tail_codec();
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            format_version,
+        );
+        builder.tokens.add("body".to_owned());
+
+        let mut posting_list =
+            PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec);
+        let expected = (0..(BLOCK_SIZE + 5) as u32)
+            .map(|doc_id| {
+                let positions = vec![doc_id % 3, doc_id % 3 + 2, doc_id % 3 + 5];
+                posting_list.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+                builder.docs.append(30_000 + doc_id as u64, 20 + doc_id % 7);
+                (doc_id, positions.len() as u32, positions)
+            })
+            .collect::<Vec<_>>();
+        builder.posting_lists.push(posting_list);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                POSITIONS_LAYOUT_KEY.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
+            ),
+            (
+                POSITIONS_CODEC_KEY.to_owned(),
+                PositionStreamCodec::PackedDelta.as_str().to_owned(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::new().with_position(true))
+            .await
+            .unwrap();
+
+        let actual = index.partitions[0]
+            .inverted_list
+            .posting_list(0, true, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(doc_id, freq, positions)| {
+                (doc_id as u32, freq, positions.unwrap().collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_block_max_scores_capacity_matches_block_count() {
         let mut docs = DocSet::default();

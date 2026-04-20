@@ -17,7 +17,11 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
@@ -121,6 +125,42 @@ impl std::fmt::Display for ProxyObjectStore {
     }
 }
 
+/// An object store wrapper that counts listing operations.
+///
+/// This increments the shared counter for both `list` and `list_with_delimiter`
+/// so tests can observe all listing-based directory and version discovery calls.
+#[derive(Debug)]
+pub struct CountingObjectStore {
+    target: Arc<dyn ObjectStore>,
+    listing_count: Arc<AtomicUsize>,
+}
+
+impl CountingObjectStore {
+    pub fn new(target: Arc<dyn ObjectStore>, listing_count: Arc<AtomicUsize>) -> Self {
+        Self {
+            target,
+            listing_count,
+        }
+    }
+
+    fn record_listing(&self) {
+        self.listing_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn delegate_list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Pin<Box<dyn futures::Stream<Item = OSResult<ObjectMeta>> + Send>> {
+        self.target.list(prefix)
+    }
+}
+
+impl std::fmt::Display for CountingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingObjectStore({})", self.target)
+    }
+}
+
 #[async_trait]
 impl ObjectStore for ProxyObjectStore {
     async fn put_opts(
@@ -201,6 +241,68 @@ impl ObjectStore for ProxyObjectStore {
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.before_method("copy_if_not_exists", from)?;
+        self.target.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
+        self.target.get_range(location, range).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.target.get_ranges(location, ranges).await
+    }
+
+    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
+        self.target.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OSResult<()> {
+        self.target.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.record_listing();
+        self.delegate_list(prefix).boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.record_listing();
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.copy(from, to).await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.rename(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy_if_not_exists(from, to).await
     }
 }

@@ -99,6 +99,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -117,6 +118,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             namespace_obj,
             table_id_obj,
             allow_external_blob_outside_bases,
+            blob_pack_file_size_threshold,
         ),
         JObject::default()
     )
@@ -138,6 +140,7 @@ fn inner_create_with_ffi_array<'local>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -165,6 +168,7 @@ fn inner_create_with_ffi_array<'local>(
         namespace_obj,
         table_id_obj,
         allow_external_blob_outside_bases,
+        blob_pack_file_size_threshold,
         reader,
     )
 }
@@ -185,6 +189,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -202,6 +207,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             namespace_obj,
             table_id_obj,
             allow_external_blob_outside_bases,
+            blob_pack_file_size_threshold,
         ),
         JObject::null()
     )
@@ -222,6 +228,7 @@ fn inner_create_with_ffi_stream<'local>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -239,6 +246,7 @@ fn inner_create_with_ffi_stream<'local>(
         namespace_obj,
         table_id_obj,
         allow_external_blob_outside_bases,
+        blob_pack_file_size_threshold,
         reader,
     )
 }
@@ -257,6 +265,7 @@ fn create_fragment<'a>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,     // Optional<Long>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -274,6 +283,7 @@ fn create_fragment<'a>(
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
         &allow_external_blob_outside_bases,
+        &blob_pack_file_size_threshold,
     )?;
 
     // Set up storage options provider if namespace is provided
@@ -536,8 +546,8 @@ impl IntoJava for &FragmentUpdateResult {
 impl IntoJava for &DataFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let path = env.new_string(self.path.clone())?.into();
-        let fields = JLance(self.fields.clone()).into_java(env)?;
-        let column_indices = JLance(self.column_indices.clone()).into_java(env)?;
+        let fields = JLance(self.fields.to_vec()).into_java(env)?;
+        let column_indices = JLance(self.column_indices.to_vec()).into_java(env)?;
         let file_size_bytes = match self.file_size_bytes.get() {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
@@ -775,8 +785,8 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let base_id = get_base_id(env, self)?;
         Ok(DataFile {
             path,
-            fields,
-            column_indices,
+            fields: fields.into(),
+            column_indices: column_indices.into(),
             file_major_version,
             file_minor_version,
             file_size_bytes,

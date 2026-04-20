@@ -5,6 +5,8 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+#[cfg(feature = "substrait")]
+pub mod ann_proto;
 mod filter;
 pub mod filtered_read;
 #[cfg(feature = "substrait")]
@@ -17,6 +19,8 @@ mod pushdown_scan;
 mod rowids;
 pub mod scalar_index;
 mod scan;
+#[cfg(feature = "substrait")]
+pub mod table_identifier;
 mod take;
 #[cfg(test)]
 pub mod testing;

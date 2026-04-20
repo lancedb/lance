@@ -288,6 +288,27 @@ class _Dataset:
         row_indices: List[int],
         blob_column: str,
     ) -> List[LanceBlobFile]: ...
+    def read_blobs(
+        self,
+        row_ids: List[int],
+        blob_column: str,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]: ...
+    def read_blobs_by_addresses(
+        self,
+        row_addresses: List[int],
+        blob_column: str,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]: ...
+    def read_blobs_by_indices(
+        self,
+        row_indices: List[int],
+        blob_column: str,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
@@ -361,7 +382,7 @@ class _Dataset:
         kwargs: Optional[Dict[str, Any]] = None,
     ): ...
     def drop_index(self, name: str): ...
-    def prewarm_index(self, name: str): ...
+    def prewarm_index(self, name: str, *, with_position: bool = False): ...
     def merge_index_metadata(
         self,
         index_uuid: str,

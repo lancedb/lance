@@ -281,7 +281,8 @@ async fn build_partial_fixture(dataset: &mut Dataset, bench_case: BenchCase) -> 
     }
 
     let fragment_groups = contiguous_fragment_groups(dataset, bench_case.num_shards);
-    let (ivf_params, pq_params) = train_shared_ivf_pq(dataset, bench_case.num_partitions).await;
+    let (ivf_params, pq_params) =
+        Box::pin(train_shared_ivf_pq(dataset, bench_case.num_partitions)).await;
     let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
 
     for fragments in fragment_groups {
@@ -290,7 +291,7 @@ async fn build_partial_fixture(dataset: &mut Dataset, bench_case: BenchCase) -> 
             .name("distributed_merge_only".to_string())
             .fragments(fragments)
             .index_uuid(fixture_uuid.to_string());
-        builder.execute_uncommitted().await.unwrap();
+        Box::pin(builder.execute_uncommitted()).await.unwrap();
     }
 
     MergeFixture {

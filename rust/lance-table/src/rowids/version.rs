@@ -7,10 +7,14 @@
 //! update version for each row in a Lance dataset, enabling efficient
 //! cross-version diff operations.
 
+use std::sync::Arc;
+
 use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
 use prost::Message;
+use serde::de::Deserializer;
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{ExternalFile, Fragment, pb};
@@ -210,19 +214,59 @@ impl<'a> Iterator for VersionsIter<'a> {
 
 /// Metadata about the location of dataset version sequence data
 /// Following the same pattern as RowIdMeta
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+///
+/// When stored inline, identical byte sequences are shared across fragments
+/// via `Arc<[u8]>` to reduce manifest memory for large tables.
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum RowDatasetVersionMeta {
     /// Small sequences stored inline in the fragment metadata
-    Inline(Vec<u8>),
+    Inline(Arc<[u8]>),
     /// Large sequences stored in external files
     External(ExternalFile),
+}
+
+// Custom Serialize: convert Arc<[u8]> to slice for transparent JSON output
+impl Serialize for RowDatasetVersionMeta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Helper<'a> {
+            Inline { inline: &'a [u8] },
+            External { external: &'a ExternalFile },
+        }
+
+        match self {
+            Self::Inline(data) => Helper::Inline {
+                inline: data.as_ref(),
+            }
+            .serialize(serializer),
+            Self::External(file) => Helper::External { external: file }.serialize(serializer),
+        }
+    }
+}
+
+// Custom Deserialize: read Vec<u8> and convert to Arc<[u8]>
+impl<'de> Deserialize<'de> for RowDatasetVersionMeta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Helper {
+            Inline { inline: Vec<u8> },
+            External { external: ExternalFile },
+        }
+
+        match Helper::deserialize(deserializer)? {
+            Helper::Inline { inline } => Ok(Self::Inline(Arc::from(inline))),
+            Helper::External { external } => Ok(Self::External(external)),
+        }
+    }
 }
 
 impl RowDatasetVersionMeta {
     /// Create inline metadata from a version sequence
     pub fn from_sequence(sequence: &RowDatasetVersionSequence) -> lance_core::Result<Self> {
         let bytes = write_dataset_versions(sequence);
-        Ok(Self::Inline(bytes))
+        Ok(Self::Inline(Arc::from(bytes)))
     }
 
     /// Create external metadata reference
@@ -248,7 +292,7 @@ pub fn last_updated_at_version_meta_to_pb(
     meta.as_ref().map(|m| match m {
         RowDatasetVersionMeta::Inline(data) => {
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
-                data.clone(),
+                data.to_vec(),
             )
         }
         RowDatasetVersionMeta::External(file) => {
@@ -269,7 +313,7 @@ pub fn created_at_version_meta_to_pb(
 ) -> Option<pb::data_fragment::CreatedAtVersionSequence> {
     meta.as_ref().map(|m| match m {
         RowDatasetVersionMeta::Inline(data) => {
-            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.clone())
+            pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.to_vec())
         }
         RowDatasetVersionMeta::External(file) => {
             pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
@@ -561,7 +605,7 @@ impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for RowDatasetVers
     fn try_from(value: pb::data_fragment::LastUpdatedAtVersionSequence) -> Result<Self> {
         match value {
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
-                Ok(Self::Inline(data))
+                Ok(Self::Inline(Arc::from(data)))
             }
             pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
                 file,
@@ -580,7 +624,7 @@ impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionM
     fn try_from(value: pb::data_fragment::CreatedAtVersionSequence) -> Result<Self> {
         match value {
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
-                Ok(Self::Inline(data))
+                Ok(Self::Inline(Arc::from(data)))
             }
             pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
                 Ok(Self::External(ExternalFile {

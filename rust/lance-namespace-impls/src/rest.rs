@@ -32,7 +32,7 @@ use lance_namespace::models::{
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
     DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    ErrorResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
@@ -534,93 +534,38 @@ impl RestNamespace {
         }
     }
 
+    /// Map a reqwest::Error to the appropriate NamespaceError variant.
+    ///
+    /// Timeout and connection errors are mapped to `ServiceUnavailable`,
+    /// while other errors are mapped to `Internal`.
+    fn request_error(e: reqwest::Error) -> lance_core::Error {
+        let message = format!("Failed to execute request: {:?}", e);
+        if e.is_timeout() || e.is_connect() {
+            NamespaceError::ServiceUnavailable { message }.into()
+        } else {
+            NamespaceError::Internal { message }.into()
+        }
+    }
+
     /// Parse an error response body and return the appropriate NamespaceError.
     ///
-    /// Attempts to parse a JSON body with `{"error": {"code": N, "message": "..."}}`.
-    /// Falls back to mapping the HTTP status code (using the operation to disambiguate)
-    /// if the JSON body doesn't contain an error code.
-    fn parse_error_response(
-        status: reqwest::StatusCode,
-        content: &str,
-        operation: &str,
-    ) -> lance_core::Error {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
-            && let Some(error_obj) = json.get("error")
-        {
-            let code = error_obj
-                .get("code")
-                .and_then(|c| c.as_u64())
-                .map(|c| c as u32);
-            let message = error_obj
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or(content);
-
-            if let Some(code) = code {
-                return NamespaceError::from_code(code, message).into();
+    /// Deserializes the response as an `ErrorResponse` model (the spec-defined
+    /// flat JSON format with a required numeric `code` field). The error code is
+    /// the sole source of truth for error classification. When deserialization
+    /// fails, returns Internal with the raw response as context.
+    fn parse_error_response(status: reqwest::StatusCode, content: &str) -> lance_core::Error {
+        match serde_json::from_str::<ErrorResponse>(content) {
+            Ok(err_resp) => {
+                let message = err_resp.error.as_deref().unwrap_or(content);
+                NamespaceError::from_code(err_resp.code as u32, message).into()
             }
-        }
-
-        let message = format!("Response error: status={}, content={}", status, content);
-        Self::error_from_status(status, operation, message).into()
-    }
-
-    /// Map an HTTP status code to a NamespaceError variant.
-    ///
-    /// For unambiguous status codes (401, 403, 429, 501, 503) the mapping is direct.
-    /// For 404 and 409 the `operation` string is used to select the appropriate
-    /// "not found" or "already exists" variant.
-    fn error_from_status(
-        status: reqwest::StatusCode,
-        operation: &str,
-        message: String,
-    ) -> NamespaceError {
-        match status.as_u16() {
-            400 => NamespaceError::InvalidInput { message },
-            401 => NamespaceError::Unauthenticated { message },
-            403 => NamespaceError::PermissionDenied { message },
-            404 => Self::not_found_for_operation(operation, message),
-            409 => Self::already_exists_for_operation(operation, message),
-            429 => NamespaceError::Throttled { message },
-            501 => NamespaceError::Unsupported { message },
-            503 => NamespaceError::ServiceUnavailable { message },
-            _ => NamespaceError::Internal { message },
-        }
-    }
-
-    /// Pick the appropriate "not found" variant based on the operation.
-    fn not_found_for_operation(operation: &str, message: String) -> NamespaceError {
-        if operation.contains("namespace") {
-            NamespaceError::NamespaceNotFound { message }
-        } else if operation.contains("index") {
-            NamespaceError::TableIndexNotFound { message }
-        } else if operation.contains("tag") {
-            NamespaceError::TableTagNotFound { message }
-        } else if operation.contains("transaction") {
-            NamespaceError::TransactionNotFound { message }
-        } else if operation.contains("version") {
-            NamespaceError::TableVersionNotFound { message }
-        } else if operation.contains("column") {
-            NamespaceError::TableColumnNotFound { message }
-        } else if operation.contains("table") {
-            NamespaceError::TableNotFound { message }
-        } else {
-            NamespaceError::Internal { message }
-        }
-    }
-
-    /// Pick the appropriate "already exists" variant based on the operation.
-    fn already_exists_for_operation(operation: &str, message: String) -> NamespaceError {
-        if operation.contains("namespace") {
-            NamespaceError::NamespaceAlreadyExists { message }
-        } else if operation.contains("index") {
-            NamespaceError::TableIndexAlreadyExists { message }
-        } else if operation.contains("tag") {
-            NamespaceError::TableTagAlreadyExists { message }
-        } else if operation.contains("table") {
-            NamespaceError::TableAlreadyExists { message }
-        } else {
-            NamespaceError::Internal { message }
+            Err(e) => NamespaceError::Internal {
+                message: format!(
+                    "Failed to parse error response: status={}, body={}, error={:?}",
+                    status, content, e
+                ),
+            }
+            .into(),
         }
     }
 
@@ -639,28 +584,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -680,28 +621,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -721,11 +658,7 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
@@ -733,10 +666,10 @@ impl RestNamespace {
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
+                    message: format!("Failed to read response body: {:?}", e),
                 })
             })?;
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -756,28 +689,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -1141,26 +1070,22 @@ impl LanceNamespace for RestNamespace {
             .rest_client
             .execute(req_builder, operation, &id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
             resp.bytes().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response bytes: {}", e),
+                    message: format!("Failed to read response bytes: {:?}", e),
                 })
             })
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
+                    message: format!("Failed to read response body: {:?}", e),
                 })
             })?;
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 

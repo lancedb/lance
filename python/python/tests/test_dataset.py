@@ -4215,6 +4215,45 @@ def test_late_materialization_batch_size(tmp_path: Path):
         assert batch.num_rows == 32
 
 
+def test_batch_size_bytes_chopping_fallback(tmp_path: Path):
+    # Write rows with large strings (~10KiB each). The file reader's byte-size
+    # estimation is based on on-disk size which, for strings, can differ
+    # significantly from in-memory size.  The rechunk fallback should still
+    # split oversized batches so no single batch exceeds the target by too much.
+    num_rows = 200
+    row_text = "x" * 10 * 1024  # 10 KiB per row
+    table = pa.table(
+        {
+            "id": pa.array(range(num_rows), type=pa.int64()),
+            "text": pa.array([row_text] * num_rows, type=pa.large_string()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="stable")
+
+    # Target ~50 KiB per batch with ~10 KiB per row → expect ~5 rows per batch.
+    # Without the rechunk fallback all 200 rows would arrive in a single batch.
+    target_bytes = 50 * 1024
+    batches = list(
+        dataset.to_batches(
+            filter="id >= 0",
+            batch_size_bytes=target_bytes,
+            late_materialization=False,
+        )
+    )
+
+    total_rows = sum(b.num_rows for b in batches)
+    assert total_rows == num_rows
+
+    # We should get many batches, not one giant batch.
+    assert len(batches) > 1, f"expected many batches, got {len(batches)}"
+    # Each batch should have a small number of rows (target ~5, allow up to 10).
+    for batch in batches:
+        assert batch.num_rows <= 10, (
+            f"batch has {batch.num_rows} rows, expected at most ~10 "
+            f"for a {target_bytes} byte target with ~10KiB rows"
+        )
+
+
 def test_use_scalar_index(tmp_path: Path):
     table = pa.table({"filter": range(100)})
     dataset = lance.write_dataset(table, tmp_path)

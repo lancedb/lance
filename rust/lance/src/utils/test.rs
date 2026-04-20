@@ -262,7 +262,7 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
     fragment
         .files
         .iter()
-        .map(|file| file.fields.clone())
+        .map(|file| file.fields.to_vec())
         .collect::<Vec<_>>()
 }
 
