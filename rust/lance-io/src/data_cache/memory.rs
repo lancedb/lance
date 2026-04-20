@@ -136,14 +136,21 @@ impl CacheShardInner {
         let now = now_ms();
 
         let mut scores: Vec<u64> = (0..num_samples)
-            .map(|i| {
+            .filter_map(|i| {
                 let idx = (self.clock_hand + i * step) % n;
                 self.dense_ring[idx]
                     .as_ref()
+                    .filter(|e| e.data_size.load(Ordering::Relaxed) > 0)
                     .map(|e| e.eviction_score(now))
-                    .unwrap_or(0)
             })
             .collect();
+
+        if scores.is_empty() {
+            // All sampled slots are Loading or None — set threshold to 0 so
+            // that any loaded entry qualifies for eviction.
+            self.eviction_threshold = 0;
+            return;
+        }
 
         scores.sort_unstable();
         let idx = (scores.len() * EVICTION_PERCENTILE / 100).min(scores.len().saturating_sub(1));
@@ -178,6 +185,9 @@ impl CacheShardInner {
                 num_checked = 0;
             }
 
+            // 3 owners = HashMap + dense_ring + this clone. >3 means an
+            // active caller holds a reference — skip to avoid evicting a
+            // live entry.
             if Arc::strong_count(&entry) > 3 {
                 continue;
             }
@@ -207,7 +217,6 @@ impl CacheShardInner {
                 }
             }
         }
-
         (freed, evicted)
     }
 }
@@ -397,13 +406,10 @@ impl MemoryCache {
         if self.max_bytes == 0 {
             return loader.await;
         }
-
         let (entry, is_new) = self.find_or_create(&key, length);
-
         if is_new {
             return self.load_exclusive(&key, length, &entry, loader).await;
         }
-
         let bytes = self
             .wait_for_entry(&key, length, &entry)
             .await
