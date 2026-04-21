@@ -1861,6 +1861,8 @@ impl Transaction {
                     ))
                 });
 
+        let new_version = current_manifest.map_or(1, |m| m.version + 1);
+
         match &self.operation {
             Operation::Clone { .. } => {
                 return Err(Error::internal(
@@ -1875,7 +1877,6 @@ impl Transaction {
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
-                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     for fragment in new_fragments.iter_mut() {
                         let version_meta = build_version_meta(fragment, new_version);
                         fragment.last_updated_at_version_meta = version_meta.clone();
@@ -1945,7 +1946,6 @@ impl Transaction {
                     && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
                     && !off_map.is_empty()
                 {
-                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     let prev_version = current_manifest.map(|m| m.version).unwrap_or(0);
                     for fragment in final_fragments.iter_mut() {
                         let Some(bitmap) = off_map.get(&fragment.id) else {
@@ -1988,7 +1988,6 @@ impl Transaction {
                 }
 
                 if next_row_id.is_some() {
-                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     resolve_update_version_metadata(
                         existing_fragments,
                         new_fragments.as_mut_slice(),
@@ -2033,7 +2032,7 @@ impl Transaction {
                 if !merged_generations.is_empty() {
                     update_mem_wal_index_merged_generations(
                         &mut final_indices,
-                        current_manifest.map_or(1, |m| m.version + 1),
+                        new_version,
                         merged_generations.clone(),
                     )?;
                 }
@@ -2045,7 +2044,6 @@ impl Transaction {
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
-                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     for fragment in new_fragments.iter_mut() {
                         let version_meta = build_version_meta(fragment, new_version);
                         fragment.last_updated_at_version_meta = version_meta.clone();
@@ -2114,7 +2112,6 @@ impl Transaction {
                 let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();
                 if next_row_id.is_some() {
-                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     let prev_by_id: HashMap<u64, &Fragment> =
                         existing_fragments.iter().map(|f| (f.id, f)).collect();
                     for fragment in merged_fragments.iter_mut() {
@@ -2308,7 +2305,7 @@ impl Transaction {
             Operation::UpdateMemWalState { merged_generations } => {
                 update_mem_wal_index_merged_generations(
                     &mut final_indices,
-                    current_manifest.map_or(1, |m| m.version + 1),
+                    new_version,
                     merged_generations.clone(),
                 )?;
             }
