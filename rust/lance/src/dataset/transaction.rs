@@ -27,8 +27,8 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowIdMeta, pb,
+        BasePath, DataFile, DataStorageFormat, Fragment, FragmentBaseAssignment, IndexFile,
+        IndexMetadata, Manifest, RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
@@ -250,10 +250,19 @@ pub enum Operation {
         branch_name: Option<String>,
     },
 
-    // Update base paths in the dataset (currently only supports adding new bases).
+    /// Update base paths in the dataset and optionally reassign existing
+    /// fragment data files to those bases.
+    ///
+    /// New base paths are added to the manifest and, if `fragment_assignments`
+    /// is non-empty, each listed fragment's data files and deletion file are
+    /// updated to reference the specified base. No data is moved; the caller
+    /// must ensure the data already exists at the target base location.
     UpdateBases {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
+        /// Per-fragment base reassignments applied atomically with the new
+        /// base registrations. Fragments not listed here are unchanged.
+        fragment_assignments: Vec<FragmentBaseAssignment>,
     },
 }
 
@@ -1039,9 +1048,16 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
-            (Self::UpdateBases { new_bases: a }, Self::UpdateBases { new_bases: b }) => {
-                compare_vec(a, b)
-            }
+            (
+                Self::UpdateBases {
+                    new_bases: a,
+                    fragment_assignments: fa,
+                },
+                Self::UpdateBases {
+                    new_bases: b,
+                    fragment_assignments: fb,
+                },
+            ) => compare_vec(a, b) && compare_vec(fa, fb),
 
             (Self::UpdateBases { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -2122,10 +2138,33 @@ impl Transaction {
                     merged_generations.clone(),
                 )?;
             }
-            Operation::UpdateBases { .. } => {
-                // UpdateBases operation doesn't modify fragments or indices
-                // Base paths are handled in the manifest creation section below
-                final_fragments.extend(maybe_existing_fragments?.clone());
+            Operation::UpdateBases {
+                fragment_assignments,
+                ..
+            } => {
+                let existing_fragments = maybe_existing_fragments?;
+                if fragment_assignments.is_empty() {
+                    final_fragments.extend(existing_fragments.iter().cloned());
+                } else {
+                    let assignment_map: HashMap<u64, Option<u32>> = fragment_assignments
+                        .iter()
+                        .map(|a| (a.fragment_id, a.base_id))
+                        .collect();
+                    for fragment in existing_fragments.iter() {
+                        if let Some(&base_id) = assignment_map.get(&fragment.id) {
+                            let mut new_frag = fragment.clone();
+                            for file in &mut new_frag.files {
+                                file.base_id = base_id;
+                            }
+                            if let Some(del) = &mut new_frag.deletion_file {
+                                del.base_id = base_id;
+                            }
+                            final_fragments.push(new_frag);
+                        } else {
+                            final_fragments.push(fragment.clone());
+                        }
+                    }
+                }
             }
         };
 
@@ -2224,14 +2263,17 @@ impl Transaction {
         }
 
         // Handle UpdateBases operation to update manifest base_paths
-        if let Operation::UpdateBases { new_bases } = &self.operation {
+        if let Operation::UpdateBases { new_bases, .. } = &self.operation {
             // Validate and add new base paths to the manifest
             for new_base in new_bases {
                 // Check for conflicts with existing base paths
                 if let Some(existing_base) = manifest
                     .base_paths
                     .values()
-                    .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
+                    .find(|bp| {
+                        (new_base.name.is_some() && bp.name == new_base.name)
+                            || bp.path == new_base.path
+                    })
                 {
                     return Err(Error::invalid_input(format!(
                         "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
@@ -2985,8 +3027,13 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
+                fragment_assignments,
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
+                fragment_assignments: fragment_assignments
+                    .into_iter()
+                    .map(FragmentBaseAssignment::from)
+                    .collect(),
             },
             None => {
                 return Err(Error::internal(
@@ -3253,13 +3300,21 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<_>>(),
                 })
             }
-            Operation::UpdateBases { new_bases } => {
+            Operation::UpdateBases {
+                new_bases,
+                fragment_assignments,
+            } => {
                 pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                     new_bases: new_bases
                         .iter()
                         .cloned()
                         .map(|bp: BasePath| -> pb::BasePath { bp.into() })
                         .collect::<Vec<pb::BasePath>>(),
+                    fragment_assignments: fragment_assignments
+                        .iter()
+                        .cloned()
+                        .map(pb::transaction::FragmentBaseAssignment::from)
+                        .collect(),
                 })
             }
         };

@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+lance = { workspace = true, default-features = false }
 lance-core.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true

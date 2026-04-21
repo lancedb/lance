@@ -840,6 +840,39 @@ impl From<BasePath> for pb::BasePath {
     }
 }
 
+/// Assigns a base path to all data files within a fragment.
+///
+/// Used as part of `UpdateBases` to atomically register new base paths and
+/// reassign existing fragment data files in a single commit. No data is moved;
+/// the caller is responsible for ensuring the data already exists at the
+/// target base location.
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct FragmentBaseAssignment {
+    /// ID of the fragment whose data files should be reassigned.
+    pub fragment_id: u64,
+    /// The base path ID to assign. `None` clears any existing base_id,
+    /// causing the fragment's data files to resolve against the dataset root.
+    pub base_id: Option<u32>,
+}
+
+impl From<pb::transaction::FragmentBaseAssignment> for FragmentBaseAssignment {
+    fn from(p: pb::transaction::FragmentBaseAssignment) -> Self {
+        Self {
+            fragment_id: p.fragment_id,
+            base_id: p.base_id,
+        }
+    }
+}
+
+impl From<FragmentBaseAssignment> for pb::transaction::FragmentBaseAssignment {
+    fn from(a: FragmentBaseAssignment) -> Self {
+        Self {
+            fragment_id: a.fragment_id,
+            base_id: a.base_id,
+        }
+    }
+}
+
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 

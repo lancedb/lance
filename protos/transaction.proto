@@ -316,10 +316,26 @@ message Transaction {
     repeated MergedGeneration merged_generations = 1;
   }
 
+  // Assigns a base path to all data files within a fragment.
+  // Used as part of UpdateBases to atomically register new base paths and
+  // reassign existing fragment data files in a single commit.
+  message FragmentBaseAssignment {
+    // The ID of the fragment whose data files should be reassigned.
+    uint64 fragment_id = 1;
+    // The base path ID to assign to this fragment's data files.
+    // When absent, the fragment's data files are assigned to the dataset root
+    // (any existing base_id is cleared).
+    optional uint32 base_id = 2;
+  }
+
   // An operation that updates base paths in the dataset.
   message UpdateBases {
     // The new base paths to add to the manifest.
     repeated BasePath new_bases = 1;
+    // Optional per-fragment base reassignments applied atomically with the new
+    // base registrations. Each entry reassigns all data files in the named
+    // fragment to the specified base. Fragments not listed are unchanged.
+    repeated FragmentBaseAssignment fragment_assignments = 2;
   }
 
   // The operation of this transaction.

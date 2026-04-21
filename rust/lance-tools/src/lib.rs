@@ -3,4 +3,5 @@
 
 pub mod cli;
 pub mod meta;
+pub mod table;
 pub mod util;

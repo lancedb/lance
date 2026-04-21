@@ -1633,7 +1633,10 @@ impl Dataset {
         new_bases: Vec<lance_table::format::BasePath>,
         transaction_properties: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let operation = Operation::UpdateBases { new_bases };
+        let operation = Operation::UpdateBases {
+            new_bases,
+            fragment_assignments: vec![],
+        };
 
         let transaction = TransactionBuilder::new(self.manifest.version, operation)
             .transaction_properties(transaction_properties.map(Arc::new))
@@ -1644,6 +1647,93 @@ impl Dataset {
             .await?;
 
         Ok(new_dataset)
+    }
+
+    /// Convert a single-base dataset into a multi-base dataset.
+    ///
+    /// This is a **metadata-only** operation. The caller must have already
+    /// copied the dataset directory to each additional URI (e.g. with `azcopy`
+    /// or `gsutil rsync`) before calling this method.
+    ///
+    /// Existing fragments are distributed round-robin across the original base
+    /// and each additional base, giving each base approximately
+    /// `total_fragments / (1 + additional_uris.len())` fragments.
+    ///
+    /// # Arguments
+    /// * `additional_uris` – Full URIs of the additional dataset copies, one per
+    ///   new base (e.g. `"az://container2/path"`, `"/local/copy"`).
+    /// * `transaction_properties` – Optional key-value metadata forwarded to the
+    ///   commit transaction.
+    ///
+    /// # Returns
+    /// A new `Dataset` handle pointing at the updated manifest.
+    pub async fn to_multi_base(
+        self: &Arc<Self>,
+        additional_uris: Vec<String>,
+        transaction_properties: Option<HashMap<String, String>>,
+    ) -> Result<Self> {
+        if additional_uris.is_empty() {
+            return Err(Error::invalid_input(
+                "to_multi_base requires at least one additional URI".to_string(),
+            ));
+        }
+
+        // Choose IDs for the new bases, starting above the current maximum.
+        let start_id: u32 = self
+            .manifest
+            .base_paths
+            .keys()
+            .max()
+            .map(|&m| m + 1)
+            .unwrap_or(1);
+
+        let new_bases: Vec<lance_table::format::BasePath> = additional_uris
+            .iter()
+            .enumerate()
+            .map(|(i, uri)| {
+                lance_table::format::BasePath::new(
+                    start_id + i as u32,
+                    uri.clone(),
+                    None,
+                    true, // is_dataset_root: data lives under <uri>/data/
+                )
+            })
+            .collect();
+
+        // Distribute fragments round-robin.
+        //   slot 0  → keep default base (no base_id change)
+        //   slot 1  → new base with id `start_id`
+        //   slot 2  → new base with id `start_id + 1`
+        //   …
+        let n_slots = (additional_uris.len() + 1) as u64;
+        let fragment_assignments: Vec<lance_table::format::FragmentBaseAssignment> = self
+            .fragments()
+            .iter()
+            .filter_map(|frag| {
+                let slot = frag.id % n_slots;
+                if slot == 0 {
+                    None // stays on the original/default base
+                } else {
+                    Some(lance_table::format::FragmentBaseAssignment {
+                        fragment_id: frag.id,
+                        base_id: Some(start_id + (slot - 1) as u32),
+                    })
+                }
+            })
+            .collect();
+
+        let operation = Operation::UpdateBases {
+            new_bases,
+            fragment_assignments,
+        };
+
+        let transaction = TransactionBuilder::new(self.manifest.version, operation)
+            .transaction_properties(transaction_properties.map(Arc::new))
+            .build();
+
+        CommitBuilder::new(self.clone())
+            .execute(transaction)
+            .await
     }
 
     pub async fn count_deleted_rows(&self) -> Result<usize> {

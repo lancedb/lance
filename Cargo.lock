@@ -5133,6 +5133,7 @@ name = "lance-tools"
 version = "6.0.0-beta.2"
 dependencies = [
  "clap",
+ "lance",
  "lance-core",
  "lance-file",
  "lance-io",

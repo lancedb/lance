@@ -1200,10 +1200,15 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if let Operation::UpdateBases { new_bases } = &self.transaction.operation {
+        if let Operation::UpdateBases {
+            new_bases,
+            fragment_assignments,
+        } = &self.transaction.operation
+        {
             match &other_transaction.operation {
                 Operation::UpdateBases {
                     new_bases: committed_bases,
+                    fragment_assignments: committed_assignments,
                 } => {
                     // Check if any of the bases being added conflict with committed bases
                     for new_base in new_bases {
@@ -1225,6 +1230,20 @@ impl<'a> TransactionRebase<'a> {
                             if new_base.path == committed_base.path {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
+                            }
+                        }
+                    }
+                    // Check for fragment assignment conflicts: two concurrent UpdateBases
+                    // operations must not both reassign the same fragment.
+                    if !fragment_assignments.is_empty() && !committed_assignments.is_empty() {
+                        for new_assign in fragment_assignments {
+                            for committed_assign in committed_assignments {
+                                if new_assign.fragment_id == committed_assign.fragment_id {
+                                    return Err(self.incompatible_conflict_err(
+                                        other_transaction,
+                                        other_version,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2775,6 +2794,7 @@ mod tests {
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2787,6 +2807,7 @@ mod tests {
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2811,6 +2832,7 @@ mod tests {
                     name: Some("duplicate_name".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2823,6 +2845,7 @@ mod tests {
                     name: Some("duplicate_name".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2852,6 +2875,7 @@ mod tests {
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2864,6 +2888,7 @@ mod tests {
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2893,6 +2918,7 @@ mod tests {
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2905,6 +2931,7 @@ mod tests {
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2933,6 +2960,7 @@ mod tests {
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -2991,6 +3019,7 @@ mod tests {
                         is_dataset_root: false,
                     },
                 ],
+                fragment_assignments: vec![],
             },
         );
 
@@ -3004,6 +3033,7 @@ mod tests {
                     name: Some("base3".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -3033,6 +3063,7 @@ mod tests {
                     name: None,
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -3045,6 +3076,7 @@ mod tests {
                     name: None,
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -3069,6 +3101,7 @@ mod tests {
                     name: Some("base1".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 
@@ -3081,6 +3114,7 @@ mod tests {
                     name: Some("base2".to_string()),
                     is_dataset_root: false,
                 }],
+                fragment_assignments: vec![],
             },
         );
 

@@ -532,3 +532,205 @@ async fn test_concurrent_add_bases_with_data_write() {
     // Should have both data writes (10 rows total)
     assert_eq!(final_dataset.count_rows(None).await.unwrap(), 10);
 }
+
+// ----- to_multi_base tests -----
+
+/// Verify that `to_multi_base` with 2 additional URIs distributes fragments
+/// round-robin and registers both new base paths in the manifest.
+#[tokio::test]
+async fn test_to_multi_base_metadata() {
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use std::sync::Arc;
+
+    // Write 3 fragments (3 rows each) to an in-memory dataset.
+    let mut data_gen =
+        BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+    let dataset = Dataset::write(
+        data_gen.batch(3),
+        "memory://multi_base_meta_test",
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dataset = Dataset::write(
+        data_gen.batch(3),
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dataset = Arc::new(
+        Dataset::write(
+            data_gen.batch(3),
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(dataset.fragments().len(), 3);
+
+    // Convert to multi-base with two fictional additional URIs.
+    let updated = dataset
+        .to_multi_base(
+            vec![
+                "memory://copy1".to_string(),
+                "memory://copy2".to_string(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Two new base paths should be registered.
+    assert_eq!(updated.manifest.base_paths.len(), 2);
+    for bp in updated.manifest.base_paths.values() {
+        assert!(bp.is_dataset_root, "new bases should be dataset roots");
+    }
+
+    // With 3 fragments and n_slots=3, distribution is exactly one per slot.
+    // slot 0 (id % 3 == 0) → default base, slot 1 → base 1, slot 2 → base 2.
+    let frags = updated.fragments();
+    assert_eq!(frags.len(), 3);
+
+    let default_count = frags.iter().filter(|f| f.files[0].base_id.is_none()).count();
+    let base1_count = frags
+        .iter()
+        .filter(|f| f.files[0].base_id == Some(1))
+        .count();
+    let base2_count = frags
+        .iter()
+        .filter(|f| f.files[0].base_id == Some(2))
+        .count();
+
+    assert_eq!(default_count, 1, "exactly one fragment on the default base");
+    assert_eq!(base1_count, 1, "exactly one fragment on base 1");
+    assert_eq!(base2_count, 1, "exactly one fragment on base 2");
+}
+
+/// Verify that after `to_multi_base` the dataset is still fully readable when
+/// the data files have been copied to the additional base locations.
+#[tokio::test]
+async fn test_to_multi_base_readable() {
+    use lance_core::utils::tempfile::TempDir;
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use std::sync::Arc;
+
+    // --- Write a 3-fragment dataset to a temp directory ---
+    let root_dir = TempDir::default();
+    let source_uri = root_dir.path_str();
+
+    let mut data_gen =
+        BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+    let dataset = Dataset::write(
+        data_gen.batch(3),
+        &source_uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dataset = Dataset::write(
+        data_gen.batch(3),
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dataset = Arc::new(
+        Dataset::write(
+            data_gen.batch(3),
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let original_rows = dataset.count_rows(None).await.unwrap();
+    assert_eq!(original_rows, 9);
+    assert_eq!(dataset.fragments().len(), 3);
+
+    // --- Copy the full dataset to two additional temp directories ---
+    let copy1_dir = TempDir::default();
+    let copy2_dir = TempDir::default();
+    copy_dir_recursive(root_dir.std_path(), copy1_dir.std_path());
+    copy_dir_recursive(root_dir.std_path(), copy2_dir.std_path());
+
+    // Build file:// URIs for the two copies.
+    let copy1_uri = format!("file://{}", copy1_dir.path_str());
+    let copy2_uri = format!("file://{}", copy2_dir.path_str());
+
+    // --- Convert to multi-base (metadata only) ---
+    let updated = dataset
+        .to_multi_base(vec![copy1_uri, copy2_uri], None)
+        .await
+        .unwrap();
+
+    assert_eq!(updated.manifest.base_paths.len(), 2);
+
+    // --- Re-open the dataset and verify all rows are accessible ---
+    let reopened = Dataset::open(&source_uri).await.unwrap();
+    let row_count = reopened.count_rows(None).await.unwrap();
+    assert_eq!(
+        row_count, original_rows,
+        "all rows should be readable after to_multi_base"
+    );
+
+    // Scan to exercise actual file reads across all three bases.
+    let batches: Vec<_> = reopened
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let total_scanned: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_scanned, original_rows);
+}
+
+/// Recursively copy the contents of `src` into `dst`.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path).unwrap();
+            copy_dir_recursive(&src_path, &dst_path);
+        } else {
+            std::fs::copy(&src_path, &dst_path).unwrap();
+        }
+    }
+}
