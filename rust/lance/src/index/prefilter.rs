@@ -214,7 +214,7 @@ impl DatasetPreFilter {
         Self::create_deletion_mask_impl(dataset, fragments, false)
     }
 
-    /// Like [`create_deletion_mask`] but also restricts results to the given
+    /// Like [`Self::create_deletion_mask`] but also restricts results to the given
     /// `fragments`, blocking any row from a fragment not in the set.
     pub fn create_restricted_deletion_mask(
         dataset: Arc<Dataset>,
