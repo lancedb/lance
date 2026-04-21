@@ -1378,9 +1378,12 @@ fn merge_with_schema(
                         );
                         let merged_validity =
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
+                        // `trimmed_values` starts at the first used value, so offsets
+                        // must be shifted to match or `ListArray::new` panics when the
+                        // input list was sliced (e.g. from a filtered batch).
                         let merged_list = ListArray::new(
                             child_field.clone(),
-                            left_list.offsets().clone(),
+                            left_list.trimmed_offsets(),
                             merged_values,
                             merged_validity,
                         );
@@ -1405,7 +1408,7 @@ fn merge_with_schema(
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
                         let merged_list = LargeListArray::new(
                             child_field.clone(),
-                            left_list.offsets().clone(),
+                            left_list.trimmed_offsets(),
                             merged_values,
                             merged_validity,
                         );
@@ -2314,6 +2317,103 @@ mod tests {
         // merge left_list and right_list
         let merged_array = merge_with_schema(&left_list_struct, &right_list_struct, &target_fields);
         assert_eq!(merged_array.len(), 2);
+    }
+
+    // Regression for #6580: merge_with_schema panicked when the left list was a
+    // sliced view whose offsets did not start at zero (common after a filtered
+    // scan). Cloning those offsets alongside `trimmed_values` produced offsets
+    // larger than the trimmed child, panicking in `ListArray::new`.
+    #[test]
+    fn test_merge_with_schema_sliced_list_struct() {
+        // Build a List<Struct> with two rows of 5 items each, then slice away
+        // the first row so the remaining list's offsets start at 5, not 0.
+        let struct_fields = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let values = Arc::new(StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef],
+            None,
+        ));
+        let full_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+            OffsetBuffer::from_lengths([5, 5]),
+            values,
+            None,
+        );
+        let sliced_left = full_list.slice(1, 1);
+        assert_eq!(sliced_left.offsets()[0], 5);
+        assert_eq!(sliced_left.offsets()[1], 10);
+
+        let right_struct = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("b", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from_iter_values(100..105)) as ArrayRef],
+            None,
+        ));
+        let right_list = ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(right_struct.fields().clone()),
+                true,
+            )),
+            OffsetBuffer::from_lengths([5]),
+            right_struct,
+            None,
+        );
+
+        let target_fields = Fields::from(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Int32, true),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+
+        let left_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "items",
+                sliced_left.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(sliced_left) as ArrayRef],
+        )
+        .unwrap();
+        let right_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "items",
+                right_list.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(right_list) as ArrayRef],
+        )
+        .unwrap();
+
+        let merged = left_batch
+            .merge_with_schema(&right_batch, &Schema::new(target_fields.to_vec()))
+            .unwrap();
+
+        let merged_list = merged
+            .column_by_name("items")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(merged_list.len(), 1);
+        assert_eq!(merged_list.value_length(0), 5);
+        let merged_struct = merged_list.values().as_struct();
+        assert_eq!(merged_struct.num_columns(), 2);
+        let a = merged_struct
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // After shifting offsets to zero, values 5..10 should be first.
+        let a_vals: Vec<i32> = a.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(a_vals, vec![5, 6, 7, 8, 9]);
     }
 
     #[test]
