@@ -73,6 +73,7 @@ pub mod frag_reuse;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
+pub(crate) mod scalar_logical;
 pub mod vector;
 
 use self::append::merge_indices;

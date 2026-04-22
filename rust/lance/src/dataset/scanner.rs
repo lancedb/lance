@@ -81,7 +81,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::scalar::scalar_index_fragment_bitmap;
+use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };

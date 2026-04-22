@@ -10,7 +10,7 @@ use crate::{
     index::{
         DatasetIndexExt,
         prefilter::DatasetPreFilter,
-        scalar::{open_named_scalar_index, scalar_index_fragment_bitmap},
+        scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
     },
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
