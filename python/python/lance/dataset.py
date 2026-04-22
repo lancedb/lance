@@ -2789,6 +2789,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
+            Literal["PARTITIONED_ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
             IndexConfig,
@@ -2834,7 +2835,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 5 types of scalar indices available today.
+        There are several types of scalar indices available today.
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -2858,6 +2859,9 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
+        * ``PARTITIONED_ZONEMAP``. This is a distributed variant of zonemap that stores
+          one shard per fragment build. It is intended for executor-parallel index
+          creation and uses the same pruning semantics as ``ZONEMAP`` at query time.
         * ``INVERTED`` (alias: ``FTS``). It is used to index document columns. This
           index can conduct full-text searches. For example, a column that contains any
           word
@@ -2879,7 +2883,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``,
+            ``"PARTITIONED_ZONEMAP"``, ``"INVERTED"``,
             ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
@@ -3012,6 +3017,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "BITMAP",
                 "NGRAM",
                 "ZONEMAP",
+                "PARTITIONED_ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
                 "FTS",
@@ -3020,8 +3026,9 @@ class LanceDataset(pa.dataset.Dataset):
             ]:
                 raise NotImplementedError(
                     (
-                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
+                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", '
+                        '"PARTITIONED_ZONEMAP", "LABEL_LIST", "INVERTED", '
+                        '"BLOOMFILTER" or "RTREE" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )

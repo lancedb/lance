@@ -1200,6 +1200,7 @@ impl DirectoryNamespace {
             "INVERTED" | "FTS" => Ok(IndexType::Inverted),
             "NGRAM" => Ok(IndexType::NGram),
             "ZONEMAP" | "ZONE_MAP" => Ok(IndexType::ZoneMap),
+            "PARTITIONED_ZONEMAP" | "PARTITIONED_ZONE_MAP" => Ok(IndexType::PartitionedZoneMap),
             "BLOOMFILTER" | "BLOOM_FILTER" => Ok(IndexType::BloomFilter),
             "RTREE" | "R_TREE" => Ok(IndexType::RTree),
             "VECTOR" | "IVF_PQ" => Ok(IndexType::IvfPq),
@@ -1250,6 +1251,10 @@ impl DirectoryNamespace {
             IndexType::ZoneMap => DirectoryIndexParams::Scalar {
                 index_type,
                 params: ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            },
+            IndexType::PartitionedZoneMap => DirectoryIndexParams::Scalar {
+                index_type,
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::PartitionedZoneMap),
             },
             IndexType::BloomFilter => DirectoryIndexParams::Scalar {
                 index_type,

@@ -169,6 +169,8 @@ fn determine_index_type<'local>(
             Some("INVERTED")
         } else if lower.contains("ngram") {
             Some("NGRAM")
+        } else if lower.contains("partitionedzonemap") {
+            Some("PARTITIONED_ZONEMAP")
         } else if lower.contains("zonemap") {
             Some("ZONEMAP")
         } else if lower.contains("bloomfilter") {

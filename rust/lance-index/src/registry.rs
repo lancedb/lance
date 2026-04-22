@@ -9,9 +9,15 @@ use crate::scalar::rtree::RTreeIndexPlugin;
 use crate::{
     pb, pbold,
     scalar::{
-        bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        bitmap::BitmapIndexPlugin,
+        bloomfilter::BloomFilterIndexPlugin,
+        btree::BTreeIndexPlugin,
+        inverted::InvertedIndexPlugin,
+        json::JsonIndexPlugin,
+        label_list::LabelListIndexPlugin,
+        ngram::NGramIndexPlugin,
+        registry::ScalarIndexPlugin,
+        zonemap::{PartitionedZoneMapIndexPlugin, ZoneMapIndexPlugin},
     },
 };
 
@@ -49,6 +55,14 @@ impl IndexPluginRegistry {
             .insert(plugin_name, Box::new(PluginType::default()));
     }
 
+    pub fn add_alias<PluginType: ScalarIndexPlugin + std::default::Default + 'static>(
+        &mut self,
+        alias: &str,
+    ) {
+        self.plugins
+            .insert(alias.to_string(), Box::new(PluginType::default()));
+    }
+
     /// Create a registry with the default plugins
     pub fn with_default_plugins() -> Arc<Self> {
         let mut registry = Self {
@@ -59,6 +73,8 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
         registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
         registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+        registry.add_plugin::<pb::PartitionedZoneMapIndexDetails, PartitionedZoneMapIndexPlugin>();
+        registry.add_alias::<PartitionedZoneMapIndexPlugin>("partitioned_zonemap");
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();

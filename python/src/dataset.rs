@@ -1972,6 +1972,7 @@ impl Dataset {
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
+            "PARTITIONED_ZONEMAP" => IndexType::PartitionedZoneMap,
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
@@ -2001,6 +2002,10 @@ impl Dataset {
             }),
             "ZONEMAP" => Box::new(ScalarIndexParams {
                 index_type: "zonemap".to_string(),
+                params: None,
+            }),
+            "PARTITIONED_ZONEMAP" => Box::new(ScalarIndexParams {
+                index_type: "partitioned_zonemap".to_string(),
                 params: None,
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {

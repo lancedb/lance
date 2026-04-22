@@ -216,6 +216,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::Inverted
                 | IndexType::NGram
                 | IndexType::ZoneMap
+                | IndexType::PartitionedZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
                 | IndexType::RTree,
@@ -1135,6 +1136,94 @@ mod tests {
         assert!(
             !merge_tags.iter().any(|e| e == "start:merge_lookups"),
             "fragment-based distributed BTREE merge should not use merge_lookups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_metadata_partitioned_zonemap_reports_progress() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(
+            lance_index::scalar::BuiltinIndexType::PartitionedZoneMap,
+        );
+        let fragment_ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+
+        for &fragment_id in &fragment_ids {
+            let index_metadata = CreateIndexBuilder::new(
+                &mut dataset,
+                &["id"],
+                IndexType::PartitionedZoneMap,
+                &params,
+            )
+            .name("distributed_partitioned_zonemap".to_string())
+            .fragments(vec![fragment_id])
+            .index_uuid(shared_uuid.clone())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+            let fragment_bitmap = index_metadata.fragment_bitmap.as_ref().unwrap();
+            let indexed_fragments: Vec<u32> = fragment_bitmap.iter().collect();
+            assert_eq!(indexed_fragments, vec![fragment_id]);
+        }
+
+        let merge_progress = Arc::new(RecordingProgress::default());
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::PartitionedZoneMap,
+                None,
+                merge_progress.clone(),
+            )
+            .await
+            .unwrap();
+
+        let merge_tags = merge_progress
+            .recorded_events()
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "start:validate_partition_files"),
+            "expected validate_partition_files start during public merge"
+        );
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "progress:validate_partition_files"),
+            "expected validate_partition_files progress during public merge"
+        );
+        assert!(
+            merge_tags
+                .iter()
+                .any(|e| e == "complete:validate_partition_files"),
+            "expected validate_partition_files complete during public merge"
         );
     }
 

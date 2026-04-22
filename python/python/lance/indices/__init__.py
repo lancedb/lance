@@ -29,6 +29,7 @@ class SupportedDistributedIndices(str, Enum):
     # Scalar index types
     BTREE = "BTREE"
     INVERTED = "INVERTED"
+    PARTITIONED_ZONEMAP = "PARTITIONED_ZONEMAP"
 
     # Precise vector index types supported by distributed merge
     IVF_FLAT = "IVF_FLAT"

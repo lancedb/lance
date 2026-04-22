@@ -942,6 +942,7 @@ fn inner_create_index<'local>(
         | IndexType::Inverted
         | IndexType::NGram
         | IndexType::ZoneMap
+        | IndexType::PartitionedZoneMap
         | IndexType::BloomFilter
         | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams

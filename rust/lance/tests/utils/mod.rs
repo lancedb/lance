@@ -195,6 +195,7 @@ async fn build_dataset(
             | IndexType::LabelList
             | IndexType::NGram
             | IndexType::ZoneMap
+            | IndexType::PartitionedZoneMap
             | IndexType::BloomFilter => Box::new(ScalarIndexParams::for_builtin(
                 (*index_type).try_into().unwrap(),
             )),

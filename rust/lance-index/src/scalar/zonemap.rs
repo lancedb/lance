@@ -19,8 +19,7 @@ use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
-    BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
-    compute_next_prefix,
+    CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria, compute_next_prefix,
 };
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
@@ -42,14 +41,45 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
+const PARTITIONED_ZONEMAP_FILENAME_SUFFIX: &str = "_zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
+
+fn partitioned_zonemap_filename(fragment_id: u32) -> String {
+    format!("part_{fragment_id}{PARTITIONED_ZONEMAP_FILENAME_SUFFIX}")
+}
+
+fn is_partitioned_zonemap_filename(name: &str) -> bool {
+    name.starts_with("part_") && name.ends_with(PARTITIONED_ZONEMAP_FILENAME_SUFFIX)
+}
+
+fn zonemap_index_details(index_type: IndexType) -> Result<prost_types::Any> {
+    match index_type {
+        IndexType::ZoneMap => {
+            prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).map_err(Into::into)
+        }
+        IndexType::PartitionedZoneMap => {
+            prost_types::Any::from_msg(&crate::pb::PartitionedZoneMapIndexDetails::default())
+                .map_err(Into::into)
+        }
+        _ => Err(Error::invalid_input(format!(
+            "unsupported zonemap index type: {index_type}"
+        ))),
+    }
+}
+
+fn zonemap_index_params(index_type: IndexType, rows_per_zone: u64) -> Result<ScalarIndexParams> {
+    let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(rows_per_zone))?;
+    Ok(ScalarIndexParams::for_builtin(index_type.try_into()?).with_params(&params))
+}
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
@@ -106,6 +136,7 @@ pub struct ZoneMapIndex {
     data_type: DataType,
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
+    index_type: IndexType,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
     index_cache: WeakLanceCache,
@@ -117,6 +148,7 @@ impl std::fmt::Debug for ZoneMapIndex {
             .field("zones", &self.zones)
             .field("data_type", &self.data_type)
             .field("rows_per_zone", &self.rows_per_zone)
+            .field("index_type", &self.index_type)
             .field("store", &self.store)
             .field("fri", &self.fri)
             .field("index_cache", &self.index_cache)
@@ -385,6 +417,18 @@ impl ZoneMapIndex {
     where
         Self: Sized,
     {
+        Self::load_single(store, fri, index_cache, IndexType::ZoneMap).await
+    }
+
+    async fn load_single(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+        index_type: IndexType,
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
         let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
         let zone_maps = index_file
             .read_range(0..index_file.num_rows(), None)
@@ -402,17 +446,80 @@ impl ZoneMapIndex {
             fri,
             index_cache,
             rows_per_zone,
+            index_type,
         )?))
     }
 
-    fn try_from_serialized(
-        data: RecordBatch,
+    async fn load_partitioned(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
-        rows_per_zone: u64,
-    ) -> Result<Self> {
-        // The RecordBatch should have columns: min, max, null_count
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        let mut files = store.list_files_with_sizes().await?;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let partition_files = files
+            .into_iter()
+            .filter(|file| is_partitioned_zonemap_filename(&file.path))
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+
+        if partition_files.is_empty() {
+            return Self::load_single(store, fri, index_cache, IndexType::PartitionedZoneMap).await;
+        }
+
+        let mut rows_per_zone = None;
+        let mut data_type = None;
+        let mut zones = Vec::new();
+
+        for file in partition_files {
+            let index_file = store.open_index_file(&file).await?;
+            let zone_maps = index_file
+                .read_range(0..index_file.num_rows(), None)
+                .await?;
+            let this_rows_per_zone = index_file
+                .schema()
+                .metadata
+                .get(ZONEMAP_SIZE_META_KEY)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(ROWS_PER_ZONE_DEFAULT);
+            if let Some(existing) = rows_per_zone {
+                if existing != this_rows_per_zone {
+                    return Err(Error::invalid_input(format!(
+                        "partitioned zonemap shard {file} has rows_per_zone={this_rows_per_zone}, expected {existing}"
+                    )));
+                }
+            } else {
+                rows_per_zone = Some(this_rows_per_zone);
+            }
+
+            let (mut file_zones, file_data_type) = Self::deserialize_zones(&zone_maps)?;
+            if let Some(existing) = &data_type {
+                if existing != &file_data_type {
+                    return Err(Error::invalid_input(format!(
+                        "partitioned zonemap shard {file} has mismatched data type {file_data_type:?}, expected {existing:?}"
+                    )));
+                }
+            } else {
+                data_type = Some(file_data_type);
+            }
+            zones.append(&mut file_zones);
+        }
+
+        Ok(Arc::new(Self {
+            zones,
+            data_type: data_type.unwrap_or(DataType::Null),
+            rows_per_zone: rows_per_zone.unwrap_or(ROWS_PER_ZONE_DEFAULT),
+            index_type: IndexType::PartitionedZoneMap,
+            store,
+            fri,
+            index_cache: WeakLanceCache::from(index_cache),
+        }))
+    }
+
+    fn deserialize_zones(data: &RecordBatch) -> Result<(Vec<ZoneMapStatistics>, DataType)> {
         let min_col = data
             .column_by_name("min")
             .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
@@ -443,7 +550,6 @@ impl ZoneMapIndex {
             .ok_or_else(|| {
                 Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64")
             })?;
-
         let fragment_id_col = data
             .column_by_name("fragment_id")
             .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
@@ -452,7 +558,6 @@ impl ZoneMapIndex {
             .ok_or_else(|| {
                 Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64")
             })?;
-
         let zone_start_col = data
             .column_by_name("zone_start")
             .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
@@ -462,32 +567,13 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
-        let data_type = min_col.data_type().clone();
-
-        if data.num_rows() == 0 {
-            return Ok(Self {
-                zones: Vec::new(),
-                data_type,
-                rows_per_zone,
-                store,
-                fri,
-                index_cache: WeakLanceCache::from(index_cache),
-            });
-        }
-
-        let num_zones = data.num_rows();
-        let mut zones = Vec::with_capacity(num_zones);
-
-        for i in 0..num_zones {
-            let min = ScalarValue::try_from_array(min_col, i)?;
-            let max = ScalarValue::try_from_array(max_col, i)?;
-            let null_count = null_count_col.value(i);
-            let nan_count = nan_count_col.value(i);
+        let mut zones = Vec::with_capacity(data.num_rows());
+        for i in 0..data.num_rows() {
             zones.push(ZoneMapStatistics {
-                min,
-                max,
-                null_count,
-                nan_count,
+                min: ScalarValue::try_from_array(min_col, i)?,
+                max: ScalarValue::try_from_array(max_col, i)?,
+                null_count: null_count_col.value(i),
+                nan_count: nan_count_col.value(i),
                 bound: ZoneBound {
                     fragment_id: fragment_id_col.value(i),
                     start: zone_start_col.value(i),
@@ -495,11 +581,42 @@ impl ZoneMapIndex {
                 },
             });
         }
+        Ok((zones, min_col.data_type().clone()))
+    }
+
+    fn try_from_serialized(
+        data: RecordBatch,
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+        rows_per_zone: u64,
+        index_type: IndexType,
+    ) -> Result<Self> {
+        let data_type = data
+            .column_by_name("min")
+            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?
+            .data_type()
+            .clone();
+
+        if data.num_rows() == 0 {
+            return Ok(Self {
+                zones: Vec::new(),
+                data_type,
+                rows_per_zone,
+                index_type,
+                store,
+                fri,
+                index_cache: WeakLanceCache::from(index_cache),
+            });
+        }
+
+        let (zones, _) = Self::deserialize_zones(&data)?;
 
         Ok(Self {
             zones,
             data_type,
             rows_per_zone,
+            index_type,
             store,
             fri,
             index_cache: WeakLanceCache::from(index_cache),
@@ -530,13 +647,17 @@ impl Index for ZoneMapIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
+            "index_type": match self.index_type {
+                IndexType::PartitionedZoneMap => "partitioned_zonemap",
+                _ => "zonemap",
+            },
             "num_zones": self.zones.len(),
             "rows_per_zone": self.rows_per_zone,
         }))
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::ZoneMap
+        self.index_type
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
@@ -599,11 +720,10 @@ impl ScalarIndex for ZoneMapIndex {
         let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
-        builder.write_index(dest_store).await?;
+        builder.write_index(dest_store, ZONEMAP_FILENAME).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
-                .unwrap(),
+            index_details: zonemap_index_details(self.index_type)?,
             index_version: ZONEMAP_INDEX_VERSION,
             files: Some(dest_store.list_files_with_sizes().await?),
         })
@@ -616,8 +736,7 @@ impl ScalarIndex for ZoneMapIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
+        zonemap_index_params(self.index_type, self.rows_per_zone)
     }
 }
 
@@ -732,7 +851,7 @@ impl ZoneMapIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+    pub async fn write_index(self, index_store: &dyn IndexStore, file_name: &str) -> Result<()> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -742,7 +861,7 @@ impl ZoneMapIndexBuilder {
         );
 
         let mut index_file = index_store
-            .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
+            .new_index_file(file_name, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
         index_file.finish().await?;
@@ -839,6 +958,7 @@ impl ZoneMapIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<ZoneMapIndexBuilderParams>,
+        file_name: &str,
     ) -> Result<()> {
         // train_zonemap_index: calling scan_aligned_chunks
         let value_type = batches_source.schema().field(0).data_type().clone();
@@ -847,7 +967,7 @@ impl ZoneMapIndexPlugin {
 
         builder.train(batches_source).await?;
 
-        builder.write_index(index_store).await?;
+        builder.write_index(index_store, file_name).await?;
         Ok(())
     }
 }
@@ -934,10 +1054,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        Self::train_zonemap_index(data, index_store, Some(request.params), ZONEMAP_FILENAME)
+            .await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
-                .unwrap(),
+            index_details: zonemap_index_details(IndexType::ZoneMap)?,
             index_version: ZONEMAP_INDEX_VERSION,
             files: Some(index_store.list_files_with_sizes().await?),
         })
@@ -950,8 +1070,149 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(
+            ZoneMapIndex::load_single(index_store, frag_reuse_index, cache, IndexType::ZoneMap)
+                .await? as Arc<dyn ScalarIndex>,
+        )
     }
+}
+
+#[derive(Debug, Default)]
+pub struct PartitionedZoneMapIndexPlugin;
+
+#[async_trait]
+impl ScalarIndexPlugin for PartitionedZoneMapIndexPlugin {
+    fn name(&self) -> &str {
+        "partitioned_zonemap"
+    }
+
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        if field.data_type().is_nested() {
+            return Err(Error::invalid_input_source(
+                "A zone map index can only be created on a non-nested field.".into(),
+            ));
+        }
+
+        let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
+        Ok(Box::new(ZoneMapIndexTrainingRequest::new(params)))
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        ZONEMAP_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(index_name, true)))
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let request = (request as Box<dyn std::any::Any>)
+            .downcast::<ZoneMapIndexTrainingRequest>()
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
+            })?;
+        let file_name = match fragment_ids.as_deref() {
+            Some([fragment_id]) => partitioned_zonemap_filename(*fragment_id),
+            Some(fragment_ids) => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "partitioned zonemap expects exactly one fragment per shard, got {}",
+                        fragment_ids.len()
+                    )
+                    .into(),
+                ));
+            }
+            None => ZONEMAP_FILENAME.to_string(),
+        };
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            data,
+            index_store,
+            Some(request.params),
+            &file_name,
+        )
+        .await?;
+
+        Ok(CreatedIndex {
+            index_details: zonemap_index_details(IndexType::PartitionedZoneMap)?,
+            index_version: ZONEMAP_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
+        })
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(
+            ZoneMapIndex::load_partitioned(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
+
+    fn details_as_json(&self, _details: &prost_types::Any) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "layout": "partitioned"
+        }))
+    }
+}
+
+pub async fn merge_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    progress: Arc<dyn crate::progress::IndexBuildProgress>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    progress
+        .stage_start("validate_partition_files", None, "files")
+        .await?;
+
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+    let mut matched = 0u64;
+    while let Some(item) = list_stream.next().await {
+        let meta = item?;
+        let file_name = meta.location.filename().unwrap_or_default();
+        if file_name == ZONEMAP_FILENAME || is_partitioned_zonemap_filename(file_name) {
+            matched += 1;
+            progress
+                .stage_progress("validate_partition_files", matched)
+                .await?;
+        }
+    }
+    progress.stage_complete("validate_partition_files").await?;
+
+    if matched == 0 {
+        return Err(Error::invalid_input(format!(
+            "no zonemap shard files found in index directory: {index_dir}"
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -990,8 +1251,8 @@ mod tests {
     };
 
     // Add missing imports for the tests
-    use crate::Index; // Import Index trait to access calculate_included_frags
     use crate::metrics::NoOpMetricsCollector;
+    use crate::{Index, IndexType}; // Import Index trait to access calculate_included_frags
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
     use std::collections::Bound;
 
@@ -1017,6 +1278,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partitioned_zonemap_loads_multiple_shards() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+
+        for fragment_id in 0..2u64 {
+            let values = arrow_array::Int32Array::from_iter_values(
+                (0..4).map(|offset| (fragment_id as i32) * 10 + offset),
+            );
+            let row_ids =
+                UInt64Array::from_iter_values((0..4).map(|offset| (fragment_id << 32) | offset));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
+                    .unwrap();
+            let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                stream::once(std::future::ready(Ok(batch))),
+            ));
+            ZoneMapIndexPlugin::train_zonemap_index(
+                stream,
+                test_store.as_ref(),
+                Some(ZoneMapIndexBuilderParams::new(4)),
+                &partitioned_zonemap_filename(fragment_id as u32),
+            )
+            .await
+            .unwrap();
+        }
+
+        let index = ZoneMapIndex::load_partitioned(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.index_type(), IndexType::PartitionedZoneMap);
+        assert_eq!(index.rows_per_zone, 4);
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter(0..2)
+        );
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(11))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(1u64 << 32..((1u64 << 32) + 4));
+        assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
     async fn test_empty_zonemap_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
@@ -1039,9 +1359,14 @@ mod tests {
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        ZoneMapIndexPlugin::train_zonemap_index(data_stream, test_store.as_ref(), None)
-            .await
-            .unwrap();
+        ZoneMapIndexPlugin::train_zonemap_index(
+            data_stream,
+            test_store.as_ref(),
+            None,
+            ZONEMAP_FILENAME,
+        )
+        .await
+        .unwrap();
 
         log::debug!("Successfully wrote the index file");
 
@@ -1083,6 +1408,7 @@ mod tests {
             stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(5000)),
+            ZONEMAP_FILENAME,
         )
         .await
         .unwrap();
@@ -1208,7 +1534,7 @@ mod tests {
         let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
         // Train and write the zonemap index
-        ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None)
+        ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None, ZONEMAP_FILENAME)
             .await
             .unwrap();
 
@@ -1311,6 +1637,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(100)),
+            ZONEMAP_FILENAME,
         )
         .await
         .unwrap();
@@ -1495,6 +1822,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(100)),
+            ZONEMAP_FILENAME,
         )
         .await
         .unwrap();
@@ -1696,6 +2024,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::default()),
+            ZONEMAP_FILENAME,
         )
         .await
         .unwrap();
@@ -1858,6 +2187,7 @@ mod tests {
                 data_stream,
                 test_store.as_ref(),
                 Some(ZoneMapIndexBuilderParams::new(5000)),
+                ZONEMAP_FILENAME,
             )
             .await
             .unwrap();
@@ -2066,6 +2396,7 @@ mod tests {
                 data_stream,
                 test_store.as_ref(),
                 Some(ZoneMapIndexBuilderParams::default()),
+                ZONEMAP_FILENAME,
             )
             .await
             .unwrap();
@@ -2141,6 +2472,7 @@ mod tests {
                 data_stream,
                 test_store.as_ref(),
                 Some(ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE_DEFAULT * 3)),
+                ZONEMAP_FILENAME,
             )
             .await
             .unwrap();
@@ -2342,6 +2674,7 @@ mod tests {
             zones,
             data_type: DataType::Utf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            index_type: IndexType::ZoneMap,
             store: test_store,
             fri: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
@@ -2414,6 +2747,7 @@ mod tests {
             zones,
             data_type: DataType::Utf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            index_type: IndexType::ZoneMap,
             store: test_store,
             fri: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
@@ -2481,6 +2815,7 @@ mod tests {
             zones,
             data_type: DataType::LargeUtf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
+            index_type: IndexType::ZoneMap,
             store: test_store,
             fri: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),

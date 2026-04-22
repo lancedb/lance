@@ -16,7 +16,7 @@ use crate::{
 use arrow_schema::DataType;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::datatypes::Field;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
@@ -24,6 +24,7 @@ use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
+    ZoneMapIndexDetails,
 };
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
@@ -420,12 +421,15 @@ pub(crate) async fn infer_scalar_index_details(
         )))?;
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
+    let zonemap_lookup = index_dir.child("zonemap.lance");
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     let index_details = if let DataType::List(_) = col.data_type() {
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
         prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
+    } else if dataset.object_store.exists(&zonemap_lookup).await? {
+        prost_types::Any::from_msg(&ZoneMapIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
@@ -446,7 +450,22 @@ pub(crate) async fn infer_scalar_index_details(
     {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
-        prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
+        let mut list_stream = dataset.object_store.list(Some(index_dir.clone()));
+        let mut found_partitioned_zonemap = false;
+        while let Some(item) = list_stream.next().await {
+            let meta = item?;
+            let file_name = meta.location.filename().unwrap_or_default();
+            if file_name.starts_with("part_") && file_name.ends_with("_zonemap.lance") {
+                found_partitioned_zonemap = true;
+                break;
+            }
+        }
+        if found_partitioned_zonemap {
+            prost_types::Any::from_msg(&lance_index::pb::PartitionedZoneMapIndexDetails::default())
+                .unwrap()
+        } else {
+            prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
+        }
     };
 
     let index_details = Arc::new(index_details);
@@ -623,6 +642,10 @@ mod tests {
                 IndexType::NGram => {
                     prost_types::Any::from_msg(&NGramIndexDetails::default()).unwrap()
                 }
+                IndexType::PartitionedZoneMap => prost_types::Any::from_msg(
+                    &lance_index::pb::PartitionedZoneMapIndexDetails::default(),
+                )
+                .unwrap(),
                 IndexType::Vector => {
                     prost_types::Any::from_msg(&VectorIndexDetails::default()).unwrap()
                 }

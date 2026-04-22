@@ -190,4 +190,6 @@ message JsonIndexDetails {
 }
 message BloomFilterIndexDetails {}
 
+message PartitionedZoneMapIndexDetails {}
+
 message RTreeIndexDetails {}
