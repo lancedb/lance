@@ -444,4 +444,75 @@ mod tests {
                 .all(|fragment_id| *fragment_id == target_fragment)
         );
     }
+
+    #[tokio::test]
+    async fn test_commit_existing_zonemap_segments_replaces_overlapping_segments() {
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+
+        let mut first_segments = Vec::new();
+        for fragment in &fragments {
+            first_segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                    .name("value_zonemap_replace".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        dataset
+            .commit_existing_index_segments("value_zonemap_replace", "value", first_segments)
+            .await
+            .unwrap();
+
+        let mut replacement_segments = Vec::new();
+        for fragment in &fragments {
+            replacement_segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                    .name("value_zonemap_replace".to_string())
+                    .replace(true)
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let replacement_uuids = replacement_segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+
+        dataset
+            .commit_existing_index_segments("value_zonemap_replace", "value", replacement_segments)
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("value_zonemap_replace")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), fragments.len());
+        assert_eq!(
+            committed
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>(),
+            replacement_uuids
+        );
+        assert_eq!(
+            scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap_replace")
+                .await
+                .unwrap()
+                .unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+    }
 }

@@ -995,6 +995,11 @@ impl DatasetIndexExt for Dataset {
         validate_segment_metadata(index_name, &segments)?;
         validate_segment_index_details(index_name, &segments)?;
 
+        let incoming_type_url = segments[0]
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone());
+        let mut incoming_fragments = RoaringBitmap::new();
         let mut new_indices = Vec::with_capacity(segments.len());
         for mut segment in segments {
             if segment.fields != [field.id] {
@@ -1003,16 +1008,57 @@ impl DatasetIndexExt for Dataset {
                     segment.uuid, segment.fields, field.id
                 )));
             }
+            if let (Some(expected), Some(actual)) = (
+                incoming_type_url.as_deref(),
+                segment
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str()),
+            ) && expected != actual
+            {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment set for index '{}' mixes incompatible index detail types",
+                    index_name
+                )));
+            }
+            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
+                incoming_fragments |= fragment_bitmap.clone();
+            }
             segment.name = index_name.to_string();
             segment.dataset_version = self.manifest.version;
             new_indices.push(segment);
         }
 
+        let existing_named_indices = self.load_indices_by_name(index_name).await?;
+        if existing_named_indices
+            .iter()
+            .any(|idx| idx.fields != [field.id])
+        {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        let removed_indices = existing_named_indices
+            .into_iter()
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .zip(incoming_type_url.as_deref())
+                    .is_none_or(|(details, expected)| details.type_url == expected)
+            })
+            .filter(|idx| {
+                idx.fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| !bitmap.is_disjoint(&incoming_fragments))
+            })
+            .collect::<Vec<_>>();
+
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
-                removed_indices: vec![],
+                removed_indices,
             },
             None,
         );
