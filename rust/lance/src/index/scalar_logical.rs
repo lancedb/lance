@@ -23,7 +23,7 @@ use crate::index::scalar::fetch_index_details;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 #[derive(Debug)]
-pub(crate) struct LogicalScalarIndex {
+pub struct LogicalScalarIndex {
     name: String,
     column: String,
     index_type: IndexType,
@@ -254,7 +254,7 @@ fn union_fragment_bitmaps(indices: &[IndexMetadata], index_name: &str) -> Result
     Ok(combined)
 }
 
-pub(crate) async fn scalar_index_fragment_bitmap(
+pub async fn scalar_index_fragment_bitmap(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -270,7 +270,7 @@ pub(crate) async fn scalar_index_fragment_bitmap(
     }
 }
 
-pub(crate) async fn open_named_scalar_index(
+pub async fn open_named_scalar_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
