@@ -1070,10 +1070,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            ZoneMapIndex::load_single(index_store, frag_reuse_index, cache, IndexType::ZoneMap)
-                .await? as Arc<dyn ScalarIndex>,
-        )
+        Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
 }
 
@@ -1222,7 +1219,9 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
-    use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
+    use crate::scalar::zonemap::{
+        ZoneMapIndexPlugin, ZoneMapStatistics, partitioned_zonemap_filename,
+    };
     use arrow::datatypes::Float32Type;
     use arrow_array::{Array, RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
