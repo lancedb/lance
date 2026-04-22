@@ -3239,7 +3239,11 @@ pub(crate) async fn write_manifest_file(
         // Preserve it here so this second apply_feature_flags call does not clear it
         // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
         let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
-        apply_feature_flags(manifest, use_stable_row_ids, config.disable_transaction_file)?;
+        apply_feature_flags(
+            manifest,
+            use_stable_row_ids,
+            config.disable_transaction_file,
+        )?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
