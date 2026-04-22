@@ -81,6 +81,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -3810,16 +3811,18 @@ impl Scanner {
             ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
                 & self.fragments_covered_by_index_query(rhs).await?),
             ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(search) => {
-                let idx = self
-                    .dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search.index_name))
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
-            }
+            ScalarIndexExpr::Query(search) => scalar_index_fragment_bitmap(
+                self.dataset.as_ref(),
+                &search.column,
+                &search.index_name,
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::Error::internal(format!(
+                    "Index not found even though it must have been found earlier: {}",
+                    search.index_name
+                ))
+            }),
         }
     }
 

@@ -18,6 +18,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::Field;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
@@ -38,11 +39,12 @@ use lance_index::scalar::registry::{
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
-    lance_format::LanceIndexStore,
+    lance_format::LanceIndexStore, zonemap::LogicalZoneMapIndex,
 };
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
+use roaring::RoaringBitmap;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -399,6 +401,104 @@ pub async fn open_scalar_index(
         .await
 }
 
+fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> bool {
+    index
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0)
+}
+
+fn union_fragment_bitmaps(indices: &[IndexMetadata], index_name: &str) -> Result<RoaringBitmap> {
+    let mut combined = RoaringBitmap::new();
+    for index in indices {
+        let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Scalar index '{}' segment {} is missing fragment coverage",
+                index_name, index.uuid
+            ))
+        })?;
+        combined |= fragment_bitmap.clone();
+    }
+    Ok(combined)
+}
+
+async fn load_named_zonemap_segments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+) -> Result<Option<Vec<IndexMetadata>>> {
+    let usable_indices = dataset
+        .load_indices_by_name(index_name)
+        .await?
+        .into_iter()
+        .filter(|index| index_intersects_dataset(index, dataset))
+        .collect::<Vec<_>>();
+
+    if usable_indices.len() <= 1 {
+        return Ok(None);
+    }
+
+    for index in &usable_indices {
+        let index_details = fetch_index_details(dataset, column, index).await?;
+        if !index_details.type_url.ends_with("ZoneMapIndexDetails") {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(usable_indices))
+}
+
+pub(crate) async fn scalar_index_fragment_bitmap(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+) -> Result<Option<RoaringBitmap>> {
+    if let Some(indices) = load_named_zonemap_segments(dataset, column, index_name).await? {
+        return union_fragment_bitmaps(&indices, index_name).map(Some);
+    }
+
+    Ok(dataset
+        .load_scalar_index(IndexCriteria::default().with_name(index_name))
+        .await?
+        .and_then(|index| index.fragment_bitmap))
+}
+
+pub(crate) async fn open_named_scalar_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
+    if let Some(indices) = load_named_zonemap_segments(dataset, column, index_name).await? {
+        let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
+        let stores = indices
+            .iter()
+            .map(|index| {
+                LanceIndexStore::from_dataset_for_existing(dataset, index)
+                    .map(|store| Arc::new(store) as Arc<dyn IndexStore>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let logical_cache = LanceCache::no_cache();
+        return Ok(
+            LogicalZoneMapIndex::load(stores, frag_reuse_index, &logical_cache).await?
+                as Arc<dyn ScalarIndex>,
+        );
+    }
+
+    let index = dataset
+        .load_scalar_index(IndexCriteria::default().with_name(index_name))
+        .await?
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
+                index_name, column
+            ))
+        })?;
+    dataset
+        .open_scalar_index(column, &index.uuid.to_string(), metrics)
+        .await
+}
+
 pub(crate) async fn infer_scalar_index_details(
     dataset: &Dataset,
     column: &str,
@@ -594,6 +694,8 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
+    use crate::dataset::Dataset;
+    use crate::index::create::CreateIndexBuilder;
     use arrow::{
         array::AsArray,
         datatypes::{Int32Type, UInt64Type},
@@ -603,8 +705,12 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::{IndexType, optimize::OptimizeOptions};
-    use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
+    use lance_index::{
+        pbold::NGramIndexDetails,
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+    };
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
@@ -815,6 +921,53 @@ mod tests {
             }
         }
         assert_eq!(max_frag_id_seen, 3);
+    }
+
+    #[tokio::test]
+    async fn test_open_named_scalar_index_uses_all_zonemap_segments() {
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut segments = Vec::new();
+
+        for fragment in &fragments {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                    .name("value_zonemap".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segments.push(segment);
+        }
+
+        dataset
+            .commit_existing_index_segments("value_zonemap", "value", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("value_zonemap").await.unwrap();
+        assert_eq!(committed.len(), fragments.len());
+
+        let logical =
+            open_named_scalar_index(&dataset, "value", "value_zonemap", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        assert_eq!(
+            logical.calculate_included_frags().await.unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+
+        let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
     }
 
     #[tokio::test]

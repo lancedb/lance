@@ -24,7 +24,9 @@ use crate::scalar::{
 };
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
+use futures::future::try_join_all;
 use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::utils::mask::NullableRowAddrSet;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
@@ -111,6 +113,12 @@ pub struct ZoneMapIndex {
     index_cache: WeakLanceCache,
 }
 
+#[derive(Debug)]
+pub struct LogicalZoneMapIndex {
+    segments: Vec<Arc<ZoneMapIndex>>,
+    rows_per_zone: u64,
+}
+
 impl std::fmt::Debug for ZoneMapIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZoneMapIndex")
@@ -127,6 +135,55 @@ impl std::fmt::Debug for ZoneMapIndex {
 impl DeepSizeOf for ZoneMapIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
+    }
+}
+
+impl LogicalZoneMapIndex {
+    pub async fn load(
+        stores: Vec<Arc<dyn IndexStore>>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        if stores.is_empty() {
+            return Err(Error::invalid_input(
+                "LogicalZoneMapIndex requires at least one segment".to_string(),
+            ));
+        }
+
+        let segments = try_join_all(
+            stores
+                .into_iter()
+                .map(|store| ZoneMapIndex::load(store, fri.clone(), index_cache)),
+        )
+        .await?;
+
+        let data_type = segments[0].data_type.clone();
+        let rows_per_zone = segments[0].rows_per_zone;
+        for segment in segments.iter().skip(1) {
+            if segment.data_type != data_type {
+                return Err(Error::invalid_input(format!(
+                    "LogicalZoneMapIndex requires identical data types across segments, found {:?} and {:?}",
+                    data_type, segment.data_type
+                )));
+            }
+            if segment.rows_per_zone != rows_per_zone {
+                return Err(Error::invalid_input(format!(
+                    "LogicalZoneMapIndex requires identical rows_per_zone across segments, found {} and {}",
+                    rows_per_zone, segment.rows_per_zone
+                )));
+            }
+        }
+
+        Ok(Arc::new(Self {
+            segments,
+            rows_per_zone,
+        }))
+    }
+}
+
+impl DeepSizeOf for LogicalZoneMapIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.segments.deep_size_of_children(context)
     }
 }
 
@@ -621,6 +678,126 @@ impl ScalarIndex for ZoneMapIndex {
     }
 }
 
+#[async_trait]
+impl Index for LogicalZoneMapIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::invalid_input_source(
+            "LogicalZoneMapIndex is not a vector index".into(),
+        ))
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        for segment in &self.segments {
+            segment.prewarm().await?;
+        }
+        Ok(())
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "num_segments": self.segments.len(),
+            "num_zones": self.segments.iter().map(|segment| segment.zones.len()).sum::<usize>(),
+            "rows_per_zone": self.rows_per_zone,
+        }))
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::ZoneMap
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = RoaringBitmap::new();
+        for segment in &self.segments {
+            frag_ids |= segment.calculate_included_frags().await?;
+        }
+        Ok(frag_ids)
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for LogicalZoneMapIndex {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let results = try_join_all(
+            self.segments
+                .iter()
+                .map(|segment| segment.search(query, metrics)),
+        )
+        .await?;
+
+        let mut selections = Vec::with_capacity(results.len());
+        let mut all_exact = true;
+        for result in results {
+            match result {
+                SearchResult::Exact(rows) => selections.push(rows),
+                SearchResult::AtMost(rows) => {
+                    all_exact = false;
+                    selections.push(rows);
+                }
+                SearchResult::AtLeast(_) => {
+                    return Err(Error::not_supported(
+                        "LogicalZoneMapIndex does not support AtLeast search results".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let selection = NullableRowAddrSet::union_all(&selections);
+        Ok(if all_exact {
+            SearchResult::Exact(selection)
+        } else {
+            SearchResult::AtMost(selection)
+        })
+    }
+
+    fn can_remap(&self) -> bool {
+        false
+    }
+
+    async fn remap(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "LogicalZoneMapIndex does not support remap".into(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "LogicalZoneMapIndex does not support update".into(),
+        ))
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(
+            TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+        )
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
+    }
+}
+
 fn default_rows_per_zone() -> u64 {
     *DEFAULT_ROWS_PER_ZONE
 }
@@ -918,15 +1095,9 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "ZoneMap index does not support fragment training".into(),
-            ));
-        }
-
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
             .map_err(|_| {
