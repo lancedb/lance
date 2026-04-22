@@ -450,6 +450,9 @@ pub(crate) async fn infer_scalar_index_details(
     {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
+        // Missing details can come from older/manual commits, so fall back to a directory scan.
+        // This is intentionally only in the inference path to avoid adding a list operation to
+        // normal indexed reads.
         let mut list_stream = dataset.object_store.list(Some(index_dir.clone()));
         let mut found_partitioned_zonemap = false;
         while let Some(item) = list_stream.next().await {

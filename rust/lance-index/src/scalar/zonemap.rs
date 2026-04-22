@@ -467,7 +467,9 @@ impl ZoneMapIndex {
             .collect::<Vec<_>>();
 
         if partition_files.is_empty() {
-            return Self::load_single(store, fri, index_cache, IndexType::PartitionedZoneMap).await;
+            return Err(Error::invalid_input(
+                "partitioned zonemap index is missing part_*_zonemap.lance shards",
+            ));
         }
 
         let mut rows_per_zone = None;
@@ -1140,7 +1142,11 @@ impl ScalarIndexPlugin for PartitionedZoneMapIndexPlugin {
                     .into(),
                 ));
             }
-            None => ZONEMAP_FILENAME.to_string(),
+            None => {
+                return Err(Error::invalid_input_source(
+                    "partitioned zonemap requires exactly one fragment id per shard".into(),
+                ));
+            }
         };
 
         ZoneMapIndexPlugin::train_zonemap_index(
@@ -1191,21 +1197,30 @@ pub async fn merge_index_files(
 
     let mut list_stream = object_store.list(Some(index_dir.clone()));
     let mut matched = 0u64;
+    let mut found_single_file_layout = false;
     while let Some(item) = list_stream.next().await {
         let meta = item?;
         let file_name = meta.location.filename().unwrap_or_default();
-        if file_name == ZONEMAP_FILENAME || is_partitioned_zonemap_filename(file_name) {
+        if is_partitioned_zonemap_filename(file_name) {
             matched += 1;
             progress
                 .stage_progress("validate_partition_files", matched)
                 .await?;
+        } else if file_name == ZONEMAP_FILENAME {
+            found_single_file_layout = true;
         }
     }
     progress.stage_complete("validate_partition_files").await?;
 
+    if found_single_file_layout {
+        return Err(Error::invalid_input(format!(
+            "unexpected zonemap.lance found in partitioned zonemap index directory: {index_dir}"
+        )));
+    }
+
     if matched == 0 {
         return Err(Error::invalid_input(format!(
-            "no zonemap shard files found in index directory: {index_dir}"
+            "no partitioned zonemap shard files found in index directory: {index_dir}"
         )));
     }
 
@@ -1214,13 +1229,20 @@ pub async fn merge_index_files(
 
 #[cfg(test)]
 mod tests {
+    use crate::Result;
     use crate::scalar::registry::VALUE_COLUMN_NAME;
+    use crate::scalar::registry::ScalarIndexPlugin;
     use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
+    use crate::{
+        Index, IndexType,
+        progress::{IndexBuildProgress, NoopIndexBuildProgress},
+    };
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{
-        ZoneMapIndexPlugin, ZoneMapStatistics, partitioned_zonemap_filename,
+        PartitionedZoneMapIndexPlugin, ZoneMapIndexPlugin, ZoneMapStatistics, merge_index_files,
+        partitioned_zonemap_filename,
     };
     use arrow::datatypes::Float32Type;
     use arrow_array::{Array, RecordBatch, UInt64Array, record_batch};
@@ -1249,11 +1271,11 @@ mod tests {
         },
     };
 
-    // Add missing imports for the tests
     use crate::metrics::NoOpMetricsCollector;
-    use crate::{Index, IndexType}; // Import Index trait to access calculate_included_frags
-    use roaring::RoaringBitmap; // Import RoaringBitmap for the test
+    use roaring::RoaringBitmap;
     use std::collections::Bound;
+
+    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -1276,6 +1298,26 @@ mod tests {
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
     }
 
+    fn zonemap_batch_stream(
+        values: impl IntoIterator<Item = i32>,
+        fragment_id: u64,
+    ) -> SendableRecordBatchStream {
+        let values = arrow_array::Int32Array::from_iter_values(values);
+        let row_ids = UInt64Array::from_iter_values(
+            (0..values.len() as u64).map(|offset| (fragment_id << 32) | offset),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
+            .unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(batch))),
+        ))
+    }
+
     #[tokio::test]
     async fn test_partitioned_zonemap_loads_multiple_shards() {
         let tmpdir = TempObjDir::default();
@@ -1285,24 +1327,11 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-
         for fragment_id in 0..2u64 {
-            let values = arrow_array::Int32Array::from_iter_values(
+            let stream = zonemap_batch_stream(
                 (0..4).map(|offset| (fragment_id as i32) * 10 + offset),
+                fragment_id,
             );
-            let row_ids =
-                UInt64Array::from_iter_values((0..4).map(|offset| (fragment_id << 32) | offset));
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
-                    .unwrap();
-            let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-                schema.clone(),
-                stream::once(std::future::ready(Ok(batch))),
-            ));
             ZoneMapIndexPlugin::train_zonemap_index(
                 stream,
                 test_store.as_ref(),
@@ -1333,6 +1362,111 @@ mod tests {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(1u64 << 32..((1u64 << 32) + 4));
         assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_zonemap_rejects_missing_fragment_id() {
+        let plugin = PartitionedZoneMapIndexPlugin;
+        let tmpdir = TempObjDir::default();
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.as_ref().clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let request = plugin
+            .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
+            .unwrap();
+        let err = match plugin
+            .train_index(
+                zonemap_batch_stream(0..4, 0),
+                &store,
+                request,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+        {
+            Ok(_) => panic!("partitioned zonemap should reject training without a fragment id"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("partitioned zonemap requires exactly one fragment id per shard"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_zonemap_load_rejects_single_file_layout() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            zonemap_batch_stream(0..4, 0),
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(4)),
+            ZONEMAP_FILENAME,
+        )
+        .await
+        .unwrap();
+
+        let err = ZoneMapIndex::load_partitioned(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("partitioned zonemap index is missing part_*_zonemap.lance shards"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_zonemap_merge_rejects_mixed_layout() {
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            zonemap_batch_stream(0..4, 0),
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(4)),
+            &partitioned_zonemap_filename(0),
+        )
+        .await
+        .unwrap();
+        ZoneMapIndexPlugin::train_zonemap_index(
+            zonemap_batch_stream(10..14, 1),
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(4)),
+            ZONEMAP_FILENAME,
+        )
+        .await
+        .unwrap();
+
+        let progress = Arc::new(RecordingProgress::default());
+        let err = merge_index_files(object_store.as_ref(), tmpdir.as_ref(), progress.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unexpected zonemap.lance found in partitioned zonemap index directory"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            progress
+                .recorded_events()
+                .iter()
+                .any(|(kind, stage, _)| kind == "complete" && stage == "validate_partition_files"),
+            "expected validate_partition_files completion before reporting the mixed-layout error"
+        );
     }
 
     #[tokio::test]
