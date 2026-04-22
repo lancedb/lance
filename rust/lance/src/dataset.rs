@@ -3238,8 +3238,8 @@ pub(crate) async fn write_manifest_file(
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
         // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
-        let stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
-        apply_feature_flags(manifest, stable_row_ids, config.disable_transaction_file)?;
+        let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
+        apply_feature_flags(manifest, use_stable_row_ids, config.disable_transaction_file)?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));

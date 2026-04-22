@@ -89,10 +89,9 @@ fn resolve_update_version_metadata(
     // via a deletion vector) and again in a newer fragment holding rewritten data. For
     // `created_at` we need the mapping from the original fragment/offset; that is always the
     // first occurrence when fragments are processed in ascending `id` order.
-    let mut frag_indices: Vec<usize> = (0..existing_fragments.len()).collect();
-    frag_indices.sort_by_key(|&i| existing_fragments[i].id);
-    for &i in &frag_indices {
-        let frag = &existing_fragments[i];
+    let mut sorted_frags: Vec<&Fragment> = existing_fragments.iter().collect();
+    sorted_frags.sort_by_key(|f| f.id);
+    for frag in sorted_frags {
         if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
             && let Ok(seq) = read_row_ids(data)
         {
@@ -2183,10 +2182,10 @@ impl Transaction {
             let inherited = current_manifest
                 .map(|m| m.uses_stable_row_ids())
                 .unwrap_or(false);
-            let stable_row_ids = config.use_stable_row_ids || inherited;
+            let use_stable_row_ids = config.use_stable_row_ids || inherited;
             apply_feature_flags(
                 &mut manifest,
-                stable_row_ids,
+                use_stable_row_ids,
                 config.disable_transaction_file,
             )?;
         }
