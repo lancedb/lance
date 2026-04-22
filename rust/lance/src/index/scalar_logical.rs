@@ -142,7 +142,7 @@ impl ScalarIndex for LogicalScalarIndex {
         _dest_store: &dyn lance_index::scalar::IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(
-            "LogicalScalarIndex '{}' is a query-time wrapper and does not support remap",
+            "LogicalScalarIndex '{}' is a query-time wrapper and does not support remap; rebuild the index to consolidate segments before remapping",
             self.name
         )))
     }
@@ -154,7 +154,7 @@ impl ScalarIndex for LogicalScalarIndex {
         _old_data_filter: Option<lance_index::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(
-            "LogicalScalarIndex '{}' is a query-time wrapper and does not support update",
+            "LogicalScalarIndex '{}' is a query-time wrapper and does not support update; rebuild the index to consolidate segments before updating",
             self.name
         )))
     }
@@ -222,17 +222,33 @@ async fn load_named_scalar_segments(
         .filter(|index| index_intersects_dataset(index, dataset))
         .collect::<Vec<_>>();
 
+    let needs_fallback_fetch = usable_indices
+        .iter()
+        .any(|index| index.index_details.is_none());
+
     let mut index_type_url = None::<String>;
     for index in &usable_indices {
-        let index_details = fetch_index_details(dataset, column, index).await?;
+        let segment_type_url = if needs_fallback_fetch {
+            fetch_index_details(dataset, column, index)
+                .await?
+                .type_url
+                .clone()
+        } else {
+            index
+                .index_details
+                .as_ref()
+                .expect("checked above")
+                .type_url
+                .clone()
+        };
         match &index_type_url {
-            Some(expected) if expected != &index_details.type_url => {
+            Some(expected) if expected != &segment_type_url => {
                 return Err(Error::invalid_input(format!(
                     "Scalar index '{}' on column '{}' mixes incompatible segment types",
                     index_name, column
                 )));
             }
-            None => index_type_url = Some(index_details.type_url.clone()),
+            None => index_type_url = Some(segment_type_url),
             Some(_) => {}
         }
     }

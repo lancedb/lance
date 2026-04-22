@@ -127,6 +127,30 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
+    let mut type_url = None::<&str>;
+    for segment in segments {
+        let segment_type_url = segment.index_details.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing index details",
+                segment.uuid
+            ))
+        })?;
+        match type_url {
+            Some(expected) if expected != segment_type_url.type_url => {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment set for index '{}' mixes incompatible index detail types",
+                    index_name
+                )));
+            }
+            None => type_url = Some(segment_type_url.type_url.as_str()),
+            Some(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub struct ScalarIndexCacheKey<'a> {
@@ -969,6 +993,7 @@ impl DatasetIndexExt for Dataset {
         };
 
         validate_segment_metadata(index_name, &segments)?;
+        validate_segment_index_details(index_name, &segments)?;
 
         let mut new_indices = Vec::with_capacity(segments.len());
         for mut segment in segments {
@@ -2255,6 +2280,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
+    use lance_index::pbold::BTreeIndexDetails;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -6028,6 +6054,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_mixed_index_detail_types() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "vector_idx".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(std::iter::once(1_u32).collect()),
+            index_details: Some(Arc::new(
+                prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
+            )),
+            index_version: IndexType::BTree.version(),
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: seg0.files.clone(),
+        };
+
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![seg0, seg1])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mixes incompatible index detail types")
+        );
     }
 
     #[tokio::test]
