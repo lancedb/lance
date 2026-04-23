@@ -313,11 +313,13 @@ pub async fn open_named_scalar_index(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::ops::Bound;
 
     use arrow::datatypes::Int32Type;
     use datafusion::scalar::ScalarValue;
     use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::array;
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
@@ -373,6 +375,127 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+    }
+
+    #[tokio::test]
+    async fn test_open_named_scalar_index_uses_all_btree_segments() {
+        let test_dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+
+        for fragment in &fragments {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segments.push(segment);
+        }
+
+        dataset
+            .commit_existing_index_segments("value_btree", "value", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("value_btree").await.unwrap();
+        assert_eq!(committed.len(), fragments.len());
+
+        let logical =
+            open_named_scalar_index(&dataset, "value", "value_btree", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        assert_eq!(logical.index_type(), IndexType::BTree);
+        assert_eq!(
+            logical.calculate_included_frags().await.unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+
+        let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_btree")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+    }
+
+    #[tokio::test]
+    async fn test_btree_segment_search_is_exact_across_fragments() {
+        let test_dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_search".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        dataset
+            .commit_existing_index_segments("value_btree_search", "value", segments)
+            .await
+            .unwrap();
+
+        let logical = open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_btree_search",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(20))),
+            Bound::Included(ScalarValue::Int32(Some(43))),
+        );
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!(
+                "expected exact result from segmented btree, got {:?}",
+                other
+            ),
+        };
+
+        let searched_fragments = row_addrs
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<Vec<_>>();
+        assert_eq!(searched_fragments.len(), 24);
+        assert_eq!(
+            searched_fragments.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
     }
 
     #[tokio::test]
