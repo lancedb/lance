@@ -106,6 +106,11 @@ class VenvExecutor:
                 "--extra-index-url",
                 "https://pypi.fury.io/lancedb/",
                 f"pylance=={self.version}",
+                # Released Lance wheels (e.g. 2.0.1, 4.0.0b1) import
+                # CreateEmptyTableRequest from lance_namespace, which was
+                # removed in lance-namespace 0.7.0. Pin to <0.7 so old wheels
+                # resolve a compatible transitive dep.
+                "lance-namespace<0.7",
                 "pytest",
             ],
             check=True,
