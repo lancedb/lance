@@ -8,7 +8,6 @@ use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
     index::{
-        DatasetIndexExt,
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
     },
@@ -44,7 +43,6 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
-    IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
@@ -336,14 +334,15 @@ impl MapIndexExec {
     ) -> datafusion::error::Result<
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
-        let index = dataset
-            .load_scalar_index(IndexCriteria::default().with_name(&index_name))
+        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
             .await?
-            .unwrap();
-        let deletion_mask_fut = DatasetPreFilter::create_restricted_deletion_mask(
-            dataset.clone(),
-            index.fragment_bitmap.unwrap(),
-        );
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
+                ))
+            })?;
+        let deletion_mask_fut =
+            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
         let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {
