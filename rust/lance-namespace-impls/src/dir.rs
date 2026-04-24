@@ -34,7 +34,7 @@ use lance_index::vector::{
 use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
 use std::collections::HashMap;
@@ -1104,11 +1104,18 @@ impl DirectoryNamespace {
     }
 
     async fn table_uri_has_actual_manifests(&self, table_uri: &str) -> Result<bool> {
-        manifest::ManifestNamespace::path_has_actual_manifests(
-            &self.object_store,
-            &Self::uri_to_object_store_path(table_uri),
-        )
-        .await
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        manifest::ManifestNamespace::path_has_actual_manifests(&self.object_store, &table_path)
+            .await
+    }
+
+    fn object_store_path_from_uri(&self, uri: &str) -> Result<Path> {
+        let registry = self
+            .session
+            .as_ref()
+            .map(|session| session.store_registry())
+            .unwrap_or_else(|| Arc::new(ObjectStoreRegistry::default()));
+        ObjectStore::extract_path_from_uri(registry, uri)
     }
 
     fn validate_dir_only_properties(
@@ -1742,21 +1749,6 @@ impl DirectoryNamespace {
         format!("{}/{}.lance", &self.root, table_name)
     }
 
-    fn uri_to_object_store_path(uri: &str) -> Path {
-        let path_str = if let Some(rest) = uri.strip_prefix("file://") {
-            rest
-        } else if let Some(rest) = uri.strip_prefix("s3://") {
-            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
-        } else if let Some(rest) = uri.strip_prefix("gs://") {
-            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
-        } else if let Some(rest) = uri.strip_prefix("az://") {
-            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
-        } else {
-            uri
-        };
-        Path::from(path_str)
-    }
-
     /// Get the object store path for a table (relative to base_path)
     fn table_path(&self, table_name: &str) -> Path {
         self.base_path
@@ -1982,9 +1974,8 @@ impl DirectoryNamespace {
         let mut deleted_count = 0i64;
         for te in table_entries {
             let table_uri = self.resolve_table_location(&te.table_id).await?;
-            let table_path = Self::uri_to_object_store_path(&table_uri);
-            let table_path_str = table_path.as_ref();
-            let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+            let table_path = self.object_store_path_from_uri(&table_uri)?;
+            let versions_dir_path = table_path.child(VERSIONS_DIR);
 
             for (start, end) in &te.ranges {
                 for version in *start..=*end {
@@ -2669,8 +2660,8 @@ impl LanceNamespace for DirectoryNamespace {
         // Fallback when table_version_storage is not enabled: list from _versions/ directory
         let table_uri = self.resolve_table_location(&request.id).await?;
 
-        let table_path = Self::uri_to_object_store_path(&table_uri);
-        let versions_dir = table_path.child("_versions");
+        let table_path = self.object_store_path_from_uri(&table_uri)?;
+        let versions_dir = table_path.child(VERSIONS_DIR);
         let manifest_metas: Vec<_> = self
             .object_store
             .read_dir_all(&versions_dir, None)
@@ -2758,7 +2749,7 @@ impl LanceNamespace for DirectoryNamespace {
         let staging_manifest_path = &request.manifest_path;
         let version = request.version as u64;
 
-        let table_path = Self::uri_to_object_store_path(&table_uri);
+        let table_path = self.object_store_path_from_uri(&table_uri)?;
 
         // Determine naming scheme from request, default to V2
         let naming_scheme = match request.naming_scheme.as_deref() {
@@ -2769,7 +2760,14 @@ impl LanceNamespace for DirectoryNamespace {
         // Compute final path using the naming scheme
         let final_path = naming_scheme.manifest_path(&table_path, version);
 
-        let staging_path = Self::uri_to_object_store_path(staging_manifest_path);
+        let staging_path = Path::parse(staging_manifest_path).map_err(|e| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid staging manifest path '{}': {}",
+                    staging_manifest_path, e
+                ),
+            })
+        })?;
         let manifest_data = self
             .object_store
             .inner
