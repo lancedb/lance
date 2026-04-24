@@ -137,11 +137,11 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
 /// Convert an [`ANNIvfPartitionExec`] to proto for serialization.
 pub async fn ann_ivf_partition_exec_to_proto(
     exec: &ANNIvfPartitionExec,
-) -> Result<pb::ANNIvfPartitionExecProto> {
+) -> Result<pb::AnnIvfPartitionExecProto> {
     let table = table_identifier_from_dataset(&exec.dataset).await?;
     let query = query_to_proto(&exec.query)?;
 
-    Ok(pb::ANNIvfPartitionExecProto {
+    Ok(pb::AnnIvfPartitionExecProto {
         query: Some(query),
         table: Some(table),
         index_uuids: exec.index_uuids.clone(),
@@ -150,7 +150,7 @@ pub async fn ann_ivf_partition_exec_to_proto(
 
 /// Reconstruct an [`ANNIvfPartitionExec`] from proto.
 pub async fn ann_ivf_partition_exec_from_proto(
-    proto: pb::ANNIvfPartitionExecProto,
+    proto: pb::AnnIvfPartitionExecProto,
     dataset: Option<Arc<Dataset>>,
 ) -> Result<ANNIvfPartitionExec> {
     let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
