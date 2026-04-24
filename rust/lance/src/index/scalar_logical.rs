@@ -222,24 +222,17 @@ async fn load_named_scalar_segments(
         .filter(|index| index_intersects_dataset(index, dataset))
         .collect::<Vec<_>>();
 
-    let needs_fallback_fetch = usable_indices
-        .iter()
-        .any(|index| index.index_details.is_none());
-
     let mut index_type_url = None::<String>;
     for index in &usable_indices {
-        let segment_type_url = if needs_fallback_fetch {
-            fetch_index_details(dataset, column, index)
-                .await?
-                .type_url
-                .clone()
-        } else {
-            index
-                .index_details
-                .as_ref()
-                .expect("checked above")
-                .type_url
-                .clone()
+        let segment_type_url = match index.index_details.as_ref() {
+            Some(index_details) => index_details.type_url.clone(),
+            None => {
+                // Legacy manifests may omit embedded details, so fetch only the missing ones.
+                fetch_index_details(dataset, column, index)
+                    .await?
+                    .type_url
+                    .clone()
+            }
         };
         match &index_type_url {
             Some(expected) if expected != &segment_type_url => {
