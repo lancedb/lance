@@ -287,6 +287,7 @@ struct PaginationQuery {
     delimiter: Option<String>,
     page_token: Option<String>,
     limit: Option<i32>,
+    include_declared: Option<bool>,
     descending: Option<bool>,
 }
 
@@ -454,6 +455,7 @@ async fn list_tables(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -554,6 +556,32 @@ async fn deregister_table(
 struct CreateTableQuery {
     delimiter: Option<String>,
     mode: Option<String>,
+    properties: Option<String>,
+    storage_options: Option<String>,
+}
+
+fn parse_json_query_param<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+    operation: &str,
+    param_name: &str,
+) -> std::result::Result<Option<T>, Response> {
+    match raw {
+        Some(raw) => serde_json::from_str(raw).map(Some).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "Failed to parse {} {} query parameter as JSON: {}",
+                            operation, param_name, e
+                        )
+                    }
+                })),
+            )
+                .into_response()
+        }),
+        None => Ok(None),
+    }
 }
 
 async fn create_table(
@@ -563,9 +591,24 @@ async fn create_table(
     Query(params): Query<CreateTableQuery>,
     body: Bytes,
 ) -> Response {
+    let properties =
+        match parse_json_query_param(params.properties.as_deref(), "create_table", "properties") {
+            Ok(properties) => properties,
+            Err(response) => return response,
+        };
+    let storage_options = match parse_json_query_param(
+        params.storage_options.as_deref(),
+        "create_table",
+        "storage_options",
+    ) {
+        Ok(storage_options) => storage_options,
+        Err(response) => return response,
+    };
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
+        properties,
+        storage_options,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -874,6 +917,7 @@ async fn list_all_tables(
         id: None,
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };

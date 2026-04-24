@@ -13,12 +13,15 @@ use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::scanner::Scanner;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::dataset::{
+    Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
+};
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
 use lance_index::scalar::{
@@ -54,7 +57,8 @@ use lance_namespace::models::{
     GetTableStatsResponse, Identity, IndexContent, InsertIntoTableRequest, InsertIntoTableResponse,
     ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
     ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, QueryTableRequest,
+    ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
+    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest,
     QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest, RestoreTableResponse,
     TableExistsRequest, TableVersion, UpdateTableSchemaMetadataRequest,
     UpdateTableSchemaMetadataResponse,
@@ -939,9 +943,9 @@ impl DirectoryNamespace {
 
             let table_name = &path[..path.len() - 6];
 
-            // Use atomic check to skip deregistered tables and declared-but-not-written tables
+            // Use atomic check to skip deregistered tables.
             let status = self.check_table_status(table_name).await;
-            if status.is_deregistered || status.has_reserved_file {
+            if status.is_deregistered {
                 continue;
             }
 
@@ -1016,6 +1020,154 @@ impl DirectoryNamespace {
         })
     }
 
+    async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
+        manifest::ManifestNamespace::path_has_actual_manifests(
+            &self.object_store,
+            &self.table_path(table_name),
+        )
+        .await
+    }
+
+    async fn filter_declared_tables(
+        &self,
+        tables: Vec<String>,
+        include_declared: bool,
+    ) -> Result<Vec<String>> {
+        if include_declared {
+            return Ok(tables);
+        }
+
+        let mut stream = futures::stream::iter(tables.into_iter().map(|table_name| async move {
+            // `include_declared=false` is an explicit opt-in. We still pay one `_versions/` probe
+            // per table here so declared-state is derived from actual manifests. This is linear in
+            // the total number of listed tables, but we probe a bounded number concurrently.
+            if self.table_has_actual_manifests(&table_name).await? {
+                Ok::<Option<String>, Error>(Some(table_name))
+            } else {
+                Ok::<Option<String>, Error>(None)
+            }
+        }))
+        .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
+
+        let mut filtered = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Some(table_name) = result? {
+                filtered.push(table_name);
+            }
+        }
+        Ok(filtered)
+    }
+
+    fn ipc_reader_from_request_data(
+        request_data: &Bytes,
+        operation: &str,
+    ) -> Result<(
+        Box<dyn arrow::record_batch::RecordBatchReader + Send>,
+        usize,
+    )> {
+        if request_data.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Request data (Arrow IPC stream) is required for {}",
+                    operation
+                ),
+            }
+            .into());
+        }
+
+        let cursor = Cursor::new(request_data.as_ref());
+        let stream_reader =
+            StreamReader::try_new(cursor, None).map_err(|e| NamespaceError::InvalidInput {
+                message: format!("Invalid Arrow IPC stream: {}", e),
+            })?;
+        let arrow_schema = stream_reader.schema();
+
+        let mut num_rows = 0usize;
+        let mut batches = Vec::new();
+        for batch_result in stream_reader {
+            let batch = batch_result.map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to read batch from IPC stream: {}", e),
+            })?;
+            num_rows += batch.num_rows();
+            batches.push(batch);
+        }
+
+        let reader: Box<dyn arrow::record_batch::RecordBatchReader + Send> = if batches.is_empty() {
+            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], arrow_schema))
+        } else {
+            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
+            Box::new(RecordBatchIterator::new(batch_results, arrow_schema))
+        };
+
+        Ok((reader, num_rows))
+    }
+
+    async fn table_uri_has_actual_manifests(&self, table_uri: &str) -> Result<bool> {
+        manifest::ManifestNamespace::path_has_actual_manifests(
+            &self.object_store,
+            &Self::uri_to_object_store_path(table_uri),
+        )
+        .await
+    }
+
+    fn validate_dir_only_properties(
+        properties: Option<&HashMap<String, String>>,
+        operation: &str,
+    ) -> Result<()> {
+        // Dir-only mode has no metadata catalog, so non-empty table properties would be accepted
+        // and then lost. Reject them instead. Request-level storage options are different: they
+        // directly affect the current write and remain supported in dir-only mode.
+        if properties.is_some_and(|properties| !properties.is_empty()) {
+            return Err(NamespaceError::Unsupported {
+                message: format!(
+                    "{} with non-empty table properties requires manifest_enabled=true",
+                    operation
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn write_reader_to_table(
+        &self,
+        table_uri: &str,
+        reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
+        mode: WriteMode,
+        extra_storage_options: Option<HashMap<String, String>>,
+    ) -> Result<Dataset> {
+        // Insert and merge-insert request models do not carry request-level storage options,
+        // so these writes intentionally use the namespace-level storage options only.
+        let mut merged_storage_options = self.storage_options.clone().unwrap_or_default();
+        if let Some(extra_storage_options) = extra_storage_options {
+            merged_storage_options.extend(extra_storage_options);
+        }
+        let store_params = (!merged_storage_options.is_empty()).then(|| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                    merged_storage_options,
+                ),
+            )),
+            ..Default::default()
+        });
+
+        let write_params = WriteParams {
+            mode,
+            store_params,
+            session: self.session.clone(),
+            ..Default::default()
+        };
+
+        let dataset = Dataset::write(reader, table_uri, Some(write_params))
+            .await
+            .map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to write table at '{}': {}", table_uri, e),
+            })?;
+
+        Ok(dataset)
+    }
+
     /// Internal describe_table implementation that doesn't record metrics.
     /// Used by both the public describe_table (which records metrics) and
     /// internal callers like resolve_table_location (which shouldn't).
@@ -1079,11 +1231,11 @@ impl DirectoryNamespace {
         let vend_credentials = request.vend_credentials.unwrap_or(true);
         let identity = request.identity.as_deref();
 
-        // If not loading detailed metadata, return minimal response with just location
         if !load_detailed_metadata {
             let storage_options = self
                 .get_storage_options_for_table(&table_uri, vend_credentials, identity)
                 .await?;
+            let is_only_declared = !self.table_has_actual_manifests(&table_name).await?;
             return Ok(DescribeTableResponse {
                 table: Some(table_name),
                 namespace: request.id.as_ref().map(|id| {
@@ -1096,6 +1248,7 @@ impl DirectoryNamespace {
                 location: Some(table_uri.clone()),
                 table_uri: Some(table_uri),
                 storage_options,
+                is_only_declared: is_only_declared.then_some(true),
                 managed_versioning: if self.table_version_tracking_enabled {
                     Some(true)
                 } else {
@@ -1167,8 +1320,9 @@ impl DirectoryNamespace {
                 })
             }
             Err(err) => {
-                // Use the reserved file status from the atomic check
-                if status.has_reserved_file {
+                if manifest::ManifestNamespace::is_not_found_load_error(&err)
+                    && !self.table_has_actual_manifests(&table_name).await?
+                {
                     let storage_options = self
                         .get_storage_options_for_table(&table_uri, vend_credentials, identity)
                         .await?;
@@ -1184,6 +1338,7 @@ impl DirectoryNamespace {
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
                         storage_options,
+                        is_only_declared: Some(true),
                         managed_versioning: if self.table_version_tracking_enabled {
                             Some(true)
                         } else {
@@ -1786,8 +1941,11 @@ impl DirectoryNamespace {
         // Get all table locations already in the manifest
         let manifest_locations = manifest_ns.list_manifest_table_locations().await?;
 
-        // Get all tables from directory
-        let dir_tables = self.list_directory_tables().await?;
+        // Get all tables from directory and skip declared-only tables that have not
+        // written any actual version manifests yet.
+        let dir_tables = self
+            .filter_declared_tables(self.list_directory_tables().await?, false)
+            .await?;
 
         // Register each directory table that doesn't have an overlapping location
         // If a directory name already exists in the manifest,
@@ -2191,6 +2349,10 @@ impl LanceNamespace for DirectoryNamespace {
             self.list_directory_tables().await?
         };
 
+        tables = self
+            .filter_declared_tables(tables, request.include_declared.unwrap_or(true))
+            .await?;
+
         // Apply sorting and pagination
         let next_page_token =
             Self::apply_pagination(&mut tables, request.page_token, request.limit);
@@ -2281,78 +2443,43 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.create_table(request, request_data).await;
         }
 
+        Self::validate_dir_only_properties(request.properties.as_ref(), "create_table")?;
+
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
-        if request_data.is_empty() {
-            return Err(NamespaceError::InvalidInput {
-                message: "Request data (Arrow IPC stream) is required for create_table".to_string(),
+        let status = self.check_table_status(&table_name).await;
+        let (reader, _num_rows) =
+            Self::ipc_reader_from_request_data(&request_data, "create_table")?;
+
+        if status.exists && self.table_has_actual_manifests(&table_name).await? {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: table_name,
             }
             .into());
         }
 
-        // Parse the Arrow IPC stream from request_data
-        let cursor = Cursor::new(request_data.to_vec());
-        let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {:?}", e),
-            })
-        })?;
-        let arrow_schema = stream_reader.schema();
-
-        // Collect all batches from the stream
-        let mut batches = Vec::new();
-        for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| {
-                lance_core::Error::from(NamespaceError::InvalidInput {
-                    message: format!("Failed to read batch from IPC stream: {:?}", e),
-                })
-            })?);
+        let write_result = self
+            .write_reader_to_table(
+                &table_uri,
+                reader,
+                WriteMode::Create,
+                request.storage_options.clone(),
+            )
+            .await;
+        if let Err(err) = write_result {
+            if self.table_uri_has_actual_manifests(&table_uri).await? {
+                return Err(NamespaceError::TableAlreadyExists {
+                    message: table_name,
+                }
+                .into());
+            }
+            return Err(err);
         }
-
-        // Create RecordBatchReader from the batches
-        let reader = if batches.is_empty() {
-            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
-            let batches = vec![Ok(batch)];
-            RecordBatchIterator::new(batches, arrow_schema.clone())
-        } else {
-            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
-            RecordBatchIterator::new(batch_results, arrow_schema)
-        };
-
-        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
-            )),
-            ..Default::default()
-        });
-
-        let write_params = WriteParams {
-            mode: WriteMode::Create,
-            store_params,
-            ..Default::default()
-        };
-
-        // Create the Lance dataset using the actual Lance API
-        Dataset::write(reader, &table_uri, Some(write_params))
-            .await
-            .map_err(|e| {
-                let err_msg = format!("{}", e);
-                let ns_err = if err_msg.contains("already exists") {
-                    NamespaceError::TableAlreadyExists {
-                        message: format!("Table already exists at '{}': {:?}", table_uri, e),
-                    }
-                } else {
-                    NamespaceError::Internal {
-                        message: format!("Failed to create Lance dataset: {:?}", e),
-                    }
-                };
-                lance_core::Error::from(ns_err)
-            })?;
-
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
             storage_options: self.storage_options.clone(),
+            properties: request.properties,
             ..Default::default()
         })
     }
@@ -2375,6 +2502,8 @@ impl LanceNamespace for DirectoryNamespace {
             }
             return Ok(response);
         }
+
+        Self::validate_dir_only_properties(request.properties.as_ref(), "declare_table")?;
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
@@ -2432,6 +2561,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DeclareTableResponse {
             location: Some(table_uri),
             storage_options,
+            properties: request.properties,
             managed_versioning: if self.table_version_tracking_enabled {
                 Some(true)
             } else {
@@ -3210,6 +3340,9 @@ impl LanceNamespace for DirectoryNamespace {
         // In dir-only mode there are no child namespaces, so all tables live in the
         // root directory. This is equivalent to listing the root namespace.
         let mut tables = self.list_directory_tables().await?;
+        tables = self
+            .filter_declared_tables(tables, request.include_declared.unwrap_or(true))
+            .await?;
         Self::apply_pagination(&mut tables, request.page_token, request.limit);
         Ok(ListTablesResponse::new(tables))
     }
@@ -3506,37 +3639,8 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<InsertIntoTableResponse> {
         self.record_op("insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-
-        if request_data.is_empty() {
-            return Err(NamespaceError::InvalidInput {
-                message: "Request data (Arrow IPC stream) is required for insert_into_table"
-                    .to_string(),
-            }
-            .into());
-        }
-
-        let cursor = Cursor::new(request_data.as_ref());
-        let stream_reader =
-            StreamReader::try_new(cursor, None).map_err(|e| NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {:?}", e),
-            })?;
-        let arrow_schema = stream_reader.schema();
-
-        let mut batches = Vec::new();
-        for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| NamespaceError::InvalidInput {
-                message: format!("Failed to read batch from IPC stream: {:?}", e),
-            })?);
-        }
-
-        let reader = if batches.is_empty() {
-            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
-            let batches = vec![Ok(batch)];
-            RecordBatchIterator::new(batches, arrow_schema.clone())
-        } else {
-            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
-            RecordBatchIterator::new(batch_results, arrow_schema)
-        };
+        let (reader, _num_rows) =
+            Self::ipc_reader_from_request_data(&request_data, "insert_into_table")?;
 
         let mode = match request.mode.as_deref() {
             Some(m) if m.eq_ignore_ascii_case("overwrite") => WriteMode::Overwrite,
@@ -3553,40 +3657,122 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
-            )),
-            ..Default::default()
-        });
-
-        let write_params = WriteParams {
-            mode,
-            store_params,
-            session: self.session.clone(),
-            ..Default::default()
-        };
-
-        Dataset::write(reader, &table_uri, Some(write_params))
-            .await
-            .map_err(|e| {
-                let err_msg = format!("{}", e);
-                if err_msg.contains("conflict") || err_msg.contains("CommitConflict") {
-                    NamespaceError::ConcurrentModification {
-                        message: format!(
-                            "Concurrent modification on table at '{}': {:?}",
-                            table_uri, e
-                        ),
-                    }
-                } else {
-                    NamespaceError::Internal {
-                        message: format!("Failed to insert into table at '{}': {:?}", table_uri, e),
-                    }
-                }
-            })?;
+        if !self.table_uri_has_actual_manifests(&table_uri).await? {
+            self.write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+                .await?;
+        } else {
+            self.write_reader_to_table(&table_uri, reader, mode, None)
+                .await?;
+        }
 
         Ok(InsertIntoTableResponse {
             transaction_id: None,
+        })
+    }
+
+    async fn merge_insert_into_table(
+        &self,
+        request: MergeInsertIntoTableRequest,
+        request_data: Bytes,
+    ) -> Result<MergeInsertIntoTableResponse> {
+        self.record_op("merge_insert_into_table");
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let on = request.on.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "'on' field is required for merge_insert_into_table".to_string(),
+            })
+        })?;
+
+        let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
+        let (reader, num_rows) =
+            Self::ipc_reader_from_request_data(&request_data, "merge_insert_into_table")?;
+
+        if !table_has_manifests {
+            let dataset = self
+                .write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+                .await?;
+            let version = dataset.version().version as i64;
+            return Ok(MergeInsertIntoTableResponse {
+                transaction_id: None,
+                num_updated_rows: Some(0),
+                num_inserted_rows: Some(num_rows as i64),
+                num_deleted_rows: Some(0),
+                version: Some(version),
+            });
+        }
+
+        let dataset = Arc::new(
+            self.load_dataset(&table_uri, None, "merge_insert_into_table")
+                .await?,
+        );
+
+        let mut merge_builder = MergeInsertBuilder::try_new(dataset.clone(), vec![on.clone()])
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Failed to create merge_insert_into_table builder: {}", e),
+                })
+            })?;
+
+        if let Some(filter) = request.when_matched_update_all_filt.as_deref() {
+            let behavior = WhenMatched::update_if(dataset.as_ref(), filter).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid when_matched_update_all_filt for merge_insert_into_table: {}",
+                        e
+                    ),
+                })
+            })?;
+            merge_builder.when_matched(behavior);
+        } else if request.when_matched_update_all.unwrap_or(false) {
+            merge_builder.when_matched(WhenMatched::UpdateAll);
+        }
+
+        if matches!(request.when_not_matched_insert_all, Some(false)) {
+            merge_builder.when_not_matched(WhenNotMatched::DoNothing);
+        } else {
+            merge_builder.when_not_matched(WhenNotMatched::InsertAll);
+        }
+
+        if let Some(filter) = request.when_not_matched_by_source_delete_filt.as_deref() {
+            let behavior = WhenNotMatchedBySource::delete_if(dataset.as_ref(), filter).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid when_not_matched_by_source_delete_filt for merge_insert_into_table: {}",
+                        e
+                    ),
+                })
+            })?;
+            merge_builder.when_not_matched_by_source(behavior);
+        } else if request.when_not_matched_by_source_delete.unwrap_or(false) {
+            merge_builder.when_not_matched_by_source(WhenNotMatchedBySource::Delete);
+        }
+
+        if let Some(use_index) = request.use_index {
+            merge_builder.use_index(use_index);
+        }
+
+        let (dataset, stats) = merge_builder
+            .try_build()
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Failed to build merge_insert_into_table job: {}", e),
+                })
+            })?
+            .execute_reader(reader)
+            .await
+            .map_err(|e| NamespaceError::Internal {
+                message: format!(
+                    "Failed to merge_insert_into_table at '{}': {}",
+                    table_uri, e
+                ),
+            })?;
+
+        Ok(MergeInsertIntoTableResponse {
+            transaction_id: None,
+            num_updated_rows: Some(stats.num_updated_rows as i64),
+            num_inserted_rows: Some(stats.num_inserted_rows as i64),
+            num_deleted_rows: Some(stats.num_deleted_rows as i64),
+            version: Some(dataset.version().version as i64),
         })
     }
 
@@ -3954,6 +4140,22 @@ mod tests {
             writer.finish().unwrap();
         }
         buffer
+    }
+
+    fn create_non_empty_test_ipc_data() -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(convert_json_arrow_schema(&create_test_schema()).unwrap());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
     }
 
     /// Helper to create a simple test schema
@@ -5965,7 +6167,7 @@ mod tests {
     #[tokio::test]
     async fn test_declare_table_v1_mode() {
         use lance_namespace::models::{
-            DeclareTableRequest, DescribeTableRequest, TableExistsRequest,
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest, TableExistsRequest,
         };
 
         let temp_dir = TempStdDir::default();
@@ -6000,11 +6202,365 @@ mod tests {
         assert!(describe_response.location.is_some());
         assert!(describe_response.version.is_none()); // Not written yet
         assert!(describe_response.schema.is_none()); // Not written yet
+        assert_eq!(describe_response.is_only_declared, Some(true));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let list_response = namespace.list_tables(list_req.clone()).await.unwrap();
+        assert_eq!(list_response.tables, vec!["test_table".to_string()]);
+
+        list_req.include_declared = Some(false);
+        let list_response = namespace.list_tables(list_req).await.unwrap();
+        assert!(list_response.tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_declared_table_promotes_it_from_declared_state() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, InsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut insert_req = InsertIntoTableRequest::new();
+        insert_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .insert_into_table(insert_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.version, Some(1));
+        assert!(describe_response.schema.is_some());
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_after_declare_table_v1_mode_creates_table() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, Some(1));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_declared_table_with_manifest_promotes_it() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, InsertIntoTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut insert_req = InsertIntoTableRequest::new();
+        insert_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .insert_into_table(
+                insert_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_after_declare_table_with_manifest_creates_table() {
+        use lance_namespace::models::{
+            CreateTableRequest, DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, Some(1));
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.version, Some(1));
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_after_declare_table_with_manifest_rejects_new_properties() {
+        use lance_namespace::models::{CreateTableRequest, DeclareTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "bob".to_string())]));
+
+        let result = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot set properties for already declared table")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_into_declared_table_v1_mode_creates_table() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+            MergeInsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some("id".to_string());
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.num_updated_rows, Some(0));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_into_declared_table_with_manifest_creates_table() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+            MergeInsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some("id".to_string());
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.num_updated_rows, Some(0));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn test_declare_table_with_manifest() {
-        use lance_namespace::models::{DeclareTableRequest, TableExistsRequest};
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest, TableExistsRequest,
+        };
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -6020,15 +6576,55 @@ mod tests {
         // Declare a table
         let mut declare_req = DeclareTableRequest::new();
         declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
         let response = namespace.declare_table(declare_req).await.unwrap();
 
         // Should return location
         assert!(response.location.is_some());
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
 
         // Table should exist in manifest
         let mut exists_req = TableExistsRequest::new();
         exists_req.id = Some(vec!["test_table".to_string()]);
         assert!(namespace.table_exists(exists_req).await.is_ok());
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(true));
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        assert_eq!(
+            namespace
+                .list_tables(list_req.clone())
+                .await
+                .unwrap()
+                .tables,
+            vec!["test_table".to_string()]
+        );
+        list_req.include_declared = Some(false);
+        assert!(
+            namespace
+                .list_tables(list_req)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
     }
 
     #[tokio::test]
