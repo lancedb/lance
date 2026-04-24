@@ -109,7 +109,7 @@
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-core</artifactId>
-            <version>0.7.0</version>
+            <version>0.7.1</version>
         </dependency>
         <dependency>
             <groupId>org.lance</groupId>
