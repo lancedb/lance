@@ -318,6 +318,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "NGram" => IndexType::NGram.to_string(),
         "ZoneMap" => IndexType::ZoneMap.to_string(),
         "BloomFilter" => IndexType::BloomFilter.to_string(),
+        "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),

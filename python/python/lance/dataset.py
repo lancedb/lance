@@ -1162,6 +1162,13 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.data_storage_version
 
     @property
+    def has_stable_row_ids(self) -> bool:
+        """
+        Whether this dataset has stable row IDs enabled
+        """
+        return self._ds.has_stable_row_ids
+
+    @property
     def max_field_id(self) -> int:
         """
         The max_field_id in manifest
