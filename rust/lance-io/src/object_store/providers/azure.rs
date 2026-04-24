@@ -14,13 +14,14 @@ use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
-    azure::{AzureConfigKey, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
 };
 use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    dynamic_credentials::{NamespaceCredentialsProvider, supports_dynamic_credentials},
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -29,13 +30,70 @@ use lance_core::error::{Error, Result};
 pub struct AzureBlobStoreProvider;
 
 impl AzureBlobStoreProvider {
+    fn normalize_opendal_azure_options(
+        options: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut config_map = HashMap::new();
+
+        if let Some(account_name) = options
+            .get("account_name")
+            .cloned()
+            .or_else(|| options.get("azure_storage_account_name").cloned())
+        {
+            config_map.insert("account_name".to_string(), account_name);
+        }
+
+        if let Some(endpoint) = options
+            .get("endpoint")
+            .cloned()
+            .or_else(|| options.get("azure_storage_endpoint").cloned())
+            .or_else(|| options.get("azure_endpoint").cloned())
+        {
+            config_map.insert("endpoint".to_string(), endpoint);
+        }
+
+        if let Some(account_key) = options
+            .get("account_key")
+            .cloned()
+            .or_else(|| options.get("azure_storage_account_key").cloned())
+            .or_else(|| options.get("azure_storage_access_key").cloned())
+            .or_else(|| options.get("azure_storage_master_key").cloned())
+            .or_else(|| options.get("access_key").cloned())
+            .or_else(|| options.get("master_key").cloned())
+        {
+            config_map.insert("account_key".to_string(), account_key);
+        }
+
+        if let Some(sas_token) = options
+            .get("sas_token")
+            .cloned()
+            .or_else(|| options.get("azure_storage_sas_token").cloned())
+            .or_else(|| options.get("azure_storage_sas_key").cloned())
+            .or_else(|| options.get("sas_key").cloned())
+        {
+            config_map.insert("sas_token".to_string(), sas_token);
+        }
+
+        if let Some(container) = options.get("container").cloned() {
+            config_map.insert("container".to_string(), container);
+        }
+        if let Some(filesystem) = options.get("filesystem").cloned() {
+            config_map.insert("filesystem".to_string(), filesystem);
+        }
+        if let Some(root) = options.get("root").cloned() {
+            config_map.insert("root".to_string(), root);
+        }
+
+        config_map
+    }
+
     fn build_opendal_operator(
         base_path: &Url,
         storage_options: &StorageOptions,
     ) -> Result<Operator> {
         // Start with all storage options as the config map
         // OpenDAL will handle environment variables through its default credentials chain
-        let mut config_map: HashMap<String, String> = storage_options.0.clone();
+        let mut config_map = Self::normalize_opendal_azure_options(&storage_options.0);
 
         match base_path.scheme() {
             "az" => {
@@ -113,6 +171,7 @@ impl AzureBlobStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
+        accessor: Option<Arc<StorageOptionsAccessor>>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
@@ -130,7 +189,29 @@ impl AzureBlobStoreProvider {
             builder = builder.with_config(key, value);
         }
 
+        if let Some(credentials) = build_dynamic_azure_credentials(accessor).await? {
+            builder = builder.with_credentials(credentials);
+        }
+
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+    }
+}
+
+async fn build_dynamic_azure_credentials(
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+) -> Result<Option<AzureCredentialProvider>> {
+    let Some(accessor) = accessor.filter(|accessor| accessor.has_provider()) else {
+        return Ok(None);
+    };
+
+    if supports_dynamic_credentials::<AzureCredential>(&accessor).await? {
+        Ok(Some(
+            Arc::new(NamespaceCredentialsProvider::<AzureCredential>::new(
+                accessor,
+            )) as AzureCredentialProvider,
+        ))
+    } else {
+        Ok(None)
     }
 }
 
@@ -157,11 +238,15 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             .map(|v| v.as_str() == "true")
             .unwrap_or(false);
 
+        let accessor = params.get_accessor();
+
         let inner: Arc<dyn OSObjectStore> = if use_opendal {
+            // OpenDAL Azure intentionally uses static/environment-backed configuration only.
+            // Namespace-vended dynamic credentials are supported on the native object_store path.
             self.build_opendal_azure_store(&base_path, &storage_options)
                 .await?
         } else {
-            self.build_microsoft_azure_store(&base_path, &storage_options)
+            self.build_microsoft_azure_store(&base_path, &storage_options, accessor)
                 .await?
         };
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
@@ -281,7 +366,10 @@ impl StorageOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::ObjectStoreParams;
+    use std::sync::Arc;
+
+    use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
+    use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use std::collections::HashMap;
 
     #[test]
@@ -296,7 +384,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_use_opendal_flag() {
-        use crate::object_store::StorageOptionsAccessor;
         let provider = AzureBlobStoreProvider;
         let url = Url::parse("az://test-container/path").unwrap();
         let params_with_flag = ObjectStoreParams {
@@ -328,6 +415,37 @@ mod tests {
             "az:// with use_opendal=true should use OpenDAL Azblob, got: {}",
             inner_desc
         );
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_azure_credentials_provider() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            StaticMockStorageOptionsProvider {
+                options: HashMap::from([(
+                    "azure_storage_sas_token".to_string(),
+                    "?sv=2022-11-02&sp=rl&sig=test".to_string(),
+                )]),
+            },
+        )));
+
+        let credentials = build_dynamic_azure_credentials(Some(accessor))
+            .await
+            .expect("dynamic azure credentials should build")
+            .expect("expected credential provider")
+            .get_credential()
+            .await
+            .expect("expected azure credential");
+
+        match credentials.as_ref() {
+            AzureCredential::SASToken(pairs) => {
+                assert!(
+                    pairs
+                        .iter()
+                        .any(|(key, value)| key == "sig" && value == "test")
+                );
+            }
+            other => panic!("expected SAS token, got {other:?}"),
+        }
     }
 
     #[test]

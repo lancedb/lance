@@ -9,13 +9,14 @@ use opendal::{Operator, services::Gcs};
 
 use object_store::{
     RetryConfig, StaticCredentialProvider,
-    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
+    gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder, GoogleConfigKey},
 };
 use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    dynamic_credentials::{NamespaceCredentialsProvider, supports_dynamic_credentials},
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -58,6 +59,7 @@ impl GcsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
+        accessor: Option<Arc<StorageOptionsAccessor>>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
@@ -74,8 +76,10 @@ impl GcsStoreProvider {
         for (key, value) in storage_options.as_gcs_options() {
             builder = builder.with_config(key, value);
         }
-        let token_key = "google_storage_token";
-        if let Some(storage_token) = storage_options.get(token_key) {
+
+        if let Some(credentials) = build_dynamic_gcp_credentials(accessor).await? {
+            builder = builder.with_credentials(credentials);
+        } else if let Some(storage_token) = storage_options.get("google_storage_token") {
             let credential = GcpCredential {
                 bearer: storage_token.clone(),
             };
@@ -84,6 +88,23 @@ impl GcsStoreProvider {
         }
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+    }
+}
+
+async fn build_dynamic_gcp_credentials(
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+) -> Result<Option<GcpCredentialProvider>> {
+    let Some(accessor) = accessor.filter(|accessor| accessor.has_provider()) else {
+        return Ok(None);
+    };
+
+    if supports_dynamic_credentials::<GcpCredential>(&accessor).await? {
+        Ok(Some(
+            Arc::new(NamespaceCredentialsProvider::<GcpCredential>::new(accessor))
+                as GcpCredentialProvider,
+        ))
+    } else {
+        Ok(None)
     }
 }
 
@@ -102,11 +123,15 @@ impl ObjectStoreProvider for GcsStoreProvider {
             .map(|v| v.as_str() == "true")
             .unwrap_or(false);
 
+        let accessor = params.get_accessor();
+
         let inner = if use_opendal {
+            // OpenDAL GCS intentionally uses static/environment-backed configuration only.
+            // Namespace-vended dynamic credentials are supported on the native object_store path.
             self.build_opendal_gcs_store(&base_path, &storage_options)
                 .await?
         } else {
-            self.build_google_cloud_store(&base_path, &storage_options)
+            self.build_google_cloud_store(&base_path, &storage_options, accessor)
                 .await?
         };
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
@@ -176,7 +201,10 @@ impl StorageOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::ObjectStoreParams;
+    use std::sync::Arc;
+
+    use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
+    use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use std::collections::HashMap;
 
     #[test]
@@ -191,7 +219,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_use_opendal_flag() {
-        use crate::object_store::StorageOptionsAccessor;
         let provider = GcsStoreProvider;
         let url = Url::parse("gs://test-bucket/path").unwrap();
         let params_with_flag = ObjectStoreParams {
@@ -212,5 +239,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "gs");
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_gcp_credentials_provider() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            StaticMockStorageOptionsProvider {
+                options: HashMap::from([(
+                    "google_storage_token".to_string(),
+                    "gcp-token".to_string(),
+                )]),
+            },
+        )));
+
+        let credentials = build_dynamic_gcp_credentials(Some(accessor))
+            .await
+            .expect("dynamic gcp credentials should build")
+            .expect("expected credential provider")
+            .get_credential()
+            .await
+            .expect("expected gcp credential");
+
+        assert_eq!(credentials.bearer, "gcp-token");
     }
 }

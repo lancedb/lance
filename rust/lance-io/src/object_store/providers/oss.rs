@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Oss};
 use url::Url;
 
+use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -17,12 +19,11 @@ use lance_core::error::{Error, Result};
 #[derive(Default, Debug)]
 pub struct OssStoreProvider;
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for OssStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
-
+impl OssStoreProvider {
+    fn base_oss_options(
+        base_path: &Url,
+        storage_options: &StorageOptions,
+    ) -> Result<HashMap<String, String>> {
         let bucket = base_path
             .host_str()
             .ok_or_else(|| Error::invalid_input("OSS URL must contain bucket name"))?
@@ -30,19 +31,21 @@ impl ObjectStoreProvider for OssStoreProvider {
 
         let prefix = base_path.path().trim_start_matches('/').to_string();
 
-        // Start with environment variables as base configuration
+        // Snapshot env-backed OSS defaults at store construction time. Dynamic provider
+        // options can still override these values during per-request config merging.
         let mut config_map: HashMap<String, String> = std::env::vars()
-            .filter(|(k, _)| {
-                k.starts_with("OSS_") || k.starts_with("AWS_") || k.starts_with("ALIBABA_CLOUD_")
+            .filter(|(key, _)| {
+                key.starts_with("OSS_")
+                    || key.starts_with("AWS_")
+                    || key.starts_with("ALIBABA_CLOUD_")
             })
-            .map(|(k, v)| {
-                // Convert env var names to opendal config keys
-                let key = k
+            .map(|(key, value)| {
+                let normalized_key = key
                     .to_lowercase()
                     .replace("oss_", "")
                     .replace("aws_", "")
                     .replace("alibaba_cloud_", "");
-                (key, v)
+                (normalized_key, value)
             })
             .collect();
 
@@ -52,25 +55,55 @@ impl ObjectStoreProvider for OssStoreProvider {
             config_map.insert("root".to_string(), "/".to_string());
         }
 
-        // Override with storage options if provided
-        if let Some(endpoint) = storage_options.0.get("oss_endpoint") {
-            config_map.insert("endpoint".to_string(), endpoint.clone());
+        config_map.extend(storage_options.0.clone());
+
+        Ok(config_map)
+    }
+
+    fn normalize_oss_config(options: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+        let mut config_map = HashMap::new();
+
+        if let Some(bucket) = options.get("bucket").cloned() {
+            config_map.insert("bucket".to_string(), bucket);
+        }
+        if let Some(root) = options.get("root").cloned() {
+            config_map.insert("root".to_string(), root);
         }
 
-        if let Some(access_key_id) = storage_options.0.get("oss_access_key_id") {
-            config_map.insert("access_key_id".to_string(), access_key_id.clone());
+        if let Some(endpoint) = options
+            .get("oss_endpoint")
+            .cloned()
+            .or_else(|| options.get("endpoint").cloned())
+        {
+            config_map.insert("endpoint".to_string(), endpoint);
         }
-
-        if let Some(secret_access_key) = storage_options.0.get("oss_secret_access_key") {
-            config_map.insert("access_key_secret".to_string(), secret_access_key.clone());
+        if let Some(access_key_id) = options
+            .get("oss_access_key_id")
+            .cloned()
+            .or_else(|| options.get("access_key_id").cloned())
+        {
+            config_map.insert("access_key_id".to_string(), access_key_id);
         }
-
-        if let Some(region) = storage_options.0.get("oss_region") {
-            config_map.insert("region".to_string(), region.clone());
+        if let Some(secret_access_key) = options
+            .get("oss_secret_access_key")
+            .cloned()
+            .or_else(|| options.get("access_key_secret").cloned())
+        {
+            config_map.insert("access_key_secret".to_string(), secret_access_key);
         }
-
-        if let Some(security_token) = storage_options.0.get("oss_security_token") {
-            config_map.insert("security_token".to_string(), security_token.clone());
+        if let Some(region) = options
+            .get("oss_region")
+            .cloned()
+            .or_else(|| options.get("region").cloned())
+        {
+            config_map.insert("region".to_string(), region);
+        }
+        if let Some(security_token) = options
+            .get("oss_security_token")
+            .cloned()
+            .or_else(|| options.get("security_token").cloned())
+        {
+            config_map.insert("security_token".to_string(), security_token);
         }
 
         if !config_map.contains_key("endpoint") {
@@ -79,11 +112,41 @@ impl ObjectStoreProvider for OssStoreProvider {
             ));
         }
 
+        Ok(config_map)
+    }
+
+    fn build_oss_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         let operator = Operator::from_iter::<Oss>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?
             .finish();
 
-        let opendal_store = Arc::new(OpendalStore::new(operator));
+        Ok(OpendalStore::new(operator))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for OssStoreProvider {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+
+        let base_options = Self::base_oss_options(&base_path, &storage_options)?;
+        let accessor = params.get_accessor();
+
+        let inner: Arc<dyn OSObjectStore> =
+            if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
+                Arc::new(DynamicOpenDalStore::new(
+                    format!("oss:{}", base_path),
+                    base_options,
+                    accessor,
+                    Self::normalize_oss_config,
+                    Self::build_oss_store,
+                ))
+            } else {
+                Arc::new(Self::build_oss_store(Self::normalize_oss_config(
+                    &base_options,
+                )?)?)
+            };
 
         let mut url = base_path;
         if !url.path().ends_with('/') {
@@ -92,7 +155,7 @@ impl ObjectStoreProvider for OssStoreProvider {
 
         Ok(ObjectStore {
             scheme: "oss".to_string(),
-            inner: opendal_store,
+            inner,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -107,8 +170,13 @@ impl ObjectStoreProvider for OssStoreProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::OssStoreProvider;
-    use crate::object_store::ObjectStoreProvider;
+    use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
+    use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
+    use crate::object_store::{ObjectStoreProvider, StorageOptionsAccessor};
     use url::Url;
 
     #[test]
@@ -119,5 +187,43 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_opendal_oss_store_uses_provider_credentials() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            StaticMockStorageOptionsProvider {
+                options: HashMap::from([
+                    (
+                        "oss_endpoint".to_string(),
+                        "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+                    ),
+                    ("oss_access_key_id".to_string(), "akid".to_string()),
+                    ("oss_secret_access_key".to_string(), "secret".to_string()),
+                    ("oss_security_token".to_string(), "token".to_string()),
+                ]),
+            },
+        )));
+
+        let base_options = OssStoreProvider::base_oss_options(
+            &Url::parse("oss://bucket/path").unwrap(),
+            &crate::object_store::StorageOptions(HashMap::new()),
+        )
+        .unwrap();
+
+        let store = DynamicOpenDalStore::new(
+            "oss",
+            base_options,
+            accessor,
+            OssStoreProvider::normalize_oss_config,
+            OssStoreProvider::build_oss_store,
+        );
+
+        let current_store = store
+            .current_store()
+            .await
+            .expect("dynamic OpenDAL OSS store should build");
+
+        assert!(current_store.to_string().contains("Opendal"));
     }
 }
