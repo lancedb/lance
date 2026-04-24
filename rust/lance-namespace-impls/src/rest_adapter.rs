@@ -564,10 +564,10 @@ fn parse_json_query_param<T: serde::de::DeserializeOwned>(
     raw: Option<&str>,
     operation: &str,
     param_name: &str,
-) -> std::result::Result<Option<T>, Response> {
+) -> std::result::Result<Option<T>, Box<Response>> {
     match raw {
         Some(raw) => serde_json::from_str(raw).map(Some).map_err(|e| {
-            (
+            let response = (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": {
@@ -578,7 +578,8 @@ fn parse_json_query_param<T: serde::de::DeserializeOwned>(
                     }
                 })),
             )
-                .into_response()
+                .into_response();
+            Box::new(response)
         }),
         None => Ok(None),
     }
@@ -594,7 +595,7 @@ async fn create_table(
     let properties =
         match parse_json_query_param(params.properties.as_deref(), "create_table", "properties") {
             Ok(properties) => properties,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
     let storage_options = match parse_json_query_param(
         params.storage_options.as_deref(),
@@ -602,7 +603,7 @@ async fn create_table(
         "storage_options",
     ) {
         Ok(storage_options) => storage_options,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),

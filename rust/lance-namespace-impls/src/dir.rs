@@ -1235,7 +1235,8 @@ impl DirectoryNamespace {
             let storage_options = self
                 .get_storage_options_for_table(&table_uri, vend_credentials, identity)
                 .await?;
-            let is_only_declared = !self.table_has_actual_manifests(&table_name).await?;
+            let is_only_declared =
+                status.has_reserved_file && !self.table_has_actual_manifests(&table_name).await?;
             return Ok(DescribeTableResponse {
                 table: Some(table_name),
                 namespace: request.id.as_ref().map(|id| {
@@ -1321,6 +1322,7 @@ impl DirectoryNamespace {
             }
             Err(err) => {
                 if manifest::ManifestNamespace::is_not_found_load_error(&err)
+                    && status.has_reserved_file
                     && !self.table_has_actual_manifests(&table_name).await?
                 {
                     let storage_options = self
