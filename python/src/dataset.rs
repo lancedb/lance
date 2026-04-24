@@ -725,6 +725,11 @@ impl Dataset {
         Ok(self.ds.manifest().data_storage_format.version.clone())
     }
 
+    #[getter(has_stable_row_ids)]
+    fn has_stable_row_ids(&self) -> bool {
+        self.ds.manifest().uses_stable_row_ids()
+    }
+
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
         rt().block_on(None, self.ds.index_statistics(&index_name))?

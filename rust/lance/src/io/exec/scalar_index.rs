@@ -7,7 +7,10 @@ use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
-    index::{DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter},
+    index::{
+        prefilter::DatasetPreFilter,
+        scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
+    },
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
@@ -40,7 +43,6 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
-    IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
@@ -62,12 +64,7 @@ impl ScalarIndexLoader for Dataset {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let idx = self
-            .load_scalar_index(IndexCriteria::default().with_name(index_name))
-            .await?
-            .ok_or_else(|| Error::internal(format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column)))?;
-        self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
-            .await
+        open_named_scalar_index(self, column, index_name, metrics).await
     }
 }
 
@@ -133,13 +130,14 @@ impl ScalarIndexExec {
                 Self::fragments_covered_by_index_query(expr, dataset).await
             }
             ScalarIndexExpr::Query(search_key) => {
-                let idx = dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search_key.index_name))
+                scalar_index_fragment_bitmap(dataset, &search_key.column, &search_key.index_name)
                     .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Index not found even though it must have been found earlier: {}",
+                            search_key.index_name
+                        ))
+                    })
             }
         }
     }
@@ -336,14 +334,15 @@ impl MapIndexExec {
     ) -> datafusion::error::Result<
         impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
     > {
-        let index = dataset
-            .load_scalar_index(IndexCriteria::default().with_name(&index_name))
+        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
             .await?
-            .unwrap();
-        let deletion_mask_fut = DatasetPreFilter::create_restricted_deletion_mask(
-            dataset.clone(),
-            index.fragment_bitmap.unwrap(),
-        );
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
+                ))
+            })?;
+        let deletion_mask_fut =
+            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
         let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {

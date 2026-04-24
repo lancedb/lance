@@ -216,6 +216,57 @@ public class ZonemapStatsTest {
   }
 
   @Test
+  public void testGetZonemapStatsCommittedSegments(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("segmented_zonemap_stats").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(allocator, path, intSchema(), new WriteParams.Builder().build())) {
+        // empty
+      }
+      Dataset ds2 = writeIntFragment(allocator, path, 1, 0, 50);
+      ds2.close();
+      Dataset ds3 = writeIntFragment(allocator, path, 2, 50, 50);
+      ds3.close();
+
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, fragments.size());
+
+        ScalarIndexParams params = ScalarIndexParams.create("zonemap", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+
+        Index firstSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList("value"), IndexType.ZONEMAP, indexParams)
+                    .withIndexName("value_zm")
+                    .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                    .build());
+        Index secondSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList("value"), IndexType.ZONEMAP, indexParams)
+                    .withIndexName("value_zm")
+                    .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                    .build());
+
+        dataset.commitExistingIndexSegments(
+            "value_zm", "value", List.of(firstSegment, secondSegment));
+
+        List<ZoneStats> stats = dataset.getZonemapStats("value");
+        assertNotNull(stats);
+        assertFalse(stats.isEmpty());
+
+        Set<Integer> fragmentIds = new HashSet<>();
+        for (ZoneStats z : stats) {
+          fragmentIds.add(z.getFragmentId());
+        }
+        assertEquals(2, fragmentIds.size(), "Expected zones from 2 committed segments");
+      }
+    }
+  }
+
+  @Test
   public void testGetZonemapStatsWrongColumnReturnsEmpty(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("wrong_col").toString();
     try (BufferAllocator allocator = new RootAllocator()) {

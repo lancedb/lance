@@ -73,6 +73,7 @@ pub mod frag_reuse;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
+pub(crate) mod scalar_logical;
 pub mod vector;
 
 use self::append::merge_indices;
@@ -121,6 +122,30 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
             )));
         }
         covered_fragments |= fragment_bitmap.clone();
+    }
+
+    Ok(())
+}
+
+fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
+    let mut type_url = None::<&str>;
+    for segment in segments {
+        let segment_type_url = segment.index_details.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing index details",
+                segment.uuid
+            ))
+        })?;
+        match type_url {
+            Some(expected) if expected != segment_type_url.type_url => {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment set for index '{}' mixes incompatible index detail types",
+                    index_name
+                )));
+            }
+            None => type_url = Some(segment_type_url.type_url.as_str()),
+            Some(_) => {}
+        }
     }
 
     Ok(())
@@ -318,6 +343,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "NGram" => IndexType::NGram.to_string(),
         "ZoneMap" => IndexType::ZoneMap.to_string(),
         "BloomFilter" => IndexType::BloomFilter.to_string(),
+        "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
@@ -967,7 +993,14 @@ impl DatasetIndexExt for Dataset {
         };
 
         validate_segment_metadata(index_name, &segments)?;
+        validate_segment_index_details(index_name, &segments)?;
 
+        let incoming_type_url = segments[0]
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone());
+        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
+        let mut incoming_fragments = RoaringBitmap::new();
         let mut new_indices = Vec::with_capacity(segments.len());
         for mut segment in segments {
             if segment.fields != [field.id] {
@@ -976,16 +1009,69 @@ impl DatasetIndexExt for Dataset {
                     segment.uuid, segment.fields, field.id
                 )));
             }
+            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
+                incoming_fragments |= fragment_bitmap.clone();
+            }
             segment.name = index_name.to_string();
             segment.dataset_version = self.manifest.version;
             new_indices.push(segment);
         }
 
+        let existing_named_indices = self.load_indices_by_name(index_name).await?;
+        if existing_named_indices
+            .iter()
+            .any(|idx| idx.fields != [field.id])
+        {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        let removed_indices = existing_named_indices
+            .into_iter()
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .zip(incoming_type_url.as_deref())
+                    .is_none_or(|(details, expected)| details.type_url == expected)
+            })
+            .map(|idx| -> Result<Option<IndexMetadata>> {
+                let Some(existing_fragments) = idx.fragment_bitmap.as_ref() else {
+                    if incoming_fragments != dataset_fragments {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
+                            idx.uuid, index_name
+                        )));
+                    }
+                    return Ok(Some(idx));
+                };
+
+                if existing_fragments.is_disjoint(&incoming_fragments) {
+                    return Ok(None);
+                }
+
+                let uncovered = existing_fragments - &incoming_fragments;
+                if !uncovered.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
+                        index_name,
+                        uncovered.iter().collect::<Vec<_>>(),
+                        idx.uuid
+                    )));
+                }
+
+                Ok(Some(idx))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
-                removed_indices: vec![],
+                removed_indices,
             },
             None,
         );
@@ -2253,6 +2339,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
+    use lance_index::pbold::BTreeIndexDetails;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -6026,6 +6113,107 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_mixed_index_detail_types() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "vector_idx".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(std::iter::once(1_u32).collect()),
+            index_details: Some(Arc::new(
+                prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
+            )),
+            index_version: IndexType::BTree.version(),
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: seg0.files.clone(),
+        };
+
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![seg0, seg1])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mixes incompatible index detail types")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_partial_replacement_of_wider_segment() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let original = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32, 1_u32],
+            b"original",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![original])
+            .await
+            .unwrap();
+
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"replacement",
+        )
+        .await;
+
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![replacement])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("would orphan fragments"));
     }
 
     #[tokio::test]
