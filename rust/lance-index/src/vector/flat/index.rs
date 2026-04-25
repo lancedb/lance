@@ -486,6 +486,23 @@ impl Quantization for FlatBinQuantizer {
     }
 }
 
+impl From<FlatBinQuantizer> for Quantizer {
+    fn from(value: FlatBinQuantizer) -> Self {
+        Self::FlatBin(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatBinQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::FlatBin(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input("quantizer is not FlatBinQuantizer")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,22 +655,5 @@ mod tests {
             search_results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![0, 3]
         );
-    }
-}
-
-impl From<FlatBinQuantizer> for Quantizer {
-    fn from(value: FlatBinQuantizer) -> Self {
-        Self::FlatBin(value)
-    }
-}
-
-impl TryFrom<Quantizer> for FlatBinQuantizer {
-    type Error = Error;
-
-    fn try_from(value: Quantizer) -> Result<Self> {
-        match value {
-            Quantizer::FlatBin(quantizer) => Ok(quantizer),
-            _ => Err(Error::invalid_input("quantizer is not FlatBinQuantizer")),
-        }
     }
 }

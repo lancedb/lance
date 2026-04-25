@@ -1926,7 +1926,23 @@ mod tests {
             .await
             .unwrap(),
         );
-        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[], None));
+        let mut indexed_fragments = RoaringBitmap::new();
+        for fragment in dataset.manifest.fragments.iter() {
+            indexed_fragments.insert(fragment.id as u32);
+        }
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            name: "test".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(indexed_fragments),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
         prefilter.wait_for_ready().await.unwrap();
         prefilter
     }

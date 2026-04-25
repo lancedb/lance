@@ -53,6 +53,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     }
 
     /// Search this partition and accumulate candidates into a caller-owned top-k heap.
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_topk(
         &self,
         _query: ArrayRef,
@@ -68,6 +69,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 
     /// Search this partition and accumulate candidates into a caller-owned top-k heap,
     /// reusing scratch buffers owned by the caller.
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_topk_with_scratch(
         &self,
         query: ArrayRef,
