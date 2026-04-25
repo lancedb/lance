@@ -626,6 +626,16 @@ class TestChildNamespaceOperations:
         exists_req = TableExistsRequest(id=["test_ns", "declared_table"])
         memory_ns_client.table_exists(exists_req)
 
+        describe_req = DescribeTableRequest(id=["test_ns", "declared_table"])
+        describe_resp = memory_ns_client.describe_table(describe_req)
+        assert describe_resp.is_only_declared is None
+
+        describe_req = DescribeTableRequest(
+            id=["test_ns", "declared_table"], check_declared=True
+        )
+        describe_resp = memory_ns_client.describe_table(describe_req)
+        assert describe_resp.is_only_declared is True
+
 
 class TestDeeplyNestedNamespaces:
     """Tests for deeply nested namespace hierarchies.
@@ -871,10 +881,6 @@ def _get_ops_metric(ns_client, metric_name: str) -> int:
     return metrics.get(metric_name, 0)
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="External manifest store has known issues on Windows",
-)
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
 def test_external_manifest_store_invokes_namespace_apis(use_custom):
     """Test that namespace APIs are invoked correctly for managed versioning.
@@ -1336,10 +1342,6 @@ class TestDataManipulation:
         assert result_table.num_rows == 2  # Alice and Charlie
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Table version listing not supported on Windows",
-)
 class TestTableVersions:
     """Tests for table version operations."""
 

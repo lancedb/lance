@@ -1234,16 +1234,25 @@ impl DirectoryNamespace {
         }
 
         let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        let should_check_declared =
+            load_detailed_metadata || request.check_declared.unwrap_or(false);
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
         let identity = request.identity.as_deref();
+        let is_only_declared = if should_check_declared {
+            if status.has_reserved_file {
+                Some(!self.table_has_actual_manifests(&table_name).await?)
+            } else {
+                Some(false)
+            }
+        } else {
+            None
+        };
 
         if !load_detailed_metadata {
             let storage_options = self
                 .get_storage_options_for_table(&table_uri, vend_credentials, identity)
                 .await?;
-            let is_only_declared =
-                status.has_reserved_file && !self.table_has_actual_manifests(&table_name).await?;
             return Ok(DescribeTableResponse {
                 table: Some(table_name),
                 namespace: request.id.as_ref().map(|id| {
@@ -1256,7 +1265,33 @@ impl DirectoryNamespace {
                 location: Some(table_uri.clone()),
                 table_uri: Some(table_uri),
                 storage_options,
-                is_only_declared: is_only_declared.then_some(true),
+                is_only_declared,
+                managed_versioning: if self.table_version_tracking_enabled {
+                    Some(true)
+                } else {
+                    None
+                },
+                ..Default::default()
+            });
+        }
+
+        if is_only_declared == Some(true) {
+            let storage_options = self
+                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                .await?;
+            return Ok(DescribeTableResponse {
+                table: Some(table_name),
+                namespace: request.id.as_ref().map(|id| {
+                    if id.len() > 1 {
+                        id[..id.len() - 1].to_vec()
+                    } else {
+                        vec![]
+                    }
+                }),
+                location: Some(table_uri.clone()),
+                table_uri: Some(table_uri),
+                storage_options,
+                is_only_declared,
                 managed_versioning: if self.table_version_tracking_enabled {
                     Some(true)
                 } else {
@@ -1319,6 +1354,7 @@ impl DirectoryNamespace {
                     schema: Some(Box::new(json_schema)),
                     storage_options,
                     metadata: Some(metadata),
+                    is_only_declared,
                     managed_versioning: if self.table_version_tracking_enabled {
                         Some(true)
                     } else {
@@ -1329,8 +1365,7 @@ impl DirectoryNamespace {
             }
             Err(err) => {
                 if manifest::ManifestNamespace::is_not_found_load_error(&err)
-                    && status.has_reserved_file
-                    && !self.table_has_actual_manifests(&table_name).await?
+                    && is_only_declared == Some(true)
                 {
                     let storage_options = self
                         .get_storage_options_for_table(&table_uri, vend_credentials, identity)
@@ -1347,7 +1382,7 @@ impl DirectoryNamespace {
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
                         storage_options,
-                        is_only_declared: Some(true),
+                        is_only_declared,
                         managed_versioning: if self.table_version_tracking_enabled {
                             Some(true)
                         } else {
@@ -4023,7 +4058,7 @@ mod tests {
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_core::utils::testing::CountingObjectStore;
-    use lance_io::object_store::providers::local::FileStoreProvider;
+    use lance_io::object_store::{providers::local::FileStoreProvider, uri_to_url};
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
         QueryTableRequestColumns,
@@ -4096,8 +4131,10 @@ mod tests {
     }
 
     fn file_object_store_uri(path: &str) -> String {
-        let path_prefix = if path.starts_with('/') { "" } else { "/" };
-        format!("file-object-store://{path_prefix}{path}")
+        let file_url = uri_to_url(path).unwrap();
+        let mut url = Url::parse("file-object-store:///").unwrap();
+        url.set_path(file_url.path());
+        url.to_string()
     }
 
     fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Session> {
@@ -6202,6 +6239,12 @@ mod tests {
         assert!(describe_response.location.is_some());
         assert!(describe_response.version.is_none()); // Not written yet
         assert!(describe_response.schema.is_none()); // Not written yet
+        assert_eq!(describe_response.is_only_declared, None);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.check_declared = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
         assert_eq!(describe_response.is_only_declared, Some(true));
 
         let mut list_req = ListTablesRequest::new();
@@ -6247,7 +6290,7 @@ mod tests {
         describe_req.load_detailed_metadata = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
 
-        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.is_only_declared, Some(false));
         assert_eq!(describe_response.version, Some(1));
         assert!(describe_response.schema.is_some());
 
@@ -6295,7 +6338,7 @@ mod tests {
         describe_req.id = Some(vec!["test_table".to_string()]);
         describe_req.load_detailed_metadata = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
-        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.is_only_declared, Some(false));
         assert_eq!(describe_response.version, Some(1));
 
         let mut list_req = ListTablesRequest::new();
@@ -6341,7 +6384,7 @@ mod tests {
         describe_req.id = Some(vec!["test_table".to_string()]);
         describe_req.load_detailed_metadata = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
-        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.is_only_declared, Some(false));
         assert_eq!(describe_response.version, Some(1));
 
         let mut list_req = ListTablesRequest::new();
@@ -6397,7 +6440,7 @@ mod tests {
         describe_req.id = Some(vec!["test_table".to_string()]);
         describe_req.load_detailed_metadata = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
-        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.is_only_declared, Some(false));
         assert_eq!(describe_response.version, Some(1));
         assert_eq!(
             describe_response
@@ -6493,7 +6536,7 @@ mod tests {
         describe_req.id = Some(vec!["test_table".to_string()]);
         describe_req.load_detailed_metadata = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
-        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.is_only_declared, Some(false));
         assert_eq!(describe_response.version, Some(1));
 
         let mut list_req = ListTablesRequest::new();
@@ -6544,7 +6587,7 @@ mod tests {
         describe_req.id = Some(vec!["test_table".to_string()]);
         describe_req.load_detailed_metadata = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
-        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(describe_response.is_only_declared, Some(false));
         assert_eq!(describe_response.version, Some(1));
 
         let mut list_req = ListTablesRequest::new();
@@ -6596,6 +6639,12 @@ mod tests {
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.check_declared = Some(true);
         let describe_response = namespace.describe_table(describe_req).await.unwrap();
         assert_eq!(describe_response.is_only_declared, Some(true));
         assert_eq!(
@@ -7007,7 +7056,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_list_table_versions() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -7124,7 +7172,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_describe_table_version() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -7239,7 +7286,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_describe_table_version_latest() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -7321,7 +7367,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_create_table_version() {
         use futures::TryStreamExt;
         use lance::dataset::builder::DatasetBuilder;
@@ -7432,7 +7477,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_create_table_version_conflict() {
         // create_table_version should fail if the version already exists.
         // Each version always writes to a new file location.
@@ -7778,7 +7822,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[cfg(not(windows))]
         async fn test_external_manifest_store_invokes_namespace_apis() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -7898,7 +7941,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[cfg(not(windows))]
         async fn test_dataset_commit_with_external_manifest_store() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -8895,7 +8937,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[cfg(not(windows))]
         async fn test_create_table_version_records_in_manifest() {
             // When table_version_storage_enabled is enabled, single create_table_version
             // should also record the version in __manifest
@@ -9105,10 +9146,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        windows,
-        ignore = "TODO: https://github.com/lance-format/lance/issues/6557"
-    )]
     async fn test_dir_listing_no_extra_calls_without_migration() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -9177,10 +9214,54 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        windows,
-        ignore = "TODO: https://github.com/lance-format/lance/issues/6557"
-    )]
+    async fn test_describe_declared_table_checks_versions_only_when_requested() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        let namespace = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(
+            listing_count.load(Ordering::SeqCst),
+            1,
+            "Default describe_table should only list the table directory"
+        );
+
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.check_declared = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+
+        assert_eq!(describe_response.is_only_declared, Some(true));
+        assert_eq!(
+            listing_count.load(Ordering::SeqCst),
+            2,
+            "check_declared describe_table should list the table directory and _versions"
+        );
+    }
+
+    #[tokio::test]
     async fn test_dir_listing_extra_calls_with_migration() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();

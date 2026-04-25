@@ -291,6 +291,14 @@ struct PaginationQuery {
     descending: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DescribeTableQuery {
+    delimiter: Option<String>,
+    with_table_uri: Option<bool>,
+    load_detailed_metadata: Option<bool>,
+    check_declared: Option<bool>,
+}
+
 // ============================================================================
 // Error Conversion
 // ============================================================================
@@ -486,11 +494,20 @@ async fn describe_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
+    Query(params): Query<DescribeTableQuery>,
     Json(mut request): Json<DescribeTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    if params.with_table_uri.is_some() {
+        request.with_table_uri = params.with_table_uri;
+    }
+    if params.load_detailed_metadata.is_some() {
+        request.load_detailed_metadata = params.load_detailed_metadata;
+    }
+    if params.check_declared.is_some() {
+        request.check_declared = params.check_declared;
+    }
 
     match backend.describe_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -2004,6 +2021,17 @@ mod tests {
                 location.contains("test_table"),
                 "Location should contain table name"
             );
+            assert_eq!(response.is_only_declared, None);
+
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
+            describe_req.check_declared = Some(true);
+            let response = fixture
+                .namespace
+                .describe_table(describe_req)
+                .await
+                .expect("Should describe declared table with check_declared");
+            assert_eq!(response.is_only_declared, Some(true));
 
             // Declared tables don't have a version until data is written
             // (version is None for declared tables)
@@ -3008,6 +3036,7 @@ mod tests {
                 ]),
                 with_table_uri: None,
                 load_detailed_metadata: None,
+                check_declared: None,
                 vend_credentials: None,
                 version: None,
                 identity: None,

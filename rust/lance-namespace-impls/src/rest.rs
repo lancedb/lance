@@ -855,6 +855,11 @@ impl LanceNamespace for RestNamespace {
             detailed_str = detailed.to_string();
             query.push(("load_detailed_metadata", detailed_str.as_str()));
         }
+        let check_declared_str;
+        if let Some(check_declared) = request.check_declared {
+            check_declared_str = check_declared.to_string();
+            query.push(("check_declared", check_declared_str.as_str()));
+        }
         self.post_json(&path, &query, &request, "describe_table", &id)
             .await
     }

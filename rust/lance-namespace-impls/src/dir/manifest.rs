@@ -1956,6 +1956,8 @@ impl LanceNamespace for ManifestNamespace {
         };
 
         let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        let should_check_declared =
+            load_detailed_metadata || request.check_declared.unwrap_or(false);
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
 
@@ -1969,10 +1971,13 @@ impl LanceNamespace for ManifestNamespace {
                 } else {
                     None
                 };
+                let is_only_declared = if should_check_declared {
+                    Some(!self.location_has_actual_manifests(&info.location).await?)
+                } else {
+                    None
+                };
 
                 if !load_detailed_metadata {
-                    let is_only_declared =
-                        !self.location_has_actual_manifests(&info.location).await?;
                     return Ok(DescribeTableResponse {
                         table: Some(table_name),
                         namespace: Some(namespace_id),
@@ -1980,7 +1985,20 @@ impl LanceNamespace for ManifestNamespace {
                         table_uri: Some(table_uri),
                         storage_options,
                         properties: info.metadata,
-                        is_only_declared: is_only_declared.then_some(true),
+                        is_only_declared,
+                        ..Default::default()
+                    });
+                }
+
+                if is_only_declared == Some(true) {
+                    return Ok(DescribeTableResponse {
+                        table: Some(table_name),
+                        namespace: Some(namespace_id),
+                        location: Some(table_uri.clone()),
+                        table_uri: Some(table_uri),
+                        storage_options,
+                        properties: info.metadata,
+                        is_only_declared,
                         ..Default::default()
                     });
                 }
@@ -2014,14 +2032,12 @@ impl LanceNamespace for ManifestNamespace {
                             schema: Some(Box::new(json_schema)),
                             storage_options,
                             properties: info.metadata.clone(),
-                            is_only_declared: None,
+                            is_only_declared,
                             ..Default::default()
                         })
                     }
                     Err(err) => {
-                        if Self::is_not_found_load_error(&err)
-                            && !self.location_has_actual_manifests(&info.location).await?
-                        {
+                        if Self::is_not_found_load_error(&err) && is_only_declared == Some(true) {
                             Ok(DescribeTableResponse {
                                 table: Some(table_name),
                                 namespace: Some(namespace_id),
@@ -2029,7 +2045,7 @@ impl LanceNamespace for ManifestNamespace {
                                 table_uri: Some(table_uri),
                                 storage_options,
                                 properties: info.metadata,
-                                is_only_declared: Some(true),
+                                is_only_declared,
                                 ..Default::default()
                             })
                         } else {
