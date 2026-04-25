@@ -7460,7 +7460,7 @@ mod tests {
         let version_info = response
             .version
             .expect("response should contain version info");
-        let version_2_path = Path::from(version_info.manifest_path);
+        let version_2_path = Path::parse(&version_info.manifest_path).unwrap();
         let head_result = dataset.object_store().inner.head(&version_2_path).await;
         assert!(
             head_result.is_ok(),
