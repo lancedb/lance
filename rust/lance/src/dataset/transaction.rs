@@ -80,8 +80,18 @@ fn resolve_update_version_metadata(
     new_fragments: &mut [Fragment],
     new_version: u64,
 ) -> Result<()> {
-    // ~24 bytes per entry (u64 key + &Fragment pointer + usize offset + hash metadata).
-    // For a 1M-row dataset this is ~24 MB — acceptable for a transient transaction structure.
+    // Collect only the row IDs we actually need to resolve — those appearing in new_fragments
+    // with inline metadata. This bounds the lookup map to O(updated rows) instead of
+    // O(all dataset rows), which matters for datasets approaching 1B+ rows.
+    let needed_row_ids: HashSet<u64> = new_fragments
+        .iter()
+        .filter_map(|f| match &f.row_id_meta {
+            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
+            _ => None,
+        })
+        .flat_map(|seq| seq.iter().collect::<Vec<_>>())
+        .collect();
+
     let mut row_id_to_source: HashMap<u64, (&Fragment, usize)> = HashMap::new();
     // Stable row IDs must be globally unique among *live* rows, but after a rewrite-style
     // update the same stable ID can appear twice in `existing_fragments`: once in an older
@@ -96,7 +106,9 @@ fn resolve_update_version_metadata(
             && let Ok(seq) = read_row_ids(data)
         {
             for (offset, rid) in seq.iter().enumerate() {
-                row_id_to_source.entry(rid).or_insert((frag, offset));
+                if needed_row_ids.contains(&rid) {
+                    row_id_to_source.entry(rid).or_insert((frag, offset));
+                }
             }
         }
     }
