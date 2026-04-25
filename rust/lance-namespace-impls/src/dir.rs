@@ -364,6 +364,8 @@ impl DirectoryNamespaceBuilder {
     ///
     /// GCP-specific properties (for gs:// locations):
     /// - `credential_vendor.gcp_service_account`: Service account to impersonate (optional)
+    /// - `credential_vendor.gcp_workload_identity_provider`: Workload Identity Provider for OIDC token exchange (optional)
+    /// - `credential_vendor.gcp_impersonation_service_account`: Service account to impersonate after workload identity exchange (optional)
     ///
     /// Note: GCP uses Application Default Credentials (ADC). To use a service account key file,
     /// set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable before starting.
@@ -372,6 +374,7 @@ impl DirectoryNamespaceBuilder {
     /// Azure-specific properties (for az:// locations):
     /// - `credential_vendor.azure_account_name`: Azure storage account name (required for Azure)
     /// - `credential_vendor.azure_tenant_id`: Azure tenant ID (optional)
+    /// - `credential_vendor.azure_federated_client_id`: Client ID used for workload identity federation (optional)
     /// - `credential_vendor.azure_duration_millis`: Credential duration in ms (default: 3600000, up to 7 days)
     ///
     /// # Arguments
@@ -569,8 +572,8 @@ impl DirectoryNamespaceBuilder {
     /// Use short property names without the `credential_vendor.` prefix.
     /// Common properties: `enabled`, `permission`.
     /// AWS properties: `aws_role_arn`, `aws_external_id`, `aws_region`, `aws_role_session_name`, `aws_duration_millis`.
-    /// GCP properties: `gcp_service_account`.
-    /// Azure properties: `azure_account_name`, `azure_tenant_id`, `azure_duration_millis`.
+    /// GCP properties: `gcp_service_account`, `gcp_workload_identity_provider`, `gcp_impersonation_service_account`.
+    /// Azure properties: `azure_account_name`, `azure_tenant_id`, `azure_federated_client_id`, `azure_duration_millis`.
     ///
     /// # Arguments
     ///
