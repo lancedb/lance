@@ -306,7 +306,8 @@ impl AzureCredentialVendor {
     /// (matches object_store's credential resolution order):
     /// 1. Workload Identity Federation (AZURE_FEDERATED_TOKEN_FILE + tenant + client ID)
     /// 2. Client Secret OAuth (AZURE_CLIENT_ID + AZURE_CLIENT_SECRET + tenant)
-    /// 3. Managed Identity (IMDS)
+    /// 3. Azure CLI (`az account get-access-token`)
+    /// 4. Managed Identity (IMDS)
     async fn fetch_static_access_token(&self) -> Result<String> {
         if let (Some(tenant_id), Some(client_id), Ok(federated_token_file)) = (
             self.tenant_id_for_static_auth(),
@@ -347,8 +348,58 @@ impl AzureCredentialVendor {
                 .await;
         }
 
+        if let Ok(token) = self.fetch_azure_cli_token().await {
+            debug!("Azure static auth: using Azure CLI access token");
+            return Ok(token);
+        }
+
         debug!("Azure static auth: falling back to managed identity flow");
         self.fetch_managed_identity_token().await
+    }
+
+    async fn fetch_azure_cli_token(&self) -> Result<String> {
+        let output = tokio::process::Command::new("az")
+            .args([
+                "account",
+                "get-access-token",
+                "--resource",
+                AZURE_STORAGE_RESOURCE,
+                "--query",
+                "accessToken",
+                "--output",
+                "tsv",
+            ])
+            .output()
+            .await
+            .map_err(|err| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to invoke Azure CLI for storage access token: {}",
+                        err
+                    ),
+                })
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Azure CLI failed to fetch storage access token (status={}): {}",
+                    output.status, stderr
+                ),
+            }
+            .into());
+        }
+
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if token.is_empty() {
+            return Err(NamespaceError::Internal {
+                message: "Azure CLI returned an empty storage access token".to_string(),
+            }
+            .into());
+        }
+
+        Ok(token)
     }
 
     async fn exchange_client_secret_for_azure_token(
@@ -1140,8 +1191,11 @@ mod tests {
             Ok(Some(account_name))
         }
 
+        const TEST_CONTAINER: &str = "examples";
+        const TEST_PREFIX: &str = "lance-cv-integ-test";
+
         #[tokio::test]
-        async fn test_fetch_static_access_token_with_local_azure_credentials() -> Result<()> {
+        async fn test_fetch_static_access_token() -> Result<()> {
             let Some(account_name) = maybe_account_name()? else {
                 return Ok(());
             };
@@ -1161,7 +1215,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_vend_credentials_with_local_azure_credentials() -> Result<()> {
+        async fn test_vend_directory_scoped_sas() -> Result<()> {
             let Some(account_name) = maybe_account_name()? else {
                 return Ok(());
             };
@@ -1172,9 +1226,8 @@ mod tests {
                     .with_duration_millis(5 * 60 * 1000),
             );
 
-            let credentials = vendor
-                .vend_credentials("az://integration-test-container/path/to/table", None)
-                .await?;
+            let location = format!("az://{}/{}", TEST_CONTAINER, TEST_PREFIX);
+            let credentials = vendor.vend_credentials(&location, None).await?;
 
             assert_eq!(
                 credentials
@@ -1187,16 +1240,82 @@ mod tests {
                 .storage_options
                 .get("azure_storage_sas_token")
                 .expect("Azure SAS token should be present");
+            assert!(sas_token.contains("sig="));
+            assert!(sas_token.contains("sr=d"), "Expected directory-scoped SAS");
+            assert!(credentials.expires_at_millis > 0);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_vend_container_scoped_sas() -> Result<()> {
+            let Some(account_name) = maybe_account_name()? else {
+                return Ok(());
+            };
+
+            let vendor = AzureCredentialVendor::new(
+                AzureCredentialVendorConfig::new()
+                    .with_account_name(account_name.clone())
+                    .with_duration_millis(5 * 60 * 1000),
+            );
+
+            let location = format!("az://{}", TEST_CONTAINER);
+            let credentials = vendor.vend_credentials(&location, None).await?;
+
+            let sas_token = credentials
+                .storage_options
+                .get("azure_storage_sas_token")
+                .expect("Azure SAS token should be present");
+            assert!(sas_token.contains("sr=c"), "Expected container-scoped SAS");
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_only_sas_cannot_write() -> Result<()> {
+            let Some(account_name) = maybe_account_name()? else {
+                return Ok(());
+            };
+
+            let vendor = AzureCredentialVendor::new(
+                AzureCredentialVendorConfig::new()
+                    .with_account_name(account_name.clone())
+                    .with_permission(VendedPermission::Read)
+                    .with_duration_millis(5 * 60 * 1000),
+            );
+
+            let location = format!("az://{}/{}", TEST_CONTAINER, TEST_PREFIX);
+            let credentials = vendor.vend_credentials(&location, None).await?;
+
+            let sas_token = credentials
+                .storage_options
+                .get("azure_storage_sas_token")
+                .unwrap();
+
+            let blob_url = format!(
+                "https://{}.blob.core.windows.net/{}/{}/should-not-exist.txt?{}",
+                account_name, TEST_CONTAINER, TEST_PREFIX, sas_token
+            );
+
+            let client = reqwest::Client::new();
+            let put_resp = client
+                .put(&blob_url)
+                .header("x-ms-blob-type", "BlockBlob")
+                .header("x-ms-version", SAS_VERSION)
+                .body("should fail")
+                .send()
+                .await
+                .map_err(|err| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to send PUT request: {}", err),
+                    })
+                })?;
 
             assert!(
-                sas_token.contains("sig="),
-                "SAS token should include signature"
+                put_resp.status().is_client_error(),
+                "Read-only SAS should not allow writes, got status {}",
+                put_resp.status()
             );
-            assert!(
-                sas_token.contains("sr=d"),
-                "Expected directory-scoped SAS token"
-            );
-            assert!(credentials.expires_at_millis > 0);
 
             Ok(())
         }
