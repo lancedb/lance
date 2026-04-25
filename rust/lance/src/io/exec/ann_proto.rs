@@ -232,8 +232,11 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
     }
 
     use pb::ann_ivf_sub_index_exec_proto::PreFilterType;
-    let prefilter_type =
-        PreFilterType::try_from(proto.prefilter_type).unwrap_or(PreFilterType::None);
+    let prefilter_type = PreFilterType::try_from(proto.prefilter_type).map_err(|_| {
+        Error::invalid_input_source(
+            format!("Invalid PreFilterType value: {}", proto.prefilter_type).into(),
+        )
+    })?;
 
     let prefilter_source = match (prefilter_type, prefilter_input) {
         (PreFilterType::None, None) => PreFilterSource::None,
