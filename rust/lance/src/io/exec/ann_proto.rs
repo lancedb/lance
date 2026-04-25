@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Protobuf serialization for [`ANNIvfSubIndexExec`].
+//! Protobuf serialization for [`ANNIvfPartitionExec`] and [`ANNIvfSubIndexExec`].
 //!
 //! Proto message definitions live in `crate::pb` (compiled from `ann.proto`).
 //! Conversion functions live here because they need access to `ANNIvfSubIndexExec`
@@ -24,7 +24,7 @@ use lance_table::format::pb as table_pb;
 use crate::Dataset;
 use crate::pb;
 
-use super::knn::ANNIvfSubIndexExec;
+use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
 use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 use super::utils::PreFilterSource;
 
@@ -128,6 +128,45 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         use_index: proto.use_index,
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
     })
+}
+
+// =============================================================================
+// ANNIvfPartitionExec <-> Proto
+// =============================================================================
+
+/// Convert an [`ANNIvfPartitionExec`] to proto for serialization.
+pub async fn ann_ivf_partition_exec_to_proto(
+    exec: &ANNIvfPartitionExec,
+) -> Result<pb::AnnIvfPartitionExecProto> {
+    let table = table_identifier_from_dataset(&exec.dataset).await?;
+    let query = query_to_proto(&exec.query)?;
+
+    Ok(pb::AnnIvfPartitionExecProto {
+        query: Some(query),
+        table: Some(table),
+        index_uuids: exec.index_uuids.clone(),
+    })
+}
+
+/// Reconstruct an [`ANNIvfPartitionExec`] from proto.
+pub async fn ann_ivf_partition_exec_from_proto(
+    proto: pb::AnnIvfPartitionExecProto,
+    dataset: Option<Arc<Dataset>>,
+) -> Result<ANNIvfPartitionExec> {
+    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
+
+    let query_proto = proto.query.ok_or_else(|| {
+        Error::invalid_input_source("Missing VectorQueryProto in ANNIvfPartitionExecProto".into())
+    })?;
+    let query = query_from_proto(query_proto)?;
+
+    if proto.index_uuids.is_empty() {
+        return Err(Error::invalid_input_source(
+            "ANNIvfPartitionExecProto contains no index UUIDs".into(),
+        ));
+    }
+
+    ANNIvfPartitionExec::try_new(dataset, proto.index_uuids, query)
 }
 
 // =============================================================================
@@ -328,6 +367,51 @@ mod tests {
             .await
             .unwrap();
         (Arc::new(ds), dir)
+    }
+
+    #[tokio::test]
+    async fn test_ann_ivf_partition_proto_roundtrip() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(!indices.is_empty());
+
+        let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
+        let query = Query {
+            column: "vector".to_string(),
+            key,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 2,
+            maximum_nprobes: Some(4),
+            ef: None,
+            refine_factor: Some(2),
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            dist_q_c: 0.0,
+        };
+
+        let exec = ANNIvfPartitionExec::try_new(
+            dataset.clone(),
+            indices.iter().map(|idx| idx.uuid.to_string()).collect(),
+            query,
+        )
+        .unwrap();
+
+        let proto = ann_ivf_partition_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(proto.index_uuids.len(), indices.len());
+
+        let back = ann_ivf_partition_exec_from_proto(proto, Some(dataset.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(back.query.column, "vector");
+        assert_eq!(back.query.k, 10);
+        assert_eq!(back.query.minimum_nprobes, 2);
+        assert_eq!(back.query.refine_factor, Some(2));
+        assert_eq!(back.index_uuids.len(), indices.len());
+        assert_eq!(back.dataset.uri(), dataset.uri());
     }
 
     #[tokio::test]

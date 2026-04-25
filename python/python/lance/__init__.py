@@ -101,6 +101,7 @@ def dataset(
     session: Optional[Session] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -169,6 +170,12 @@ def dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`. Cannot be used with `uri`.
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by base path URI. Each key
+        is a base path URI (e.g., "s3://bucket/path") and each value is a dict
+        of storage options (credentials, endpoint, etc.) for that base.  When a base
+        has no explicit entry here, the top-level ``storage_options`` is
+        used as a fallback.
 
     Notes
     -----
@@ -244,6 +251,7 @@ def dataset(
         namespace_client=namespace_client,
         table_id=table_id,
         namespace_client_managed_versioning=namespace_client_managed_versioning,
+        base_store_params=base_store_params,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -270,6 +278,7 @@ def dataset(
                 namespace_client=namespace_client,
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
+                base_store_params=base_store_params,
             )
     else:
         return ds

@@ -513,7 +513,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false, base_store_params=None))]
     fn new(
         py: Python,
         uri: String,
@@ -531,6 +531,7 @@ impl Dataset {
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
+        base_store_params: Option<HashMap<String, HashMap<String, String>>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -650,6 +651,17 @@ impl Dataset {
                         external_manifest_store: Arc::new(external_store),
                     });
                 builder = builder.with_commit_handler(commit_handler);
+            }
+        }
+
+        if let Some(base_store_params) = base_store_params {
+            for (base_path, opts) in base_store_params {
+                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                };
+                builder = builder.with_base_store_params(base_path, store_params);
             }
         }
 
@@ -3618,6 +3630,20 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             && !target_bases_list.is_empty()
         {
             p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        // Handle base_store_params: per-base storage options keyed by base path URI
+        if let Some(base_store_params) =
+            get_dict_opt::<HashMap<String, HashMap<String, String>>>(options, "base_store_params")?
+        {
+            for (base_path, opts) in base_store_params {
+                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                };
+                p = p.with_base_store_params(base_path, store_params);
+            }
         }
 
         if let Some(allow_external) =

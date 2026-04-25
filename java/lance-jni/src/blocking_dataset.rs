@@ -1979,6 +1979,64 @@ fn inner_take(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeSample(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    n: jlong,
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
+) -> jbyteArray {
+    match inner_sample(&mut env, java_dataset, n, columns_obj, fragment_ids_obj) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_sample(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    n: jlong,
+    columns_obj: JObject,      // List<String>
+    fragment_ids_obj: JObject, // Optional<List<Integer>>
+) -> Result<jbyteArray> {
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+    let fragment_ids: Option<Vec<i32>> = env.get_ints_opt(&fragment_ids_obj)?;
+    let fragment_ids_u32: Option<Vec<u32>> =
+        fragment_ids.map(|ids| ids.iter().map(|&id| id as u32).collect());
+
+    let result = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset = &dataset_guard.inner;
+
+        let projection = dataset
+            .schema()
+            .project_preserve_system_columns(&columns)
+            .map_err(|e| Error::runtime_error(e.to_string()))?;
+
+        match RT.block_on(dataset.sample(n as usize, &projection, fragment_ids_u32.as_deref())) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &result.schema())?;
+        writer.write(&result)?;
+        writer.finish()?;
+    }
+
+    let byte_array = env.byte_array_from_slice(&buffer)?;
+    Ok(**byte_array)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDelete(
     mut env: JNIEnv,
     java_dataset: JObject,
