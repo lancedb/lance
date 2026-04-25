@@ -39,3 +39,10 @@ message ANNIvfSubIndexExecProto {
   lance.datafusion.TableIdentifier table = 2;
   repeated lance.table.IndexMetadata indices = 3;
 }
+
+// Serializable form of ANNIvfPartitionExec — the IVF centroid routing node.
+message ANNIvfPartitionExecProto {
+  VectorQueryProto query = 1;
+  lance.datafusion.TableIdentifier table = 2;
+  repeated string index_uuids = 3;
+}
