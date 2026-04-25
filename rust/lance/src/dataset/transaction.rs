@@ -80,9 +80,8 @@ fn resolve_update_version_metadata(
     new_fragments: &mut [Fragment],
     new_version: u64,
 ) -> Result<()> {
-    // Collect only the row IDs we actually need to resolve — those appearing in new_fragments
-    // with inline metadata. This bounds the lookup map to O(updated rows) instead of
-    // O(all dataset rows), which matters for datasets approaching 1B+ rows.
+    // Collect only the row IDs we actually need to resolve, those appearing in new_fragments
+    // with inline metadata. This bounds the lookup map to O(updated rows) instead of O(all dataset rows)
     let needed_row_ids: HashSet<u64> = new_fragments
         .iter()
         .filter_map(|f| match &f.row_id_meta {
