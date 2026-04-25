@@ -49,8 +49,8 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::{
-    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, ParallelMode, PartitionSearchControl,
-    PreparedPartitionSearchHandle, Query, VectorIndex, flat::compute_distance,
+    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, ParallelMode, PartitionSearchControl, Query,
+    VectorIndex, flat::compute_distance,
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -780,43 +780,21 @@ impl ANNIvfSubIndexExec {
         Ok(batch)
     }
 
-    async fn prepare_partition_search(
-        index: Arc<dyn VectorIndex>,
-        query: Query,
-        part_id: usize,
-        pre_filter: Arc<DatasetPreFilter>,
-        metrics: Arc<AnnIndexMetrics>,
-    ) -> DataFusionResult<PreparedPartitionSearchHandle> {
-        index
-            .prepare_partition_search(part_id, &query, pre_filter, &metrics.index_metrics)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to prepare KNN: {}", e)))
-            .await
-    }
-
-    fn search_prepared_partition(
-        index: &dyn VectorIndex,
-        prepared: PreparedPartitionSearchHandle,
-        metrics: &AnnIndexMetrics,
-    ) -> DataFusionResult<RecordBatch> {
-        let batch = index
-            .search_prepared_partition(prepared, &metrics.index_metrics)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))?;
-        metrics.baseline_metrics.record_output(batch.num_rows());
-        Ok(batch)
-    }
-
     fn instrument_sequential_partition_stream(
         stream: stream::BoxStream<'static, DataFusionResult<RecordBatch>>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
         record_initial: bool,
+        record_partition_per_batch: bool,
     ) -> stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
         stream
             .map(move |batch| {
                 let metrics = metrics.clone();
                 let state = state.clone();
                 batch.inspect(move |batch| {
-                    metrics.partitions_searched.add(1);
+                    if record_partition_per_batch {
+                        metrics.partitions_searched.add(1);
+                    }
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     if record_initial {
                         state.record_batch(batch);
@@ -932,6 +910,7 @@ impl ANNIvfSubIndexExec {
                             metrics,
                             state,
                             false,
+                            true,
                         ),
                     )
                 })
@@ -950,33 +929,14 @@ impl ANNIvfSubIndexExec {
                     let index = index.clone();
                     async move {
                         metrics.partitions_searched.add(1);
-                        let batch = if index.supports_prepared_partition_search() {
-                            let prepared = Self::prepare_partition_search(
-                                index.clone(),
-                                query,
-                                part_id as usize,
-                                pre_filter,
-                                metrics.clone(),
-                            )
-                            .await?;
-                            spawn_cpu(move || {
-                                Self::search_prepared_partition(
-                                    index.as_ref(),
-                                    prepared,
-                                    metrics.as_ref(),
-                                )
-                            })
-                            .await?
-                        } else {
-                            Self::search_partition(
-                                index,
-                                query,
-                                part_id as usize,
-                                pre_filter,
-                                metrics,
-                            )
-                            .await?
-                        };
+                        let batch = Self::search_partition(
+                            index,
+                            query,
+                            part_id as usize,
+                            pre_filter,
+                            metrics,
+                        )
+                        .await?;
                         state.record_late_batch(batch.num_rows());
                         Ok(batch)
                     }
@@ -1003,6 +963,7 @@ impl ANNIvfSubIndexExec {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
         if query.parallel_mode == ParallelMode::Sequential {
+            metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
                 let prefilter: Arc<dyn PreFilter> = prefilter;
                 let index_metrics: Arc<dyn MetricsCollector> =
@@ -1028,6 +989,7 @@ impl ANNIvfSubIndexExec {
                         metrics,
                         state,
                         true,
+                        false,
                     ),
                 )
             })
@@ -1046,27 +1008,9 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let batch = if index.supports_prepared_partition_search() {
-                        let prepared = Self::prepare_partition_search(
-                            index.clone(),
-                            query,
-                            part_id as usize,
-                            pre_filter,
-                            metrics.clone(),
-                        )
-                        .await?;
-                        spawn_cpu(move || {
-                            Self::search_prepared_partition(
-                                index.as_ref(),
-                                prepared,
-                                metrics.as_ref(),
-                            )
-                        })
-                        .await?
-                    } else {
+                    let batch =
                         Self::search_partition(index, query, part_id as usize, pre_filter, metrics)
-                            .await?
-                    };
+                            .await?;
                     state.record_batch(&batch);
                     Ok(batch)
                 }
@@ -1543,6 +1487,7 @@ mod tests {
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::vector::PreparedPartitionSearchHandle;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};

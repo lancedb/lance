@@ -5,13 +5,17 @@
 
 use std::io::Write as IoWrite;
 use std::marker::PhantomData;
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::{BinaryHeap, HashMap},
+    sync::Arc,
+};
 
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -30,10 +34,11 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
-use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
+use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
@@ -587,6 +592,58 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(batch)
     }
 
+    fn accumulate_prepared_partition_search(
+        distance_type: DistanceType,
+        prepared: PreparedPartitionSearch<S, Q>,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        distance_scratch: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let PreparedPartitionSearch {
+            query,
+            pre_filter,
+            partition_centroid,
+            part_entry,
+            _marker: _,
+        } = prepared;
+        let query =
+            Self::preprocess_partition_query(distance_type, partition_centroid.as_ref(), &query)?;
+        let param = (&query).into();
+        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+        let k = query.k * refine_factor;
+        let part = part_entry
+            .as_any()
+            .downcast_ref::<PartitionEntry<S, Q>>()
+            .ok_or(Error::internal(
+                "failed to downcast partition entry".to_string(),
+            ))?;
+        part.index.accumulate_topk_with_scratch(
+            query.key,
+            k,
+            param,
+            &part.storage,
+            pre_filter,
+            heap,
+            distance_scratch,
+            u16_scratch,
+            u8_scratch,
+            metrics,
+        )
+    }
+
+    fn global_heap_to_batch(heap: BinaryHeap<OrderedNode<u64>>) -> Result<RecordBatch> {
+        let (row_ids, dists): (Vec<_>, Vec<_>) = heap.into_iter().map(|r| (r.id, r.dist.0)).unzip();
+        Ok(RecordBatch::try_new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(dists)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )?)
+    }
+
     fn preprocess_partition_query(
         distance_type: DistanceType,
         partition_centroid: Option<&ArrayRef>,
@@ -1011,10 +1068,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let prepared = self
-            .prepare_partition(partition_id, query, pre_filter, metrics)
-            .await?;
-        Self::run_prepared_partition_search(self.distance_type, prepared, metrics)
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        pre_filter.wait_for_ready().await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let (batch, local_metrics) = spawn_cpu(move || {
+            let param = (&query).into();
+            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+            let k = query.k * refine_factor;
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<S, Q>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let batch = part.index.search(
+                query.key,
+                k,
+                param,
+                &part.storage,
+                pre_filter,
+                &local_metrics,
+            )?;
+            Result::Ok((batch, local_metrics))
+        })
+        .await?;
+
+        local_metrics.dump_into(metrics);
+
+        Ok(batch)
     }
 
     async fn prepare_partition_search(
@@ -1072,6 +1155,62 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         }
 
         let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+
+        if control.is_none() && S::supports_global_topk_heap() {
+            let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+            let prepare_index = self.clone();
+            let prepare_metrics = metrics.clone();
+            let prepared = stream::iter(start_idx..end_idx)
+                .map(move |idx| {
+                    let part_id = partitions.value(idx);
+                    let mut query = query.clone();
+                    query.dist_q_c = q_c_dists.value(idx);
+                    let index = prepare_index.clone();
+                    let pre_filter = pre_filter.clone();
+                    let metrics = prepare_metrics.clone();
+                    async move {
+                        index
+                            .prepare_partition(
+                                part_id as usize,
+                                &query,
+                                pre_filter,
+                                metrics.as_ref(),
+                            )
+                            .await
+                    }
+                })
+                .buffered(prepare_parallelism)
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let distance_type = self.distance_type;
+            let search_metrics = metrics.clone();
+            let batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
+                let mut heap = BinaryHeap::with_capacity(heap_capacity);
+                let mut distance_scratch = Vec::new();
+                let mut u16_scratch = Vec::new();
+                let mut u8_scratch = Vec::new();
+                for prepared in prepared {
+                    Self::accumulate_prepared_partition_search(
+                        distance_type,
+                        prepared,
+                        &mut heap,
+                        &mut distance_scratch,
+                        &mut u16_scratch,
+                        &mut u8_scratch,
+                        search_metrics.as_ref(),
+                    )
+                    .map_err(DataFusionError::from)?;
+                }
+                Self::global_heap_to_batch(heap).map_err(DataFusionError::from)
+            })
+            .await?;
+
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                VECTOR_RESULT_SCHEMA.clone(),
+                stream::once(async move { Ok(batch) }),
+            )));
+        }
 
         let (prepared_tx, mut prepared_rx) =
             mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(1);
