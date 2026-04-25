@@ -67,6 +67,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::{
     execution::{
@@ -80,6 +81,7 @@ use datafusion::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
+        sorts::sort::SortExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
     },
@@ -103,13 +105,12 @@ use lance_core::{
 };
 use lance_datafusion::{
     chunker::chunk_stream,
-    dataframe::DataFrameExt,
-    exec::{LanceExecutionOptions, analyze_plan, get_session_context},
-    utils::reader_to_stream,
-};
-use lance_datafusion::{
-    exec::{OneShotExec, execute_plan},
-    utils::StreamingWriteSource,
+    dataframe::BatchStreamGrouper,
+    exec::{
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan, execute_plan,
+        get_session_context,
+    },
+    utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
@@ -864,25 +865,28 @@ impl MergeInsertJob {
         &self,
         source: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
-        // We need to do a full index scan if we're deleting source data
-        let can_use_scalar_index = matches!(
-            self.params.delete_not_matched_by_source, // this value marks behavior for rows in target that are not matched by the source. Value assigned earlier.
-            WhenNotMatchedBySource::Keep
-        ) && self.params.use_index;
-
-        if can_use_scalar_index {
+        if self.params.use_index
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            )
+        {
             // keeping unmatched rows, no deletion
             if let Some(index) = self.join_key_as_scalar_index().await? {
-                self.create_indexed_scan_joined_stream(source, index).await
-            } else {
-                self.create_full_table_joined_stream(source).await
+                return self.create_indexed_scan_joined_stream(source, index).await;
             }
-        } else {
+        }
+
+        if !matches!(
+            self.params.delete_not_matched_by_source,
+            WhenNotMatchedBySource::Keep
+        ) {
             info!(
                 "The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan"
             );
-            self.create_full_table_joined_stream(source).await
         }
+
+        self.create_full_table_joined_stream(source).await
     }
 
     async fn update_fragments(
@@ -897,12 +901,37 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        let mut group_stream = session_ctx
+        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
+        // single batch that is larger than the memory pool, so we must
+        // rechunk oversized batches before they reach the sort.
+        const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
+        let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
-            .sort(vec![col(ROW_ADDR).sort(true, true)])?
-            .group_by_stream(&["_fragment_id"])
-            .await?;
+            .sort(vec![col(ROW_ADDR).sort(true, true)])?;
+        let sorted_plan = sorted.create_physical_plan().await?;
+        // Walk the physical plan and insert HardCapBatchSizeExec below every
+        // sort node so each input batch fits in the memory pool.
+        let capped_plan = sorted_plan
+            .transform_down(|node| {
+                if node.as_any().downcast_ref::<SortExec>().is_some() {
+                    let children = node.children();
+                    let new_children: Vec<Arc<dyn ExecutionPlan>> = children
+                        .into_iter()
+                        .map(|c| {
+                            Arc::new(HardCapBatchSizeExec::new(c.clone(), MAX_BATCH_BYTES))
+                                as Arc<dyn ExecutionPlan>
+                        })
+                        .collect();
+                    let new_node = node.with_new_children(new_children)?;
+                    Ok(Transformed::yes(new_node))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })?
+            .data;
+        let capped_stream = capped_plan.execute(0, session_ctx.task_ctx())?;
+        let mut group_stream = BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
@@ -1261,12 +1290,19 @@ impl MergeInsertJob {
             let updated_fields = fragment.files.last().unwrap().fields.clone();
             all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
-                for field in &mut data_file.fields {
-                    if updated_fields.contains(field) {
-                        // Tombstone these fields
-                        *field = -2;
-                    }
-                }
+                let new_fields: Arc<[i32]> = data_file
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        if updated_fields.contains(field) {
+                            -2 // Tombstone
+                        } else {
+                            *field
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                data_file.fields = new_fields;
             }
         }
 
@@ -1480,7 +1516,7 @@ impl MergeInsertJob {
     ///
     /// The fast path is only available for specific conditions:
     /// - when_matched is UpdateAll or UpdateIf or Fail
-    /// - Either use_index is false OR there's no scalar index on join key
+    /// - The execution will not use the legacy scalar-index join path
     /// - Source schema matches dataset schema exactly
     /// - when_not_matched_by_source is Keep, Delete, or DeleteIf
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
@@ -1499,7 +1535,15 @@ impl MergeInsertJob {
             },
         );
 
-        let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
+        let would_use_scalar_index = if self.params.use_index
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            ) {
+            self.join_key_as_scalar_index().await?.is_some()
+        } else {
+            false
+        };
 
         // Check if this is a delete-only operation (no update/insert writes needed from source)
         // For delete-only, we don't need the full source schema, just key columns for matching
@@ -1523,7 +1567,7 @@ impl MergeInsertJob {
                 | WhenMatched::UpdateIf(_)
                 | WhenMatched::Fail
                 | WhenMatched::Delete
-        ) && (!self.params.use_index || !has_scalar_index)
+        ) && !would_use_scalar_index
             && schema_ok
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -2279,7 +2323,7 @@ mod tests {
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{BatchCount, Dimension, RowCount, Seed, array};
     use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use mock_instant::thread_local::MockClock;
@@ -3607,8 +3651,8 @@ mod tests {
                 let data_files = &frag.files;
                 // Updated columns should be only columns in new data files
                 // -2 field ids are tombstoned.
-                assert_eq!(&data_files[0].fields, &[0, -2, -2]);
-                assert_eq!(&data_files[1].fields, &[2, 1]);
+                assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
+                assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
             };
             has_added_files(&fragments_after[1]);
             has_added_files(&fragments_after[2]);
@@ -5449,6 +5493,76 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     }
 
     #[tokio::test]
+    async fn test_explain_plan_full_schema_delete_by_source_with_fsl_and_scalar_index() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![
+                            1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3, 3.0, 3.1, 3.2, 3.3,
+                        ]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(dataset_batch)],
+                schema.clone(),
+            )),
+            "memory://test_explain_plan_full_schema_delete_by_source_with_fsl_and_scalar_index",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::Scalar, None, &scalar_params, false)
+            .await
+            .unwrap();
+
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .try_build()
+                .unwrap();
+
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
+        assert!(plan.contains("HashJoinExec"));
+        assert!(plan.contains("join_type=Full"));
+        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
+            "target-side scan should prune the FSL payload from the join build side even when a scalar index exists: {plan}"
+        );
+        assert!(
+            !plan.contains(
+                "LanceRead: uri=test_explain_plan_full_schema_delete_by_source_with_fsl_and_scalar_index/data, projection=[id, vec]"
+            ),
+            "target-side scan should not include the FSL payload in the join build side: {plan}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_merge_insert_full_schema_delete_by_source_with_fsl() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -5486,6 +5600,98 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         )
         .await
         .unwrap();
+
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![20.0, 20.1, 20.2, 20.3, 40.0, 40.1, 40.2, 40.3]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let (merged_dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(source_batch)],
+                    schema.clone(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_deleted_rows, 2);
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        let merged = merged_dataset.scan().try_into_batch().await.unwrap();
+        let ids = merged["id"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(ids, vec![2, 4]);
+
+        let vecs = merged["vec"].as_fixed_size_list();
+        let actual = vecs
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(actual, vec![20.0, 20.1, 20.2, 20.3, 40.0, 40.1, 40.2, 40.3]);
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_full_schema_delete_by_source_with_fsl_and_scalar_index() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let dataset_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![
+                            1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3, 3.0, 3.1, 3.2, 3.3,
+                        ]),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(dataset_batch)],
+                schema.clone(),
+            )),
+            "memory://test_merge_insert_full_schema_delete_by_source_with_fsl_and_scalar_index",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::Scalar, None, &scalar_params, false)
+            .await
+            .unwrap();
 
         let source_batch = RecordBatch::try_new(
             schema.clone(),
@@ -7476,6 +7682,672 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 Err(other) => panic!("Expected External, got: {:?}", other),
                 Ok(_) => panic!("Expected error"),
             }
+        }
+    }
+
+    /// Creates a 3-fragment dataset (100 rows each) with columns (id: Utf8, category: Utf8,
+    /// value_a: Float64, value_b: Float64) and a BTree index on `id`.
+    ///
+    /// Fragment 0: id-0000..id-0099
+    /// Fragment 1: id-0100..id-0199
+    /// Fragment 2: id-0200..id-0299
+    async fn create_indexed_3frag_dataset() -> Arc<Dataset> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * 100;
+            let ids: Vec<String> = (start..start + 100).map(|j| format!("id-{j:04}")).collect();
+            let categories: Vec<&str> = vec!["A"; 100];
+            let value_a: Vec<f64> = (0..100)
+                .map(|i| i as f64 + frag_idx as f64 * 100.0)
+                .collect();
+            let value_b: Vec<f64> = (0..100).map(|i| i as f64 * 0.1).collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(categories)),
+                    Arc::new(Float64Array::from(value_a)),
+                    Arc::new(Float64Array::from(value_b)),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Write first fragment
+        let batch0 = make_batch(0);
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch0)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://indexed_3frag", None)
+            .await
+            .unwrap();
+
+        // Append fragments 1 and 2
+        for frag_idx in 1..3 {
+            let batch = make_batch(frag_idx);
+            let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+            ds.append(reader, None).await.unwrap();
+        }
+
+        // Create BTree index on id
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        Arc::new(ds)
+    }
+
+    /// Perform a partial-schema merge_insert (only id + value_a) targeting specific id ranges.
+    /// This causes touched fragments to drop from the index bitmap while btree data retains
+    /// stale entries.
+    async fn partial_merge_insert(
+        dataset: Arc<Dataset>,
+        id_range: std::ops::Range<usize>,
+        value_a_val: f64,
+    ) -> Arc<Dataset> {
+        let ids: Vec<String> = id_range.map(|j| format!("id-{j:04}")).collect();
+        let n = ids.len();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(Float64Array::from(vec![value_a_val; n])),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], sub_schema));
+
+        let (ds, _) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+        ds
+    }
+
+    // Regression test: partial-schema merge_insert followed by another partial merge_insert
+    // on the same rows should not produce "Ambiguous merge inserts" errors.
+    //
+    // The bug: the first partial merge_insert drops the touched fragment from the index bitmap
+    // but leaves stale btree entries. The second merge_insert finds the same rows via both
+    // the stale btree lookup AND the unindexed fragment scan, causing duplicates.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_index_ambiguous() {
+        let dataset = create_indexed_3frag_dataset().await;
+
+        // Step 2: Partial merge_insert on fragment 1 rows -> fragment 1 drops from bitmap
+        let dataset = partial_merge_insert(dataset, 100..200, 999.0).await;
+
+        // Step 3: Another partial merge_insert on the same rows.
+        // This should succeed, not fail with "Ambiguous merge inserts".
+        let dataset = partial_merge_insert(dataset, 100..200, 888.0).await;
+
+        // Verify correctness: all 300 rows present, updated values correct
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+        let combined = concat_batches(&all_schema, &batches).unwrap();
+        assert_eq!(combined.num_rows(), 300);
+
+        // Check the updated rows have value_a = 888.0
+        let result = dataset
+            .scan()
+            .filter("id >= 'id-0100' AND id < 'id-0200'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let result = concat_batches(&all_schema, &result).unwrap();
+        assert_eq!(result.num_rows(), 100);
+        let values = result
+            .column_by_name("value_a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..100 {
+            assert_eq!(values.value(i), 888.0, "row {i} should have value_a=888.0");
+        }
+    }
+
+    // Regression test: partial-schema merge_insert followed by update (deleting all rows
+    // in a fragment) followed by partial merge_insert should not produce
+    // "fragment id N does not exist" errors.
+    //
+    // The bug: stale btree entries reference the deleted fragment. The deletion mask doesn't
+    // block those addresses because the fragment isn't in the index bitmap. TakeExec tries
+    // to read from a non-existent fragment.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_index_fragment_not_exist() {
+        let dataset = create_indexed_3frag_dataset().await;
+
+        // Step 2: Partial merge_insert on fragment 1 rows -> fragment 1 drops from bitmap
+        let dataset = partial_merge_insert(dataset, 100..200, 999.0).await;
+
+        // Step 3: Update all rows that were in fragment 1, causing fragment 1 to be
+        // fully deleted and replaced by a new fragment.
+        let update_result = crate::dataset::UpdateBuilder::new(Arc::new((*dataset).clone()))
+            .update_where("id >= 'id-0100' AND id < 'id-0200'")
+            .unwrap()
+            .set("category", "'B'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update_result.new_dataset;
+
+        // Step 4: Partial merge_insert on the same rows.
+        // This should succeed, not fail with "fragment does not exist".
+        let dataset = partial_merge_insert(dataset, 100..200, 888.0).await;
+
+        // Verify correctness
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+        let combined = concat_batches(&all_schema, &batches).unwrap();
+        assert_eq!(combined.num_rows(), 300);
+    }
+
+    // Regression test: partial-schema merge_insert followed by update (deleting SOME rows
+    // in a fragment) followed by partial merge_insert should not produce
+    // "RecordBatch size mismatch" errors.
+    //
+    // The bug: stale btree entries reference deleted rows in a fragment that still exists.
+    // The deletion mask doesn't block those addresses (fragment not in bitmap). TakeExec
+    // reads the fragment but the rows have deletion markers, returning 0 rows where N
+    // were expected.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_index_batch_size_mismatch() {
+        let dataset = create_indexed_3frag_dataset().await;
+
+        // Step 2: Partial merge_insert on fragment 1 rows -> fragment 1 drops from bitmap
+        let dataset = partial_merge_insert(dataset, 100..200, 999.0).await;
+
+        // Step 3: Update HALF of the rows that were in fragment 1. Fragment 1 survives
+        // but the updated rows are deleted from it (moved to a new fragment).
+        let update_result = crate::dataset::UpdateBuilder::new(Arc::new((*dataset).clone()))
+            .update_where("id >= 'id-0100' AND id < 'id-0150'")
+            .unwrap()
+            .set("category", "'B'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update_result.new_dataset;
+
+        // Step 4: Partial merge_insert targeting the rows that were updated (and thus
+        // deleted from fragment 1). Should succeed, not fail with batch size mismatch.
+        let dataset = partial_merge_insert(dataset, 100..150, 888.0).await;
+
+        // Verify correctness
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let all_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+        let combined = concat_batches(&all_schema, &batches).unwrap();
+        assert_eq!(combined.num_rows(), 300);
+    }
+
+    // Regression test: after a partial-schema merge_insert drops a fragment from the vector
+    // index bitmap, a vector search should not return duplicate rows. The stale vector index
+    // data still references the dropped fragment, and the scanner also flat-scans unindexed
+    // fragments, causing the same rows to appear from both paths.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_vector_index_duplicates() {
+        let dim = 4i32;
+        let rows_per_frag = 10usize;
+        let num_frags = 3usize;
+        let total_rows = rows_per_frag * num_frags;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+
+        let make_batch = |frag_idx: usize, offset: f32| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:04}"))
+                .collect();
+            let cats: Vec<&str> = vec!["A"; rows_per_frag];
+            let values: Vec<f32> = (0..rows_per_frag * dim as usize)
+                .map(|i| (start * dim as usize + i) as f32 + offset)
+                .collect();
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(cats)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Write 3 fragments
+        let batch0 = make_batch(0, 0.0);
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch0)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://vector_stale_test", None)
+            .await
+            .unwrap();
+        for frag_idx in 1..num_frags {
+            let batch = make_batch(frag_idx, 0.0);
+            let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+            ds.append(reader, None).await.unwrap();
+        }
+
+        // Create IVF_FLAT vector index on vec
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Partial merge_insert with (id, vec) on fragment 1 rows - slightly different vectors.
+        // This drops fragment 1 from the vector index bitmap.
+        let frag1_start = rows_per_frag;
+        let ids: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("id-{j:04}"))
+            .collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let values: Vec<f32> = (0..rows_per_frag * dim as usize)
+            .map(|i| (frag1_start * dim as usize + i) as f32 + 0.5)
+            .collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![Arc::new(StringArray::from(ids)), Arc::new(vectors)],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        // KNN search with k = total_rows to retrieve all rows
+        let query: Float32Array = (0..dim)
+            .map(|i| (frag1_start * dim as usize + i as usize) as f32 + 0.5)
+            .collect();
+        let results = ds
+            .scan()
+            .nearest("vec", &query, total_rows)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Check no duplicate ids
+        let ids = results
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unique_ids: std::collections::HashSet<&str> =
+            (0..ids.len()).map(|i| ids.value(i)).collect();
+        assert_eq!(
+            unique_ids.len(),
+            ids.len(),
+            "Found duplicate ids in KNN results: {} unique out of {} total",
+            unique_ids.len(),
+            ids.len()
+        );
+    }
+
+    // Regression test: after a partial-schema merge_insert drops a fragment from the FTS
+    // index bitmap, a full text search should not return duplicate rows. The stale inverted
+    // index data still references the dropped fragment, and the scanner also flat-scans
+    // unindexed fragments, causing the same rows to appear from both paths.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_fts_index_duplicates() {
+        let rows_per_frag = 10usize;
+        let num_frags = 3usize;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:04}"))
+                .collect();
+            let cats: Vec<&str> = vec!["A"; rows_per_frag];
+            // Every row contains "common" so we can search for it and expect all rows
+            let texts: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("common unique{j:04}"))
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(cats)),
+                    Arc::new(StringArray::from(texts)),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Write 3 fragments
+        let batch0 = make_batch(0);
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch0)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://fts_stale_test", None)
+            .await
+            .unwrap();
+        for frag_idx in 1..num_frags {
+            let batch = make_batch(frag_idx);
+            let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+            ds.append(reader, None).await.unwrap();
+        }
+
+        // Create inverted index on text
+        let params = InvertedIndexParams::default();
+        ds.create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Partial merge_insert with (id, text) on fragment 1 rows.
+        // Text still contains "common" so FTS will find them via both paths.
+        // This drops fragment 1 from the inverted index bitmap.
+        let frag1_start = rows_per_frag;
+        let ids: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("id-{j:04}"))
+            .collect();
+        let texts: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("common updated{j:04}"))
+            .collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(texts)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        // FTS search for "common" — every row should match exactly once
+        let query = FullTextSearchQuery::new("common".to_string());
+        let results = ds
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Check no duplicate ids
+        let ids = results
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unique_ids: std::collections::HashSet<&str> =
+            (0..ids.len()).map(|i| ids.value(i)).collect();
+        assert_eq!(
+            unique_ids.len(),
+            ids.len(),
+            "Found duplicate ids in FTS results: {} unique out of {} total",
+            unique_ids.len(),
+            ids.len()
+        );
+        // Also verify we got all rows
+        assert_eq!(
+            unique_ids.len(),
+            rows_per_frag * num_frags,
+            "Expected {} rows but got {}",
+            rows_per_frag * num_frags,
+            unique_ids.len()
+        );
+    }
+
+    // Regression test: after a partial-schema merge_insert invalidates a fragment,
+    // compaction should succeed and subsequent searches should return correct results.
+    //
+    // The compaction planner separates indexed and unindexed fragments into different
+    // groups. After invalidating the middle fragment, the indexed fragments on either
+    // side form separate compactable groups. After compaction the old invalidated
+    // fragment ID may remain in invalidated_fragment_bitmap but this is harmless
+    // because the fragment no longer exists and no index results reference it.
+    #[tokio::test]
+    async fn test_compaction_after_invalidated_fragment() {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+        // Use 5 small fragments so that after invalidating the middle one (fragment 2),
+        // the planner has enough neighbors to form compactable groups on each side:
+        // {0,1} (indexed) and {3,4} (indexed), with {2} (unindexed) separate.
+        let rows_per_frag = 20;
+        let num_frags = 5;
+        let total_rows = rows_per_frag * num_frags;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value_a", DataType::Float64, false),
+            Field::new("value_b", DataType::Float64, false),
+        ]));
+
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:04}"))
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(vec!["A"; rows_per_frag])),
+                    Arc::new(Float64Array::from(
+                        (0..rows_per_frag).map(|i| i as f64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from(
+                        (0..rows_per_frag)
+                            .map(|i| i as f64 * 0.1)
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+
+        let batch0 = make_batch(0);
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch0)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://compaction_test", None)
+            .await
+            .unwrap();
+        for frag_idx in 1..num_frags {
+            let batch = make_batch(frag_idx);
+            let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+            ds.append(reader, None).await.unwrap();
+        }
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Invalidate fragment 2 (the middle one)
+        let frag2_start = 2 * rows_per_frag;
+        let ds = partial_merge_insert(ds, frag2_start..frag2_start + rows_per_frag, 999.0).await;
+
+        // Verify pre-compaction state
+        let indices = ds.load_indices().await.unwrap();
+        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        assert!(!idx.fragment_bitmap.as_ref().unwrap().contains(2));
+
+        // Run compaction with a target that forces merging of the small fragments.
+        let mut ds = (*ds).clone();
+        let opts = CompactionOptions {
+            target_rows_per_fragment: total_rows,
+            ..Default::default()
+        };
+        compact_files(&mut ds, opts, None).await.unwrap();
+
+        // The indexed fragments (0,1 and 3,4) should be compacted.
+        // Fragment 2 (unindexed) may or may not be compacted on its own.
+        // Either way, the old fragment IDs in the bitmap should be replaced.
+        let indices = ds.load_indices().await.unwrap();
+        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let bitmap = idx.fragment_bitmap.as_ref().unwrap();
+        for &old_id in &[0u32, 1, 3, 4] {
+            assert!(
+                !bitmap.contains(old_id),
+                "Old indexed fragment {} should not be in bitmap after compaction",
+                old_id
+            );
+        }
+        assert!(
+            !bitmap.is_empty(),
+            "Bitmap should have new compacted fragments"
+        );
+
+        // The invalidated bitmap may still reference old fragment 2.
+        // This is harmless — fragment 2 no longer exists (or was compacted into
+        // a new fragment), so blocking it is a no-op.
+
+        // Verify search works correctly despite stale invalidated entries.
+        let ds = Arc::new(ds);
+        let ds = partial_merge_insert(ds, frag2_start..frag2_start + rows_per_frag, 888.0).await;
+
+        // All rows present
+        let batches = ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let combined = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(combined.num_rows(), total_rows);
+
+        // Updated rows have correct value
+        let result = ds
+            .scan()
+            .filter(&format!(
+                "id >= 'id-{:04}' AND id < 'id-{:04}'",
+                frag2_start,
+                frag2_start + rows_per_frag
+            ))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let result = concat_batches(&schema, &result).unwrap();
+        assert_eq!(result.num_rows(), rows_per_frag);
+        let values = result
+            .column_by_name("value_a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..rows_per_frag {
+            assert_eq!(values.value(i), 888.0, "row {i} should have value_a=888.0");
         }
     }
 }

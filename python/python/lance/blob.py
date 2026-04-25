@@ -282,6 +282,10 @@ class BlobFile(io.RawIOBase):
     def readall(self) -> bytes:
         return self.inner.readall()
 
+    def read_range(self, offset: int, length: int) -> bytes:
+        """Read a blob-local byte range without changing the current cursor."""
+        return self.inner.read_range(offset, length)
+
     def readinto(self, b: bytearray) -> int:
         return self.inner.read_into(b)
 

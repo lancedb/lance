@@ -46,6 +46,12 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 
 See [python/AGENTS.md](python/AGENTS.md) and [java/AGENTS.md](java/AGENTS.md).
 
+## Language-Specific Environment Contract
+
+- For language-specific tasks, always follow the environment and command rules in the corresponding subdirectory guide before running build, test, lint, format, or tooling commands.
+- Do not substitute a different environment manager or toolchain just because a command appears missing, unavailable, or slow.
+- If a language-specific command fails outside the documented workflow, treat that as an environment usage mistake first. Fix the environment usage, rerun with the prescribed commands, and only then conclude that a dependency or tool is unavailable.
+
 ### Integration Testing
 
 ```bash

@@ -126,7 +126,7 @@ We can convert these into repetition levels as follows:
 | 3      | 2          | Start of new middle list                  |
 | ?      | 2          | Start of new inner-most list (empty list) |
 | ?      | 3          | Start of new outer-most list (empty list) |
-| 4      | 0          | Start of new outer-most list              |
+| 4      | 3          | Start of new outer-most list              |
 
 ### Mini Block Page Layout
 

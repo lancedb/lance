@@ -41,10 +41,12 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, utils::mask::RowAddrTreeMap};
 use lance_core::{ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
+use lance_tokenizer::{
+    AlphaNumOnlyFilter, AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer,
+};
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
-use tantivy::tokenizer::TextAnalyzer;
 use tracing::instrument;
 
 const TOKENS_COL: &str = "tokens";
@@ -65,15 +67,15 @@ pub static POSTINGS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 pub static TEXT_PREPPER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
-    TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
-        .filter(tantivy::tokenizer::LowerCaser)
-        .filter(tantivy::tokenizer::AsciiFoldingFilter)
+    TextAnalyzer::builder(RawTokenizer::default())
+        .filter(LowerCaser)
+        .filter(AsciiFoldingFilter)
         .build()
 });
 /// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
 pub static NGRAM_TOKENIZER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
-    TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(3, 3).unwrap())
-        .filter(tantivy::tokenizer::AlphaNumOnlyFilter)
+    TextAnalyzer::builder(NgramTokenizer::all_ngrams(3, 3).unwrap())
+        .filter(AlphaNumOnlyFilter)
         .build()
 });
 
@@ -1335,7 +1337,7 @@ mod tests {
     };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
-    use tantivy::tokenizer::TextAnalyzer;
+    use lance_tokenizer::TextAnalyzer;
 
     use crate::scalar::{
         ScalarIndex, SearchResult, TextQuery,

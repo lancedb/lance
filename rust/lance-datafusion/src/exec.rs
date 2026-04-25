@@ -313,21 +313,22 @@ impl std::fmt::Debug for LanceExecutionOptions {
     }
 }
 
-const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
+        let num_partitions = self.target_partition.unwrap_or(1) as u64;
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
                 .map(|s| match s.parse::<u64>() {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
-                        DEFAULT_LANCE_MEM_POOL_SIZE
+                        DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
                     }
                 })
-                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE)
+                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
         })
     }
 
@@ -945,6 +946,133 @@ impl ExecutionPlan for StrictBatchSizeExec {
     }
 }
 
+/// Exec node that rechunks batches so no output batch exceeds `max_bytes`.
+///
+/// # Why this exists
+///
+/// DataFusion's sort operator cannot handle batches larger than the memory
+/// pool size.  When upstream operators produce very large batches this can
+/// cause the sort to fail.  This node caps batch sizes
+/// *before* the sort so the operation succeeds.  The trade-off is a
+/// potentially expensive deep copy of the batch data — see below — but that
+/// is preferable to failing the operation entirely.  This workaround may
+/// become unnecessary if a fix is upstreamed to DataFusion.
+///
+/// # Deep copy
+///
+/// After slicing a RecordBatch, `get_array_memory_size` still reports the
+/// size of the *original* backing buffers, not the slice.  To get accurate
+/// sizes the slices must be deep-copied.  This is a last resort and can be
+/// expensive for large batches, but the deep copy is only performed when a
+/// batch actually needs to be sliced — batches that are already within the
+/// target range pass through at zero cost.
+///
+/// If a single row exceeds `max_bytes`, execution fails with an error.
+#[derive(Clone, Debug)]
+pub struct HardCapBatchSizeExec {
+    input: Arc<dyn ExecutionPlan>,
+    max_bytes: usize,
+}
+
+impl HardCapBatchSizeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, max_bytes: usize) -> Self {
+        Self { input, max_bytes }
+    }
+}
+
+impl DisplayAs for HardCapBatchSizeExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "HardCapBatchSizeExec(max_bytes={})", self.max_bytes)
+    }
+}
+
+impl ExecutionPlan for HardCapBatchSizeExec {
+    fn name(&self) -> &str {
+        "HardCapBatchSizeExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            max_bytes: self.max_bytes,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let max_bytes = self.max_bytes;
+        let rechunked = lance_arrow::stream::rechunk_stream_by_size_deep_copy(
+            stream,
+            schema.clone(),
+            0,
+            max_bytes,
+        );
+        // Check that no single-row batch exceeds the limit.
+        let validated = rechunked.map(move |result| {
+            let batch = result?;
+            if batch.num_rows() == 1 && batch.get_array_memory_size() > max_bytes {
+                return Err(DataFusionError::External(Box::new(Error::invalid_input(
+                    format!(
+                        "a single row is {} bytes which exceeds the maximum allowed batch \
+                         size of {} bytes",
+                        batch.get_array_memory_size(),
+                        max_bytes,
+                    ),
+                ))));
+            }
+            Ok(batch)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,5 +1178,36 @@ mod tests {
                 "new config should be cached"
             );
         }
+    }
+
+    #[test]
+    fn test_mem_pool_size_scales_with_partitions() {
+        let default_per_partition = DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION;
+
+        // No partitions specified → defaults to 1 partition
+        let opts = LanceExecutionOptions::default();
+        assert_eq!(opts.mem_pool_size(), default_per_partition);
+
+        // 4 partitions → 4x the per-partition size
+        let opts = LanceExecutionOptions {
+            target_partition: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(opts.mem_pool_size(), default_per_partition * 4);
+
+        // 8 partitions → 8x the per-partition size
+        let opts = LanceExecutionOptions {
+            target_partition: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(opts.mem_pool_size(), default_per_partition * 8);
+
+        // Explicit mem_pool_size is not scaled
+        let opts = LanceExecutionOptions {
+            mem_pool_size: Some(50 * 1024 * 1024),
+            target_partition: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
     }
 }

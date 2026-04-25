@@ -594,6 +594,7 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
+    use crate::dataset::Dataset;
     use arrow::{
         array::AsArray,
         datatypes::{Int32Type, UInt64Type},
@@ -604,7 +605,10 @@ mod tests {
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
     use lance_index::{IndexType, optimize::OptimizeOptions};
-    use lance_index::{pbold::NGramIndexDetails, scalar::BuiltinIndexType};
+    use lance_index::{
+        pbold::NGramIndexDetails,
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+    };
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(

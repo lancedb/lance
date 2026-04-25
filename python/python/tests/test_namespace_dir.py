@@ -815,6 +815,7 @@ class TestLanceNamespaceConnect:
             "root": f"memory://test_connect_{unique_id}",
             "manifest_enabled": "true",
             "dir_listing_enabled": "true",
+            "dir_listing_to_manifest_migration_enabled": "true",
         }
 
         # Connect via lance.namespace.connect

@@ -19,6 +19,7 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512\"))");
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
+    println!("cargo:rerun-if-changed=src/simd/bf16.c");
     println!("cargo:rerun-if-changed=src/simd/dist_table.c");
 
     // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
@@ -37,13 +38,16 @@ fn main() -> Result<(), String> {
     if target_arch == "aarch64" && target_os == "macos" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
+        build_bf16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
     } else if target_arch == "aarch64" && target_os == "ios" {
         // Build version with NEON
         // A13 bionic is the earliest supported iOS SOC
         build_f16_with_flags("neon", &["-mtune=apple-a13"]).unwrap();
+        build_bf16_with_flags("neon", &["-mtune=apple-a13"]).unwrap();
     } else if target_arch == "aarch64" && (target_os == "linux" || target_os == "android") {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
+        build_bf16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
     } else if target_arch == "x86_64" {
         // Build a version with AVX512
         if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
@@ -57,6 +61,17 @@ fn main() -> Result<(), String> {
         } else {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
+            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
+        };
+        // Build AVX-512 bf16 kernels (sapphirerapids has native vdpbf16ps)
+        if let Err(err) =
+            build_bf16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
+        {
+            println!(
+                "cargo:warning=Skipping build of AVX-512 bf16 kernels. Error: {}",
+                err
+            );
+        } else {
             println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
         };
         if let Err(err) = build_dist_table_with_flags("avx512", &["-march=native"]) {
@@ -77,11 +92,20 @@ fn main() -> Result<(), String> {
                 err
             ));
         };
+        // Build AVX2 bf16 kernels (bf16-to-f32 is just a shift, auto-vectorizes well)
+        if let Err(err) = build_bf16_with_flags("avx2", &["-march=haswell"]) {
+            return Err(format!(
+                "Unable to build AVX2 bf16 kernels.  Received error: {}",
+                err
+            ));
+        };
         // There is no SSE instruction set for f16 -> f32 float conversion
     } else if target_arch == "loongarch64" {
         // Build a version with LSX and LASX
         build_f16_with_flags("lsx", &["-mlsx"]).unwrap();
         build_f16_with_flags("lasx", &["-mlasx"]).unwrap();
+        build_bf16_with_flags("lsx", &["-mlsx"]).unwrap();
+        build_bf16_with_flags("lasx", &["-mlasx"]).unwrap();
     } else {
         // Only error if fp16kernels was explicitly requested on unsupported platform.
         // This allows builds on iOS, Android, etc. when the feature is disabled.
@@ -126,6 +150,32 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     }
 
     builder.try_compile(&format!("f16_{}", suffix))
+}
+
+fn build_bf16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
+    if cfg!(not(feature = "fp16kernels")) {
+        println!(
+            "cargo:warning=fp16kernels feature is not enabled, skipping build of bf16 kernels"
+        );
+        return Ok(());
+    }
+
+    let mut builder = cc::Build::new();
+    builder
+        .std("c17")
+        .file("src/simd/bf16.c")
+        .flag("-ffast-math")
+        .flag("-funroll-loops")
+        .flag("-O3")
+        .flag("-Wall")
+        .flag("-Wextra")
+        .flag(format!("-DSUFFIX=_{}", suffix).as_str());
+
+    for flag in flags {
+        builder.flag(flag);
+    }
+
+    builder.try_compile(&format!("bf16_{}", suffix))
 }
 
 fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {

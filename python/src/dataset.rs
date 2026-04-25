@@ -12,6 +12,7 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
 use arrow_array::{RecordBatch, RecordBatchReader, make_array};
+use arrow_cast::cast_with_options;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -117,6 +118,30 @@ pub mod stats;
 const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
+
+fn read_blobs_to_python(
+    py: Python<'_>,
+    blobs: Vec<lance::dataset::ReadBlob>,
+) -> Vec<(u64, Py<PyBytes>)> {
+    blobs
+        .into_iter()
+        .map(|blob| (blob.row_address, PyBytes::new(py, &blob.data).unbind()))
+        .collect()
+}
+
+fn configure_read_blobs_builder(
+    mut builder: lance::dataset::ReadBlobsBuilder,
+    io_buffer_size: Option<u64>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobsBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -488,7 +513,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false, base_store_params=None))]
     fn new(
         py: Python,
         uri: String,
@@ -506,6 +531,7 @@ impl Dataset {
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
+        base_store_params: Option<HashMap<String, HashMap<String, String>>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -628,6 +654,17 @@ impl Dataset {
             }
         }
 
+        if let Some(base_store_params) = base_store_params {
+            for (base_path, opts) in base_store_params {
+                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                };
+                builder = builder.with_base_store_params(base_path, store_params);
+            }
+        }
+
         let dataset = rt().block_on(Some(py), builder.load())?;
 
         match dataset {
@@ -698,6 +735,11 @@ impl Dataset {
     #[getter(data_storage_version)]
     fn data_storage_version(&self) -> PyResult<String> {
         Ok(self.ds.manifest().data_storage_format.version.clone())
+    }
+
+    #[getter(has_stable_row_ids)]
+    fn has_stable_row_ids(&self) -> bool {
+        self.ds.manifest().uses_stable_row_ids()
     }
 
     /// Get index statistics
@@ -800,7 +842,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -812,6 +854,7 @@ impl Dataset {
         offset: Option<i64>,
         nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
+        batch_size_bytes: Option<u64>,
         io_buffer_size: Option<u64>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
@@ -955,6 +998,9 @@ impl Dataset {
 
         if let Some(batch_size) = batch_size {
             scanner.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
         }
         if let Some(io_buffer_size) = io_buffer_size {
             scanner.io_buffer_size(io_buffer_size);
@@ -1242,6 +1288,90 @@ impl Dataset {
             )?
             .infer_error()?;
         Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+    }
+
+    #[pyo3(signature=(
+        row_ids,
+        blob_column,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blobs(
+        self_: PyRef<'_, Self>,
+        row_ids: Vec<u64>,
+        blob_column: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+        let builder = configure_read_blobs_builder(
+            self_
+                .ds
+                .read_blobs(blob_column)
+                .infer_error()?
+                .with_row_ids(row_ids),
+            io_buffer_size,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blobs_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        row_addresses,
+        blob_column,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blobs_by_addresses(
+        self_: PyRef<'_, Self>,
+        row_addresses: Vec<u64>,
+        blob_column: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+        let builder = configure_read_blobs_builder(
+            self_
+                .ds
+                .read_blobs(blob_column)
+                .infer_error()?
+                .with_row_addresses(row_addresses),
+            io_buffer_size,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blobs_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        row_indices,
+        blob_column,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blobs_by_indices(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<u64>,
+        blob_column: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+        let builder = configure_read_blobs_builder(
+            self_
+                .ds
+                .read_blobs(blob_column)
+                .infer_error()?
+                .with_row_indices(row_indices),
+            io_buffer_size,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blobs_to_python(self_.py(), blobs))
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
@@ -3504,6 +3634,20 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p = p.with_target_base_names_or_paths(target_bases_list);
         }
 
+        // Handle base_store_params: per-base storage options keyed by base path URI
+        if let Some(base_store_params) =
+            get_dict_opt::<HashMap<String, HashMap<String, String>>>(options, "base_store_params")?
+        {
+            for (base_path, opts) in base_store_params {
+                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..Default::default()
+                };
+                p = p.with_base_store_params(base_path, store_params);
+            }
+        }
+
         if let Some(allow_external) =
             get_dict_opt::<bool>(options, "allow_external_blob_outside_bases")?
         {
@@ -3513,6 +3657,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p = p.with_external_blob_mode(
                 ExternalBlobMode::try_from(external_blob_mode.as_str()).infer_error()?,
             );
+        }
+        if let Some(max_bytes) = get_dict_opt::<usize>(options, "blob_pack_file_size_threshold")? {
+            p = p.with_blob_pack_file_size_threshold(max_bytes);
         }
 
         // Handle properties
@@ -3608,14 +3755,13 @@ fn prepare_vector_index_params(
             // as the vectors that will be indexed.
             let mut centroids: Arc<dyn Array> = batch.column(0).clone();
             if centroids.data_type() != column_type {
-                centroids = lance_arrow::cast::cast_with_options(
-                    centroids.as_ref(),
-                    column_type,
-                    &Default::default(),
-                )
-                .map_err(|e| {
-                    PyValueError::new_err(format!("Failed to cast centroids to column type: {}", e))
-                })?;
+                centroids = cast_with_options(centroids.as_ref(), column_type, &Default::default())
+                    .map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Failed to cast centroids to column type: {}",
+                            e
+                        ))
+                    })?;
             }
             let centroids = as_fixed_size_list_array(centroids.as_ref());
 

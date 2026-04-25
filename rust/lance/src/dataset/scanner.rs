@@ -81,6 +81,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -719,6 +720,10 @@ pub struct Scanner {
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
+    /// If set, the scanner will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    batch_size_bytes: Option<u64>,
+
     /// Number of batches to prefetch
     batch_readahead: usize,
 
@@ -989,6 +994,7 @@ impl Scanner {
             filter: LanceFilter::default(),
             full_text_query: None,
             batch_size: None,
+            batch_size_bytes: None,
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
@@ -1261,9 +1267,26 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Set the batch size.
+    /// Set the maximum number of rows per batch.
+    ///
+    /// Note: this can be overridden by [`Self::batch_size_bytes`] or by a dataset-level
+    /// `batch_size_bytes` set via [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  When a byte-based
+    /// batch size is active, the row-based batch size is used only as an initial estimate.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the target batch size in bytes.
+    ///
+    /// When set, the scanner will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    ///
+    /// This can also be configured at the dataset level via
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  A scanner-level setting takes
+    /// precedence over the dataset-level default.
+    pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
         self
     }
 
@@ -1697,6 +1720,30 @@ impl Scanner {
     pub fn with_file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
         self
+    }
+
+    /// Compute the resolved file reader options, merging the scanner's explicit
+    /// `file_reader_options`, the dataset-level defaults, and the `batch_size_bytes`
+    /// setting.
+    fn resolved_file_reader_options(&self) -> Option<FileReaderOptions> {
+        let base = self
+            .file_reader_options
+            .clone()
+            .or_else(|| self.dataset.file_reader_options.clone());
+        match (base, self.batch_size_bytes) {
+            (Some(mut opts), Some(bsb)) => {
+                if opts.batch_size_bytes.is_none() {
+                    opts.batch_size_bytes = Some(bsb);
+                }
+                Some(opts)
+            }
+            (Some(opts), None) => Some(opts),
+            (None, Some(bsb)) => Some(FileReaderOptions {
+                batch_size_bytes: Some(bsb),
+                ..Default::default()
+            }),
+            (None, None) => None,
+        }
     }
 
     /// Create a physical expression for a column that may be nested
@@ -2667,6 +2714,10 @@ impl Scanner {
 
         if let Some(batch_size) = self.batch_size {
             read_options = read_options.with_batch_size(batch_size as u32);
+        }
+
+        if let Some(file_reader_options) = self.resolved_file_reader_options() {
+            read_options = read_options.with_file_reader_options(file_reader_options);
         }
 
         if let Some(fragment_readahead) = self.fragment_readahead {
@@ -3771,16 +3822,18 @@ impl Scanner {
             ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
                 & self.fragments_covered_by_index_query(rhs).await?),
             ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(search) => {
-                let idx = self
-                    .dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search.index_name))
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
-            }
+            ScalarIndexExpr::Query(search) => scalar_index_fragment_bitmap(
+                self.dataset.as_ref(),
+                &search.column,
+                &search.index_name,
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::Error::internal(format!(
+                    "Index not found even though it must have been found earlier: {}",
+                    search.index_name
+                ))
+            }),
         }
     }
 
@@ -4014,6 +4067,7 @@ impl Scanner {
             with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
+            file_reader_options: self.resolved_file_reader_options(),
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
@@ -4040,10 +4094,7 @@ impl Scanner {
             with_row_address: self.projection_plan.physical_projection.with_row_addr,
             make_deletions_null,
             ordered_output: self.ordered,
-            file_reader_options: self
-                .file_reader_options
-                .clone()
-                .or_else(|| self.dataset.file_reader_options.clone()),
+            file_reader_options: self.resolved_file_reader_options(),
         };
 
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
@@ -8142,6 +8193,121 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "LIKE '%app%' should not use LikePrefix index, but got: {}",
             plan_str
         );
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_with_segmented_zone_map() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(150), BatchCount::from(6));
+
+        let write_params = WriteParams {
+            max_rows_per_file: 25,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(
+            data,
+            "memory://test_like_segmented_zonemap",
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() > 1, "expected multiple fragments");
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut segments = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            let mut builder = dataset.create_index_builder(&["name"], IndexType::Scalar, &params);
+            builder = builder
+                .name("name_zonemap".to_string())
+                .fragments(vec![fragment.id() as u32]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+
+        dataset
+            .commit_existing_index_segments("name_zonemap", "name", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("name_zonemap").await.unwrap();
+        assert_eq!(committed.len(), fragments.len());
+
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "segmented zonemap should use LikePrefix pruning, but got: {}",
+            plan_str
+        );
+
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let with_index_ids = with_index
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let without_index_ids = without_index
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(with_index_ids, without_index_ids);
+        assert!(!with_index_ids.is_empty());
+
+        let names = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|value| value.unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().all(|name| name.starts_with("app")));
     }
 
     #[tokio::test]

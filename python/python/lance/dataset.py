@@ -227,6 +227,23 @@ def _is_null_blob_description(description: Any) -> bool:
     return False
 
 
+def _resolve_blob_selection(
+    ids: Optional[Union[List[int], pa.Array]],
+    addresses: Optional[Union[List[int], pa.Array]],
+    indices: Optional[Union[List[int], pa.Array]],
+) -> Tuple[str, Union[List[int], pa.Array]]:
+    if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
+        raise ValueError("Exactly one of ids, indices, or addresses must be specified")
+
+    if ids is not None:
+        return "ids", ids
+    if addresses is not None:
+        return "addresses", addresses
+    if indices is not None:
+        return "indices", indices
+    raise ValueError("Either ids, addresses, or indices must be specified")
+
+
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
         """Executes the merge insert operation
@@ -566,10 +583,12 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client: Optional[Any] = None,
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
+        self._base_store_params = base_store_params
 
         # Handle deprecation warning for index_cache_size
         if index_cache_size is not None:
@@ -604,6 +623,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client=namespace_client,
             table_id=table_id,
             namespace_client_managed_versioning=namespace_client_managed_versioning,
+            base_store_params=base_store_params,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -617,6 +637,7 @@ class LanceDataset(pa.dataset.Dataset):
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
         read_params: Optional[Dict[str, Any]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         return cls(
             uri,
@@ -625,6 +646,7 @@ class LanceDataset(pa.dataset.Dataset):
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
             read_params=read_params,
+            base_store_params=base_store_params,
         )
 
     def __reduce__(self):
@@ -635,6 +657,7 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.serialized_manifest(),
             self._default_scan_options,
             self._read_params,
+            self._base_store_params,
         )
 
     def __getstate__(self):
@@ -645,19 +668,22 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.serialized_manifest(),
             self._default_scan_options,
             self._read_params,
+            self._base_store_params,
         )
 
     def __setstate__(self, state):
-        # Handle backwards compatibility - state may not have read_params
+        # Handle backwards compatibility - state may not have read_params or
+        # base_store_params.
         (
             self._uri,
             self._storage_options,
             version,
             manifest,
             default_scan_options,
-            *rest,  # Capture optional read_params
+            *rest,  # Capture optional read_params and base_store_params.
         ) = state
         read_params = rest[0] if rest else None
+        base_store_params = rest[1] if len(rest) > 1 else None
         self._ds = _Dataset(
             self._uri,
             version,
@@ -665,9 +691,11 @@ class LanceDataset(pa.dataset.Dataset):
             manifest=manifest,
             default_scan_options=default_scan_options,
             read_params=read_params,
+            base_store_params=base_store_params,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
+        self._base_store_params = base_store_params
         self._namespace_client = None
         self._table_id = None
         self._namespace_client_managed_versioning = False
@@ -676,6 +704,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._uri = self._uri
         ds._storage_options = self._storage_options
+        ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
         ds._namespace_client_managed_versioning = (
@@ -775,6 +804,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = self._storage_options
+        ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
         ds._default_scan_options = self._default_scan_options
@@ -834,6 +864,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_size: Optional[int] = None,
+        batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
@@ -929,9 +960,16 @@ class LanceDataset(pa.dataset.Dataset):
                 }
 
         batch_size: int, default None
-            The target size of batches returned.  In some cases batches can be up to
-            twice this size (but never larger than this).  In some cases batches can
-            be smaller than this size.
+            The maximum number of rows per batch.  In some cases batches can be
+            smaller than this size.  Note: this can be overridden by
+            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
+            configured via ``FileReaderOptions``.
+        batch_size_bytes: int, default None
+            If set, the scanner will produce batches whose total size in bytes
+            is approximately this value, overriding the row-based ``batch_size``.
+            This can also be configured at the dataset level via
+            ``FileReaderOptions``.  A scanner-level setting takes precedence
+            over the dataset-level default.
         io_buffer_size: int, default None
             The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
             for more information.
@@ -1067,6 +1105,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.limit, limit)
         setopt(builder.offset, offset)
         setopt(builder.batch_size, batch_size)
+        setopt(builder.batch_size_bytes, batch_size_bytes)
         setopt(builder.io_buffer_size, io_buffer_size)
         setopt(builder.batch_readahead, batch_readahead)
         setopt(builder.fragment_readahead, fragment_readahead)
@@ -1136,6 +1175,13 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.data_storage_version
 
     @property
+    def has_stable_row_ids(self) -> bool:
+        """
+        Whether this dataset has stable row IDs enabled
+        """
+        return self._ds.has_stable_row_ids
+
+    @property
     def max_field_id(self) -> int:
         """
         The max_field_id in manifest
@@ -1150,6 +1196,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_size: Optional[int] = None,
+        batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
@@ -1277,6 +1324,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
@@ -1720,6 +1768,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_size: Optional[int] = None,
+        batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
@@ -1756,6 +1805,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
@@ -1897,20 +1947,76 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         blob_files : List[BlobFile]
         """
-        if sum([bool(v is not None) for v in [ids, addresses, indices]]) != 1:
-            raise ValueError(
-                "Exactly one of ids, indices, or addresses must be specified"
-            )
+        selection_kind, selection_values = _resolve_blob_selection(
+            ids, addresses, indices
+        )
 
-        if ids is not None:
-            lance_blob_files = self._ds.take_blobs(ids, blob_column)
-        elif addresses is not None:
-            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
-        elif indices is not None:
-            lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
+        if selection_kind == "ids":
+            lance_blob_files = self._ds.take_blobs(selection_values, blob_column)
+        elif selection_kind == "addresses":
+            lance_blob_files = self._ds.take_blobs_by_addresses(
+                selection_values, blob_column
+            )
         else:
-            raise ValueError("Either ids, addresses, or indices must be specified")
+            lance_blob_files = self._ds.take_blobs_by_indices(
+                selection_values, blob_column
+            )
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+
+    def read_blobs(
+        self,
+        blob_column: str,
+        ids: Optional[Union[List[int], pa.Array]] = None,
+        addresses: Optional[Union[List[int], pa.Array]] = None,
+        indices: Optional[Union[List[int], pa.Array]] = None,
+        *,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, bytes]]:
+        """
+        Read blobs directly into memory using Lance's planned blob reader.
+
+        Unlike :py:meth:`take_blobs`, which returns file-like :py:class:`lance.BlobFile`
+        handles for random access, this API plans and executes batched reads and
+        returns materialized blob payloads.
+
+        Exactly one of ids, addresses, or indices must be specified.
+
+        Parameters
+        ----------
+        blob_column : str
+            The name of the blob column to read.
+        ids : Integer Array or array-like
+            Row IDs to read in the dataset.
+        addresses : Integer Array or array-like
+            The (unstable) row addresses to read in the dataset.
+        indices : Integer Array or array-like
+            The offset / indices of the row in the dataset.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing blobs.
+        preserve_order : bool, optional
+            If True, returned rows follow the requested selection order.
+
+        Returns
+        -------
+        blobs : List[Tuple[int, bytes]]
+            A list of ``(row_address, blob_bytes)`` pairs.
+        """
+        selection_kind, selection_values = _resolve_blob_selection(
+            ids, addresses, indices
+        )
+
+        kwargs = {
+            "io_buffer_size": io_buffer_size,
+            "preserve_order": preserve_order,
+        }
+        if selection_kind == "ids":
+            return self._ds.read_blobs(selection_values, blob_column, **kwargs)
+        if selection_kind == "addresses":
+            return self._ds.read_blobs_by_addresses(
+                selection_values, blob_column, **kwargs
+            )
+        return self._ds.read_blobs_by_indices(selection_values, blob_column, **kwargs)
 
     def head(self, num_rows, **kwargs):
         """
@@ -3810,6 +3916,15 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.session()
 
     @staticmethod
+    def _inherit_base_store_params(
+        dataset_or_uri: Union[str, Path, LanceDataset, None],
+        base_store_params: Optional[Dict[str, Dict[str, str]]],
+    ) -> Optional[Dict[str, Dict[str, str]]]:
+        if base_store_params is None and isinstance(dataset_or_uri, LanceDataset):
+            return dataset_or_uri._base_store_params
+        return base_store_params
+
+    @staticmethod
     def _commit(
         base_uri: Union[str, Path],
         operation: LanceOperation.BaseOperation,
@@ -3838,6 +3953,7 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3908,6 +4024,8 @@ class LanceDataset(pa.dataset.Dataset):
         table_id : List[str], optional
             The table identifier within the namespace (e.g., ["workspace", "table"]).
             Must be provided together with namespace_client.
+        base_store_params : dict of str to dict, optional
+            Runtime-only object store parameters keyed by base path URI.
 
         Returns
         -------
@@ -3935,6 +4053,10 @@ class LanceDataset(pa.dataset.Dataset):
         2  3  c
         3  4  d
         """
+        base_store_params = LanceDataset._inherit_base_store_params(
+            base_uri, base_store_params
+        )
+
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -4008,6 +4130,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
+        ds._base_store_params = base_store_params
         ds._namespace_client = namespace_client
         ds._table_id = table_id
         ds._namespace_client_managed_versioning = namespace_client_managed_versioning
@@ -4026,6 +4149,7 @@ class LanceDataset(pa.dataset.Dataset):
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> BulkCommitResult:
         """Create a new version of dataset with multiple transactions.
 
@@ -4068,6 +4192,8 @@ class LanceDataset(pa.dataset.Dataset):
             the future.
         max_retries : int
             The maximum number of retries to perform when committing the dataset.
+        base_store_params : dict of str to dict, optional
+            Runtime-only object store parameters keyed by base path URI.
 
         Returns
         -------
@@ -4077,6 +4203,10 @@ class LanceDataset(pa.dataset.Dataset):
             merged: Transaction
                 The merged transaction that was applied to the dataset.
         """
+        base_store_params = LanceDataset._inherit_base_store_params(
+            dest, base_store_params
+        )
+
         if isinstance(dest, Path):
             dest = str(dest)
         elif isinstance(dest, LanceDataset):
@@ -4105,6 +4235,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = storage_options
+        ds._base_store_params = base_store_params
         ds._namespace_client = None
         ds._table_id = None
         ds._default_scan_options = None
@@ -5189,6 +5320,7 @@ class ScannerBuilder:
         self._columns_with_transform = None
         self._nearest = None
         self._batch_size: Optional[int] = None
+        self._batch_size_bytes: Optional[int] = None
         self._io_buffer_size: Optional[int] = None
         self._batch_readahead: Optional[int] = None
         self._fragment_readahead: Optional[int] = None
@@ -5219,8 +5351,26 @@ class ScannerBuilder:
         return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
-        """Set batch size for Scanner"""
+        """Set the maximum number of rows per batch.
+
+        Note: this can be overridden by ``batch_size_bytes`` or by a
+        dataset-level ``batch_size_bytes`` configured via
+        ``FileReaderOptions``.
+        """
         self._batch_size = batch_size
+        return self
+
+    def batch_size_bytes(self, batch_size_bytes: int) -> ScannerBuilder:
+        """Set the target batch size in bytes.
+
+        When set, the scanner will produce batches whose total size in bytes
+        is approximately this value, overriding the row-based ``batch_size``.
+
+        This can also be configured at the dataset level via
+        ``FileReaderOptions``.  A scanner-level setting takes precedence
+        over the dataset-level default.
+        """
+        self._batch_size_bytes = batch_size_bytes
         return self
 
     def io_buffer_size(self, io_buffer_size: int) -> ScannerBuilder:
@@ -5609,6 +5759,7 @@ class ScannerBuilder:
             self._offset,
             self._nearest,
             self._batch_size,
+            self._batch_size_bytes,
             self._io_buffer_size,
             self._batch_readahead,
             self._fragment_readahead,
@@ -6250,8 +6401,10 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -6346,6 +6499,12 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by base path URI. Each key
+        is a base path URI (e.g., "s3://bucket/path") and each value is a dict
+        of storage options (credentials, endpoint, etc.) for that base. These
+        are not persisted to the manifest. When a base has no explicit entry
+        here, the top-level ``storage_options`` is used as a fallback.
     external_blob_mode: {"reference", "ingest"}, default "reference"
         How external blob URIs are handled on write.
 
@@ -6357,6 +6516,9 @@ def write_dataset(
         If False, external blob URIs must map to the dataset root or a registered
         base path. If True, external blob URIs outside registered bases are allowed.
         This option only applies when ``external_blob_mode="reference"``.
+    blob_pack_file_size_threshold: optional, int, default None
+        Maximum size in bytes for blob v2 pack (.blob) sidecar files. When a pack
+        file reaches this size, a new one is started. If not set, defaults to 1 GiB.
     namespace_client : optional, LanceNamespace
         A namespace client from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
@@ -6463,6 +6625,7 @@ def write_dataset(
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
+    base_store_params = LanceDataset._inherit_base_store_params(uri, base_store_params)
 
     # Merge properties and commit_message with priority to commit_message
     merged_properties = _merge_message_to_properties(
@@ -6483,8 +6646,10 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "base_store_params": base_store_params,
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
+        "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
     }
 
     # Add namespace_client and table_id for storage options provider and managed
@@ -6512,6 +6677,7 @@ def write_dataset(
 
     ds = LanceDataset.__new__(LanceDataset)
     ds._storage_options = storage_options
+    ds._base_store_params = base_store_params
     ds._namespace_client = namespace_client
     ds._table_id = table_id
     ds._namespace_client_managed_versioning = namespace_client_managed_versioning

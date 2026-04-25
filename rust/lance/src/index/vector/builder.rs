@@ -1024,29 +1024,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let is_pq = Q::quantization_type() == QuantizationType::Product;
-        let is_rq = Q::quantization_type() == QuantizationType::Rabit;
+        let quantization_type = Q::quantization_type();
+        let is_pq = quantization_type == QuantizationType::Product;
+        let is_rq = quantization_type == QuantizationType::Rabit;
+        let is_flat = quantization_type == QuantizationType::Flat;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
 
-        let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
-        fields.extend(quantizer.extra_fields());
-        let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
         let writer_options = FileWriterOptions {
             format_version: Some(self.format_version),
             ..Default::default()
         };
-        let mut storage_writer = FileWriter::try_new(
-            self.store.create(&storage_path).await?,
-            storage_schema.clone(),
-            writer_options.clone(),
-        )?;
+        let mut storage_writer = if is_flat {
+            None
+        } else {
+            let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
+            fields.extend(quantizer.extra_fields());
+            let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
+            Some(FileWriter::try_new(
+                self.store.create(&storage_path).await?,
+                storage_schema,
+                writer_options.clone(),
+            )?)
+        };
         let mut index_writer = FileWriter::try_new(
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
-            writer_options,
+            writer_options.clone(),
         )?;
 
         // maintain the IVF partitions
@@ -1109,7 +1115,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
                     }
 
-                    storage_writer.write_batch(&batch).await?;
+                    if storage_writer.is_none() {
+                        let storage_schema: Schema = batch.schema_ref().as_ref().try_into()?;
+                        storage_writer = Some(FileWriter::try_new(
+                            self.store.create(&storage_path).await?,
+                            storage_schema,
+                            writer_options.clone(),
+                        )?);
+                    }
+                    storage_writer
+                        .as_mut()
+                        .expect("storage writer must be initialized before write")
+                        .write_batch(&batch)
+                        .await?;
                     storage_ivf.add_partition(batch.num_rows() as u32);
                 }
             }
@@ -1145,14 +1163,45 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         }
 
+        if storage_writer.is_none() {
+            let Some(centroids) = ivf.centroids.as_ref() else {
+                return Err(Error::invalid_input(
+                    "flat storage writer could not infer schema from empty partitions without IVF centroids",
+                ));
+            };
+            let flat_schema = arrow_schema::Schema::new(vec![
+                ROW_ID_FIELD.as_ref().clone(),
+                arrow_schema::Field::new(
+                    lance_index::vector::flat::storage::FLAT_COLUMN,
+                    DataType::FixedSizeList(
+                        Arc::new(arrow_schema::Field::new(
+                            "item",
+                            centroids.value_type(),
+                            true,
+                        )),
+                        centroids.value_length(),
+                    ),
+                    true,
+                ),
+            ]);
+            let storage_schema: Schema = (&flat_schema).try_into()?;
+            storage_writer = Some(FileWriter::try_new(
+                self.store.create(&storage_path).await?,
+                storage_schema,
+                writer_options.clone(),
+            )?);
+        }
+
+        let storage_writer = storage_writer
+            .as_mut()
+            .expect("storage writer must be initialized before final metadata write");
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         let ivf_buffer_pos = storage_writer
             .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
-        let quant_type = Q::quantization_type();
-        let transposed = match quant_type {
+        let transposed = match quantization_type {
             QuantizationType::Product | QuantizationType::Rabit => self.transpose_codes,
             _ => false,
         };

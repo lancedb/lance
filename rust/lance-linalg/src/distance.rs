@@ -17,9 +17,12 @@ use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, L
 use arrow_schema::{ArrowError, DataType};
 
 pub mod cosine;
+pub mod cosine_u8;
 pub mod dot;
+pub mod dot_u8;
 pub mod hamming;
 pub mod l2;
+pub mod l2_u8;
 pub mod norm_l2;
 
 pub use cosine::*;

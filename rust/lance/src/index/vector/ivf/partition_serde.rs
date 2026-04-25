@@ -530,10 +530,11 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Float32Array, UInt8Array, UInt64Array,
+        Float16Array, Float32Array, Float64Array, UInt8Array, UInt64Array,
         types::{Float32Type, UInt8Type},
     };
     use arrow_schema::{DataType, Field, Schema};
+    use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
     use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
@@ -721,6 +722,22 @@ mod tests {
         FlatFloatStorage::new(vectors, DistanceType::L2)
     }
 
+    fn make_flat_storage_f16(num_rows: usize, dim: usize) -> FlatFloatStorage {
+        let values: Vec<f16> = (0..num_rows * dim)
+            .map(|i| f16::from_f32(i as f32 * 0.01))
+            .collect();
+        let values_array = Float16Array::from(values);
+        let vectors = FixedSizeListArray::try_new_from_values(values_array, dim as i32).unwrap();
+        FlatFloatStorage::new(vectors, DistanceType::L2)
+    }
+
+    fn make_flat_storage_f64(num_rows: usize, dim: usize) -> FlatFloatStorage {
+        let values: Vec<f64> = (0..num_rows * dim).map(|i| i as f64 * 0.01).collect();
+        let values_array = Float64Array::from(values);
+        let vectors = FixedSizeListArray::try_new_from_values(values_array, dim as i32).unwrap();
+        FlatFloatStorage::new(vectors, DistanceType::L2)
+    }
+
     // ----- Flat tests -------------------------------------------------------
 
     #[test]
@@ -768,6 +785,56 @@ mod tests {
                     .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
+    }
+
+    #[test]
+    fn test_roundtrip_flat_flat_f16() {
+        let storage = make_flat_storage_f16(8, 16);
+        let entry = PartitionEntry::<FlatIndex, FlatQuantizer> {
+            index: FlatIndex::default(),
+            storage,
+        };
+
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
+        let restored =
+            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
+                .unwrap();
+
+        let restored_batch = restored.storage.to_batches().unwrap().next().unwrap();
+        let schema = restored_batch.schema();
+        let field = schema
+            .field_with_name(lance_index::vector::flat::storage::FLAT_COLUMN)
+            .unwrap();
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!("flat column should be fixed size list");
+        };
+        assert_eq!(item.data_type(), &DataType::Float16);
+    }
+
+    #[test]
+    fn test_roundtrip_flat_flat_f64() {
+        let storage = make_flat_storage_f64(8, 16);
+        let entry = PartitionEntry::<FlatIndex, FlatQuantizer> {
+            index: FlatIndex::default(),
+            storage,
+        };
+
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
+        let restored =
+            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
+                .unwrap();
+
+        let restored_batch = restored.storage.to_batches().unwrap().next().unwrap();
+        let schema = restored_batch.schema();
+        let field = schema
+            .field_with_name(lance_index::vector::flat::storage::FLAT_COLUMN)
+            .unwrap();
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!("flat column should be fixed size list");
+        };
+        assert_eq!(item.data_type(), &DataType::Float64);
     }
 
     // ----- SQ helpers -------------------------------------------------------

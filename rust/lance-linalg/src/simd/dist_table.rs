@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -57,13 +59,28 @@ pub fn sum_4bit_dist_table(
                 )
             }
         },
+        #[cfg(target_arch = "aarch64")]
+        SimdSupport::Neon => unsafe {
+            for i in (0..n).step_by(BATCH_SIZE) {
+                sum_dist_table_32bytes_batch_neon(
+                    &codes[i * code_len..(i + BATCH_SIZE) * code_len],
+                    dist_table,
+                    &mut dists[i..i + BATCH_SIZE],
+                )
+            }
+        },
         _ => sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists),
     }
 }
 
 #[inline]
 #[allow(unused)]
-fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+pub fn sum_4bit_dist_table_scalar(
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [u16],
+) {
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
         for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
@@ -159,6 +176,77 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
     _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, dis1);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn sum_dist_table_32bytes_batch_neon(codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+    let low_mask = vdupq_n_u8(0x0f);
+
+    // 8 accumulators: 4 per 128-bit "lane" (lo = bytes 0..16, hi = bytes 16..32 of each block)
+    let mut accu0_lo = vdupq_n_u16(0);
+    let mut accu1_lo = vdupq_n_u16(0);
+    let mut accu2_lo = vdupq_n_u16(0);
+    let mut accu3_lo = vdupq_n_u16(0);
+    let mut accu0_hi = vdupq_n_u16(0);
+    let mut accu1_hi = vdupq_n_u16(0);
+    let mut accu2_hi = vdupq_n_u16(0);
+    let mut accu3_hi = vdupq_n_u16(0);
+
+    let codes_ptr = codes.as_ptr();
+    let dt_ptr = dist_table.as_ptr();
+
+    for i in (0..codes.len()).step_by(32) {
+        // Process lo lane: bytes [i..i+16]
+        let c_lo = vld1q_u8(codes_ptr.add(i));
+        let lut_lo = vld1q_u8(dt_ptr.add(i));
+
+        let lo_lo = vandq_u8(c_lo, low_mask);
+        let hi_lo = vshrq_n_u8::<4>(c_lo);
+
+        let res_lo_lo = vqtbl1q_u8(lut_lo, lo_lo);
+        let res_hi_lo = vqtbl1q_u8(lut_lo, hi_lo);
+
+        accu0_lo = vaddq_u16(accu0_lo, vreinterpretq_u16_u8(res_lo_lo));
+        accu1_lo = vaddq_u16(accu1_lo, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_lo_lo)));
+        accu2_lo = vaddq_u16(accu2_lo, vreinterpretq_u16_u8(res_hi_lo));
+        accu3_lo = vaddq_u16(accu3_lo, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_hi_lo)));
+
+        // Process hi lane: bytes [i+16..i+32]
+        let c_hi = vld1q_u8(codes_ptr.add(i + 16));
+        let lut_hi = vld1q_u8(dt_ptr.add(i + 16));
+
+        let lo_hi = vandq_u8(c_hi, low_mask);
+        let hi_hi = vshrq_n_u8::<4>(c_hi);
+
+        let res_lo_hi = vqtbl1q_u8(lut_hi, lo_hi);
+        let res_hi_hi = vqtbl1q_u8(lut_hi, hi_hi);
+
+        accu0_hi = vaddq_u16(accu0_hi, vreinterpretq_u16_u8(res_lo_hi));
+        accu1_hi = vaddq_u16(accu1_hi, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_lo_hi)));
+        accu2_hi = vaddq_u16(accu2_hi, vreinterpretq_u16_u8(res_hi_hi));
+        accu3_hi = vaddq_u16(accu3_hi, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_hi_hi)));
+    }
+
+    // Merge: clean even bytes by subtracting the odd-byte bleed
+    accu0_lo = vsubq_u16(accu0_lo, vshlq_n_u16::<8>(accu1_lo));
+    accu0_hi = vsubq_u16(accu0_hi, vshlq_n_u16::<8>(accu1_hi));
+
+    // Cross-lane merge: add lo and hi lane accumulators
+    // This is the NEON equivalent of AVX2's permute2f128 + blend + add
+    let dis0_even = vaddq_u16(accu0_lo, accu0_hi);
+    let dis0_odd = vaddq_u16(accu1_lo, accu1_hi);
+    vst1q_u16(dists.as_mut_ptr(), dis0_even);
+    vst1q_u16(dists.as_mut_ptr().add(8), dis0_odd);
+
+    // Same for hi-nibble accumulators (vectors 16..31)
+    accu2_lo = vsubq_u16(accu2_lo, vshlq_n_u16::<8>(accu3_lo));
+    accu2_hi = vsubq_u16(accu2_hi, vshlq_n_u16::<8>(accu3_hi));
+
+    let dis1_even = vaddq_u16(accu2_lo, accu2_hi);
+    let dis1_odd = vaddq_u16(accu3_lo, accu3_hi);
+    vst1q_u16(dists.as_mut_ptr().add(16), dis1_even);
+    vst1q_u16(dists.as_mut_ptr().add(24), dis1_odd);
+}
+
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
 // implement it in Rust once we upgrade rust to 1.89.0.
 unsafe extern "C" {
@@ -213,5 +301,84 @@ mod tests {
 
         // so the distance is 2 * (dist_table[0x6] + dist_table[0xb + 16]) = 2*(7 + 12) = 38
         assert_eq!(dists[1], 38);
+    }
+
+    /// Test that the SIMD path (NEON on ARM, AVX2 on x86) produces identical
+    /// results to the scalar reference across a range of dimensions, including
+    /// very large ones (up to DIM=65536).
+    ///
+    /// Note: dist_table values are capped to avoid u16 overflow, matching
+    /// production behavior where values are quantized to a small range.
+    /// (The scalar path uses saturating_add while SIMD uses wrapping add,
+    /// so they diverge on overflow — but overflow never occurs with real
+    /// quantized data.)
+    #[test]
+    fn test_simd_matches_scalar_varied_dimensions() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        // code_len = dim / 8 for 1-bit quantization; we test various code_lens
+        // directly since that's what the function sees.
+        // code_len=16 → DIM=128, code_len=192 → DIM=1536,
+        // code_len=512 → DIM=4096, code_len=8192 → DIM=65536
+        for code_len in [2, 16, 96, 192, 512, 1024, 8192] {
+            let n = BATCH_SIZE; // 32 vectors per batch
+
+            // Each code byte produces 2 lookups; cap values so
+            // 2 * code_len * max_val < u16::MAX.
+            let max_val = (u16::MAX as usize / (2 * code_len)).min(255) as u8;
+
+            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
+                .map(|_| rng.random_range(0..=max_val))
+                .collect();
+
+            let mut expected = vec![0u16; n];
+            sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
+
+            let mut actual = vec![0u16; n];
+            sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
+
+            assert_eq!(
+                actual,
+                expected,
+                "SIMD and scalar mismatch for code_len={} (DIM={})",
+                code_len,
+                code_len * 8,
+            );
+        }
+    }
+
+    /// Test with multiple batches to verify accumulation across batch boundaries.
+    #[test]
+    fn test_simd_matches_scalar_multi_batch() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+
+        for code_len in [16, 192, 1024] {
+            let n = BATCH_SIZE * 10; // 320 vectors = 10 batches
+
+            let max_val = (u16::MAX as usize / (2 * code_len)).min(255) as u8;
+
+            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
+                .map(|_| rng.random_range(0..=max_val))
+                .collect();
+
+            let mut expected = vec![0u16; n];
+            sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
+
+            let mut actual = vec![0u16; n];
+            sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
+
+            assert_eq!(
+                actual,
+                expected,
+                "SIMD and scalar mismatch for multi-batch code_len={} (DIM={}, n={})",
+                code_len,
+                code_len * 8,
+                n,
+            );
+        }
     }
 }

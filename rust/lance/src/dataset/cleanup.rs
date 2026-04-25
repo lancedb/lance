@@ -2396,7 +2396,8 @@ mod tests {
         // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 1);
-        assert_eq!(before_count.num_tx_files, 2);
+        // Only 1 txn file: the failed commit's txn file was already cleaned up.
+        assert_eq!(before_count.num_tx_files, 1);
 
         // All of our manifests are newer than the threshold but temp files
         // should still be deleted.
