@@ -306,8 +306,7 @@ impl AzureCredentialVendor {
     /// (matches object_store's credential resolution order):
     /// 1. Workload Identity Federation (AZURE_FEDERATED_TOKEN_FILE + tenant + client ID)
     /// 2. Client Secret OAuth (AZURE_CLIENT_ID + AZURE_CLIENT_SECRET + tenant)
-    /// 3. Azure CLI (`az account get-access-token`)
-    /// 4. Managed Identity (IMDS)
+    /// 3. Managed Identity (IMDS)
     async fn fetch_static_access_token(&self) -> Result<String> {
         if let (Some(tenant_id), Some(client_id), Ok(federated_token_file)) = (
             self.tenant_id_for_static_auth(),
@@ -348,58 +347,8 @@ impl AzureCredentialVendor {
                 .await;
         }
 
-        if let Ok(token) = self.fetch_azure_cli_token().await {
-            debug!("Azure static auth: using Azure CLI access token");
-            return Ok(token);
-        }
-
         debug!("Azure static auth: falling back to managed identity flow");
         self.fetch_managed_identity_token().await
-    }
-
-    async fn fetch_azure_cli_token(&self) -> Result<String> {
-        let output = tokio::process::Command::new("az")
-            .args([
-                "account",
-                "get-access-token",
-                "--resource",
-                AZURE_STORAGE_RESOURCE,
-                "--query",
-                "accessToken",
-                "--output",
-                "tsv",
-            ])
-            .output()
-            .await
-            .map_err(|err| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to invoke Azure CLI for storage access token: {}",
-                        err
-                    ),
-                })
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(NamespaceError::Internal {
-                message: format!(
-                    "Azure CLI failed to fetch storage access token (status={}): {}",
-                    output.status, stderr
-                ),
-            }
-            .into());
-        }
-
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if token.is_empty() {
-            return Err(NamespaceError::Internal {
-                message: "Azure CLI returned an empty storage access token".to_string(),
-            }
-            .into());
-        }
-
-        Ok(token)
     }
 
     async fn exchange_client_secret_for_azure_token(
