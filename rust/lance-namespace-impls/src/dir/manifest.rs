@@ -542,7 +542,11 @@ impl ManifestNamespace {
                 })
             })?
             .pop_if_empty()
-            .push(relative_location);
+            .extend(
+                relative_location
+                    .split('/')
+                    .filter(|segment| !segment.is_empty()),
+            );
 
         // Clear any query string to avoid trailing "?" in the URL.
         // Use set_query(None) instead of set_query("") because the latter
@@ -3907,6 +3911,24 @@ mod tests {
         assert!(
             !result.contains("//hash_workspace$test_table"),
             "local file URI should not add a double slash before table directory: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_construct_full_uri_with_nested_relative_location() {
+        let result =
+            ManifestNamespace::construct_full_uri("/tmp/root", "workspace/physical_table.lance")
+                .unwrap();
+
+        assert!(
+            result.ends_with("/tmp/root/workspace/physical_table.lance"),
+            "nested relative location should preserve path separators: {}",
+            result
+        );
+        assert!(
+            !result.contains("%2Fphysical_table.lance"),
+            "nested relative location should not encode path separators: {}",
             result
         );
     }
