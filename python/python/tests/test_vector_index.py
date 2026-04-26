@@ -1896,7 +1896,7 @@ def test_vector_index_with_parallel_mode(indexed_dataset):
             "column": "vector",
             "q": q,
             "k": 10,
-            "parallel_mode": "Parallel",
+            "parallel_mode": "  Parallel  ",
         }
     )
 
