@@ -33,6 +33,7 @@ pub(in crate::object_store) struct DynamicOpenDalStore {
     accessor: Arc<StorageOptionsAccessor>,
     normalize_config: NormalizeConfigFn,
     build_store: BuildStoreFn,
+    protected_keys: Vec<&'static str>,
     cache: Arc<RwLock<Option<CachedOpenDalStore>>>,
 }
 
@@ -59,11 +60,26 @@ impl DynamicOpenDalStore {
             accessor,
             normalize_config,
             build_store,
+            protected_keys: Vec::new(),
             cache: Arc::new(RwLock::new(None)),
         }
     }
 
-    fn merge_options(&self, dynamic_options: HashMap<String, String>) -> HashMap<String, String> {
+    pub(in crate::object_store) fn with_protected_keys(
+        mut self,
+        keys: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
+        self.protected_keys = keys.into_iter().collect();
+        self
+    }
+
+    fn merge_options(
+        &self,
+        mut dynamic_options: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        for key in &self.protected_keys {
+            dynamic_options.remove(*key);
+        }
         let mut merged = self.base_options.as_ref().clone();
         merged.extend(dynamic_options);
         merged
@@ -258,5 +274,43 @@ mod tests {
             .expect("second store should reuse cache");
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_merge_options_preserves_protected_base_keys() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            StaticMockStorageOptionsProvider {
+                options: HashMap::new(),
+            },
+        )));
+        let store = DynamicOpenDalStore::new(
+            "memory",
+            HashMap::from([
+                ("bucket".to_string(), "url-bucket".to_string()),
+                ("root".to_string(), "/".to_string()),
+                ("token".to_string(), "base-token".to_string()),
+            ]),
+            accessor,
+            |options| Ok(options.clone()),
+            |_| {
+                let operator = Operator::new(Memory::default()).map_err(|e| {
+                    lance_core::Error::invalid_input(format!(
+                        "Failed to create memory operator: {e:?}"
+                    ))
+                })?;
+                Ok(OpendalStore::new(operator.finish()))
+            },
+        )
+        .with_protected_keys(["bucket", "root"]);
+
+        let merged = store.merge_options(HashMap::from([
+            ("bucket".to_string(), "provider-bucket".to_string()),
+            ("root".to_string(), "/provider-root".to_string()),
+            ("token".to_string(), "provider-token".to_string()),
+        ]));
+
+        assert_eq!(merged.get("bucket").unwrap(), "url-bucket");
+        assert_eq!(merged.get("root").unwrap(), "/");
+        assert_eq!(merged.get("token").unwrap(), "provider-token");
     }
 }

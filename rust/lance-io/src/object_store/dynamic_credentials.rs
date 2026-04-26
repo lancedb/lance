@@ -73,7 +73,7 @@ impl<T> NamespaceCredentialsProvider<T> {
 }
 
 /// Build a dynamic credential provider for any cloud type, returning `None`
-/// if the accessor has no provider or the vended options are incompatible with `T`.
+/// if the accessor has no provider or the provider options are incompatible with `T`.
 pub async fn build_dynamic_credential_provider<T>(
     accessor: Option<Arc<StorageOptionsAccessor>>,
 ) -> Result<Option<Arc<dyn CredentialProvider<Credential = T>>>>
@@ -84,16 +84,12 @@ where
         return Ok(None);
     };
 
-    // Validate that the provider vends credentials compatible with T.
-    // Try initial options first, then fall back to a provider fetch.
-    // Initial options may contain only non-credential fields (e.g. region)
-    // while the provider vends the actual credentials.
     let compatible = if let Some(initial) = accessor.initial_storage_options()
         && T::try_from(DynamicCredentials(initial.clone())).is_ok()
     {
         true
     } else {
-        let fetched = accessor.get_storage_options().await?.0;
+        let fetched = accessor.refresh_storage_options().await?.0;
         T::try_from(DynamicCredentials(fetched)).is_ok()
     };
 
@@ -107,6 +103,13 @@ where
     ))
 }
 
+fn map_credential_error(error: Error) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "NamespaceCredentialsProvider",
+        source: Box::new(error),
+    }
+}
+
 #[async_trait]
 impl<T> CredentialProvider for NamespaceCredentialsProvider<T>
 where
@@ -115,19 +118,24 @@ where
     type Credential = T;
 
     async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-        let storage_options = self.accessor.get_storage_options().await.map_err(|e| {
-            object_store::Error::Generic {
-                store: "NamespaceCredentialsProvider",
-                source: Box::new(e),
-            }
-        })?;
+        let storage_options = self
+            .accessor
+            .get_storage_options()
+            .await
+            .map_err(map_credential_error)?;
 
-        let credential = T::try_from(DynamicCredentials(storage_options.0)).map_err(|e| {
-            object_store::Error::Generic {
-                store: "NamespaceCredentialsProvider",
-                source: Box::new(e),
+        let credential = match T::try_from(DynamicCredentials(storage_options.0)) {
+            Ok(credential) => credential,
+            Err(_) if self.accessor.has_provider() => {
+                let storage_options = self
+                    .accessor
+                    .refresh_storage_options()
+                    .await
+                    .map_err(map_credential_error)?;
+                T::try_from(DynamicCredentials(storage_options.0)).map_err(map_credential_error)?
             }
-        })?;
+            Err(error) => return Err(map_credential_error(error)),
+        };
 
         Ok(Arc::new(credential))
     }
@@ -172,6 +180,7 @@ impl TryFrom<DynamicCredentials> for ObjectStoreAwsCredential {
         let token = credentials
             .0
             .get("aws_session_token")
+            .or_else(|| credentials.0.get("aws_token"))
             .or_else(|| credentials.0.get("aws_security_token"))
             .or_else(|| credentials.0.get("session_token"))
             .or_else(|| credentials.0.get("token"))
@@ -275,6 +284,53 @@ mod tests {
         assert_eq!(credentials.key_id, "AKID");
         assert_eq!(credentials.secret_key, "SECRET");
         assert_eq!(credentials.token.as_deref(), Some("TOKEN"));
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_dynamic_aws_credentials_aws_token_alias() {
+        let provider = Arc::new(StaticMockStorageOptionsProvider {
+            options: HashMap::from([
+                ("aws_access_key_id".to_string(), "AKID".to_string()),
+                ("aws_secret_access_key".to_string(), "SECRET".to_string()),
+                ("aws_token".to_string(), "TOKEN".to_string()),
+            ]),
+        });
+
+        let credentials =
+            NamespaceCredentialsProvider::<ObjectStoreAwsCredential>::from_provider(provider)
+                .get_credential()
+                .await
+                .expect("aws credentials should convert");
+
+        assert_eq!(credentials.token.as_deref(), Some("TOKEN"));
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_dynamic_credentials_fetch_provider_when_initial_has_metadata_only() {
+        let provider = Arc::new(StaticMockStorageOptionsProvider {
+            options: HashMap::from([
+                ("aws_access_key_id".to_string(), "AKID".to_string()),
+                ("aws_secret_access_key".to_string(), "SECRET".to_string()),
+            ]),
+        });
+        let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            HashMap::from([("region".to_string(), "us-west-2".to_string())]),
+            provider,
+        ));
+
+        let credentials =
+            build_dynamic_credential_provider::<ObjectStoreAwsCredential>(Some(accessor))
+                .await
+                .expect("dynamic credential provider should build")
+                .expect("provider should be returned")
+                .get_credential()
+                .await
+                .expect("provider-vended aws credentials should convert");
+
+        assert_eq!(credentials.key_id, "AKID");
+        assert_eq!(credentials.secret_key, "SECRET");
     }
 
     #[cfg(feature = "azure")]

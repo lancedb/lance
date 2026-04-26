@@ -62,10 +62,9 @@ fn build_hf_base_options(
     repo_id: &str,
     storage_options: &StorageOptions,
 ) -> HashMap<String, String> {
-    let mut options = HashMap::new();
+    let mut options = storage_options.0.clone();
     options.insert("repo_type".to_string(), repo_type.to_string());
     options.insert("repo_id".to_string(), repo_id.to_string());
-    options.extend(storage_options.0.clone());
     options
 }
 
@@ -146,13 +145,16 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         let accessor = params.get_accessor();
         let inner: Arc<dyn OSObjectStore> =
             if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
-                Arc::new(DynamicOpenDalStore::new(
-                    format!("hf:{}", base_path),
-                    base_options,
-                    accessor,
-                    normalize_hf_config,
-                    build_hf_store,
-                ))
+                Arc::new(
+                    DynamicOpenDalStore::new(
+                        format!("hf:{}", base_path),
+                        base_options,
+                        accessor,
+                        normalize_hf_config,
+                        build_hf_store,
+                    )
+                    .with_protected_keys(["repo_type", "repo_id"]),
+                )
             } else {
                 Arc::new(build_hf_store(normalize_hf_config(&base_options)?)?)
             };
@@ -241,6 +243,24 @@ mod tests {
             config_map.insert("revision".to_string(), rev);
         }
         assert_eq!(config_map.get("revision").unwrap(), "stable");
+    }
+
+    #[test]
+    fn storage_options_cannot_override_url_repo_identity() {
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::from([
+                ("repo_type".to_string(), "model".to_string()),
+                ("repo_id".to_string(), "other/repo".to_string()),
+                ("hf_revision".to_string(), "stable".to_string()),
+            ])),
+        ))
+        .unwrap();
+
+        assert_eq!(config.get("repo_type").unwrap(), "dataset");
+        assert_eq!(config.get("repo_id").unwrap(), "acme/repo");
+        assert_eq!(config.get("revision").unwrap(), "stable");
     }
 
     #[test]

@@ -49,13 +49,14 @@ impl OssStoreProvider {
             })
             .collect();
 
-        config_map.insert("bucket".to_string(), bucket);
+        config_map.extend(storage_options.0.clone());
 
-        if !prefix.is_empty() {
+        config_map.insert("bucket".to_string(), bucket);
+        if prefix.is_empty() {
+            config_map.remove("root");
+        } else {
             config_map.insert("root".to_string(), "/".to_string());
         }
-
-        config_map.extend(storage_options.0.clone());
 
         Ok(config_map)
     }
@@ -75,16 +76,10 @@ impl OssStoreProvider {
         ];
 
         for (canonical, aliases) in alias_groups {
-            if !config_map.contains_key(*canonical) {
-                for alias in *aliases {
-                    if let Some(value) = config_map.remove(*alias) {
-                        config_map.insert(canonical.to_string(), value);
-                        break;
-                    }
-                }
-            } else {
-                for alias in *aliases {
-                    config_map.remove(*alias);
+            for alias in *aliases {
+                if let Some(value) = config_map.remove(*alias) {
+                    config_map.insert(canonical.to_string(), value);
+                    break;
                 }
             }
         }
@@ -118,13 +113,16 @@ impl ObjectStoreProvider for OssStoreProvider {
 
         let inner: Arc<dyn OSObjectStore> =
             if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
-                Arc::new(DynamicOpenDalStore::new(
-                    format!("oss:{}", base_path),
-                    base_options,
-                    accessor,
-                    Self::normalize_oss_config,
-                    Self::build_oss_store,
-                ))
+                Arc::new(
+                    DynamicOpenDalStore::new(
+                        format!("oss:{}", base_path),
+                        base_options,
+                        accessor,
+                        Self::normalize_oss_config,
+                        Self::build_oss_store,
+                    )
+                    .with_protected_keys(["bucket", "root"]),
+                )
             } else {
                 Arc::new(Self::build_oss_store(Self::normalize_oss_config(
                     &base_options,
@@ -170,6 +168,82 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn test_oss_alias_options_override_canonical_env_options() {
+        let config = OssStoreProvider::normalize_oss_config(&HashMap::from([
+            (
+                "endpoint".to_string(),
+                "https://env.example.com".to_string(),
+            ),
+            (
+                "oss_endpoint".to_string(),
+                "https://user.example.com".to_string(),
+            ),
+            ("access_key_id".to_string(), "env-akid".to_string()),
+            ("oss_access_key_id".to_string(), "user-akid".to_string()),
+            ("access_key_secret".to_string(), "env-secret".to_string()),
+            (
+                "oss_secret_access_key".to_string(),
+                "user-secret".to_string(),
+            ),
+            ("region".to_string(), "env-region".to_string()),
+            ("oss_region".to_string(), "user-region".to_string()),
+            ("security_token".to_string(), "env-token".to_string()),
+            ("oss_security_token".to_string(), "user-token".to_string()),
+            ("bucket".to_string(), "bucket".to_string()),
+        ]))
+        .unwrap();
+
+        assert_eq!(config.get("endpoint").unwrap(), "https://user.example.com");
+        assert_eq!(config.get("access_key_id").unwrap(), "user-akid");
+        assert_eq!(config.get("access_key_secret").unwrap(), "user-secret");
+        assert_eq!(config.get("region").unwrap(), "user-region");
+        assert_eq!(config.get("security_token").unwrap(), "user-token");
+        assert!(!config.contains_key("oss_endpoint"));
+        assert!(!config.contains_key("oss_security_token"));
+    }
+
+    #[test]
+    fn test_oss_url_bucket_and_root_are_authoritative() {
+        let storage_options = crate::object_store::StorageOptions(HashMap::from([
+            (
+                "oss_endpoint".to_string(),
+                "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+            ),
+            ("bucket".to_string(), "storage-options-bucket".to_string()),
+            ("root".to_string(), "/storage-options-root".to_string()),
+        ]));
+        let base_options = OssStoreProvider::base_oss_options(
+            &Url::parse("oss://url-bucket/path").unwrap(),
+            &storage_options,
+        )
+        .unwrap();
+        let config = OssStoreProvider::normalize_oss_config(&base_options).unwrap();
+
+        assert_eq!(config.get("bucket").unwrap(), "url-bucket");
+        assert_eq!(config.get("root").unwrap(), "/");
+    }
+
+    #[test]
+    fn test_oss_empty_url_path_removes_storage_option_root() {
+        let storage_options = crate::object_store::StorageOptions(HashMap::from([
+            (
+                "oss_endpoint".to_string(),
+                "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+            ),
+            ("root".to_string(), "/storage-options-root".to_string()),
+        ]));
+        let base_options = OssStoreProvider::base_oss_options(
+            &Url::parse("oss://url-bucket").unwrap(),
+            &storage_options,
+        )
+        .unwrap();
+        let config = OssStoreProvider::normalize_oss_config(&base_options).unwrap();
+
+        assert_eq!(config.get("bucket").unwrap(), "url-bucket");
+        assert!(!config.contains_key("root"));
     }
 
     #[tokio::test]
