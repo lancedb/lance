@@ -4634,10 +4634,7 @@ mod tests {
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::{Arc, atomic::AtomicUsize};
     use url::Url;
 
     fn assert_plan_contains_all(plan: &str, expected_fragments: &[&str], context: &str) {
@@ -4664,6 +4661,7 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[allow(dead_code)]
     struct CountingFileStoreProvider {
         listing_count: Arc<AtomicUsize>,
     }
@@ -4699,6 +4697,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn file_object_store_uri(path: &str) -> String {
         let file_url = uri_to_url(path).unwrap();
         let mut url = Url::parse("file-object-store:///").unwrap();
@@ -4706,6 +4705,7 @@ mod tests {
         url.to_string()
     }
 
+    #[allow(dead_code)]
     fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Session> {
         let registry = Arc::new(ObjectStoreRegistry::default());
         registry.insert(
