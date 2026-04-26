@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance import LanceDataset, LanceFragment
+from lance import LanceDataset, LanceFragment, ParallelMode
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
@@ -1888,7 +1888,7 @@ def test_vector_index_with_parallel_mode(indexed_dataset):
             "column": "vector",
             "q": q,
             "k": 10,
-            "parallel_mode": "Sequential",
+            "parallel_mode": ParallelMode.SEQUENTIAL,
         }
     )
     parallel = indexed_dataset.to_table(
