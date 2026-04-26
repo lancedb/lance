@@ -60,7 +60,7 @@ use lance_datafusion::{
 };
 use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
-use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, path::Path};
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -1219,7 +1219,7 @@ impl BTreeIndex {
         let (page_lookup_file, standalone_partition_page_file) =
             match store.open_index_file(BTREE_LOOKUP_NAME).await {
                 Ok(page_lookup_file) => (page_lookup_file, None),
-                Err(original_err) => {
+                Err(original_err) if is_missing_lookup_error(&original_err) => {
                     let files = store.list_files_with_sizes().await?;
                     let Some((lookup_file, page_file)) = find_single_partition_files(&files)?
                     else {
@@ -1230,6 +1230,7 @@ impl BTreeIndex {
                         Some(page_file.to_string()),
                     )
                 }
+                Err(other_err) => return Err(other_err),
             };
         let num_rows_in_lookup = page_lookup_file.num_rows();
         let serialized_lookup = page_lookup_file
@@ -2041,6 +2042,18 @@ fn find_single_partition_files(
     }
 
     Ok(Some((lookup_files[0], page_files[0])))
+}
+
+fn is_missing_lookup_error(err: &Error) -> bool {
+    matches!(err, Error::NotFound { .. })
+        || matches!(
+            err,
+            Error::IO { source, .. }
+                if source
+                    .downcast_ref::<ObjectStoreError>()
+                    .map(|os_err| matches!(os_err, ObjectStoreError::NotFound { .. }))
+                    .unwrap_or(false)
+        )
 }
 
 /// Merge multiple partition page / lookup files into a complete metadata file
