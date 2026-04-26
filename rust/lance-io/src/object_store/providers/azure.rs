@@ -194,6 +194,42 @@ impl AzureBlobStoreProvider {
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
+
+    fn calculate_object_store_prefix_with_env(
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+        env_options: &HashMap<String, String>,
+    ) -> Result<String> {
+        let authority = url.authority();
+        let (container, account) = match authority.find("@") {
+            Some(at_index) => {
+                // The URI has an:
+                // - az:// schema type and is similar to 'az://container@account.dfs.core.windows.net/path-part/file
+                //         or possibly 'az://container@account/path-part/file' (the short version).
+                // - abfss:// schema type and is similar to 'abfss://filesystem@account.dfs.core.windows.net/path-part/file'.
+                let container = &authority[..at_index];
+                let account = &authority[at_index + 1..];
+                (
+                    container,
+                    account.split(".").next().unwrap_or_default().to_string(),
+                )
+            }
+            None => {
+                // The URI looks like 'az://container/path-part/file'.
+                // We must look at the storage options to find the account.
+                let mut account = match storage_options {
+                    Some(opts) => StorageOptions::find_configured_storage_account(opts),
+                    None => None,
+                };
+                if account.is_none() {
+                    account = StorageOptions::find_configured_storage_account(env_options);
+                }
+                let account = account.ok_or(Error::invalid_input("Unable to find object store prefix: no Azure account name in URI, and no storage account configured."))?;
+                (authority, account)
+            }
+        };
+        Ok(format!("{}${}@{}", url.scheme(), container, account))
+    }
 }
 
 #[async_trait::async_trait]
@@ -264,35 +300,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         url: &Url,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        let authority = url.authority();
-        let (container, account) = match authority.find("@") {
-            Some(at_index) => {
-                // The URI has an:
-                // - az:// schema type and is similar to 'az://container@account.dfs.core.windows.net/path-part/file
-                //         or possibly 'az://container@account/path-part/file' (the short version).
-                // - abfss:// schema type and is similar to 'abfss://filesystem@account.dfs.core.windows.net/path-part/file'.
-                let container = &authority[..at_index];
-                let account = &authority[at_index + 1..];
-                (
-                    container,
-                    account.split(".").next().unwrap_or_default().to_string(),
-                )
-            }
-            None => {
-                // The URI looks like 'az://container/path-part/file'.
-                // We must look at the storage options to find the account.
-                let mut account = match storage_options {
-                    Some(opts) => StorageOptions::find_configured_storage_account(opts),
-                    None => None,
-                };
-                if account.is_none() {
-                    account = StorageOptions::find_configured_storage_account(&ENV_OPTIONS.0);
-                }
-                let account = account.ok_or(Error::invalid_input("Unable to find object store prefix: no Azure account name in URI, and no storage account configured."))?;
-                (authority, account)
-            }
-        };
-        Ok(format!("{}${}@{}", url.scheme(), container, account))
+        Self::calculate_object_store_prefix_with_env(url, storage_options, &ENV_OPTIONS.0)
     }
 }
 
@@ -493,16 +501,15 @@ mod tests {
 
     #[test]
     fn test_fail_to_calculate_object_store_prefix_from_url() {
-        let provider = AzureBlobStoreProvider;
         let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
         let expected = "Invalid user input: Unable to find object store prefix: no Azure account name in URI, and no storage account configured.";
-        let result = provider
-            .calculate_object_store_prefix(
-                &Url::parse("az://container/path").unwrap(),
-                Some(&options),
-            )
-            .expect_err("expected error")
-            .to_string();
+        let result = AzureBlobStoreProvider::calculate_object_store_prefix_with_env(
+            &Url::parse("az://container/path").unwrap(),
+            Some(&options),
+            &HashMap::new(),
+        )
+        .expect_err("expected error")
+        .to_string();
         assert_eq!(expected, &result[..expected.len()]);
     }
 
