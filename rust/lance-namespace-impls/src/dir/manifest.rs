@@ -2203,10 +2203,13 @@ impl LanceNamespace for ManifestNamespace {
                     .into());
                 }
                 CreateTableMode::ExistOk => {
+                    let properties = existing_table
+                        .as_ref()
+                        .and_then(|table| table.metadata.clone());
                     return Ok(CreateTableResponse {
                         location: Some(table_uri),
                         storage_options: self.storage_options.clone(),
-                        properties: None,
+                        properties,
                         ..Default::default()
                     });
                 }
@@ -2303,11 +2306,11 @@ impl LanceNamespace for ManifestNamespace {
             })
         } else {
             match existing_table {
-                Some(_) => Ok(CreateTableResponse {
+                Some(existing_table) => Ok(CreateTableResponse {
                     version: Some(version),
                     location: Some(table_uri),
                     storage_options: self.storage_options.clone(),
-                    properties: None,
+                    properties: existing_table.metadata,
                     ..Default::default()
                 }),
                 None => {

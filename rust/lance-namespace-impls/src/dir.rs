@@ -6466,7 +6466,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.version, Some(1));
-        assert!(response.properties.is_none());
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
@@ -6567,7 +6573,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.properties.is_none());
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
         assert_eq!(
             open_dataset(&namespace, "test_table")
                 .await
