@@ -4108,6 +4108,8 @@ mod tests {
         let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
         assert_eq!(n, names(&["c", "d"]));
         assert_eq!(next, Some("d".to_string()));
+    }
+
     /// Test that drop_table with table_version_storage_enabled cleans up
     /// version entries so that a subsequent drop_namespace succeeds.
     /// This is the scenario described in the PR body.
