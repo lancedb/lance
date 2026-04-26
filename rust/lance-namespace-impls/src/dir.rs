@@ -1175,6 +1175,86 @@ impl DirectoryNamespace {
         Ok(dataset)
     }
 
+    async fn list_table_versions_from_storage(
+        &self,
+        table_uri: &str,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<TableVersion>> {
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        let versions_dir = table_path.child(VERSIONS_DIR);
+        let manifest_metas: Vec<_> = self
+            .object_store
+            .read_dir_all(&versions_dir, None)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to list manifest files for table at '{}': {}",
+                        table_uri, e
+                    ),
+                })
+            })?;
+
+        let is_v2_naming = manifest_metas
+            .first()
+            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
+
+        let mut table_versions: Vec<TableVersion> = manifest_metas
+            .into_iter()
+            .filter_map(|meta| {
+                let filename = meta.location.filename()?;
+                let version_str = filename.strip_suffix(".manifest")?;
+                if version_str.starts_with('d') {
+                    return None;
+                }
+                let file_version: u64 = version_str.parse().ok()?;
+
+                let actual_version = if file_version > u64::MAX / 2 {
+                    u64::MAX - file_version
+                } else {
+                    file_version
+                };
+
+                Some(TableVersion {
+                    version: actual_version as i64,
+                    manifest_path: meta.location.to_string(),
+                    manifest_size: Some(meta.size as i64),
+                    e_tag: meta.e_tag,
+                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
+                    metadata: None,
+                })
+            })
+            .collect();
+
+        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+
+        let needs_sort = if list_is_ordered {
+            if is_v2_naming {
+                !descending
+            } else {
+                descending
+            }
+        } else {
+            true
+        };
+
+        if needs_sort {
+            if descending {
+                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
+            } else {
+                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
+            }
+        }
+
+        if let Some(limit) = limit {
+            table_versions.truncate(limit as usize);
+        }
+
+        Ok(table_versions)
+    }
+
     /// Internal describe_table implementation that doesn't record metrics.
     /// Used by both the public describe_table (which records metrics) and
     /// internal callers like resolve_table_location (which shouldn't).
@@ -2694,79 +2774,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Fallback when table_version_storage is not enabled: list from _versions/ directory
         let table_uri = self.resolve_table_location(&request.id).await?;
-
-        let table_path = self.object_store_path_from_uri(&table_uri)?;
-        let versions_dir = table_path.child(VERSIONS_DIR);
-        let manifest_metas: Vec<_> = self
-            .object_store
-            .read_dir_all(&versions_dir, None)
-            .try_collect()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to list manifest files for table at '{}': {}",
-                        table_uri, e
-                    ),
-                })
-            })?;
-
-        let is_v2_naming = manifest_metas
-            .first()
-            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
-
-        let mut table_versions: Vec<TableVersion> = manifest_metas
-            .into_iter()
-            .filter_map(|meta| {
-                let filename = meta.location.filename()?;
-                let version_str = filename.strip_suffix(".manifest")?;
-                if version_str.starts_with('d') {
-                    return None;
-                }
-                let file_version: u64 = version_str.parse().ok()?;
-
-                let actual_version = if file_version > u64::MAX / 2 {
-                    u64::MAX - file_version
-                } else {
-                    file_version
-                };
-
-                // Use full path from object_store (relative to object store root)
-                Some(TableVersion {
-                    version: actual_version as i64,
-                    manifest_path: meta.location.to_string(),
-                    manifest_size: Some(meta.size as i64),
-                    e_tag: meta.e_tag,
-                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
-                    metadata: None,
-                })
-            })
-            .collect();
-
-        let list_is_ordered = self.object_store.list_is_lexically_ordered;
         let want_descending = request.descending == Some(true);
-
-        let needs_sort = if list_is_ordered {
-            if is_v2_naming {
-                !want_descending
-            } else {
-                want_descending
-            }
-        } else {
-            true
-        };
-
-        if needs_sort {
-            if want_descending {
-                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
-            } else {
-                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
-            }
-        }
-
-        if let Some(limit) = request.limit {
-            table_versions.truncate(limit as usize);
-        }
+        let table_versions = self
+            .list_table_versions_from_storage(&table_uri, want_descending, request.limit)
+            .await?;
 
         Ok(ListTableVersionsResponse {
             versions: table_versions,
@@ -2803,61 +2814,91 @@ impl LanceNamespace for DirectoryNamespace {
                 ),
             })
         })?;
-        let manifest_data = self
+
+        let copy_result = match self
             .object_store
             .inner
-            .get(&staging_path)
+            .copy_if_not_exists(&staging_path, &final_path)
             .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to read staging manifest at '{}': {}",
-                        staging_manifest_path, e
-                    ),
-                })
-            })?
-            .bytes()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to read staging manifest bytes at '{}': {}",
-                        staging_manifest_path, e
-                    ),
-                })
-            })?;
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotImplemented) | Err(ObjectStoreError::NotSupported { .. }) => {
+                let manifest_data = self
+                    .object_store
+                    .inner
+                    .get(&staging_path)
+                    .await
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to read staging manifest at '{}': {}",
+                                staging_manifest_path, e
+                            ),
+                        })
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to read staging manifest bytes at '{}': {}",
+                                staging_manifest_path, e
+                            ),
+                        })
+                    })?;
+                self.object_store
+                    .inner
+                    .put_opts(
+                        &final_path,
+                        manifest_data.into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
 
-        let manifest_size = manifest_data.len() as i64;
-
-        let put_result = self
-            .object_store
-            .inner
-            .put_opts(
-                &final_path,
-                manifest_data.into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => {
-                    lance_core::Error::from(NamespaceError::ConcurrentModification {
+        match copy_result {
+            Ok(()) => {}
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => {
+                return Err(lance_core::Error::from(
+                    NamespaceError::ConcurrentModification {
                         message: format!(
                             "Version {} already exists for table at '{}'",
                             version, table_uri
                         ),
-                    })
-                }
-                _ => lance_core::Error::from(NamespaceError::Internal {
+                    },
+                ));
+            }
+            Err(e) => {
+                return Err(lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
                         "Failed to create version {} for table at '{}': {}",
                         version, table_uri, e
                     ),
-                }),
+                }));
+            }
+        }
+
+        let final_meta = self
+            .object_store
+            .inner
+            .head(&final_path)
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to stat created version {} for table at '{}': {}",
+                        version, table_uri, e
+                    ),
+                })
             })?;
+        let manifest_size = final_meta.size as i64;
 
         // Delete the staging manifest after successful copy
         if let Err(e) = self.object_store.inner.delete(&staging_path).await {
@@ -2879,7 +2920,7 @@ impl LanceNamespace for DirectoryNamespace {
             let metadata_json = serde_json::json!({
                 "manifest_path": final_path.to_string(),
                 "manifest_size": manifest_size,
-                "e_tag": put_result.e_tag,
+                "e_tag": final_meta.e_tag,
                 "naming_scheme": request.naming_scheme.as_deref().unwrap_or("V2"),
             })
             .to_string();
@@ -2909,7 +2950,7 @@ impl LanceNamespace for DirectoryNamespace {
                 version: version as i64,
                 manifest_path: final_path.to_string(),
                 manifest_size: Some(manifest_size),
-                e_tag: put_result.e_tag,
+                e_tag: final_meta.e_tag,
                 timestamp_millis: None,
                 metadata: None,
             })),
@@ -2930,53 +2971,33 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.describe_table_version(&table_id, version).await;
         }
 
-        // Fallback when table_version_storage is not enabled: open the dataset to describe the version
+        // Fallback when table_version_storage is not enabled: inspect physical manifests directly.
         let table_uri = self.resolve_table_location(&request.id).await?;
-
-        // Use DatasetBuilder with storage options to support S3 with custom endpoints
-        let mut builder = DatasetBuilder::from_uri(&table_uri);
-        if let Some(opts) = &self.storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-        if let Some(sess) = &self.session {
-            builder = builder.with_session(sess.clone());
-        }
-        let mut dataset = builder.load().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::TableNotFound {
-                message: format!("Failed to open table at '{}': {:?}", table_uri, e),
-            })
-        })?;
-
-        if let Some(version) = request.version {
-            dataset = dataset
-                .checkout_version(version as u64)
-                .await
-                .map_err(|e| {
+        let versions = self
+            .list_table_versions_from_storage(&table_uri, true, None)
+            .await?;
+        let table_version = if let Some(requested_version) = request.version {
+            versions
+                .into_iter()
+                .find(|version| version.version == requested_version)
+                .ok_or_else(|| {
                     lance_core::Error::from(NamespaceError::TableVersionNotFound {
                         message: format!(
-                            "Failed to checkout version {} for table at '{}': {}",
-                            version, table_uri, e
+                            "version {} for table {}",
+                            requested_version,
+                            Self::format_table_id_from_request(&request.id)
                         ),
                     })
-                })?;
-        }
-
-        let version_info = dataset.version();
-        let manifest_location = dataset.manifest_location();
-        let metadata: std::collections::HashMap<String, String> =
-            version_info.metadata.into_iter().collect();
-
-        let table_version = TableVersion {
-            version: version_info.version as i64,
-            manifest_path: manifest_location.path.to_string(),
-            manifest_size: manifest_location.size.map(|s| s as i64),
-            e_tag: manifest_location.e_tag.clone(),
-            timestamp_millis: Some(version_info.timestamp.timestamp_millis()),
-            metadata: if metadata.is_empty() {
-                None
-            } else {
-                Some(metadata)
-            },
+                })?
+        } else {
+            versions.into_iter().next().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                    message: format!(
+                        "latest version for table {}",
+                        Self::format_table_id_from_request(&request.id)
+                    ),
+                })
+            })?
         };
 
         Ok(DescribeTableVersionResponse {
@@ -7566,13 +7587,14 @@ mod tests {
         );
 
         // Get the path from the response for verification
-        let version_2_path = Path::from(
-            first_result
+        let version_2_path = Path::parse(
+            &first_result
                 .unwrap()
                 .version
                 .expect("response should contain version info")
                 .manifest_path,
-        );
+        )
+        .unwrap();
 
         // Create version 2 again (should fail - conflict)
         let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());

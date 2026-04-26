@@ -488,22 +488,24 @@ impl ManifestNamespace {
     pub(crate) fn construct_full_uri(root: &str, relative_location: &str) -> Result<String> {
         let mut base_url = lance_io::object_store::uri_to_url(root)?;
 
-        // Ensure the base URL has a trailing slash so that URL.join() appends
-        // rather than replaces the last path segment.
-        // Without this fix, "s3://bucket/path/subdir".join("table.lance")
+        // Ensure the base URL has a trailing slash so that path segment mutation
+        // appends rather than replaces the last path segment.
+        // Without this fix, appending "table.lance" to "s3://bucket/path/subdir"
         // would incorrectly produce "s3://bucket/path/table.lance" (missing subdir).
         if !base_url.path().ends_with('/') {
             base_url.set_path(&format!("{}/", base_url.path()));
         }
 
-        let mut full_url = base_url.join(relative_location).map_err(|e| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: format!(
-                    "Failed to join URI '{}' with '{}': {:?}",
-                    root, relative_location, e
-                ),
-            })
-        })?;
+        let mut full_url = base_url.clone();
+        full_url
+            .path_segments_mut()
+            .map_err(|_| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Cannot modify path segments for URI '{}'", root),
+                })
+            })?
+            .pop_if_empty()
+            .push(relative_location);
 
         // Clear any query string to avoid trailing "?" in the URL.
         // Use set_query(None) instead of set_query("") because the latter
@@ -3803,6 +3805,24 @@ mod tests {
         assert_eq!(
             query_param_result, "s3://bucket/path/table.lance",
             "URL with query parameters should have them stripped"
+        );
+    }
+
+    #[test]
+    fn test_construct_full_uri_with_dollar_sign() {
+        let result =
+            ManifestNamespace::construct_full_uri("/tmp/root", "hash_workspace$test_table")
+                .unwrap();
+
+        assert!(
+            result.ends_with("/tmp/root/hash_workspace$test_table"),
+            "local file URI should preserve dollar signs without adding empty path segments: {}",
+            result
+        );
+        assert!(
+            !result.contains("//hash_workspace$test_table"),
+            "local file URI should not add a double slash before table directory: {}",
+            result
         );
     }
 
