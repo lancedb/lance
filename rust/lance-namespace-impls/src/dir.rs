@@ -4216,6 +4216,22 @@ mod tests {
         create_ipc_data_from_batches(schema, vec![batch])
     }
 
+    fn create_single_row_test_ipc_data() -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(convert_json_arrow_schema(&create_test_schema()).unwrap());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec![Some("carol")])),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
     /// Helper to create a simple test schema
     fn create_test_schema() -> JsonArrowSchema {
         let int_type = JsonArrowDataType::new("int32".to_string());
@@ -6440,6 +6456,7 @@ mod tests {
 
         let mut create_req = CreateTableRequest::new();
         create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("Overwrite".to_string());
         let response = namespace
             .create_table(
                 create_req,
@@ -6449,13 +6466,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.version, Some(1));
-        assert_eq!(
-            response
-                .properties
-                .as_ref()
-                .and_then(|properties| properties.get("owner")),
-            Some(&"alice".to_string())
-        );
+        assert!(response.properties.is_none());
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
@@ -6516,6 +6527,164 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot set properties for already declared table")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_manifest_exist_ok_keeps_existing_table() {
+        use lance_namespace::models::{CreateTableRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("ExistOk".to_string());
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "bob".to_string())]));
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_single_row_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.properties.is_none());
+        assert_eq!(
+            open_dataset(&namespace, "test_table")
+                .await
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_manifest_overwrite_replaces_existing_table() {
+        use lance_namespace::models::{CreateTableRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("overwrite".to_string());
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "bob".to_string())]));
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_single_row_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, Some(2));
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"bob".to_string())
+        );
+        assert_eq!(
+            open_dataset(&namespace, "test_table")
+                .await
+                .count_rows(None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"bob".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_manifest_invalid_mode_rejected() {
+        use lance_namespace::models::CreateTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("append".to_string());
+        let result = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported create_table mode")
         );
     }
 

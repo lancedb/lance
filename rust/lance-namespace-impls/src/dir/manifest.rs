@@ -15,8 +15,8 @@ use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, stream::StreamExt};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{
-    DeleteBuilder, MergeInsertBuilder, ReadParams, WhenMatched, WhenNotMatched, WriteParams,
-    builder::DatasetBuilder,
+    DeleteBuilder, MergeInsertBuilder, ReadParams, WhenMatched, WhenNotMatched, WriteMode,
+    WriteParams, builder::DatasetBuilder,
 };
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
@@ -94,6 +94,43 @@ impl ObjectType {
                 message: format!("Invalid object type: {}", s),
             }
             .into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateTableMode {
+    Create,
+    ExistOk,
+    Overwrite,
+}
+
+impl CreateTableMode {
+    fn parse(mode: Option<&str>) -> Result<Self> {
+        match mode {
+            None => Ok(Self::Create),
+            Some(mode) if mode.eq_ignore_ascii_case("create") => Ok(Self::Create),
+            Some(mode)
+                if mode.eq_ignore_ascii_case("existok")
+                    || mode.eq_ignore_ascii_case("exist_ok") =>
+            {
+                Ok(Self::ExistOk)
+            }
+            Some(mode) if mode.eq_ignore_ascii_case("overwrite") => Ok(Self::Overwrite),
+            Some(mode) => Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Unsupported create_table mode '{}'. Supported modes are: 'Create', 'ExistOk', 'Overwrite'",
+                    mode
+                ),
+            }
+            .into()),
+        }
+    }
+
+    fn write_mode(self) -> WriteMode {
+        match self {
+            Self::Overwrite => WriteMode::Overwrite,
+            Self::Create | Self::ExistOk => WriteMode::Create,
         }
     }
 }
@@ -962,6 +999,25 @@ impl ManifestNamespace {
         entries: Vec<ManifestEntry>,
         base_objects: Option<Vec<String>>,
     ) -> Result<()> {
+        self.merge_into_manifest_with_metadata(entries, base_objects, WhenMatched::Fail)
+            .await
+    }
+
+    async fn upsert_into_manifest_with_metadata(
+        &self,
+        entries: Vec<ManifestEntry>,
+        base_objects: Option<Vec<String>>,
+    ) -> Result<()> {
+        self.merge_into_manifest_with_metadata(entries, base_objects, WhenMatched::UpdateAll)
+            .await
+    }
+
+    async fn merge_into_manifest_with_metadata(
+        &self,
+        entries: Vec<ManifestEntry>,
+        base_objects: Option<Vec<String>>,
+        when_matched: WhenMatched,
+    ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -1033,7 +1089,7 @@ impl ManifestNamespace {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        // Use MergeInsert to ensure uniqueness on object_id
+        // Use MergeInsert so callers can choose fail-on-existing inserts or metadata upserts.
         let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset_arc = Arc::new(dataset_guard.clone());
@@ -1047,13 +1103,9 @@ impl ManifestNamespace {
                     })
                 },
             )?;
-        merge_builder.when_matched(WhenMatched::Fail);
+        merge_builder.when_matched(when_matched);
         merge_builder.when_not_matched(WhenNotMatched::InsertAll);
         // Use conflict_retries to handle cross-process races on manifest mutations.
-        // When two processes concurrently insert the same object_id, the second one
-        // hits a commit conflict. With conflict_retries > 0, the retry re-evaluates
-        // the full MergeInsert plan against the latest data, where the join detects
-        // the existing row and WhenMatched::Fail fires, producing a clear error.
         merge_builder.conflict_retries(5);
         // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
         // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
@@ -2038,28 +2090,13 @@ impl LanceNamespace for ManifestNamespace {
                             ..Default::default()
                         })
                     }
-                    Err(err) => {
-                        if Self::is_not_found_load_error(&err) && is_only_declared == Some(true) {
-                            Ok(DescribeTableResponse {
-                                table: Some(table_name),
-                                namespace: Some(namespace_id),
-                                location: Some(table_uri.clone()),
-                                table_uri: Some(table_uri),
-                                storage_options,
-                                properties: info.metadata,
-                                is_only_declared,
-                                ..Default::default()
-                            })
-                        } else {
-                            Err(NamespaceError::Internal {
-                                message: format!(
-                                    "Table exists in manifest but failed to load dataset '{}': {}",
-                                    object_id, err
-                                ),
-                            }
-                            .into())
-                        }
+                    Err(err) => Err(NamespaceError::Internal {
+                        message: format!(
+                            "Table exists in manifest but failed to load dataset '{}': {}",
+                            object_id, err
+                        ),
                     }
+                    .into()),
                 }
             }
             None => Err(NamespaceError::TableNotFound {
@@ -2126,13 +2163,6 @@ impl LanceNamespace for ManifestNamespace {
             None
         };
 
-        if existing_has_manifests == Some(true) {
-            return Err(NamespaceError::TableAlreadyExists {
-                message: table_name.clone(),
-            }
-            .into());
-        }
-
         if existing_has_manifests == Some(false)
             && request
                 .properties
@@ -2148,6 +2178,11 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
+        let create_mode = if existing_has_manifests == Some(false) {
+            CreateTableMode::Create
+        } else {
+            CreateTableMode::parse(request.mode.as_deref())?
+        };
         let dir_name = if let Some(existing_table) = &existing_table {
             existing_table.location.clone()
         } else if namespace.is_empty() && self.dir_listing_enabled {
@@ -2156,6 +2191,28 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
+        let overwriting_existing_table =
+            existing_has_manifests == Some(true) && create_mode == CreateTableMode::Overwrite;
+
+        if existing_has_manifests == Some(true) {
+            match create_mode {
+                CreateTableMode::Create => {
+                    return Err(NamespaceError::TableAlreadyExists {
+                        message: table_name.clone(),
+                    }
+                    .into());
+                }
+                CreateTableMode::ExistOk => {
+                    return Ok(CreateTableResponse {
+                        location: Some(table_uri),
+                        storage_options: self.storage_options.clone(),
+                        properties: None,
+                        ..Default::default()
+                    });
+                }
+                CreateTableMode::Overwrite => {}
+            }
+        }
 
         // Validate that request_data is provided
         if data.is_empty() {
@@ -2209,48 +2266,73 @@ impl LanceNamespace for ManifestNamespace {
             ..Default::default()
         };
         let write_params = WriteParams {
+            mode: create_mode.write_mode(),
             session: self.session.clone(),
             store_params: Some(store_params),
             ..Default::default()
         };
-        let _dataset = Dataset::write(Box::new(reader), &table_uri, Some(write_params))
+        let dataset = Dataset::write(Box::new(reader), &table_uri, Some(write_params))
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to write dataset: {:?}", e),
                 })
             })?;
+        let version = dataset.version().version as i64;
 
-        match existing_table {
-            Some(existing_table) => Ok(CreateTableResponse {
-                version: Some(1),
+        if overwriting_existing_table {
+            let metadata =
+                Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
+            self.upsert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id,
+                    object_type: ObjectType::Table,
+                    location: Some(dir_name),
+                    metadata,
+                }],
+                None,
+            )
+            .await?;
+
+            Ok(CreateTableResponse {
+                version: Some(version),
                 location: Some(table_uri),
                 storage_options: self.storage_options.clone(),
-                properties: existing_table.metadata,
+                properties: request.properties,
                 ..Default::default()
-            }),
-            None => {
-                let metadata =
-                    Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
-                // Register in manifest (store dir_name, not full URI)
-                self.insert_into_manifest_with_metadata(
-                    vec![ManifestEntry {
-                        object_id,
-                        object_type: ObjectType::Table,
-                        location: Some(dir_name.clone()),
-                        metadata,
-                    }],
-                    None,
-                )
-                .await?;
-
-                Ok(CreateTableResponse {
-                    version: Some(1),
+            })
+        } else {
+            match existing_table {
+                Some(_) => Ok(CreateTableResponse {
+                    version: Some(version),
                     location: Some(table_uri),
                     storage_options: self.storage_options.clone(),
-                    properties: request.properties,
+                    properties: None,
                     ..Default::default()
-                })
+                }),
+                None => {
+                    let metadata =
+                        Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
+                    // Register in manifest (store dir_name, not full URI)
+                    self.insert_into_manifest_with_metadata(
+                        vec![ManifestEntry {
+                            object_id,
+                            object_type: ObjectType::Table,
+                            location: Some(dir_name.clone()),
+                            metadata,
+                        }],
+                        None,
+                    )
+                    .await?;
+
+                    Ok(CreateTableResponse {
+                        version: Some(version),
+                        location: Some(table_uri),
+                        storage_options: self.storage_options.clone(),
+                        properties: request.properties,
+                        ..Default::default()
+                    })
+                }
             }
         }
     }
