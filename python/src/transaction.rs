@@ -299,6 +299,17 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
+                    updated_row_offsets: ob
+                        .getattr("updated_row_offsets")
+                        .ok()
+                        .and_then(|attr| {
+                            if attr.is_none() {
+                                None
+                            } else {
+                                attr.extract::<std::collections::HashMap<u64, Vec<u32>>>()
+                                    .ok()
+                            }
+                        }),
                 };
                 Ok(Self(op))
             }
@@ -450,6 +461,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_modified,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                updated_row_offsets,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -467,6 +479,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     },
                     None => "rewrite_rows",
                 };
+                let updated_row_offsets_py = match updated_row_offsets {
+                    Some(map) => {
+                        let dict = pyo3::types::PyDict::new(py);
+                        for (frag_id, offsets) in map {
+                            dict.set_item(frag_id, offsets)?;
+                        }
+                        dict.into_any()
+                    }
+                    None => py.None().into_bound(py),
+                };
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -477,6 +499,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_modified,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    updated_row_offsets_py,
                 ))
             }
             Operation::DataReplacement { replacements } => {

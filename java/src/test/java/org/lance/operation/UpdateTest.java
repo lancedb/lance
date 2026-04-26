@@ -36,11 +36,16 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class UpdateTest extends OperationTestBase {
 
@@ -200,6 +205,323 @@ public class UpdateTest extends OperationTestBase {
             assertEquals(expectNames, actualNames);
             assertEquals(expectTimeStamps, actualTimeStamps);
           }
+        }
+      }
+    }
+  }
+
+
+  @Test
+  void testUpdateColumnsReturnsMatchedOffsets(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testUpdateColumnsMatchedOffsets").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.UpdateColumnTestDataset testDataset =
+          new TestUtils.UpdateColumnTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 6;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(appendTxn)) {
+          assertEquals(rowCount, ds.countRows());
+        }
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+      Fragment targetFragment = dataset.getFragments().get(0);
+      int updateRowCount = 4;
+      FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
+
+      // Verify matchedOffsets is populated
+      long[] matchedOffsets = updateResult.getMatchedOffsets();
+      assertNotNull(matchedOffsets, "matchedOffsets should not be null");
+      // The update sends _rowid [0,1,2,3] for a 6-row fragment.
+      // Rows 0,1,2,3 all exist, so all 4 should be matched.
+      assertTrue(matchedOffsets.length > 0, "matchedOffsets should not be empty");
+      assertEquals(updateRowCount, matchedOffsets.length,
+          "All update rows should match");
+    }
+  }
+
+  @Test
+  void testUpdateWithUpdatedRowOffsets(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testUpdateWithOffsets").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.UpdateColumnTestDataset testDataset =
+          new TestUtils.UpdateColumnTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 6;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(appendTxn)) {
+          assertEquals(rowCount, ds.countRows());
+        }
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+      Fragment targetFragment = dataset.getFragments().get(0);
+      int updateRowCount = 4;
+      FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
+
+      // Build updatedRowOffsets map from matchedOffsets
+      long fragmentId = dataset.getFragments().get(0).getId();
+      long[] matchedOffsets = updateResult.getMatchedOffsets();
+      Map<Long, long[]> offsetsMap = new HashMap<>();
+      offsetsMap.put(fragmentId, matchedOffsets);
+
+      // Commit with updatedRowOffsets via RewriteColumns mode
+      try (Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Update.builder()
+                      .updatedFragments(
+                          Collections.singletonList(updateResult.getUpdatedFragment()))
+                      .fieldsModified(updateResult.getFieldsModified())
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
+                      .updatedRowOffsets(Optional.of(offsetsMap))
+                      .build())
+              .build()) {
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(updateTxn)) {
+          assertEquals(3, ds.version());
+          assertEquals(rowCount, ds.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testUpdateBuilderDefaultsEmptyOffsets() {
+    // Verify builder default is Optional.empty()
+    Update update = Update.builder()
+        .removedFragmentIds(Collections.emptyList())
+        .build();
+    assertEquals(Optional.empty(), update.updatedRowOffsets());
+  }
+
+  @Test
+  void testUpdateBuilderWithOffsets() {
+    Map<Long, long[]> offsets = new HashMap<>();
+    offsets.put(1L, new long[]{0, 2, 4});
+    offsets.put(2L, new long[]{1, 3, 5});
+
+    Update update = Update.builder()
+        .removedFragmentIds(Collections.emptyList())
+        .updateMode(Optional.of(UpdateMode.RewriteColumns))
+        .updatedRowOffsets(Optional.of(offsets))
+        .build();
+
+    assertTrue(update.updatedRowOffsets().isPresent());
+    Map<Long, long[]> got = update.updatedRowOffsets().get();
+    assertEquals(2, got.size());
+    assertArrayEquals(new long[]{0, 2, 4}, got.get(1L));
+    assertArrayEquals(new long[]{1, 3, 5}, got.get(2L));
+  }
+
+  /**
+   * Backward compatibility: old Java code builds Update without updatedRowOffsets.
+   * The builder default is Optional.empty(), and commit should succeed without offsets.
+   * This is the RewriteRows path where offsets are not needed.
+   */
+  @Test
+  void testBackwardCompatUpdateWithoutOffsets_RewriteRows(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testBackwardCompatRewriteRows").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        dataset = new CommitBuilder(this.dataset).execute(appendTxn);
+      }
+
+      // Old-style Update: no updatedRowOffsets parameter at all
+      int newRowCount = 30;
+      FragmentMetadata newFragment = testDataset.createNewFragment(newRowCount);
+      try (Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Update.builder()
+                      .removedFragmentIds(
+                          Collections.singletonList(
+                              Long.valueOf(dataset.getFragments().get(0).getId())))
+                      .newFragments(Collections.singletonList(newFragment))
+                      .updateMode(Optional.of(UpdateMode.RewriteRows))
+                      // no .updatedRowOffsets() call — old code never set this
+                      .build())
+              .build()) {
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(updateTxn)) {
+          assertEquals(3, ds.version());
+          assertEquals(newRowCount, ds.countRows());
+        }
+      }
+    }
+  }
+
+  /**
+   * Backward compatibility: old Java code builds Update with RewriteColumns mode
+   * but without updatedRowOffsets. This was the only available path before the
+   * offsets feature was added. Commit should still succeed.
+   */
+  @Test
+  void testBackwardCompatUpdateWithoutOffsets_RewriteColumns(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("testBackwardCompatRewriteColumns").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.UpdateColumnTestDataset testDataset =
+          new TestUtils.UpdateColumnTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 6;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        dataset = new CommitBuilder(this.dataset).execute(appendTxn);
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+      Fragment targetFragment = dataset.getFragments().get(0);
+      int updateRowCount = 4;
+      FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
+
+      // Old-style commit: RewriteColumns but without updatedRowOffsets
+      try (Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Update.builder()
+                      .updatedFragments(
+                          Collections.singletonList(updateResult.getUpdatedFragment()))
+                      .fieldsModified(updateResult.getFieldsModified())
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
+                      // no .updatedRowOffsets() — old code path
+                      .build())
+              .build()) {
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(updateTxn)) {
+          assertEquals(3, ds.version());
+          assertEquals(rowCount, ds.countRows());
+        }
+      }
+    }
+  }
+
+  /**
+   * Backward compatibility: old Java code builds Update without updateMode at all.
+   * This was the default before UpdateMode was introduced.
+   */
+  @Test
+  void testBackwardCompatUpdateWithoutUpdateMode(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testBackwardCompatNoMode").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        dataset = new CommitBuilder(this.dataset).execute(appendTxn);
+      }
+
+      int newRowCount = 30;
+      FragmentMetadata newFragment = testDataset.createNewFragment(newRowCount);
+      // Old-style: no updateMode, no updatedRowOffsets
+      try (Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Update.builder()
+                      .removedFragmentIds(
+                          Collections.singletonList(
+                              Long.valueOf(dataset.getFragments().get(0).getId())))
+                      .newFragments(Collections.singletonList(newFragment))
+                      // no .updateMode() — defaults to Optional.empty()
+                      // no .updatedRowOffsets() — defaults to Optional.empty()
+                      .build())
+              .build()) {
+        assertEquals(Optional.empty(), ((Update) updateTxn.getOperation()).updateMode());
+        assertEquals(Optional.empty(), ((Update) updateTxn.getOperation()).updatedRowOffsets());
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(updateTxn)) {
+          assertEquals(3, ds.version());
+          assertEquals(newRowCount, ds.countRows());
+        }
+      }
+    }
+  }
+
+  /**
+   * Backward compatibility: explicitly passing Optional.empty() for updatedRowOffsets
+   * should behave identically to not setting it at all.
+   */
+  @Test
+  void testBackwardCompatExplicitEmptyOffsets(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testExplicitEmptyOffsets").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.UpdateColumnTestDataset testDataset =
+          new TestUtils.UpdateColumnTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 6;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        dataset = new CommitBuilder(this.dataset).execute(appendTxn);
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+      Fragment targetFragment = dataset.getFragments().get(0);
+      int updateRowCount = 4;
+      FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
+
+      // Explicitly pass Optional.empty() — same as not calling the method
+      try (Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Update.builder()
+                      .updatedFragments(
+                          Collections.singletonList(updateResult.getUpdatedFragment()))
+                      .fieldsModified(updateResult.getFieldsModified())
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
+                      .updatedRowOffsets(Optional.empty())
+                      .build())
+              .build()) {
+        assertEquals(Optional.empty(), ((Update) updateTxn.getOperation()).updatedRowOffsets());
+        try (Dataset ds = new CommitBuilder(this.dataset).execute(updateTxn)) {
+          assertEquals(3, ds.version());
+          assertEquals(rowCount, ds.countRows());
         }
       }
     }

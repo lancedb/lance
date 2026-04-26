@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
+use roaring::RoaringBitmap;
+
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
@@ -1601,12 +1603,38 @@ impl FileFragment {
         Ok(self)
     }
 
+    /// If you need to opt out of offset tracking to save memory, use
+    /// [`update_columns_with_tracking`] with `track_matched_offsets = false`.
     pub async fn update_columns(
         &mut self,
         right_stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-    ) -> Result<(Fragment, Vec<u32>)> {
+    ) -> Result<(Fragment, Vec<u32>, Option<RoaringBitmap>)> {
+        self.update_columns_impl(right_stream, left_on, right_on, true)
+            .await
+    }
+
+
+    pub async fn update_columns_with_tracking(
+        &mut self,
+        right_stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        track_matched_offsets: bool,
+    ) -> Result<(Fragment, Vec<u32>, Option<RoaringBitmap>)> {
+        self.update_columns_impl(right_stream, left_on, right_on, track_matched_offsets)
+            .await
+    }
+
+    /// Internal implementation of update_columns with configurable offset tracking.
+    async fn update_columns_impl(
+        &mut self,
+        right_stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        track_matched_offsets: bool,
+    ) -> Result<(Fragment, Vec<u32>, Option<RoaringBitmap>)> {
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(format!(
                 "Column {} does not exist in the left side fragment",
@@ -1655,11 +1683,35 @@ impl FileFragment {
             .await?;
         // Hash join
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
+        let mut matched_bitmap: Option<RoaringBitmap> = if track_matched_offsets {
+            Some(RoaringBitmap::new())
+        } else {
+            None
+        };
+        let mut physical_offset: u32 = 0;
         while let Some(batch) = updater.next().await? {
-            let updated_batch = joiner
-                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset())
-                .await?;
-            updater.update(updated_batch).await?;
+            let batch_len = batch.num_rows() as u32;
+            if track_matched_offsets {
+                let (updated_batch, batch_matched) = joiner
+                    .collect_with_fallback_reporting(
+                        batch,
+                        batch[left_on].clone(),
+                        self.dataset(),
+                    )
+                    .await?;
+                if let Some(ref mut bm) = matched_bitmap {
+                    for local_idx in batch_matched {
+                        bm.insert(physical_offset + local_idx);
+                    }
+                }
+                updater.update(updated_batch).await?;
+                physical_offset += batch_len;
+            } else {
+                let updated_batch = joiner
+                    .collect_with_fallback(batch, batch[left_on].clone(), self.dataset())
+                    .await?;
+                updater.update(updated_batch).await?;
+            }
         }
 
         let mut updated_fragment = updater.finish().await?;
@@ -1689,7 +1741,7 @@ impl FileFragment {
             .filter_map(|&i| u32::try_from(i).ok())
             .collect();
         // Note: updated field should be returned when committing, waiting to be done
-        Ok((updated_fragment, updated_fields))
+        Ok((updated_fragment, updated_fields, matched_bitmap))
     }
 
     /// Append new columns to the fragment
@@ -2850,7 +2902,7 @@ mod tests {
             vec![Ok(update_batch1)].into_iter(),
             schema1,
         ));
-        let (updated_fragment1, fields_modified1) = fragment1
+        let (updated_fragment1, fields_modified1, _matched_offsets1) = fragment1
             .update_columns(right_stream1, ROW_ID, ROW_ID)
             .await
             .unwrap();
@@ -2863,6 +2915,7 @@ mod tests {
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
+            updated_row_offsets: None,
         };
         let mut dataset1 = Dataset::commit(
             test_uri,
@@ -2923,7 +2976,7 @@ mod tests {
             vec![Ok(update_batch2)].into_iter(),
             schema2,
         ));
-        let (updated_fragment2, fields_modified2) = fragment2
+        let (updated_fragment2, fields_modified2, _matched_offsets2) = fragment2
             .update_columns(right_stream2, "i", "i1")
             .await
             .unwrap();
@@ -2936,6 +2989,7 @@ mod tests {
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
+            updated_row_offsets: None,
         };
         let dataset2 = Dataset::commit(
             test_uri,
@@ -3631,7 +3685,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let batch = concat_batches(&schema, &batches).unwrap();
+        let batch = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
 
         let mut row_id: i32 = 0;
         let mut i: usize = 0;
@@ -3982,5 +4036,232 @@ mod tests {
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_update_columns_returns_matched_offsets() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset_v2(test_uri).await;
+
+        let _ = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
+                None,
+                None,
+            )
+            .await;
+        let mut fragment = dataset.get_fragment(0).unwrap();
+
+        // Fragment 0 has rows with i = 0..40
+        // Update only even rows (0, 2, 4, ..., 38) via ROW_ID join
+        let row_ids: Vec<u64> = (0..40u64).filter(|v| v % 2 == 0).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(row_ids.clone())),
+                Arc::new(Int64Array::from(vec![42i64; 20])),
+            ],
+        )
+            .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)].into_iter(),
+            schema,
+        ));
+
+        let (_updated_fragment, _fields_modified, matched_offsets) = fragment
+            .update_columns(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+
+        // update_columns always tracks offsets (hardcoded true)
+        let bitmap = matched_offsets.expect("update_columns should always return Some(bitmap)");
+        let matched: Vec<u32> = bitmap.iter().collect();
+        // Even row indices: 0, 2, 4, ..., 38
+        let expected: Vec<u32> = (0..40u32).filter(|v| v % 2 == 0).collect();
+        assert_eq!(matched, expected);
+    }
+
+    #[tokio::test]
+    async fn test_update_columns_large_offsets_bitmap_encoding() {
+        // Create a dataset with a single fragment containing >5000 rows to
+        // exercise the RoaringBitmap path (proto serialization uses bitmap
+        // encoding when offsets.len() > 5000).
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let num_rows: i32 = 8000;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+            .unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: num_rows as usize, // single fragment
+            max_rows_per_group: 1024,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        // Add a column to update
+        let _ = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
+                None,
+                None,
+            )
+            .await;
+        let mut fragment = dataset.get_fragment(0).unwrap();
+
+        // Update 6000 rows (offsets 0..6000) — exceeds the 5000 threshold
+        let update_count = 6000usize;
+        let row_ids: Vec<u64> = (0..update_count as u64).collect();
+        let update_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(Int64Array::from(vec![42i64; update_count])),
+            ],
+        )
+            .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)].into_iter(),
+            update_schema,
+        ));
+
+        let (updated_fragment, fields_modified, matched_offsets) = fragment
+            .update_columns(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+
+        // ---- Verify the RoaringBitmap returned by update_columns ----
+        let bitmap = matched_offsets.expect("should always return Some(bitmap)");
+        assert_eq!(bitmap.len(), update_count as u64);
+        let matched: Vec<u32> = bitmap.iter().collect();
+        let expected: Vec<u32> = (0..update_count as u32).collect();
+        assert_eq!(matched, expected);
+
+        // ---- Verify protobuf round-trip uses bitmap encoding for >5000 offsets ----
+        use crate::dataset::transaction::{Operation, UpdateMode};
+        use lance_table::format::pb;
+        use std::collections::HashMap;
+
+        let mut offsets_map = HashMap::new();
+        offsets_map.insert(
+            updated_fragment.id,
+            bitmap.iter().collect::<Vec<u32>>(),
+        );
+        let op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![updated_fragment],
+            new_fragments: vec![],
+            fields_modified,
+            merged_generations: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_row_offsets: Some(offsets_map.clone()),
+        };
+
+        let txn = crate::dataset::transaction::Transaction {
+            read_version: dataset.version().version,
+            uuid: uuid::Uuid::new_v4().to_string(),
+            operation: op,
+            tag: None,
+            transaction_properties: None,
+        };
+
+        // Serialize to protobuf and verify bitmap encoding is used
+        let pb_txn: pb::Transaction = pb::Transaction::from(&txn);
+        if let Some(pb::transaction::Operation::Update(ref update)) = pb_txn.operation {
+            assert_eq!(update.updated_row_offsets.len(), 1);
+            let fro = &update.updated_row_offsets[0];
+            assert!(
+                matches!(
+                    fro.offsets,
+                    Some(pb::transaction::fragment_row_offsets::Offsets::Bitmap(_))
+                ),
+                "Expected bitmap encoding for >5000 offsets, got array encoding"
+            );
+        } else {
+            panic!("Expected Update operation in protobuf");
+        }
+
+        // Deserialize back and verify offsets are preserved
+        let round_tripped =
+            crate::dataset::transaction::Transaction::try_from(pb_txn).unwrap();
+        if let Operation::Update {
+            updated_row_offsets: Some(rt_map),
+            ..
+        } = &round_tripped.operation
+        {
+            let (_, rt_offsets) = rt_map.iter().next().unwrap();
+            assert_eq!(rt_offsets.len(), update_count);
+            assert_eq!(*rt_offsets, expected);
+        } else {
+            panic!("Expected Update with Some(updated_row_offsets)");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_columns_with_tracking_false_returns_none() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset_v2(test_uri).await;
+
+        let _ = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
+                None,
+                None,
+            )
+            .await;
+        let mut fragment = dataset.get_fragment(0).unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("col1", DataType::Int64, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+                Arc::new(Int64Array::from(vec![99i64; 3])),
+            ],
+        )
+            .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)].into_iter(),
+            schema,
+        ));
+
+        let (_updated_fragment, _fields_modified, matched_offsets) = fragment
+            .update_columns_with_tracking(right_stream, ROW_ID, ROW_ID, false)
+            .await
+            .unwrap();
+
+        assert!(
+            matched_offsets.is_none(),
+            "update_columns_with_tracking(false) should return None"
+        );
     }
 }

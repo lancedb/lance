@@ -222,6 +222,12 @@ pub enum Operation {
         /// Optional filter for detecting conflicts on inserted row keys.
         /// Only tracks keys from INSERT operations during merge insert, not updates.
         inserted_rows_filter: Option<KeyExistenceFilter>,
+        /// Optional per-fragment map of updated row offsets (physical row indices within each fragment).
+        /// Used for RewriteColumns mode to selectively update `_row_last_updated_at_version`.
+        /// Key: fragment ID, Value: sorted local physical row offsets that were updated.
+        /// Callers can construct this from `RoaringBitmap` via `.iter().collect()`.
+        /// If None, all rows in updated_fragments are assumed to be updated (or caller already set metadata).
+        updated_row_offsets: Option<HashMap<u64, Vec<u32>>>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -421,6 +427,7 @@ impl PartialEq for Operation {
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
                     inserted_rows_filter: a_inserted_rows_filter,
+                    updated_row_offsets: a_updated_row_offsets,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
@@ -431,6 +438,7 @@ impl PartialEq for Operation {
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
                     inserted_rows_filter: b_inserted_rows_filter,
+                    updated_row_offsets: b_updated_row_offsets,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
@@ -444,6 +452,7 @@ impl PartialEq for Operation {
                     )
                     && a_update_mode == b_update_mode
                     && a_inserted_rows_filter == b_inserted_rows_filter
+                    && a_updated_row_offsets == b_updated_row_offsets
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1667,13 +1676,14 @@ impl Transaction {
                 merged_generations,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                updated_row_offsets,
                 ..
             } => {
                 // Extract existing fragments once for reuse
                 let existing_fragments = maybe_existing_fragments?;
 
                 // Apply updates to existing fragments
-                let updated_frags: Vec<Fragment> = existing_fragments
+                let mut updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
                         if removed_fragment_ids.contains(&f.id) {
@@ -1691,8 +1701,30 @@ impl Transaction {
                 // Note: We don't update version metadata for fragments with deletion vectors
                 // because the version sequences are indexed by physical row position, not logical position.
                 // Version metadata for deleted rows will be filtered out during scan using the deletion vector.
-                if next_row_id.is_some() {
-                    // Version metadata will be properly set during compaction when deletions are materialized
+                // For RewriteColumns mode with stable row IDs, selectively update
+                // _row_last_updated_at_version for only the matched rows in each fragment.
+                if next_row_id.is_some() && update_mode == &Some(UpdateMode::RewriteColumns) {
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    let prev_version = current_manifest.map(|m| m.version).unwrap_or(0);
+
+                    if let Some(offsets_map) = updated_row_offsets {
+                        for frag in updated_frags.iter_mut() {
+                            if let Some(offsets) = offsets_map.get(&frag.id) {
+                                // Selectively refresh only matched rows
+                                let offsets_usize: Vec<usize> =
+                                    offsets.iter().map(|o| *o as usize).collect();
+                                lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                                    frag,
+                                    &offsets_usize,
+                                    new_version,
+                                    prev_version,
+                                )?;
+                            }
+                            // Fragments not in the map: don't touch their version metadata (guard)
+                        }
+                    }
+                    // If updated_row_offsets is None, the caller (e.g., merge_insert) has already
+                    // set version metadata directly on the fragments before constructing the operation.
                 }
 
                 final_fragments.extend(updated_frags);
@@ -2857,6 +2889,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows,
+                updated_row_offsets,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2881,6 +2914,28 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows_filter: inserted_rows
                     .map(|ik| KeyExistenceFilter::try_from(&ik))
                     .transpose()?,
+                updated_row_offsets: if updated_row_offsets.is_empty() {
+                    None
+                } else {
+                    Some(
+                        updated_row_offsets
+                            .into_iter()
+                            .map(|fro| {
+                                let offsets: Vec<u32> = match fro.offsets {
+                                    Some(pb::transaction::fragment_row_offsets::Offsets::Array(arr)) => {
+                                        arr.offsets
+                                    }
+                                    Some(pb::transaction::fragment_row_offsets::Offsets::Bitmap(buf)) => {
+                                        let bitmap = RoaringBitmap::deserialize_from(&buf[..]).unwrap();
+                                        bitmap.iter().collect()
+                                    }
+                                    None => Vec::new(),
+                                };
+                                (fro.fragment_id, offsets)
+                            })
+                            .collect(),
+                    )
+                },
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -3183,6 +3238,7 @@ impl From<&Transaction> for pb::Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
+                updated_row_offsets,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -3204,6 +3260,33 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or(0),
                 inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
+                updated_row_offsets: updated_row_offsets
+                    .as_ref()
+                    .map(|map| {
+                        map.iter()
+                            .map(|(frag_id, offsets)| {
+                                // Use bitmap encoding when dense (>5000 offsets),
+                                // array encoding when sparse.
+                                let proto_offsets = if offsets.len() > 5000 {
+                                    let bitmap: RoaringBitmap = offsets.iter().copied().collect();
+                                    let mut buf = Vec::new();
+                                    bitmap.serialize_into(&mut buf).unwrap();
+                                    Some(pb::transaction::fragment_row_offsets::Offsets::Bitmap(buf))
+                                } else {
+                                    Some(pb::transaction::fragment_row_offsets::Offsets::Array(
+                                        pb::transaction::FragmentRowOffsetArray {
+                                            offsets: offsets.iter().copied().collect(),
+                                        },
+                                    ))
+                                };
+                                pb::transaction::FragmentRowOffsets {
+                                    fragment_id: *frag_id,
+                                    offsets: proto_offsets,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
@@ -4526,5 +4609,174 @@ mod tests {
         // This should succeed — the old manifest's LEGACY format should not
         // cause strict validation of the new STABLE fragments.
         validate_operation(Some(&legacy_manifest), &operation).unwrap();
+    }
+
+    #[test]
+    fn test_updated_row_offsets_pb_roundtrip_array_encoding() {
+        // Small number of offsets -> array encoding
+        let mut offsets_map = HashMap::new();
+        offsets_map.insert(1u64, vec![0u32, 5, 10]);
+        offsets_map.insert(3u64, vec![2u32, 7]);
+
+        let transaction = Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(1), Fragment::new(3)],
+                new_fragments: vec![],
+                fields_modified: vec![1],
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_row_offsets: Some(offsets_map.clone()),
+            },
+            tag: None,
+            transaction_properties: None,
+        };
+
+        let pb_txn: pb::Transaction = pb::Transaction::from(&transaction);
+        let round_tripped = Transaction::try_from(pb_txn).unwrap();
+
+        assert_eq!(transaction.operation, round_tripped.operation);
+        if let Operation::Update {
+            updated_row_offsets,
+            ..
+        } = &round_tripped.operation
+        {
+            let got = updated_row_offsets.as_ref().unwrap();
+            assert_eq!(got.get(&1u64).unwrap(), &vec![0u32, 5, 10]);
+            assert_eq!(got.get(&3u64).unwrap(), &vec![2u32, 7]);
+        } else {
+            panic!("Expected Operation::Update");
+        }
+    }
+
+    #[test]
+    fn test_updated_row_offsets_pb_roundtrip_bitmap_encoding() {
+        // >5000 offsets -> bitmap encoding
+        let large_offsets: Vec<u32> = (0..6000).collect();
+        let mut offsets_map = HashMap::new();
+        offsets_map.insert(42u64, large_offsets.clone());
+
+        let transaction = Transaction {
+            read_version: 2,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(42)],
+                new_fragments: vec![],
+                fields_modified: vec![1],
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_row_offsets: Some(offsets_map),
+            },
+            tag: None,
+            transaction_properties: None,
+        };
+
+        let pb_txn: pb::Transaction = pb::Transaction::from(&transaction);
+        let round_tripped = Transaction::try_from(pb_txn).unwrap();
+
+        if let Operation::Update {
+            updated_row_offsets,
+            ..
+        } = &round_tripped.operation
+        {
+            let got = updated_row_offsets.as_ref().unwrap();
+            assert_eq!(got.get(&42u64).unwrap(), &large_offsets);
+        } else {
+            panic!("Expected Operation::Update");
+        }
+    }
+
+    #[test]
+    fn test_updated_row_offsets_none_roundtrip() {
+        let transaction = Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(0)],
+                new_fragments: vec![],
+                fields_modified: vec![1],
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_row_offsets: None,
+            },
+            tag: None,
+            transaction_properties: None,
+        };
+
+        let pb_txn: pb::Transaction = pb::Transaction::from(&transaction);
+        let round_tripped = Transaction::try_from(pb_txn).unwrap();
+
+        if let Operation::Update {
+            updated_row_offsets,
+            ..
+        } = &round_tripped.operation
+        {
+            assert!(updated_row_offsets.is_none());
+        } else {
+            panic!("Expected Operation::Update");
+        }
+    }
+
+    #[test]
+    fn test_updated_row_offsets_equality() {
+        let mut map_a = HashMap::new();
+        map_a.insert(1u64, vec![0u32, 1, 2]);
+
+        let mut map_b = HashMap::new();
+        map_b.insert(1u64, vec![0u32, 1, 2]);
+
+        let op_a = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            merged_generations: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_row_offsets: Some(map_a),
+        };
+
+        let op_b = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            merged_generations: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_row_offsets: Some(map_b),
+        };
+
+        assert_eq!(op_a, op_b);
+
+        // Different offsets should not be equal
+        let mut map_c = HashMap::new();
+        map_c.insert(1u64, vec![0u32, 1, 3]);
+
+        let op_c = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            merged_generations: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_row_offsets: Some(map_c),
+        };
+
+        assert_ne!(op_a, op_c);
     }
 }

@@ -227,6 +227,25 @@ message Transaction {
     }
   }
 
+  // Per-fragment row offsets that were updated during a RewriteColumns operation.
+  // Used to selectively update _row_last_updated_at_version for only the matched rows.
+  message FragmentRowOffsets {
+    // The fragment ID.
+    uint64 fragment_id = 1;
+    // The matched row offsets, encoded either as a sorted array or a Roaring bitmap.
+    oneof offsets {
+      // Sorted, deduplicated local physical row offsets (used when sparse).
+      FragmentRowOffsetArray array = 2;
+      // Roaring bitmap of local physical row offsets (used when dense).
+      bytes bitmap = 3;
+    }
+  }
+
+  // An array of row offsets within a fragment.
+  message FragmentRowOffsetArray {
+    repeated uint32 offsets = 1;
+  }
+
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows
@@ -248,6 +267,13 @@ message Transaction {
     // Filter for checking existence of keys in newly inserted rows, used for conflict detection.
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
+    // Per-fragment updated row offsets for RewriteColumns mode.
+    // When present, only the specified rows in each fragment will have their
+    // _row_last_updated_at_version advanced to the new dataset version.
+    // Fragments not listed here are not partially refreshed.
+    // If empty, the caller has already set version metadata on the fragments,
+    // or all rows in updated_fragments are assumed updated.
+    repeated FragmentRowOffsets updated_row_offsets = 9;
   }
 
   // The mode of update operation

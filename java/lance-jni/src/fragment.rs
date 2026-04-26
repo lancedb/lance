@@ -45,6 +45,7 @@ pub(crate) struct FragmentMergeResult {
 pub(crate) struct FragmentUpdateResult {
     updated_fragment: Fragment,
     fields_modified: Vec<u32>,
+    matched_offsets: Vec<u32>,
 }
 
 //////////////////
@@ -487,11 +488,14 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let (updated_fragment, fields_modified) =
+    let (updated_fragment, fields_modified, matched_bitmap) =
         RT.block_on(fragment.update_columns(reader, &left_on_str, &right_on_str))?;
     let result = FragmentUpdateResult {
         updated_fragment,
         fields_modified,
+        matched_offsets: matched_bitmap
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default(),
     };
     result.into_java(env)
 }
@@ -512,6 +516,7 @@ const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/FragmentMetadata;Lorg/lance/schema/LanceSchema;)V";
 const FRAGMENT_UPDATE_RESULT_CLASS: &str = "org/lance/fragment/FragmentUpdateResult";
 const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J)V";
+const FRAGMENT_UPDATE_RESULT_WITH_OFFSETS_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J[J)V";
 
 impl IntoJava for &FragmentMergeResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -532,14 +537,37 @@ impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let java_updated_fragment = self.updated_fragment.into_java(env)?;
         let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
-        Ok(env.new_object(
-            FRAGMENT_UPDATE_RESULT_CLASS,
-            FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
-            &[
-                JValueGen::Object(&java_updated_fragment),
-                JValueGen::Object(&java_fields_modified),
-            ],
-        )?)
+
+        // Try with updated row offsets first; then fall back
+        let class = env.find_class(FRAGMENT_UPDATE_RESULT_CLASS)?;
+        let has_new_ctor = env
+            .get_method_id(&class, "<init>", FRAGMENT_UPDATE_RESULT_WITH_OFFSETS_CONSTRUCTOR_SIG)
+            .is_ok();
+        if env.exception_check()? {
+            env.exception_clear()?;
+        }
+        if has_new_ctor {
+            let java_matched_offsets = JLance(self.matched_offsets.clone()).into_java(env)?;
+            Ok(env.new_object(
+                FRAGMENT_UPDATE_RESULT_CLASS,
+                FRAGMENT_UPDATE_RESULT_WITH_OFFSETS_CONSTRUCTOR_SIG,
+                &[
+                    JValueGen::Object(&java_updated_fragment),
+                    JValueGen::Object(&java_fields_modified),
+                    JValueGen::Object(&java_matched_offsets),
+                ],
+            )?)
+        } else {
+            // Old Java jar without matchedOffsets — silently drop the field
+            Ok(env.new_object(
+                FRAGMENT_UPDATE_RESULT_CLASS,
+                FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
+                &[
+                    JValueGen::Object(&java_updated_fragment),
+                    JValueGen::Object(&java_fields_modified),
+                ],
+            )?)
+        }
     }
 }
 
@@ -810,5 +838,63 @@ fn convert_to_java_integer<'local>(
             &[JValue::Int(base_index as jint)],
         )?),
         None => Ok(JObject::null()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance::table::format::Fragment;
+    use roaring::RoaringBitmap;
+
+    #[test]
+    fn test_fragment_update_result_from_some_bitmap() {
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        bitmap.insert(2);
+        bitmap.insert(4);
+        bitmap.insert(100);
+
+        let matched_bitmap: Option<RoaringBitmap> = Some(bitmap);
+        let offsets: Vec<u32> = matched_bitmap
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default();
+
+        let result = FragmentUpdateResult {
+            updated_fragment: Fragment::new(7),
+            fields_modified: vec![1],
+            matched_offsets: offsets,
+        };
+        assert_eq!(result.matched_offsets, vec![0, 2, 4, 100]);
+    }
+
+    #[test]
+    fn test_fragment_update_result_from_none_bitmap() {
+        // When tracking is disabled, matched_bitmap is None -> empty vec
+        let matched_bitmap: Option<RoaringBitmap> = None;
+        let offsets: Vec<u32> = matched_bitmap
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default();
+
+        let result = FragmentUpdateResult {
+            updated_fragment: Fragment::new(3),
+            fields_modified: vec![2],
+            matched_offsets: offsets,
+        };
+        assert!(result.matched_offsets.is_empty());
+    }
+
+    #[test]
+    fn test_fragment_update_result_large_offsets() {
+        // Verify large offset sets (>5000, the bitmap encoding threshold) work
+        let offsets: Vec<u32> = (0..6000).collect();
+        let result = FragmentUpdateResult {
+            updated_fragment: Fragment::new(99),
+            fields_modified: vec![1, 2],
+            matched_offsets: offsets,
+        };
+        assert_eq!(result.matched_offsets.len(), 6000);
+        assert_eq!(result.matched_offsets[0], 0);
+        assert_eq!(result.matched_offsets[5999], 5999);
     }
 }

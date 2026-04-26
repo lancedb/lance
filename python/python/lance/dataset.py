@@ -5033,6 +5033,12 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_row_offsets: Optional[Dict[int, List[int]]] = None
+        """Optional per-fragment map of updated row offsets (physical row indices
+        within each fragment). Used for RewriteColumns mode to selectively
+        update ``_row_last_updated_at_version``. Key: fragment ID, Value:
+        sorted, deduplicated local physical row offsets that were updated.
+        If None, all rows in updated_fragments are assumed to be updated."""
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)

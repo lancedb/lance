@@ -25,10 +25,16 @@ import org.apache.arrow.c.ArrowArrayStream;
 public class FragmentUpdateResult {
   private final FragmentMetadata updatedFragment;
   private final long[] fieldsModified;
+  private final long[] matchedOffsets;
 
-  public FragmentUpdateResult(FragmentMetadata updatedFragment, long[] updatedFieldIds) {
+  public FragmentUpdateResult(FragmentMetadata updatedFragment, long[] updatedFieldIds, long[] matchedOffsets) {
     this.updatedFragment = updatedFragment;
     this.fieldsModified = updatedFieldIds;
+    this.matchedOffsets = matchedOffsets;
+  }
+
+  public FragmentUpdateResult(FragmentMetadata updatedFragment, long[] updatedFieldIds) {
+    this(updatedFragment, updatedFieldIds, new long[0]);
   }
 
   public FragmentMetadata getUpdatedFragment() {
@@ -39,11 +45,21 @@ public class FragmentUpdateResult {
     return fieldsModified;
   }
 
+  /**
+   * Physical row offsets within the fragment that were matched (updated) by the join.
+   * These are 0-based indices and can be passed as {@code updatedRowOffsets} when
+   * committing with {@link org.lance.operation.Update}.
+   */
+  public long[] getMatchedOffsets() {
+    return matchedOffsets;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("fragmentMetadata", updatedFragment)
         .add("updatedFieldIds", fieldsModified)
+        .add("matchedOffsets", matchedOffsets)
         .toString();
   }
 }

@@ -20,6 +20,7 @@ import com.google.common.base.MoreObjects;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -30,6 +31,7 @@ public class Update implements Operation {
   private final long[] fieldsModified;
   private final long[] fieldsForPreservingFragBitmap;
   private final Optional<UpdateMode> updateMode;
+  private final Optional<Map<Long, long[]>> updatedRowOffsets;
 
   private Update(
       List<Long> removedFragmentIds,
@@ -37,13 +39,15 @@ public class Update implements Operation {
       List<FragmentMetadata> newFragments,
       long[] fieldsModified,
       long[] fieldsForPreservingFragBitmap,
-      Optional<UpdateMode> updateMode) {
+      Optional<UpdateMode> updateMode,
+      Optional<Map<Long, long[]>> updatedRowOffsets) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
     this.fieldsModified = fieldsModified;
     this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
     this.updateMode = updateMode;
+    this.updatedRowOffsets = updatedRowOffsets;
   }
 
   public static Builder builder() {
@@ -74,6 +78,16 @@ public class Update implements Operation {
     return updateMode;
   }
 
+  /**
+   * Optional per-fragment map of updated row offsets (physical row indices within each fragment).
+   * Used for RewriteColumns mode to selectively update _row_last_updated_at_version.
+   * Key: fragment ID, Value: sorted, deduplicated local physical row offsets that were updated.
+   * If empty, all rows in updated_fragments are assumed to be updated.
+   */
+  public Optional<Map<Long, long[]>> updatedRowOffsets() {
+    return updatedRowOffsets;
+  }
+
   @Override
   public String name() {
     return "Update";
@@ -87,6 +101,7 @@ public class Update implements Operation {
         .add("fieldsModified", fieldsModified)
         .add("fieldsForPreservingFragBitmap", fieldsForPreservingFragBitmap)
         .add("updateMode", updateMode)
+        .add("updatedRowOffsets", updatedRowOffsets)
         .toString();
   }
 
@@ -100,7 +115,8 @@ public class Update implements Operation {
         && Objects.equals(newFragments, that.newFragments)
         && Arrays.equals(fieldsModified, that.fieldsModified)
         && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
-        && Objects.equals(updateMode, that.updateMode);
+        && Objects.equals(updateMode, that.updateMode)
+        && Objects.equals(updatedRowOffsets, that.updatedRowOffsets);
   }
 
   public enum UpdateMode {
@@ -115,6 +131,7 @@ public class Update implements Operation {
     private long[] fieldsModified = new long[0];
     private long[] fieldsForPreservingFragBitmap = new long[0];
     private Optional<UpdateMode> updateMode = Optional.empty();
+    private Optional<Map<Long, long[]>> updatedRowOffsets = Optional.empty();
 
     private Builder() {}
 
@@ -148,6 +165,15 @@ public class Update implements Operation {
       return this;
     }
 
+    /**
+     * Set per-fragment updated row offsets for RewriteColumns mode.
+     * @param updatedRowOffsets Map from fragment ID to sorted physical row offsets that were updated.
+     */
+    public Builder updatedRowOffsets(Optional<Map<Long, long[]>> updatedRowOffsets) {
+      this.updatedRowOffsets = updatedRowOffsets;
+      return this;
+    }
+
     public Update build() {
       return new Update(
           removedFragmentIds,
@@ -155,7 +181,8 @@ public class Update implements Operation {
           newFragments,
           fieldsModified,
           fieldsForPreservingFragBitmap,
-          updateMode);
+          updateMode,
+          updatedRowOffsets);
     }
   }
 }

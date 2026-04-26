@@ -362,15 +362,16 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+    ) -> PyResult<(PyLance<Fragment>, Vec<u32>, Option<Vec<u32>>)> {
         let mut fragment = self.fragment.clone();
-        let (updated_fragment, fields_modified) = rt()
+        let (updated_fragment, fields_modified, matched_bitmap) = rt()
             .spawn(None, async move {
                 fragment.update_columns(reader.0, &left_on, &right_on).await
             })?
             .infer_error()?;
 
-        Ok((PyLance(updated_fragment), fields_modified))
+        let matched_offsets = matched_bitmap.map(|bm| bm.iter().collect());
+        Ok((PyLance(updated_fragment), fields_modified, matched_offsets))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {

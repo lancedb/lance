@@ -794,10 +794,14 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-        Tuple[FragmentMetadata, List[int]]
+        Tuple[FragmentMetadata, List[int], List[int]]
             A tuple of:
             - FragmentMetadata: The updated fragment metadata
             - List[int]: The list of field IDs that were modified
+            - List[int]: The list of physical row offsets that were matched
+              (updated). These are 0-based indices within the fragment and
+              can be passed as ``updated_row_offsets`` when committing with
+              ``LanceOperation.Update``.
 
         Examples
         --------
@@ -854,10 +858,10 @@ class LanceFragment(pa.dataset.Fragment):
             right_on = left_on
 
         reader = _coerce_reader(data_obj, schema)
-        metadata, fields_modified = self._fragment.update_columns(
+        metadata, fields_modified, matched_offsets = self._fragment.update_columns(
             reader, left_on, right_on
         )
-        return metadata, fields_modified
+        return metadata, fields_modified, matched_offsets
 
     def merge_columns(
         self,

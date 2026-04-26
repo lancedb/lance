@@ -433,6 +433,7 @@ fn convert_to_java_operation_inner<'local>(
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
+            updated_row_offsets,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -456,9 +457,69 @@ fn convert_to_java_operation_inner<'local>(
                     &[JValue::Object(&update_mode)],
                 )?
                 .l()?;
+
+            let update_class = env.find_class("org/lance/operation/Update")?;
+            let with_offsets_sig = "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Optional;)V";
+            let without_offsets_sig = "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V";
+            let has_new_ctor = env
+                .get_method_id(&update_class, "<init>", with_offsets_sig)
+                .is_ok();
+            if env.exception_check()? {
+                env.exception_clear()?;
+            }
+
+            if !has_new_ctor {
+                return Ok(env.new_object(
+                    "org/lance/operation/Update",
+                    without_offsets_sig,
+                    &[
+                        JValue::Object(&removed_fragment_ids_obj),
+                        JValue::Object(&updated_fragments_obj),
+                        JValue::Object(&new_fragments_obj),
+                        JValueGen::Object(&fields_modified),
+                        JValueGen::Object(&fields_for_preserving_frag_bitmap),
+                        JValue::Object(&update_mode_optional),
+                    ],
+                )?)
+            }
+
+            let java_offsets_map = if let Some(offsets_map) = updated_row_offsets {
+                let hash_map = env.new_object("java/util/HashMap", "()V", &[])?;
+                for (frag_id, offsets) in offsets_map {
+                    let java_frag_id = env.new_object(
+                        "java/lang/Long",
+                        "(J)V",
+                        &[JValue::Long(frag_id as i64)],
+                    )?;
+                    let java_offsets = env.new_long_array(offsets.len() as i32)?;
+                    let offsets_i64: Vec<i64> = offsets.iter().map(|o| *o as i64).collect();
+                    env.set_long_array_region(&java_offsets, 0, &offsets_i64)?;
+                    env.call_method(
+                        &hash_map,
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[
+                            JValue::Object(&java_frag_id),
+                            JValue::Object(&java_offsets),
+                        ],
+                    )?;
+                }
+                hash_map
+            } else {
+                JObject::null()
+            };
+            let offsets_optional = env
+                .call_static_method(
+                    "java/util/Optional",
+                    "ofNullable",
+                    "(Ljava/lang/Object;)Ljava/util/Optional;",
+                    &[JValue::Object(&java_offsets_map)],
+                )?
+                .l()?;
+
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V",
+                with_offsets_sig,
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -466,6 +527,7 @@ fn convert_to_java_operation_inner<'local>(
                     JValueGen::Object(&fields_modified),
                     JValueGen::Object(&fields_for_preserving_frag_bitmap),
                     JValue::Object(&update_mode_optional),
+                    JValue::Object(&offsets_optional),
                 ],
             )?)
         }
@@ -1213,6 +1275,67 @@ fn convert_to_rust_operation(
                     update_mode.extract_object(env)
                 })?;
 
+            // Extract updated_row_offsets: Optional<Map<Long, long[]>>
+            // Use safe fallback for old Java jars that lack updatedRowOffsets() method
+            let updated_row_offsets: Option<HashMap<u64, Vec<u32>>> = {
+                let method_result = env.call_method(
+                    java_operation,
+                    "updatedRowOffsets",
+                    "()Ljava/util/Optional;",
+                    &[],
+                );
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_clear().ok();
+                    None
+                } else if let Ok(jval) = method_result {
+                    let optional_obj = jval.l().ok();
+                    match optional_obj {
+                        Some(opt) => env.get_optional(&opt, |env, offsets_map| {
+                            let entry_set = env
+                                .call_method(offsets_map, "entrySet", "()Ljava/util/Set;", &[])?
+                                .l()?;
+                            let iterator = env
+                                .call_method(&entry_set, "iterator", "()Ljava/util/Iterator;", &[])?
+                                .l()?;
+                            let mut result = HashMap::new();
+                            loop {
+                                let has_next =
+                                    env.call_method(&iterator, "hasNext", "()Z", &[])?.z()?;
+                                if !has_next {
+                                    break;
+                                }
+                                let entry = env
+                                    .call_method(
+                                        &iterator,
+                                        "next",
+                                        "()Ljava/lang/Object;",
+                                        &[],
+                                    )?
+                                    .l()?;
+                                let key = env
+                                    .call_method(&entry, "getKey", "()Ljava/lang/Object;", &[])?
+                                    .l()?;
+                                let frag_id =
+                                    env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
+                                let value = env
+                                    .call_method(&entry, "getValue", "()Ljava/lang/Object;", &[])?
+                                    .l()?;
+                                let long_array = JLongArray::from(value);
+                                let len = env.get_array_length(&long_array)? as usize;
+                                let mut buf = vec![0i64; len];
+                                env.get_long_array_region(&long_array, 0, &mut buf)?;
+                                let offsets: Vec<u32> = buf.iter().map(|v| *v as u32).collect();
+                                result.insert(frag_id, offsets);
+                            }
+                            Ok(result)
+                        })?,
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            };
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
@@ -1222,6 +1345,7 @@ fn convert_to_rust_operation(
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,
+                updated_row_offsets,
             }
         }
         "DataReplacement" => {
@@ -1802,5 +1926,98 @@ mod tests {
             schema.metadata,
             HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())])
         );
+    }
+
+    #[test]
+    fn test_operation_update_with_row_offsets() {
+        use lance::dataset::transaction::{Operation, UpdateMode};
+
+        let mut offsets_map = HashMap::new();
+        offsets_map.insert(1u64, vec![0u32, 2, 4]);
+        offsets_map.insert(2u64, vec![1u32, 3, 5]);
+
+        let op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![1],
+            merged_generations: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_row_offsets: Some(offsets_map.clone()),
+        };
+
+        if let Operation::Update {
+            updated_row_offsets,
+            update_mode,
+            ..
+        } = &op
+        {
+            assert!(updated_row_offsets.is_some());
+            let map = updated_row_offsets.as_ref().unwrap();
+            assert_eq!(map.len(), 2);
+            assert_eq!(map.get(&1u64).unwrap(), &vec![0u32, 2, 4]);
+            assert_eq!(map.get(&2u64).unwrap(), &vec![1u32, 3, 5]);
+            assert_eq!(*update_mode, Some(UpdateMode::RewriteColumns));
+        } else {
+            panic!("Expected Operation::Update");
+        }
+    }
+
+    #[test]
+    fn test_operation_update_without_row_offsets() {
+        use lance::dataset::transaction::{Operation, UpdateMode};
+
+        let op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            merged_generations: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_row_offsets: None,
+        };
+
+        if let Operation::Update {
+            updated_row_offsets,
+            ..
+        } = &op
+        {
+            assert!(updated_row_offsets.is_none());
+        } else {
+            panic!("Expected Operation::Update");
+        }
+    }
+
+    #[test]
+    fn test_bitmap_to_offsets_vec_conversion() {
+        use roaring::RoaringBitmap;
+
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        bitmap.insert(5);
+        bitmap.insert(10);
+        bitmap.insert(100);
+
+        let offsets: Vec<u32> = bitmap.iter().collect();
+        assert_eq!(offsets, vec![0, 5, 10, 100]);
+
+        let empty_bitmap = RoaringBitmap::new();
+        let empty_offsets: Vec<u32> = empty_bitmap.iter().collect();
+        assert!(empty_offsets.is_empty());
+    }
+
+    #[test]
+    fn test_offsets_i64_u32_conversion() {
+        let java_longs: Vec<i64> = vec![0, 1, 2, 100, 5000];
+        let rust_offsets: Vec<u32> = java_longs.iter().map(|v| *v as u32).collect();
+        assert_eq!(rust_offsets, vec![0u32, 1, 2, 100, 5000]);
+
+        let rust_offsets: Vec<u32> = vec![0, 5, 10, 15, 20];
+        let java_longs: Vec<i64> = rust_offsets.iter().map(|o| *o as i64).collect();
+        assert_eq!(java_longs, vec![0i64, 5, 10, 15, 20]);
     }
 }

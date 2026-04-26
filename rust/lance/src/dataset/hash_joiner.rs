@@ -278,6 +278,71 @@ impl HashJoiner {
             .await?;
         Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
     }
+    /// Like [`collect_with_fallback`], but also reports which row indices in the
+    /// left batch were matched (i.e. found in the right table).
+    ///
+    /// Returns `(result_batch, matched_left_indices)` where `matched_left_indices`
+    /// contains the 0-based positions within the left batch that had a match.
+    pub(super) async fn collect_with_fallback_reporting(
+        &self,
+        left_batch: &RecordBatch,
+        index_column: ArrayRef,
+        dataset: &Dataset,
+    ) -> Result<(RecordBatch, Vec<u32>)> {
+        if index_column.data_type() != &self.index_type {
+            return Err(Error::invalid_input(format!(
+                "Index column type mismatch: expected {}, got {}",
+                self.index_type,
+                index_column.data_type()
+            )));
+        }
+        let left_batch_index = self.batches.len();
+        let mut matched_indices = Vec::new();
+        let indices = column_to_rows(index_column)?
+            .into_iter()
+            .enumerate()
+            .map(|(left_rowi, row)| {
+                self.index_map
+                    .get(&row.owned())
+                    .map(|(batch_i, row_i)| {
+                        matched_indices.push(left_rowi as u32);
+                        (*batch_i, *row_i)
+                    })
+                    .unwrap_or((left_batch_index, left_rowi))
+            })
+            .collect::<Vec<_>>();
+        let indices = Arc::new(indices);
+        let columns = futures::stream::iter(0..self.batches[0].num_columns())
+            .map(|column_i| {
+                let mut arrays = Vec::with_capacity(self.batches.len() + 1);
+                for batch in &self.batches {
+                    arrays.push(batch.column(column_i).clone());
+                }
+                arrays.push(left_batch.column(column_i).clone());
+                let indices = indices.clone();
+                async move {
+                    let task_result = task::spawn_blocking(move || {
+                        let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
+                        interleave(array_refs.as_ref(), indices.as_ref())
+                            .map_err(|err| Error::invalid_input(format!("HashJoiner: {}", err)))
+                    })
+                    .await;
+                    match task_result {
+                        Ok(Ok(array)) => {
+                            Self::check_lance_support_null(&array, dataset)?;
+                            Ok(array)
+                        }
+                        Ok(Err(err)) => Err(err),
+                        Err(err) => Err(Error::invalid_input(format!("HashJoiner: {}", err))),
+                    }
+                }
+            })
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
+        let result = RecordBatch::try_new(self.batches[0].schema(), columns)?;
+        Ok((result, matched_indices))
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +454,145 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Index column type mismatch: expected Int32, got UInt32")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_with_fallback_reporting() {
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+                Arc::new(StringArray::from(vec!["ten", "twenty", "thirty"])),
+            ],
+        )
+            .unwrap();
+        let right_reader: Box<dyn RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(right_batch)], right_schema.clone()),
+        );
+        let joiner = HashJoiner::try_new(right_reader, "key").await.unwrap();
+
+        let dataset = create_dataset().await;
+
+        // Left batch schema must match joiner output schema: [val] only.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                "old_10", "old_99", "old_20", "old_88", "old_30",
+            ]))],
+        )
+            .unwrap();
+        // Index column passed separately (keys [10, 99, 20, 88, 30]).
+        let index_col: ArrayRef = Arc::new(Int32Array::from(vec![10, 99, 20, 88, 30]));
+
+        let (result, matched) = joiner
+            .collect_with_fallback_reporting(&left_batch, index_col, &dataset)
+            .await
+            .unwrap();
+
+        // Matches at local indices 0, 2, 4
+        assert_eq!(matched, vec![0u32, 2, 4]);
+
+        // Matched rows get right-table values; unmatched keep left-table values
+        assert_eq!(
+            result.column_by_name("val").unwrap().as_ref(),
+            &StringArray::from(vec!["ten", "old_99", "twenty", "old_88", "thirty"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_with_fallback_reporting_no_matches() {
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+            .unwrap();
+        let right_reader: Box<dyn RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(right_batch)], right_schema.clone()),
+        );
+        let joiner = HashJoiner::try_new(right_reader, "key").await.unwrap();
+
+        let dataset = create_dataset().await;
+
+        // Left batch with only the non-key column
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["x", "y", "z"]))],
+        )
+            .unwrap();
+        let index_col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        let (result, matched) = joiner
+            .collect_with_fallback_reporting(&left_batch, index_col, &dataset)
+            .await
+            .unwrap();
+
+        // No matches
+        assert!(matched.is_empty());
+        // All values from left
+        assert_eq!(
+            result.column_by_name("val").unwrap().as_ref(),
+            &StringArray::from(vec!["x", "y", "z"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_with_fallback_reporting_all_matches() {
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["new_1", "new_2", "new_3"])),
+            ],
+        )
+            .unwrap();
+        let right_reader: Box<dyn RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(right_batch)], right_schema.clone()),
+        );
+        let joiner = HashJoiner::try_new(right_reader, "key").await.unwrap();
+
+        let dataset = create_dataset().await;
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["old_1", "old_2", "old_3"]))],
+        )
+            .unwrap();
+        let index_col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        let (result, matched) = joiner
+            .collect_with_fallback_reporting(&left_batch, index_col, &dataset)
+            .await
+            .unwrap();
+
+        assert_eq!(matched, vec![0u32, 1, 2]);
+        assert_eq!(
+            result.column_by_name("val").unwrap().as_ref(),
+            &StringArray::from(vec!["new_1", "new_2", "new_3"])
         );
     }
 }
