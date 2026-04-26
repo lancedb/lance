@@ -72,20 +72,39 @@ impl<T> NamespaceCredentialsProvider<T> {
     }
 }
 
-pub async fn supports_dynamic_credentials<T>(accessor: &Arc<StorageOptionsAccessor>) -> Result<bool>
+/// Build a dynamic credential provider for any cloud type, returning `None`
+/// if the accessor has no provider or the vended options are incompatible with `T`.
+pub async fn build_dynamic_credential_provider<T>(
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+) -> Result<Option<Arc<dyn CredentialProvider<Credential = T>>>>
 where
-    T: TryFrom<DynamicCredentials, Error = Error>,
+    T: TryFrom<DynamicCredentials, Error = Error> + fmt::Debug + Send + Sync + 'static,
 {
-    if let Some(initial) = accessor.initial_storage_options() {
-        return Ok(T::try_from(DynamicCredentials(initial.clone())).is_ok());
+    let Some(accessor) = accessor.filter(|a| a.has_provider()) else {
+        return Ok(None);
+    };
+
+    // Validate that the provider vends credentials compatible with T.
+    // Try initial options first, then fall back to a provider fetch.
+    // Initial options may contain only non-credential fields (e.g. region)
+    // while the provider vends the actual credentials.
+    let compatible = if let Some(initial) = accessor.initial_storage_options()
+        && T::try_from(DynamicCredentials(initial.clone())).is_ok()
+    {
+        true
+    } else {
+        let fetched = accessor.get_storage_options().await?.0;
+        T::try_from(DynamicCredentials(fetched)).is_ok()
+    };
+
+    if !compatible {
+        return Ok(None);
     }
 
-    // If there is no initial snapshot, trust that the accessor's provider is
-    // being used for credential vending for this store type. This avoids an
-    // eager fetch during store construction, but means callers should only use
-    // this helper when the provider is expected to vend credentials compatible
-    // with `T`.
-    Ok(accessor.has_provider())
+    Ok(Some(
+        Arc::new(NamespaceCredentialsProvider::<T>::new(accessor))
+            as Arc<dyn CredentialProvider<Credential = T>>,
+    ))
 }
 
 #[async_trait]
@@ -140,9 +159,23 @@ impl TryFrom<DynamicCredentials> for ObjectStoreAwsCredential {
     type Error = Error;
 
     fn try_from(credentials: DynamicCredentials) -> Result<Self> {
-        let key_id = credentials.0.get("aws_access_key_id").cloned();
-        let secret_key = credentials.0.get("aws_secret_access_key").cloned();
-        let token = credentials.0.get("aws_session_token").cloned();
+        let key_id = credentials
+            .0
+            .get("aws_access_key_id")
+            .or_else(|| credentials.0.get("access_key_id"))
+            .cloned();
+        let secret_key = credentials
+            .0
+            .get("aws_secret_access_key")
+            .or_else(|| credentials.0.get("secret_access_key"))
+            .cloned();
+        let token = credentials
+            .0
+            .get("aws_session_token")
+            .or_else(|| credentials.0.get("aws_security_token"))
+            .or_else(|| credentials.0.get("session_token"))
+            .or_else(|| credentials.0.get("token"))
+            .cloned();
 
         match (key_id, secret_key) {
             (Some(key_id), Some(secret_key)) => Ok(Self {
@@ -164,6 +197,8 @@ impl TryFrom<DynamicCredentials> for AzureCredential {
             .0
             .get("azure_storage_sas_token")
             .or_else(|| credentials.0.get("azure_storage_sas_key"))
+            .or_else(|| credentials.0.get("sas_token"))
+            .or_else(|| credentials.0.get("sas_key"))
         {
             return Ok(Self::SASToken(split_azure_sas(sas)?));
         }
@@ -172,6 +207,7 @@ impl TryFrom<DynamicCredentials> for AzureCredential {
             .0
             .get("azure_storage_token")
             .or_else(|| credentials.0.get("bearer_token"))
+            .or_else(|| credentials.0.get("token"))
         {
             return Ok(Self::BearerToken(token.clone()));
         }
@@ -270,6 +306,35 @@ mod tests {
                 );
             }
             other => panic!("expected SAS token, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_dynamic_azure_credentials_short_sas_aliases() {
+        for key in ["sas_token", "sas_key"] {
+            let provider = Arc::new(StaticMockStorageOptionsProvider {
+                options: HashMap::from([(
+                    key.to_string(),
+                    "?sv=2022-11-02&sp=rl&sig=short".to_string(),
+                )]),
+            });
+
+            let credentials =
+                NamespaceCredentialsProvider::<AzureCredential>::from_provider(provider)
+                    .get_credential()
+                    .await
+                    .unwrap_or_else(|_| panic!("azure credentials should convert for key '{key}'"));
+
+            match credentials.as_ref() {
+                AzureCredential::SASToken(pairs) => {
+                    assert!(
+                        pairs.iter().any(|(k, v)| k == "sig" && v == "short"),
+                        "SAS token from key '{key}' should contain sig=short"
+                    );
+                }
+                other => panic!("expected SAS token for key '{key}', got {other:?}"),
+            }
         }
     }
 

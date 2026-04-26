@@ -9,14 +9,14 @@ use opendal::{Operator, services::Gcs};
 
 use object_store::{
     RetryConfig, StaticCredentialProvider,
-    gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder, GoogleConfigKey},
+    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
 };
 use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
-    dynamic_credentials::{NamespaceCredentialsProvider, supports_dynamic_credentials},
+    dynamic_credentials::build_dynamic_credential_provider,
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -77,7 +77,9 @@ impl GcsStoreProvider {
             builder = builder.with_config(key, value);
         }
 
-        if let Some(credentials) = build_dynamic_gcp_credentials(accessor).await? {
+        if let Some(credentials) =
+            build_dynamic_credential_provider::<GcpCredential>(accessor).await?
+        {
             builder = builder.with_credentials(credentials);
         } else if let Some(storage_token) = storage_options.get("google_storage_token") {
             let credential = GcpCredential {
@@ -88,23 +90,6 @@ impl GcsStoreProvider {
         }
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
-    }
-}
-
-async fn build_dynamic_gcp_credentials(
-    accessor: Option<Arc<StorageOptionsAccessor>>,
-) -> Result<Option<GcpCredentialProvider>> {
-    let Some(accessor) = accessor.filter(|accessor| accessor.has_provider()) else {
-        return Ok(None);
-    };
-
-    if supports_dynamic_credentials::<GcpCredential>(&accessor).await? {
-        Ok(Some(
-            Arc::new(NamespaceCredentialsProvider::<GcpCredential>::new(accessor))
-                as GcpCredentialProvider,
-        ))
-    } else {
-        Ok(None)
     }
 }
 
@@ -252,7 +237,7 @@ mod tests {
             },
         )));
 
-        let credentials = build_dynamic_gcp_credentials(Some(accessor))
+        let credentials = build_dynamic_credential_provider::<GcpCredential>(Some(accessor))
             .await
             .expect("dynamic gcp credentials should build")
             .expect("expected credential provider")

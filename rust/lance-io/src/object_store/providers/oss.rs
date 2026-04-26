@@ -60,50 +60,33 @@ impl OssStoreProvider {
         Ok(config_map)
     }
 
+    /// Normalize OSS storage options, resolving aliases for well-known keys
+    /// while passing through all other options (e.g. `role_arn`,
+    /// `sts_endpoint`, `allow_anonymous`, etc.) so that OpenDAL can use them.
     fn normalize_oss_config(options: &HashMap<String, String>) -> Result<HashMap<String, String>> {
-        let mut config_map = HashMap::new();
+        let mut config_map = options.clone();
 
-        if let Some(bucket) = options.get("bucket").cloned() {
-            config_map.insert("bucket".to_string(), bucket);
-        }
-        if let Some(root) = options.get("root").cloned() {
-            config_map.insert("root".to_string(), root);
-        }
+        let alias_groups: &[(&str, &[&str])] = &[
+            ("endpoint", &["oss_endpoint"]),
+            ("access_key_id", &["oss_access_key_id"]),
+            ("access_key_secret", &["oss_secret_access_key"]),
+            ("region", &["oss_region"]),
+            ("security_token", &["oss_security_token"]),
+        ];
 
-        if let Some(endpoint) = options
-            .get("oss_endpoint")
-            .cloned()
-            .or_else(|| options.get("endpoint").cloned())
-        {
-            config_map.insert("endpoint".to_string(), endpoint);
-        }
-        if let Some(access_key_id) = options
-            .get("oss_access_key_id")
-            .cloned()
-            .or_else(|| options.get("access_key_id").cloned())
-        {
-            config_map.insert("access_key_id".to_string(), access_key_id);
-        }
-        if let Some(secret_access_key) = options
-            .get("oss_secret_access_key")
-            .cloned()
-            .or_else(|| options.get("access_key_secret").cloned())
-        {
-            config_map.insert("access_key_secret".to_string(), secret_access_key);
-        }
-        if let Some(region) = options
-            .get("oss_region")
-            .cloned()
-            .or_else(|| options.get("region").cloned())
-        {
-            config_map.insert("region".to_string(), region);
-        }
-        if let Some(security_token) = options
-            .get("oss_security_token")
-            .cloned()
-            .or_else(|| options.get("security_token").cloned())
-        {
-            config_map.insert("security_token".to_string(), security_token);
+        for (canonical, aliases) in alias_groups {
+            if !config_map.contains_key(*canonical) {
+                for alias in *aliases {
+                    if let Some(value) = config_map.remove(*alias) {
+                        config_map.insert(canonical.to_string(), value);
+                        break;
+                    }
+                }
+            } else {
+                for alias in *aliases {
+                    config_map.remove(*alias);
+                }
+            }
         }
 
         if !config_map.contains_key("endpoint") {

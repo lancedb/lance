@@ -14,14 +14,14 @@ use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
-    azure::{AzureConfigKey, AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
 };
 use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
-    dynamic_credentials::{NamespaceCredentialsProvider, supports_dynamic_credentials},
+    dynamic_credentials::build_dynamic_credential_provider,
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -30,58 +30,55 @@ use lance_core::error::{Error, Result};
 pub struct AzureBlobStoreProvider;
 
 impl AzureBlobStoreProvider {
+    /// Normalize Azure storage options for OpenDAL, resolving aliases for
+    /// well-known keys while passing through all other options (e.g.
+    /// `client_id`, `tenant_id`, `encryption_key`, etc.) so that OpenDAL
+    /// can use them directly.
     fn normalize_opendal_azure_options(
         options: &HashMap<String, String>,
     ) -> HashMap<String, String> {
-        let mut config_map = HashMap::new();
+        // Start with all options so unknown keys are forwarded to OpenDAL.
+        let mut config_map = options.clone();
 
-        if let Some(account_name) = options
-            .get("account_name")
-            .cloned()
-            .or_else(|| options.get("azure_storage_account_name").cloned())
-        {
-            config_map.insert("account_name".to_string(), account_name);
-        }
+        // Normalize well-known aliases into canonical OpenDAL key names.
+        // Remove the alias after resolving to avoid duplicate/conflicting entries.
+        let alias_groups: &[(&str, &[&str])] = &[
+            ("account_name", &["azure_storage_account_name"]),
+            ("endpoint", &["azure_storage_endpoint", "azure_endpoint"]),
+            (
+                "account_key",
+                &[
+                    "azure_storage_account_key",
+                    "azure_storage_access_key",
+                    "azure_storage_master_key",
+                    "access_key",
+                    "master_key",
+                ],
+            ),
+            (
+                "sas_token",
+                &[
+                    "azure_storage_sas_token",
+                    "azure_storage_sas_key",
+                    "sas_key",
+                ],
+            ),
+        ];
 
-        if let Some(endpoint) = options
-            .get("endpoint")
-            .cloned()
-            .or_else(|| options.get("azure_storage_endpoint").cloned())
-            .or_else(|| options.get("azure_endpoint").cloned())
-        {
-            config_map.insert("endpoint".to_string(), endpoint);
-        }
-
-        if let Some(account_key) = options
-            .get("account_key")
-            .cloned()
-            .or_else(|| options.get("azure_storage_account_key").cloned())
-            .or_else(|| options.get("azure_storage_access_key").cloned())
-            .or_else(|| options.get("azure_storage_master_key").cloned())
-            .or_else(|| options.get("access_key").cloned())
-            .or_else(|| options.get("master_key").cloned())
-        {
-            config_map.insert("account_key".to_string(), account_key);
-        }
-
-        if let Some(sas_token) = options
-            .get("sas_token")
-            .cloned()
-            .or_else(|| options.get("azure_storage_sas_token").cloned())
-            .or_else(|| options.get("azure_storage_sas_key").cloned())
-            .or_else(|| options.get("sas_key").cloned())
-        {
-            config_map.insert("sas_token".to_string(), sas_token);
-        }
-
-        if let Some(container) = options.get("container").cloned() {
-            config_map.insert("container".to_string(), container);
-        }
-        if let Some(filesystem) = options.get("filesystem").cloned() {
-            config_map.insert("filesystem".to_string(), filesystem);
-        }
-        if let Some(root) = options.get("root").cloned() {
-            config_map.insert("root".to_string(), root);
+        for (canonical, aliases) in alias_groups {
+            if !config_map.contains_key(*canonical) {
+                for alias in *aliases {
+                    if let Some(value) = config_map.remove(*alias) {
+                        config_map.insert(canonical.to_string(), value);
+                        break;
+                    }
+                }
+            } else {
+                // Canonical key exists; remove aliases to avoid conflicts.
+                for alias in *aliases {
+                    config_map.remove(*alias);
+                }
+            }
         }
 
         config_map
@@ -189,29 +186,13 @@ impl AzureBlobStoreProvider {
             builder = builder.with_config(key, value);
         }
 
-        if let Some(credentials) = build_dynamic_azure_credentials(accessor).await? {
+        if let Some(credentials) =
+            build_dynamic_credential_provider::<AzureCredential>(accessor).await?
+        {
             builder = builder.with_credentials(credentials);
         }
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
-    }
-}
-
-async fn build_dynamic_azure_credentials(
-    accessor: Option<Arc<StorageOptionsAccessor>>,
-) -> Result<Option<AzureCredentialProvider>> {
-    let Some(accessor) = accessor.filter(|accessor| accessor.has_provider()) else {
-        return Ok(None);
-    };
-
-    if supports_dynamic_credentials::<AzureCredential>(&accessor).await? {
-        Ok(Some(
-            Arc::new(NamespaceCredentialsProvider::<AzureCredential>::new(
-                accessor,
-            )) as AzureCredentialProvider,
-        ))
-    } else {
-        Ok(None)
     }
 }
 
@@ -428,7 +409,7 @@ mod tests {
             },
         )));
 
-        let credentials = build_dynamic_azure_credentials(Some(accessor))
+        let credentials = build_dynamic_credential_provider::<AzureCredential>(Some(accessor))
             .await
             .expect("dynamic azure credentials should build")
             .expect("expected credential provider")

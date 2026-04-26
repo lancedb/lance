@@ -29,7 +29,7 @@ use url::Url;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
-    dynamic_credentials::{NamespaceCredentialsProvider, supports_dynamic_credentials},
+    dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -274,24 +274,20 @@ pub async fn build_aws_credential(
 
     let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
 
-    // If accessor has a provider, check whether it vends credentials.
-    // If it does, use DynamicStorageOptionsCredentialProvider for ongoing
-    // refresh. If not, fall through to the default credentials chain.
-    if let Some(accessor) = storage_options_accessor
-        && accessor.has_provider()
+    // Explicit aws_credentials takes precedence over dynamic credentials.
+    if credentials.is_none()
+        && let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
+            storage_options_accessor.clone(),
+        )
+        .await?
     {
-        // Explicit aws_credentials takes precedence
-        if let Some(creds) = credentials {
-            return Ok((creds, region));
-        }
+        return Ok((dynamic_creds, region));
+    }
 
-        if supports_dynamic_credentials::<ObjectStoreAwsCredential>(&accessor).await? {
-            return Ok((
-                Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
-                region,
-            ));
-        }
-
+    if storage_options_accessor
+        .as_ref()
+        .is_some_and(|a| a.has_provider())
+    {
         log::debug!(
             "Storage options from provider do not contain explicit AWS credentials, \
              falling back to default AWS credentials chain."
