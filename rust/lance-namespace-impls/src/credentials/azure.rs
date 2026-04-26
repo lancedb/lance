@@ -1140,8 +1140,8 @@ mod tests {
             Ok(Some(account_name))
         }
 
-        const TEST_CONTAINER: &str = "examples";
-        const TEST_PREFIX: &str = "lance-cv-integ-test";
+        const TEST_CONTAINER: &str = "lance-integ-test";
+        const TEST_PREFIX: &str = "cv-test";
 
         #[tokio::test]
         async fn test_fetch_static_access_token() -> Result<()> {
@@ -1216,6 +1216,72 @@ mod tests {
                 .get("azure_storage_sas_token")
                 .expect("Azure SAS token should be present");
             assert!(sas_token.contains("sr=c"), "Expected container-scoped SAS");
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_vended_sas_can_write_read_delete() -> Result<()> {
+            let Some(account_name) = maybe_account_name()? else {
+                return Ok(());
+            };
+
+            let vendor = AzureCredentialVendor::new(
+                AzureCredentialVendorConfig::new()
+                    .with_account_name(account_name.clone())
+                    .with_permission(VendedPermission::Admin)
+                    .with_duration_millis(5 * 60 * 1000),
+            );
+
+            let location = format!("az://{}/{}", TEST_CONTAINER, TEST_PREFIX);
+            let credentials = vendor.vend_credentials(&location, None).await?;
+
+            let sas_token = credentials
+                .storage_options
+                .get("azure_storage_sas_token")
+                .unwrap();
+
+            let blob_url = format!(
+                "https://{}.blob.core.windows.net/{}/{}/e2e-test.txt?{}",
+                account_name, TEST_CONTAINER, TEST_PREFIX, sas_token
+            );
+
+            let client = reqwest::Client::new();
+            let test_content = format!("lance-integ-{}", chrono::Utc::now().timestamp());
+
+            // Write
+            let put_resp = client
+                .put(&blob_url)
+                .header("x-ms-blob-type", "BlockBlob")
+                .header("x-ms-version", SAS_VERSION)
+                .body(test_content.clone())
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                put_resp.status().is_success(),
+                "PUT failed: {}",
+                put_resp.text().await.unwrap_or_default()
+            );
+
+            // Read
+            let get_resp = client
+                .get(&blob_url)
+                .header("x-ms-version", SAS_VERSION)
+                .send()
+                .await
+                .unwrap();
+            assert!(get_resp.status().is_success(), "GET failed");
+            assert_eq!(get_resp.text().await.unwrap(), test_content);
+
+            // Delete
+            let del_resp = client
+                .delete(&blob_url)
+                .header("x-ms-version", SAS_VERSION)
+                .send()
+                .await
+                .unwrap();
+            assert!(del_resp.status().is_success(), "DELETE failed");
 
             Ok(())
         }
