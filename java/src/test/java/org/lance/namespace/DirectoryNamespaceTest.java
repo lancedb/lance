@@ -1275,6 +1275,18 @@ public class DirectoryNamespaceTest {
     DeclareTableResponse declareResp = namespaceClient.declareTable(declareReq);
     assertNotNull(declareResp);
     assertNotNull(declareResp.getLocation());
+
+    DescribeTableRequest descReq =
+        new DescribeTableRequest().id(Arrays.asList("workspace", "declared_table"));
+    DescribeTableResponse descResp = namespaceClient.describeTable(descReq);
+    assertNull(descResp.getIsOnlyDeclared());
+
+    DescribeTableRequest checkReq =
+        new DescribeTableRequest()
+            .id(Arrays.asList("workspace", "declared_table"))
+            .checkDeclared(true);
+    DescribeTableResponse checkResp = namespaceClient.describeTable(checkReq);
+    assertEquals(Boolean.TRUE, checkResp.getIsOnlyDeclared());
   }
 
   @Test

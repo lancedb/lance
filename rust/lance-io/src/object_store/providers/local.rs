@@ -124,6 +124,10 @@ mod tests {
                 "file-object-store:///C:/Users/ADMINI~1/AppData/Local",
                 "C:/Users/ADMINI~1/AppData/Local",
             ),
+            (
+                "file:///C:/Users/RUNNER~1/AppData/Local/Temp/tmpm49j_w0f",
+                "C:/Users/RUNNER~1/AppData/Local/Temp/tmpm49j_w0f",
+            ),
         ];
 
         for (uri, expected_path) in cases {

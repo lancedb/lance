@@ -29,8 +29,6 @@ import org.lance.namespace.model.BatchCreateTableVersionsResponse;
 import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CountTableRowsRequest;
-import org.lance.namespace.model.CreateEmptyTableRequest;
-import org.lance.namespace.model.CreateEmptyTableResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateNamespaceResponse;
 import org.lance.namespace.model.CreateTableIndexRequest;
@@ -227,12 +225,6 @@ public class CustomNamespace implements LanceNamespace, Closeable {
   @Override
   public DeclareTableResponse declareTable(DeclareTableRequest request) {
     return inner.declareTable(request);
-  }
-
-  @Override
-  @SuppressWarnings("deprecation")
-  public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-    return inner.createEmptyTable(request);
   }
 
   @Override

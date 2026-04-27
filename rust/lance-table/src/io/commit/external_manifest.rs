@@ -48,7 +48,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
     ) -> Result<ManifestLocation> {
         let path = self.get(base_uri, version).await?;
-        let path = Path::from(path);
+        let path = Path::parse(&path).map_err(|e| Error::invalid_input(e.to_string()))?;
         let naming_scheme = detect_naming_scheme_from_path(&path)?;
         Ok(ManifestLocation {
             version,
@@ -75,7 +75,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     ) -> Result<Option<ManifestLocation>> {
         self.get_latest_version(base_uri).await.and_then(|res| {
             res.map(|(version, uri)| {
-                let path = Path::from(uri);
+                let path = Path::parse(&uri).map_err(|e| Error::invalid_input(e.to_string()))?;
                 let naming_scheme = detect_naming_scheme_from_path(&path)?;
                 Ok(ManifestLocation {
                     version,

@@ -923,11 +923,11 @@ impl DatasetIndexExt for Dataset {
                 })
                 .await?;
             let mut indices = indices.as_ref().clone();
-            indices.iter_mut().for_each(|idx| {
+            for idx in indices.iter_mut() {
                 if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                    frag_reuse_index.remap_fragment_bitmap(bitmap).unwrap();
+                    frag_reuse_index.remap_fragment_bitmap(bitmap)?;
                 }
-            });
+            }
             Ok(Arc::new(indices))
         } else {
             Ok(indices)

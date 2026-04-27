@@ -303,6 +303,51 @@ impl StorageOptionsAccessor {
         }
     }
 
+    /// Fetch fresh options from the provider and update the cache.
+    ///
+    /// This bypasses the cache for callers that need to validate provider-vended
+    /// credentials even when initial metadata has no expiration.
+    pub(crate) async fn refresh_storage_options(&self) -> Result<super::StorageOptions> {
+        let Some(provider) = &self.provider else {
+            return self.get_storage_options().await;
+        };
+
+        log::debug!(
+            "Refreshing storage options from provider: {}",
+            provider.provider_id()
+        );
+
+        let storage_options_map = provider.fetch_storage_options().await.map_err(|e| {
+            Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to fetch storage options: {}",
+                e
+            ))))
+        })?;
+
+        let Some(options) = storage_options_map else {
+            if let Some(initial) = &self.initial_options {
+                return Ok(super::StorageOptions(initial.clone()));
+            }
+            log::debug!(
+                "Provider {} returned no storage options, using default credentials",
+                provider.provider_id()
+            );
+            return Ok(super::StorageOptions(HashMap::new()));
+        };
+
+        let expires_at_millis = options
+            .get(EXPIRES_AT_MILLIS_KEY)
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let mut cache = self.cache.write().await;
+        *cache = Some(CachedStorageOptions {
+            options: options.clone(),
+            expires_at_millis,
+        });
+
+        Ok(super::StorageOptions(options))
+    }
+
     async fn do_get_storage_options(&self) -> Result<Option<super::StorageOptions>> {
         // Check if we have valid cached options with read lock
         {
