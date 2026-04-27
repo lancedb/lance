@@ -452,8 +452,14 @@ impl<'a> InsertBuilder<'a> {
                 }
             }
             WriteDestination::NamespaceTable(namespace_table) => {
+                let mut namespace_table = namespace_table.clone();
+                if namespace_table.namespace_client_table_context.is_none() {
+                    namespace_table.namespace_client_table_context =
+                        namespace_table_context.clone();
+                }
+
                 if namespace_table.dataset.is_some() {
-                    self.dest.clone()
+                    WriteDestination::NamespaceTable(namespace_table)
                 } else {
                     let context = namespace_table_context
                         .as_ref()
@@ -468,10 +474,9 @@ impl<'a> InsertBuilder<'a> {
 
                     match builder.load().await {
                         Ok(dataset) => WriteDestination::NamespaceTable(
-                            namespace_table.clone().with_dataset(Arc::new(dataset)),
+                            namespace_table.with_dataset(Arc::new(dataset)),
                         ),
                         Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                            let mut namespace_table = namespace_table.clone();
                             namespace_table.namespace_client_table_context = Some(context.clone());
                             WriteDestination::NamespaceTable(namespace_table)
                         }

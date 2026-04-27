@@ -1077,7 +1077,7 @@ def test_namespace_entry_points_reject_explicit_uri_with_context(tmp_path):
         )
 
 
-def test_namespace_open_passes_requested_version_to_describe(tmp_path):
+def test_namespace_open_version_uses_lance_checkout(tmp_path):
     inner = connect(
         "dir",
         {
@@ -1119,7 +1119,7 @@ def test_namespace_open_passes_requested_version_to_describe(tmp_path):
     ds = lance.dataset(namespace_client=ns_client, table_id=table_id, version=1)
 
     assert ds.version == 1
-    assert ns_client.describe_versions[-1] == 1
+    assert ns_client.describe_versions[-1] is None
 
 
 @pytest.mark.skipif(
