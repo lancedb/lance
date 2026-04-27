@@ -41,6 +41,7 @@ except ImportError:
     class StrEnum(str, Enum):
         pass
 
+
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
