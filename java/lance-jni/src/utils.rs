@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
 use crate::traits::FromJObjectWithEnv;
-use lance_index::vector::{ParallelMode, Query};
+use lance_index::vector::Query;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -207,6 +207,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         };
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
+        let partition_parallelism = env
+            .call_method(&java_obj, "getPartitionParallelism", "()I", &[])?
+            .i()?;
 
         Ok(Query {
             column,
@@ -221,7 +224,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             metric_type: distance_type,
             use_index,
             dist_q_c: 0.0,
-            parallel_mode: ParallelMode::Sequential,
+            partition_parallelism,
         })
     })?;
 

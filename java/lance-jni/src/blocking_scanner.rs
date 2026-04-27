@@ -320,6 +320,11 @@ pub(crate) fn build_scanner_with_options<'a>(
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
         scanner.use_index(use_index);
+
+        let partition_parallelism = env
+            .call_method(&java_obj, "getPartitionParallelism", "()I", &[])?
+            .i()?;
+        scanner.partition_parallelism(partition_parallelism);
         Ok(())
     })?;
 

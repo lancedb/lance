@@ -59,6 +59,7 @@ public class JNITest {
                 .setRefineFactor(40)
                 .setDistanceType(DistanceType.L2)
                 .setUseIndex(true)
+                .setPartitionParallelism(-1)
                 .build()));
   }
 
