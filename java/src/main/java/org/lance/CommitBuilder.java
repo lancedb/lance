@@ -29,6 +29,8 @@ import java.util.Map;
  * <ul>
  *   <li><strong>Dataset-based commit</strong>: commits against an existing dataset.
  *   <li><strong>URI-based commit</strong>: creates or updates a dataset at a URI.
+ *   <li><strong>Namespace-based commit</strong>: creates or updates a table through a namespace
+ *       client.
  * </ul>
  *
  * <p>Example usage (dataset-based):
@@ -53,6 +55,20 @@ import java.util.Map;
  *     // use committed dataset
  * }
  * }</pre>
+ *
+ * <p>Example usage (namespace-based):
+ *
+ * <pre>{@code
+ * try (Transaction txn = new Transaction.Builder()
+ *     .operation(Overwrite.builder().fragments(fragments).schema(schema).build())
+ *     .build();
+ *     Dataset committed = new CommitBuilder(allocator)
+ *         .namespaceClient(namespaceClient)
+ *         .tableId(tableId)
+ *         .execute(txn)) {
+ *     // use committed dataset
+ * }
+ * }</pre>
  */
 public class CommitBuilder {
   static {
@@ -66,7 +82,7 @@ public class CommitBuilder {
   private Map<String, String> writeParams;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
-  private boolean namespaceClientManagedVersioning = false;
+  private NamespaceClientTableContext namespaceClientTableContext;
   private boolean enableV2ManifestPaths = true;
   private boolean detached = false;
   private Boolean useStableRowIds;
@@ -101,6 +117,21 @@ public class CommitBuilder {
   }
 
   /**
+   * Create a commit builder for creating or updating a table through a namespace client.
+   *
+   * <p>Use {@link #namespaceClient(LanceNamespace)} and {@link #tableId(List)} before executing.
+   * The table location is resolved from the namespace client or the cached namespace context.
+   *
+   * @param allocator the Arrow buffer allocator for schema export
+   */
+  public CommitBuilder(BufferAllocator allocator) {
+    Preconditions.checkNotNull(allocator, "Allocator must not be null");
+    this.dataset = null;
+    this.uri = null;
+    this.allocator = allocator;
+  }
+
+  /**
    * Set write parameters (storage options) for the commit.
    *
    * @param writeParams the write parameters
@@ -114,7 +145,7 @@ public class CommitBuilder {
   /**
    * Set the namespace client for managed versioning. When set, commits are routed through the
    * namespace client's {@code createTableVersion} API instead of writing directly to the object
-   * store. This is supported for both dataset-based and URI-based commits.
+   * store. This is supported for dataset-based and namespace-based commits.
    *
    * @param namespaceClient the LanceNamespace client instance
    * @return this builder instance
@@ -138,17 +169,14 @@ public class CommitBuilder {
   }
 
   /**
-   * Set whether namespace manages versioning.
+   * Sets a cached namespace context from a prior {@code describeTable} or {@code declareTable}
+   * call. Rust uses this to determine managed versioning and storage options.
    *
-   * <p>When true and namespaceClient/tableId are set, commits are routed through the namespace
-   * client's create_table_version API. This is typically set based on the managed_versioning field
-   * from describe_table or declare_table responses.
-   *
-   * @param namespaceClientManagedVersioning whether namespace manages versioning
+   * @param context the cached namespace context
    * @return this builder instance
    */
-  public CommitBuilder namespaceClientManagedVersioning(boolean namespaceClientManagedVersioning) {
-    this.namespaceClientManagedVersioning = namespaceClientManagedVersioning;
+  public CommitBuilder namespaceClientTableContext(NamespaceClientTableContext context) {
+    this.namespaceClientTableContext = context;
     return this;
   }
 
@@ -246,6 +274,27 @@ public class CommitBuilder {
    */
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
+    boolean hasNamespaceFields = namespaceClient != null || tableId != null;
+    boolean hasCompleteNamespace = namespaceClient != null && tableId != null;
+
+    if (uri != null && hasNamespaceFields) {
+      throw new IllegalArgumentException("Cannot specify both URI and namespaceClient+tableId.");
+    }
+
+    if (namespaceClientTableContext != null && !hasCompleteNamespace) {
+      throw new IllegalArgumentException(
+          "namespaceClientTableContext requires namespaceClient and tableId.");
+    }
+
+    if (hasNamespaceFields && !hasCompleteNamespace) {
+      if (namespaceClient == null) {
+        throw new IllegalArgumentException(
+            "tableId is set but namespaceClient is missing. Both must be provided together.");
+      }
+      throw new IllegalArgumentException(
+          "namespaceClient is set but tableId is missing. Both must be provided together.");
+    }
+
     if (dataset != null) {
       Dataset result =
           nativeCommitToDataset(
@@ -260,14 +309,13 @@ public class CommitBuilder {
               skipAutoCleanup,
               namespaceClient,
               tableId,
-              namespaceClientManagedVersioning);
+              namespaceClientTableContext);
       result.setAllocator(dataset.allocator());
       return result;
     }
-    if (uri != null) {
+    if (hasCompleteNamespace) {
       Dataset result =
-          nativeCommitToUri(
-              uri,
+          nativeCommitToNamespace(
               transaction,
               detached,
               enableV2ManifestPaths,
@@ -279,11 +327,28 @@ public class CommitBuilder {
               storageFormat,
               maxRetries,
               skipAutoCleanup,
-              namespaceClientManagedVersioning);
+              namespaceClientTableContext);
       result.setAllocator(allocator);
       return result;
     }
-    throw new IllegalStateException("CommitBuilder requires either a dataset or a URI");
+    if (uri != null) {
+      Dataset result =
+          nativeCommitToUri(
+              uri,
+              transaction,
+              detached,
+              enableV2ManifestPaths,
+              allocator,
+              writeParams,
+              useStableRowIds,
+              storageFormat,
+              maxRetries,
+              skipAutoCleanup);
+      result.setAllocator(allocator);
+      return result;
+    }
+    throw new IllegalStateException(
+        "CommitBuilder requires a dataset, URI, or namespaceClient+tableId");
   }
 
   private static native Dataset nativeCommitToDataset(
@@ -298,10 +363,21 @@ public class CommitBuilder {
       boolean skipAutoCleanup,
       Object namespace,
       Object tableId,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 
   private static native Dataset nativeCommitToUri(
       String uri,
+      Transaction transaction,
+      boolean detached,
+      boolean enableV2ManifestPaths,
+      Object allocator,
+      Map<String, String> writeParams,
+      Boolean useStableRowIds,
+      String storageFormat,
+      int maxRetries,
+      boolean skipAutoCleanup);
+
+  private static native Dataset nativeCommitToNamespace(
       Transaction transaction,
       boolean detached,
       boolean enableV2ManifestPaths,
@@ -313,5 +389,5 @@ public class CommitBuilder {
       String storageFormat,
       int maxRetries,
       boolean skipAutoCleanup,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 }

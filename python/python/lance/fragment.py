@@ -49,7 +49,7 @@ if TYPE_CHECKING:
         Transaction,
     )
     from .lance import LanceSchema
-    from .namespace import LanceNamespace
+    from .namespace import LanceNamespace, NamespaceClientTableContext
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
@@ -348,6 +348,7 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -391,11 +392,15 @@ class LanceFragment(pa.dataset.Fragment):
             A namespace client for automatic credential refresh. When provided with
             `table_id`, a storage options provider will be created automatically to
             refresh credentials via the namespace. Must be provided together with
-            `table_id`. The caller should provide initial/merged storage options via
-            the `storage_options` parameter.
+            `table_id`.
         table_id : optional, List[str]
             The table identifier when using a namespace (e.g., ["my_table"]).
             Must be provided together with `namespace_client`.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. The native layer uses
+            this cached metadata together with ``namespace_client`` and
+            ``table_id`` to avoid redundant namespace lookups while keeping
+            credential refresh support.
 
         See Also
         --------
@@ -411,7 +416,6 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-        # Validate namespace_client and table_id are provided together
         if namespace_client is not None and table_id is None:
             raise ValueError(
                 "Both 'namespace_client' and 'table_id' must be provided together."
@@ -419,6 +423,11 @@ class LanceFragment(pa.dataset.Fragment):
         elif table_id is not None and namespace_client is None:
             raise ValueError(
                 "Both 'namespace_client' and 'table_id' must be provided together."
+            )
+        if namespace_client_table_context is not None and namespace_client is None:
+            raise ValueError(
+                "'namespace_client_table_context' requires 'namespace_client' and "
+                "'table_id' to be provided."
             )
 
         if use_legacy_format is not None:
@@ -449,6 +458,7 @@ class LanceFragment(pa.dataset.Fragment):
             storage_options=storage_options,
             namespace_client=namespace_client,
             table_id=table_id,
+            namespace_client_table_context=namespace_client_table_context,
         )
 
     @property
@@ -1008,6 +1018,7 @@ if TYPE_CHECKING:
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional[NamespaceClientTableContext] = None,
     ) -> Transaction: ...
 
     @overload
@@ -1030,6 +1041,7 @@ if TYPE_CHECKING:
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional[NamespaceClientTableContext] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -1052,6 +1064,7 @@ def write_fragments(
     initial_bases: Optional[List["DatasetBasePath"]] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -1136,6 +1149,11 @@ def write_fragments(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`.
+    namespace_client_table_context : optional, NamespaceClientTableContext
+        Cached context from a prior namespace call. The native layer uses
+        this cached metadata together with ``namespace_client`` and
+        ``table_id`` to avoid redundant namespace lookups while keeping
+        credential refresh support.
 
     Returns
     -------
@@ -1153,7 +1171,6 @@ def write_fragments(
     """
     from .dataset import LanceDataset
 
-    # Validate namespace_client and table_id are provided together
     if namespace_client is not None and table_id is None:
         raise ValueError(
             "Both 'namespace_client' and 'table_id' must be provided together."
@@ -1161,6 +1178,11 @@ def write_fragments(
     elif table_id is not None and namespace_client is None:
         raise ValueError(
             "Both 'namespace_client' and 'table_id' must be provided together."
+        )
+    if namespace_client_table_context is not None and namespace_client is None:
+        raise ValueError(
+            "'namespace_client_table_context' requires 'namespace_client' and "
+            "'table_id' to be provided."
         )
 
     reader = _coerce_reader(data, schema)
@@ -1196,6 +1218,7 @@ def write_fragments(
         storage_options=storage_options,
         namespace_client=namespace_client,
         table_id=table_id,
+        namespace_client_table_context=namespace_client_table_context,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
         initial_bases=initial_bases,

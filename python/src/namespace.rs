@@ -1512,6 +1512,13 @@ impl LanceNamespaceTrait for PyLanceNamespace {
         call_py_method(self.py_namespace.clone(), "describe_table", request).await
     }
 
+    async fn declare_table(
+        &self,
+        request: lance_namespace::models::DeclareTableRequest,
+    ) -> lance_core::Result<lance_namespace::models::DeclareTableResponse> {
+        call_py_method(self.py_namespace.clone(), "declare_table", request).await
+    }
+
     async fn describe_table_version(
         &self,
         request: DescribeTableVersionRequest,
@@ -1579,6 +1586,24 @@ pub fn extract_namespace_arc(
 
     // Custom Python implementation or subclass - wrap with PyLanceNamespace
     PyLanceNamespace::create_arc(py, namespace_client)
+}
+
+/// Extract a [`NamespaceClientTableContext`] from a Python object.
+///
+/// Reads the `location`, `storage_options`, and `managed_versioning`
+/// attributes from the Python `NamespaceClientTableContext` instance.
+pub fn extract_namespace_client_table_context(
+    ctx: &Bound<'_, PyAny>,
+) -> PyResult<lance_namespace::NamespaceClientTableContext> {
+    let location: String = ctx.getattr("location")?.extract()?;
+    let storage_options: Option<HashMap<String, String>> =
+        ctx.getattr("storage_options")?.extract()?;
+    let managed_versioning: bool = ctx.getattr("managed_versioning")?.extract()?;
+    Ok(lance_namespace::NamespaceClientTableContext {
+        location,
+        storage_options,
+        managed_versioning,
+    })
 }
 
 /// Python wrapper for REST adapter server

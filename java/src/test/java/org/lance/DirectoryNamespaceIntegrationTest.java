@@ -25,6 +25,7 @@ import org.lance.namespace.model.DropTableRequest;
 import org.lance.namespace.model.DropTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
 import org.lance.operation.Append;
+import org.lance.operation.Overwrite;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -60,7 +61,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -1158,15 +1158,11 @@ public class DirectoryNamespaceIntegrationTest {
           0, getDescribeCallCount(innerNamespaceClient), "describeTable should not be called yet");
 
       String tableUri = response.getLocation();
-      Map<String, String> namespaceStorageOptions = response.getStorageOptions();
+      NamespaceClientTableContext namespaceClientTableContext =
+          NamespaceClientTableContext.fromDeclareTableResponse(response);
 
-      // Merge storage options
-      Map<String, String> mergedOptions = new HashMap<>(storageOptions);
-      if (namespaceStorageOptions != null) {
-        mergedOptions.putAll(namespaceStorageOptions);
-      }
-
-      WriteParams writeParams = new WriteParams.Builder().withStorageOptions(mergedOptions).build();
+      WriteParams writeParams =
+          new WriteParams.Builder().withStorageOptions(storageOptions).build();
       List<String> tableId = Arrays.asList(tableName);
 
       // Step 2: Write multiple fragments in parallel (simulated)
@@ -1188,7 +1184,14 @@ public class DirectoryNamespaceIntegrationTest {
         root.setRowCount(2);
 
         List<FragmentMetadata> fragment1 =
-            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+            Fragment.create(
+                tableUri,
+                allocator,
+                root,
+                writeParams,
+                namespaceClient,
+                tableId,
+                namespaceClientTableContext);
         allFragments.addAll(fragment1);
       }
 
@@ -1208,7 +1211,14 @@ public class DirectoryNamespaceIntegrationTest {
         root.setRowCount(2);
 
         List<FragmentMetadata> fragment2 =
-            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+            Fragment.create(
+                tableUri,
+                allocator,
+                root,
+                writeParams,
+                namespaceClient,
+                tableId,
+                namespaceClientTableContext);
         allFragments.addAll(fragment2);
       }
 
@@ -1226,16 +1236,29 @@ public class DirectoryNamespaceIntegrationTest {
         root.setRowCount(1);
 
         List<FragmentMetadata> fragment3 =
-            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+            Fragment.create(
+                tableUri,
+                allocator,
+                root,
+                writeParams,
+                namespaceClient,
+                tableId,
+                namespaceClientTableContext);
         allFragments.addAll(fragment3);
       }
 
       // Step 3: Commit all fragments as one operation
-      FragmentOperation.Overwrite overwriteOp =
-          new FragmentOperation.Overwrite(allFragments, schema);
-
-      try (Dataset dataset =
-          Dataset.commit(allocator, tableUri, overwriteOp, Optional.empty(), mergedOptions)) {
+      try (Transaction transaction =
+              new Transaction.Builder()
+                  .operation(Overwrite.builder().fragments(allFragments).schema(schema).build())
+                  .build();
+          Dataset dataset =
+              new CommitBuilder(allocator)
+                  .writeParams(storageOptions)
+                  .namespaceClient(namespaceClient)
+                  .tableId(tableId)
+                  .namespaceClientTableContext(namespaceClientTableContext)
+                  .execute(transaction)) {
         assertEquals(5, dataset.countRows(), "Should have 5 total rows from all fragments");
         assertEquals(1, dataset.listVersions().size(), "Should have 1 version after commit");
       }
@@ -1285,15 +1308,11 @@ public class DirectoryNamespaceIntegrationTest {
           1, getDeclareCallCount(innerNamespaceClient), "declareTable should be called once");
 
       String tableUri = response.getLocation();
-      Map<String, String> namespaceStorageOptions = response.getStorageOptions();
+      NamespaceClientTableContext namespaceClientTableContext =
+          NamespaceClientTableContext.fromDeclareTableResponse(response);
 
-      // Merge storage options
-      Map<String, String> mergedOptions = new HashMap<>(storageOptions);
-      if (namespaceStorageOptions != null) {
-        mergedOptions.putAll(namespaceStorageOptions);
-      }
-
-      WriteParams writeParams = new WriteParams.Builder().withStorageOptions(mergedOptions).build();
+      WriteParams writeParams =
+          new WriteParams.Builder().withStorageOptions(storageOptions).build();
       List<String> tableId = Arrays.asList(tableName);
 
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
@@ -1317,7 +1336,14 @@ public class DirectoryNamespaceIntegrationTest {
 
         // Create fragment with namespace client
         List<FragmentMetadata> fragments1 =
-            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+            Fragment.create(
+                tableUri,
+                allocator,
+                root,
+                writeParams,
+                namespaceClient,
+                tableId,
+                namespaceClientTableContext);
 
         assertEquals(1, fragments1.size());
 
@@ -1332,22 +1358,45 @@ public class DirectoryNamespaceIntegrationTest {
 
         // Create another fragment with the same namespace client
         List<FragmentMetadata> fragments2 =
-            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+            Fragment.create(
+                tableUri,
+                allocator,
+                root,
+                writeParams,
+                namespaceClient,
+                tableId,
+                namespaceClientTableContext);
 
         assertEquals(1, fragments2.size());
 
         // Commit first fragment to the dataset using Overwrite (for empty table)
-        FragmentOperation.Overwrite overwriteOp =
-            new FragmentOperation.Overwrite(fragments1, schema);
-        try (Dataset updatedDataset =
-            Dataset.commit(allocator, tableUri, overwriteOp, Optional.empty(), mergedOptions)) {
+        try (Transaction transaction =
+                new Transaction.Builder()
+                    .operation(Overwrite.builder().fragments(fragments1).schema(schema).build())
+                    .build();
+            Dataset updatedDataset =
+                new CommitBuilder(allocator)
+                    .writeParams(storageOptions)
+                    .namespaceClient(namespaceClient)
+                    .tableId(tableId)
+                    .namespaceClientTableContext(namespaceClientTableContext)
+                    .execute(transaction)) {
           assertEquals(1, updatedDataset.version());
           assertEquals(3, updatedDataset.countRows());
 
           // Append second fragment
-          FragmentOperation.Append appendOp2 = new FragmentOperation.Append(fragments2);
-          try (Dataset finalDataset =
-              Dataset.commit(allocator, tableUri, appendOp2, Optional.of(1L), mergedOptions)) {
+          try (Transaction appendTransaction =
+                  new Transaction.Builder()
+                      .readVersion(1L)
+                      .operation(Append.builder().fragments(fragments2).build())
+                      .build();
+              Dataset finalDataset =
+                  new CommitBuilder(allocator)
+                      .writeParams(storageOptions)
+                      .namespaceClient(namespaceClient)
+                      .tableId(tableId)
+                      .namespaceClientTableContext(namespaceClientTableContext)
+                      .execute(appendTransaction)) {
             assertEquals(2, finalDataset.version());
             assertEquals(6, finalDataset.countRows());
           }
@@ -1396,23 +1445,18 @@ public class DirectoryNamespaceIntegrationTest {
       DeclareTableResponse response = namespaceClient.declareTable(request);
 
       String tableUri = response.getLocation();
-      Map<String, String> namespaceStorageOptions = response.getStorageOptions();
-
-      // Merge storage options
-      Map<String, String> mergedOptions = new HashMap<>(storageOptions);
-      if (namespaceStorageOptions != null) {
-        mergedOptions.putAll(namespaceStorageOptions);
-      }
+      NamespaceClientTableContext namespaceClientTableContext =
+          NamespaceClientTableContext.fromDeclareTableResponse(response);
 
       // First, write some initial data using Fragment.create and commit
-      WriteParams writeParams = new WriteParams.Builder().withStorageOptions(mergedOptions).build();
+      WriteParams writeParams =
+          new WriteParams.Builder().withStorageOptions(storageOptions).build();
       List<String> tableId = Arrays.asList(tableName);
 
       List<FragmentMetadata> initialFragments;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         IntVector idVector = (IntVector) root.getVector("id");
-        org.apache.arrow.vector.VarCharVector nameVector =
-            (org.apache.arrow.vector.VarCharVector) root.getVector("name");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
 
         idVector.allocateNew(2);
         nameVector.allocateNew(2);
@@ -1427,35 +1471,48 @@ public class DirectoryNamespaceIntegrationTest {
         root.setRowCount(2);
 
         initialFragments =
-            Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+            Fragment.create(
+                tableUri,
+                allocator,
+                root,
+                writeParams,
+                namespaceClient,
+                tableId,
+                namespaceClientTableContext);
       }
 
       // Commit initial fragments
-      FragmentOperation.Overwrite overwriteOp =
-          new FragmentOperation.Overwrite(initialFragments, schema);
-      try (Dataset dataset =
-          Dataset.commit(allocator, tableUri, overwriteOp, Optional.empty(), mergedOptions)) {
+      try (Transaction transaction =
+              new Transaction.Builder()
+                  .operation(Overwrite.builder().fragments(initialFragments).schema(schema).build())
+                  .build();
+          Dataset dataset =
+              new CommitBuilder(allocator)
+                  .writeParams(storageOptions)
+                  .namespaceClient(namespaceClient)
+                  .tableId(tableId)
+                  .namespaceClientTableContext(namespaceClientTableContext)
+                  .execute(transaction)) {
         assertEquals(1, dataset.version());
         assertEquals(2, dataset.countRows());
       }
 
       // Now test Transaction.commit with namespace client
-      // Open dataset with namespace client using mergedOptions (which has expires_at_millis)
-      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(mergedOptions).build();
+      ReadOptions readOptions = new ReadOptions.Builder().setStorageOptions(storageOptions).build();
 
       try (Dataset datasetWithNamespaceClient =
           Dataset.open()
               .allocator(allocator)
               .namespaceClient(namespaceClient)
               .tableId(tableId)
+              .namespaceClientTableContext(namespaceClientTableContext)
               .readOptions(readOptions)
               .build()) {
         // Create more fragments to append
         List<FragmentMetadata> newFragments;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
           IntVector idVector = (IntVector) root.getVector("id");
-          org.apache.arrow.vector.VarCharVector nameVector =
-              (org.apache.arrow.vector.VarCharVector) root.getVector("name");
+          VarCharVector nameVector = (VarCharVector) root.getVector("name");
 
           idVector.allocateNew(2);
           nameVector.allocateNew(2);
@@ -1470,7 +1527,14 @@ public class DirectoryNamespaceIntegrationTest {
           root.setRowCount(2);
 
           newFragments =
-              Fragment.create(tableUri, allocator, root, writeParams, namespaceClient, tableId);
+              Fragment.create(
+                  tableUri,
+                  allocator,
+                  root,
+                  writeParams,
+                  namespaceClient,
+                  tableId,
+                  namespaceClientTableContext);
         }
 
         // Create and commit transaction
@@ -1481,7 +1545,11 @@ public class DirectoryNamespaceIntegrationTest {
                 .operation(appendOp)
                 .build()) {
           try (Dataset committedDataset =
-              new CommitBuilder(datasetWithNamespaceClient).execute(transaction)) {
+              new CommitBuilder(datasetWithNamespaceClient)
+                  .namespaceClient(namespaceClient)
+                  .tableId(tableId)
+                  .namespaceClientTableContext(namespaceClientTableContext)
+                  .execute(transaction)) {
             assertEquals(2, committedDataset.version());
             assertEquals(4, committedDataset.countRows());
           }

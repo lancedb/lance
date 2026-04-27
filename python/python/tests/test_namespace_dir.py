@@ -979,6 +979,149 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         ), "describe_table_version should be called once when opening version 1"
 
 
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_cached_context_skips_namespace_lookup_for_open_and_append(use_custom):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inner_ns_client = lance.namespace.DirectoryNamespace(
+            root=tmpdir,
+            table_version_tracking_enabled="true",
+            manifest_enabled="true",
+            ops_metrics_enabled="true",
+        )
+        ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+
+        ns_client.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+
+        table_id = ["workspace", "cached_context_table"]
+        table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+        ds = lance.write_dataset(
+            table1, namespace_client=ns_client, table_id=table_id, mode="create"
+        )
+        assert ds.count_rows() == 2
+
+        describe_resp = ns_client.describe_table(DescribeTableRequest(id=table_id))
+        context = (
+            lance.namespace.NamespaceClientTableContext.from_describe_table_response(
+                describe_resp
+            )
+        )
+
+        describe_count_before_open = _get_ops_metric(inner_ns_client, "describe_table")
+        ds_from_context = lance.dataset(
+            namespace_client=ns_client,
+            table_id=table_id,
+            namespace_client_table_context=context,
+        )
+        assert ds_from_context.count_rows() == 2
+        assert (
+            _get_ops_metric(inner_ns_client, "describe_table")
+            == describe_count_before_open
+        ), "describe_table should not be called when opening with cached context"
+
+        create_count_before_append = _get_ops_metric(
+            inner_ns_client, "create_table_version"
+        )
+        describe_count_before_append = _get_ops_metric(
+            inner_ns_client, "describe_table"
+        )
+
+        table2 = pa.Table.from_pylist([{"a": 100, "b": 200}, {"a": 1000, "b": 2000}])
+        appended = lance.write_dataset(
+            table2,
+            namespace_client=ns_client,
+            table_id=table_id,
+            mode="append",
+            namespace_client_table_context=context,
+        )
+        assert appended.count_rows() == 4
+        assert (
+            _get_ops_metric(inner_ns_client, "describe_table")
+            == describe_count_before_append
+        ), "describe_table should not be called when appending with cached context"
+        assert (
+            _get_ops_metric(inner_ns_client, "create_table_version")
+            == create_count_before_append + 1
+        ), "create_table_version should still be called for the append commit"
+
+
+def test_namespace_entry_points_reject_explicit_uri_with_context(tmp_path):
+    context = lance.namespace.NamespaceClientTableContext(
+        str(tmp_path / "table.lance"),
+        None,
+        False,
+    )
+    namespace_client = object()
+    table_id = ["workspace", "table"]
+    operation = lance.LanceOperation.Overwrite(
+        pa.schema([pa.field("a", pa.int64())]), []
+    )
+
+    with pytest.raises(ValueError, match="Cannot specify both 'uri'"):
+        lance.LanceDataset(
+            str(tmp_path / "explicit.lance"),
+            namespace_client=namespace_client,
+            table_id=table_id,
+            namespace_client_table_context=context,
+        )
+
+    with pytest.raises(ValueError, match="namespace_client_table_context"):
+        lance.LanceDataset(namespace_client_table_context=context)
+
+    with pytest.raises(ValueError, match="Cannot specify both 'base_uri'"):
+        lance.LanceDataset.commit(
+            str(tmp_path / "explicit.lance"),
+            operation,
+            namespace_client=namespace_client,
+            table_id=table_id,
+            namespace_client_table_context=context,
+        )
+
+
+def test_namespace_open_passes_requested_version_to_describe(tmp_path):
+    inner = connect(
+        "dir",
+        {
+            "root": str(tmp_path / "ns"),
+            "table_storage_root": str(tmp_path / "tables"),
+        },
+    )
+    table_id = ["workspace", "versioned_open"]
+    lance.write_dataset(
+        pa.table({"a": [1]}),
+        namespace_client=inner,
+        table_id=table_id,
+        mode="create",
+    )
+    lance.write_dataset(
+        pa.table({"a": [2]}),
+        namespace_client=inner,
+        table_id=table_id,
+        mode="append",
+    )
+
+    class RecordingNamespace(CustomNamespace):
+        def __init__(self, wrapped):
+            super().__init__(wrapped)
+            self.describe_versions = []
+
+        def describe_table(
+            self, request: DescribeTableRequest
+        ) -> DescribeTableResponse:
+            version = (
+                request.version
+                if hasattr(request, "version")
+                else request.get("version")
+            )
+            self.describe_versions.append(version)
+            return super().describe_table(request)
+
+    ns_client = RecordingNamespace(inner)
+    ds = lance.dataset(namespace_client=ns_client, table_id=table_id, version=1)
+
+    assert ds.version == 1
+    assert ns_client.describe_versions[-1] == 1
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="Windows file locking prevents reliable concurrent filesystem operations",

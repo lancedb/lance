@@ -23,7 +23,84 @@ from lance import (
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
+from lance.namespace import NamespaceClientTableContext
 from lance.progress import FileSystemFragmentWriteProgress
+
+
+def test_fragment_wrappers_forward_namespace_context(monkeypatch, tmp_path: Path):
+    calls = {}
+
+    class FakeFragmentApi:
+        @staticmethod
+        def create(dataset_uri, fragment_id, reader, **kwargs):
+            calls["create"] = {
+                "dataset_uri": dataset_uri,
+                "fragment_id": fragment_id,
+                "kwargs": kwargs,
+            }
+            return "created"
+
+    def fake_write_fragments(dataset_uri, reader, **kwargs):
+        calls["write_fragments"] = {
+            "dataset_uri": dataset_uri,
+            "kwargs": kwargs,
+        }
+        return []
+
+    monkeypatch.setattr("lance.fragment._Fragment", FakeFragmentApi)
+    monkeypatch.setattr("lance.fragment._write_fragments", fake_write_fragments)
+
+    context = NamespaceClientTableContext(
+        str(tmp_path),
+        {"from_context": "value"},
+        False,
+    )
+    namespace_client = object()
+    table_id = ["workspace", "table"]
+
+    assert (
+        LanceFragment.create(
+            tmp_path,
+            pa.table({"a": [1]}),
+            storage_options={"from_user": "value"},
+            namespace_client=namespace_client,
+            table_id=table_id,
+            namespace_client_table_context=context,
+        )
+        == "created"
+    )
+
+    write_fragments(
+        pa.table({"a": [1]}),
+        str(tmp_path),
+        storage_options={"from_user": "value"},
+        namespace_client=namespace_client,
+        table_id=table_id,
+        namespace_client_table_context=context,
+    )
+
+    assert calls["create"]["kwargs"]["storage_options"] == {"from_user": "value"}
+    assert calls["create"]["kwargs"]["namespace_client"] is namespace_client
+    assert calls["create"]["kwargs"]["table_id"] == table_id
+    assert calls["create"]["kwargs"]["namespace_client_table_context"] is context
+    assert calls["write_fragments"]["kwargs"]["storage_options"] == {
+        "from_user": "value"
+    }
+    assert calls["write_fragments"]["kwargs"]["namespace_client"] is namespace_client
+    assert calls["write_fragments"]["kwargs"]["table_id"] == table_id
+    assert (
+        calls["write_fragments"]["kwargs"]["namespace_client_table_context"] is context
+    )
+
+
+def test_fragment_create_rejects_context_without_namespace(tmp_path: Path):
+    context = NamespaceClientTableContext(str(tmp_path), None, False)
+    with pytest.raises(ValueError, match="namespace_client_table_context"):
+        LanceFragment.create(
+            tmp_path,
+            pa.table({"a": [1]}),
+            namespace_client_table_context=context,
+        )
 
 
 def test_write_fragment(tmp_path: Path):

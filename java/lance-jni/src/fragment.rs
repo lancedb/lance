@@ -23,11 +23,10 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocking_dataset::extract_namespace_info;
+use crate::blocking_dataset::{extract_namespace_client_table_context, extract_namespace_info};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
-use crate::utils::extract_storage_options;
 use crate::{
     RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -89,17 +88,18 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    max_rows_per_file: JObject,                 // Optional<Integer>
-    max_rows_per_group: JObject,                // Optional<Integer>
-    max_bytes_per_file: JObject,                // Optional<Long>
-    mode: JObject,                              // Optional<String>
-    enable_stable_row_ids: JObject,             // Optional<Boolean>
-    data_storage_version: JObject,              // Optional<String>
-    storage_options_obj: JObject,               // Map<String, String>
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    max_rows_per_file: JObject,                  // Optional<Integer>
+    max_rows_per_group: JObject,                 // Optional<Integer>
+    max_bytes_per_file: JObject,                 // Optional<Long>
+    mode: JObject,                               // Optional<String>
+    enable_stable_row_ids: JObject,              // Optional<Boolean>
+    data_storage_version: JObject,               // Optional<String>
+    storage_options_obj: JObject,                // Map<String, String>
+    namespace_obj: JObject,                      // LanceNamespace (can be null)
+    table_id_obj: JObject,                       // List<String> (can be null)
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
+    allow_external_blob_outside_bases: JObject,  // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,      // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -117,6 +117,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             storage_options_obj,
             namespace_obj,
             table_id_obj,
+            namespace_client_table_context_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
         ),
@@ -130,17 +131,18 @@ fn inner_create_with_ffi_array<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    max_rows_per_file: JObject,                 // Optional<Integer>
-    max_rows_per_group: JObject,                // Optional<Integer>
-    max_bytes_per_file: JObject,                // Optional<Long>
-    mode: JObject,                              // Optional<String>
-    enable_stable_row_ids: JObject,             // Optional<Boolean>
-    data_storage_version: JObject,              // Optional<String>
-    storage_options_obj: JObject,               // Map<String, String>
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    max_rows_per_file: JObject,                  // Optional<Integer>
+    max_rows_per_group: JObject,                 // Optional<Integer>
+    max_bytes_per_file: JObject,                 // Optional<Long>
+    mode: JObject,                               // Optional<String>
+    enable_stable_row_ids: JObject,              // Optional<Boolean>
+    data_storage_version: JObject,               // Optional<String>
+    storage_options_obj: JObject,                // Map<String, String>
+    namespace_obj: JObject,                      // LanceNamespace (can be null)
+    table_id_obj: JObject,                       // List<String> (can be null)
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
+    allow_external_blob_outside_bases: JObject,  // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,      // Optional<Long>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -167,6 +169,7 @@ fn inner_create_with_ffi_array<'local>(
         storage_options_obj,
         namespace_obj,
         table_id_obj,
+        namespace_client_table_context_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         reader,
@@ -179,17 +182,18 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    max_rows_per_file: JObject,                 // Optional<Integer>
-    max_rows_per_group: JObject,                // Optional<Integer>
-    max_bytes_per_file: JObject,                // Optional<Long>
-    mode: JObject,                              // Optional<String>
-    enable_stable_row_ids: JObject,             // Optional<Boolean>
-    data_storage_version: JObject,              // Optional<String>
-    storage_options_obj: JObject,               // Map<String, String>
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    max_rows_per_file: JObject,                  // Optional<Integer>
+    max_rows_per_group: JObject,                 // Optional<Integer>
+    max_bytes_per_file: JObject,                 // Optional<Long>
+    mode: JObject,                               // Optional<String>
+    enable_stable_row_ids: JObject,              // Optional<Boolean>
+    data_storage_version: JObject,               // Optional<String>
+    storage_options_obj: JObject,                // Map<String, String>
+    namespace_obj: JObject,                      // LanceNamespace (can be null)
+    table_id_obj: JObject,                       // List<String> (can be null)
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
+    allow_external_blob_outside_bases: JObject,  // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,      // Optional<Long>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -206,6 +210,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             storage_options_obj,
             namespace_obj,
             table_id_obj,
+            namespace_client_table_context_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
         ),
@@ -218,17 +223,18 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    max_rows_per_file: JObject,                 // Optional<Integer>
-    max_rows_per_group: JObject,                // Optional<Integer>
-    max_bytes_per_file: JObject,                // Optional<Long>
-    mode: JObject,                              // Optional<String>
-    enable_stable_row_ids: JObject,             // Optional<Boolean>
-    data_storage_version: JObject,              // Optional<String>
-    storage_options_obj: JObject,               // Map<String, String>
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    max_rows_per_file: JObject,                  // Optional<Integer>
+    max_rows_per_group: JObject,                 // Optional<Integer>
+    max_bytes_per_file: JObject,                 // Optional<Long>
+    mode: JObject,                               // Optional<String>
+    enable_stable_row_ids: JObject,              // Optional<Boolean>
+    data_storage_version: JObject,               // Optional<String>
+    storage_options_obj: JObject,                // Map<String, String>
+    namespace_obj: JObject,                      // LanceNamespace (can be null)
+    table_id_obj: JObject,                       // List<String> (can be null)
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
+    allow_external_blob_outside_bases: JObject,  // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,      // Optional<Long>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -245,6 +251,7 @@ fn inner_create_with_ffi_stream<'local>(
         storage_options_obj,
         namespace_obj,
         table_id_obj,
+        namespace_client_table_context_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         reader,
@@ -255,17 +262,18 @@ fn inner_create_with_ffi_stream<'local>(
 fn create_fragment<'a>(
     env: &mut JNIEnv<'a>,
     dataset_uri: JString,
-    max_rows_per_file: JObject,                 // Optional<Integer>
-    max_rows_per_group: JObject,                // Optional<Integer>
-    max_bytes_per_file: JObject,                // Optional<Long>
-    mode: JObject,                              // Optional<String>
-    enable_stable_row_ids: JObject,             // Optional<Boolean>
-    data_storage_version: JObject,              // Optional<String>
-    storage_options_obj: JObject,               // Map<String, String>
-    namespace_obj: JObject,                     // LanceNamespace (can be null)
-    table_id_obj: JObject,                      // List<String> (can be null)
-    allow_external_blob_outside_bases: JObject, // Optional<Boolean>
-    blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    max_rows_per_file: JObject,                  // Optional<Integer>
+    max_rows_per_group: JObject,                 // Optional<Integer>
+    max_bytes_per_file: JObject,                 // Optional<Long>
+    mode: JObject,                               // Optional<String>
+    enable_stable_row_ids: JObject,              // Optional<Boolean>
+    data_storage_version: JObject,               // Optional<String>
+    storage_options_obj: JObject,                // Map<String, String>
+    namespace_obj: JObject,                      // LanceNamespace (can be null)
+    table_id_obj: JObject,                       // List<String> (can be null)
+    namespace_client_table_context_obj: JObject, // NamespaceClientTableContext (can be null)
+    allow_external_blob_outside_bases: JObject,  // Optional<Boolean>
+    blob_pack_file_size_threshold: JObject,      // Optional<Long>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -288,27 +296,38 @@ fn create_fragment<'a>(
 
     // Set up storage options provider if namespace is provided
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
     if let Some((namespace, table_id)) = namespace_info {
         let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
             LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
         );
 
-        let storage_options: HashMap<String, String> =
-            extract_storage_options(env, &storage_options_obj)?;
+        let mut merged_storage_options: HashMap<String, String> = write_params
+            .store_params
+            .as_ref()
+            .and_then(|params| params.storage_options().cloned())
+            .unwrap_or_default();
+        if let Some(namespace_client_table_context) = namespace_client_table_context
+            && let Some(context_storage_options) = namespace_client_table_context.storage_options
+        {
+            merged_storage_options.extend(context_storage_options);
+        }
 
-        let accessor = if storage_options.is_empty() {
+        let existing_params = write_params.store_params.take().unwrap_or_default();
+        let accessor = if merged_storage_options.is_empty() {
             Arc::new(lance::io::StorageOptionsAccessor::with_provider(provider))
         } else {
             Arc::new(
                 lance::io::StorageOptionsAccessor::with_initial_and_provider(
-                    storage_options,
+                    merged_storage_options,
                     provider,
                 ),
             )
         };
         write_params.store_params = Some(ObjectStoreParams {
             storage_options_accessor: Some(accessor),
-            ..Default::default()
+            ..existing_params
         });
     }
 

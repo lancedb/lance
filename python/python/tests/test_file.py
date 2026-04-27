@@ -9,7 +9,116 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
+from lance.dataset import LanceDataset
 from lance.file import LanceFileReader, LanceFileSession, LanceFileWriter
+from lance.namespace import NamespaceClientTableContext
+
+
+def test_file_wrappers_forward_namespace_context(monkeypatch):
+    calls = {}
+
+    def fake_reader(path, **kwargs):
+        calls["reader"] = (path, kwargs)
+        return object()
+
+    def fake_session(base_path, **kwargs):
+        calls["session"] = (base_path, kwargs)
+        return object()
+
+    def fake_writer(path, *args, **kwargs):
+        calls["writer"] = (path, args, kwargs)
+        return object()
+
+    monkeypatch.setattr("lance.file._LanceFileReader", fake_reader)
+    monkeypatch.setattr("lance.file._LanceFileSession", fake_session)
+    monkeypatch.setattr("lance.file._LanceFileWriter", fake_writer)
+
+    context = NamespaceClientTableContext(
+        "s3://bucket/table",
+        {"from_context": "value"},
+        False,
+    )
+    namespace_client = object()
+    table_id = ["workspace", "table"]
+
+    LanceFileReader(
+        "s3://bucket/file.lance",
+        storage_options={"from_user": "value"},
+        namespace_client=namespace_client,
+        table_id=table_id,
+        namespace_client_table_context=context,
+    )
+    LanceFileSession(
+        "s3://bucket/session",
+        storage_options={"from_user": "value"},
+        namespace_client=namespace_client,
+        table_id=table_id,
+        namespace_client_table_context=context,
+    )
+    LanceFileWriter(
+        "s3://bucket/file.lance",
+        storage_options={"from_user": "value"},
+        namespace_client=namespace_client,
+        table_id=table_id,
+        namespace_client_table_context=context,
+    )
+
+    assert calls["reader"][1]["storage_options"] == {"from_user": "value"}
+    assert calls["reader"][1]["namespace_client"] is namespace_client
+    assert calls["reader"][1]["table_id"] == table_id
+    assert calls["reader"][1]["namespace_client_table_context"] is context
+    assert calls["session"][1]["storage_options"] == {"from_user": "value"}
+    assert calls["session"][1]["namespace_client"] is namespace_client
+    assert calls["session"][1]["table_id"] == table_id
+    assert calls["session"][1]["namespace_client_table_context"] is context
+    assert calls["writer"][2]["storage_options"] == {"from_user": "value"}
+    assert calls["writer"][2]["namespace_client"] is namespace_client
+    assert calls["writer"][2]["table_id"] == table_id
+    assert calls["writer"][2]["namespace_client_table_context"] is context
+
+
+def test_file_wrappers_reject_context_without_namespace(tmp_path):
+    context = NamespaceClientTableContext(str(tmp_path), None, False)
+
+    for cls, args in [
+        (LanceFileReader, (str(tmp_path / "file.lance"),)),
+        (LanceFileSession, (str(tmp_path),)),
+        (LanceFileWriter, (str(tmp_path / "file.lance"),)),
+    ]:
+        with pytest.raises(ValueError, match="namespace_client_table_context"):
+            cls(*args, namespace_client_table_context=context)
+
+
+def test_dataset_new_file_session_forwards_namespace_context(monkeypatch):
+    calls = {}
+
+    def fake_session(**kwargs):
+        calls.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("lance.file.LanceFileSession", fake_session)
+
+    context = NamespaceClientTableContext(
+        "s3://bucket/table",
+        {"from_context": "value"},
+        False,
+    )
+    namespace_client = object()
+    table_id = ["workspace", "table"]
+    ds = LanceDataset.__new__(LanceDataset)
+    ds._uri = "s3://bucket/table"
+    ds._namespace_client = namespace_client
+    ds._table_id = table_id
+    ds._namespace_client_table_context = context
+    ds.latest_storage_options = lambda: {"from_latest": "value"}
+
+    ds.new_file_session()
+
+    assert calls["base_path"] == "s3://bucket/table"
+    assert calls["storage_options"] == {"from_latest": "value"}
+    assert calls["namespace_client"] is namespace_client
+    assert calls["table_id"] == table_id
+    assert calls["namespace_client_table_context"] is context
 
 
 def test_file_read_projection(tmp_path):

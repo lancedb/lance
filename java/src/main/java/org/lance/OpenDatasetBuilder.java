@@ -14,16 +14,12 @@
 package org.lance;
 
 import org.lance.namespace.LanceNamespace;
-import org.lance.namespace.model.DescribeTableRequest;
-import org.lance.namespace.model.DescribeTableResponse;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Builder for opening a Dataset.
@@ -56,6 +52,7 @@ public class OpenDatasetBuilder {
   private String uri;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private NamespaceClientTableContext namespaceClientTableContext;
   private ReadOptions options = new ReadOptions.Builder().build();
   private Session session;
 
@@ -117,6 +114,22 @@ public class OpenDatasetBuilder {
   }
 
   /**
+   * Sets a cached namespace context from a prior {@code describeTable} or {@code declareTable}
+   * call. When provided, skips the namespace call and uses the cached location, storage options,
+   * and managed-versioning flag directly.
+   *
+   * <p>Cannot be used with {@code uri()}. Must be used together with {@code namespaceClient()} and
+   * {@code tableId()}.
+   *
+   * @param context the cached namespace context
+   * @return this builder instance
+   */
+  public OpenDatasetBuilder namespaceClientTableContext(NamespaceClientTableContext context) {
+    this.namespaceClientTableContext = context;
+    return this;
+  }
+
+  /**
    * Sets the read options.
    *
    * @param options Read options
@@ -155,93 +168,55 @@ public class OpenDatasetBuilder {
    * @throws IllegalArgumentException if required parameters are missing or invalid
    */
   public Dataset build() {
-    // Validate that exactly one of uri or namespaceClient+tableId is provided
     boolean hasUri = uri != null;
-    boolean hasNamespaceClient = namespaceClient != null && tableId != null;
+    boolean hasNamespaceFields = namespaceClient != null || tableId != null;
+    boolean hasCompleteNamespace = namespaceClient != null && tableId != null;
+    boolean hasContext = namespaceClientTableContext != null;
 
-    if (hasUri && hasNamespaceClient) {
-      throw new IllegalArgumentException(
-          "Cannot specify both uri and namespaceClient+tableId. Use one or the other.");
+    if (hasUri && hasNamespaceFields) {
+      throw new IllegalArgumentException("Cannot specify both uri and namespaceClient+tableId.");
     }
-    if (!hasUri && !hasNamespaceClient) {
-      if (namespaceClient != null) {
+    if (hasContext && !hasCompleteNamespace) {
+      throw new IllegalArgumentException(
+          "namespaceClientTableContext requires namespaceClient and tableId.");
+    }
+    if (!hasUri && !hasNamespaceFields) {
+      throw new IllegalArgumentException("Either uri or namespaceClient+tableId must be provided.");
+    }
+
+    if (hasNamespaceFields && !hasCompleteNamespace) {
+      if (namespaceClient == null) {
         throw new IllegalArgumentException(
-            "namespaceClient is set but tableId is missing. Both namespaceClient and tableId must"
-                + " be provided together.");
-      } else if (tableId != null) {
-        throw new IllegalArgumentException(
-            "tableId is set but namespaceClient is missing. Both namespaceClient and tableId must"
-                + " be provided together.");
+            "tableId is set but namespaceClient is missing. Both must be provided together.");
       } else {
         throw new IllegalArgumentException(
-            "Either uri or namespaceClient+tableId must be provided.");
+            "namespaceClient is set but tableId is missing. Both must be provided together.");
       }
     }
 
     Preconditions.checkNotNull(options, "options must be set");
 
-    // Create allocator if not provided
     if (allocator == null) {
       allocator = new RootAllocator(Long.MAX_VALUE);
       selfManagedAllocator = true;
     }
 
-    // Handle namespace client-based opening
-    if (hasNamespaceClient) {
+    if (hasCompleteNamespace) {
       return buildFromNamespaceClient();
     }
 
-    // Handle URI-based opening
     return Dataset.open(allocator, selfManagedAllocator, uri, options, session);
   }
 
   private Dataset buildFromNamespaceClient() {
-    // Call describe_table to get location and storage options
-    DescribeTableRequest request = new DescribeTableRequest();
-    request.setId(tableId);
-    // Only set version if present
-    options.getVersion().ifPresent(v -> request.setVersion(Long.valueOf(v)));
-
-    DescribeTableResponse response = namespaceClient.describeTable(request);
-
-    String location = response.getLocation();
-    if (location == null || location.isEmpty()) {
-      throw new IllegalArgumentException("Namespace client did not return a table location");
-    }
-
-    // Check if namespace client manages versioning (commits go through namespace client API)
-    Boolean namespaceClientManagedVersioning = response.getManagedVersioning();
-
-    Map<String, String> namespaceStorageOptions = response.getStorageOptions();
-
-    ReadOptions.Builder optionsBuilder =
-        new ReadOptions.Builder()
-            .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
-            .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
-
-    options.getVersion().ifPresent(optionsBuilder::setVersion);
-    options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
-    options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
-
-    Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
-    if (namespaceStorageOptions != null) {
-      storageOptions.putAll(namespaceStorageOptions);
-    }
-    optionsBuilder.setStorageOptions(storageOptions);
-
-    // Pass namespaceClient, tableId, and namespaceClientManagedVersioning to Rust
-    // The Rust side will:
-    // - Create a storage options provider when namespaceClient/tableId are non-null for credential
-    // refresh
-    // - Create an external manifest commit handler when namespaceClientManagedVersioning is true
     return Dataset.open(
         allocator,
         selfManagedAllocator,
-        location,
-        optionsBuilder.build(),
+        null,
+        options,
         session,
         namespaceClient,
         tableId,
-        Boolean.TRUE.equals(namespaceClientManagedVersioning));
+        namespaceClientTableContext);
   }
 }

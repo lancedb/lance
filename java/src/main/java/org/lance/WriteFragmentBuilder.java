@@ -49,6 +49,7 @@ public class WriteFragmentBuilder {
   private WriteParams.Builder writeParamsBuilder;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private NamespaceClientTableContext namespaceClientTableContext;
 
   WriteFragmentBuilder() {}
 
@@ -128,7 +129,7 @@ public class WriteFragmentBuilder {
    *
    * <p>When provided with `tableId`, a storage options provider will be created automatically to
    * refresh credentials via the namespace client. Must be provided together with `tableId`. The
-   * caller should provide initial/merged storage options via the `storageOptions` method.
+   * caller should provide storage options via the `storageOptions` method.
    *
    * @param namespaceClient the LanceNamespace client instance
    * @return this builder
@@ -148,6 +149,20 @@ public class WriteFragmentBuilder {
    */
   public WriteFragmentBuilder tableId(List<String> tableId) {
     this.tableId = tableId;
+    return this;
+  }
+
+  /**
+   * Sets a cached namespace context from a prior {@code describeTable} or {@code declareTable}
+   * call. When provided, the cached storage options and managed-versioning flag are reused.
+   *
+   * <p>Must be used together with {@code namespaceClient()} and {@code tableId()}.
+   *
+   * @param context the cached namespace context
+   * @return this builder
+   */
+  public WriteFragmentBuilder namespaceClientTableContext(NamespaceClientTableContext context) {
+    this.namespaceClientTableContext = context;
     return this;
   }
 
@@ -231,17 +246,25 @@ public class WriteFragmentBuilder {
   public List<FragmentMetadata> execute() {
     validate();
 
-    // Build the write params
     WriteParams finalWriteParams = buildWriteParams();
 
-    // Pass namespaceClient and tableId to JNI - Rust will automatically create a
-    // storage options provider when these are non-null for credential refresh
     if (vectorSchemaRoot != null) {
       return Fragment.create(
-          datasetUri, allocator, vectorSchemaRoot, finalWriteParams, namespaceClient, tableId);
+          datasetUri,
+          allocator,
+          vectorSchemaRoot,
+          finalWriteParams,
+          namespaceClient,
+          tableId,
+          namespaceClientTableContext);
     } else {
       return Fragment.create(
-          datasetUri, arrowArrayStream, finalWriteParams, namespaceClient, tableId);
+          datasetUri,
+          arrowArrayStream,
+          finalWriteParams,
+          namespaceClient,
+          tableId,
+          namespaceClientTableContext);
     }
   }
 
@@ -279,5 +302,8 @@ public class WriteFragmentBuilder {
         (namespaceClient == null && tableId == null)
             || (namespaceClient != null && tableId != null),
         "Both 'namespaceClient' and 'tableId' must be provided together");
+    Preconditions.checkState(
+        namespaceClientTableContext == null || namespaceClient != null,
+        "namespaceClientTableContext requires namespaceClient and tableId");
   }
 }

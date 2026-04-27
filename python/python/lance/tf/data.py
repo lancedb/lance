@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from lance import LanceNamespace
+    from lance.namespace import NamespaceClientTableContext
 
 
 def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
@@ -143,7 +144,7 @@ def from_lance(
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
     namespace_client: Optional["LanceNamespace"] = None,
     table_id: Optional[List[str]] = None,
-    ignore_namespace_table_storage_options: bool = False,
+    namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
 ) -> tf.data.Dataset:
     """Create a ``tf.data.Dataset`` from a Lance dataset.
 
@@ -171,9 +172,10 @@ def from_lance(
     table_id : Optional[List[str]], optional
         Table identifier used together with ``namespace_client`` to locate
         the table.
-    ignore_namespace_table_storage_options : bool, default False
-        When using ``namespace_client``/``table_id``, ignore storage options
-        returned by the namespace.
+    namespace_client_table_context : optional, NamespaceClientTableContext
+        Cached context from a prior namespace call. When provided with
+        ``namespace_client`` and ``table_id``, skips the namespace lookup and
+        uses the cached location, storage options, and managed-versioning flag.
 
     Examples
     --------
@@ -214,9 +216,14 @@ def from_lance(
 
     """
     if isinstance(dataset, LanceDataset):
-        if namespace_client is not None or table_id is not None:
+        if (
+            namespace_client is not None
+            or table_id is not None
+            or namespace_client_table_context is not None
+        ):
             raise ValueError(
-                "Cannot specify 'namespace_client' or 'table_id' when passing "
+                "Cannot specify 'namespace_client', 'table_id', or "
+                "'namespace_client_table_context' when passing "
                 "a LanceDataset instance"
             )
     else:
@@ -224,7 +231,7 @@ def from_lance(
             dataset,
             namespace_client=namespace_client,
             table_id=table_id,
-            ignore_namespace_table_storage_options=ignore_namespace_table_storage_options,
+            namespace_client_table_context=namespace_client_table_context,
         )
 
     if isinstance(fragments, tf.data.Dataset):

@@ -27,6 +27,7 @@ from lance.namespace import (
     DescribeTableRequest,
     DirectoryNamespace,
     LanceNamespace,
+    NamespaceClientTableContext,
 )
 from lance_namespace import (
     CreateNamespaceRequest,
@@ -586,8 +587,7 @@ def test_namespace_distributed_write(s3_bucket: str, use_custom: bool):
     ns_client_storage_options = response.storage_options
     assert ns_client_storage_options is not None
 
-    merged_options = dict(storage_options)
-    merged_options.update(ns_client_storage_options)
+    context = NamespaceClientTableContext.from_declare_table_response(response)
 
     from lance.fragment import write_fragments
 
@@ -595,27 +595,30 @@ def test_namespace_distributed_write(s3_bucket: str, use_custom: bool):
     fragment1 = write_fragments(
         fragment1_data,
         table_uri,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     fragment2_data = pa.Table.from_pylist([{"a": 10, "b": 20}, {"a": 30, "b": 40}])
     fragment2 = write_fragments(
         fragment2_data,
         table_uri,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     fragment3_data = pa.Table.from_pylist([{"a": 100, "b": 200}])
     fragment3 = write_fragments(
         fragment3_data,
         table_uri,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     all_fragments = fragment1 + fragment2 + fragment3
@@ -623,11 +626,12 @@ def test_namespace_distributed_write(s3_bucket: str, use_custom: bool):
     operation = lance.LanceOperation.Overwrite(fragment1_data.schema, all_fragments)
 
     ds = lance.LanceDataset.commit(
-        table_uri,
+        None,
         operation,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     assert ds.count_rows() == 5
@@ -688,9 +692,9 @@ def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
     describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
-    merged_options = dict(storage_options)
-    if describe_response.storage_options:
-        merged_options.update(describe_response.storage_options)
+    context = NamespaceClientTableContext.from_describe_table_response(
+        describe_response
+    )
 
     initial_describe_count = get_describe_call_count(inner_ns_client)
 
@@ -700,9 +704,10 @@ def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
     writer = LanceFileWriter(
         file_uri,
         schema=schema,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
@@ -719,9 +724,10 @@ def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
 
     reader = LanceFileReader(
         file_uri,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
@@ -739,9 +745,10 @@ def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
     writer2 = LanceFileWriter(
         file_uri2,
         schema=schema,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     batch3 = pa.RecordBatch.from_pydict(
@@ -755,9 +762,10 @@ def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
 
     reader2 = LanceFileReader(
         file_uri2,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
@@ -797,18 +805,20 @@ def test_file_reader_with_namespace_client(s3_bucket: str, use_custom: bool):
     describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
-    merged_options = dict(storage_options)
-    if describe_response.storage_options:
-        merged_options.update(describe_response.storage_options)
+    context = NamespaceClientTableContext.from_describe_table_response(
+        describe_response
+    )
 
     file_uri = f"s3://{s3_bucket}/{table_name}_file_reader_test.lance"
     schema = pa.schema([pa.field("x", pa.int64()), pa.field("y", pa.int64())])
 
-    # Write a file first (without namespace_client to keep it simple)
     writer = LanceFileWriter(
         file_uri,
         schema=schema,
-        storage_options=merged_options,
+        storage_options=storage_options,
+        namespace_client=ns_client,
+        table_id=table_id,
+        namespace_client_table_context=context,
     )
     batch = pa.RecordBatch.from_pydict({"x": [1, 2, 3], "y": [4, 5, 6]}, schema=schema)
     writer.write_batch(batch)
@@ -818,18 +828,19 @@ def test_file_reader_with_namespace_client(s3_bucket: str, use_custom: bool):
     describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
-    merged_options = dict(storage_options)
-    if describe_response.storage_options:
-        merged_options.update(describe_response.storage_options)
+    context = NamespaceClientTableContext.from_describe_table_response(
+        describe_response
+    )
 
     initial_describe_count = get_describe_call_count(inner_ns_client)
 
     # First read should work without needing refresh
     reader = LanceFileReader(
         file_uri,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
     result = reader.read_all(batch_size=1024)
     result_table = result.to_table()
@@ -847,7 +858,7 @@ def test_file_reader_with_namespace_client(s3_bucket: str, use_custom: bool):
     writer2 = LanceFileWriter(
         file_uri2,
         schema=schema,
-        storage_options=merged_options,
+        storage_options=storage_options,
     )
     batch2 = pa.RecordBatch.from_pydict(
         {"x": [100, 200], "y": [300, 400]}, schema=schema
@@ -858,9 +869,10 @@ def test_file_reader_with_namespace_client(s3_bucket: str, use_custom: bool):
     # Second read should trigger credential refresh
     reader2 = LanceFileReader(
         file_uri2,
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
     result2 = reader2.read_all(batch_size=1024)
     result_table2 = result2.to_table()
@@ -903,18 +915,19 @@ def test_file_session_with_namespace_client(s3_bucket: str, use_custom: bool):
     describe_response = ns_client.describe_table(
         DescribeTableRequest(id=table_id, version=None)
     )
-    merged_options = dict(storage_options)
-    if describe_response.storage_options:
-        merged_options.update(describe_response.storage_options)
+    context = NamespaceClientTableContext.from_describe_table_response(
+        describe_response
+    )
 
     initial_describe_count = get_describe_call_count(inner_ns_client)
 
     # Create session with namespace_client
     session = LanceFileSession(
         f"s3://{s3_bucket}/{table_name}_session",
-        storage_options=merged_options,
+        storage_options=storage_options,
         namespace_client=ns_client,
         table_id=table_id,
+        namespace_client_table_context=context,
     )
 
     # Test contains method

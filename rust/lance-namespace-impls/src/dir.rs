@@ -6163,7 +6163,7 @@ mod tests {
 
         let reader1 = RecordBatchIterator::new(vec![data1].into_iter().map(Ok), schema.clone());
         let dataset =
-            Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None)
+            Dataset::write_into_namespace(reader1, namespace.clone(), table_id.clone(), None, None)
                 .await
                 .unwrap();
 
@@ -6190,6 +6190,7 @@ mod tests {
             reader2,
             namespace.clone(),
             table_id.clone(),
+            None,
             Some(params_append),
         )
         .await
@@ -6218,6 +6219,7 @@ mod tests {
             reader3,
             namespace.clone(),
             table_id.clone(),
+            None,
             Some(params_overwrite),
         )
         .await
@@ -7305,6 +7307,7 @@ mod tests {
             batches,
             namespace.clone(),
             table_id.clone(),
+            None,
             Some(write_params),
         )
         .await
@@ -7421,6 +7424,7 @@ mod tests {
             batches,
             namespace.clone(),
             table_id.clone(),
+            None,
             Some(write_params),
         )
         .await
@@ -7535,6 +7539,7 @@ mod tests {
             batches,
             namespace.clone(),
             table_id.clone(),
+            None,
             Some(write_params),
         )
         .await
@@ -8083,6 +8088,7 @@ mod tests {
                 batches,
                 ns.clone(),
                 table_id.clone(),
+                None,
                 Some(write_params),
             )
             .await
@@ -8197,6 +8203,7 @@ mod tests {
                 batches,
                 tracking_ns.clone(),
                 table_id.clone(),
+                None,
                 Some(write_params),
             )
             .await
@@ -8221,6 +8228,7 @@ mod tests {
                 batches,
                 tracking_ns.clone(),
                 table_id.clone(),
+                None,
                 Some(write_params),
             )
             .await

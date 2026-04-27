@@ -60,6 +60,7 @@ import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
 import org.lance.operation.Append;
+import org.lance.operation.Overwrite;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -838,6 +839,280 @@ public class DirectoryNamespaceTest {
       }
 
       existingDataset.close();
+      namespaceClient.close();
+    }
+  }
+
+  @Test
+  void testNamespaceCommitBuilderResolvesActualLocation(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
+      String tableName = "test_uri_commit_table";
+      List<String> tableId = Arrays.asList(tableName);
+
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
+
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+        idVector.allocateNew(2);
+        nameVector.allocateNew(2);
+        idVector.set(0, 1);
+        idVector.set(1, 2);
+        nameVector.set(0, "Alice".getBytes());
+        nameVector.set(1, "Bob".getBytes());
+        idVector.setValueCount(2);
+        nameVector.setValueCount(2);
+        root.setRowCount(2);
+
+        ArrowReader reader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return root;
+              }
+            };
+
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(reader)
+                .namespaceClient(namespaceClient)
+                .tableId(tableId)
+                .mode(WriteParams.WriteMode.CREATE)
+                .execute()) {
+          assertEquals(2, dataset.countRows());
+        }
+      }
+
+      Dataset existingDataset =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build();
+      String datasetUri = existingDataset.uri();
+
+      List<FragmentMetadata> fragments;
+      try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector idVector = (IntVector) appendRoot.getVector("id");
+        VarCharVector nameVector = (VarCharVector) appendRoot.getVector("name");
+
+        idVector.allocateNew(2);
+        nameVector.allocateNew(2);
+        idVector.set(0, 3);
+        idVector.set(1, 4);
+        nameVector.set(0, "Charlie".getBytes());
+        nameVector.set(1, "Diana".getBytes());
+        idVector.setValueCount(2);
+        nameVector.setValueCount(2);
+        appendRoot.setRowCount(2);
+
+        fragments =
+            Fragment.create(datasetUri, allocator, appendRoot, new WriteParams.Builder().build());
+      }
+
+      int createCountBefore = getCreateTableVersionCount(namespaceClient);
+      try (Transaction txn =
+              new Transaction.Builder()
+                  .readVersion(existingDataset.version())
+                  .operation(Append.builder().fragments(fragments).build())
+                  .build();
+          Dataset committed =
+              new CommitBuilder(allocator)
+                  .namespaceClient(namespaceClient)
+                  .tableId(tableId)
+                  .execute(txn)) {
+        assertEquals(2, committed.version());
+        assertEquals(4, committed.countRows());
+        assertEquals(datasetUri, committed.uri());
+      }
+
+      assertEquals(
+          createCountBefore + 1,
+          getCreateTableVersionCount(namespaceClient),
+          "create_table_version should be called for namespace CommitBuilder");
+
+      try (Dataset latestDs =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
+        assertEquals(4, latestDs.countRows());
+        assertEquals(2, latestDs.version());
+      }
+
+      existingDataset.close();
+      namespaceClient.close();
+    }
+  }
+
+  @Test
+  void testNamespaceCommitBuilderDeclaresMissingTable(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
+      String tableName = "test_uri_commit_declare_table";
+      List<String> tableId = Arrays.asList(tableName);
+
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
+
+      int createCountBefore = getCreateTableVersionCount(namespaceClient);
+      try (Transaction txn =
+              new Transaction.Builder()
+                  .operation(Overwrite.builder().fragments(List.of()).schema(schema).build())
+                  .build();
+          Dataset committed =
+              new CommitBuilder(allocator)
+                  .namespaceClient(namespaceClient)
+                  .tableId(tableId)
+                  .execute(txn)) {
+        assertEquals(1, committed.version());
+        assertEquals(0, committed.countRows());
+      }
+
+      assertEquals(
+          createCountBefore + 1,
+          getCreateTableVersionCount(namespaceClient),
+          "create_table_version should be called for namespace commit creating a missing table");
+
+      try (Dataset latestDs =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
+        assertEquals(0, latestDs.countRows());
+        assertEquals(1, latestDs.version());
+      }
+
+      assertThrows(
+          RuntimeException.class,
+          () -> {
+            try (Dataset ignored =
+                Dataset.write()
+                    .allocator(allocator)
+                    .schema(schema)
+                    .namespaceClient(namespaceClient)
+                    .tableId(tableId)
+                    .mode(WriteParams.WriteMode.CREATE)
+                    .execute()) {}
+          });
+
+      namespaceClient.close();
+    }
+  }
+
+  @Test
+  void testWriteDatasetBuilderCreatesEmptyNamespaceTable(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
+      List<String> tableId = Arrays.asList("test_write_builder_empty_namespace_table");
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
+
+      int createCountBefore = getCreateTableVersionCount(namespaceClient);
+      try (Dataset dataset =
+          Dataset.write()
+              .allocator(allocator)
+              .schema(schema)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .mode(WriteParams.WriteMode.CREATE)
+              .execute()) {
+        assertEquals(1, dataset.version());
+        assertEquals(0, dataset.countRows());
+      }
+
+      assertEquals(
+          createCountBefore + 1,
+          getCreateTableVersionCount(namespaceClient),
+          "create_table_version should be called for empty namespace table creation");
+
+      try (Dataset latestDs =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
+        assertEquals(0, latestDs.countRows());
+        assertEquals(1, latestDs.version());
+      }
+
+      namespaceClient.close();
+    }
+  }
+
+  @Test
+  void testCommitBuilderRejectsUriWithNamespace(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
+      List<String> tableId = Arrays.asList("test_reject_uri_with_namespace");
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+      String explicitUri = managedVersioningTempDir.resolve("explicit-target").toUri().toString();
+      try (Transaction txn =
+          new Transaction.Builder()
+              .operation(Overwrite.builder().fragments(List.of()).schema(schema).build())
+              .build()) {
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                    new CommitBuilder(explicitUri, allocator)
+                        .namespaceClient(namespaceClient)
+                        .tableId(tableId)
+                        .execute(txn));
+        assertTrue(error.getMessage().contains("Cannot specify both URI and namespaceClient"));
+      }
+
       namespaceClient.close();
     }
   }

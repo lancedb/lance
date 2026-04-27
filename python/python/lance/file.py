@@ -25,7 +25,27 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
-    from .namespace import LanceNamespace
+    from .namespace import LanceNamespace, NamespaceClientTableContext
+
+
+def _validate_namespace_client_args(
+    namespace_client: Optional["LanceNamespace"],
+    table_id: Optional[List[str]],
+    namespace_client_table_context: Optional["NamespaceClientTableContext"],
+) -> None:
+    if namespace_client is not None and table_id is None:
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
+    if table_id is not None and namespace_client is None:
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
+    if namespace_client_table_context is not None and namespace_client is None:
+        raise ValueError(
+            "'namespace_client_table_context' requires 'namespace_client' and "
+            "'table_id' to be provided."
+        )
 
 
 class ReaderResults:
@@ -71,6 +91,7 @@ class LanceFileReader:
         *,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
         _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
@@ -91,13 +112,24 @@ class LanceFileReader:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. The native layer uses
+            this cached metadata together with ``namespace_client`` and
+            ``table_id`` to avoid redundant namespace lookups while keeping
+            credential refresh support.
         columns: list of str, default None
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
         """
+
         if _inner_reader is not None:
             self._reader = _inner_reader
         else:
+            _validate_namespace_client_args(
+                namespace_client,
+                table_id,
+                namespace_client_table_context,
+            )
             if isinstance(path, Path):
                 path = str(path)
             self._reader = _LanceFileReader(
@@ -105,6 +137,7 @@ class LanceFileReader:
                 storage_options=storage_options,
                 namespace_client=namespace_client,
                 table_id=table_id,
+                namespace_client_table_context=namespace_client_table_context,
                 columns=columns,
             )
 
@@ -222,6 +255,7 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
     ):
         """
         Creates a new file session
@@ -241,14 +275,26 @@ class LanceFileSession:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. The native layer uses
+            this cached metadata together with ``namespace_client`` and
+            ``table_id`` to avoid redundant namespace lookups while keeping
+            credential refresh support.
         """
+
         if isinstance(base_path, Path):
             base_path = str(base_path)
+        _validate_namespace_client_args(
+            namespace_client,
+            table_id,
+            namespace_client_table_context,
+        )
         self._session = _LanceFileSession(
             base_path,
             storage_options=storage_options,
             namespace_client=namespace_client,
             table_id=table_id,
+            namespace_client_table_context=namespace_client_table_context,
         )
 
     def open_reader(
@@ -394,6 +440,7 @@ class LanceFileWriter:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional["NamespaceClientTableContext"] = None,
         max_page_bytes: Optional[int] = None,
         _inner_writer: Optional[_LanceFileWriter] = None,
         **kwargs,
@@ -426,14 +473,25 @@ class LanceFileWriter:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        namespace_client_table_context : optional, NamespaceClientTableContext
+            Cached context from a prior namespace call. The native layer uses
+            this cached metadata together with ``namespace_client`` and
+            ``table_id`` to avoid redundant namespace lookups while keeping
+            credential refresh support.
         max_page_bytes : optional, int
             The maximum size of a page in bytes, if a single array would create a
             page larger than this then it will be split into multiple pages. The
             default value is 32MB.
         """
+
         if _inner_writer is not None:
             self._writer = _inner_writer
         else:
+            _validate_namespace_client_args(
+                namespace_client,
+                table_id,
+                namespace_client_table_context,
+            )
             if isinstance(path, Path):
                 path = str(path)
             self._writer = _LanceFileWriter(
@@ -444,6 +502,7 @@ class LanceFileWriter:
                 storage_options=storage_options,
                 namespace_client=namespace_client,
                 table_id=table_id,
+                namespace_client_table_context=namespace_client_table_context,
                 max_page_bytes=max_page_bytes,
                 **kwargs,
             )

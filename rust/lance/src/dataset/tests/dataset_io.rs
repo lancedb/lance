@@ -44,9 +44,68 @@ use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_io::utils::tracking_store::IOTracker;
+use lance_namespace::{LanceNamespace, NamespaceClientTableContext};
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
+
+#[derive(Debug)]
+struct DummyNamespace;
+
+impl LanceNamespace for DummyNamespace {
+    fn namespace_id(&self) -> String {
+        "dummy".to_string()
+    }
+}
+
+#[tokio::test]
+async fn test_write_into_namespace_preserves_user_storage_options_without_cached_options() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let table_path = tmpdir.path().join("table");
+    let table_uri = table_path.to_str().unwrap().to_string();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+    let user_storage_options = HashMap::from([("user_token".to_string(), "user".to_string())]);
+    let write_params = WriteParams {
+        mode: WriteMode::Create,
+        store_params: Some(ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                user_storage_options.clone(),
+            ))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let context = NamespaceClientTableContext {
+        location: table_uri,
+        storage_options: None,
+        managed_versioning: false,
+    };
+
+    let dataset = Dataset::write_into_namespace(
+        reader,
+        Arc::new(DummyNamespace),
+        vec!["table".to_string()],
+        Some(&context),
+        Some(write_params),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        dataset.initial_storage_options(),
+        Some(&user_storage_options)
+    );
+    assert!(dataset.storage_options_provider().is_some());
+}
 
 #[tokio::test]
 async fn test_truncate_table() {

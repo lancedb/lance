@@ -234,7 +234,7 @@ public class Fragment {
   @Deprecated
   public static List<FragmentMetadata> create(
       String datasetUri, BufferAllocator allocator, VectorSchemaRoot root, WriteParams params) {
-    return create(datasetUri, allocator, root, params, null, null);
+    return create(datasetUri, allocator, root, params, null, null, null);
   }
 
   /**
@@ -249,7 +249,7 @@ public class Fragment {
   @Deprecated
   public static List<FragmentMetadata> create(
       String datasetUri, ArrowArrayStream stream, WriteParams params) {
-    return create(datasetUri, stream, params, null, null);
+    return create(datasetUri, stream, params, null, null, null);
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -259,7 +259,8 @@ public class Fragment {
       VectorSchemaRoot root,
       WriteParams params,
       LanceNamespace namespaceClient,
-      List<String> tableId) {
+      List<String> tableId,
+      NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
@@ -280,6 +281,7 @@ public class Fragment {
           params.getStorageOptions(),
           namespaceClient,
           tableId,
+          namespaceClientTableContext,
           params.getAllowExternalBlobOutsideBases(),
           params.getBlobPackFileSizeThreshold());
     }
@@ -291,7 +293,8 @@ public class Fragment {
       ArrowArrayStream stream,
       WriteParams params,
       LanceNamespace namespaceClient,
-      List<String> tableId) {
+      List<String> tableId,
+      NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
@@ -307,6 +310,7 @@ public class Fragment {
         params.getStorageOptions(),
         namespaceClient,
         tableId,
+        namespaceClientTableContext,
         params.getAllowExternalBlobOutsideBases(),
         params.getBlobPackFileSizeThreshold());
   }
@@ -325,6 +329,7 @@ public class Fragment {
       Map<String, String> storageOptions,
       LanceNamespace namespaceClient,
       List<String> tableId,
+      NamespaceClientTableContext namespaceClientTableContext,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold);
 
@@ -341,6 +346,7 @@ public class Fragment {
       Map<String, String> storageOptions,
       LanceNamespace namespaceClient,
       List<String> tableId,
+      NamespaceClientTableContext namespaceClientTableContext,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold);
 }

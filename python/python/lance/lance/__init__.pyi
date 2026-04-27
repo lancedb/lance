@@ -47,6 +47,7 @@ from ..fragment import (
     DataFile,
     FragmentMetadata,
 )
+from ..namespace import NamespaceClientTableContext
 from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
@@ -103,6 +104,7 @@ class LanceFileWriter:
         storage_options: Optional[Dict[str, str]],
         namespace_client: Optional[LanceNamespace],
         table_id: Optional[List[str]],
+        namespace_client_table_context: Optional[NamespaceClientTableContext],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -118,6 +120,7 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_table_context: Optional[NamespaceClientTableContext] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -143,6 +146,7 @@ class LanceFileReader:
         storage_options: Optional[Dict[str, str]],
         namespace_client: Optional[LanceNamespace],
         table_id: Optional[List[str]],
+        namespace_client_table_context: Optional[NamespaceClientTableContext],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -538,7 +542,10 @@ def _write_fragments(
     storage_options: Optional[Dict[str, str]],
     namespace_client: Optional[LanceNamespace],
     table_id: Optional[List[str]],
+    namespace_client_table_context: Optional[NamespaceClientTableContext],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]],
+    initial_bases: Optional[List[DatasetBasePath]],
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -552,7 +559,10 @@ def _write_fragments_transaction(
     storage_options: Optional[Dict[str, str]],
     namespace_client: Optional[LanceNamespace],
     table_id: Optional[List[str]],
+    namespace_client_table_context: Optional[NamespaceClientTableContext],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]],
+    initial_bases: Optional[List[DatasetBasePath]],
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

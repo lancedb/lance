@@ -82,19 +82,16 @@ use lance_index::{
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
-use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
-};
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::indices::{PyIndexConfig, PyIndexDescription};
-use crate::namespace::extract_namespace_arc;
+use crate::namespace::{extract_namespace_arc, extract_namespace_client_table_context};
 use crate::rt;
 use crate::scanner::ScanStatistics;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
@@ -102,7 +99,6 @@ use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
-use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -514,10 +510,10 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false, base_store_params=None))]
+    #[pyo3(signature=(uri=None, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None, namespace_client=None, table_id=None, namespace_client_table_context=None, base_store_params=None))]
     fn new(
         py: Python,
-        uri: String,
+        uri: Option<String>,
         version: Option<Bound<PyAny>>,
         block_size: Option<usize>,
         index_cache_size: Option<usize>,
@@ -531,9 +527,35 @@ impl Dataset {
         session: Option<Session>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
-        namespace_client_managed_versioning: bool,
+        namespace_client_table_context: Option<&Bound<'_, PyAny>>,
         base_store_params: Option<HashMap<String, HashMap<String, String>>>,
     ) -> PyResult<Self> {
+        let has_uri = uri.is_some();
+        let has_namespace = namespace_client.is_some() || table_id.is_some();
+        let has_complete_namespace = namespace_client.is_some() && table_id.is_some();
+        let has_context = namespace_client_table_context.is_some();
+
+        if has_uri && has_namespace {
+            return Err(PyValueError::new_err(
+                "Cannot specify both 'uri' and 'namespace_client'/'table_id'.",
+            ));
+        }
+        if has_uri && has_context {
+            return Err(PyValueError::new_err(
+                "Cannot specify both 'uri' and 'namespace_client_table_context'.",
+            ));
+        }
+        if has_context && !has_complete_namespace {
+            return Err(PyValueError::new_err(
+                "'namespace_client_table_context' requires 'namespace_client' and 'table_id'.",
+            ));
+        }
+        if has_namespace && !has_complete_namespace {
+            return Err(PyValueError::new_err(
+                "Both 'namespace_client' and 'table_id' must be provided together.",
+            ));
+        }
+
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
             params.metadata_cache_size_bytes(metadata_cache_size_bytes);
@@ -587,7 +609,45 @@ impl Dataset {
             params.file_reader_options = Some(file_reader_options);
         }
 
-        let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
+        // Create builder: namespace path or URI path
+        let namespace_describe_version = if let Some(ver) = &version
+            && let Ok(i) = ver.downcast::<PyInt>()
+        {
+            Some(i.extract::<u64>()?)
+        } else {
+            None
+        };
+
+        let mut builder = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(py, ns_client)?;
+            let namespace_client_table_context = namespace_client_table_context
+                .map(|c| extract_namespace_client_table_context(c))
+                .transpose()?;
+            let mut b =
+                if let Some(namespace_client_table_context) = namespace_client_table_context {
+                    DatasetBuilder::for_namespace(ns_client, tid.clone())
+                        .with_namespace_client_table_context(namespace_client_table_context)
+                } else {
+                    rt().block_on(
+                        Some(py),
+                        DatasetBuilder::from_namespace_with_version(
+                            ns_client,
+                            tid.clone(),
+                            namespace_describe_version,
+                        ),
+                    )?
+                    .map_err(|err| PyIOError::new_err(err.to_string()))?
+                }
+                .with_index_cache_size_bytes(params.index_cache_size_bytes)
+                .with_metadata_cache_size_bytes(params.metadata_cache_size_bytes);
+            b = b.with_read_params(params);
+            b
+        } else {
+            let uri = uri.ok_or_else(|| {
+                PyValueError::new_err("uri is required when namespace_client is not provided")
+            })?;
+            DatasetBuilder::from_uri(&uri).with_read_params(params)
+        };
 
         if let Some(ver) = version {
             if let Ok(i) = ver.cast::<PyInt>() {
@@ -602,8 +662,6 @@ impl Dataset {
                 ));
             };
         }
-        // Save a copy of storage options for potential namespace-based credential refresh
-        let initial_storage_options = storage_options.clone();
 
         if let Some(mut storage_options) = storage_options {
             if let Some(user_agent) = storage_options.get_mut("user_agent") {
@@ -625,36 +683,6 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        // Set up namespace-based features if namespace_client and table_id are provided
-        if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-            let ns_client = extract_namespace_arc(py, ns_client)?;
-
-            // Auto-create storage options provider from namespace client
-            // when storage_options are present (meaning credentials came from namespace.describe_table)
-            if initial_storage_options.is_some() {
-                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                    LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
-                );
-                // Create accessor with initial options and provider for credential refresh
-                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                    initial_storage_options.clone().unwrap_or_default(),
-                    provider,
-                ));
-                builder = builder.with_storage_options_accessor(accessor);
-            }
-
-            // Set up commit handler only if namespace manages versioning
-            if namespace_client_managed_versioning {
-                let external_store =
-                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
-                let commit_handler: Arc<dyn CommitHandler> =
-                    Arc::new(ExternalManifestCommitHandler {
-                        external_manifest_store: Arc::new(external_store),
-                    });
-                builder = builder.with_commit_handler(commit_handler);
-            }
-        }
-
         if let Some(base_store_params) = base_store_params {
             for (base_path, opts) in base_store_params {
                 let accessor = Arc::new(StorageOptionsAccessor::with_static_options(opts));
@@ -669,10 +697,13 @@ impl Dataset {
         let dataset = rt().block_on(Some(py), builder.load())?;
 
         match dataset {
-            Ok(ds) => Ok(Self {
-                uri,
-                ds: Arc::new(ds),
-            }),
+            Ok(ds) => {
+                let resolved_uri = ds.uri().to_string();
+                Ok(Self {
+                    uri: resolved_uri,
+                    ds: Arc::new(ds),
+                })
+            }
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
@@ -2361,7 +2392,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_table_context = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2375,7 +2406,7 @@ impl Dataset {
         enable_stable_row_ids: Option<bool>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
-        namespace_client_managed_versioning: bool,
+        namespace_client_table_context: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2397,14 +2428,14 @@ impl Dataset {
             enable_stable_row_ids,
             namespace_client,
             table_id,
-            namespace_client_managed_versioning,
+            namespace_client_table_context,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_table_context = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2416,7 +2447,7 @@ impl Dataset {
         enable_stable_row_ids: Option<bool>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
-        namespace_client_managed_versioning: bool,
+        namespace_client_table_context: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
@@ -2430,34 +2461,55 @@ impl Dataset {
             None
         };
 
-        // Create commit_handler: prefer user-provided commit_lock, then namespace client-based handler
-        // (only if namespace_client_managed_versioning is true)
+        let namespace_client_table_context = namespace_client_table_context
+            .map(|c| extract_namespace_client_table_context(c))
+            .transpose()?;
+        if namespace_client_table_context.is_some()
+            && (namespace_client.is_none() || table_id.is_none())
+        {
+            return Err(PyValueError::new_err(
+                "'namespace_client_table_context' requires 'namespace_client' and 'table_id'.",
+            ));
+        }
+        if namespace_client.is_some() != table_id.is_some() {
+            return Err(PyValueError::new_err(
+                "Both 'namespace_client' and 'table_id' must be provided together.",
+            ));
+        }
+        if (namespace_client.is_some() || table_id.is_some())
+            && matches!(&dest, PyWriteDest::Uri(uri) if !uri.is_empty())
+        {
+            return Err(PyValueError::new_err(
+                "Cannot specify both 'dest' and 'namespace_client'/'table_id'.",
+            ));
+        }
+
         let commit_handler: Option<Arc<dyn CommitHandler>> =
             if let Some(commit_lock) = commit_lock.as_ref() {
-                // User provided a commit_lock
                 Some(
                     commit_lock
                         .into_py_any(commit_lock.py())
                         .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)?,
                 )
-            } else if namespace_client_managed_versioning
-                && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
-            {
-                // Create ExternalManifestCommitHandler from namespace client and table_id
-                // only when namespace manages versioning
-                let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_client, tid);
-                Some(Arc::new(ExternalManifestCommitHandler {
-                    external_manifest_store: Arc::new(external_store),
-                }) as Arc<dyn CommitHandler>)
             } else {
                 None
             };
 
-        let mut builder = CommitBuilder::new(dest.as_dest())
-            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
-            .with_detached(detached.unwrap_or(false))
-            .with_max_retries(max_retries.unwrap_or(20));
+        let mut builder = if let (Some(ns_client), Some(tid)) = (namespace_client, table_id) {
+            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+            match dest {
+                PyWriteDest::Dataset(dataset) => CommitBuilder::new(dataset.ds.clone())
+                    .with_namespace(ns_client, tid, namespace_client_table_context),
+                PyWriteDest::Uri(_) => {
+                    CommitBuilder::new_namespace(ns_client, tid, namespace_client_table_context)
+                }
+            }
+        } else {
+            CommitBuilder::new(dest.as_dest())
+        }
+        .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
+        .with_detached(detached.unwrap_or(false))
+        .with_max_retries(max_retries.unwrap_or(20));
 
         if let Some(enable) = enable_stable_row_ids {
             builder = builder.use_stable_row_ids(enable);
@@ -3452,29 +3504,95 @@ impl Dataset {
 #[pyfunction(name = "_write_dataset")]
 pub fn write_dataset(
     reader: &Bound<'_, PyAny>,
-    dest: PyWriteDest,
+    dest: Option<PyWriteDest>,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
-    let ds = if reader.is_instance_of::<Scanner>() {
-        let scanner: Scanner = reader.extract()?;
-        let batches = rt()
-            .block_on(Some(py), scanner.to_reader())?
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        rt().block_on(
-            Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?
+    let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
+    let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
+    let namespace_client_table_context_opt =
+        get_dict_opt::<Bound<PyAny>>(options, "namespace_client_table_context")?;
+    let has_namespace = namespace_client_opt.is_some() || table_id_opt.is_some();
+    let has_complete_namespace = namespace_client_opt.is_some() && table_id_opt.is_some();
+
+    if has_namespace && dest.is_some() {
+        return Err(PyValueError::new_err(
+            "Cannot specify both 'dest' and 'namespace_client'/'table_id'.",
+        ));
+    }
+    if namespace_client_table_context_opt.is_some() && !has_complete_namespace {
+        return Err(PyValueError::new_err(
+            "'namespace_client_table_context' requires 'namespace_client' and 'table_id'.",
+        ));
+    }
+    if has_namespace && !has_complete_namespace {
+        return Err(PyValueError::new_err(
+            "Both 'namespace_client' and 'table_id' must be provided together.",
+        ));
+    }
+
+    let ds = if let (Some(ns_client), Some(table_id)) =
+        (namespace_client_opt.as_ref(), table_id_opt.as_ref())
+    {
+        let ns_client = extract_namespace_arc(py, ns_client)?;
+        let namespace_client_table_context = namespace_client_table_context_opt
+            .map(|c| extract_namespace_client_table_context(&c))
+            .transpose()?;
+
+        if reader.is_instance_of::<Scanner>() {
+            let scanner: Scanner = reader.extract()?;
+            let batches = rt()
+                .block_on(Some(py), scanner.to_reader())?
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write_into_namespace(
+                    batches,
+                    ns_client,
+                    table_id.clone(),
+                    namespace_client_table_context.as_ref(),
+                    params,
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        } else {
+            let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write_into_namespace(
+                    batches,
+                    ns_client,
+                    table_id.clone(),
+                    namespace_client_table_context.as_ref(),
+                    params,
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        }
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        rt().block_on(
-            Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?
+        let dest = dest.ok_or_else(|| {
+            PyValueError::new_err("dest is required when namespace_client is not provided")
+        })?;
+        if reader.is_instance_of::<Scanner>() {
+            let scanner: Scanner = reader.extract()?;
+            let batches = rt()
+                .block_on(Some(py), scanner.to_reader())?
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write(batches, dest.as_dest(), params),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        } else {
+            let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+            rt().block_on(
+                Some(py),
+                LanceDataset::write(batches, dest.as_dest(), params),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        }
     };
     Ok(Dataset {
         uri: ds.uri().to_string(),
@@ -3552,34 +3670,12 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
 
-        // Extract namespace_client and table_id for storage options provider creation
-        let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
-        let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
-
-        if let Some(so) = storage_options.clone() {
-            // If namespace_client and table_id are provided, create storage options provider from them
-            if let (Some(ns_client), Some(table_id)) =
-                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
-            {
-                let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                    LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
-                );
-                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                    so, provider,
-                ));
-                p.store_params = Some(ObjectStoreParams {
-                    storage_options_accessor: Some(accessor),
-                    ..Default::default()
-                });
-            } else {
-                // No namespace, just use storage options directly
-                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
-                p.store_params = Some(ObjectStoreParams {
-                    storage_options_accessor: Some(accessor),
-                    ..Default::default()
-                });
-            }
+        if let Some(so) = storage_options {
+            let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
+            p.store_params = Some(ObjectStoreParams {
+                storage_options_accessor: Some(accessor),
+                ..Default::default()
+            });
         }
 
         if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?
@@ -3684,24 +3780,6 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 new_props.insert(key, value);
             }
             p.transaction_properties = Some(Arc::new(new_props));
-        }
-
-        // Handle namespace_client and table_id for managed versioning (external manifest store)
-        // Only set if commit_handler is not already set by user and namespace_client_managed_versioning is true
-        let namespace_client_managed_versioning =
-            get_dict_opt::<bool>(options, "namespace_client_managed_versioning")?.unwrap_or(false);
-        if p.commit_handler.is_none()
-            && namespace_client_managed_versioning
-            && let (Some(ns_client), Some(table_id)) =
-                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
-        {
-            let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            p.commit_handler = Some(commit_handler);
         }
 
         Some(p)

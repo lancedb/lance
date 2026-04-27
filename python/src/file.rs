@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::namespace::extract_namespace_arc;
+use crate::namespace::{extract_namespace_arc, extract_namespace_client_table_context};
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
@@ -39,7 +39,7 @@ use lance_io::{
 use object_store::path::Path;
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
-    exceptions::{PyIOError, PyRuntimeError},
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
     pyclass, pyfunction, pymethods,
     types::PyAny,
 };
@@ -48,6 +48,56 @@ use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+type StorageOptionsProvider = Arc<dyn lance_io::object_store::StorageOptionsProvider>;
+type StorageOptionsAndProvider = (
+    Option<HashMap<String, String>>,
+    Option<StorageOptionsProvider>,
+);
+
+fn resolve_storage_options_and_provider(
+    storage_options: Option<HashMap<String, String>>,
+    namespace_client: Option<&Bound<'_, PyAny>>,
+    table_id: Option<&Vec<String>>,
+    namespace_client_table_context: Option<&Bound<'_, PyAny>>,
+) -> PyResult<StorageOptionsAndProvider> {
+    if namespace_client.is_some() != table_id.is_some() {
+        return Err(PyValueError::new_err(
+            "Both 'namespace_client' and 'table_id' must be provided together.",
+        ));
+    }
+    if namespace_client_table_context.is_some() && namespace_client.is_none() {
+        return Err(PyValueError::new_err(
+            "'namespace_client_table_context' requires 'namespace_client' and 'table_id'.",
+        ));
+    }
+
+    let provider = if let (Some(ns_client), Some(tid)) = (namespace_client, table_id) {
+        let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
+        Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+            ns_client,
+            tid.clone(),
+        )) as StorageOptionsProvider)
+    } else {
+        None
+    };
+
+    let merged_storage_options = if let Some(context) = namespace_client_table_context {
+        let context = extract_namespace_client_table_context(context)?;
+        match context.storage_options {
+            Some(context_storage_options) => {
+                let mut merged_storage_options = storage_options.unwrap_or_default();
+                merged_storage_options.extend(context_storage_options);
+                Some(merged_storage_options)
+            }
+            None => storage_options,
+        }
+    } else {
+        storage_options
+    };
+
+    Ok((merged_storage_options, provider))
+}
 #[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceBufferDescriptor {
@@ -299,7 +349,7 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
-    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, namespace_client=None, table_id=None, keep_original_array=None, max_page_bytes=None))]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, namespace_client=None, table_id=None, namespace_client_table_context=None, keep_original_array=None, max_page_bytes=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: String,
@@ -309,20 +359,16 @@ impl LanceFileWriter {
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_table_context: Option<&Bound<'_, PyAny>>,
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        // Create storage options provider from namespace_client and table_id if both are provided
-        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                ns_client,
-                tid.clone(),
-            ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
-        } else {
-            None
-        };
+        let (storage_options, provider) = resolve_storage_options_and_provider(
+            storage_options,
+            namespace_client,
+            table_id.as_ref(),
+            namespace_client_table_context,
+        )?;
 
         rt().block_on(
             None,
@@ -456,24 +502,20 @@ impl LanceFileSession {
 #[pymethods]
 impl LanceFileSession {
     #[new]
-    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None))]
+    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None, namespace_client_table_context=None))]
     pub fn new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_table_context: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        // Create storage options provider from namespace_client and table_id if both are provided
-        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                ns_client,
-                tid.clone(),
-            ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
-        } else {
-            None
-        };
+        let (storage_options, provider) = resolve_storage_options_and_provider(
+            storage_options,
+            namespace_client,
+            table_id.as_ref(),
+            namespace_client_table_context,
+        )?;
         rt().block_on(None, Self::try_new(uri_or_path, storage_options, provider))?
     }
 
@@ -754,25 +796,21 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, columns=None))]
+    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, namespace_client_table_context=None, columns=None))]
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        namespace_client_table_context: Option<&Bound<'_, PyAny>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        // Create storage options provider from namespace_client and table_id if both are provided
-        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                ns_client,
-                tid.clone(),
-            ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
-        } else {
-            None
-        };
+        let (storage_options, provider) = resolve_storage_options_and_provider(
+            storage_options,
+            namespace_client,
+            table_id.as_ref(),
+            namespace_client_table_context,
+        )?;
         rt().block_on(None, Self::open(path, storage_options, provider, columns))?
     }
 

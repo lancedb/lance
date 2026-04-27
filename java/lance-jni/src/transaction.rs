@@ -4,7 +4,9 @@
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::RT;
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::blocking_dataset::{
+    BlockingDataset, NATIVE_DATASET, extract_namespace_client_table_context, extract_namespace_info,
+};
 use crate::error::Result;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
@@ -22,14 +24,10 @@ use lance::dataset::transaction::{
     UpdateMap, UpdateMapEntry, UpdateMode,
 };
 use lance::io::ObjectStoreParams;
-use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
-use lance_table::io::commit::CommitHandler;
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
@@ -624,7 +622,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     skip_auto_cleanup: jboolean,
     namespace_obj: JObject,
     table_id_obj: JObject,
-    namespace_client_managed_versioning: jboolean,
+    namespace_client_table_context_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -641,7 +639,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             skip_auto_cleanup != 0,
             namespace_obj,
             table_id_obj,
-            namespace_client_managed_versioning != 0,
+            namespace_client_table_context_obj,
         )
     )
 }
@@ -660,7 +658,7 @@ fn inner_commit_to_dataset<'local>(
     skip_auto_cleanup: bool,
     namespace_obj: JObject,
     table_id_obj: JObject,
-    namespace_client_managed_versioning: bool,
+    namespace_client_table_context_obj: JObject,
 ) -> Result<JObject<'local>> {
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
@@ -753,18 +751,9 @@ fn inner_commit_to_dataset<'local>(
         Some(&mut java_blocking_ds),
     )?;
 
-    // Set namespace commit handler only if namespace_client_managed_versioning is true
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let commit_handler = if namespace_client_managed_versioning {
-        namespace_info.map(|(ns, tid)| {
-            let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
-            Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            }) as Arc<dyn CommitHandler>
-        })
-    } else {
-        None
-    };
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
 
     let new_blocking_ds = {
         let mut dataset_guard =
@@ -778,7 +767,9 @@ fn inner_commit_to_dataset<'local>(
             storage_format,
             max_retries,
             skip_auto_cleanup,
-            commit_handler,
+            None,
+            namespace_info,
+            namespace_client_table_context,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -1372,6 +1363,39 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     java_transaction: JObject,
     detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
+    allocator_obj: JObject,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_commit_to_uri(
+            &mut env,
+            uri,
+            java_transaction,
+            detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
+            allocator_obj,
+            write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
+        )
+    )
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToNamespace<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JObject,
+    java_transaction: JObject,
+    detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
@@ -1380,13 +1404,12 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     storage_format_obj: JObject,
     max_retries: jint,
     skip_auto_cleanup: jboolean,
-    namespace_client_managed_versioning: jboolean,
+    namespace_client_table_context_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_to_uri(
+        inner_commit_to_namespace(
             &mut env,
-            uri,
             java_transaction,
             detached_jbool != 0,
             enable_v2_manifest_paths != 0,
@@ -1398,7 +1421,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             storage_format_obj,
             max_retries as u32,
             skip_auto_cleanup != 0,
-            namespace_client_managed_versioning != 0,
+            namespace_client_table_context_obj,
         )
     )
 }
@@ -1410,15 +1433,12 @@ fn inner_commit_to_uri<'local>(
     java_transaction: JObject,
     detached: bool,
     enable_v2_manifest_paths: bool,
-    namespace_obj: JObject,
-    table_id_obj: JObject,
     allocator_obj: JObject,
     write_params_obj: JObject,
     use_stable_row_ids_obj: JObject,
     storage_format_obj: JObject,
     max_retries: u32,
     skip_auto_cleanup: bool,
-    namespace_client_managed_versioning: bool,
 ) -> Result<JObject<'local>> {
     let uri_str: String = uri.extract(env)?;
 
@@ -1448,63 +1468,35 @@ fn inner_commit_to_uri<'local>(
         Some(parse_storage_format(&format_str)?)
     };
 
-    // Extract namespace info and create storage options provider if namespace is provided
-    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
-    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> =
-        if let Some((ref ns, ref tid)) = namespace_info {
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                ns.clone(),
-                tid.clone(),
-            )))
-        } else {
-            None
-        };
-
-    // Keep a copy of initial options for opening the read dataset.
     let initial_storage_options = write_param.clone();
-
-    let accessor = match (write_param.is_empty(), storage_options_provider.clone()) {
-        (false, Some(provider)) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_initial_and_provider(write_param, provider),
-        )),
-        (false, None) => Some(Arc::new(
+    let accessor = if !write_param.is_empty() {
+        Some(Arc::new(
             lance::io::StorageOptionsAccessor::with_static_options(write_param),
-        )),
-        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
-            provider,
-        ))),
-        (true, None) => None,
+        ))
+    } else {
+        None
     };
-
     let store_params = ObjectStoreParams {
         storage_options_accessor: accessor,
         ..Default::default()
     };
 
-    let (open_namespace, open_table_id) = match &namespace_info {
-        Some((namespace_client, tid)) => (Some(namespace_client.clone()), Some(tid.clone())),
-        None => (None, None),
-    };
-
-    // Open the read dataset using the same storage options (and provider, if any) so that
-    // `convert_to_rust_transaction` can derive schema/field ids based on the target dataset.
+    // Open the read dataset so that convert_to_rust_transaction can derive schema/field ids.
     let mut ds = BlockingDataset::open(
-        &uri_str,
+        Some(&*uri_str),
         None,
         None,
         6 * 1024 * 1024,
         1024 * 1024,
         initial_storage_options,
         None,
-        storage_options_provider,
         None,
-        open_namespace,
-        open_table_id,
-        namespace_client_managed_versioning,
+        None,
+        None,
+        None,
     )
     .ok();
 
-    // Convert Java transaction to Rust
     let allocator_ref = if allocator_obj.is_null() {
         None
     } else {
@@ -1513,8 +1505,7 @@ fn inner_commit_to_uri<'local>(
     let transaction =
         convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref(), ds.as_mut())?;
 
-    // Build CommitBuilder with URI
-    let mut builder = CommitBuilder::new(&*uri_str)
+    let mut builder = CommitBuilder::new(uri_str.as_str())
         .with_store_params(store_params)
         .with_detached(detached)
         .enable_v2_manifest_paths(enable_v2_manifest_paths);
@@ -1532,13 +1523,110 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_skip_auto_cleanup(true);
     }
 
-    // Set namespace commit handler only if namespace_client_managed_versioning is true
-    if namespace_client_managed_versioning && let Some((namespace_client, tid)) = namespace_info {
-        let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
-        let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-            external_manifest_store: Arc::new(external_store),
-        });
-        builder = builder.with_commit_handler(commit_handler);
+    let dataset = RT.block_on(builder.execute(transaction))?;
+    let blocking_ds = BlockingDataset { inner: dataset };
+    blocking_ds.into_java(env)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_commit_to_namespace<'local>(
+    env: &mut JNIEnv<'local>,
+    java_transaction: JObject,
+    detached: bool,
+    enable_v2_manifest_paths: bool,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    allocator_obj: JObject,
+    write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
+    namespace_client_table_context_obj: JObject,
+) -> Result<JObject<'local>> {
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
+    };
+
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
+    };
+
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?
+        .ok_or_else(|| Error::input_error("namespace and table id are required".to_string()))?;
+    let namespace_client_table_context =
+        extract_namespace_client_table_context(env, &namespace_client_table_context_obj)?;
+    let initial_storage_options = write_param.clone();
+    let accessor = if !write_param.is_empty() {
+        Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(write_param),
+        ))
+    } else {
+        None
+    };
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: accessor,
+        ..Default::default()
+    };
+
+    let mut ds = BlockingDataset::open(
+        None,
+        None,
+        None,
+        6 * 1024 * 1024,
+        1024 * 1024,
+        initial_storage_options,
+        None,
+        None,
+        Some(namespace_info.0.clone()),
+        Some(namespace_info.1.clone()),
+        namespace_client_table_context.clone(),
+    )
+    .ok();
+
+    let allocator_ref = if allocator_obj.is_null() {
+        None
+    } else {
+        Some(allocator_obj)
+    };
+    let transaction =
+        convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref(), ds.as_mut())?;
+
+    let mut builder = CommitBuilder::new_namespace(
+        namespace_info.0,
+        namespace_info.1,
+        namespace_client_table_context,
+    )
+    .with_store_params(store_params)
+    .with_detached(detached)
+    .enable_v2_manifest_paths(enable_v2_manifest_paths);
+
+    if let Some(use_stable) = use_stable_row_ids {
+        builder = builder.use_stable_row_ids(use_stable);
+    }
+    if let Some(format) = storage_format {
+        builder = builder.with_storage_format(format);
+    }
+    if max_retries > 0 {
+        builder = builder.with_max_retries(max_retries);
+    }
+    if skip_auto_cleanup {
+        builder = builder.with_skip_auto_cleanup(true);
     }
 
     let dataset = RT.block_on(builder.execute(transaction))?;

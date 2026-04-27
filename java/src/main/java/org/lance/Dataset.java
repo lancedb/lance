@@ -118,7 +118,7 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Creates an empty dataset.
+   * Creates an empty dataset with the given schema.
    *
    * @param allocator the buffer allocator
    * @param path dataset uri
@@ -159,34 +159,6 @@ public class Dataset implements Closeable {
     }
   }
 
-  /**
-   * Create a dataset with given stream.
-   *
-   * @param allocator buffer allocator
-   * @param stream arrow stream
-   * @param path dataset uri
-   * @param params write parameters
-   * @return Dataset
-   * @deprecated Use {@link #write()} builder instead. For example: {@code
-   *     Dataset.write().allocator(allocator).stream(stream).uri(path)
-   *     .mode(WriteMode.CREATE).execute()}
-   */
-  /**
-   * Create a dataset with given stream.
-   *
-   * @param allocator buffer allocator
-   * @param stream arrow stream
-   * @param path dataset uri
-   * @param params write parameters
-   * @return Dataset
-   * @deprecated Use {@link #write()} builder instead.
-   */
-  @Deprecated
-  public static Dataset create(
-      BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
-    return create(allocator, stream, path, params, null, null, false);
-  }
-
   private static native Dataset createWithFfiSchema(
       long arrowSchemaMemoryAddress,
       String path,
@@ -202,6 +174,61 @@ public class Dataset implements Closeable {
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold);
+
+  /**
+   * Create a dataset with given stream.
+   *
+   * @deprecated Use {@link #write()} builder instead.
+   */
+  @Deprecated
+  public static Dataset create(
+      BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
+    return create(allocator, stream, path, params, null, null, null);
+  }
+
+  /**
+   * Open a dataset from the specified path.
+   *
+   * @deprecated Use {@link #open()} builder instead: {@code Dataset.open().uri(path).build()}
+   */
+  @Deprecated
+  public static Dataset open(String path) {
+    return open(
+        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
+  }
+
+  /**
+   * Open a dataset from the specified path with options.
+   *
+   * @deprecated Use {@link #open()} builder instead: {@code
+   *     Dataset.open().uri(path).readOptions(options).build()}
+   */
+  @Deprecated
+  public static Dataset open(String path, ReadOptions options) {
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
+  }
+
+  /**
+   * Open a dataset from the specified path with allocator.
+   *
+   * @deprecated Use {@link #open()} builder instead: {@code
+   *     Dataset.open().allocator(allocator).uri(path).build()}
+   */
+  @Deprecated
+  public static Dataset open(String path, BufferAllocator allocator) {
+    return open(allocator, path, new ReadOptions.Builder().build());
+  }
+
+  /**
+   * Open a dataset from the specified path with allocator and options.
+   *
+   * @deprecated Use {@link #open()} builder instead: {@code
+   *     Dataset.open().allocator(allocator).uri(path).readOptions(options).build()}
+   */
+  @Deprecated
+  public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
+    return open(allocator, false, path, options, null);
+  }
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -240,15 +267,15 @@ public class Dataset implements Closeable {
       Optional<Long> blobPackFileSizeThreshold,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 
   /**
    * Creates a dataset with optional namespace client support for managed versioning.
    *
    * <p>When namespaceClient and tableId are provided, the Rust side will automatically create a
-   * storage options provider for credential refresh. When namespaceClientManagedVersioning is true,
-   * the commit handler will use the namespace client's create_table_version method for version
-   * tracking.
+   * storage options provider for credential refresh. When namespaceClientTableContext indicates
+   * managed versioning, the commit handler will use the namespace client's create_table_version
+   * method for version tracking.
    *
    * @param allocator buffer allocator
    * @param stream arrow stream
@@ -257,8 +284,8 @@ public class Dataset implements Closeable {
    * @param namespaceClient optional namespace client for managed versioning and credential refresh
    *     (can be null)
    * @param tableId optional table identifier within the namespace client (can be null)
-   * @param namespaceClientManagedVersioning whether namespace manages versioning (commits go
-   *     through namespace API)
+   * @param namespaceClientTableContext optional cached namespace table context from describe or
+   *     declare table
    * @return Dataset
    */
   static Dataset create(
@@ -268,10 +295,9 @@ public class Dataset implements Closeable {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
+      NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
-    Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
     Dataset dataset =
         createWithFfiStream(
@@ -291,65 +317,9 @@ public class Dataset implements Closeable {
             params.getBlobPackFileSizeThreshold(),
             namespaceClient,
             tableId,
-            namespaceClientManagedVersioning);
+            namespaceClientTableContext);
     dataset.allocator = allocator;
     return dataset;
-  }
-
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @param path file path
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code Dataset.open().uri(path).build()}
-   */
-  @Deprecated
-  public static Dataset open(String path) {
-    return open(
-        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
-  }
-
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @param path file path
-   * @param options the open options
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code
-   *     Dataset.open().uri(path).readOptions(options).build()}
-   */
-  @Deprecated
-  public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
-  }
-
-  /**
-   * Open a dataset from the specified path.
-   *
-   * @param path file path
-   * @param allocator Arrow buffer allocator
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code
-   *     Dataset.open().allocator(allocator).uri(path).build()}
-   */
-  @Deprecated
-  public static Dataset open(String path, BufferAllocator allocator) {
-    return open(allocator, path, new ReadOptions.Builder().build());
-  }
-
-  /**
-   * Open a dataset from the specified path with additional options.
-   *
-   * @param allocator Arrow buffer allocator
-   * @param path file path
-   * @param options the open options
-   * @return Dataset
-   * @deprecated Use {@link #open()} builder instead: {@code
-   *     Dataset.open().allocator(allocator).uri(path).readOptions(options).build()}
-   */
-  @Deprecated
-  public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options, null);
   }
 
   /**
@@ -365,7 +335,7 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
-    return open(allocator, selfManagedAllocator, path, options, session, null, null, false);
+    return open(allocator, selfManagedAllocator, path, options, session, null, null, null);
   }
 
   /**
@@ -379,8 +349,8 @@ public class Dataset implements Closeable {
    * @param namespaceClient the LanceNamespace to use for managed versioning and credential refresh
    *     (null if not using namespace client)
    * @param tableId table identifier (null if not using namespace client)
-   * @param namespaceClientManagedVersioning whether namespace manages versioning (commits go
-   *     through namespace API)
+   * @param namespaceClientTableContext optional cached namespace table context from describe or
+   *     declare table
    * @return Dataset
    */
   static Dataset open(
@@ -391,8 +361,7 @@ public class Dataset implements Closeable {
       Session session,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
-    Preconditions.checkNotNull(path);
+      NamespaceClientTableContext namespaceClientTableContext) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
 
@@ -414,7 +383,7 @@ public class Dataset implements Closeable {
             sessionHandle,
             namespaceClient,
             tableId,
-            namespaceClientManagedVersioning);
+            namespaceClientTableContext);
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     if (effectiveSession != null) {
@@ -437,7 +406,7 @@ public class Dataset implements Closeable {
       long sessionHandle,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning);
+      NamespaceClientTableContext namespaceClientTableContext);
 
   /**
    * Creates a builder for opening a dataset.

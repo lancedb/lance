@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -23,8 +24,12 @@ use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform};
+use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
+    StorageOptionsProvider,
+};
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
@@ -38,9 +43,96 @@ use pyo3::{intern, prelude::*};
 
 use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
+use crate::namespace::{extract_namespace_arc, extract_namespace_client_table_context};
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
+
+fn get_non_none_kwarg<'py>(
+    kwargs: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(value) = kwargs.get_item(key)? else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn resolve_write_params(
+    params: Option<WriteParams>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<WriteParams>> {
+    let Some(kwargs) = kwargs else {
+        return Ok(params);
+    };
+
+    let namespace_client_table_context =
+        get_non_none_kwarg(kwargs, "namespace_client_table_context")?
+            .map(|context| extract_namespace_client_table_context(&context))
+            .transpose()?;
+
+    let namespace_client = get_non_none_kwarg(kwargs, "namespace_client")?;
+    let table_id: Option<Vec<String>> = get_non_none_kwarg(kwargs, "table_id")?
+        .map(|table_id| table_id.extract())
+        .transpose()?;
+
+    if namespace_client.is_some() != table_id.is_some() {
+        return Err(PyValueError::new_err(
+            "Both 'namespace_client' and 'table_id' must be provided together.",
+        ));
+    }
+    if namespace_client_table_context.is_some() && namespace_client.is_none() {
+        return Err(PyValueError::new_err(
+            "'namespace_client_table_context' requires 'namespace_client' and 'table_id'.",
+        ));
+    }
+
+    let provider = if let (Some(namespace_client), Some(table_id)) =
+        (namespace_client.as_ref(), table_id.as_ref())
+    {
+        let namespace_client = extract_namespace_arc(namespace_client.py(), namespace_client)?;
+        Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+            namespace_client,
+            table_id.clone(),
+        )) as Arc<dyn StorageOptionsProvider>)
+    } else {
+        None
+    };
+
+    let mut params = params.unwrap_or_default();
+    let mut merged_storage_options: HashMap<String, String> = params
+        .store_params
+        .as_ref()
+        .and_then(|store_params| store_params.storage_options().cloned())
+        .unwrap_or_default();
+    if let Some(namespace_client_table_context) = namespace_client_table_context
+        && let Some(context_storage_options) = namespace_client_table_context.storage_options
+    {
+        merged_storage_options.extend(context_storage_options);
+    }
+
+    let existing_store_params = params.store_params.take().unwrap_or_default();
+    let storage_options_accessor = match (merged_storage_options.is_empty(), provider) {
+        (false, Some(provider)) => Some(Arc::new(
+            StorageOptionsAccessor::with_initial_and_provider(merged_storage_options, provider),
+        )),
+        (false, None) => Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            merged_storage_options,
+        ))),
+        (true, Some(provider)) => Some(Arc::new(StorageOptionsAccessor::with_provider(provider))),
+        (true, None) => None,
+    };
+    params.store_params = Some(ObjectStoreParams {
+        storage_options_accessor,
+        ..existing_store_params
+    });
+
+    Ok(Some(params))
+}
 
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
@@ -123,6 +215,7 @@ impl FileFragment {
         } else {
             None
         };
+        let params = resolve_write_params(params, kwargs)?;
 
         let batches = convert_reader(reader)?;
 
@@ -437,8 +530,8 @@ fn do_write_fragments(
 
     let params = kwargs
         .and_then(|params| get_write_params(params).transpose())
-        .transpose()?
-        .unwrap_or_default();
+        .transpose()?;
+    let params = resolve_write_params(params, kwargs)?.unwrap_or_default();
 
     rt().block_on(
         Some(reader.py()),
