@@ -22,8 +22,16 @@ use lance_file::previous::writer::{
 };
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{self as current_writer, FileWriterOptions};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, ObjectStoreRegistry,
+    StorageOptionsAccessor, StorageOptionsProvider,
+};
+use lance_namespace::{
+    ErrorCode as NamespaceErrorCode, LanceNamespace, NamespaceClientTableContext,
+    models::{DeclareTableRequest, DescribeTableRequest},
+};
 use lance_table::format::{BasePath, DataFile, Fragment};
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -37,6 +45,8 @@ use crate::Dataset;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver, preprocess_blob_batches,
 };
+use crate::dataset::transaction::Operation;
+use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::session::Session;
 
 use super::DATA_DIR;
@@ -57,52 +67,255 @@ pub use commit::CommitBuilder;
 pub use delete::{DeleteBuilder, DeleteResult};
 pub use insert::InsertBuilder;
 
+/// A namespace table destination to write data to.
+///
+/// This keeps user-provided namespace inputs and cached namespace table context
+/// together so write and commit paths do not encode unresolved namespace tables
+/// as placeholder URIs.
+#[derive(Debug, Clone)]
+pub struct NamespaceTableDestination {
+    pub(crate) namespace_client: Arc<dyn LanceNamespace>,
+    pub(crate) table_id: Vec<String>,
+    pub(crate) namespace_client_table_context: Option<NamespaceClientTableContext>,
+    pub(crate) dataset: Option<Arc<Dataset>>,
+}
+
+impl NamespaceTableDestination {
+    pub fn new(
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        namespace_client_table_context: Option<NamespaceClientTableContext>,
+    ) -> Self {
+        Self {
+            namespace_client,
+            table_id,
+            namespace_client_table_context,
+            dataset: None,
+        }
+    }
+
+    pub fn with_dataset(mut self, dataset: Arc<Dataset>) -> Self {
+        self.dataset = Some(dataset);
+        self
+    }
+
+    pub(crate) fn with_optional_dataset(mut self, dataset: Option<Arc<Dataset>>) -> Self {
+        self.dataset = dataset;
+        self
+    }
+
+    pub(crate) fn dataset(&self) -> Option<&Dataset> {
+        self.dataset.as_deref()
+    }
+
+    fn error_chain_contains_namespace_table_not_found(
+        err: &(dyn std::error::Error + 'static),
+    ) -> bool {
+        if let Some(err) = err.downcast_ref::<lance_namespace::NamespaceError>() {
+            return err.code() == NamespaceErrorCode::TableNotFound;
+        }
+        if let Some(err) = err.downcast_ref::<Error>() {
+            return Self::is_namespace_table_not_found(err);
+        }
+        if let Some(source) = err.source() {
+            return Self::error_chain_contains_namespace_table_not_found(source);
+        }
+        false
+    }
+
+    fn is_namespace_table_not_found(err: &Error) -> bool {
+        match err {
+            Error::Namespace { source, .. } => {
+                Self::error_chain_contains_namespace_table_not_found(source.as_ref())
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn resolve_context_for_write(
+        &self,
+        mode: WriteMode,
+    ) -> Result<NamespaceClientTableContext> {
+        if let Some(namespace_client_table_context) = &self.namespace_client_table_context {
+            return Ok(namespace_client_table_context.clone());
+        }
+
+        match mode {
+            WriteMode::Create => {
+                let declare_request = DeclareTableRequest {
+                    id: Some(self.table_id.clone()),
+                    ..Default::default()
+                };
+                let response = self.namespace_client.declare_table(declare_request).await?;
+                NamespaceClientTableContext::from_declare_table_response(response)
+            }
+            WriteMode::Append | WriteMode::Overwrite => {
+                let describe_request = DescribeTableRequest {
+                    id: Some(self.table_id.clone()),
+                    ..Default::default()
+                };
+                let response = self
+                    .namespace_client
+                    .describe_table(describe_request)
+                    .await?;
+                NamespaceClientTableContext::from_describe_table_response(response)
+            }
+        }
+    }
+
+    pub(crate) async fn resolve_context_for_commit(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<NamespaceClientTableContext> {
+        if let Some(namespace_client_table_context) = &self.namespace_client_table_context {
+            return Ok(namespace_client_table_context.clone());
+        }
+
+        let describe_request = DescribeTableRequest {
+            id: Some(self.table_id.clone()),
+            ..Default::default()
+        };
+        match self.namespace_client.describe_table(describe_request).await {
+            Ok(response) => NamespaceClientTableContext::from_describe_table_response(response),
+            Err(err)
+                if Self::is_namespace_table_not_found(&err)
+                    && matches!(
+                        transaction.operation,
+                        Operation::Overwrite { .. } | Operation::Clone { .. }
+                    ) =>
+            {
+                let declare_request = DeclareTableRequest {
+                    id: Some(self.table_id.clone()),
+                    ..Default::default()
+                };
+                let response = self.namespace_client.declare_table(declare_request).await?;
+                NamespaceClientTableContext::from_declare_table_response(response)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn store_params_with_context(
+        &self,
+        existing_store_params: ObjectStoreParams,
+        namespace_client_table_context: &NamespaceClientTableContext,
+    ) -> ObjectStoreParams {
+        let provider: Arc<dyn StorageOptionsProvider> =
+            Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                self.namespace_client.clone(),
+                self.table_id.clone(),
+            ));
+        let mut merged_storage_options = existing_store_params
+            .storage_options()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(storage_options) = &namespace_client_table_context.storage_options {
+            merged_storage_options.extend(storage_options.clone());
+        }
+        ObjectStoreParams {
+            storage_options_accessor: Some(if merged_storage_options.is_empty() {
+                Arc::new(StorageOptionsAccessor::with_provider(provider))
+            } else {
+                Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                    merged_storage_options,
+                    provider,
+                ))
+            }),
+            ..existing_store_params
+        }
+    }
+
+    pub(crate) fn managed_commit_handler(
+        &self,
+        namespace_client_table_context: &NamespaceClientTableContext,
+    ) -> Option<Arc<dyn CommitHandler>> {
+        if namespace_client_table_context.managed_versioning {
+            let external_store = LanceNamespaceExternalManifestStore::new(
+                self.namespace_client.clone(),
+                self.table_id.clone(),
+            );
+            Some(Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            }) as Arc<dyn CommitHandler>)
+        } else {
+            None
+        }
+    }
+}
+
 /// The destination to write data to.
 #[derive(Debug, Clone)]
-pub enum WriteDestination<'a> {
+pub enum WriteDestination {
     /// An existing dataset to write to.
     Dataset(Arc<Dataset>),
     /// A URI to write to.
-    Uri(&'a str),
+    Uri(String),
+    /// A namespace table to resolve through a Lance namespace client.
+    NamespaceTable(NamespaceTableDestination),
 }
 
-impl WriteDestination<'_> {
+impl WriteDestination {
     pub fn dataset(&self) -> Option<&Dataset> {
         match self {
-            WriteDestination::Dataset(dataset) => Some(dataset.as_ref()),
-            WriteDestination::Uri(_) => None,
+            Self::Dataset(dataset) => Some(dataset.as_ref()),
+            Self::Uri(_) => None,
+            Self::NamespaceTable(table) => table.dataset(),
         }
     }
 
     pub fn uri(&self) -> String {
         match self {
-            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
-            WriteDestination::Uri(uri) => uri.to_string(),
+            Self::Dataset(dataset) => dataset.uri.clone(),
+            Self::Uri(uri) => uri.clone(),
+            Self::NamespaceTable(table) => table
+                .dataset
+                .as_ref()
+                .map(|dataset| dataset.uri.clone())
+                .or_else(|| {
+                    table
+                        .namespace_client_table_context
+                        .as_ref()
+                        .map(|context| context.location.clone())
+                })
+                .unwrap_or_else(|| format!("namespace:{}", table.table_id.join("."))),
+        }
+    }
+
+    pub(crate) fn namespace_table(&self) -> Option<&NamespaceTableDestination> {
+        match self {
+            Self::NamespaceTable(table) => Some(table),
+            _ => None,
         }
     }
 }
 
-impl From<Arc<Dataset>> for WriteDestination<'_> {
+impl From<Arc<Dataset>> for WriteDestination {
     fn from(dataset: Arc<Dataset>) -> Self {
-        WriteDestination::Dataset(dataset)
+        Self::Dataset(dataset)
     }
 }
 
-impl<'a> From<&'a str> for WriteDestination<'a> {
-    fn from(uri: &'a str) -> Self {
-        WriteDestination::Uri(uri)
+impl From<String> for WriteDestination {
+    fn from(uri: String) -> Self {
+        Self::Uri(uri)
     }
 }
 
-impl<'a> From<&'a String> for WriteDestination<'a> {
-    fn from(uri: &'a String) -> Self {
-        WriteDestination::Uri(uri.as_str())
+impl From<&str> for WriteDestination {
+    fn from(uri: &str) -> Self {
+        Self::Uri(uri.to_string())
     }
 }
 
-impl<'a> From<&'a Path> for WriteDestination<'a> {
-    fn from(path: &'a Path) -> Self {
-        WriteDestination::Uri(path.as_ref())
+impl From<&String> for WriteDestination {
+    fn from(uri: &String) -> Self {
+        Self::Uri(uri.clone())
+    }
+}
+
+impl From<&Path> for WriteDestination {
+    fn from(path: &Path) -> Self {
+        Self::Uri(path.as_ref().to_string())
     }
 }
 
@@ -463,7 +676,7 @@ impl WriteParams {
     note = "Use [`InsertBuilder::execute_uncommitted_stream`] instead"
 )]
 pub async fn write_fragments(
-    dest: impl Into<WriteDestination<'_>>,
+    dest: impl Into<WriteDestination>,
     data: impl StreamingWriteSource,
     params: WriteParams,
 ) -> Result<Transaction> {

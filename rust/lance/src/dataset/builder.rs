@@ -126,36 +126,28 @@ impl DatasetBuilder {
     /// Create a DatasetBuilder from a LanceNamespace client for an optional table version.
     ///
     /// Calls `describe_table()` to fetch the table location, storage options,
-    /// and managed-versioning flag. When `version` is provided, it is passed to
-    /// the namespace so version-scoped locations or vended credentials can be
-    /// resolved before the dataset is opened.
+    /// and managed-versioning flag. When `version` is provided, it is applied to
+    /// the returned dataset builder using normal Lance version checkout.
     #[allow(deprecated)]
     pub async fn from_namespace_with_version(
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         version: Option<u64>,
     ) -> Result<Self> {
-        let version = version
-            .map(|version| {
-                i64::try_from(version).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "table version {} exceeds namespace request range",
-                        version
-                    ))
-                })
-            })
-            .transpose()?;
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
-            version,
             ..Default::default()
         };
         let response = namespace_client.describe_table(request).await?;
         let namespace_client_table_context =
             NamespaceClientTableContext::from_describe_table_response(response)?;
 
-        Ok(Self::for_namespace(namespace_client, table_id)
-            .with_namespace_client_table_context(namespace_client_table_context))
+        let mut builder = Self::for_namespace(namespace_client, table_id)
+            .with_namespace_client_table_context(namespace_client_table_context);
+        if let Some(version) = version {
+            builder = builder.with_version(version);
+        }
+        Ok(builder)
     }
 }
 
@@ -582,7 +574,38 @@ impl DatasetBuilder {
 
     /// Set options based on [WriteParams].
     pub fn with_write_params(mut self, write_params: WriteParams) -> Self {
-        if let Some(options) = write_params.store_params {
+        if let Some(mut options) = write_params.store_params {
+            options.storage_options_accessor = match (
+                self.options.storage_options_accessor.as_ref(),
+                options.storage_options_accessor.as_ref(),
+            ) {
+                (Some(existing), Some(incoming)) => {
+                    let mut merged_storage_options = existing
+                        .initial_storage_options()
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(incoming_storage_options) = incoming.initial_storage_options() {
+                        merged_storage_options.extend(incoming_storage_options.clone());
+                    }
+                    let provider = existing
+                        .provider()
+                        .cloned()
+                        .or_else(|| incoming.provider().cloned());
+                    Some(if let Some(provider) = provider {
+                        Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                            merged_storage_options,
+                            provider,
+                        ))
+                    } else {
+                        Arc::new(StorageOptionsAccessor::with_static_options(
+                            merged_storage_options,
+                        ))
+                    })
+                }
+                (Some(existing), None) => Some(existing.clone()),
+                (None, Some(incoming)) => Some(incoming.clone()),
+                (None, None) => None,
+            };
             self.options = options;
         }
 
@@ -999,6 +1022,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn namespace_context_provider_survives_write_params() {
+        let user_storage_options = HashMap::from([("user_token".to_string(), "user".to_string())]);
+        let builder =
+            DatasetBuilder::for_namespace(Arc::new(DummyNamespace), vec!["table".to_string()])
+                .with_namespace_client_table_context(namespace_context(None))
+                .with_write_params(WriteParams {
+                    store_params: Some(ObjectStoreParams {
+                        storage_options_accessor: Some(Arc::new(
+                            StorageOptionsAccessor::with_static_options(
+                                user_storage_options.clone(),
+                            ),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+
+        let accessor = builder
+            .options
+            .storage_options_accessor
+            .expect("namespace provider should survive write params");
+        assert!(accessor.provider().is_some());
+        assert_eq!(
+            accessor.initial_storage_options(),
+            Some(&user_storage_options)
+        );
+    }
+
     #[tokio::test]
     async fn for_namespace_requires_context_before_load() {
         let err =
@@ -1034,9 +1086,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_namespace_with_version_passes_version_to_describe_table() {
+    async fn from_namespace_with_version_sets_dataset_version_target() {
         let describe_version = Arc::new(std::sync::Mutex::new(None));
-        DatasetBuilder::from_namespace_with_version(
+        let builder = DatasetBuilder::from_namespace_with_version(
             Arc::new(RecordingNamespace {
                 describe_version: describe_version.clone(),
             }),
@@ -1046,6 +1098,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(*describe_version.lock().unwrap(), Some(7));
+        assert_eq!(*describe_version.lock().unwrap(), None);
+        assert!(matches!(
+            builder.version,
+            Some(crate::dataset::refs::Ref::VersionNumber(7))
+        ));
     }
 }

@@ -717,9 +717,9 @@ mod tests {
         }
     }
 
-    impl<'a> From<&'a TempStrDir> for WriteDestination<'a> {
-        fn from(value: &'a TempStrDir) -> Self {
-            WriteDestination::Uri(value.as_str())
+    impl From<&TempStrDir> for WriteDestination {
+        fn from(value: &TempStrDir) -> Self {
+            Self::Uri(value.as_str().to_string())
         }
     }
 }

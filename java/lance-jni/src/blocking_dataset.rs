@@ -175,11 +175,7 @@ impl BlockingDataset {
                 DatasetBuilder::for_namespace(namespace_client, tid)
                     .with_namespace_client_table_context(namespace_client_table_context)
             } else {
-                RT.block_on(DatasetBuilder::from_namespace_with_version(
-                    namespace_client,
-                    tid,
-                    version,
-                ))?
+                RT.block_on(DatasetBuilder::from_namespace(namespace_client, tid))?
             };
             b.with_read_params(params)
         } else {

@@ -45,14 +45,14 @@ use crate::dataset::progress::{WriteProgressFn, WriteStats};
 /// they are passed to the [`CommitBuilder`].
 #[derive(Debug, Clone)]
 pub struct InsertBuilder<'a> {
-    dest: WriteDestination<'a>,
+    dest: WriteDestination,
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
 }
 
 impl<'a> InsertBuilder<'a> {
-    pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
+    pub fn new(dest: impl Into<WriteDestination>) -> Self {
         Self {
             dest: dest.into(),
             params: None,
@@ -130,7 +130,7 @@ impl<'a> InsertBuilder<'a> {
         self.write_uncommitted_impl(data).await.map(|(t, _)| t)
     }
 
-    async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
+    async fn do_commit(context: &WriteContext, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_storage_format(context.storage_version)
@@ -153,7 +153,7 @@ impl<'a> InsertBuilder<'a> {
     async fn write_uncommitted_impl(
         &self,
         data: Vec<RecordBatch>,
-    ) -> Result<(Transaction, WriteContext<'_>)> {
+    ) -> Result<(Transaction, WriteContext)> {
         // TODO: This should be able to split the data up based on max_rows_per_file
         // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
@@ -188,7 +188,7 @@ impl<'a> InsertBuilder<'a> {
         &self,
         stream: SendableRecordBatchStream,
         schema: Schema,
-    ) -> Result<(Transaction, WriteContext<'_>)> {
+    ) -> Result<(Transaction, WriteContext)> {
         let mut context = self.resolve_context().await?;
 
         info!(
@@ -223,7 +223,7 @@ impl<'a> InsertBuilder<'a> {
     fn build_transaction(
         schema: Schema,
         fragments: Vec<Fragment>,
-        context: &WriteContext<'_>,
+        context: &WriteContext,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
@@ -281,20 +281,26 @@ impl<'a> InsertBuilder<'a> {
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
         // Write mode
-        match (&context.params.mode, &context.dest) {
-            (WriteMode::Create, WriteDestination::Dataset(ds)) => {
-                return Err(Error::dataset_already_exists(ds.uri.clone()));
+        match context.params.mode {
+            WriteMode::Create => {
+                if let Some(ds) = context.dest.dataset() {
+                    return Err(Error::dataset_already_exists(ds.uri.clone()));
+                }
             }
-            (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
-                log::warn!("No existing dataset at {uri}, it will be created");
-                context.params.mode = WriteMode::Create;
+            WriteMode::Append | WriteMode::Overwrite => {
+                if context.dest.dataset().is_none() {
+                    log::warn!(
+                        "No existing dataset at {}, it will be created",
+                        context.dest.uri()
+                    );
+                    context.params.mode = WriteMode::Create;
+                }
             }
-            _ => {}
         }
 
         // Validate schema
         if matches!(context.params.mode, WriteMode::Append)
-            && let WriteDestination::Dataset(dataset) = &context.dest
+            && let Some(dataset) = context.dest.dataset()
         {
             // If the dataset is already using (or not using) stable row ids, we need to match
             // and ignore whatever the user provided as input
@@ -332,7 +338,7 @@ impl<'a> InsertBuilder<'a> {
         }
 
         // Feature flags
-        if let WriteDestination::Dataset(dataset) = &context.dest
+        if let Some(dataset) = context.dest.dataset()
             && !can_write_dataset(dataset.manifest.writer_feature_flags)
         {
             let message = format!(
@@ -346,11 +352,25 @@ impl<'a> InsertBuilder<'a> {
         Ok(())
     }
 
-    async fn resolve_context(&self) -> Result<WriteContext<'a>> {
+    async fn resolve_context(&self) -> Result<WriteContext> {
         let mut params = self.params.cloned().unwrap_or_default();
         if let Some(cb) = self.write_progress.clone() {
             params.write_progress = Some(cb);
         }
+        let mut namespace_table_context = None;
+        if let Some(namespace_table) = self.dest.namespace_table() {
+            let context = namespace_table
+                .resolve_context_for_write(params.mode)
+                .await?;
+            let existing_store_params = params.store_params.take().unwrap_or_default();
+            params.store_params =
+                Some(namespace_table.store_params_with_context(existing_store_params, &context));
+            if params.commit_handler.is_none() {
+                params.commit_handler = namespace_table.managed_commit_handler(&context);
+            }
+            namespace_table_context = Some(context);
+        }
+
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -377,6 +397,40 @@ impl<'a> InsertBuilder<'a> {
                 .await?;
                 (object_store, base_path, commit_handler)
             }
+            WriteDestination::NamespaceTable(namespace_table) => {
+                if let Some(dataset) = &namespace_table.dataset {
+                    (
+                        dataset.object_store.clone(),
+                        dataset.base.clone(),
+                        params
+                            .commit_handler
+                            .clone()
+                            .unwrap_or_else(|| dataset.commit_handler.clone()),
+                    )
+                } else {
+                    let context = namespace_table_context
+                        .as_ref()
+                        .expect("namespace table context was resolved above");
+                    let registry = params
+                        .session
+                        .as_ref()
+                        .map(|s| s.store_registry())
+                        .unwrap_or_else(|| Arc::new(Default::default()));
+                    let (object_store, base_path) = ObjectStore::from_uri_and_params(
+                        registry,
+                        &context.location,
+                        &params.store_params.clone().unwrap_or_default(),
+                    )
+                    .await?;
+                    let commit_handler = resolve_commit_handler(
+                        &context.location,
+                        params.commit_handler.clone(),
+                        &params.store_params,
+                    )
+                    .await?;
+                    (object_store, base_path, commit_handler)
+                }
+            }
         };
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
@@ -392,15 +446,43 @@ impl<'a> InsertBuilder<'a> {
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri)
+                        WriteDestination::Uri(uri.clone())
                     }
                     Err(e) => return Err(e),
                 }
             }
+            WriteDestination::NamespaceTable(namespace_table) => {
+                if namespace_table.dataset.is_some() {
+                    self.dest.clone()
+                } else {
+                    let context = namespace_table_context
+                        .as_ref()
+                        .expect("namespace table context was resolved above");
+                    let builder =
+                        DatasetBuilder::from_uri(&context.location).with_read_params(ReadParams {
+                            store_options: params.store_params.clone(),
+                            commit_handler: params.commit_handler.clone(),
+                            session: params.session.clone(),
+                            ..Default::default()
+                        });
+
+                    match builder.load().await {
+                        Ok(dataset) => WriteDestination::NamespaceTable(
+                            namespace_table.clone().with_dataset(Arc::new(dataset)),
+                        ),
+                        Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
+                            let mut namespace_table = namespace_table.clone();
+                            namespace_table.namespace_client_table_context = Some(context.clone());
+                            WriteDestination::NamespaceTable(namespace_table)
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
         };
 
-        let storage_version = match (&params.mode, &dest) {
-            (WriteMode::Overwrite, WriteDestination::Dataset(dataset)) => {
+        let storage_version = match (&params.mode, dest.dataset()) {
+            (WriteMode::Overwrite, Some(dataset)) => {
                 // If overwriting an existing dataset, allow the user to specify but use
                 // the existing version if they don't
                 params.data_storage_version.map(Ok).unwrap_or_else(|| {
@@ -408,13 +490,13 @@ impl<'a> InsertBuilder<'a> {
                     m.data_storage_format.lance_file_version()
                 })?
             }
-            (_, WriteDestination::Dataset(dataset)) => {
+            (_, Some(dataset)) => {
                 // If appending to an existing dataset, always use the dataset version
                 let m = dataset.manifest.as_ref();
                 m.data_storage_format.lance_file_version()?
             }
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
-            (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
+            (_, None) => params.storage_version_or_default(),
         };
 
         Ok(WriteContext {
@@ -429,9 +511,9 @@ impl<'a> InsertBuilder<'a> {
 }
 
 #[derive(Debug)]
-struct WriteContext<'a> {
+struct WriteContext {
     params: WriteParams,
-    dest: WriteDestination<'a>,
+    dest: WriteDestination,
     object_store: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,

@@ -4290,6 +4290,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = base_store_params
         ds._namespace_client = None
         ds._table_id = None
+        ds._namespace_client_table_context = None
         ds._default_scan_options = None
         ds._read_params = None
         return BulkCommitResult(

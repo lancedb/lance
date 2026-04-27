@@ -1647,6 +1647,8 @@ def test_commit_batch_append():
     result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
     dataset = result["dataset"]
     assert dataset.version == 2
+    assert dataset._namespace_client_table_context is None
+    assert dataset.__copy__()._namespace_client_table_context is None
     assert len(dataset.get_fragments()) == 3
     assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
     merged_txn = result["merged"]

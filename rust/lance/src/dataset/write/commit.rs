@@ -6,14 +6,8 @@ use std::sync::Arc;
 
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
-use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptionsAccessor,
-    StorageOptionsProvider,
-};
-use lance_namespace::{
-    ErrorCode as NamespaceErrorCode, LanceNamespace, NamespaceClientTableContext,
-    models::{DeclareTableRequest, DescribeTableRequest},
-};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_namespace::{LanceNamespace, NamespaceClientTableContext};
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
@@ -31,40 +25,19 @@ use crate::{
     session::Session,
 };
 
-use super::{WriteDestination, resolve_commit_handler};
+use super::{NamespaceTableDestination, WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
-use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
-use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use tracing::info;
-
-#[derive(Clone)]
-struct NamespaceCommitInfo {
-    namespace_client: Arc<dyn LanceNamespace>,
-    table_id: Vec<String>,
-    namespace_client_table_context: Option<NamespaceClientTableContext>,
-}
-
-impl std::fmt::Debug for NamespaceCommitInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NamespaceCommitInfo")
-            .field("table_id", &self.table_id)
-            .field(
-                "namespace_client_table_context",
-                &self.namespace_client_table_context,
-            )
-            .finish()
-    }
-}
 
 /// Create a new commit from a [`Transaction`].
 ///
 /// Transactions can be created using a write method like [`super::InsertBuilder::execute_uncommitted`].
 #[derive(Debug, Clone)]
-pub struct CommitBuilder<'a> {
-    dest: WriteDestination<'a>,
-    uri_was_explicitly_set: bool,
+pub struct CommitBuilder {
+    dest: WriteDestination,
+    validation_error: Option<String>,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
@@ -76,39 +49,14 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
-    namespace_commit_info: Option<NamespaceCommitInfo>,
 }
 
-impl<'a> CommitBuilder<'a> {
-    fn error_chain_contains_namespace_table_not_found(
-        err: &(dyn std::error::Error + 'static),
-    ) -> bool {
-        if let Some(err) = err.downcast_ref::<lance_namespace::NamespaceError>() {
-            return err.code() == NamespaceErrorCode::TableNotFound;
-        }
-        if let Some(err) = err.downcast_ref::<Error>() {
-            return Self::is_namespace_table_not_found(err);
-        }
-        if let Some(source) = err.source() {
-            return Self::error_chain_contains_namespace_table_not_found(source);
-        }
-        false
-    }
-
-    fn is_namespace_table_not_found(err: &Error) -> bool {
-        match err {
-            Error::Namespace { source, .. } => {
-                Self::error_chain_contains_namespace_table_not_found(source.as_ref())
-            }
-            _ => false,
-        }
-    }
-
-    pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
+impl CommitBuilder {
+    pub fn new(dest: impl Into<WriteDestination>) -> Self {
         let dest = dest.into();
         Self {
-            uri_was_explicitly_set: matches!(dest, WriteDestination::Uri(_)),
             dest,
+            validation_error: None,
             use_stable_row_ids: None,
             enable_v2_manifest_paths: true,
             storage_format: None,
@@ -120,7 +68,6 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             affected_rows: None,
             transaction_properties: None,
-            namespace_commit_info: None,
         }
     }
 
@@ -129,26 +76,13 @@ impl<'a> CommitBuilder<'a> {
         table_id: Vec<String>,
         namespace_client_table_context: Option<NamespaceClientTableContext>,
     ) -> Self {
-        Self {
-            dest: WriteDestination::Uri(""),
-            uri_was_explicitly_set: false,
-            use_stable_row_ids: None,
-            enable_v2_manifest_paths: true,
-            storage_format: None,
-            commit_handler: None,
-            store_params: None,
-            object_store: None,
-            session: None,
-            detached: false,
-            commit_config: Default::default(),
-            affected_rows: None,
-            transaction_properties: None,
-            namespace_commit_info: Some(NamespaceCommitInfo {
+        Self::new(WriteDestination::NamespaceTable(
+            NamespaceTableDestination::new(
                 namespace_client,
                 table_id,
                 namespace_client_table_context,
-            }),
-        }
+            ),
+        ))
     }
 
     pub fn with_namespace(
@@ -157,11 +91,25 @@ impl<'a> CommitBuilder<'a> {
         table_id: Vec<String>,
         namespace_client_table_context: Option<NamespaceClientTableContext>,
     ) -> Self {
-        self.namespace_commit_info = Some(NamespaceCommitInfo {
+        let namespace_table = NamespaceTableDestination::new(
             namespace_client,
             table_id,
             namespace_client_table_context,
-        });
+        );
+        let current_dest = std::mem::replace(&mut self.dest, WriteDestination::Uri(String::new()));
+        self.dest = match current_dest {
+            WriteDestination::Dataset(dataset) => {
+                WriteDestination::NamespaceTable(namespace_table.with_dataset(dataset))
+            }
+            WriteDestination::NamespaceTable(existing) => WriteDestination::NamespaceTable(
+                namespace_table.with_optional_dataset(existing.dataset),
+            ),
+            uri @ WriteDestination::Uri(_) => {
+                self.validation_error =
+                    Some("namespace clients cannot be combined with an explicit uri".to_string());
+                uri
+            }
+        };
         self
     }
 
@@ -278,173 +226,110 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    async fn resolve_namespace_client_table_context(
-        &self,
-        transaction: &Transaction,
-    ) -> Result<Option<NamespaceClientTableContext>> {
-        let Some(namespace_commit_info) = &self.namespace_commit_info else {
-            return Ok(None);
-        };
-
-        if let Some(namespace_client_table_context) =
-            &namespace_commit_info.namespace_client_table_context
-        {
-            return Ok(Some(namespace_client_table_context.clone()));
-        }
-
-        let describe_request = DescribeTableRequest {
-            id: Some(namespace_commit_info.table_id.clone()),
-            ..Default::default()
-        };
-        match namespace_commit_info
-            .namespace_client
-            .describe_table(describe_request)
-            .await
-        {
-            Ok(response) => {
-                NamespaceClientTableContext::from_describe_table_response(response).map(Some)
-            }
-            Err(err)
-                if Self::is_namespace_table_not_found(&err)
-                    && matches!(
-                        transaction.operation,
-                        Operation::Overwrite { .. } | Operation::Clone { .. }
-                    ) =>
-            {
-                let declare_request = DeclareTableRequest {
-                    id: Some(namespace_commit_info.table_id.clone()),
-                    ..Default::default()
-                };
-                let response = namespace_commit_info
-                    .namespace_client
-                    .declare_table(declare_request)
-                    .await?;
-                NamespaceClientTableContext::from_declare_table_response(response).map(Some)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
-        if self.uri_was_explicitly_set && self.namespace_commit_info.is_some() {
-            return Err(Error::invalid_input(
-                "namespace clients cannot be combined with an explicit uri",
-            ));
+        if let Some(validation_error) = &self.validation_error {
+            return Err(Error::invalid_input(validation_error.clone()));
         }
 
-        let namespace_client_table_context = self
-            .resolve_namespace_client_table_context(&transaction)
-            .await?;
+        let namespace_client_table_context =
+            if let Some(namespace_table) = self.dest.namespace_table() {
+                Some(
+                    namespace_table
+                        .resolve_context_for_commit(&transaction)
+                        .await?,
+                )
+            } else {
+                None
+            };
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
         let effective_uri = match (&self.dest, &namespace_client_table_context) {
-            (WriteDestination::Uri(_), Some(namespace_client_table_context)) => {
+            (WriteDestination::Uri(uri), _) => Some(uri.clone()),
+            (WriteDestination::NamespaceTable(_), Some(namespace_client_table_context)) => {
                 Some(namespace_client_table_context.location.clone())
             }
-            (WriteDestination::Uri(uri), None) => Some((*uri).to_string()),
+            (WriteDestination::NamespaceTable(_), None) => {
+                return Err(Error::invalid_input(
+                    "namespace table destination requires resolved table context",
+                ));
+            }
             (WriteDestination::Dataset(_), _) => None,
         };
 
         let mut effective_store_params = self.store_params.clone();
         let mut effective_commit_handler = self.commit_handler.clone();
-        if let (Some(namespace_commit_info), Some(namespace_client_table_context)) =
-            (&self.namespace_commit_info, &namespace_client_table_context)
+        if let (Some(namespace_table), Some(namespace_client_table_context)) =
+            (self.dest.namespace_table(), &namespace_client_table_context)
         {
-            if effective_commit_handler.is_none()
-                && namespace_client_table_context.managed_versioning
-            {
-                let external_store = LanceNamespaceExternalManifestStore::new(
-                    namespace_commit_info.namespace_client.clone(),
-                    namespace_commit_info.table_id.clone(),
-                );
-                effective_commit_handler = Some(Arc::new(ExternalManifestCommitHandler {
-                    external_manifest_store: Arc::new(external_store),
-                }) as Arc<dyn CommitHandler>);
+            if effective_commit_handler.is_none() {
+                effective_commit_handler =
+                    namespace_table.managed_commit_handler(namespace_client_table_context);
             }
-
-            let provider: Arc<dyn StorageOptionsProvider> =
-                Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                    namespace_commit_info.namespace_client.clone(),
-                    namespace_commit_info.table_id.clone(),
-                ));
             let existing_store_params = effective_store_params.take().unwrap_or_default();
-            let mut merged_storage_options = existing_store_params
-                .storage_options()
-                .cloned()
-                .unwrap_or_default();
-            if let Some(storage_options) = &namespace_client_table_context.storage_options {
-                merged_storage_options.extend(storage_options.clone());
-            }
-            effective_store_params = Some(ObjectStoreParams {
-                storage_options_accessor: Some(if merged_storage_options.is_empty() {
-                    Arc::new(StorageOptionsAccessor::with_provider(provider))
-                } else {
-                    Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                        merged_storage_options,
-                        provider,
-                    ))
-                }),
-                ..existing_store_params
-            });
+            effective_store_params =
+                Some(namespace_table.store_params_with_context(
+                    existing_store_params,
+                    namespace_client_table_context,
+                ));
         }
 
-        let resolved_uri = if matches!(self.dest, WriteDestination::Uri(_)) {
-            Some(
-                effective_uri
-                    .as_deref()
-                    .ok_or_else(|| Error::invalid_input("uri is required"))?,
-            )
-        } else {
-            None
-        };
+        let resolved_uri = effective_uri;
 
-        let (object_store, base_path, commit_handler) = match &self.dest {
-            WriteDestination::Dataset(dataset) => (
+        let (object_store, base_path, commit_handler) = if let Some(dataset) = self.dest.dataset() {
+            (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
                 effective_commit_handler
                     .clone()
                     .or_else(|| Some(dataset.commit_handler.clone()))
                     .unwrap(),
-            ),
-            WriteDestination::Uri(_) => {
-                let uri = resolved_uri.expect("uri destinations must have a resolved uri");
-                let commit_handler = if let (Some(_), Some(commit_handler)) =
-                    (&self.object_store, &effective_commit_handler)
-                {
-                    commit_handler.clone()
-                } else {
-                    resolve_commit_handler(
-                        uri,
-                        effective_commit_handler.clone(),
-                        &effective_store_params,
-                    )
-                    .await?
-                };
-                let (object_store, base_path) = if let Some(passed_store) = self.object_store {
-                    (
-                        passed_store,
-                        ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
-                    )
-                } else {
-                    ObjectStore::from_uri_and_params(
-                        session.store_registry(),
-                        uri,
-                        &effective_store_params.clone().unwrap_or_default(),
-                    )
-                    .await?
-                };
-                (object_store, base_path, commit_handler)
-            }
+            )
+        } else {
+            let uri = resolved_uri
+                .as_deref()
+                .ok_or_else(|| Error::invalid_input("uri is required"))?;
+            let commit_handler = if let (Some(_), Some(commit_handler)) =
+                (&self.object_store, &effective_commit_handler)
+            {
+                commit_handler.clone()
+            } else {
+                resolve_commit_handler(
+                    uri,
+                    effective_commit_handler.clone(),
+                    &effective_store_params,
+                )
+                .await?
+            };
+            let (object_store, base_path) = if let Some(passed_store) = self.object_store {
+                (
+                    passed_store,
+                    ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
+                )
+            } else {
+                ObjectStore::from_uri_and_params(
+                    session.store_registry(),
+                    uri,
+                    &effective_store_params.clone().unwrap_or_default(),
+                )
+                .await?
+            };
+            (object_store, base_path, commit_handler)
         };
 
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
-            WriteDestination::Uri(_) => {
-                let uri = resolved_uri.expect("uri destinations must have a resolved uri");
+            WriteDestination::NamespaceTable(namespace_table)
+                if namespace_table.dataset.is_some() =>
+            {
+                self.dest.clone()
+            }
+            WriteDestination::Uri(_) | WriteDestination::NamespaceTable(_) => {
+                let uri = resolved_uri
+                    .as_deref()
+                    .expect("uri destinations must have a resolved uri");
                 // Check if it already exists.
                 let mut builder = DatasetBuilder::from_uri(uri)
                     .with_read_params(ReadParams {
@@ -462,9 +347,27 @@ impl<'a> CommitBuilder<'a> {
                 }
 
                 match builder.load().await {
-                    Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
+                    Ok(dataset) => match &self.dest {
+                        WriteDestination::NamespaceTable(namespace_table) => {
+                            WriteDestination::NamespaceTable(
+                                namespace_table.clone().with_dataset(Arc::new(dataset)),
+                            )
+                        }
+                        _ => WriteDestination::Dataset(Arc::new(dataset)),
+                    },
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri)
+                        match (&self.dest, &namespace_client_table_context) {
+                            (
+                                WriteDestination::NamespaceTable(namespace_table),
+                                Some(namespace_client_table_context),
+                            ) => {
+                                let mut namespace_table = namespace_table.clone();
+                                namespace_table.namespace_client_table_context =
+                                    Some(namespace_client_table_context.clone());
+                                WriteDestination::NamespaceTable(namespace_table)
+                            }
+                            _ => WriteDestination::Uri(uri.to_string()),
+                        }
                     }
                     Err(e) => return Err(e),
                 }
@@ -491,12 +394,14 @@ impl<'a> CommitBuilder<'a> {
             validate_operation(None, &transaction.operation)?;
         }
 
-        let (metadata_cache, index_cache) = match &dest {
-            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
-            WriteDestination::Uri(uri) => (
-                Arc::new(session.metadata_cache.for_dataset(uri)),
-                Arc::new(session.index_cache.for_dataset(uri)),
-            ),
+        let (metadata_cache, index_cache) = if let Some(ds) = dest.dataset() {
+            (ds.metadata_cache.clone(), ds.index_cache.clone())
+        } else {
+            let uri = dest.uri();
+            (
+                Arc::new(session.metadata_cache.for_dataset(&uri)),
+                Arc::new(session.index_cache.for_dataset(&uri)),
+            )
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
@@ -595,42 +500,42 @@ impl<'a> CommitBuilder<'a> {
 
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
-        match &dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
+        if let Some(dataset) = dest.dataset() {
+            Ok(Dataset {
                 manifest: Arc::new(manifest),
                 manifest_location,
                 session,
                 fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
-            WriteDestination::Uri(uri) => {
-                let refs = Refs::new(
-                    object_store.clone(),
-                    commit_handler.clone(),
-                    BranchLocation {
-                        path: base_path.clone(),
-                        uri: uri.to_string(),
-                        branch: manifest.branch.clone(),
-                    },
-                );
+                ..dataset.clone()
+            })
+        } else {
+            let uri = dest.uri();
+            let refs = Refs::new(
+                object_store.clone(),
+                commit_handler.clone(),
+                BranchLocation {
+                    path: base_path.clone(),
+                    uri: uri.clone(),
+                    branch: manifest.branch.clone(),
+                },
+            );
 
-                Ok(Dataset {
-                    object_store,
-                    base: base_path,
-                    uri: uri.to_string(),
-                    manifest: Arc::new(manifest),
-                    manifest_location,
-                    session,
-                    commit_handler,
-                    refs,
-                    index_cache,
-                    fragment_bitmap,
-                    metadata_cache,
-                    file_reader_options: None,
-                    store_params: effective_store_params.clone().map(Box::new),
-                    base_store_params: None,
-                })
-            }
+            Ok(Dataset {
+                object_store,
+                base: base_path,
+                uri,
+                manifest: Arc::new(manifest),
+                manifest_location,
+                session,
+                commit_handler,
+                refs,
+                index_cache,
+                fragment_bitmap,
+                metadata_cache,
+                file_reader_options: None,
+                store_params: effective_store_params.clone().map(Box::new),
+                base_store_params: None,
+            })
         }
     }
 
@@ -736,6 +641,59 @@ mod tests {
             tag: None,
             transaction_properties: None,
         }
+    }
+
+    #[derive(Debug)]
+    struct DummyNamespace;
+
+    impl LanceNamespace for DummyNamespace {
+        fn namespace_id(&self) -> String {
+            "dummy".to_string()
+        }
+    }
+
+    fn namespace_context() -> NamespaceClientTableContext {
+        NamespaceClientTableContext {
+            location: "memory://namespace-table".to_string(),
+            storage_options: None,
+            managed_versioning: false,
+        }
+    }
+
+    #[test]
+    fn new_namespace_uses_namespace_table_destination() {
+        let context = namespace_context();
+        let builder = CommitBuilder::new_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(context.clone()),
+        );
+
+        let WriteDestination::NamespaceTable(namespace_table) = builder.dest else {
+            panic!("new_namespace should use WriteDestination::NamespaceTable");
+        };
+        assert!(namespace_table.dataset.is_none());
+        assert_eq!(namespace_table.table_id, vec!["table".to_string()]);
+        let cached_context = namespace_table
+            .namespace_client_table_context
+            .expect("namespace context should be cached");
+        assert_eq!(cached_context.location, context.location);
+        assert_eq!(
+            cached_context.managed_versioning,
+            context.managed_versioning
+        );
+    }
+
+    #[test]
+    fn with_namespace_rejects_explicit_uri_destination() {
+        let builder = CommitBuilder::new("memory://explicit").with_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(namespace_context()),
+        );
+
+        assert!(builder.validation_error.is_some());
+        assert!(matches!(builder.dest, WriteDestination::Uri(_)));
     }
 
     #[tokio::test]

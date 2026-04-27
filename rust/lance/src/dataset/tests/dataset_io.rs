@@ -1097,7 +1097,7 @@ async fn test_shallow_clone_multiple_times(
 
     // Async dataset writer function
     async fn write_dataset(
-        dest: impl Into<WriteDestination<'_>>,
+        dest: impl Into<WriteDestination>,
         row_count: u64,
         mode: WriteMode,
         version: LanceFileVersion,

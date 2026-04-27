@@ -33,8 +33,7 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
-    StorageOptionsAccessor, StorageOptionsProvider,
+    ObjectStore, ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::{
@@ -46,11 +45,9 @@ use lance_table::format::{
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
-    VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
-    write_manifest_file_to_path,
+    VERSIONS_DIR, migrate_scheme_to_v2, write_manifest_file_to_path,
 };
 
-use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 use prost::Message;
@@ -118,7 +115,6 @@ use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
@@ -135,7 +131,8 @@ pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
     AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, ExternalBlobMode, InsertBuilder,
-    WriteDestination, WriteMode, WriteParams, WriteProgressFn, WriteStats, write_fragments,
+    NamespaceTableDestination, WriteDestination, WriteMode, WriteParams, WriteProgressFn,
+    WriteStats, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
@@ -503,7 +500,7 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.clone()))
             .with_store_params(store_params.unwrap_or_default())
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
@@ -747,7 +744,7 @@ impl Dataset {
     ///
     pub async fn write(
         batches: impl RecordBatchReader + Send + 'static,
-        dest: impl Into<WriteDestination<'_>>,
+        dest: impl Into<WriteDestination>,
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut builder = InsertBuilder::new(dest);
@@ -768,103 +765,19 @@ impl Dataset {
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         namespace_client_table_context: Option<&NamespaceClientTableContext>,
-        mut params: Option<WriteParams>,
+        params: Option<WriteParams>,
     ) -> Result<Self> {
-        let mut write_params = params.take().unwrap_or_default();
-
-        let owned_context;
-        let namespace_client_table_context = match namespace_client_table_context {
-            Some(c) => c,
-            None => {
-                owned_context = match write_params.mode {
-                    WriteMode::Create => {
-                        let declare_request = DeclareTableRequest {
-                            id: Some(table_id.clone()),
-                            ..Default::default()
-                        };
-                        let response = namespace_client.declare_table(declare_request).await?;
-                        NamespaceClientTableContext::from_declare_table_response(response)?
-                    }
-                    WriteMode::Append | WriteMode::Overwrite => {
-                        let request = DescribeTableRequest {
-                            id: Some(table_id.clone()),
-                            ..Default::default()
-                        };
-                        let response = namespace_client.describe_table(request).await?;
-                        NamespaceClientTableContext::from_describe_table_response(response)?
-                    }
-                };
-                &owned_context
-            }
-        };
-
-        if namespace_client_table_context.managed_versioning {
-            let external_store = LanceNamespaceExternalManifestStore::new(
-                namespace_client.clone(),
-                table_id.clone(),
-            );
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            write_params.commit_handler = Some(commit_handler);
-        }
-
-        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
-            LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
+        let namespace_table = NamespaceTableDestination::new(
+            namespace_client,
+            table_id,
+            namespace_client_table_context.cloned(),
         );
-
-        let mut merged_options = write_params
-            .store_params
-            .as_ref()
-            .and_then(|p| p.storage_options().cloned())
-            .unwrap_or_default();
-        if let Some(ref namespace_storage_options) = namespace_client_table_context.storage_options
-        {
-            merged_options.extend(
-                namespace_storage_options
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone())),
-            );
-        }
-        let accessor = if merged_options.is_empty() {
-            Arc::new(StorageOptionsAccessor::with_provider(provider))
-        } else {
-            Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                merged_options,
-                provider,
-            ))
-        };
-
-        let existing_params = write_params.store_params.take().unwrap_or_default();
-        write_params.store_params = Some(ObjectStoreParams {
-            storage_options_accessor: Some(accessor),
-            ..existing_params
-        });
-
-        match write_params.mode {
-            WriteMode::Create => {
-                Self::write(
-                    batches,
-                    namespace_client_table_context.location.as_str(),
-                    Some(write_params),
-                )
-                .await
-            }
-            WriteMode::Append | WriteMode::Overwrite => {
-                let mut builder =
-                    DatasetBuilder::from_uri(namespace_client_table_context.location.as_str());
-                if let Some(ref store_params) = write_params.store_params
-                    && let Some(accessor) = &store_params.storage_options_accessor
-                {
-                    builder = builder.with_storage_options_accessor(accessor.clone());
-                }
-                if let Some(ref commit_handler) = write_params.commit_handler {
-                    builder = builder.with_commit_handler(commit_handler.clone());
-                }
-                let dataset = Arc::new(builder.load().await?);
-                Self::write(batches, dataset, Some(write_params)).await
-            }
-        }
+        Self::write(
+            batches,
+            WriteDestination::NamespaceTable(namespace_table),
+            params,
+        )
+        .await
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
@@ -1160,7 +1073,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     async fn do_commit(
-        base_uri: WriteDestination<'_>,
+        base_uri: WriteDestination,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -1232,7 +1145,7 @@ impl Dataset {
     ///   this on will make the dataset unreadable for older versions of Lance
     ///   (prior to 0.17.0). Default is False.
     pub async fn commit(
-        dest: impl Into<WriteDestination<'_>>,
+        dest: impl Into<WriteDestination>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -1262,7 +1175,7 @@ impl Dataset {
     /// This can be used to stage changes or to handle "secondary" datasets whose
     /// lineage is tracked elsewhere.
     pub async fn commit_detached(
-        dest: impl Into<WriteDestination<'_>>,
+        dest: impl Into<WriteDestination>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -2376,7 +2289,7 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path.to_string()))
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
@@ -2470,7 +2383,7 @@ impl Dataset {
             branch_name: None,
         };
         let txn = Transaction::new(ref_version, clone_op, None);
-        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path.to_string()))
             .with_store_params(store_params.clone().unwrap_or_default())
             .with_object_store(target_store.clone())
             .with_commit_handler(self.commit_handler.clone())

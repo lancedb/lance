@@ -610,14 +610,6 @@ impl Dataset {
         }
 
         // Create builder: namespace path or URI path
-        let namespace_describe_version = if let Some(ver) = &version
-            && let Ok(i) = ver.downcast::<PyInt>()
-        {
-            Some(i.extract::<u64>()?)
-        } else {
-            None
-        };
-
         let mut builder = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
             let ns_client = extract_namespace_arc(py, ns_client)?;
             let namespace_client_table_context = namespace_client_table_context
@@ -630,11 +622,7 @@ impl Dataset {
                 } else {
                     rt().block_on(
                         Some(py),
-                        DatasetBuilder::from_namespace_with_version(
-                            ns_client,
-                            tid.clone(),
-                            namespace_describe_version,
-                        ),
+                        DatasetBuilder::from_namespace(ns_client, tid.clone()),
                     )?
                     .map_err(|err| PyIOError::new_err(err.to_string()))?
                 }
@@ -3159,10 +3147,10 @@ pub enum PyWriteDest {
 }
 
 impl PyWriteDest {
-    pub fn as_dest(&self) -> WriteDestination<'_> {
+    pub fn as_dest(&self) -> WriteDestination {
         match self {
             Self::Dataset(ds) => WriteDestination::Dataset(ds.ds.clone()),
-            Self::Uri(uri) => WriteDestination::Uri(uri),
+            Self::Uri(uri) => WriteDestination::Uri(uri.to_string()),
         }
     }
 }
