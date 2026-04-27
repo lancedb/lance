@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{collections::VecDeque, ops::Range, sync::{Arc, OnceLock}};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
@@ -34,6 +34,17 @@ use crate::{
     repdef::RepDefBuilder,
     utils::accumulation::AccumulationQueue,
 };
+
+/// When set, indirect I/O in the 2.0 list scheduler bypasses the backpressure system.
+///
+/// This can be useful when indirect I/O is blocking on backpressure and causing latency or
+/// deadlocks.  Set LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE=1 to enable.
+static BYPASS_INDIRECT_IO_BACKPRESSURE: OnceLock<bool> = OnceLock::new();
+
+fn bypass_indirect_io_backpressure() -> bool {
+    *BYPASS_INDIRECT_IO_BACKPRESSURE
+        .get_or_init(|| std::env::var("LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE").is_ok())
+}
 
 // Scheduling lists is tricky.  Imagine the following scenario:
 //
@@ -454,7 +465,14 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
         let items_type = self.scheduler.items_field.data_type().clone();
-        let io = context.io().clone();
+        let base_io = context.io().clone();
+        let io = if bypass_indirect_io_backpressure() {
+            base_io
+                .with_bypass_backpressure()
+                .unwrap_or(base_io)
+        } else {
+            base_io
+        };
         let cache = context.cache().clone();
 
         // Immediately spawn the indirect scheduling

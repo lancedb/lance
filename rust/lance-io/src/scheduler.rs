@@ -98,6 +98,8 @@ struct IoQueueState {
     start: Instant,
     // Last time we warned about backpressure
     last_warn: AtomicU64,
+    // When true, skip all byte-based backpressure checks (set when io_buffer_size == 0)
+    no_backpressure: bool,
 }
 
 impl IoQueueState {
@@ -110,6 +112,7 @@ impl IoQueueState {
             done_scheduling: false,
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
+            no_backpressure: io_buffer_size == 0,
         }
     }
 
@@ -134,7 +137,10 @@ impl IoQueueState {
     fn can_deliver(&self, task: &IoTask) -> bool {
         if self.iops_avail == 0 {
             false
-        } else if task.priority <= self.priorities_in_flight.min_in_flight() {
+        } else if self.no_backpressure
+            || task.bypass_backpressure
+            || task.priority <= self.priorities_in_flight.min_in_flight()
+        {
             true
         } else if task.num_bytes() as i64 > self.bytes_avail {
             self.warn_if_needed();
@@ -147,15 +153,18 @@ impl IoQueueState {
     fn next_task(&mut self) -> Option<IoTask> {
         let task = self.pending_requests.peek()?;
         if self.can_deliver(task) {
+            let skip_bytes_accounting = self.no_backpressure || task.bypass_backpressure;
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
-            self.bytes_avail -= task.num_bytes() as i64;
-            if self.bytes_avail < 0 {
-                // This can happen when we admit special priority requests
-                log::debug!(
-                    "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
-                    -self.bytes_avail
-                );
+            if !skip_bytes_accounting {
+                self.bytes_avail -= task.num_bytes() as i64;
+                if self.bytes_avail < 0 {
+                    // This can happen when we admit special priority requests
+                    log::debug!(
+                        "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
+                        -self.bytes_avail
+                    );
+                }
             }
             Some(self.pending_requests.pop().unwrap())
         } else {
@@ -257,10 +266,18 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     priority: u128,
     num_reqs: usize,
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    // When true, report 0 bytes consumed so the backpressure budget is unaffected
+    bypass_backpressure: bool,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
-    fn new(when_done: F, num_data_buffers: u32, priority: u128, num_reqs: usize) -> Self {
+    fn new(
+        when_done: F,
+        num_data_buffers: u32,
+        priority: u128,
+        num_reqs: usize,
+        bypass_backpressure: bool,
+    ) -> Self {
         Self {
             when_done: Some(when_done),
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
@@ -268,6 +285,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             priority,
             num_reqs,
             err: None,
+            bypass_backpressure,
         }
     }
 }
@@ -290,7 +308,8 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
         // the result go out of scope and get cleaned up
         let response = Response {
             data: result,
-            num_bytes: self.num_bytes,
+            // Report 0 bytes for bypass tasks so the backpressure budget is unaffected
+            num_bytes: if self.bypass_backpressure { 0 } else { self.num_bytes },
             priority: self.priority,
             num_reqs: self.num_reqs,
         };
@@ -329,6 +348,7 @@ struct IoTask {
     to_read: Range<u64>,
     when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
     priority: u128,
+    bypass_backpressure: bool,
 }
 
 impl Eq for IoTask {}
@@ -618,6 +638,7 @@ impl ScanScheduler {
             root: self.clone(),
             base_priority,
             max_iop_size,
+            bypass_backpressure: false,
         })
     }
 
@@ -639,6 +660,7 @@ impl ScanScheduler {
         tx: oneshot::Sender<Response>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
+        bypass_backpressure: bool,
     ) {
         let num_iops = request.len() as u32;
 
@@ -652,6 +674,7 @@ impl ScanScheduler {
             num_iops,
             priority,
             request.len(),
+            bypass_backpressure,
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
@@ -662,6 +685,7 @@ impl ScanScheduler {
                 reader: reader.clone(),
                 to_read: iop,
                 priority,
+                bypass_backpressure,
                 when_done: Box::new(move |data| {
                     io_queue_clone.on_iop_complete();
                     let mut dest = dest.lock().unwrap();
@@ -683,10 +707,11 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
+        bypass_backpressure: bool,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
 
-        self.do_submit_request(reader, request, tx, priority, io_queue);
+        self.do_submit_request(reader, request, tx, priority, io_queue, bypass_backpressure);
 
         let io_queue_clone = io_queue.clone();
 
@@ -705,6 +730,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         priority: u128,
         io_queue: &Arc<lite::IoQueue>,
+        bypass_backpressure: bool,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // It's important that we submit all requests _before_ we await anything
         let maybe_tasks = request
@@ -718,7 +744,7 @@ impl ScanScheduler {
                         .map_err(Error::from)
                         .boxed()
                 });
-                queue.submit(task, priority, run_fn)
+                queue.submit(task, priority, run_fn, bypass_backpressure)
             })
             .collect::<Result<Vec<_>>>();
         match maybe_tasks {
@@ -739,13 +765,14 @@ impl ScanScheduler {
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
+        bypass_backpressure: bool,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => futures::future::Either::Left(
-                self.submit_request_standard(reader, request, priority, io_queue),
+                self.submit_request_standard(reader, request, priority, io_queue, bypass_backpressure),
             ),
             IoQueueType::Lite(io_queue) => futures::future::Either::Right(
-                self.submit_request_lite(reader, request, priority, io_queue),
+                self.submit_request_lite(reader, request, priority, io_queue, bypass_backpressure),
             ),
         }
     }
@@ -788,6 +815,7 @@ pub struct FileScheduler {
     block_size: u64,
     base_priority: u64,
     max_iop_size: u64,
+    bypass_backpressure: bool,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -859,9 +887,12 @@ impl FileScheduler {
 
         self.root.stats.record_request(&updated_requests);
 
-        let bytes_vec_fut =
-            self.root
-                .submit_request(self.reader.clone(), updated_requests.clone(), priority);
+        let bytes_vec_fut = self.root.submit_request(
+            self.reader.clone(),
+            updated_requests.clone(),
+            priority,
+            self.bypass_backpressure,
+        );
 
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
@@ -919,6 +950,18 @@ impl FileScheduler {
             block_size: self.block_size,
             max_iop_size: self.max_iop_size,
             base_priority: priority,
+            bypass_backpressure: self.bypass_backpressure,
+        }
+    }
+
+    /// Returns a copy of this scheduler that bypasses backpressure for all requests.
+    ///
+    /// This should be used for indirect I/O (e.g. fetching items after decoding offsets) where
+    /// blocking on backpressure could cause a deadlock or excessive latency.
+    pub fn with_bypass_backpressure(&self) -> Self {
+        Self {
+            bypass_backpressure: true,
+            ..self.clone()
         }
     }
 
@@ -1376,9 +1419,9 @@ mod tests {
 
         // Submit several requests. The lite scheduler should call get_range
         // eagerly during submit (before the returned future is polled).
-        let fut1 = scheduler.submit_request(reader.clone(), vec![0..100], 0);
-        let fut2 = scheduler.submit_request(reader.clone(), vec![100..200], 10);
-        let fut3 = scheduler.submit_request(reader.clone(), vec![200..300], 20);
+        let fut1 = scheduler.submit_request(reader.clone(), vec![0..100], 0, false);
+        let fut2 = scheduler.submit_request(reader.clone(), vec![100..200], 10, false);
+        let fut3 = scheduler.submit_request(reader.clone(), vec![200..300], 20, false);
 
         // get_range must have been called for all 3 requests already.
         assert_eq!(get_range_count.load(Ordering::Acquire), 3);
