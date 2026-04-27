@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import operator
 import os
 import random
 import time
@@ -32,15 +33,6 @@ from typing import (
     Union,
     cast,
 )
-
-try:
-    from enum import StrEnum
-except ImportError:
-    from enum import Enum
-
-    class StrEnum(str, Enum):
-        pass
-
 
 import pyarrow as pa
 import pyarrow.dataset
@@ -113,11 +105,6 @@ _BLOB_PANDAS_MODES = frozenset(
 _BLOB_ROW_ADDR_COLUMN = "_rowaddr"
 
 
-class ParallelMode(StrEnum):
-    SEQUENTIAL = "sequential"
-    PARALLEL = "parallel"
-
-
 def _field_metadata_value(field: pa.Field, key: str) -> Optional[bytes]:
     metadata = field.metadata
     if metadata is None:
@@ -142,21 +129,6 @@ def _normalize_blob_pandas_mode(
     if blob_mode not in _BLOB_PANDAS_MODES:
         raise ValueError("blob_mode must be one of: 'lazy', 'bytes', 'descriptions'")
     return cast("Literal['lazy', 'bytes', 'descriptions']", blob_mode)
-
-
-def _normalize_parallel_mode(
-    parallel_mode: Optional[Union[str, ParallelMode]],
-) -> Optional[str]:
-    if parallel_mode is None:
-        return None
-    if isinstance(parallel_mode, ParallelMode):
-        return parallel_mode.value
-
-    normalized_parallel_mode = str(parallel_mode).strip().lower()
-    try:
-        return ParallelMode(normalized_parallel_mode).value
-    except ValueError as exc:
-        raise ValueError("parallel_mode must be one of: Sequential, Parallel") from exc
 
 
 def _simple_source_column(expr: str) -> Optional[str]:
@@ -5651,7 +5623,7 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
-        parallel_mode: Optional[Union[str, ParallelMode]] = None,
+        partition_parallelism: Optional[int] = None,
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ) -> ScannerBuilder:
         self._nearest = _build_vector_search_query(
@@ -5666,7 +5638,7 @@ class ScannerBuilder:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
-            parallel_mode=parallel_mode,
+            partition_parallelism=partition_parallelism,
             distance_range=distance_range,
         )
         return self
@@ -6782,7 +6754,7 @@ def _build_vector_search_query(
     refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
-    parallel_mode: Optional[Union[str, ParallelMode]] = None,
+    partition_parallelism: Optional[int] = None,
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -6810,10 +6782,12 @@ def _build_vector_search_query(
         Whether to use the index for the search.
     ef: int, optional
         The ef parameter for HNSW search.
-    parallel_mode: ParallelMode or str, optional
-        Partition search execution mode. One of ``ParallelMode.SEQUENTIAL`` or
-        ``ParallelMode.PARALLEL``. String values "Sequential" and "Parallel" are
-        also accepted.
+    partition_parallelism: int, optional
+        Maximum number of partitions to search concurrently. Value 0 uses the
+        automatic policy, which currently maps to the single-worker sequential
+        path. Value -1 uses the CPU pool size. Value 1 uses the single-worker
+        sequential path. Values >= 2 use the
+        partition-parallel path and are clamped to the CPU pool size.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -6881,7 +6855,10 @@ def _build_vector_search_query(
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
         raise ValueError(f"ef must be > 0 but got {ef}")
-    parallel_mode = _normalize_parallel_mode(parallel_mode)
+    if partition_parallelism is not None:
+        partition_parallelism = operator.index(partition_parallelism)
+        if partition_parallelism < -1:
+            raise ValueError("partition_parallelism must be >= -1")
 
     if distance_range is not None:
         if len(distance_range) != 2:
@@ -6899,7 +6876,7 @@ def _build_vector_search_query(
         "refine_factor": refine_factor,
         "use_index": use_index,
         "ef": ef,
-        "parallel_mode": parallel_mode,
+        "partition_parallelism": partition_parallelism,
         "distance_range": distance_range,
     }
 
@@ -7072,7 +7049,7 @@ class VectorSearchQuery:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
-        parallel_mode: Optional[Union[str, ParallelMode]] = None,
+        partition_parallelism: Optional[int] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -7085,7 +7062,7 @@ class VectorSearchQuery:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
-            parallel_mode=parallel_mode,
+            partition_parallelism=partition_parallelism,
         )
 
     def inner(self):

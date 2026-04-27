@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance import LanceDataset, LanceFragment, ParallelMode
+from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
@@ -1880,7 +1880,7 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
-def test_vector_index_with_parallel_mode(indexed_dataset):
+def test_vector_index_with_partition_parallelism(indexed_dataset):
     q = np.random.randn(128)
 
     sequential = indexed_dataset.to_table(
@@ -1888,7 +1888,7 @@ def test_vector_index_with_parallel_mode(indexed_dataset):
             "column": "vector",
             "q": q,
             "k": 10,
-            "parallel_mode": ParallelMode.SEQUENTIAL,
+            "partition_parallelism": 0,
         }
     )
     parallel = indexed_dataset.to_table(
@@ -1896,21 +1896,21 @@ def test_vector_index_with_parallel_mode(indexed_dataset):
             "column": "vector",
             "q": q,
             "k": 10,
-            "parallel_mode": "  Parallel  ",
+            "partition_parallelism": -1,
         }
     )
 
     assert sequential == parallel
 
 
-def test_vector_index_invalid_parallel_mode(indexed_dataset):
-    with pytest.raises(ValueError, match="parallel_mode"):
+def test_vector_index_invalid_partition_parallelism(indexed_dataset):
+    with pytest.raises(ValueError, match="partition_parallelism"):
         indexed_dataset.scanner(
             nearest={
                 "column": "vector",
                 "q": np.random.randn(128),
                 "k": 10,
-                "parallel_mode": "nope",
+                "partition_parallelism": -2,
             }
         )
 

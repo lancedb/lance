@@ -80,36 +80,9 @@ pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
     arrow_schema::Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
+pub const DEFAULT_PARTITION_PARALLELISM: i32 = 0;
+
 /// Query parameters for the vector indices
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ParallelMode {
-    #[default]
-    Sequential,
-    Parallel,
-}
-
-impl std::fmt::Display for ParallelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Sequential => write!(f, "Sequential"),
-            Self::Parallel => write!(f, "Parallel"),
-        }
-    }
-}
-
-impl TryFrom<&str> for ParallelMode {
-    type Error = Error;
-
-    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        match value.to_ascii_lowercase().as_str() {
-            "sequential" => Ok(Self::Sequential),
-            "parallel" => Ok(Self::Parallel),
-            other => Err(Error::invalid_input(format!(
-                "invalid parallel_mode '{other}', expected one of: Sequential, Parallel"
-            ))),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -154,8 +127,15 @@ pub struct Query {
     /// Whether to use an ANN index if available
     pub use_index: bool,
 
-    /// How partition searches are scheduled.
-    pub parallel_mode: ParallelMode,
+    /// Maximum number of partitions to search concurrently.
+    ///
+    /// Value 0 selects the automatic policy. The current implementation maps
+    /// auto to the single-worker sequential partition search path.
+    /// Value -1 uses the CPU pool size.
+    /// Value 1 uses the single-worker sequential partition search path.
+    /// Values >= 2 use the partition-parallel path and are clamped to the CPU
+    /// pool size by the execution layer.
+    pub partition_parallelism: i32,
 
     /// the distance between the query and the centroid
     /// this is only used for IVF index with Rabit quantization
