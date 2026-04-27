@@ -784,15 +784,24 @@ impl PartitionSearchControl for LatePartitionSearchControl {
     }
 }
 
-fn effective_partition_parallelism(query: &Query) -> usize {
-    effective_partition_parallelism_for(query, get_num_compute_intensive_cpus())
+fn effective_partition_parallelism(query: &Query, index: &dyn VectorIndex) -> usize {
+    let cpu_pool_size = get_num_compute_intensive_cpus();
+    effective_partition_parallelism_for(
+        query,
+        cpu_pool_size,
+        index.auto_partition_parallelism(cpu_pool_size),
+    )
 }
 
-fn effective_partition_parallelism_for(query: &Query, cpu_pool_size: usize) -> usize {
+fn effective_partition_parallelism_for(
+    query: &Query,
+    cpu_pool_size: usize,
+    auto_parallelism: usize,
+) -> usize {
     let cpu_pool_size = cpu_pool_size.max(1);
     match query.partition_parallelism {
         -1 => cpu_pool_size,
-        0 => 1,
+        0 => auto_parallelism.clamp(1, cpu_pool_size),
         n if n > 0 => (n as usize).min(cpu_pool_size).max(1),
         _ => 1,
     }
@@ -915,7 +924,7 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
-            let partition_parallelism = effective_partition_parallelism(&query);
+            let partition_parallelism = effective_partition_parallelism(&query, index.as_ref());
             if partition_parallelism <= 1 {
                 return stream::once(async move {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
@@ -997,7 +1006,7 @@ impl ANNIvfSubIndexExec {
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
-        let partition_parallelism = effective_partition_parallelism(&query);
+        let partition_parallelism = effective_partition_parallelism(&query, index.as_ref());
         if partition_parallelism <= 1 {
             metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
@@ -1562,19 +1571,21 @@ mod tests {
         let mut query = base_query();
 
         query.partition_parallelism = -1;
-        assert_eq!(effective_partition_parallelism_for(&query, 16), 16);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 16);
 
         query.partition_parallelism = 0;
-        assert_eq!(effective_partition_parallelism_for(&query, 16), 1);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 1);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 8), 8);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 128), 16);
 
         query.partition_parallelism = 1;
-        assert_eq!(effective_partition_parallelism_for(&query, 16), 1);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 8), 1);
 
         query.partition_parallelism = 4;
-        assert_eq!(effective_partition_parallelism_for(&query, 16), 4);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 4);
 
         query.partition_parallelism = 128;
-        assert_eq!(effective_partition_parallelism_for(&query, 16), 16);
+        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 16);
     }
 
     #[derive(Debug, DeepSizeOf)]

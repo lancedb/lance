@@ -1143,6 +1143,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         true
     }
 
+    fn auto_partition_parallelism(&self, cpu_pool_size: usize) -> usize {
+        if S::supports_global_topk_heap() {
+            1
+        } else {
+            cpu_pool_size.max(1)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn search_partitions(
         self: Arc<Self>,

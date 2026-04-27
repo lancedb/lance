@@ -129,8 +129,8 @@ pub struct Query {
 
     /// Maximum number of partitions to search concurrently.
     ///
-    /// Value 0 selects the automatic policy. The current implementation maps
-    /// auto to the single-worker sequential partition search path.
+    /// Value 0 selects the automatic policy. The execution layer chooses the
+    /// concurrency based on the index implementation.
     /// Value -1 uses the CPU pool size.
     /// Value 1 uses the single-worker sequential partition search path.
     /// Values >= 2 use the partition-parallel path and are clamped to the CPU
@@ -247,6 +247,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// prepare and sync execute phases.
     fn supports_prepared_partition_search(&self) -> bool {
         false
+    }
+
+    /// Choose partition search concurrency for `partition_parallelism = 0`.
+    ///
+    /// The default keeps the single-worker sequential path. Index
+    /// implementations can override this when their sub-index search work does
+    /// not benefit from the sequential fast path.
+    fn auto_partition_parallelism(&self, _cpu_pool_size: usize) -> usize {
+        1
     }
 
     /// Search a range of partitions and return a stream of per-partition result batches.
