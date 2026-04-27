@@ -543,6 +543,7 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
+            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
             dist_q_c: 0.0,
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
