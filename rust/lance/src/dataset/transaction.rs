@@ -1723,6 +1723,14 @@ impl Transaction {
                     let original_frags_map: std::collections::HashMap<u64, &Fragment> =
                         existing_fragments.iter().map(|f| (f.id, f)).collect();
 
+                    // Cache decoded created_at version sequences per original fragment, so we
+                    // only deserialize and walk runs once per source fragment instead of once
+                    // per row (the latter was O(N^2) on Update with stable row IDs).
+                    let mut created_at_seq_cache: std::collections::HashMap<
+                        u64,
+                        Option<lance_table::format::RowDatasetVersionSequence>,
+                    > = std::collections::HashMap::new();
+
                     for fragment in new_fragments.iter_mut() {
                         // For update operations with RewriteRows mode:
                         // - Rows are deleted from old fragments and rewritten to new fragments
@@ -1753,23 +1761,17 @@ impl Transaction {
 
                                 // Look up the original fragment
                                 if let Some(orig_frag) = original_frags_map.get(&orig_frag_id) {
-                                    // Get created_at version from original fragment's metadata
-                                    let created_version = if let Some(created_meta) =
-                                        &orig_frag.created_at_version_meta
-                                    {
-                                        // Load and index into the version sequence
-                                        match created_meta.load_sequence() {
-                                            Ok(seq) => {
-                                                let versions: Vec<u64> = seq.versions().collect();
-                                                versions.get(row_offset).copied().unwrap_or(1)
-                                            }
-                                            Err(_e) => {
-                                                1 // Default to version 1 on error
-                                            }
-                                        }
-                                    } else {
-                                        // No metadata on original fragment, default to version 1
-                                        1
+                                    let cached_seq = created_at_seq_cache
+                                        .entry(orig_frag_id)
+                                        .or_insert_with(|| {
+                                            orig_frag
+                                                .created_at_version_meta
+                                                .as_ref()
+                                                .and_then(|m| m.load_sequence().ok())
+                                        });
+                                    let created_version = match cached_seq {
+                                        Some(seq) => seq.version_at(row_offset).unwrap_or(1),
+                                        None => 1,
                                     };
                                     created_at_versions.push(created_version);
                                 } else {
