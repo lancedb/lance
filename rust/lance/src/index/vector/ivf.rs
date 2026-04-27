@@ -3424,6 +3424,11 @@ mod tests {
         #[case] test_case: CreateIndexCase,
         #[values(IndexFileVersion::Legacy, IndexFileVersion::V3)] index_version: IndexFileVersion,
     ) {
+        // HNSW is an approximate search algorithm, so it may not return all results.
+        let is_hnsw = matches!(
+            &test_case.index_type,
+            TestIndexType::IvfHnswPq { .. } | TestIndexType::IvfHnswSq { .. }
+        );
         let mut index_params = match test_case.index_type {
             TestIndexType::IvfPq { pq } => VectorIndexParams::with_ivf_pq_params(
                 test_case.metric_type,
@@ -3496,7 +3501,19 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(results.num_rows(), num_non_null);
+        // Use a relaxed assertion for HNSW-based indexes since they are approximate.
+        if is_hnsw {
+            let recall = results.num_rows() as f32 / num_non_null as f32;
+            assert!(
+                recall >= 0.99,
+                "HNSW recall too low: {} ({} / {})",
+                recall,
+                results.num_rows(),
+                num_non_null,
+            );
+        } else {
+            assert_eq!(results.num_rows(), num_non_null);
+        }
         assert_eq!(results["vec"].logical_null_count(), 0);
     }
 
