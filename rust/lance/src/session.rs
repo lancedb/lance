@@ -8,6 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::cache::{CacheBackend, LanceCache};
 use lance_core::{Error, Result};
 use lance_index::IndexType;
+use lance_io::data_cache::DataCache;
 use lance_io::object_store::ObjectStoreRegistry;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -53,6 +54,15 @@ pub struct Session {
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
+
+    /// Optional two-tier async data cache (memory + SSD).
+    ///
+    /// When set, raw byte ranges fetched from the object store are cached here
+    /// so that repeated reads avoid network round-trips.  Shared across all
+    /// scanners that open this dataset.
+    pub(crate) data_cache: Option<Arc<dyn DataCache>>,
+    /// When true, every cache hit is verified against the object store.
+    pub(crate) data_cache_verify: bool,
 }
 
 impl DeepSizeOf for Session {
@@ -107,6 +117,8 @@ impl Session {
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
+            data_cache: None,
+            data_cache_verify: false,
         }
     }
 
@@ -124,7 +136,40 @@ impl Session {
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
+            data_cache: None,
+            data_cache_verify: false,
         }
+    }
+
+    /// Attach a two-tier async data cache to this session.
+    ///
+    /// When set, raw byte ranges fetched from the object store will be cached
+    /// so that repeated reads by any scanner sharing this session avoid network
+    /// round-trips.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use lance::session::Session;
+    /// use lance_io::data_cache::NoopDataCache;
+    /// use std::sync::Arc;
+    ///
+    /// let session = Session::default().with_data_cache(Arc::new(NoopDataCache));
+    /// ```
+    pub fn with_data_cache(mut self, cache: Arc<dyn DataCache>) -> Self {
+        self.data_cache = Some(cache);
+        self
+    }
+
+    /// Enable checksum verification: every cache hit is re-fetched from the
+    /// object store and compared byte-for-byte. Expensive — testing only.
+    pub fn with_data_cache_verify(mut self, verify: bool) -> Self {
+        self.data_cache_verify = verify;
+        self
+    }
+
+    /// Return the data cache if one is configured.
+    pub fn data_cache(&self) -> Option<&dyn DataCache> {
+        self.data_cache.as_deref()
     }
 
     /// Register a new index extension.

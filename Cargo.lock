@@ -4593,6 +4593,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
+ "crc32fast",
  "criterion",
  "deepsize",
  "futures",

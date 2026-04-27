@@ -145,6 +145,8 @@ impl ObjectStoreProvider for OssStoreProvider {
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
+            data_cache: None,
+            data_cache_verify: false,
         })
     }
 }

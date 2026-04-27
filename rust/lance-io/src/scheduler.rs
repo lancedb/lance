@@ -43,8 +43,8 @@ pub fn bytes_read_counter() -> u64 {
 }
 
 // We want to allow requests that have a lower priority than any
-// currently in-flight request.  This helps avoid potential deadlocks
-// related to backpressure.  Unfortunately, it is quite expensive to
+// currently in-flight request. This helps avoid potential deadlocks
+// related to backpressure. Unfortunately, it is quite expensive to
 // keep track of which priorities are in-flight.
 //
 // TODO: At some point it would be nice if we can optimize this away but
@@ -247,7 +247,7 @@ impl IoQueue {
 }
 
 // There is one instance of MutableBatch shared by all the I/O operations
-// that make up a single request.  When all the I/O operations complete
+// that make up a single request. When all the I/O operations complete
 // then the MutableBatch goes out of scope and the batch request is considered
 // complete
 struct MutableBatch<F: FnOnce(Response) + Send> {
@@ -273,12 +273,12 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
 }
 
 // Rather than keep track of when all the I/O requests are finished so that we
-// can deliver the batch of data we let Rust do that for us.  When all I/O's are
+// can deliver the batch of data we let Rust do that for us. When all I/O's are
 // done then the MutableBatch will go out of scope and we know we have all the
 // data.
 impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
-        // If we have an error, return that.  Otherwise return the data
+        // If we have an error, return that. Otherwise return the data
         let result = if self.err.is_some() {
             Err(Error::wrapped(self.err.take().unwrap()))
         } else {
@@ -347,7 +347,7 @@ impl PartialOrd for IoTask {
 
 impl Ord for IoTask {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // This is intentionally inverted.  We want a min-heap
+        // This is intentionally inverted. We want a min-heap
         other.priority.cmp(&self.priority)
     }
 }
@@ -393,7 +393,7 @@ impl IoTask {
     }
 }
 
-// Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
+// Every time a scheduler starts up it launches a task to run the I/O loop. This loop
 // repeats endlessly until the scheduler is destroyed.
 async fn run_io_loop(tasks: Arc<IoQueue>) {
     // Pop the first finished task off the queue and submit another until
@@ -500,10 +500,10 @@ struct Response {
     num_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// the # of bytes that can be buffered but not yet requested.
-    /// This controls back pressure.  If data is not processed quickly enough then this
+    /// The # of bytes that can be buffered but not yet requested.
+    /// This controls back pressure. If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
     /// Whether to use the lite scheduler.
@@ -533,7 +533,7 @@ impl SchedulerConfig {
     }
 
     /// Configuration that should generally maximize bandwidth (not trying to save RAM
-    /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
+    /// at all). We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
         Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
     }
@@ -570,8 +570,8 @@ impl ScanScheduler {
                 config.io_buffer_size_bytes,
             ));
             let io_queue_clone = io_queue.clone();
-            // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
-            // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
+            // Best we can do here is fire and forget. If the I/O loop is still running when the scheduler is
+            // dropped we can't wait for it to finish or we'd block a tokio thread. We could spawn a blocking task
             // to wait for it to finish but that doesn't seem helpful.
             tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
             IoQueueType::Standard(io_queue)
@@ -588,7 +588,7 @@ impl ScanScheduler {
     /// # Arguments
     ///
     /// * path - the path to the file to open
-    /// * base_priority - the base priority for I/O requests submitted to this file scheduler
+    /// * base_priority - the base priority for I/O requests submitted to this file scheduler;
     ///   this will determine the upper 64 bits of priority (the lower 64 bits
     ///   come from `submit_request` and `submit_single`)
     pub async fn open_file_with_priority(
@@ -762,16 +762,16 @@ impl ScanScheduler {
 
 impl Drop for ScanScheduler {
     fn drop(&mut self) {
-        // If the user is dropping the ScanScheduler then they _should_ be done with I/O.  This can happen
+        // If the user is dropping the ScanScheduler then they _should_ be done with I/O. This can happen
         // even when I/O is in progress if, for example, the user is dropping a scan mid-read because they found
         // the data they wanted (limit after filter or some other example).
         //
-        // Closing the I/O queue will cancel any requests that have not yet been sent to the I/O loop.  However,
-        // it will not terminate the I/O loop itself.  This is to help prevent deadlock and ensure that all I/O
+        // Closing the I/O queue will cancel any requests that have not yet been sent to the I/O loop. However,
+        // it will not terminate the I/O loop itself. This is to help prevent deadlock and ensure that all I/O
         // requests that are submitted will terminate.
         //
         // In theory, this isn't strictly necessary, as callers should drop any task expecting I/O before they
-        // drop the scheduler.  In practice, this can be difficult to do, and it is better to spend a little bit
+        // drop the scheduler. In practice, this can be difficult to do, and it is better to spend a little bit
         // of time letting the I/O loop drain so that we can avoid any potential deadlocks.
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => io_queue.close(),
@@ -805,19 +805,18 @@ impl FileScheduler {
     /// The requests will be queued in a FIFO manner and, when all requests
     /// have been fulfilled, the returned future will be completed.
     ///
-    /// Each request has a given priority.  If the I/O loop is full then requests
+    /// Each request has a given priority. If the I/O loop is full then requests
     /// will be buffered and requests with the *lowest* priority will be released
     /// from the buffer first.
     ///
     /// Each request has a backpressure ID which controls which backpressure throttle
-    /// is applied to the request.  Requests made to the same backpressure throttle
+    /// is applied to the request. Requests made to the same backpressure throttle
     /// will be throttled together.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
-        // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
         let mut merged_requests = Vec::with_capacity(request.len());
@@ -867,7 +866,7 @@ impl FileScheduler {
         let mut final_bytes = Vec::with_capacity(request.len());
 
         async move {
-            let bytes_vec = bytes_vec_fut.await?;
+            let bytes_vec: Vec<Bytes> = bytes_vec_fut.await?;
 
             let mut orig_index = 0;
             while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
@@ -1280,7 +1279,7 @@ mod tests {
         // Now we issue multi-read that can be partially fulfilled, it will read some bytes but
         // not all of them. (using large range gap to ensure request not coalesced)
         //
-        // I'm actually not sure this behavior is great.  It's possible that we should just
+        // I'm actually not sure this behavior is great. It's possible that we should just
         // block until we can fulfill the entire request.
         let fifth_fut = file_scheduler.submit_request(vec![0..3, 90000..90007], 0);
         wait_for_bytes_read_and_idle(21).await;
@@ -1441,7 +1440,7 @@ mod tests {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn stress_backpressure() {
         // This test ensures that the backpressure mechanism works correctly with
-        // regards to priority.  In other words, as long as all requests are consumed
+        // regards to priority. In other words, as long as all requests are consumed
         // in priority order then the backpressure mechanism should not deadlock
         let some_path = Path::parse("foo").unwrap();
         let obj_store = Arc::new(ObjectStore::memory());

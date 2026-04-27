@@ -23,6 +23,7 @@ use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::{
+    data_cache::DataCache,
     object_store::DEFAULT_CLOUD_IO_PARALLELISM,
     traits::{ByteStream, Reader},
 };
@@ -200,6 +201,7 @@ impl Reader for CloudObjectReader {
                 ..Default::default()
             },
         });
+
         Box::pin(do_get_with_outer_retry(
             self.download_retry_count,
             get_request,
@@ -255,6 +257,145 @@ impl Reader for CloudObjectReader {
             let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
             Ok(get_result.into_stream())
         })
+    }
+}
+
+/// A composable cache layer that wraps any [`Reader`] and intercepts
+/// [`get_range`](Reader::get_range) calls to serve cached byte ranges.
+///
+/// Works with all reader types (local, cloud, io_uring, …) because it
+/// operates at the `Reader` trait level, not inside the object-store client.
+///
+/// # Verify mode (`cache_verify = true`)
+/// On every cache hit the range is also fetched from the inner reader and
+/// compared byte-for-byte. Mismatches are logged and returned as errors.
+pub struct CachedObjectReader {
+    inner: Arc<dyn Reader>,
+    path: Path,
+    cache: Arc<dyn DataCache>,
+    /// Stable numeric file ID interned once at construction — avoids a
+    /// string hash-map lookup on every [`get_range`](Reader::get_range) call.
+    file_id: u64,
+    cache_verify: bool,
+}
+
+impl std::fmt::Debug for CachedObjectReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedObjectReader")
+            .field("path", &self.path)
+            .field("cache_verify", &self.cache_verify)
+            .finish()
+    }
+}
+
+impl DeepSizeOf for CachedObjectReader {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.path.as_ref().deep_size_of_children(context)
+    }
+}
+
+impl CachedObjectReader {
+    pub fn new(inner: Arc<dyn Reader>, cache: Arc<dyn DataCache>, cache_verify: bool) -> Self {
+        let path = inner.path().clone();
+        let file_id = cache.intern_file(&path);
+        Self {
+            inner,
+            path,
+            cache,
+            file_id,
+            cache_verify,
+        }
+    }
+}
+
+/// Re-fetch `range` from `inner` and compare against `cached` byte-for-byte.
+/// Returns `cached` unchanged on match; errors on mismatch.
+async fn verify_cached_range(
+    inner: &Arc<dyn Reader>,
+    cached: Bytes,
+    range: Range<usize>,
+    path: &Path,
+    offset: u64,
+    length: u64,
+) -> OSResult<Bytes> {
+    let source = inner
+        .get_range(range)
+        .await
+        .map_err(|e| object_store::Error::Generic {
+            store: "data_cache_verify",
+            source: Box::new(e),
+        })?;
+
+    if cached != source {
+        let msg = format!(
+            "cache checksum mismatch at path={path} offset={offset} \
+             length={length}: cached {} bytes differ from source {} bytes",
+            cached.len(),
+            source.len()
+        );
+        tracing::error!(%msg, "CACHE CHECKSUM MISMATCH");
+        return Err(object_store::Error::Generic {
+            store: "data_cache",
+            source: msg.into(),
+        });
+    }
+    tracing::debug!(offset, length, "cache checksum OK");
+    Ok(cached)
+}
+
+impl Reader for CachedObjectReader {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+        self.inner.size()
+    }
+
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let path = self.path.clone();
+        let verify = self.cache_verify;
+        let offset = range.start as u64;
+        let length = (range.end - range.start) as u64;
+        let file_id = self.file_id;
+
+        Box::pin(async move {
+            let inner_for_loader = inner.clone();
+            let range_for_loader = range.clone();
+            let loader: BoxFuture<'static, lance_core::Result<Bytes>> = Box::pin(async move {
+                inner_for_loader
+                    .get_range(range_for_loader)
+                    .await
+                    .map_err(|e| lance_core::Error::io(e.to_string()))
+            });
+
+            let cached = cache
+                .get_or_load_by_id(file_id, offset, length, loader)
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "data_cache",
+                    source: Box::new(e),
+                })?;
+
+            if verify {
+                return verify_cached_range(&inner, cached, range, &path, offset, length).await;
+            }
+            Ok(cached)
+        })
+    }
+
+    fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
+        self.inner.get_all()
     }
 }
 
