@@ -109,6 +109,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     query: Query,
     pre_filter: Arc<dyn PreFilter>,
+    partition_id: usize,
     partition_centroid: Option<ArrayRef>,
     part_entry: Arc<dyn VectorIndexCacheEntry>,
     _marker: PhantomData<(S, Q)>,
@@ -557,6 +558,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(PreparedPartitionSearch {
             query: query.clone(),
             pre_filter,
+            partition_id,
             partition_centroid: self.ivf.centroid(partition_id),
             part_entry,
             _marker: PhantomData,
@@ -571,12 +573,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let PreparedPartitionSearch {
             query,
             pre_filter,
+            partition_id,
             partition_centroid,
             part_entry,
             _marker: _,
         } = prepared;
-        let query =
-            Self::preprocess_partition_query(distance_type, partition_centroid.as_ref(), &query)?;
+        let query = Self::preprocess_partition_query(
+            distance_type,
+            partition_id,
+            partition_centroid.as_ref(),
+            &query,
+        )?;
         let param = (&query).into();
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
@@ -604,12 +611,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let PreparedPartitionSearch {
             query,
             pre_filter,
+            partition_id,
             partition_centroid,
             part_entry,
             _marker: _,
         } = prepared;
-        let query =
-            Self::preprocess_partition_query(distance_type, partition_centroid.as_ref(), &query)?;
+        let query = Self::preprocess_partition_query(
+            distance_type,
+            partition_id,
+            partition_centroid.as_ref(),
+            &query,
+        )?;
         let param = (&query).into();
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
@@ -646,12 +658,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     fn preprocess_partition_query(
         distance_type: DistanceType,
+        partition_id: usize,
         partition_centroid: Option<&ArrayRef>,
         query: &Query,
     ) -> Result<Query> {
         if Q::use_residual(distance_type) {
-            let partition_centroid = partition_centroid
-                .ok_or_else(|| Error::index("partition centroid does not exist".to_string()))?;
+            let partition_centroid = partition_centroid.ok_or_else(|| {
+                Error::index(format!("partition centroid {partition_id} does not exist"))
+            })?;
             let residual_key = sub(&query.key, partition_centroid)?;
             let mut part_query = query.clone();
             part_query.key = residual_key;
@@ -889,6 +903,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         Self::preprocess_partition_query(
             self.distance_type,
+            partition_id,
             self.ivf.centroid(partition_id).as_ref(),
             query,
         )
