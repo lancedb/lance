@@ -309,7 +309,11 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
         let response = Response {
             data: result,
             // Report 0 bytes for bypass tasks so the backpressure budget is unaffected
-            num_bytes: if self.bypass_backpressure { 0 } else { self.num_bytes },
+            num_bytes: if self.bypass_backpressure {
+                0
+            } else {
+                self.num_bytes
+            },
             priority: self.priority,
             num_reqs: self.num_reqs,
         };
@@ -768,9 +772,15 @@ impl ScanScheduler {
         bypass_backpressure: bool,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         match &self.io_queue {
-            IoQueueType::Standard(io_queue) => futures::future::Either::Left(
-                self.submit_request_standard(reader, request, priority, io_queue, bypass_backpressure),
-            ),
+            IoQueueType::Standard(io_queue) => {
+                futures::future::Either::Left(self.submit_request_standard(
+                    reader,
+                    request,
+                    priority,
+                    io_queue,
+                    bypass_backpressure,
+                ))
+            }
             IoQueueType::Lite(io_queue) => futures::future::Either::Right(
                 self.submit_request_lite(reader, request, priority, io_queue, bypass_backpressure),
             ),

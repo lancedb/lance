@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, ops::Range, sync::{Arc, OnceLock}};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeListArray, ListArray, UInt64Array,
@@ -467,9 +471,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         let items_type = self.scheduler.items_field.data_type().clone();
         let base_io = context.io().clone();
         let io = if bypass_indirect_io_backpressure() {
-            base_io
-                .with_bypass_backpressure()
-                .unwrap_or(base_io)
+            base_io.with_bypass_backpressure().unwrap_or(base_io)
         } else {
             base_io
         };

@@ -301,7 +301,6 @@ impl SimpleBackpressureThrottle {
         }
     }
 
-
     fn warn_if_needed(&self) {
         let seconds_elapsed = self.start.elapsed().as_secs();
         let last_warn = self.last_warn.load(Ordering::Acquire);
@@ -346,7 +345,10 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
 
     fn force_acquire(&mut self, priority: u128) -> BackpressureReservation {
         self.priorities_in_flight.push(priority);
-        BackpressureReservation { num_bytes: 0, priority }
+        BackpressureReservation {
+            num_bytes: 0,
+            priority,
+        }
     }
 }
 
@@ -611,7 +613,12 @@ mod tests {
         let (blocker_tx, blocker_rx) = oneshot::channel();
         let blocker = queue
             .clone()
-            .submit(0..10, 0, make_run_fn(0, blocker_rx, start_order.clone()), false)
+            .submit(
+                0..10,
+                0,
+                make_run_fn(0, blocker_rx, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         // Submit four tasks with out-of-order priorities.
@@ -619,25 +626,45 @@ mod tests {
         let (tx_30, rx_30) = oneshot::channel();
         let h30 = queue
             .clone()
-            .submit(0..10, 30, make_run_fn(30, rx_30, start_order.clone()), false)
+            .submit(
+                0..10,
+                30,
+                make_run_fn(30, rx_30, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_10, rx_10) = oneshot::channel();
         let h10 = queue
             .clone()
-            .submit(0..10, 10, make_run_fn(10, rx_10, start_order.clone()), false)
+            .submit(
+                0..10,
+                10,
+                make_run_fn(10, rx_10, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_50, rx_50) = oneshot::channel();
         let h50 = queue
             .clone()
-            .submit(0..10, 50, make_run_fn(50, rx_50, start_order.clone()), false)
+            .submit(
+                0..10,
+                50,
+                make_run_fn(50, rx_50, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_20, rx_20) = oneshot::channel();
         let h20 = queue
             .clone()
-            .submit(0..10, 20, make_run_fn(20, rx_20, start_order.clone()), false)
+            .submit(
+                0..10,
+                20,
+                make_run_fn(20, rx_20, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         // Only the blocker has started so far.
