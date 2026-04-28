@@ -119,7 +119,7 @@ struct IoTask {
     priority: u128,
     /// The current state of the task
     state: TaskState,
-    /// When true, the task bypasses backpressure and is always scheduled immediately
+    /// When true, the task bypasses backpressure
     bypass_backpressure: bool,
 }
 

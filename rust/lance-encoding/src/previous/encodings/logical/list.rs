@@ -41,8 +41,8 @@ use crate::{
 
 /// When set, indirect I/O in the 2.0 list scheduler bypasses the backpressure system.
 ///
-/// This can be useful when indirect I/O is blocking on backpressure and causing latency or
-/// deadlocks.  Set LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE=1 to enable.
+/// This can be a blunt instrument to avoid deadlocks in 2.0 scenarios
+/// Set LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE=1 to enable.
 static BYPASS_INDIRECT_IO_BACKPRESSURE: OnceLock<bool> = OnceLock::new();
 
 fn bypass_indirect_io_backpressure() -> bool {
