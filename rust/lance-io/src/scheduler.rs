@@ -1049,10 +1049,7 @@ mod tests {
             .map(|t| (t.priority, t.bypass_backpressure))
             .collect();
 
-        assert_eq!(
-            order,
-            vec![(5, true), (20, true), (1, false), (10, false)]
-        );
+        assert_eq!(order, vec![(5, true), (20, true), (1, false), (10, false)]);
     }
 
     #[tokio::test]
