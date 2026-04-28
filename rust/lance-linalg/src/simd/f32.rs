@@ -46,14 +46,26 @@ impl std::fmt::Debug for f32x8 {
 }
 
 impl f32x8 {
+    /// Gather 8 f32 values from `slice` at the offsets in `indices`.
+    ///
+    /// On x86_64 this uses the AVX2 `vgatherdps` instruction when the host
+    /// supports it (gated at runtime via `is_x86_feature_detected!`). On
+    /// other architectures (and on x86_64 hosts without AVX2) the function
+    /// falls back to a per-index scalar load followed by `Self::from(&out)`,
+    /// which goes through `load_unaligned` (NEON / LASX / `_mm256_loadu_ps`
+    /// depending on platform). Per-tier macro stamping (e.g., the
+    /// `multiversion` crate) was considered but doesn't fit here: the function
+    /// returns `Self` and `_mm256_i32gather_ps::<4>` requires the const-generic
+    /// stride to be a compile-time literal — neither composes with the macro.
     #[inline]
     pub fn gather(slice: &[f32], indices: &[i32; 8]) -> Self {
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use super::i32::i32x8;
-
-            let idx = i32x8::from(indices);
-            Self(_mm256_i32gather_ps::<4>(slice.as_ptr(), idx.0))
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe { gather_avx2(slice, indices) }
+            } else {
+                gather_scalar_x86(slice, indices)
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -91,6 +103,37 @@ impl f32x8 {
             ];
             Self::load_unaligned(values.as_ptr())
         }
+    }
+}
+
+/// AVX2 gather. Caller must ensure the host supports AVX2 (gated by
+/// the `is_x86_feature_detected!("avx2")` check in `f32x8::gather`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gather_avx2(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
+    use super::i32::i32x8;
+
+    let idx = i32x8::from(indices);
+    f32x8(_mm256_i32gather_ps::<4>(slice.as_ptr(), idx.0))
+}
+
+/// Portable scalar gather for x86_64 hosts without AVX2.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn gather_scalar_x86(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
+    let ptr = slice.as_ptr();
+    unsafe {
+        let values = [
+            *ptr.add(indices[0] as usize),
+            *ptr.add(indices[1] as usize),
+            *ptr.add(indices[2] as usize),
+            *ptr.add(indices[3] as usize),
+            *ptr.add(indices[4] as usize),
+            *ptr.add(indices[5] as usize),
+            *ptr.add(indices[6] as usize),
+            *ptr.add(indices[7] as usize),
+        ];
+        f32x8::load_unaligned(values.as_ptr())
     }
 }
 
@@ -439,15 +482,18 @@ impl Mul for f32x8 {
     }
 }
 
-/// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
+/// 16 of 32-bit `f32` values. Stored as a pair of 256-bit AVX vectors on
+/// x86_64. Originally there was a sibling AVX-512 variant gated on
+/// `target_feature = "avx512f"`, but no project CI configuration enables
+/// `+avx512f` globally (and one of the avx512 arms still contained `todo!()`),
+/// so the variant was dead code. Removed in the runtime-SIMD-dispatch
+/// retrofit; per-tier dispatch happens in the kernel functions in
+/// `crate::distance::*` via `match *SIMD_SUPPORT` + per-tier
+/// `#[target_feature(enable = "...")]` inner functions.
 #[allow(non_camel_case_types)]
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct f32x16(__m256, __m256);
-#[allow(non_camel_case_types)]
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[derive(Clone, Copy)]
-pub struct f32x16(__m512);
 
 /// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -486,11 +532,7 @@ impl<'a> From<&'a [f32; 16]> for f32x16 {
 impl SIMD<f32, 16> for f32x16 {
     #[inline]
     fn splat(val: f32) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_set1_ps(val))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_set1_ps(val), _mm256_set1_ps(val))
         }
@@ -514,11 +556,7 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn zeros() -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_setzero_ps())
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_setzero_ps(), _mm256_setzero_ps())
         }
@@ -534,13 +572,9 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     unsafe fn load(ptr: *const f32) -> Self {
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_load_ps(ptr), _mm256_load_ps(ptr.add(8)))
-        }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_load_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -557,13 +591,9 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     unsafe fn load_unaligned(ptr: *const f32) -> Self {
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_loadu_ps(ptr), _mm256_loadu_ps(ptr.add(8)))
-        }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_loadu_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -580,11 +610,7 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     unsafe fn store(&self, ptr: *mut f32) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_store_ps(ptr, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             _mm256_store_ps(ptr, self.0);
             _mm256_store_ps(ptr.add(8), self.1);
@@ -602,11 +628,7 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     unsafe fn store_unaligned(&self, ptr: *mut f32) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_storeu_ps(ptr, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             _mm256_storeu_ps(ptr, self.0);
             _mm256_storeu_ps(ptr.add(8), self.1);
@@ -622,12 +644,9 @@ impl SIMD<f32, 16> for f32x16 {
         }
     }
 
+    #[inline]
     fn reduce_sum(&self) -> f32 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_mask_reduce_add_ps(0xFFFF, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             let mut sum = _mm256_add_ps(self.0, self.1);
             // Shift and add vector, until only 1 value left.
@@ -657,11 +676,7 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn reduce_min(&self) -> f32 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_mask_reduce_min_ps(0xFFFF, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             let mut m1 = _mm256_min_ps(self.0, self.1);
             let mut m2 = _mm256_permute2f128_ps(m1, m1, 1);
@@ -695,11 +710,7 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn min(&self, rhs: &Self) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_min_ps(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_min_ps(self.0, rhs.0), _mm256_min_ps(self.1, rhs.1))
         }
@@ -718,19 +729,12 @@ impl SIMD<f32, 16> for f32x16 {
         }
     }
 
+    #[inline]
     fn find(&self, val: f32) -> Option<i32> {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
-            // let tgt = _mm512_set1_ps(val);
-            // let mask = _mm512_cmpeq_ps_mask(self.0, tgt);
-            // if mask != 0 {
-            //     return Some(mask.trailing_zeros() as i32);
-            // }
-            todo!()
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-        unsafe {
-            // _mm256_cmpeq_ps_mask requires "avx512l".
+            // _mm256_cmpeq_ps_mask requires AVX-512 (avx512f); use a scalar scan here
+            // since we only require AVX2.
             for i in 0..16 {
                 if self.as_array().get_unchecked(i) == &val {
                     return Some(i as i32);
@@ -774,11 +778,7 @@ impl SIMD<f32, 16> for f32x16 {
 impl FloatSimd<f32, 16> for f32x16 {
     #[inline]
     fn multiply_add(&mut self, a: Self, b: Self) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            self.0 = _mm512_fmadd_ps(a.0, b.0, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
             self.1 = _mm256_fmadd_ps(a.1, b.1, self.1);
@@ -803,11 +803,7 @@ impl Add for f32x16 {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_add_ps(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_add_ps(self.0, rhs.0), _mm256_add_ps(self.1, rhs.1))
         }
@@ -830,11 +826,7 @@ impl Add for f32x16 {
 impl AddAssign for f32x16 {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            self.0 = _mm512_add_ps(self.0, rhs.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             self.0 = _mm256_add_ps(self.0, rhs.0);
             self.1 = _mm256_add_ps(self.1, rhs.1);
@@ -859,11 +851,7 @@ impl Mul for f32x16 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_mul_ps(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_mul_ps(self.0, rhs.0), _mm256_mul_ps(self.1, rhs.1))
         }
@@ -888,11 +876,7 @@ impl Sub for f32x16 {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_sub_ps(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_sub_ps(self.0, rhs.0), _mm256_sub_ps(self.1, rhs.1))
         }
@@ -915,11 +899,7 @@ impl Sub for f32x16 {
 impl SubAssign for f32x16 {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            self.0 = _mm512_sub_ps(self.0, rhs.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             self.0 = _mm256_sub_ps(self.0, rhs.0);
             self.1 = _mm256_sub_ps(self.1, rhs.1);
@@ -946,6 +926,12 @@ mod tests {
 
     #[test]
     fn test_basic_ops() {
+        // The `f32x8` constructor / load / store paths are AVX-only on x86_64
+        // after the baseline lowering; skip on hosts that don't support AVX2.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
         let b = (10..18).map(|f| f as f32).collect::<Vec<_>>();
 
@@ -983,6 +969,10 @@ mod tests {
 
     #[test]
     fn test_f32x8_cmp_ops() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let a = [1.0_f32, 2.0, 5.0, 6.0, 7.0, 3.0, 2.0, 1.0];
         let b = [2.0_f32, 1.0, 4.0, 5.0, 9.0, 5.0, 6.0, 2.0];
         let c = [2.0_f32, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0];
@@ -1007,6 +997,10 @@ mod tests {
 
     #[test]
     fn test_basic_f32x16_ops() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let a = (0..16).map(|f| f as f32).collect::<Vec<_>>();
         let b = (10..26).map(|f| f as f32).collect::<Vec<_>>();
 
@@ -1041,6 +1035,10 @@ mod tests {
 
     #[test]
     fn test_f32x16_cmp_ops() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let a = [
             1.0_f32, 2.0, 5.0, 6.0, 7.0, 3.0, 2.0, 1.0, -0.5, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 2.0,
         ];
@@ -1074,6 +1072,13 @@ mod tests {
 
     #[test]
     fn test_f32x8_gather() {
+        // `f32x8::gather` does its own runtime AVX2 detection, but the
+        // returned `f32x8` itself is `__m256`-backed on x86_64 and the
+        // `reduce_sum` helper requires AVX. Skip on pre-Haswell hosts.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();
         let idx = [0_i32, 4, 8, 12, 16, 20, 24, 29];
         let v = f32x8::gather(&a, &idx);
