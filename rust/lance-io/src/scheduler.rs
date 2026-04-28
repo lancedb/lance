@@ -1523,4 +1523,125 @@ mod tests {
             fut.await.unwrap();
         }
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_zero_buffer_size_no_backpressure() {
+        // With io_buffer_size_bytes=0 (no_backpressure=true), reads at any priority go
+        // through without blocking, even though a zero budget would normally halt all I/O.
+        let obj_store = Arc::new(ObjectStore::memory());
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 0,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(obj_store, config);
+
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        // Submit three reads at increasing priorities without awaiting any first.
+        // Priority 1 and 2 would deadlock under a real 0-byte budget without no_backpressure.
+        let fut1 = scheduler.submit_request(reader.clone(), vec![0..1000], 0, false);
+        let fut2 = scheduler.submit_request(reader.clone(), vec![1000..2000], 1, false);
+        let fut3 = scheduler.submit_request(reader.clone(), vec![2000..3000], 2, false);
+
+        let bytes1 = timeout(Duration::from_secs(5), fut1).await.unwrap().unwrap();
+        let bytes2 = timeout(Duration::from_secs(5), fut2).await.unwrap().unwrap();
+        let bytes3 = timeout(Duration::from_secs(5), fut3).await.unwrap().unwrap();
+        assert_eq!(bytes1[0].len(), 1000);
+        assert_eq!(bytes2[0].len(), 1000);
+        assert_eq!(bytes3[0].len(), 1000);
+        assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_file_scheduler_bypass_backpressure() {
+        // A FileScheduler obtained via with_bypass_backpressure() submits reads that bypass
+        // the byte budget, allowing them to proceed even when the budget is exhausted.
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![0u8; 1000].into())
+            .await
+            .unwrap();
+
+        let bytes_dispatched = Arc::new(AtomicU64::from(0));
+        let mut obj_store = MockObjectStore::default();
+        let bytes_dispatched_copy = bytes_dispatched.clone();
+        obj_store
+            .expect_get_opts()
+            .returning(move |location, options| {
+                let range = options.range.as_ref().unwrap();
+                let num_bytes = match range {
+                    GetRange::Bounded(bounded) => bounded.end - bounded.start,
+                    _ => panic!(),
+                };
+                bytes_dispatched_copy.fetch_add(num_bytes, Ordering::Release);
+                let location = location.clone();
+                let base_store = base_store.clone();
+                async move { base_store.get_opts(&location, options).await }.boxed()
+            });
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(obj_store),
+            Url::parse("mem://").unwrap(),
+            Some(500),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+
+        // Budget = 10 bytes.
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 10,
+            use_lite_scheduler: Some(false),
+        };
+        let scan_scheduler = ScanScheduler::new(obj_store, config);
+        let file_scheduler = scan_scheduler
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(1000))
+            .await
+            .unwrap();
+        let bypass_scheduler = file_scheduler.with_bypass_backpressure();
+
+        // Fill the 10-byte budget with a priority-0 read.
+        let blocker_fut = file_scheduler.submit_single(0..10, 0);
+        while bytes_dispatched.load(Ordering::Acquire) < 10 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // A normal read at priority 2 is blocked: budget = 0, priority 2 > min-in-flight 0.
+        // A bypass read at priority 1 (higher priority in the queue) bypasses the budget check.
+        let normal_fut = file_scheduler.submit_single(0..10, 2);
+        let bypass_fut = bypass_scheduler.submit_single(0..10, 1);
+
+        // Bypass read is dispatched; normal read is still blocked.
+        while bytes_dispatched.load(Ordering::Acquire) < 20 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            bytes_dispatched.load(Ordering::Acquire),
+            20,
+            "normal read should still be blocked while budget is exhausted"
+        );
+
+        // Consuming the blocker releases its 10-byte budget → normal read can proceed.
+        timeout(Duration::from_secs(5), blocker_fut)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), bypass_fut)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), normal_fut)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes_dispatched.load(Ordering::Acquire), 30);
+    }
 }

@@ -695,4 +695,111 @@ mod tests {
         h50.await.unwrap();
         assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20, 30, 50]);
     }
+
+    #[tokio::test]
+    async fn test_zero_buffer_bypasses_backpressure() {
+        // Budget = 0 sets no_backpressure = true, so all tasks start immediately
+        // regardless of how many bytes are "outstanding".
+        let queue = Arc::new(IoQueue::new(128, 0));
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        let (tx0, rx0) = oneshot::channel();
+        let h0 = queue
+            .clone()
+            .submit(0..10, 0, make_run_fn(0, rx0, start_order.clone()), false)
+            .unwrap();
+        let (tx1, rx1) = oneshot::channel();
+        let h1 = queue
+            .clone()
+            .submit(0..10, 1, make_run_fn(1, rx1, start_order.clone()), false)
+            .unwrap();
+        let (tx2, rx2) = oneshot::channel();
+        let h2 = queue
+            .clone()
+            .submit(0..10, 2, make_run_fn(2, rx2, start_order.clone()), false)
+            .unwrap();
+
+        // All three tasks start immediately — no backpressure budget check when max_bytes=0.
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 1, 2]);
+
+        tx0.send(Bytes::from_static(b"done")).unwrap();
+        tx1.send(Bytes::from_static(b"done")).unwrap();
+        tx2.send(Bytes::from_static(b"done")).unwrap();
+        h0.await.unwrap();
+        h1.await.unwrap();
+        h2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bypass_flag_proceeds_past_exhausted_budget() {
+        // Budget of 10 bytes. A blocker task fills it. A task with bypass=true starts
+        // immediately despite the exhausted budget; a normal task stays queued.
+        let queue = Arc::new(IoQueue::new(128, 10));
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        // Blocker (priority 0, 10 bytes): fills the budget.
+        let (blocker_tx, blocker_rx) = oneshot::channel();
+        let blocker = queue
+            .clone()
+            .submit(
+                0..10,
+                0,
+                make_run_fn(0, blocker_rx, start_order.clone()),
+                false,
+            )
+            .unwrap();
+
+        // Normal (priority 1, 10 bytes): blocked — budget exhausted, no priority bypass.
+        let (normal_tx, normal_rx) = oneshot::channel();
+        let normal = queue
+            .clone()
+            .submit(
+                0..10,
+                1,
+                make_run_fn(1, normal_rx, start_order.clone()),
+                false,
+            )
+            .unwrap();
+
+        // Bypass (priority 2, 10 bytes): starts immediately via force_acquire.
+        let (bypass_tx, bypass_rx) = oneshot::channel();
+        let bypass = queue
+            .clone()
+            .submit(
+                0..10,
+                2,
+                make_run_fn(2, bypass_rx, start_order.clone()),
+                true,
+            )
+            .unwrap();
+
+        // Blocker (0) and bypass (2) have started; normal (1) is still queued.
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 2]);
+
+        // Completing the blocker frees the budget and unblocks the normal task.
+        blocker_tx.send(Bytes::from_static(b"done")).unwrap();
+        blocker.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 2, 1]);
+
+        bypass_tx.send(Bytes::from_static(b"done")).unwrap();
+        bypass.await.unwrap();
+        normal_tx.send(Bytes::from_static(b"done")).unwrap();
+        normal.await.unwrap();
+    }
 }
