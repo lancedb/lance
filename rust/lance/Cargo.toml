@@ -114,6 +114,7 @@ tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 paste = "1.0"
 # For S3 / DynamoDB tests

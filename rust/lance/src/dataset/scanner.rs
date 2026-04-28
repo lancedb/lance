@@ -167,6 +167,18 @@ pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
     .unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
 });
 
+/// The user-set value of `LANCE_DEFAULT_IO_BUFFER_SIZE`, or `None` if the env var
+/// is unset or unparseable. Consult this from paths that have a sensible non-fixed
+/// default (e.g. `SchedulerConfig::max_bandwidth`) so the env var still takes
+/// precedence over that default. Re-reads the env var on each call so tests can
+/// mutate it.
+pub fn get_default_io_buffer_size_override() -> Option<u64> {
+    parse_env_var(
+        "LANCE_DEFAULT_IO_BUFFER_SIZE",
+        &DEFAULT_IO_BUFFER_SIZE_VALUE.to_string(),
+    )
+}
+
 /// Defines an ordering for a single column
 ///
 /// Floats are sorted using the IEEE 754 total ordering
@@ -10486,6 +10498,75 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "Tasks should have finished within 10 seconds but there are still {} tasks running",
             runtime.handle().metrics().num_alive_tasks()
         );
+    }
+
+    fn find_filtered_read(plan: &dyn ExecutionPlan) -> Option<&FilteredReadExec> {
+        if let Some(f) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+            return Some(f);
+        }
+        for child in plan.children() {
+            if let Some(f) = find_filtered_read(child.as_ref()) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn test_io_buffer_size_explicit_propagated() {
+        // Sanity check: an explicit .io_buffer_size(N) call must reach the
+        // FilteredReadExec options unchanged, and the absence of one must leave
+        // io_buffer_size_bytes as None so FilteredReadExec can pick its own
+        // fallback (env var or max_bandwidth).
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_io_buffer_explicit", None)
+            .await
+            .unwrap();
+
+        let plan = dataset.scan().create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(filtered.options().io_buffer_size_bytes, None);
+
+        let mut scanner = dataset.scan();
+        scanner.io_buffer_size(7777);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(filtered.options().io_buffer_size_bytes, Some(7777));
+    }
+
+    // The env var key scopes serial_test's lock so this test only blocks others
+    // that touch LANCE_DEFAULT_IO_BUFFER_SIZE — unrelated tests still run in
+    // parallel.
+    #[test]
+    #[serial_test::serial(LANCE_DEFAULT_IO_BUFFER_SIZE)]
+    fn test_default_io_buffer_size_override_env_var() {
+        // Force the sibling LazyLock to evaluate before we mutate the env var.
+        // It caches forever on first read, so another test concurrently reading
+        // *DEFAULT_IO_BUFFER_SIZE during our mutation window would otherwise
+        // cache one of our test values and poison the rest of the suite.
+        let _ = *DEFAULT_IO_BUFFER_SIZE;
+
+        // FilteredReadExec consults this when no explicit io_buffer_size was set
+        // on the scanner, so the LANCE_DEFAULT_IO_BUFFER_SIZE env var takes
+        // precedence over the max_bandwidth fallback.
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "4096");
+        }
+        assert_eq!(get_default_io_buffer_size_override(), Some(4096));
+
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "not_a_number");
+        }
+        assert_eq!(get_default_io_buffer_size_override(), None);
+
+        unsafe {
+            std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
+        }
+        assert_eq!(get_default_io_buffer_size_override(), None);
     }
 
     fn assert_values_in_range(array: &Int32Array, range: std::ops::Range<i32>, msg: &str) {

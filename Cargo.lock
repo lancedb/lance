@@ -4196,6 +4196,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serial_test",
  "snafu",
  "tempfile",
  "test-log",
