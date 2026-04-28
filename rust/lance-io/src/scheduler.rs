@@ -1547,9 +1547,18 @@ mod tests {
         let fut2 = scheduler.submit_request(reader.clone(), vec![1000..2000], 1, false);
         let fut3 = scheduler.submit_request(reader.clone(), vec![2000..3000], 2, false);
 
-        let bytes1 = timeout(Duration::from_secs(5), fut1).await.unwrap().unwrap();
-        let bytes2 = timeout(Duration::from_secs(5), fut2).await.unwrap().unwrap();
-        let bytes3 = timeout(Duration::from_secs(5), fut3).await.unwrap().unwrap();
+        let bytes1 = timeout(Duration::from_secs(5), fut1)
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes2 = timeout(Duration::from_secs(5), fut2)
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes3 = timeout(Duration::from_secs(5), fut3)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(bytes1[0].len(), 1000);
         assert_eq!(bytes2[0].len(), 1000);
         assert_eq!(bytes3[0].len(), 1000);
