@@ -359,7 +359,7 @@ impl Eq for IoTask {}
 
 impl PartialEq for IoTask {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
+        self.bypass_backpressure == other.bypass_backpressure && self.priority == other.priority
     }
 }
 
@@ -371,8 +371,11 @@ impl PartialOrd for IoTask {
 
 impl Ord for IoTask {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // This is intentionally inverted.  We want a min-heap
-        other.priority.cmp(&self.priority)
+        // Bypass tasks are always delivered before normal tasks.
+        // Within the same bypass class, this is a min-heap on priority.
+        self.bypass_backpressure
+            .cmp(&other.bypass_backpressure)
+            .then(other.priority.cmp(&self.priority))
     }
 }
 
@@ -1018,6 +1021,39 @@ mod tests {
     };
 
     use super::*;
+
+    fn make_task(priority: u128, bypass_backpressure: bool) -> IoTask {
+        IoTask {
+            reader: Arc::new(TrackingReader {
+                get_range_count: Arc::new(AtomicU64::new(0)),
+                path: Path::parse("test").unwrap(),
+            }),
+            to_read: 0..1,
+            when_done: Box::new(|_| {}),
+            priority,
+            bypass_backpressure,
+        }
+    }
+
+    #[test]
+    fn test_iotask_ordering() {
+        // Bypass tasks must come out of the heap before non-bypass tasks.
+        // Within each group, lower priority number (= higher priority) comes first.
+        let mut heap = BinaryHeap::new();
+        heap.push(make_task(10, false)); // non-bypass, low priority
+        heap.push(make_task(1, false)); // non-bypass, high priority
+        heap.push(make_task(20, true)); // bypass, low priority
+        heap.push(make_task(5, true)); // bypass, high priority
+
+        let order: Vec<(u128, bool)> = std::iter::from_fn(|| heap.pop())
+            .map(|t| (t.priority, t.bypass_backpressure))
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![(5, true), (20, true), (1, false), (10, false)]
+        );
+    }
 
     #[tokio::test]
     async fn test_full_seq_read() {

@@ -16,7 +16,7 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::{Error, Result, cache::LanceCache};
+use lance_core::{Error, Result, cache::LanceCache, utils::parse::str_is_truthy};
 use log::trace;
 use tokio::task::JoinHandle;
 
@@ -46,8 +46,11 @@ use crate::{
 static BYPASS_INDIRECT_IO_BACKPRESSURE: OnceLock<bool> = OnceLock::new();
 
 fn bypass_indirect_io_backpressure() -> bool {
-    *BYPASS_INDIRECT_IO_BACKPRESSURE
-        .get_or_init(|| std::env::var("LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE").is_ok())
+    *BYPASS_INDIRECT_IO_BACKPRESSURE.get_or_init(|| {
+        std::env::var("LANCE_BYPASS_INDIRECT_IO_BACKPRESSURE")
+            .map(|val| str_is_truthy(&val))
+            .unwrap_or(false)
+    })
 }
 
 // Scheduling lists is tricky.  Imagine the following scenario:
