@@ -157,6 +157,10 @@ pub trait DataCache: Send + Sync + std::fmt::Debug {
     }
 
     fn cache_stats(&self) -> CacheStats;
+
+    fn verify(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -259,6 +263,7 @@ pub struct TieredDataCache {
     #[cfg(unix)]
     ssd_writer: Option<Arc<SsdWriter>>,
     file_ids: Arc<FileIds>,
+    pub verify: bool,
 }
 
 impl TieredDataCache {
@@ -319,6 +324,7 @@ impl TieredDataCache {
             #[cfg(unix)]
             ssd_writer,
             file_ids: Arc::new(FileIds::new()),
+            verify: config.verify,
         }))
     }
 
@@ -412,6 +418,10 @@ impl DataCache for TieredDataCache {
             ssd_bytes_written,
             ssd_stale_misses,
         }
+    }
+
+    fn verify(&self) -> bool {
+        self.verify
     }
 }
 

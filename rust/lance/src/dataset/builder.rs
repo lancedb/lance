@@ -661,7 +661,6 @@ impl DatasetBuilder {
                         Error::invalid_input(format!("failed to initialise data cache: {e}"))
                     })?;
                     s.with_data_cache(data_cache)
-                        .with_data_cache_verify(cfg.verify)
                 } else {
                     s
                 };
@@ -692,7 +691,7 @@ impl DatasetBuilder {
         if let Some(cache) = session.data_cache.as_ref() {
             let mut store_with_cache = (*object_store).clone();
             store_with_cache.data_cache = Some(cache.clone());
-            store_with_cache.data_cache_verify = session.data_cache_verify;
+            store_with_cache.data_cache_verify = cache.verify();
             object_store = Arc::new(store_with_cache);
         }
 
