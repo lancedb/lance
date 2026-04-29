@@ -168,7 +168,7 @@ pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
 });
 
 /// The user-set value of `LANCE_DEFAULT_IO_BUFFER_SIZE`, or `None` if the env var
-/// is unset or unparseable. Consult this from paths that have a sensible non-fixed
+/// is unset or unparsable. Consult this from paths that have a sensible non-fixed
 /// default (e.g. `SchedulerConfig::max_bandwidth`) so the env var still takes
 /// precedence over that default. Re-reads the env var on each call so tests can
 /// mutate it.
