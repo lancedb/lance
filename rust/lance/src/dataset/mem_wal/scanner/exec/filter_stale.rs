@@ -82,7 +82,7 @@ pub struct FilterStaleExec {
     /// Output schema.
     schema: SchemaRef,
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FilterStaleExec {
@@ -104,12 +104,12 @@ impl FilterStaleExec {
         let mut bloom_filters = bloom_filters;
         bloom_filters.sort_by(|a, b| b.generation.cmp(&a.generation));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             input.pipeline_behavior(),
             input.boundedness(),
-        );
+        ));
 
         Self {
             input,
@@ -166,7 +166,7 @@ impl ExecutionPlan for FilterStaleExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

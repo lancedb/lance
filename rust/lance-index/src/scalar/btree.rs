@@ -585,6 +585,9 @@ impl Ord for OrderableScalarValue {
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
             // What would a btree of unions even look like?  May not be possible.
             (Union(_, _, _), _) => todo!("Support for union scalars"),
+            (RunEndEncoded(_, _, _), _) => {
+                todo!("Support for run-end encoded scalars")
+            }
             (Null, Null) => Ordering::Equal,
             (Null, _) => todo!(),
         }

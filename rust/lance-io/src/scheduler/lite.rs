@@ -119,6 +119,8 @@ struct IoTask {
     priority: u128,
     /// The current state of the task
     state: TaskState,
+    /// When true, the task bypasses backpressure
+    bypass_backpressure: bool,
 }
 
 impl IoTask {
@@ -232,6 +234,9 @@ struct BackpressureReservation {
 trait BackpressureThrottle: Send {
     fn try_acquire(&mut self, num_bytes: u64, priority: u128) -> Option<BackpressureReservation>;
     fn release(&mut self, reservation: BackpressureReservation);
+    /// Unconditionally acquire a zero-cost reservation, tracking only the priority.
+    /// Used for bypass tasks that must never be blocked by backpressure.
+    fn force_acquire(&mut self, priority: u128) -> BackpressureReservation;
 }
 
 // We want to allow requests that have a lower priority than any
@@ -277,6 +282,8 @@ struct SimpleBackpressureThrottle {
     last_warn: AtomicU64,
     bytes_available: i64,
     priorities_in_flight: PrioritiesInFlight,
+    // When true, skip all byte-based backpressure checks (set when max_bytes == 0)
+    no_backpressure: bool,
 }
 
 impl SimpleBackpressureThrottle {
@@ -290,6 +297,7 @@ impl SimpleBackpressureThrottle {
             last_warn: AtomicU64::new(0),
             bytes_available: max_bytes as i64,
             priorities_in_flight: PrioritiesInFlight::new(max_concurrency),
+            no_backpressure: max_bytes == 0,
         }
     }
 
@@ -314,7 +322,8 @@ impl SimpleBackpressureThrottle {
 
 impl BackpressureThrottle for SimpleBackpressureThrottle {
     fn try_acquire(&mut self, num_bytes: u64, priority: u128) -> Option<BackpressureReservation> {
-        if self.bytes_available >= num_bytes as i64
+        if self.no_backpressure
+            || self.bytes_available >= num_bytes as i64
             || self.priorities_in_flight.min_in_flight() >= priority
         {
             self.bytes_available -= num_bytes as i64;
@@ -332,6 +341,14 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
     fn release(&mut self, reservation: BackpressureReservation) {
         self.bytes_available += reservation.num_bytes as i64;
         self.priorities_in_flight.remove(reservation.priority);
+    }
+
+    fn force_acquire(&mut self, priority: u128) -> BackpressureReservation {
+        self.priorities_in_flight.push(priority);
+        BackpressureReservation {
+            num_bytes: 0,
+            priority,
+        }
     }
 }
 
@@ -435,10 +452,14 @@ impl IoQueue {
 
     fn push(&self, mut task: IoTask, mut state: MutexGuard<IoQueueState>) -> Result<()> {
         let task_id = task.id;
-        if let Some(reservation) = state
-            .backpressure_throttle
-            .try_acquire(task.num_bytes, task.priority)
-        {
+        let maybe_reservation = if task.bypass_backpressure {
+            Some(state.backpressure_throttle.force_acquire(task.priority))
+        } else {
+            state
+                .backpressure_throttle
+                .try_acquire(task.num_bytes, task.priority)
+        };
+        if let Some(reservation) = maybe_reservation {
             state.handle_result(task.reserve(reservation))?;
             state.handle_result(task.start())?;
             state.tasks.insert(task_id, task);
@@ -459,6 +480,7 @@ impl IoQueue {
         range: Range<u64>,
         priority: u128,
         run_fn: RunFn,
+        bypass_backpressure: bool,
     ) -> Result<TaskHandle> {
         log::trace!(
             "Submitting I/O task with range {:?}, priority {:?}",
@@ -473,6 +495,7 @@ impl IoQueue {
             id: task_id,
             num_bytes: range.end - range.start,
             priority,
+            bypass_backpressure,
             state: TaskState::Initial {
                 idle_waker: None,
                 run_fn,
@@ -590,7 +613,12 @@ mod tests {
         let (blocker_tx, blocker_rx) = oneshot::channel();
         let blocker = queue
             .clone()
-            .submit(0..10, 0, make_run_fn(0, blocker_rx, start_order.clone()))
+            .submit(
+                0..10,
+                0,
+                make_run_fn(0, blocker_rx, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         // Submit four tasks with out-of-order priorities.
@@ -598,25 +626,45 @@ mod tests {
         let (tx_30, rx_30) = oneshot::channel();
         let h30 = queue
             .clone()
-            .submit(0..10, 30, make_run_fn(30, rx_30, start_order.clone()))
+            .submit(
+                0..10,
+                30,
+                make_run_fn(30, rx_30, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_10, rx_10) = oneshot::channel();
         let h10 = queue
             .clone()
-            .submit(0..10, 10, make_run_fn(10, rx_10, start_order.clone()))
+            .submit(
+                0..10,
+                10,
+                make_run_fn(10, rx_10, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_50, rx_50) = oneshot::channel();
         let h50 = queue
             .clone()
-            .submit(0..10, 50, make_run_fn(50, rx_50, start_order.clone()))
+            .submit(
+                0..10,
+                50,
+                make_run_fn(50, rx_50, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_20, rx_20) = oneshot::channel();
         let h20 = queue
             .clone()
-            .submit(0..10, 20, make_run_fn(20, rx_20, start_order.clone()))
+            .submit(
+                0..10,
+                20,
+                make_run_fn(20, rx_20, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         // Only the blocker has started so far.
@@ -646,5 +694,112 @@ mod tests {
         tx_50.send(Bytes::from_static(b"x")).unwrap();
         h50.await.unwrap();
         assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20, 30, 50]);
+    }
+
+    #[tokio::test]
+    async fn test_zero_buffer_bypasses_backpressure() {
+        // Budget = 0 sets no_backpressure = true, so all tasks start immediately
+        // regardless of how many bytes are "outstanding".
+        let queue = Arc::new(IoQueue::new(128, 0));
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        let (tx0, rx0) = oneshot::channel();
+        let h0 = queue
+            .clone()
+            .submit(0..10, 0, make_run_fn(0, rx0, start_order.clone()), false)
+            .unwrap();
+        let (tx1, rx1) = oneshot::channel();
+        let h1 = queue
+            .clone()
+            .submit(0..10, 1, make_run_fn(1, rx1, start_order.clone()), false)
+            .unwrap();
+        let (tx2, rx2) = oneshot::channel();
+        let h2 = queue
+            .clone()
+            .submit(0..10, 2, make_run_fn(2, rx2, start_order.clone()), false)
+            .unwrap();
+
+        // All three tasks start immediately — no backpressure budget check when max_bytes=0.
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 1, 2]);
+
+        tx0.send(Bytes::from_static(b"done")).unwrap();
+        tx1.send(Bytes::from_static(b"done")).unwrap();
+        tx2.send(Bytes::from_static(b"done")).unwrap();
+        h0.await.unwrap();
+        h1.await.unwrap();
+        h2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bypass_flag_proceeds_past_exhausted_budget() {
+        // Budget of 10 bytes. A blocker task fills it. A task with bypass=true starts
+        // immediately despite the exhausted budget; a normal task stays queued.
+        let queue = Arc::new(IoQueue::new(128, 10));
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        // Blocker (priority 0, 10 bytes): fills the budget.
+        let (blocker_tx, blocker_rx) = oneshot::channel();
+        let blocker = queue
+            .clone()
+            .submit(
+                0..10,
+                0,
+                make_run_fn(0, blocker_rx, start_order.clone()),
+                false,
+            )
+            .unwrap();
+
+        // Normal (priority 1, 10 bytes): blocked — budget exhausted, no priority bypass.
+        let (normal_tx, normal_rx) = oneshot::channel();
+        let normal = queue
+            .clone()
+            .submit(
+                0..10,
+                1,
+                make_run_fn(1, normal_rx, start_order.clone()),
+                false,
+            )
+            .unwrap();
+
+        // Bypass (priority 2, 10 bytes): starts immediately via force_acquire.
+        let (bypass_tx, bypass_rx) = oneshot::channel();
+        let bypass = queue
+            .clone()
+            .submit(
+                0..10,
+                2,
+                make_run_fn(2, bypass_rx, start_order.clone()),
+                true,
+            )
+            .unwrap();
+
+        // Blocker (0) and bypass (2) have started; normal (1) is still queued.
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 2]);
+
+        // Completing the blocker frees the budget and unblocks the normal task.
+        blocker_tx.send(Bytes::from_static(b"done")).unwrap();
+        blocker.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 2, 1]);
+
+        bypass_tx.send(Bytes::from_static(b"done")).unwrap();
+        bypass.await.unwrap();
+        normal_tx.send(Bytes::from_static(b"done")).unwrap();
+        normal.await.unwrap();
     }
 }

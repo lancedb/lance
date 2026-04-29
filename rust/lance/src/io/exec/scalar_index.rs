@@ -17,7 +17,6 @@ use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
-    common::{Statistics, stats::Precision},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -79,7 +78,7 @@ impl ScalarIndexLoader for Dataset {
 pub struct ScalarIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -98,12 +97,12 @@ impl DisplayAs for ScalarIndexExec {
 
 impl ScalarIndexExec {
     pub fn new(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(INDEX_EXPR_RESULT_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             expr,
@@ -215,10 +214,13 @@ impl ExecutionPlan for ScalarIndexExec {
         )))
     }
 
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Exact(2),
-            ..Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
+        Ok(datafusion::physical_plan::Statistics {
+            num_rows: datafusion::common::stats::Precision::Exact(2),
+            ..datafusion::physical_plan::Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
         })
     }
 
@@ -226,7 +228,7 @@ impl ExecutionPlan for ScalarIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -247,7 +249,7 @@ pub struct MapIndexExec {
     column_name: String,
     index_name: String,
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -270,12 +272,12 @@ impl MapIndexExec {
         index_name: String,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             column_name,
@@ -427,7 +429,7 @@ impl ExecutionPlan for MapIndexExec {
         )))
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -449,7 +451,7 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -511,12 +513,12 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(MATERIALIZE_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             expr,
@@ -713,15 +715,11 @@ impl ExecutionPlan for MaterializeIndexExec {
         )))
     }
 
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&MATERIALIZE_INDEX_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

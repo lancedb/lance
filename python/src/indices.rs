@@ -43,7 +43,12 @@ use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::{IndexDescription, IndexType};
 use uuid::Uuid;
 
-#[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
+#[pyclass(
+    name = "IndexConfig",
+    module = "lance.indices",
+    get_all,
+    from_py_object
+)]
 #[derive(Debug, Clone)]
 pub struct PyIndexConfig {
     pub index_type: String,
@@ -61,7 +66,7 @@ impl PyIndexConfig {
     }
 }
 
-#[pyclass(name = "IvfModel", module = "lance.indices")]
+#[pyclass(name = "IvfModel", module = "lance.indices", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyIvfModel {
     pub(crate) inner: IvfModel,
@@ -505,7 +510,12 @@ pub fn load_shuffled_vectors(
     )?
 }
 
-#[pyclass(name = "IndexSegmentDescription", module = "lance.indices", get_all)]
+#[pyclass(
+    name = "IndexSegmentDescription",
+    module = "lance.indices",
+    get_all,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyIndexSegmentDescription {
     /// The UUID of the index segment

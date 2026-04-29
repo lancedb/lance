@@ -9,12 +9,10 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
-use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
-use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{ColumnarValue, PlanProperties};
@@ -97,7 +95,7 @@ pub struct LancePushdownScanExec {
     predicate: Expr,
     config: ScanConfig,
     output_schema: Arc<ArrowSchema>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -134,12 +132,12 @@ impl LancePushdownScanExec {
         }
         let output_schema = Arc::new(output_schema);
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             dataset,
@@ -183,10 +181,6 @@ impl ExecutionPlan for LancePushdownScanExec {
         } else {
             Ok(self)
         }
-    }
-
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(self.output_schema.as_ref()))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -239,7 +233,7 @@ impl ExecutionPlan for LancePushdownScanExec {
         )))
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 }
@@ -677,8 +671,7 @@ impl FragmentScanner {
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
-            let props = ExecutionProps::new();
-            let context = SimplifyContext::new(&props).with_schema(schema);
+            let context = SimplifyContext::default().with_schema(schema);
             let mut simplifier = ExprSimplifier::new(context);
 
             let mut predicates = Vec::with_capacity(num_batches);

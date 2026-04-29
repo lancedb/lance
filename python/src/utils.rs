@@ -274,9 +274,9 @@ impl Hnsw {
 pub struct PyLance<T>(pub T);
 
 /// Extract a Vec of PyLance types from a Python object.
-pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
+pub fn extract_vec<'py, T>(ob: &Bound<'py, PyAny>) -> PyResult<Vec<T>>
 where
-    PyLance<T>: FromPyObject<'a>,
+    PyLance<T>: FromPyObjectOwned<'py>,
 {
     ob.extract::<Vec<PyLance<T>>>()
         .map(|v| v.into_iter().map(|t| t.0).collect())

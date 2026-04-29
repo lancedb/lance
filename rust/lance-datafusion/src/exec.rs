@@ -71,7 +71,7 @@ pub struct OneShotExec {
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
     // can still function after exhausted
     schema: Arc<ArrowSchema>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl OneShotExec {
@@ -81,12 +81,12 @@ impl OneShotExec {
         Self {
             stream: Mutex::new(Some(stream)),
             schema: schema.clone(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::RoundRobinBatch(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 
@@ -195,18 +195,14 @@ impl ExecutionPlan for OneShotExec {
         }
     }
 
-    fn statistics(&self) -> datafusion_common::Result<datafusion_common::Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
-    }
-
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 }
 
 struct TracedExec {
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     span: Span,
 }
 
@@ -250,7 +246,7 @@ impl ExecutionPlan for TracedExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -893,7 +889,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 
@@ -999,7 +995,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 

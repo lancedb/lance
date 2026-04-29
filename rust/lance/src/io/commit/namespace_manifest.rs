@@ -108,7 +108,12 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
 
         Ok(ManifestLocation {
             version: version_info.version as u64,
-            path: Path::from(version_info.manifest_path),
+            path: Path::parse(&version_info.manifest_path).map_err(|e| {
+                lance_core::Error::invalid_input(format!(
+                    "Invalid manifest path '{}': {}",
+                    version_info.manifest_path, e
+                ))
+            })?,
             size: version_info.manifest_size.map(|s| s as u64),
             naming_scheme,
             e_tag: version_info.e_tag,

@@ -537,7 +537,7 @@ pub struct LanceScanExec {
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -611,12 +611,12 @@ impl LanceScanExec {
         }
         let output_schema = Arc::new(output_schema);
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             fragments,
@@ -710,11 +710,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -733,11 +729,15 @@ impl ExecutionPlan for LanceScanExec {
 
         Ok(Statistics {
             num_rows,
-            ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+            ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

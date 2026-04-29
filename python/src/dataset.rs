@@ -179,7 +179,7 @@ impl MergeInsertBuilder {
         // schema's unenforced primary key (if configured).
         let on = if let Some(on_any) = on {
             on_any
-                .downcast::<PyString>()
+                .cast::<PyString>()
                 .map(|val| vec![val.to_string()])
                 .or_else(|_| {
                     let iterator = on_any.try_iter().map_err(|_| {
@@ -189,7 +189,7 @@ impl MergeInsertBuilder {
                     })?;
                     let mut keys = Vec::new();
                     for key in iterator {
-                        keys.push(key?.downcast::<PyString>()?.to_string());
+                        keys.push(key?.cast::<PyString>()?.to_string());
                     }
                     PyResult::Ok(keys)
                 })?
@@ -368,7 +368,7 @@ pub fn transforms_from_python(
     py: Python<'_>,
     transforms: &Bound<'_, PyAny>,
 ) -> PyResult<NewColumnTransform> {
-    if let Ok(transforms) = transforms.downcast::<PyDict>() {
+    if let Ok(transforms) = transforms.cast::<PyDict>() {
         let expressions = transforms
             .iter()
             .map(|(k, v)| {
@@ -397,7 +397,7 @@ pub fn transforms_from_python(
                     })?;
                 let result_batch: PyArrowType<RecordBatch> = result
                     .extract(py)
-                    .map_err(|err| lance::Error::invalid_input(err.to_string()))?;
+                    .map_err(|err: PyErr| lance::Error::invalid_input(err.to_string()))?;
                 Ok(result_batch.0)
             })
         };
@@ -410,8 +410,9 @@ pub fn transforms_from_python(
         }))
     }
 }
-impl FromPyObject<'_> for PyLance<ColumnOrdering> {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<ColumnOrdering> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let ascending: bool = ob.getattr("ascending")?.extract()?;
         let nulls_first: bool = ob.getattr("nulls_first")?.extract()?;
         let column_name: String = ob.getattr("column_name")?.extract()?;
@@ -443,7 +444,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
 }
 
 /// Python binding for BasePath
-#[pyclass(name = "DatasetBasePath", module = "_lib")]
+#[pyclass(name = "DatasetBasePath", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct DatasetBasePath {
     #[pyo3(get)]
@@ -500,7 +501,7 @@ impl From<DatasetBasePath> for BasePath {
 }
 
 /// Lance Dataset that will be wrapped by another class in Python
-#[pyclass(name = "_Dataset", module = "_lib")]
+#[pyclass(name = "_Dataset", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct Dataset {
     #[pyo3(get)]
@@ -589,10 +590,10 @@ impl Dataset {
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
 
         if let Some(ver) = version {
-            if let Ok(i) = ver.downcast::<PyInt>() {
+            if let Ok(i) = ver.cast::<PyInt>() {
                 let v: u64 = i.extract()?;
                 builder = builder.with_version(v);
-            } else if let Ok(v) = ver.downcast::<PyString>() {
+            } else if let Ok(v) = ver.cast::<PyString>() {
                 let t: &str = &v.to_string_lossy();
                 builder = builder.with_tag(t);
             } else {
@@ -924,7 +925,7 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
-            let fts_query = if let Ok(full_text_query) = full_text_query.downcast::<PyDict>() {
+            let fts_query = if let Ok(full_text_query) = full_text_query.cast::<PyDict>() {
                 let mut query = full_text_query
                     .get_item("query")?
                     .ok_or_else(|| PyKeyError::new_err("query must be specified"))?
@@ -935,7 +936,7 @@ impl Dataset {
                     } else {
                         Some(
                             columns
-                                .downcast::<PyList>()?
+                                .cast::<PyList>()?
                                 .iter()
                                 .map(|c| c.extract::<String>())
                                 .collect::<PyResult<Vec<String>>>()?,
@@ -972,7 +973,7 @@ impl Dataset {
                     })?;
                 }
                 query
-            } else if let Ok(query) = full_text_query.downcast::<PyFullTextQuery>() {
+            } else if let Ok(query) = full_text_query.cast::<PyFullTextQuery>() {
                 let query = query.borrow();
                 FullTextSearchQuery::new_query(query.inner.clone())
             } else {
@@ -1121,7 +1122,7 @@ impl Dataset {
                         None
                     } else {
                         let tuple = dr
-                            .downcast::<PyTuple>()
+                            .cast::<PyTuple>()
                             .map_err(|err| PyValueError::new_err(err.to_string()))?;
                         if tuple.len() != 2 {
                             return Err(PyValueError::new_err(
@@ -1417,7 +1418,7 @@ impl Dataset {
         let alterations = alterations
             .iter()
             .map(|obj| {
-                let obj = obj.downcast::<PyDict>()?;
+                let obj = obj.cast::<PyDict>()?;
                 let path: String = obj
                     .get_item("path")?
                     .ok_or_else(|| PyValueError::new_err("path is required"))?
@@ -1541,8 +1542,8 @@ impl Dataset {
         }
 
         for (key, value) in updates {
-            let column: PyBackedStr = key.downcast::<PyString>()?.clone().try_into()?;
-            let expr: PyBackedStr = value.downcast::<PyString>()?.clone().try_into()?;
+            let column: PyBackedStr = key.cast::<PyString>()?.clone().try_into()?;
+            let expr: PyBackedStr = value.cast::<PyString>()?.clone().try_into()?;
 
             builder = builder
                 .set(column, &expr)
@@ -2060,7 +2061,7 @@ impl Dataset {
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
-                            language.downcast::<PyString>()?.clone().try_into()?;
+                            language.cast::<PyString>()?.clone().try_into()?;
                         params = params.language(&language).map_err(|e| {
                             PyValueError::new_err(format!(
                                 "can't set tokenizer language to {}: {:?}",
@@ -2915,7 +2916,7 @@ impl Dataset {
     }
 }
 
-#[pyclass(name = "SqlQuery", module = "_lib", subclass)]
+#[pyclass(name = "SqlQuery", module = "_lib", subclass, skip_from_py_object)]
 #[derive(Clone)]
 pub struct SqlQuery {
     builder: lance::dataset::sql::SqlQueryBuilder,
@@ -2975,7 +2976,12 @@ impl SqlQuery {
     }
 }
 
-#[pyclass(name = "SqlQueryBuilder", module = "_lib", subclass)]
+#[pyclass(
+    name = "SqlQueryBuilder",
+    module = "_lib",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct SqlQueryBuilder {
     builder: lance::dataset::sql::SqlQueryBuilder,
@@ -3054,7 +3060,12 @@ impl DatasetDelta {
     }
 }
 
-#[pyclass(name = "DatasetDeltaBuilder", module = "_lib", subclass)]
+#[pyclass(
+    name = "DatasetDeltaBuilder",
+    module = "_lib",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct DatasetDeltaBuilder {
     builder: lance::dataset::delta::DatasetDeltaBuilder,
@@ -3291,13 +3302,13 @@ struct IndexProgressHandler {
 impl Dataset {
     fn transform_ref(&self, reference: Option<Bound<PyAny>>) -> PyResult<Ref> {
         if let Some(reference) = reference {
-            if let Ok(i) = reference.downcast::<PyInt>() {
+            if let Ok(i) = reference.cast::<PyInt>() {
                 let version_number: u64 = i.extract()?;
                 Ok(version_number.into())
-            } else if let Ok(tag_name) = reference.downcast::<PyString>() {
+            } else if let Ok(tag_name) = reference.cast::<PyString>() {
                 let tag: &str = &tag_name.to_string_lossy();
                 Ok(tag.into())
-            } else if let Ok(tuple) = reference.downcast::<PyTuple>() {
+            } else if let Ok(tuple) = reference.cast::<PyTuple>() {
                 if tuple.len() == 2 {
                     let (branch_name, version_number) =
                         tuple.extract::<(Option<String>, Option<u64>)>()?;
@@ -3497,8 +3508,8 @@ pub fn get_commit_handler(options: &Bound<'_, PyDict>) -> PyResult<Option<Arc<dy
 // it were never present in the dictionary.  If the value is not
 // None it will try and parse it and parsing failures will be
 // returned (e.g. a parsing failure is not considered `None`)
-fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(
-    dict: &'a Bound<'py, PyDict>,
+fn get_dict_opt<'py, D: FromPyObjectOwned<'py>>(
+    dict: &Bound<'py, PyDict>,
     key: &str,
 ) -> PyResult<Option<D>> {
     let value = dict.get_item(key)?;
@@ -3507,7 +3518,7 @@ fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(
             if v.is_none() {
                 None
             } else {
-                Some(v.extract::<D>())
+                Some(v.extract::<D>().map_err(Into::into))
             }
         })
         .transpose()
@@ -3785,11 +3796,7 @@ fn prepare_vector_index_params(
                         e
                     ))
                 })?;
-                let list = l
-                    .downcast::<PyList>()?
-                    .iter()
-                    .map(|f| f.to_string())
-                    .collect();
+                let list = l.cast::<PyList>()?.iter().map(|f| f.to_string()).collect();
                 ivf_params.precomputed_shuffle_buffers = Some((path, list));
             }
             (None, None) => {}
@@ -4043,7 +4050,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     }
 }
 
-#[pyclass(name = "PyFullTextQuery")]
+#[pyclass(name = "PyFullTextQuery", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyFullTextQuery {
     pub(crate) inner: FtsQuery,
@@ -4267,7 +4274,7 @@ fn vector_query_params_from_dict(
     ))
 }
 
-#[pyclass(name = "PySearchFilter")]
+#[pyclass(name = "PySearchFilter", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySearchFilter {
     pub(crate) inner: QueryFilter,

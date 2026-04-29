@@ -46,7 +46,7 @@ pub struct FtsIndexExec {
     max_visible_batch_position: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Pre-computed batch ranges for O(log n) lookup.
     batch_ranges: Vec<BatchRange>,
@@ -112,12 +112,12 @@ impl FtsIndexExec {
         }
         let output_schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         // Pre-compute batch ranges for O(log n) lookup and max visible row
         let mut batch_ranges = Vec::new();
@@ -408,7 +408,7 @@ impl ExecutionPlan for FtsIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
