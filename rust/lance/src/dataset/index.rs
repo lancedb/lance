@@ -118,6 +118,7 @@ impl IndexRemapper for DatasetIndexRemapper {
     }
 }
 
+#[async_trait]
 pub trait LanceIndexStoreExt {
     /// Create an index store for a new index (will always be absolute with no base id)
     fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self>
@@ -125,7 +126,7 @@ pub trait LanceIndexStoreExt {
         Self: Sized;
 
     /// Open an index store for an existing index (might be relative or absolute)
-    fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self>
+    async fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self>
     where
         Self: Sized;
 }
@@ -144,6 +145,7 @@ pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
         .unwrap_or(LanceFileVersion::V2_0)
 }
 
+#[async_trait]
 impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
         let index_dir = dataset.indices_dir().child(uuid);
@@ -157,18 +159,15 @@ impl LanceIndexStoreExt for LanceIndexStore {
         ))
     }
 
-    fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self> {
+    async fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self> {
         let index_dir = dataset
             .indice_files_dir(index)?
             .child(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
-        let store = Self::with_format_version(
-            dataset.object_store.clone(),
-            index_dir,
-            Arc::new(cache),
-            format_version,
-        );
+        let object_store = dataset.object_store_for_index(index).await?;
+        let store =
+            Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
         Ok(store.with_file_sizes(index.file_size_map()))
     }
 }
@@ -232,7 +231,8 @@ mod tests {
         let second_segment_dir = dataset.indices_dir().child(second_segment_uuid.to_string());
         for file_name in ["index.idx", "auxiliary.idx"] {
             dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .copy(
                     &first_segment_dir.child(file_name),
                     &second_segment_dir.child(file_name),

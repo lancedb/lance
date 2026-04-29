@@ -502,7 +502,7 @@ async fn can_use_binary_copy_impl(
 
             // check file global buffer
             let object_store = match data_file.base_id {
-                Some(base_id) => dataset.object_store_for_base(base_id).await?,
+                Some(base_id) => dataset.object_store(Some(base_id)).await?,
                 None => dataset.object_store.clone(),
             };
             let full_path = dataset
@@ -617,7 +617,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     Err(e) => Err(e),
                 }
             })
-            .buffered(dataset.object_store().io_parallelism());
+            .buffered(dataset.object_store.as_ref().io_parallelism());
 
         let index_fragmaps = load_index_fragmaps(dataset).await?;
         let indices_containing_frag = |frag_id: u32| {
@@ -1096,7 +1096,7 @@ async fn reserve_fragment_ids(
 
     let (manifest, _) = commit_transaction(
         dataset,
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),

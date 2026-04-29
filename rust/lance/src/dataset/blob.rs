@@ -1946,7 +1946,7 @@ async fn collect_blob_entries_v2(
                     let object_store = if let Some(store) = store_cache.get(&base_id) {
                         store.clone()
                     } else {
-                        let store = dataset.object_store_for_base(base_id).await?;
+                        let store = dataset.object_store(Some(base_id)).await?;
                         store_cache.insert(base_id, store.clone());
                         store
                     };
@@ -2047,7 +2047,7 @@ async fn resolve_blob_read_location(
         if let Some(store) = store_cache.get(&base_id) {
             store.clone()
         } else {
-            let store = dataset.object_store_for_base(base_id).await?;
+            let store = dataset.object_store(Some(base_id)).await?;
             store_cache.insert(base_id, store.clone());
             store
         }

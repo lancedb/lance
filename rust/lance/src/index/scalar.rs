@@ -381,7 +381,7 @@ pub async fn open_scalar_index(
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
-    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index)?);
+    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
@@ -424,16 +424,19 @@ pub(crate) async fn infer_scalar_index_details(
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
+    let object_store = dataset.object_store_for_index(index).await?;
     let index_details = if let DataType::List(_) = col.data_type() {
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
-    } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
+    } else if object_store.exists(&bitmap_page_lookup).await? {
         prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
-    } else if dataset.object_store.exists(&inverted_list_lookup).await? {
+    } else if object_store.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
         let parse_params = async || {
-            let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index).ok()?;
+            let index_store = LanceIndexStore::from_dataset_for_existing(dataset, index)
+                .await
+                .ok()?;
             let reader = index_store.open_index_file(METADATA_FILE).await.ok()?;
             let params_str = reader.schema().metadata.get("params")?;
             let params = ::serde_json::from_str::<InvertedIndexParams>(params_str).ok()?;
@@ -441,11 +444,7 @@ pub(crate) async fn infer_scalar_index_details(
             Some(prost_types::Any::from_msg(&details).unwrap())
         };
         parse_params().await.unwrap_or(default_details)
-    } else if dataset
-        .object_store
-        .exists(&legacy_inverted_list_lookup)
-        .await?
-    {
+    } else if object_store.exists(&legacy_inverted_list_lookup).await? {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()

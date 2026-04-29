@@ -3455,6 +3455,7 @@ fn inner_get_zonemap_stats<'local>(
                     for index in &indices {
                         let index_store = Arc::new(
                             LanceIndexStore::from_dataset_for_existing(&dataset, index)
+                                .await
                                 .map_err(Error::from)?,
                         );
                         let index_file = index_store

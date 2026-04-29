@@ -1028,7 +1028,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let mut merged_segment = crate::index::vector::ivf::merge_segments(
-            self.object_store(),
+            self.object_store.as_ref(),
             &self.indices_dir(),
             source_segments,
         )
@@ -1440,7 +1440,7 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta)?);
+        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
         let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
         if index_uri.is_none() {
             index_uri = Some(index_details.type_url.clone());
@@ -1659,7 +1659,8 @@ impl DatasetIndexInternalExt for Dataset {
             // Fall back to file existence check for older indices without file metadata
             let index_dir = self.indice_files_dir(&index_meta)?;
             let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
-            self.object_store.exists(&index_file).await?
+            let object_store = self.object_store_for_index(&index_meta).await?;
+            object_store.exists(&index_file).await?
         };
 
         if is_vector_index {
@@ -1707,6 +1708,11 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        let object_store = self.object_store_for_index(&index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -1715,11 +1721,7 @@ impl DatasetIndexInternalExt for Dataset {
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
             return entry
                 .0
-                .reconstruct(
-                    self.object_store.clone(),
-                    self.metadata_cache.as_ref(),
-                    partition_cache,
-                )
+                .reconstruct(object_store, self.metadata_cache.as_ref(), partition_cache)
                 .await;
         }
 
@@ -1730,13 +1732,9 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_meta = self
-            .load_index(uuid)
-            .await?
-            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
-        let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
+        let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
@@ -2429,7 +2427,8 @@ mod tests {
             .child(uuid.to_string())
             .child(INDEX_FILE_NAME);
         dataset
-            .object_store()
+            .object_store
+            .as_ref()
             .put(&index_path, payload)
             .await
             .unwrap();
@@ -2926,7 +2925,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
-        let io_tracker = dataset.object_store().io_tracker().clone();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
 
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
@@ -3688,10 +3687,10 @@ mod tests {
             )
             .await
             .unwrap();
-        dataset.object_store().io_stats_incremental(); // Reset
+        dataset.object_store.as_ref().io_stats_incremental(); // Reset
 
         let indices = dataset.load_indices().await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         // We should already have this cached since we just wrote it.
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
@@ -3704,13 +3703,13 @@ mod tests {
             .load()
             .await
             .unwrap();
-        let stats = dataset2.object_store().io_stats_incremental(); // Reset
+        let stats = dataset2.object_store.as_ref().io_stats_incremental(); // Reset
         assert_io_lt!(stats, read_bytes, 64 * 1024);
 
         // Because the manifest is so small, we should have opportunistically
         // cached the indices in memory already.
         let indices2 = dataset2.load_indices().await.unwrap();
-        let stats = dataset2.object_store().io_stats_incremental();
+        let stats = dataset2.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices2.len(), 1);
@@ -6836,7 +6835,7 @@ mod tests {
             .unwrap();
 
         // Reset IO stats before query
-        let _ = dataset.object_store().io_stats_incremental();
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
 
         // Query using the BTree index
         let results = dataset
@@ -6849,7 +6848,7 @@ mod tests {
         assert!(results.num_rows() > 0);
 
         // Verify IOPs - should be minimal (no HEAD requests)
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         // We expect reads for: index metadata + index pages + data files
         // The key assertion is that we don't have extra HEAD requests
         assert_io_lt!(
@@ -6903,7 +6902,7 @@ mod tests {
             .unwrap();
 
         // Reset IO stats before query
-        let _ = dataset.object_store().io_stats_incremental();
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
 
         // Query using the Bitmap index
         let results = dataset
@@ -6916,7 +6915,7 @@ mod tests {
         assert!(results.num_rows() > 0);
 
         // Verify IOPs
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(
             stats,
             read_iops,
@@ -6976,7 +6975,7 @@ mod tests {
             .unwrap();
 
         // Reset IO stats before query
-        let _ = dataset.object_store().io_stats_incremental();
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
 
         // Query using the Inverted index (full-text search)
         let results = dataset
@@ -6989,7 +6988,7 @@ mod tests {
         assert!(results.num_rows() > 0);
 
         // Verify IOPs
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(
             stats,
             read_iops,
@@ -7064,7 +7063,7 @@ mod tests {
         let _ = dataset.scan().try_into_batch().await.unwrap();
 
         // Reset IO stats before query
-        let _ = dataset.object_store().io_stats_incremental();
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
 
         // Query using the IVF_PQ index (KNN search)
         let query_vector: Vec<f32> = (0..dimension).map(|i| i as f32 / 1000.0).collect();
@@ -7079,7 +7078,7 @@ mod tests {
         assert!(results.num_rows() > 0);
 
         // Verify IOPs
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(
             stats,
             read_iops,

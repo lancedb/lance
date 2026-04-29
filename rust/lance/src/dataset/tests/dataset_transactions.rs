@@ -175,8 +175,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
-        Arc::as_ptr(&dataset.object_store().inner),
-        Arc::as_ptr(&dataset2.object_store().inner)
+        Arc::as_ptr(&dataset.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset2.object_store.as_ref().inner)
     );
 
     // If we create another with **different parameters**, it should create a new store.
@@ -195,8 +195,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
-        Arc::as_ptr(&dataset.object_store().inner),
-        Arc::as_ptr(&dataset3.object_store().inner)
+        Arc::as_ptr(&dataset.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset3.object_store.as_ref().inner)
     );
 
     // Remove both datasets
@@ -331,12 +331,12 @@ async fn test_inline_transaction() {
         .load()
         .await
         .unwrap();
-    let stats = read_ds2.object_store().io_stats_incremental(); // Reset
+    let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
     // Because the manifest is so small, we should have opportunistically
     // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-    let stats = read_ds2.object_store().io_stats_incremental();
+    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
     assert_eq!(inline_tx, tx);
@@ -344,9 +344,10 @@ async fn test_inline_transaction() {
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
-    let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
-        .await
-        .unwrap();
+    let tx_file =
+        crate::io::commit::write_transaction_file(ds.object_store.as_ref(), &ds.base, &tx)
+            .await
+            .unwrap();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),
@@ -356,7 +357,7 @@ async fn test_inline_transaction() {
         )
         .unwrap();
     let location = write_manifest_file(
-        ds.object_store(),
+        ds.object_store.as_ref(),
         ds.commit_handler.as_ref(),
         &ds.base,
         &mut manifest,

@@ -33,8 +33,9 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
-    StorageOptionsAccessor, StorageOptionsProvider,
+    ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
+    ObjectStoreParams, StorageOptions, StorageOptionsAccessor, StorageOptionsProvider,
+    WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::{
@@ -153,7 +154,9 @@ pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 /// Lance Dataset
 #[derive(Clone)]
 pub struct Dataset {
-    pub object_store: Arc<ObjectStore>,
+    /// The primary dataset object store. Use [`Self::object_store`] when
+    /// resolving files that may carry a base id.
+    pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
     /// Uri of the dataset.
     ///
@@ -505,7 +508,7 @@ impl Dataset {
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             .with_store_params(store_params.unwrap_or_default())
-            .with_object_store(Arc::new(self.object_store().clone()))
+            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         let dataset = builder.execute(transaction).await?;
@@ -1332,7 +1335,7 @@ impl Dataset {
     ) -> Result<()> {
         let (manifest, manifest_location) = commit_transaction(
             self,
-            self.object_store(),
+            self.object_store.as_ref(),
             self.commit_handler.as_ref(),
             &transaction,
             write_config,
@@ -1654,10 +1657,6 @@ impl Dataset {
             .await
     }
 
-    pub fn object_store(&self) -> &ObjectStore {
-        &self.object_store
-    }
-
     /// Clone this dataset with a different object store binding.
     ///
     /// The returned dataset shares metadata, session state, and caches with the
@@ -1674,6 +1673,73 @@ impl Dataset {
             cloned.store_params = Some(Box::new(store_params));
         }
         cloned
+    }
+
+    /// Clone this dataset with extra object store wrappers applied to all read stores.
+    ///
+    /// The returned dataset uses the wrappers for the already-open primary object
+    /// store and appends the same wrappers to the dataset-level and base-specific
+    /// object store params used when additional base stores are opened later.
+    pub fn with_object_store_wrappers(
+        &self,
+        wrappers: impl IntoIterator<Item = Arc<dyn WrappingObjectStore>>,
+    ) -> Self {
+        let wrappers = wrappers.into_iter().collect::<Vec<_>>();
+        if wrappers.is_empty() {
+            return self.clone();
+        }
+
+        let mut cloned = self.clone();
+        let mut object_store = self.object_store.as_ref().clone();
+        for wrapper in &wrappers {
+            object_store.inner =
+                wrapper.wrap(&object_store.store_prefix, object_store.inner.clone());
+        }
+        cloned.object_store = Arc::new(object_store);
+        cloned.refs = Refs::new(
+            cloned.object_store.clone(),
+            cloned.commit_handler.clone(),
+            cloned.branch_location(),
+        );
+
+        let store_params = self.store_params.as_deref().cloned().unwrap_or_default();
+        cloned.store_params = Some(Box::new(Self::append_object_store_wrappers(
+            store_params,
+            &wrappers,
+        )));
+        cloned.base_store_params = self.base_store_params.as_ref().map(|base_store_params| {
+            Arc::new(
+                base_store_params
+                    .iter()
+                    .map(|(base_path, store_params)| {
+                        (
+                            base_path.clone(),
+                            Self::append_object_store_wrappers(store_params.clone(), &wrappers),
+                        )
+                    })
+                    .collect(),
+            )
+        });
+        cloned
+    }
+
+    fn append_object_store_wrappers(
+        mut store_params: ObjectStoreParams,
+        wrappers: &[Arc<dyn WrappingObjectStore>],
+    ) -> ObjectStoreParams {
+        let mut all_wrappers = Vec::with_capacity(
+            store_params.object_store_wrapper.as_ref().map_or(0, |_| 1) + wrappers.len(),
+        );
+        if let Some(wrapper) = store_params.object_store_wrapper.take() {
+            all_wrappers.push(wrapper);
+        }
+        all_wrappers.extend(wrappers.iter().cloned());
+        store_params.object_store_wrapper = match all_wrappers.len() {
+            0 => None,
+            1 => all_wrappers.pop(),
+            _ => Some(Arc::new(ChainedWrappingObjectStore::new(all_wrappers))),
+        };
+        store_params
     }
 
     fn store_params_for_base(
@@ -1794,12 +1860,14 @@ impl Dataset {
         let data_dir = self.data_file_dir_for_base(base_id)?;
         let filepath = data_dir.child(path);
 
+        let object_store = self.object_store(base_id).await?;
+
         // Get file size
-        let file_size = self.object_store().size(&filepath).await?;
+        let file_size = object_store.size(&filepath).await?;
 
         // Read file metadata
         let scheduler = ScanScheduler::new(
-            self.object_store.clone(),
+            object_store.clone(),
             SchedulerConfig::new(2 * 1024 * 1024 * 1024),
         );
         let file = scheduler
@@ -1898,8 +1966,7 @@ impl Dataset {
         }
     }
 
-    /// Get the ObjectStore for a specific path based on base_id
-    pub(crate) async fn object_store_for_base(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
+    async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
@@ -1913,6 +1980,38 @@ impl Dataset {
         .await?;
 
         Ok(store)
+    }
+
+    /// Resolve the object store for the primary dataset or an additional base.
+    ///
+    /// Pass `None` to get the primary dataset object store. Pass `Some(base_id)`
+    /// when resolving a file whose metadata references an additional base.
+    pub async fn object_store(&self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
+        match base_id {
+            Some(base_id) => self.base_object_store(base_id).await,
+            None => Ok(self.object_store.clone()),
+        }
+    }
+
+    pub(crate) async fn object_store_for_data_file(
+        &self,
+        data_file: &DataFile,
+    ) -> Result<Arc<ObjectStore>> {
+        self.object_store(data_file.base_id).await
+    }
+
+    pub(crate) async fn object_store_for_deletion(
+        &self,
+        deletion_file: &DeletionFile,
+    ) -> Result<Arc<ObjectStore>> {
+        self.object_store(deletion_file.base_id).await
+    }
+
+    pub(crate) async fn object_store_for_index(
+        &self,
+        index: &IndexMetadata,
+    ) -> Result<Arc<ObjectStore>> {
+        self.object_store(index.base_id).await
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
@@ -2390,7 +2489,7 @@ impl Dataset {
     /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
     /// ```
     pub async fn migrate_manifest_paths_v2(&mut self) -> Result<()> {
-        migrate_scheme_to_v2(self.object_store(), &self.base).await?;
+        migrate_scheme_to_v2(self.object_store.as_ref(), &self.base).await?;
         // We need to re-open.
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
@@ -2421,7 +2520,7 @@ impl Dataset {
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
-            .with_object_store(Arc::new(self.object_store().clone()))
+            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         builder.execute(transaction).await
@@ -2658,11 +2757,11 @@ pub(crate) struct NewTransactionResult<'a> {
 pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
     // Re-use the same list call for getting the latest manifest and the metadata
     // for all manifests in between.
-    let io_parallelism = dataset.object_store().io_parallelism();
+    let io_parallelism = dataset.object_store.as_ref().io_parallelism();
     let latest_version = dataset.manifest.version;
     let locations = dataset
         .commit_handler
-        .list_manifest_locations(&dataset.base, dataset.object_store(), true)
+        .list_manifest_locations(&dataset.base, dataset.object_store.as_ref(), true)
         .try_take_while(move |location| {
             futures::future::ready(Ok(location.version > latest_version))
         });
@@ -2686,7 +2785,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 } else {
                     let loaded = Arc::new(
                         Dataset::load_manifest(
-                            dataset.object_store(),
+                            dataset.object_store.as_ref(),
                             &location,
                             &dataset.uri,
                             dataset.session.as_ref(),
@@ -2941,7 +3040,7 @@ impl Dataset {
             IndexType::Inverted => {
                 // Call merge_index_files function for inverted index
                 lance_index::scalar::inverted::builder::merge_index_files(
-                    self.object_store(),
+                    self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
                     progress,
@@ -2951,7 +3050,7 @@ impl Dataset {
             IndexType::BTree => {
                 // Call merge_index_files function for btree index
                 lance_index::scalar::btree::merge_index_files(
-                    self.object_store(),
+                    self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
                     batch_readhead,
@@ -2961,7 +3060,7 @@ impl Dataset {
             }
             IndexType::Bitmap => {
                 lance_index::scalar::bitmap::merge_index_files(
-                    self.object_store(),
+                    self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
                     progress,

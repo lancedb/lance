@@ -7610,7 +7610,9 @@ mod tests {
         // Use dataset's object_store to find and copy the manifest
         let versions_path = dataset.versions_dir();
         let manifest_metas: Vec<_> = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .list(Some(&versions_path))
             .try_collect()
@@ -7629,7 +7631,9 @@ mod tests {
 
         // Read the existing manifest data
         let manifest_data = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .get(&manifest_meta.location)
             .await
@@ -7641,7 +7645,9 @@ mod tests {
         // Write to a staging location using the dataset's object_store
         let staging_path = dataset.versions_dir().child("staging_manifest");
         dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .put(&staging_path, manifest_data.into())
             .await
@@ -7666,7 +7672,13 @@ mod tests {
             .version
             .expect("response should contain version info");
         let version_2_path = Path::parse(&version_info.manifest_path).unwrap();
-        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        let head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&version_2_path)
+            .await;
         assert!(
             head_result.is_ok(),
             "Version 2 manifest should exist at {}",
@@ -7674,7 +7686,13 @@ mod tests {
         );
 
         // Verify the staging file has been deleted
-        let staging_head_result = dataset.object_store().inner.head(&staging_path).await;
+        let staging_head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&staging_path)
+            .await;
         assert!(
             staging_head_result.is_err(),
             "Staging manifest should have been deleted after create_table_version"
@@ -7722,7 +7740,9 @@ mod tests {
         // Use dataset's object_store to find and copy the manifest
         let versions_path = dataset.versions_dir();
         let manifest_metas: Vec<_> = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .list(Some(&versions_path))
             .try_collect()
@@ -7741,7 +7761,9 @@ mod tests {
 
         // Read the existing manifest data
         let manifest_data = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .get(&manifest_meta.location)
             .await
@@ -7753,7 +7775,9 @@ mod tests {
         // Write to a staging location using the dataset's object_store
         let staging_path = dataset.versions_dir().child("staging_manifest");
         dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .put(&staging_path, manifest_data.into())
             .await
@@ -7792,7 +7816,13 @@ mod tests {
         );
 
         // Verify version 2 still exists using the dataset's object_store
-        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        let head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&version_2_path)
+            .await;
         assert!(
             head_result.is_ok(),
             "Version 2 manifest should still exist at {}",
@@ -8229,7 +8259,9 @@ mod tests {
             // Verify version 2 was created using the dataset's object_store
             // List manifests in the versions directory to find the V2 named manifest
             let manifest_metas: Vec<_> = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .list(Some(&dataset.versions_dir()))
                 .try_collect()
@@ -9084,7 +9116,9 @@ mod tests {
             // Find existing manifest and create a staging copy
             let versions_path = dataset.versions_dir();
             let manifest_metas: Vec<_> = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .list(Some(&versions_path))
                 .try_collect()
@@ -9102,7 +9136,9 @@ mod tests {
                 .expect("No manifest file found");
 
             let manifest_data = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .get(&manifest_meta.location)
                 .await
@@ -9115,7 +9151,9 @@ mod tests {
                 .versions_dir()
                 .child(format!("staging_{}", table_name));
             dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .put(&staging_path, manifest_data.into())
                 .await

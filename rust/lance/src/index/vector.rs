@@ -1582,11 +1582,12 @@ pub(crate) async fn open_vector_index_v2(
         .await?
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
     let index_dir = dataset.indice_files_dir(&index_meta)?;
+    let object_store = dataset.object_store_for_index(&index_meta).await?;
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
             let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = dataset.object_store().open(&aux_path).await?;
+            let aux_reader = object_store.open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
@@ -1613,7 +1614,7 @@ pub(crate) async fn open_vector_index_v2(
 
         "IVF_HNSW_SQ" => {
             let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = dataset.object_store().open(&aux_path).await?;
+            let aux_reader = object_store.open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions {
@@ -2552,7 +2553,12 @@ mod tests {
         let out_base = dataset.indices_dir().child(&*uuid);
         let training_path = out_base.child("global_training.idx");
 
-        let writer = dataset.object_store().create(&training_path).await.unwrap();
+        let writer = dataset
+            .object_store
+            .as_ref()
+            .create(&training_path)
+            .await
+            .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
         let mut v2w = lance_file::writer::FileWriter::try_new(
             writer,

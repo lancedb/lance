@@ -1535,11 +1535,13 @@ mod tests {
     async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
         let index_dir = dataset.indices_dir().child(uuid.to_string());
         dataset
-            .object_store()
+            .object_store
+            .as_ref()
             .put(&index_dir.child("index.idx"), b"idx")
             .await?;
         dataset
-            .object_store()
+            .object_store
+            .as_ref()
             .put(&index_dir.child("auxiliary.idx"), b"aux")
             .await?;
         Ok(())
@@ -1555,11 +1557,13 @@ mod tests {
             .child(staging_uuid.to_string())
             .child(format!("partial_{}", shard_uuid));
         dataset
-            .object_store()
+            .object_store
+            .as_ref()
             .put(&shard_dir.child("index.idx"), b"idx")
             .await?;
         dataset
-            .object_store()
+            .object_store
+            .as_ref()
             .put(&shard_dir.child("auxiliary.idx"), b"aux")
             .await?;
         Ok(())
@@ -2291,7 +2295,8 @@ mod tests {
         assert_eq!(removed.index_files_removed, 2);
         assert!(
             !dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
@@ -2303,7 +2308,8 @@ mod tests {
         );
         assert!(
             dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
@@ -2315,7 +2321,8 @@ mod tests {
         );
         assert!(
             dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
@@ -2355,7 +2362,8 @@ mod tests {
         assert_eq!(removed.index_files_removed, 4);
         assert!(
             !dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
@@ -2368,7 +2376,8 @@ mod tests {
         );
         assert!(
             !dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()

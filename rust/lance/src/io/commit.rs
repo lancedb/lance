@@ -581,7 +581,7 @@ pub(crate) async fn migrate_fragments(
             let mut data_files = fragment.files.clone();
 
             // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store();
+            let object_store = dataset.object_store.as_ref();
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
@@ -699,7 +699,8 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 let index_dir = dataset
                     .indice_files_dir(index)?
                     .child(index.uuid.to_string());
-                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+                let object_store = dataset.object_store_for_index(index).await?;
+                list_index_files_with_sizes(&object_store, &index_dir).await
             }
             .await;
             match result {
@@ -908,7 +909,7 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store()
+    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;

@@ -226,10 +226,8 @@ fn file_reader_take(
 
 async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     // Create file reader v2.
-    let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::new(2 * 1024 * 1024 * 1024),
-    );
+    let object_store = dataset.object_store(None).await.unwrap();
+    let scheduler = ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
     let file = scheduler
         .open_file(file_path, &CachedFileSize::unknown())
         .await

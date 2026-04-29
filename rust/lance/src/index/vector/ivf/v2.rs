@@ -2863,7 +2863,8 @@ mod tests {
                 .child(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
-                    .object_store()
+                    .object_store
+                    .as_ref()
                     .exists(&segment_index)
                     .await
                     .unwrap(),
@@ -3244,7 +3245,7 @@ mod tests {
 
         let progress = Arc::new(RecordingProgress::default());
         let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
-            dataset.object_store(),
+            dataset.object_store.as_ref(),
             &dataset.indices_dir(),
             segments,
             progress.clone(),
@@ -3385,7 +3386,7 @@ mod tests {
             .unwrap();
 
         let scheduler = ScanScheduler::new(
-            Arc::new(dataset.object_store().clone()),
+            Arc::new(dataset.object_store.as_ref().clone()),
             SchedulerConfig::default_for_testing(),
         );
         let sq_meta = get_sq_metadata(&dataset, scheduler, &segment.uuid.to_string()).await;
@@ -5367,11 +5368,11 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -5388,7 +5389,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -5398,7 +5399,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -5482,11 +5483,11 @@ mod tests {
         assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
 
         // Reset IO stats after index creation
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -5503,7 +5504,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -5513,7 +5514,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 

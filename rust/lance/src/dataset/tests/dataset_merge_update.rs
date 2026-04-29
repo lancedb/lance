@@ -1078,7 +1078,11 @@ async fn test_replace_dataset() {
         .await
         .unwrap();
 
-    ds.object_store().remove_dir_all(test_path).await.unwrap();
+    ds.object_store
+        .as_ref()
+        .remove_dir_all(test_path)
+        .await
+        .unwrap();
 
     let ds2 = InsertBuilder::new(&test_uri)
         .execute(vec![data2.clone()])

@@ -932,9 +932,10 @@ impl FileFragment {
                     .dataset
                     .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
+                let object_store = self.dataset.object_store_for_data_file(data_file).await?;
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = PreviousFileReader::try_new_with_fragment_id(
-                    &self.dataset.object_store,
+                    &object_store,
                     &path,
                     self.schema().clone(),
                     self.id() as u32,
@@ -963,7 +964,7 @@ impl FileFragment {
             let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
                 // TODO: make object stores for non-default bases reuse the same scan scheduler
                 //  currently we always create a new one
-                let object_store = self.dataset.object_store_for_base(base_id).await?;
+                let object_store = self.dataset.object_store(Some(base_id)).await?;
                 let config = SchedulerConfig::max_bandwidth(&object_store);
                 (
                     ScanScheduler::new(object_store, config),
@@ -1248,7 +1249,7 @@ impl FileFragment {
         }
 
         for data_file in &self.metadata.files {
-            data_file.validate(&self.dataset.data_file_dir(&self.metadata.files[0])?)?;
+            data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
@@ -1831,7 +1832,7 @@ impl FileFragment {
             self.metadata.id,
             self.dataset.version().version,
             &deletion_vector,
-            self.dataset.object_store(),
+            self.dataset.object_store.as_ref(),
         )
         .await?;
 
@@ -3954,7 +3955,7 @@ mod tests {
 
         // Assert file is small (< 4300 bytes)
         {
-            let stats = dataset.object_store().io_stats_incremental();
+            let stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_eq!(stats, write_iops, 3);
             assert_io_lt!(stats, written_bytes, 4300);
         }
@@ -3979,7 +3980,7 @@ mod tests {
         assert_eq!(data.num_rows(), 1);
         assert_eq!(data.num_columns(), 7);
 
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
     }

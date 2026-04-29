@@ -157,7 +157,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
         Ok(Self {
-            store: dataset.object_store().clone(),
+            store: dataset.object_store.as_ref().clone(),
             column,
             index_dir,
             distance_type,
@@ -224,7 +224,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
         Ok(Self {
-            store: dataset.object_store().clone(),
+            store: dataset.object_store.as_ref().clone(),
             column,
             index_dir,
             distance_type: ivf_index.metric_type(),

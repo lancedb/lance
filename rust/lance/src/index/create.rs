@@ -724,7 +724,7 @@ impl<'a> IndexSegmentBuilder<'a> {
             | IndexType::IvfHnswPq
             | IndexType::IvfHnswSq => {
                 crate::index::vector::ivf::build_segment(
-                    self.dataset.object_store(),
+                    self.dataset.object_store.as_ref(),
                     &self.dataset.indices_dir(),
                     plan,
                 )
@@ -1449,7 +1449,7 @@ mod tests {
         committed_index_metadata.fragment_bitmap = Some(fragment_ids.iter().copied().collect());
         committed_index_metadata.files = Some(
             list_index_files_with_sizes(
-                dataset.object_store(),
+                dataset.object_store.as_ref(),
                 &dataset.indices_dir().child(shared_uuid.clone()),
             )
             .await
@@ -1564,7 +1564,14 @@ mod tests {
                 .indices_dir()
                 .child(segment.uuid.to_string())
                 .child(crate::index::INDEX_FILE_NAME);
-            assert!(dataset.object_store().exists(&segment_index).await.unwrap());
+            assert!(
+                dataset
+                    .object_store
+                    .as_ref()
+                    .exists(&segment_index)
+                    .await
+                    .unwrap()
+            );
             input_segments.push(segment);
         }
 
@@ -1826,7 +1833,14 @@ mod tests {
                 .indices_dir()
                 .child(segment.uuid().to_string())
                 .child(lance_index::scalar::inverted::METADATA_FILE);
-            assert!(dataset.object_store().exists(&metadata_path).await.unwrap());
+            assert!(
+                dataset
+                    .object_store
+                    .as_ref()
+                    .exists(&metadata_path)
+                    .await
+                    .unwrap()
+            );
         }
 
         dataset

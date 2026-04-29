@@ -83,7 +83,8 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     let index_file = index_dir
         .child(index.uuid.to_string())
         .child(INDEX_FILE_NAME);
-    dataset.object_store.exists(&index_file).await
+    let object_store = dataset.object_store_for_index(index).await?;
+    object_store.exists(&index_file).await
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -567,7 +568,7 @@ mod tests {
         );
 
         // There should be two indices directories existed.
-        let object_store = dataset.object_store();
+        let object_store = dataset.object_store.as_ref();
         let index_dirs = object_store.read_dir(dataset.indices_dir()).await.unwrap();
         assert_eq!(index_dirs.len(), 2);
 

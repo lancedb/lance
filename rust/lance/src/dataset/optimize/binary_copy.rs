@@ -250,7 +250,7 @@ pub async fn rewrite_files_binary_copy(
     for frag in fragments.iter() {
         for df in frag.files.iter() {
             let object_store = if let Some(base_id) = df.base_id {
-                dataset.object_store_for_base(base_id).await?
+                dataset.object_store(Some(base_id)).await?
             } else {
                 dataset.object_store.clone()
             };
