@@ -4162,28 +4162,12 @@ fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
 }
 
 fn vector_query_query_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<i32> {
-    let query_parallelism = dict
-        .get_item("query_parallelism")?
-        .filter(|value| !value.is_none())
-        .map(|value| extract_query_parallelism(&value))
-        .transpose()?;
-    let partition_parallelism = dict
-        .get_item("partition_parallelism")?
-        .filter(|value| !value.is_none())
-        .map(|value| extract_query_parallelism(&value))
-        .transpose()?;
-
-    match (query_parallelism, partition_parallelism) {
-        (Some(query_parallelism), Some(partition_parallelism))
-            if query_parallelism != partition_parallelism =>
-        {
-            Err(PyValueError::new_err(
-                "query_parallelism and partition_parallelism cannot both be set to different values",
-            ))
-        }
-        (Some(query_parallelism), _) => Ok(query_parallelism),
-        (_, Some(partition_parallelism)) => Ok(partition_parallelism),
-        _ => Ok(DEFAULT_QUERY_PARALLELISM),
+    if let Some(query_parallelism) = dict.get_item("query_parallelism")?
+        && !query_parallelism.is_none()
+    {
+        extract_query_parallelism(&query_parallelism)
+    } else {
+        Ok(DEFAULT_QUERY_PARALLELISM)
     }
 }
 

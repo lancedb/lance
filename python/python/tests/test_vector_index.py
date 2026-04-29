@@ -1915,42 +1915,6 @@ def test_vector_index_invalid_query_parallelism(indexed_dataset):
         )
 
 
-def test_vector_index_partition_parallelism_alias(indexed_dataset):
-    q = np.random.randn(128)
-
-    with_new_name = indexed_dataset.to_table(
-        nearest={
-            "column": "vector",
-            "q": q,
-            "k": 10,
-            "query_parallelism": -1,
-        }
-    )
-    with_old_name = indexed_dataset.to_table(
-        nearest={
-            "column": "vector",
-            "q": q,
-            "k": 10,
-            "partition_parallelism": -1,
-        }
-    )
-
-    assert with_new_name == with_old_name
-
-
-def test_vector_index_query_parallelism_rejects_conflicting_alias(indexed_dataset):
-    with pytest.raises(ValueError, match="query_parallelism and partition_parallelism"):
-        indexed_dataset.scanner(
-            nearest={
-                "column": "vector",
-                "q": np.random.randn(128),
-                "k": 10,
-                "query_parallelism": 1,
-                "partition_parallelism": -1,
-            }
-        )
-
-
 def test_knn_deleted_rows(tmp_path):
     data = create_table()
     ds = lance.write_dataset(data, tmp_path)

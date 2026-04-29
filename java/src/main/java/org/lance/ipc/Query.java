@@ -98,14 +98,6 @@ public class Query {
     return queryParallelism;
   }
 
-  /**
-   * @deprecated Use {@link #getQueryParallelism()} instead.
-   */
-  @Deprecated
-  public int getPartitionParallelism() {
-    return getQueryParallelism();
-  }
-
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -277,14 +269,6 @@ public class Query {
           queryParallelism >= -1, "Query parallelism must be greater than or equal to -1");
       this.queryParallelism = queryParallelism;
       return this;
-    }
-
-    /**
-     * @deprecated Use {@link #setQueryParallelism(int)} instead.
-     */
-    @Deprecated
-    public Builder setPartitionParallelism(int queryParallelism) {
-      return setQueryParallelism(queryParallelism);
     }
 
     /**

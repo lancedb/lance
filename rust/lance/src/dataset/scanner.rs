@@ -1690,12 +1690,6 @@ impl Scanner {
         self
     }
 
-    /// Configure partition-search concurrency for each vector query.
-    #[deprecated(note = "Use query_parallelism instead")]
-    pub fn partition_parallelism(&mut self, query_parallelism: i32) -> &mut Self {
-        self.query_parallelism(query_parallelism)
-    }
-
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
         self.legacy_with_row_id = true;

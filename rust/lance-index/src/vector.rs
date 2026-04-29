@@ -81,8 +81,6 @@ pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
 });
 
 pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
-#[deprecated(note = "Use DEFAULT_QUERY_PARALLELISM instead")]
-pub const DEFAULT_PARTITION_PARALLELISM: i32 = DEFAULT_QUERY_PARALLELISM;
 
 /// Query parameters for the vector indices
 

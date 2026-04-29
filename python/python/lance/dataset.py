@@ -5625,7 +5625,6 @@ class ScannerBuilder:
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
-        partition_parallelism: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -5638,8 +5637,6 @@ class ScannerBuilder:
             the CPU pool size. Value 1 uses the single-worker sequential path.
             Values >= 2 use the partition-parallel path and are clamped to the
             CPU pool size.
-        partition_parallelism: int, optional
-            Deprecated alias for query_parallelism.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -5654,7 +5651,6 @@ class ScannerBuilder:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
-            partition_parallelism=partition_parallelism,
             distance_range=distance_range,
         )
         return self
@@ -6771,7 +6767,6 @@ def _build_vector_search_query(
     use_index: bool = True,
     ef: Optional[int] = None,
     query_parallelism: Optional[int] = None,
-    partition_parallelism: Optional[int] = None,
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -6805,8 +6800,6 @@ def _build_vector_search_query(
         maps to the single-worker sequential path. Value -1 uses the CPU pool
         size. Value 1 uses the single-worker sequential path. Values >= 2 use
         the partition-parallel path and are clamped to the CPU pool size.
-    partition_parallelism: int, optional
-        Deprecated alias for query_parallelism.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -6874,17 +6867,7 @@ def _build_vector_search_query(
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
         raise ValueError(f"ef must be > 0 but got {ef}")
-    if query_parallelism is not None and partition_parallelism is not None:
-        query_parallelism = operator.index(query_parallelism)
-        partition_parallelism = operator.index(partition_parallelism)
-        if query_parallelism != partition_parallelism:
-            raise ValueError(
-                "query_parallelism and partition_parallelism cannot both be set "
-                "to different values"
-            )
-    elif partition_parallelism is not None:
-        query_parallelism = operator.index(partition_parallelism)
-    elif query_parallelism is not None:
+    if query_parallelism is not None:
         query_parallelism = operator.index(query_parallelism)
 
     if query_parallelism is not None and query_parallelism < -1:
@@ -7080,7 +7063,6 @@ class VectorSearchQuery:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
-        partition_parallelism: Optional[int] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -7094,7 +7076,6 @@ class VectorSearchQuery:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
-            partition_parallelism=partition_parallelism,
         )
 
     def inner(self):
