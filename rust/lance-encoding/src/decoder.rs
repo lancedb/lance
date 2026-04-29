@@ -1975,8 +1975,9 @@ pub struct DecoderConfig {
     /// [`schedule_and_decode`].
     ///
     /// * `None` - default behavior: scheduling runs inline on the stream's
-    ///   first poll for small requests and on a spawned task otherwise (see
-    ///   [`inline_scheduling_threshold`]).
+    ///   first poll when the request is small (controlled by the
+    ///   `LANCE_INLINE_SCHEDULING_THRESHOLD` env var) and on a spawned task
+    ///   otherwise.
     /// * `Some(true)` - always run scheduling inline.
     /// * `Some(false)` - always spawn a task for scheduling.
     pub inline_scheduling: Option<bool>,
