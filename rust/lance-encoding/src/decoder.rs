@@ -276,13 +276,13 @@ fn default_cache_repetition_index() -> bool {
 }
 
 fn inline_scheduling_threshold() -> u64 {
-    // Read every call (rather than caching) so benchmarks and tests can flip
-    // the threshold between iterations.  The cost is one process-env lookup,
-    // which is negligible next to the scheduling work that follows.
-    std::env::var(ENV_LANCE_INLINE_SCHEDULING_THRESHOLD)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INLINE_SCHEDULING_THRESHOLD)
+    static THRESHOLD: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var(ENV_LANCE_INLINE_SCHEDULING_THRESHOLD)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INLINE_SCHEDULING_THRESHOLD)
+    })
 }
 
 /// Top-level encoding message for a page.  Wraps both the
