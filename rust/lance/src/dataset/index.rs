@@ -241,7 +241,7 @@ mod tests {
                 .unwrap();
         }
 
-        let segments = vec![
+        let segments = [
             IndexMetadata {
                 uuid: first_segment_uuid,
                 fragment_bitmap: Some(std::iter::once(target_fragments[0].id() as u32).collect()),
@@ -253,6 +253,26 @@ mod tests {
                 ..built_index
             },
         ];
+
+        let segments = segments
+            .iter()
+            .map(|segment| {
+                crate::index::IndexSegment::new(
+                    segment.uuid,
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .expect("test segment metadata should have fragment coverage")
+                        .iter(),
+                    segment
+                        .index_details
+                        .as_ref()
+                        .expect("test segment metadata should have index details")
+                        .clone(),
+                    segment.index_version,
+                )
+            })
+            .collect::<Vec<_>>();
 
         dataset
             .commit_existing_index_segments("vector_idx", "vector", segments)

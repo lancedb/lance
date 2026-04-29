@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import operator
 import os
 import random
 import time
@@ -48,7 +49,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, SupportedDistributedIndices
+from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -815,13 +816,12 @@ class LanceDataset(pa.dataset.Dataset):
 
     def list_indices(self) -> List[Index]:
         """
-        Returns physical index segment information for all indices in the dataset.
+        Returns index information for all indices in the dataset.
 
         This method is deprecated as it requires loading the statistics for each index
-        which can be a very expensive operation.  It also exposes physical index
-        segments directly.  Instead use describe_indices() for logical index
-        descriptions and index_statistics() to get the statistics for individual
-        indexes of interest.
+        which can be a very expensive operation.  Instead use describe_indices() to
+        list index information and index_statistics() to get the statistics for
+        individual indexes of interest.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -832,7 +832,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.load_indices()
 
     def describe_indices(self) -> List[IndexDescription]:
-        """Returns logical index information aggregated across all segments."""
+        """Returns index information for all indices in the dataset."""
         return self._ds.describe_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
@@ -3586,7 +3586,7 @@ class LanceDataset(pa.dataset.Dataset):
             This enables distributed/fragment-level indexing. When provided, the
             method creates one segment but does not commit the index
             to the dataset. The returned metadata can be passed to
-            optionally merged with ``merge_existing_index_segments(...)``
+            ``create_index_segment_builder().with_index_type(...).with_segments(...)``
             and then committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
@@ -3770,9 +3770,10 @@ class LanceDataset(pa.dataset.Dataset):
         1. run :meth:`create_index_uncommitted` on each worker with that worker's
            assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. optionally merge one or more caller-defined groups with
-           :meth:`merge_existing_index_segments`
-        4. commit the final segment list with
+        3. call :meth:`IndexSegmentBuilder.with_index_type` with the concrete
+           distributed index type
+        4. pass them to :meth:`IndexSegmentBuilder.with_segments`
+        5. build one or more physical segments and commit them with
            :meth:`commit_existing_index_segments`
 
         Parameters are the same as :meth:`create_index`, with one additional
@@ -3853,9 +3854,9 @@ class LanceDataset(pa.dataset.Dataset):
         Merge distributed scalar index metadata.
 
         Vector distributed indexing no longer uses this API. For vector indices,
-        build segments with :meth:`create_index_uncommitted`, optionally merge
-        caller-defined groups with :meth:`merge_existing_index_segments`, and
-        publish them with :meth:`commit_existing_index_segments`.
+        build segments with :meth:`create_index_uncommitted`, plan or
+        merge them with :meth:`create_index_segment_builder`, and publish them
+        with :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
@@ -3892,6 +3893,17 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
         return None
 
+    def create_index_segment_builder(self):
+        """
+        Create a builder for turning existing segments into physical segments.
+
+        Provide the segment metadata returned by
+        :meth:`create_index_uncommitted` through
+        :meth:`IndexSegmentBuilder.with_segments`, and declare the segment type
+        with :meth:`IndexSegmentBuilder.with_index_type`.
+        """
+        return self._ds.create_index_segment_builder()
+
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """
         Merge one caller-defined group of existing uncommitted segments.
@@ -3899,7 +3911,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.merge_existing_index_segments(segments)
 
     def commit_existing_index_segments(
-        self, index_name: str, column: str, segments: List[Index]
+        self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
     ) -> LanceDataset:
         """
         Commit built index segments as one logical index.
@@ -4789,7 +4801,7 @@ class Index:
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
-    index_details: Optional[tuple[str, bytes]] = None
+    index_details: Optional[Tuple[str, bytes]] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -5620,8 +5632,21 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        query_parallelism: Optional[int] = None,
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ) -> ScannerBuilder:
+        """Configure nearest neighbor search.
+
+        Parameters
+        ----------
+        query_parallelism: int, optional
+            Maximum partition-search concurrency for a single vector query.
+            The default is 0. Value 0 uses the automatic policy, which
+            currently maps to the single-worker sequential path. Value -1 uses
+            the CPU pool size. Value 1 uses the single-worker sequential path.
+            Values >= 2 use the partition-parallel path and are clamped to the
+            CPU pool size.
+        """
         self._nearest = _build_vector_search_query(
             column,
             q,
@@ -5634,6 +5659,7 @@ class ScannerBuilder:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            query_parallelism=query_parallelism,
             distance_range=distance_range,
         )
         return self
@@ -6749,6 +6775,7 @@ def _build_vector_search_query(
     refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
+    query_parallelism: Optional[int] = None,
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -6776,6 +6803,12 @@ def _build_vector_search_query(
         Whether to use the index for the search.
     ef: int, optional
         The ef parameter for HNSW search.
+    query_parallelism: int, optional
+        Maximum partition-search concurrency for a single vector query.
+        The default is 0. Value 0 uses the automatic policy, which currently
+        maps to the single-worker sequential path. Value -1 uses the CPU pool
+        size. Value 1 uses the single-worker sequential path. Values >= 2 use
+        the partition-parallel path and are clamped to the CPU pool size.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -6843,6 +6876,11 @@ def _build_vector_search_query(
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
         raise ValueError(f"ef must be > 0 but got {ef}")
+    if query_parallelism is not None:
+        query_parallelism = operator.index(query_parallelism)
+
+    if query_parallelism is not None and query_parallelism < -1:
+        raise ValueError("query_parallelism must be >= -1")
 
     if distance_range is not None:
         if len(distance_range) != 2:
@@ -6860,6 +6898,7 @@ def _build_vector_search_query(
         "refine_factor": refine_factor,
         "use_index": use_index,
         "ef": ef,
+        "query_parallelism": query_parallelism,
         "distance_range": distance_range,
     }
 
@@ -7032,6 +7071,7 @@ class VectorSearchQuery:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        query_parallelism: Optional[int] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -7044,6 +7084,7 @@ class VectorSearchQuery:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            query_parallelism=query_parallelism,
         )
 
     def inner(self):

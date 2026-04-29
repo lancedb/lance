@@ -37,16 +37,21 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
+use lance_core::{
+    ROW_ID_FIELD,
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+};
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
+use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
+use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::{
-    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, Query, flat::compute_distance,
+    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query, VectorIndex,
+    flat::compute_distance,
 };
-use lance_index::vector::{DIST_Q_C_COLUMN, VectorIndex};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
@@ -98,6 +103,28 @@ impl AnnIndexMetrics {
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
+}
+
+async fn find_partitions_on_cpu(
+    index: Arc<dyn VectorIndex>,
+    query: Query,
+) -> DataFusionResult<(UInt32Array, Float32Array)> {
+    spawn_cpu(move || index.find_partitions(&query))
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {}", e)))
+}
+
+fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusionResult<Query> {
+    if index.metric_type() != DistanceType::Cosine {
+        return Ok(query);
+    }
+
+    let mut query = query;
+    let key = normalize_arrow(&query.key)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to normalize query: {e}")))?
+        .0;
+    query.key = key;
+    Ok(query)
 }
 
 /// [ExecutionPlan] compute vector distance from a query vector.
@@ -506,19 +533,14 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     let index = ds
                         .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                         .await?;
-                    let mut query = query.clone();
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
+                    // Normalize cosine queries once before partition ranking.
+                    let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
                     let (partitions, dist_q_c) = {
                         let _timer = metrics.find_partitions_elapsed.timer();
-                        index.find_partitions(&query).map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to find partitions: {}", e))
-                        })?
+                        find_partitions_on_cpu(index, query).await?
                     };
 
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
@@ -750,7 +772,84 @@ impl ANNIvfEarlySearchResults {
     }
 }
 
+struct LatePartitionSearchControl {
+    state: Arc<ANNIvfEarlySearchResults>,
+    max_results: usize,
+}
+
+impl PartitionSearchControl for LatePartitionSearchControl {
+    fn should_stop(&self) -> bool {
+        self.state.num_results_found.load(Ordering::Relaxed) >= self.max_results
+    }
+
+    fn record_batch(&self, batch: &RecordBatch) {
+        self.state.record_late_batch(batch.num_rows());
+    }
+}
+
+fn effective_query_parallelism(query: &Query, index: &dyn VectorIndex) -> usize {
+    let cpu_pool_size = get_num_compute_intensive_cpus();
+    effective_query_parallelism_for(
+        query,
+        cpu_pool_size,
+        index.auto_query_parallelism(cpu_pool_size),
+    )
+}
+
+fn effective_query_parallelism_for(
+    query: &Query,
+    cpu_pool_size: usize,
+    auto_parallelism: usize,
+) -> usize {
+    let cpu_pool_size = cpu_pool_size.max(1);
+    match query.query_parallelism {
+        -1 => cpu_pool_size,
+        0 => auto_parallelism.clamp(1, cpu_pool_size),
+        n if n > 0 => (n as usize).min(cpu_pool_size).max(1),
+        _ => 1,
+    }
+}
+
 impl ANNIvfSubIndexExec {
+    async fn search_partition(
+        index: Arc<dyn VectorIndex>,
+        query: Query,
+        part_id: usize,
+        pre_filter: Arc<DatasetPreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+    ) -> DataFusionResult<RecordBatch> {
+        let batch = index
+            .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
+            .await?;
+        metrics.baseline_metrics.record_output(batch.num_rows());
+        Ok(batch)
+    }
+
+    fn instrument_sequential_partition_stream(
+        stream: stream::BoxStream<'static, DataFusionResult<RecordBatch>>,
+        metrics: Arc<AnnIndexMetrics>,
+        state: Arc<ANNIvfEarlySearchResults>,
+        record_initial: bool,
+        record_partition_per_batch: bool,
+    ) -> stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
+        stream
+            .map(move |batch| {
+                let metrics = metrics.clone();
+                let state = state.clone();
+                batch.inspect(move |batch| {
+                    if record_partition_per_batch {
+                        metrics.partitions_searched.add(1);
+                    }
+                    metrics.baseline_metrics.record_output(batch.num_rows());
+                    if record_initial {
+                        state.record_batch(batch);
+                    }
+                })
+            })
+            .boxed()
+    }
+
     fn late_search(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -828,6 +927,44 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
+            let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+            if query_parallelism <= 1 {
+                return stream::once(async move {
+                    let prefilter: Arc<dyn PreFilter> = prefilter;
+                    let index_metrics: Arc<dyn MetricsCollector> =
+                        Arc::new(metrics.index_metrics.clone());
+                    let stream = index
+                        .search_partitions(
+                            query,
+                            partitions,
+                            q_c_dists,
+                            min_nprobes,
+                            max_nprobes,
+                            prefilter,
+                            Some(Arc::new(LatePartitionSearchControl {
+                                state: state.clone(),
+                                max_results,
+                            })),
+                            index_metrics,
+                        )
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!("Failed to search partitions: {e}"))
+                        })?;
+                    Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
+                        Self::instrument_sequential_partition_stream(
+                            stream.boxed(),
+                            metrics,
+                            state,
+                            false,
+                            true,
+                        ),
+                    )
+                })
+                .try_flatten()
+                .boxed();
+            }
+
             futures::stream::iter(min_nprobes..max_nprobes)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
@@ -838,28 +975,15 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     async move {
-                        let mut query = query.clone();
-                        if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?.0;
-                            query.key = key;
-                        };
-
                         metrics.partitions_searched.add(1);
-                        let batch = index
-                            .search_in_partition(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                &metrics.index_metrics,
-                            )
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to calculate KNN: {}",
-                                    e
-                                ))
-                            })
-                            .await?;
-                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        let batch = Self::search_partition(
+                            index,
+                            query,
+                            part_id as usize,
+                            pre_filter,
+                            metrics,
+                        )
+                        .await?;
                         state.record_late_batch(batch.num_rows());
                         Ok(batch)
                     }
@@ -868,7 +992,7 @@ impl ANNIvfSubIndexExec {
                     let found_so_far = state_clone.num_results_found.load(Ordering::Relaxed);
                     std::future::ready(found_so_far < max_results)
                 })
-                .buffered(get_num_compute_intensive_cpus())
+                .buffered(query_parallelism)
                 .boxed()
         });
         stream.flatten()
@@ -884,8 +1008,44 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
-        metrics.partitions_searched.add(minimum_nprobes);
 
+        let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+        if query_parallelism <= 1 {
+            metrics.partitions_searched.add(minimum_nprobes);
+            return stream::once(async move {
+                let prefilter: Arc<dyn PreFilter> = prefilter;
+                let index_metrics: Arc<dyn MetricsCollector> =
+                    Arc::new(metrics.index_metrics.clone());
+                let stream = index
+                    .search_partitions(
+                        query,
+                        partitions,
+                        q_c_dists,
+                        0,
+                        minimum_nprobes,
+                        prefilter,
+                        None,
+                        index_metrics,
+                    )
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to search partitions: {e}"))
+                    })?;
+                Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
+                    Self::instrument_sequential_partition_stream(
+                        stream.boxed(),
+                        metrics,
+                        state,
+                        true,
+                        false,
+                    ),
+                )
+            })
+            .try_flatten()
+            .boxed();
+        }
+
+        metrics.partitions_searched.add(minimum_nprobes);
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
                 let part_id = partitions.value(idx);
@@ -896,29 +1056,15 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let mut query = query.clone();
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
-
-                    let batch = index
-                        .search_in_partition(
-                            part_id as usize,
-                            &query,
-                            pre_filter,
-                            &metrics.index_metrics,
-                        )
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
-                        })
-                        .await?;
-                    metrics.baseline_metrics.record_output(batch.num_rows());
+                    let batch =
+                        Self::search_partition(index, query, part_id as usize, pre_filter, metrics)
+                            .await?;
                     state.record_batch(&batch);
                     Ok(batch)
                 }
             })
-            .buffered(get_num_compute_intensive_cpus())
+            .buffered(query_parallelism)
+            .boxed()
     }
 }
 
@@ -1076,6 +1222,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
+                        let query = normalize_query_for_index(raw_index.as_ref(), query)?;
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -1370,17 +1517,26 @@ mod tests {
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use async_trait::async_trait;
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
-    use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
+    use lance_index::{Index, IndexType};
+    use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
@@ -1399,8 +1555,466 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         }
+    }
+
+    #[test]
+    fn test_effective_query_parallelism_clamps_to_cpu_pool() {
+        let mut query = base_query();
+
+        query.query_parallelism = -1;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+
+        query.query_parallelism = 0;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 1);
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 8);
+        assert_eq!(effective_query_parallelism_for(&query, 16, 128), 16);
+
+        query.query_parallelism = 1;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 1);
+
+        query.query_parallelism = 4;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 4);
+
+        query.query_parallelism = 128;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+    }
+
+    #[derive(Debug, DeepSizeOf)]
+    struct ThreadCapturingIndex {
+        thread_name: Arc<Mutex<Option<String>>>,
+        row_ids: Vec<u64>,
+    }
+
+    #[derive(Debug, DeepSizeOf)]
+    struct PreparedThreadCapturingIndex {
+        prepared_partitions: Arc<Mutex<Vec<usize>>>,
+        searched_partitions: Arc<Mutex<Vec<usize>>>,
+        search_threads: Arc<Mutex<Vec<String>>>,
+        row_ids: Vec<u64>,
+    }
+
+    #[async_trait]
+    impl Index for ThreadCapturingIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Vector
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for ThreadCapturingIndex {
+        async fn search(
+            &self,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!()
+        }
+
+        fn find_partitions(&self, _query: &Query) -> Result<(UInt32Array, Float32Array)> {
+            let thread_name = std::thread::current()
+                .name()
+                .unwrap_or("unknown")
+                .to_string();
+            *self.thread_name.lock().unwrap() = Some(thread_name);
+            Ok((UInt32Array::from(vec![0]), Float32Array::from(vec![0.0])))
+        }
+
+        fn total_partitions(&self) -> usize {
+            1
+        }
+
+        async fn search_in_partition(
+            &self,
+            _partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!()
+        }
+
+        fn is_loadable(&self) -> bool {
+            false
+        }
+
+        fn use_residual(&self) -> bool {
+            false
+        }
+
+        async fn load(
+            &self,
+            _reader: Arc<dyn Reader>,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<Box<dyn VectorIndex>> {
+            unimplemented!()
+        }
+
+        fn num_rows(&self) -> u64 {
+            0
+        }
+
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
+            Box::new(self.row_ids.iter())
+        }
+
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
+
+        fn ivf_model(&self) -> &lance_index::vector::ivf::storage::IvfModel {
+            unimplemented!()
+        }
+
+        fn quantizer(&self) -> lance_index::vector::quantizer::Quantizer {
+            unimplemented!()
+        }
+
+        fn partition_size(&self, _part_id: usize) -> usize {
+            unimplemented!()
+        }
+
+        fn sub_index_type(
+            &self,
+        ) -> (
+            lance_index::vector::v3::subindex::SubIndexType,
+            lance_index::vector::quantizer::QuantizationType,
+        ) {
+            unimplemented!()
+        }
+
+        fn metric_type(&self) -> DistanceType {
+            DistanceType::L2
+        }
+    }
+
+    #[async_trait]
+    impl Index for PreparedThreadCapturingIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Vector
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for PreparedThreadCapturingIndex {
+        async fn search(
+            &self,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!()
+        }
+
+        fn find_partitions(&self, _query: &Query) -> Result<(UInt32Array, Float32Array)> {
+            unimplemented!()
+        }
+
+        fn total_partitions(&self) -> usize {
+            self.row_ids.len()
+        }
+
+        async fn search_in_partition(
+            &self,
+            _partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            panic!("sequential prepared path should not call search_in_partition")
+        }
+
+        async fn prepare_partition_search(
+            &self,
+            partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<PreparedPartitionSearchHandle> {
+            self.prepared_partitions.lock().unwrap().push(partition_id);
+            Ok(Box::new(partition_id))
+        }
+
+        fn search_prepared_partition(
+            &self,
+            prepared: PreparedPartitionSearchHandle,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            let partition_id = *prepared.downcast::<usize>().unwrap();
+            self.searched_partitions.lock().unwrap().push(partition_id);
+            self.search_threads.lock().unwrap().push(
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unknown")
+                    .to_string(),
+            );
+            Ok(RecordBatch::try_new(
+                KNN_INDEX_SCHEMA.clone(),
+                vec![
+                    Arc::new(Float32Array::from(vec![partition_id as f32])),
+                    Arc::new(UInt64Array::from(vec![self.row_ids[partition_id]])),
+                ],
+            )?)
+        }
+
+        fn supports_prepared_partition_search(&self) -> bool {
+            true
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn search_partitions(
+            self: Arc<Self>,
+            _query: Query,
+            partitions: Arc<UInt32Array>,
+            _q_c_dists: Arc<Float32Array>,
+            start_idx: usize,
+            end_idx: usize,
+            _pre_filter: Arc<dyn PreFilter>,
+            control: Option<Arc<dyn PartitionSearchControl>>,
+            _metrics: Arc<dyn lance_index::metrics::MetricsCollector>,
+        ) -> Result<SendableRecordBatchStream> {
+            let (batch_tx, batch_rx) = mpsc::channel(1);
+            let batch_tx_for_search = batch_tx.clone();
+            let prepared_partition_ids = (start_idx..end_idx)
+                .map(|idx| partitions.value(idx) as usize)
+                .collect::<Vec<_>>();
+            self.prepared_partitions
+                .lock()
+                .unwrap()
+                .extend(prepared_partition_ids.iter().copied());
+            tokio::spawn(async move {
+                let search_result = spawn_cpu(move || -> DataFusionResult<()> {
+                    for partition_id in prepared_partition_ids {
+                        if control
+                            .as_ref()
+                            .is_some_and(|control| control.should_stop())
+                        {
+                            return Ok(());
+                        }
+                        let batch = self
+                            .search_prepared_partition(
+                                Box::new(partition_id),
+                                &lance_index::metrics::NoOpMetricsCollector,
+                            )
+                            .map_err(datafusion::error::DataFusionError::from);
+                        match batch {
+                            Ok(batch) => {
+                                if let Some(control) = control.as_ref() {
+                                    control.record_batch(&batch);
+                                }
+                                if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Err(err) => {
+                                let _ = batch_tx_for_search.blocking_send(Err(err));
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+
+                if let Err(err) = search_result {
+                    let _ = batch_tx.send(Err(err)).await;
+                }
+            });
+
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                KNN_INDEX_SCHEMA.clone(),
+                ReceiverStream::new(batch_rx),
+            )))
+        }
+
+        fn is_loadable(&self) -> bool {
+            false
+        }
+
+        fn use_residual(&self) -> bool {
+            false
+        }
+
+        async fn load(
+            &self,
+            _reader: Arc<dyn Reader>,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<Box<dyn VectorIndex>> {
+            unimplemented!()
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.row_ids.len() as u64
+        }
+
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
+            Box::new(self.row_ids.iter())
+        }
+
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
+
+        fn ivf_model(&self) -> &lance_index::vector::ivf::storage::IvfModel {
+            unimplemented!()
+        }
+
+        fn quantizer(&self) -> lance_index::vector::quantizer::Quantizer {
+            unimplemented!()
+        }
+
+        fn partition_size(&self, _part_id: usize) -> usize {
+            unimplemented!()
+        }
+
+        fn sub_index_type(
+            &self,
+        ) -> (
+            lance_index::vector::v3::subindex::SubIndexType,
+            lance_index::vector::quantizer::QuantizationType,
+        ) {
+            unimplemented!()
+        }
+
+        fn metric_type(&self) -> DistanceType {
+            DistanceType::L2
+        }
+    }
+
+    async fn empty_prefilter() -> Arc<DatasetPreFilter> {
+        static NEXT_PREFILTER_DATASET_ID: AtomicUsize = AtomicUsize::new(0);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let uri = format!(
+            "memory://sequential-prefilter-{}",
+            NEXT_PREFILTER_DATASET_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                &uri,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut indexed_fragments = RoaringBitmap::new();
+        for fragment in dataset.manifest.fragments.iter() {
+            indexed_fragments.insert(fragment.id as u32);
+        }
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            name: "test".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(indexed_fragments),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
+        prefilter.wait_for_ready().await.unwrap();
+        prefilter
+    }
+
+    fn prepared_metrics() -> Arc<AnnIndexMetrics> {
+        Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
+    }
+
+    type PreparedIndexState = (
+        Arc<dyn VectorIndex>,
+        Arc<Mutex<Vec<usize>>>,
+        Arc<Mutex<Vec<usize>>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    fn prepared_index(row_ids: Vec<u64>) -> PreparedIndexState {
+        let prepared_partitions = Arc::new(Mutex::new(Vec::new()));
+        let searched_partitions = Arc::new(Mutex::new(Vec::new()));
+        let search_threads = Arc::new(Mutex::new(Vec::new()));
+        let index: Arc<dyn VectorIndex> = Arc::new(PreparedThreadCapturingIndex {
+            prepared_partitions: prepared_partitions.clone(),
+            searched_partitions: searched_partitions.clone(),
+            search_threads: search_threads.clone(),
+            row_ids,
+        });
+        (
+            index,
+            prepared_partitions,
+            searched_partitions,
+            search_threads,
+        )
     }
 
     #[test]
@@ -1434,6 +2048,98 @@ mod tests {
         adjust_probes(&mut query, 10);
         assert_eq!(query.minimum_nprobes, 30);
         assert_eq!(query.maximum_nprobes, Some(50));
+    }
+
+    #[tokio::test]
+    async fn test_find_partitions_runs_on_cpu_runtime() {
+        let thread_name = Arc::new(Mutex::new(None));
+        let index: Arc<dyn VectorIndex> = Arc::new(ThreadCapturingIndex {
+            thread_name: thread_name.clone(),
+            row_ids: Vec::new(),
+        });
+
+        let (_partitions, _distances) = find_partitions_on_cpu(index, base_query()).await.unwrap();
+
+        let thread_name = thread_name.lock().unwrap().clone().unwrap();
+        assert!(
+            thread_name.contains("lance-cpu"),
+            "expected find_partitions to run on the dedicated cpu runtime, got thread {thread_name}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequential_initial_search_prepares_all_then_searches_on_one_cpu_thread() {
+        let (index, prepared_partitions, searched_partitions, search_threads) =
+            prepared_index(vec![10, 11, 12]);
+        let mut query = base_query();
+        query.minimum_nprobes = 3;
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+
+        let batches = ANNIvfSubIndexExec::initial_search(
+            index,
+            query,
+            Arc::new(UInt32Array::from(vec![0, 1, 2])),
+            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+            empty_prefilter().await,
+            prepared_metrics(),
+            state,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(*searched_partitions.lock().unwrap(), vec![0, 1, 2]);
+        let search_threads = search_threads.lock().unwrap().clone();
+        assert_eq!(search_threads.len(), 3);
+        assert!(
+            search_threads.iter().all(|name| name.contains("lance-cpu")),
+            "expected prepared searches to run on the cpu runtime, got threads {search_threads:?}",
+        );
+        assert!(
+            search_threads.iter().all(|name| name == &search_threads[0]),
+            "expected all prepared searches to reuse one cpu thread, got threads {search_threads:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequential_late_search_prepares_all_then_stops_search_early() {
+        let (index, prepared_partitions, searched_partitions, _search_threads) =
+            prepared_index(vec![21, 22, 23]);
+        let mut query = base_query();
+        query.k = 2;
+        query.minimum_nprobes = 0;
+        query.maximum_nprobes = Some(3);
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+        state.record_batch(
+            &RecordBatch::try_new(
+                KNN_INDEX_SCHEMA.clone(),
+                vec![
+                    Arc::new(Float32Array::from(vec![0.0])),
+                    Arc::new(UInt64Array::from(vec![999])),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let batches = ANNIvfSubIndexExec::late_search(
+            index,
+            query,
+            Arc::new(UInt32Array::from(vec![0, 1, 2])),
+            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+            empty_prefilter().await,
+            prepared_metrics(),
+            state.clone(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
+        assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -1576,6 +2282,7 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::Cosine),
             use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
 

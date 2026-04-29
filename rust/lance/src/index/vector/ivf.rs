@@ -17,7 +17,13 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
-    index::{INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions},
+    index::{
+        INDEX_FILE_NAME,
+        api::{IndexSegment, IndexSegmentPlan},
+        pb,
+        prefilter::PreFilter,
+        vector::ivf::io::write_pq_partitions,
+    },
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use arrow::datatypes::UInt8Type;
@@ -101,7 +107,11 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
@@ -2018,6 +2028,128 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
+pub(crate) async fn plan_segments(
+    segments: &[TableIndexMetadata],
+    requested_index_type: Option<IndexType>,
+    target_segment_bytes: Option<u64>,
+) -> Result<Vec<IndexSegmentPlan>> {
+    if let Some(index_type) = requested_index_type
+        && !matches!(
+            index_type,
+            IndexType::IvfFlat
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfRq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+                | IndexType::Vector
+        )
+    {
+        return Err(Error::invalid_input(format!(
+            "Unsupported distributed vector segment build type: {}",
+            index_type
+        )));
+    }
+
+    if let Some(0) = target_segment_bytes {
+        return Err(Error::invalid_input(
+            "target_segment_bytes must be greater than zero".to_string(),
+        ));
+    }
+
+    if segments.is_empty() {
+        return Err(Error::index("No segment metadata was provided".to_string()));
+    }
+
+    let mut sorted_segments = segments.to_vec();
+    sorted_segments.sort_by_key(|index| index.uuid);
+    let mut expected_segment_ids = HashSet::with_capacity(sorted_segments.len());
+    for segment in &sorted_segments {
+        if !expected_segment_ids.insert(segment.uuid) {
+            return Err(Error::index(format!(
+                "Distributed vector segment '{}' was provided more than once",
+                segment.uuid
+            )));
+        }
+    }
+
+    let mut covered_fragments = RoaringBitmap::new();
+    for segment in &sorted_segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        if covered_fragments.intersection_len(fragment_bitmap) > 0 {
+            return Err(Error::index(
+                "Distributed vector shards have overlapping fragment coverage".to_string(),
+            ));
+        }
+        covered_fragments |= fragment_bitmap.clone();
+    }
+
+    if target_segment_bytes.is_none() {
+        return sorted_segments
+            .into_iter()
+            .map(|segment| build_segment_plan(vec![segment], requested_index_type))
+            .collect();
+    }
+
+    let target_segment_bytes = target_segment_bytes.unwrap();
+    let mut plans = Vec::new();
+    let mut current_group = Vec::new();
+    let mut current_bytes = 0_u64;
+
+    for segment in sorted_segments {
+        let source_bytes = estimate_source_index_bytes(&segment);
+        if !current_group.is_empty()
+            && current_bytes.saturating_add(source_bytes) > target_segment_bytes
+        {
+            plans.push(build_segment_plan(
+                std::mem::take(&mut current_group),
+                requested_index_type,
+            )?);
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(source_bytes);
+        current_group.push(segment);
+    }
+
+    if !current_group.is_empty() {
+        plans.push(build_segment_plan(current_group, requested_index_type)?);
+    }
+
+    Ok(plans)
+}
+
+pub(crate) async fn build_segment(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segment_plan: &IndexSegmentPlan,
+) -> Result<IndexSegment> {
+    let built_segment = segment_plan.segment().clone();
+    let segments = segment_plan.segments();
+
+    if segments.len() == 1 && segments[0].uuid == built_segment.uuid() {
+        return Ok(built_segment);
+    }
+
+    let final_dir = indices_dir.child(built_segment.uuid().to_string());
+    merge_segments_to_dir(
+        object_store,
+        indices_dir,
+        &final_dir,
+        segment_plan.segments(),
+        segment_plan.requested_index_type(),
+        lance_index::progress::noop_progress(),
+    )
+    .await?;
+
+    Ok(built_segment)
+}
+
 /// Merge one caller-defined group of source segments into a single segment.
 pub(crate) async fn merge_segments(
     object_store: &ObjectStore,
@@ -2063,7 +2195,15 @@ pub(crate) async fn merge_segments_with_progress(
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
     let final_dir = indices_dir.child(segment_uuid.to_string());
-    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments, progress).await?;
+    merge_segments_to_dir(
+        object_store,
+        indices_dir,
+        &final_dir,
+        &segments,
+        None,
+        progress,
+    )
+    .await?;
     let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
     merged_segment = TableIndexMetadata {
@@ -2089,6 +2229,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
+    _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
@@ -2134,6 +2275,52 @@ async fn merge_segments_to_dir(
     Ok(())
 }
 
+fn build_segment_plan(
+    group: Vec<TableIndexMetadata>,
+    requested_index_type: Option<IndexType>,
+) -> Result<IndexSegmentPlan> {
+    debug_assert!(!group.is_empty());
+    let first = &group[0];
+    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut estimated_bytes = 0_u64;
+    let mut segments = Vec::with_capacity(group.len());
+
+    for segment in &group {
+        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        fragment_bitmap |= source_fragment_bitmap.clone();
+        estimated_bytes = estimated_bytes.saturating_add(estimate_source_index_bytes(segment));
+        segments.push(segment.clone());
+    }
+
+    let segment_uuid = if group.len() == 1 {
+        first.uuid
+    } else {
+        Uuid::new_v4()
+    };
+    let index_version = match requested_index_type {
+        Some(index_type) => index_type.version(),
+        None => infer_source_index_version(&group)?,
+    };
+    let segment = IndexSegment::new(
+        segment_uuid,
+        fragment_bitmap,
+        Arc::new(crate::index::vector_index_details()),
+        index_version,
+    );
+
+    Ok(IndexSegmentPlan::new(
+        segment,
+        segments,
+        estimated_bytes,
+        requested_index_type,
+    ))
+}
+
 fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
     debug_assert!(!group.is_empty());
     let first = group[0].index_version;
@@ -2143,6 +2330,14 @@ fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
         ));
     }
     Ok(first)
+}
+
+fn estimate_source_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
+    index_metadata
+        .files
+        .as_ref()
+        .map(|files| files.iter().map(|file| file.size_bytes).sum())
+        .unwrap_or(0)
 }
 
 /// Best-effort reset of one target directory before rewriting it.
@@ -2668,6 +2863,7 @@ mod tests {
                     refine_factor: None,
                     metric_type: Some(MetricType::L2),
                     use_index: true,
+                    query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                     dist_q_c: 0.0,
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();

@@ -82,7 +82,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-pub use crate::index::api::DatasetIndexExt;
+pub use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentPlan, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -125,6 +125,59 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     }
 
     Ok(())
+}
+
+pub(crate) async fn build_index_metadata_from_segments(
+    dataset: &Dataset,
+    index_name: &str,
+    field_id: i32,
+    segments: Vec<IndexSegment>,
+) -> Result<Vec<IndexMetadata>> {
+    if segments.is_empty() {
+        return Err(Error::invalid_input(
+            "CreateIndex: at least one index segment is required".to_string(),
+        ));
+    }
+
+    let mut seen_segment_ids = HashSet::with_capacity(segments.len());
+    let mut covered_fragments = RoaringBitmap::new();
+    for segment in &segments {
+        if !seen_segment_ids.insert(segment.uuid()) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: duplicate segment uuid {} for index '{}'",
+                segment.uuid(),
+                index_name
+            )));
+        }
+        if !covered_fragments.is_disjoint(segment.fragment_bitmap()) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: overlapping fragment coverage in segment set for index '{}'",
+                index_name
+            )));
+        }
+        covered_fragments |= segment.fragment_bitmap().clone();
+    }
+
+    let mut new_indices = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        let index_dir = dataset.indices_dir().child(uuid.to_string());
+        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        new_indices.push(IndexMetadata {
+            uuid,
+            name: index_name.to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(fragment_bitmap),
+            index_details: Some(index_details),
+            index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(files),
+        });
+    }
+
+    Ok(new_indices)
 }
 
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -705,6 +758,7 @@ impl IndexDescription for IndexDescriptionImpl {
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
+    type IndexSegmentBuilder<'a> = create::IndexSegmentBuilder<'a>;
 
     /// Create a builder for creating an index on columns.
     ///
@@ -750,6 +804,10 @@ impl DatasetIndexExt for Dataset {
         params: &'a dyn IndexParams,
     ) -> CreateIndexBuilder<'a> {
         CreateIndexBuilder::new(self, columns, index_type, params)
+    }
+
+    fn create_index_segment_builder<'a>(&'a self) -> create::IndexSegmentBuilder<'a> {
+        create::IndexSegmentBuilder::new(self)
     }
 
     #[instrument(skip_all)]
@@ -984,7 +1042,7 @@ impl DatasetIndexExt for Dataset {
         &mut self,
         index_name: &str,
         column: &str,
-        segments: Vec<IndexMetadata>,
+        segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()> {
         let Some(field) = self.schema().field(column) else {
             return Err(Error::index(format!(
@@ -992,17 +1050,22 @@ impl DatasetIndexExt for Dataset {
             )));
         };
 
-        validate_segment_metadata(index_name, &segments)?;
-        validate_segment_index_details(index_name, &segments)?;
+        let segments = segments
+            .into_iter()
+            .map(IntoIndexSegment::into_index_segment)
+            .collect::<Result<Vec<_>>>()?;
+        let new_indices =
+            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
+        validate_segment_metadata(index_name, &new_indices)?;
+        validate_segment_index_details(index_name, &new_indices)?;
 
-        let incoming_type_url = segments[0]
+        let incoming_type_url = new_indices[0]
             .index_details
             .as_ref()
             .map(|details| details.type_url.clone());
         let dataset_fragments = self.fragment_bitmap.as_ref().clone();
         let mut incoming_fragments = RoaringBitmap::new();
-        let mut new_indices = Vec::with_capacity(segments.len());
-        for mut segment in segments {
+        for segment in &new_indices {
             if segment.fields != [field.id] {
                 return Err(Error::invalid_input(format!(
                     "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
@@ -1012,9 +1075,6 @@ impl DatasetIndexExt for Dataset {
             if let Some(fragment_bitmap) = &segment.fragment_bitmap {
                 incoming_fragments |= fragment_bitmap.clone();
             }
-            segment.name = index_name.to_string();
-            segment.dataset_version = self.manifest.version;
-            new_indices.push(segment);
         }
 
         let existing_named_indices = self.load_indices_by_name(index_name).await?;
@@ -2390,6 +2450,23 @@ mod tests {
         }
     }
 
+    fn segment_from_metadata(metadata: &IndexMetadata) -> IndexSegment {
+        IndexSegment::new(
+            metadata.uuid,
+            metadata
+                .fragment_bitmap
+                .as_ref()
+                .expect("test segment metadata should have fragment coverage")
+                .iter(),
+            metadata
+                .index_details
+                .as_ref()
+                .expect("test segment metadata should have index details")
+                .clone(),
+            metadata.index_version,
+        )
+    }
+
     async fn write_fragmented_vector_dataset(uri: &str, dimension: i32) -> Dataset {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -2545,6 +2622,13 @@ mod tests {
             .iter()
             .map(|segment| segment.uuid)
             .collect::<Vec<_>>();
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_index_type(params.index_type())
+            .with_segments(segments)
+            .build_all()
+            .await
+            .unwrap();
         dataset
             .commit_existing_index_segments(index_name, column, segments)
             .await
@@ -5968,7 +6052,7 @@ mod tests {
             .commit_existing_index_segments(
                 "vector_idx",
                 "vector",
-                vec![seg0.clone(), seg1.clone()],
+                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
             )
             .await
             .unwrap();
@@ -6035,11 +6119,11 @@ mod tests {
                 "vector_idx",
                 "vector",
                 vec![
-                    base.clone(),
-                    IndexMetadata {
+                    segment_from_metadata(&base),
+                    segment_from_metadata(&IndexMetadata {
                         fragment_bitmap: Some(std::iter::once(1_u32).collect()),
                         ..base
-                    },
+                    }),
                 ],
             )
             .await
@@ -6065,7 +6149,7 @@ mod tests {
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let err = dataset
-            .commit_existing_index_segments("vector_idx", "vector", vec![])
+            .commit_existing_index_segments("vector_idx", "vector", Vec::<IndexSegment>::new())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
@@ -6109,7 +6193,11 @@ mod tests {
         .await;
 
         let err = dataset
-            .commit_existing_index_segments("vector_idx", "vector", vec![seg0, seg1])
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));

@@ -390,6 +390,7 @@ impl IoMetrics {
     }
 }
 
+#[derive(Clone)]
 pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,

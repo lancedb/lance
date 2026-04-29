@@ -207,6 +207,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         };
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
+        let query_parallelism = env
+            .call_method(&java_obj, "getQueryParallelism", "()I", &[])?
+            .i()?;
 
         Ok(Query {
             column,
@@ -221,6 +224,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             metric_type: distance_type,
             use_index,
             dist_q_c: 0.0,
+            query_parallelism,
         })
     })?;
 

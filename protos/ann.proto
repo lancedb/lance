@@ -25,6 +25,7 @@ message VectorQueryProto {
   optional lance.index.pb.VectorMetricType metric_type = 10;
   bool use_index = 11;
   optional float dist_q_c = 12;
+  optional int32 query_parallelism = 13;
 }
 
 // Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

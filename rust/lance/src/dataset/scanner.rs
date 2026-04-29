@@ -71,7 +71,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DIST_COL, Query};
+use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -84,6 +84,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -1519,6 +1520,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: None,
             use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         });
         Ok(self)
@@ -1682,6 +1684,24 @@ impl Scanner {
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = use_index
+        }
+        self
+    }
+
+    /// Configure partition-search concurrency for each vector query.
+    ///
+    /// The default is 0.
+    /// Value 0 selects the automatic policy; today this resolves to 1 for the
+    /// sequential fast path unless an index implementation overrides it.
+    /// Value -1 uses the CPU pool size.
+    /// Value 1 uses the single-worker sequential partition search path.
+    /// Values >= 2 use the partition-parallel path and are clamped to the CPU
+    /// pool size by the execution layer.
+    pub fn query_parallelism(&mut self, query_parallelism: i32) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.query_parallelism = query_parallelism;
+        } else {
+            log::warn!("query_parallelism is not set because nearest has not been called yet");
         }
         self
     }
@@ -3327,20 +3347,14 @@ impl Scanner {
             "the column must be specified in the query".to_string(),
         ))?;
 
-        let index_meta = self
-            .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+        let segments = load_segments(&self.dataset, &column)
             .await?
             .ok_or(Error::invalid_input(format!(
                 "No Inverted index found for column {}",
                 column
             )))?;
+        let details = load_segment_details(&self.dataset, &column, &segments).await?;
 
-        let details_any =
-            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
-        let details = details_any
-            .as_ref()
-            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
         if !details.with_position {
             return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
                 .to_string()));
@@ -4911,6 +4925,13 @@ pub mod test_dataset {
                 .iter()
                 .map(|segment| segment.uuid)
                 .collect::<Vec<_>>();
+            let segments = self
+                .dataset
+                .create_index_segment_builder()
+                .with_index_type(params.index_type())
+                .with_segments(segments)
+                .build_all()
+                .await?;
             self.dataset
                 .commit_existing_index_segments("idx", "vec", segments)
                 .await?;
@@ -9925,6 +9946,49 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .project(&["i"])
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_knn_query_parallelism_defaults_and_setter() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(
+            scanner.nearest_mut().unwrap().query_parallelism,
+            DEFAULT_QUERY_PARALLELISM
+        );
+
+        scanner.query_parallelism(4);
+        assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, 4);
+
+        scanner.query_parallelism(-1);
+        assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, -1);
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_query_parallelism_returns_same_results() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+
+        let mut sequential = test_ds.dataset.scan();
+        sequential.nearest("vec", &query_vector, 50).unwrap();
+        let sequential_results = sequential.try_into_batch().await.unwrap();
+
+        let mut parallel = test_ds.dataset.scan();
+        parallel
+            .nearest("vec", &query_vector, 50)
+            .unwrap()
+            .query_parallelism(4);
+        let parallel_results = parallel.try_into_batch().await.unwrap();
+
+        assert_eq!(sequential_results, parallel_results);
     }
 
     #[tokio::test]
