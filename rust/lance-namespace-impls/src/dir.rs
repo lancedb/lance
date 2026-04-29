@@ -7605,7 +7605,7 @@ mod tests {
 
         // Open the dataset using from_namespace to get proper object_store and paths
         let table_id = vec!["test_table".to_string()];
-        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone(), None)
             .await
             .unwrap()
             .load()
@@ -7717,7 +7717,7 @@ mod tests {
 
         // Open the dataset using from_namespace to get proper object_store and paths
         let table_id = vec!["test_table".to_string()];
-        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone(), None)
             .await
             .unwrap()
             .load()
@@ -8122,7 +8122,7 @@ mod tests {
 
             // checkout_latest should call list_table_versions exactly once
             let initial_list_calls = tracking_ns.list_table_versions_calls();
-            let latest_dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+            let latest_dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone(), None)
                 .await
                 .unwrap()
                 .load()
@@ -8137,7 +8137,7 @@ mod tests {
 
             // checkout to specific version should call describe_table_version exactly once
             let initial_describe_calls = tracking_ns.describe_table_version_calls();
-            let v1_dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+            let v1_dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone(), None)
                 .await
                 .unwrap()
                 .with_version(1)
@@ -9082,7 +9082,7 @@ mod tests {
                 .unwrap();
 
             let table_id = vec![table_name.to_string()];
-            let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+            let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone(), None)
                 .await
                 .unwrap()
                 .load()

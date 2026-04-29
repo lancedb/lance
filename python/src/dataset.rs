@@ -615,17 +615,16 @@ impl Dataset {
             let namespace_client_table_context = namespace_client_table_context
                 .map(|c| extract_namespace_client_table_context(c))
                 .transpose()?;
-            let mut b =
-                if let Some(namespace_client_table_context) = namespace_client_table_context {
-                    DatasetBuilder::for_namespace(ns_client, tid.clone())
-                        .with_namespace_client_table_context(namespace_client_table_context)
-                } else {
-                    rt().block_on(
-                        Some(py),
-                        DatasetBuilder::from_namespace(ns_client, tid.clone()),
-                    )?
-                    .map_err(|err| PyIOError::new_err(err.to_string()))?
-                }
+            let mut b = rt()
+                .block_on(
+                    Some(py),
+                    DatasetBuilder::from_namespace(
+                        ns_client,
+                        tid.clone(),
+                        namespace_client_table_context,
+                    ),
+                )?
+                .map_err(|err| PyIOError::new_err(err.to_string()))?
                 .with_index_cache_size_bytes(params.index_cache_size_bytes)
                 .with_metadata_cache_size_bytes(params.metadata_cache_size_bytes);
             b = b.with_read_params(params);

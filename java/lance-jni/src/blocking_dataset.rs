@@ -169,15 +169,12 @@ impl BlockingDataset {
         };
 
         let mut builder = if let (Some(namespace_client), Some(tid)) = (namespace, table_id) {
-            let b = if let Some(namespace_client_table_context) =
-                namespace_client_table_context.clone()
-            {
-                DatasetBuilder::for_namespace(namespace_client, tid)
-                    .with_namespace_client_table_context(namespace_client_table_context)
-            } else {
-                RT.block_on(DatasetBuilder::from_namespace(namespace_client, tid))?
-            };
-            b.with_read_params(params)
+            RT.block_on(DatasetBuilder::from_namespace(
+                namespace_client,
+                tid,
+                namespace_client_table_context,
+            ))?
+            .with_read_params(params)
         } else {
             let uri = uri.ok_or_else(|| {
                 Error::input_error(

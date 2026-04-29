@@ -55,8 +55,6 @@ pub struct DatasetBuilder {
     /// Runtime-only exact object store bindings keyed by base path URI.
     base_store_params: HashMap<String, ObjectStoreParams>,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
-    uri_was_explicitly_set: bool,
-    validation_error: Option<String>,
 }
 
 impl std::fmt::Debug for DatasetBuilder {
@@ -76,14 +74,12 @@ impl std::fmt::Debug for DatasetBuilder {
             )
             .field("base_store_params", &!self.base_store_params.is_empty())
             .field("namespace_info", &self.namespace_info.is_some())
-            .field("uri_was_explicitly_set", &self.uri_was_explicitly_set)
-            .field("validation_error", &self.validation_error)
             .finish()
     }
 }
 
 impl DatasetBuilder {
-    fn from_uri_impl<T: AsRef<str>>(table_uri: T, uri_was_explicitly_set: bool) -> Self {
+    fn from_uri_impl<T: AsRef<str>>(table_uri: T) -> Self {
         Self {
             index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
@@ -98,120 +94,91 @@ impl DatasetBuilder {
             storage_options_override: None,
             base_store_params: HashMap::new(),
             namespace_info: None,
-            uri_was_explicitly_set,
-            validation_error: None,
         }
     }
 
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
-        Self::from_uri_impl(table_uri, true)
-    }
-
-    pub fn for_namespace(namespace_client: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
-        Self::from_uri_impl("", false).with_namespace(namespace_client, table_id)
+        Self::from_uri_impl(table_uri)
     }
 
     /// Create a DatasetBuilder from a LanceNamespace client.
     ///
-    /// Calls `describe_table()` to fetch the table location, storage options,
-    /// and managed-versioning flag.
+    /// When `namespace_client_table_context` is `None`, calls `describe_table()`
+    /// to fetch the table location, storage options, and managed-versioning flag.
+    /// When provided, uses the cached context directly and does not call the
+    /// namespace.
     #[allow(deprecated)]
     pub async fn from_namespace(
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
+        namespace_client_table_context: Option<NamespaceClientTableContext>,
     ) -> Result<Self> {
-        let request = DescribeTableRequest {
-            id: Some(table_id.clone()),
-            ..Default::default()
-        };
-        let response = namespace_client.describe_table(request).await?;
         let namespace_client_table_context =
-            NamespaceClientTableContext::from_describe_table_response(response)?;
+            if let Some(namespace_client_table_context) = namespace_client_table_context {
+                namespace_client_table_context
+            } else {
+                let request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                };
+                let response = namespace_client.describe_table(request).await?;
+                NamespaceClientTableContext::from_describe_table_response(response)?
+            };
 
-        Ok(Self::for_namespace(namespace_client, table_id)
-            .with_namespace_client_table_context(namespace_client_table_context))
+        Self::from_resolved_namespace(namespace_client, table_id, namespace_client_table_context)
+    }
+
+    fn from_resolved_namespace(
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        namespace_client_table_context: NamespaceClientTableContext,
+    ) -> Result<Self> {
+        if namespace_client_table_context.location.is_empty() {
+            return Err(Error::invalid_input(
+                "NamespaceClientTableContext missing location",
+            ));
+        }
+
+        let mut builder = Self::from_uri_impl(&namespace_client_table_context.location);
+        builder.namespace_info = Some((namespace_client.clone(), table_id.clone()));
+        builder.storage_options_override = namespace_client_table_context.storage_options.clone();
+
+        if namespace_client_table_context.managed_versioning {
+            let external_store = LanceNamespaceExternalManifestStore::new(
+                namespace_client.clone(),
+                table_id.clone(),
+            );
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder.commit_handler = Some(commit_handler);
+        }
+
+        let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+            LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
+        );
+        let mut merged_storage_options = builder
+            .options
+            .storage_options()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(storage_options) = &namespace_client_table_context.storage_options {
+            merged_storage_options.extend(storage_options.clone());
+        }
+        let accessor = if merged_storage_options.is_empty() {
+            StorageOptionsAccessor::with_provider(provider)
+        } else {
+            StorageOptionsAccessor::with_initial_and_provider(merged_storage_options, provider)
+        };
+        builder.options.storage_options_accessor = Some(Arc::new(accessor));
+
+        Ok(builder)
     }
 }
 
 // Much of this builder is directly inspired from the to delta-rs table builder implementation
 // https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
 impl DatasetBuilder {
-    /// Associate a namespace client and table id with this builder.
-    pub fn with_namespace(
-        mut self,
-        namespace_client: Arc<dyn LanceNamespace>,
-        table_id: Vec<String>,
-    ) -> Self {
-        if self.uri_was_explicitly_set {
-            self.validation_error = Some(
-                "namespace clients cannot be combined with an explicit uri/location".to_string(),
-            );
-            return self;
-        }
-        self.namespace_info = Some((namespace_client, table_id));
-        self
-    }
-
-    /// Apply a cached namespace table context to this builder.
-    ///
-    /// For full namespace behavior (credential refresh and managed-versioning
-    /// commit handling), call [`Self::with_namespace`] first.
-    pub fn with_namespace_client_table_context(
-        mut self,
-        namespace_client_table_context: NamespaceClientTableContext,
-    ) -> Self {
-        if self.uri_was_explicitly_set {
-            self.validation_error = Some(
-                "namespace_client_table_context cannot be combined with an explicit uri/location"
-                    .to_string(),
-            );
-            return self;
-        }
-        if self.namespace_info.is_none() {
-            self.validation_error = Some(
-                "namespace_client_table_context requires with_namespace() to be set first"
-                    .to_string(),
-            );
-            return self;
-        }
-
-        self.table_uri = namespace_client_table_context.location.clone();
-        self.storage_options_override = namespace_client_table_context.storage_options.clone();
-
-        if let Some((namespace_client, table_id)) = &self.namespace_info {
-            if namespace_client_table_context.managed_versioning {
-                let external_store = LanceNamespaceExternalManifestStore::new(
-                    namespace_client.clone(),
-                    table_id.clone(),
-                );
-                let commit_handler: Arc<dyn CommitHandler> =
-                    Arc::new(ExternalManifestCommitHandler {
-                        external_manifest_store: Arc::new(external_store),
-                    });
-                self.commit_handler = Some(commit_handler);
-            }
-
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> =
-                Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                    namespace_client.clone(),
-                    table_id.clone(),
-                ));
-            let mut merged_storage_options =
-                self.options.storage_options().cloned().unwrap_or_default();
-            if let Some(storage_options) = &namespace_client_table_context.storage_options {
-                merged_storage_options.extend(storage_options.clone());
-            }
-            let accessor = if merged_storage_options.is_empty() {
-                StorageOptionsAccessor::with_provider(provider)
-            } else {
-                StorageOptionsAccessor::with_initial_and_provider(merged_storage_options, provider)
-            };
-            self.options.storage_options_accessor = Some(Arc::new(accessor));
-        }
-
-        self
-    }
-
     /// Set the cache size for indices. Set to zero, to disable the cache.
     pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
         self.index_cache_size_bytes = cache_size;
@@ -354,6 +321,7 @@ impl DatasetBuilder {
                 StorageOptionsAccessor::with_static_options(storage_options),
             ));
         }
+        self.apply_storage_options_override();
         self
     }
 
@@ -384,6 +352,7 @@ impl DatasetBuilder {
                 StorageOptionsAccessor::with_static_options(storage_options),
             ));
         }
+        self.apply_storage_options_override();
         self
     }
 
@@ -537,6 +506,7 @@ impl DatasetBuilder {
                 (None, None) => None,
             };
             self.options = options;
+            self.apply_storage_options_override();
         }
 
         if let Some(session) = read_params.session {
@@ -589,6 +559,7 @@ impl DatasetBuilder {
                 (None, None) => None,
             };
             self.options = options;
+            self.apply_storage_options_override();
         }
 
         if let Some(commit_handler) = write_params.commit_handler {
@@ -618,12 +589,9 @@ impl DatasetBuilder {
     pub async fn build_object_store(
         self,
     ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
-        if let Some(validation_error) = self.validation_error.clone() {
-            return Err(Error::invalid_input(validation_error));
-        }
         if self.namespace_info.is_some() && self.table_uri.is_empty() {
             return Err(Error::invalid_input(
-                "namespace dataset opens require from_namespace() or namespace_client_table_context",
+                "namespace dataset opens require from_namespace() to resolve a table location",
             ));
         }
         let commit_handler = match self.commit_handler {
@@ -720,6 +688,13 @@ impl DatasetBuilder {
         };
         merged_params.storage_options_accessor = Some(storage_options_accessor);
         merged_params
+    }
+
+    fn apply_storage_options_override(&mut self) {
+        if let Some(override_opts) = &self.storage_options_override {
+            self.options =
+                Self::merge_store_params_with_storage_options(&self.options, override_opts);
+        }
     }
 
     async fn load_impl(mut self) -> Result<Dataset> {
@@ -938,11 +913,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn namespace_context_attaches_provider_without_initial_storage_options() {
-        let builder =
-            DatasetBuilder::for_namespace(Arc::new(DummyNamespace), vec!["table".to_string()])
-                .with_namespace_client_table_context(namespace_context(None));
+    #[tokio::test]
+    async fn namespace_context_attaches_provider_without_initial_storage_options() {
+        let builder = DatasetBuilder::from_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(namespace_context(None)),
+        )
+        .await
+        .unwrap();
 
         let accessor = builder
             .options
@@ -952,14 +931,16 @@ mod tests {
         assert!(accessor.initial_storage_options().is_none());
     }
 
-    #[test]
-    fn namespace_context_uses_cached_location_and_initial_storage_options() {
+    #[tokio::test]
+    async fn namespace_context_uses_cached_location_and_initial_storage_options() {
         let storage_options = HashMap::from([("token".to_string(), "cached".to_string())]);
-        let builder =
-            DatasetBuilder::for_namespace(Arc::new(DummyNamespace), vec!["table".to_string()])
-                .with_namespace_client_table_context(namespace_context(Some(
-                    storage_options.clone(),
-                )));
+        let builder = DatasetBuilder::from_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(namespace_context(Some(storage_options.clone()))),
+        )
+        .await
+        .unwrap();
 
         let accessor = builder
             .options
@@ -970,8 +951,8 @@ mod tests {
         assert_eq!(accessor.initial_storage_options(), Some(&storage_options));
     }
 
-    #[test]
-    fn namespace_context_merges_existing_storage_options() {
+    #[tokio::test]
+    async fn namespace_context_merges_existing_storage_options() {
         let user_storage_options = HashMap::from([
             ("user_token".to_string(), "user".to_string()),
             ("token".to_string(), "user".to_string()),
@@ -986,12 +967,14 @@ mod tests {
             ("expires_at_millis".to_string(), "123".to_string()),
         ]);
 
-        let builder =
-            DatasetBuilder::for_namespace(Arc::new(DummyNamespace), vec!["table".to_string()])
-                .with_storage_options(user_storage_options)
-                .with_namespace_client_table_context(namespace_context(Some(
-                    namespace_storage_options,
-                )));
+        let builder = DatasetBuilder::from_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(namespace_context(Some(namespace_storage_options))),
+        )
+        .await
+        .unwrap()
+        .with_storage_options(user_storage_options);
 
         let accessor = builder
             .options
@@ -1004,23 +987,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn namespace_context_provider_survives_write_params() {
+    #[tokio::test]
+    async fn namespace_context_provider_survives_write_params() {
         let user_storage_options = HashMap::from([("user_token".to_string(), "user".to_string())]);
-        let builder =
-            DatasetBuilder::for_namespace(Arc::new(DummyNamespace), vec!["table".to_string()])
-                .with_namespace_client_table_context(namespace_context(None))
-                .with_write_params(WriteParams {
-                    store_params: Some(ObjectStoreParams {
-                        storage_options_accessor: Some(Arc::new(
-                            StorageOptionsAccessor::with_static_options(
-                                user_storage_options.clone(),
-                            ),
-                        )),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                });
+        let builder = DatasetBuilder::from_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(namespace_context(None)),
+        )
+        .await
+        .unwrap()
+        .with_write_params(WriteParams {
+            store_params: Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(user_storage_options.clone()),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
 
         let accessor = builder
             .options
@@ -1034,14 +1019,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn for_namespace_requires_context_before_load() {
-        let err =
-            DatasetBuilder::for_namespace(Arc::new(DummyNamespace), vec!["table".to_string()])
-                .load()
-                .await
-                .unwrap_err();
+    async fn namespace_context_overrides_write_params_storage_options() {
+        let user_storage_options = HashMap::from([
+            ("user_token".to_string(), "user".to_string()),
+            ("token".to_string(), "user".to_string()),
+        ]);
+        let namespace_storage_options = HashMap::from([
+            ("token".to_string(), "cached".to_string()),
+            ("expires_at_millis".to_string(), "123".to_string()),
+        ]);
+        let expected_storage_options = HashMap::from([
+            ("user_token".to_string(), "user".to_string()),
+            ("token".to_string(), "cached".to_string()),
+            ("expires_at_millis".to_string(), "123".to_string()),
+        ]);
 
-        assert!(err.to_string().contains("namespace_client_table_context"));
+        let builder = DatasetBuilder::from_namespace(
+            Arc::new(DummyNamespace),
+            vec!["table".to_string()],
+            Some(namespace_context(Some(namespace_storage_options))),
+        )
+        .await
+        .unwrap()
+        .with_write_params(WriteParams {
+            store_params: Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(user_storage_options),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let accessor = builder
+            .options
+            .storage_options_accessor
+            .expect("namespace context should override write params storage options");
+        assert!(accessor.provider().is_some());
+        assert_eq!(
+            accessor.initial_storage_options(),
+            Some(&expected_storage_options)
+        );
     }
 
     #[derive(Debug)]
@@ -1075,6 +1093,7 @@ mod tests {
                 describe_version: describe_version.clone(),
             }),
             vec!["table".to_string()],
+            None,
         )
         .await
         .unwrap()
