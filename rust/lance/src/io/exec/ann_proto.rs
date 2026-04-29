@@ -99,7 +99,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         metric_type,
         use_index: query.use_index,
         dist_q_c: Some(query.dist_q_c),
-        partition_parallelism: Some(query.query_parallelism),
+        query_parallelism: Some(query.query_parallelism),
     })
 }
 
@@ -127,9 +127,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
-        query_parallelism: proto
-            .partition_parallelism
-            .unwrap_or(DEFAULT_QUERY_PARALLELISM),
+        query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
     })
 }
