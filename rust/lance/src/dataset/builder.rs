@@ -120,20 +120,6 @@ impl DatasetBuilder {
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
     ) -> Result<Self> {
-        Self::from_namespace_with_version(namespace_client, table_id, None).await
-    }
-
-    /// Create a DatasetBuilder from a LanceNamespace client for an optional table version.
-    ///
-    /// Calls `describe_table()` to fetch the table location, storage options,
-    /// and managed-versioning flag. When `version` is provided, it is applied to
-    /// the returned dataset builder using normal Lance version checkout.
-    #[allow(deprecated)]
-    pub async fn from_namespace_with_version(
-        namespace_client: Arc<dyn LanceNamespace>,
-        table_id: Vec<String>,
-        version: Option<u64>,
-    ) -> Result<Self> {
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
             ..Default::default()
@@ -142,12 +128,8 @@ impl DatasetBuilder {
         let namespace_client_table_context =
             NamespaceClientTableContext::from_describe_table_response(response)?;
 
-        let mut builder = Self::for_namespace(namespace_client, table_id)
-            .with_namespace_client_table_context(namespace_client_table_context);
-        if let Some(version) = version {
-            builder = builder.with_version(version);
-        }
-        Ok(builder)
+        Ok(Self::for_namespace(namespace_client, table_id)
+            .with_namespace_client_table_context(namespace_client_table_context))
     }
 }
 
@@ -1086,17 +1068,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_namespace_with_version_sets_dataset_version_target() {
+    async fn from_namespace_leaves_version_as_builder_option() {
         let describe_version = Arc::new(std::sync::Mutex::new(None));
-        let builder = DatasetBuilder::from_namespace_with_version(
+        let builder = DatasetBuilder::from_namespace(
             Arc::new(RecordingNamespace {
                 describe_version: describe_version.clone(),
             }),
             vec!["table".to_string()],
-            Some(7),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_version(7);
 
         assert_eq!(*describe_version.lock().unwrap(), None);
         assert!(matches!(
