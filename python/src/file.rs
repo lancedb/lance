@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceBufferDescriptor {
     /// The byte offset of the buffer in the file
@@ -70,7 +70,7 @@ impl LanceBufferDescriptor {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LancePageMetadata {
     /// The buffers in the page
@@ -94,7 +94,7 @@ impl LancePageMetadata {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnMetadata {
     /// The column-wide buffers
@@ -119,7 +119,7 @@ impl LanceColumnMetadata {
 }
 
 /// Statistics summarize some of the file metadata for quick summary info
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileStatistics {
     /// Statistics about each of the columns in the file
@@ -135,7 +135,7 @@ impl LanceFileStatistics {
 }
 
 /// Summary information describing a column
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnStatistics {
     /// The number of pages in the column
@@ -170,7 +170,7 @@ impl LanceFileStatistics {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileMetadata {
     /// The schema of the file

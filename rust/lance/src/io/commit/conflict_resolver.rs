@@ -746,9 +746,38 @@ impl<'a> TransactionRebase<'a> {
                                 .push(committed_fri.clone());
                             Ok(())
                         }
-                        // If rewrite defers index remap,
-                        // then it does not conflict with index creation
-                        (None, Some(_)) => Ok(()),
+                        // If rewrite defers index remap, the FRI handles the
+                        // post-commit bitmap update — but only if each rewrite
+                        // group is fully inside or fully outside each new
+                        // index's fragment bitmap. A group that straddles
+                        // would produce a bitmap with a mix of indexed and
+                        // non-indexed fragments, which load_indices rejects.
+                        (None, Some(_)) => {
+                            for index in new_indices {
+                                let Some(frag_bitmap) = &index.fragment_bitmap else {
+                                    return Err(self
+                                        .retryable_conflict_err(other_transaction, other_version));
+                                };
+                                for group in groups {
+                                    let mut indexed = 0usize;
+                                    let mut unindexed = 0usize;
+                                    for frag in &group.old_fragments {
+                                        if frag_bitmap.contains(frag.id as u32) {
+                                            indexed += 1;
+                                        } else {
+                                            unindexed += 1;
+                                        }
+                                    }
+                                    if indexed > 0 && unindexed > 0 {
+                                        return Err(self.retryable_conflict_err(
+                                            other_transaction,
+                                            other_version,
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
                         // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), None) => {
                             // this should not happen today since we don't support committing

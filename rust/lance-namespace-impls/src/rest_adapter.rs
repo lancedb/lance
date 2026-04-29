@@ -287,7 +287,16 @@ struct PaginationQuery {
     delimiter: Option<String>,
     page_token: Option<String>,
     limit: Option<i32>,
+    include_declared: Option<bool>,
     descending: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeTableQuery {
+    delimiter: Option<String>,
+    with_table_uri: Option<bool>,
+    load_detailed_metadata: Option<bool>,
+    check_declared: Option<bool>,
 }
 
 // ============================================================================
@@ -454,6 +463,7 @@ async fn list_tables(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -484,11 +494,20 @@ async fn describe_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
+    Query(params): Query<DescribeTableQuery>,
     Json(mut request): Json<DescribeTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    if params.with_table_uri.is_some() {
+        request.with_table_uri = params.with_table_uri;
+    }
+    if params.load_detailed_metadata.is_some() {
+        request.load_detailed_metadata = params.load_detailed_metadata;
+    }
+    if params.check_declared.is_some() {
+        request.check_declared = params.check_declared;
+    }
 
     match backend.describe_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -554,6 +573,33 @@ async fn deregister_table(
 struct CreateTableQuery {
     delimiter: Option<String>,
     mode: Option<String>,
+    properties: Option<String>,
+    storage_options: Option<String>,
+}
+
+fn parse_json_query_param<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+    operation: &str,
+    param_name: &str,
+) -> std::result::Result<Option<T>, Box<Response>> {
+    match raw {
+        Some(raw) => serde_json::from_str(raw).map(Some).map_err(|e| {
+            let response = (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "Failed to parse {} {} query parameter as JSON: {}",
+                            operation, param_name, e
+                        )
+                    }
+                })),
+            )
+                .into_response();
+            Box::new(response)
+        }),
+        None => Ok(None),
+    }
 }
 
 async fn create_table(
@@ -563,9 +609,24 @@ async fn create_table(
     Query(params): Query<CreateTableQuery>,
     body: Bytes,
 ) -> Response {
+    let properties =
+        match parse_json_query_param(params.properties.as_deref(), "create_table", "properties") {
+            Ok(properties) => properties,
+            Err(response) => return *response,
+        };
+    let storage_options = match parse_json_query_param(
+        params.storage_options.as_deref(),
+        "create_table",
+        "storage_options",
+    ) {
+        Ok(storage_options) => storage_options,
+        Err(response) => return *response,
+    };
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
+        properties,
+        storage_options,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -874,6 +935,7 @@ async fn list_all_tables(
         id: None,
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -1959,6 +2021,17 @@ mod tests {
                 location.contains("test_table"),
                 "Location should contain table name"
             );
+            assert_eq!(response.is_only_declared, None);
+
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
+            describe_req.check_declared = Some(true);
+            let response = fixture
+                .namespace
+                .describe_table(describe_req)
+                .await
+                .expect("Should describe declared table with check_declared");
+            assert_eq!(response.is_only_declared, Some(true));
 
             // Declared tables don't have a version until data is written
             // (version is None for declared tables)
@@ -2963,6 +3036,7 @@ mod tests {
                 ]),
                 with_table_uri: None,
                 load_detailed_metadata: None,
+                check_declared: None,
                 vend_credentials: None,
                 version: None,
                 identity: None,

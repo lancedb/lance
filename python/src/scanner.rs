@@ -33,7 +33,7 @@ use crate::schema::logical_arrow_schema;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
-#[pyclass(name = "_Scanner", module = "_lib")]
+#[pyclass(name = "_Scanner", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct Scanner {
     scanner: Arc<LanceScanner>,
@@ -49,7 +49,7 @@ impl Scanner {
     }
 }
 
-#[pyclass(name = "ScanStatistics", module = "_lib", get_all)]
+#[pyclass(name = "ScanStatistics", module = "_lib", get_all, skip_from_py_object)]
 #[derive(Clone)]
 /// Statistics about the scan.
 pub struct ScanStatistics {

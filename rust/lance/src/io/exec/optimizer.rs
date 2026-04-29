@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use super::TakeExec;
 use arrow_schema::Schema as ArrowSchema;
+#[allow(deprecated)]
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result as DFResult,
     physical_optimizer::{PhysicalOptimizerRule, optimizer::PhysicalOptimizer},
-    physical_plan::{
-        ExecutionPlan, coalesce_batches::CoalesceBatchesExec, projection::ProjectionExec,
-    },
+    physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
 use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 
@@ -70,6 +70,7 @@ impl CoalesceTake {
 }
 
 impl PhysicalOptimizerRule for CoalesceTake {
+    #[allow(deprecated)]
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,

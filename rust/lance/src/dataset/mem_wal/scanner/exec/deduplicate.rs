@@ -67,7 +67,7 @@ pub struct DeduplicateExec {
     /// Whether the input is already sorted by (pk, _memtable_gen DESC, _rowaddr DESC).
     input_sorted: bool,
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DeduplicateExec {
@@ -155,12 +155,12 @@ impl DeduplicateExec {
         let schema = Arc::new(Schema::new(output_fields));
 
         // Output is single partition after sort + dedup
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             input.pipeline_behavior(),
             input.boundedness(),
-        );
+        ));
 
         Ok(Self {
             input,
@@ -237,12 +237,12 @@ impl DeduplicateExec {
         let schema = Arc::new(Schema::new(output_fields));
 
         // Output is single partition after dedup
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             input.pipeline_behavior(),
             input.boundedness(),
-        );
+        ));
 
         Ok(Self {
             input,
@@ -381,7 +381,7 @@ impl ExecutionPlan for DeduplicateExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

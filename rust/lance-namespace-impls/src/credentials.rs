@@ -40,10 +40,13 @@
 //! # Note: GCP token duration cannot be configured; it's determined by the STS endpoint
 //! # To use a service account key file, set GOOGLE_APPLICATION_CREDENTIALS env var before starting
 //! credential_vendor.gcp_service_account = "my-sa@project.iam.gserviceaccount.com"
+//! credential_vendor.gcp_workload_identity_provider = "projects/123456/locations/global/workloadIdentityPools/pool/providers/provider"
+//! credential_vendor.gcp_impersonation_service_account = "my-sa@project.iam.gserviceaccount.com"
 //!
 //! # Azure-specific properties (for az:// locations)
 //! credential_vendor.azure_account_name = "mystorageaccount"  # required for Azure
 //! credential_vendor.azure_tenant_id = "my-tenant-id"
+//! credential_vendor.azure_federated_client_id = "my-app-client-id"
 //! credential_vendor.azure_duration_millis = "3600000"  # 1 hour (default, up to 7 days)
 //! ```
 //!
@@ -517,8 +520,14 @@ async fn create_gcp_vendor(
     if let Some(sa) = properties.get(gcp_props::SERVICE_ACCOUNT) {
         config = config.with_service_account(sa);
     }
+    if let Some(provider) = properties.get(gcp_props::WORKLOAD_IDENTITY_PROVIDER) {
+        config = config.with_workload_identity_provider(provider);
+    }
+    if let Some(service_account) = properties.get(gcp_props::IMPERSONATION_SERVICE_ACCOUNT) {
+        config = config.with_impersonation_service_account(service_account);
+    }
 
-    let vendor = GcpCredentialVendor::new(config).await?;
+    let vendor = GcpCredentialVendor::new(config)?;
     Ok(Some(Box::new(vendor)))
 }
 
@@ -548,6 +557,9 @@ fn create_azure_vendor(
 
     if let Some(tenant_id) = properties.get(azure_props::TENANT_ID) {
         config = config.with_tenant_id(tenant_id);
+    }
+    if let Some(client_id) = properties.get(azure_props::FEDERATED_CLIENT_ID) {
+        config = config.with_federated_client_id(client_id);
     }
 
     let vendor = AzureCredentialVendor::new(config);

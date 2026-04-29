@@ -17,7 +17,7 @@ use pyo3::{
     types::PyTuple,
 };
 
-#[pyclass(name = "LanceField", module = "lance.schema")]
+#[pyclass(name = "LanceField", module = "lance.schema", from_py_object)]
 #[derive(Clone)]
 pub struct LanceField(pub Field);
 
@@ -86,7 +86,7 @@ impl LanceField {
 ///
 /// The assignment of field ids is particular to each dataset, so these schemas
 /// cannot be used interchangeably between datasets.
-#[pyclass(name = "LanceSchema", module = "lance.schema")]
+#[pyclass(name = "LanceSchema", module = "lance.schema", from_py_object)]
 #[derive(Clone)]
 pub struct LanceSchema(pub Schema);
 

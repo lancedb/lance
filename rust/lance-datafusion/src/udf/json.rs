@@ -393,8 +393,9 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
                 } else if raw.is_boolean().unwrap_or(false) {
                     JsonbType::Boolean
                 } else if raw.is_number().unwrap_or(false) {
-                    // Try to determine if it's an integer or float
-                    if raw.to_i64().is_ok() {
+                    let is_float_storage =
+                        matches!(raw.as_number(), Ok(Some(jsonb::Number::Float64(_))));
+                    if !is_float_storage && raw.is_i64().unwrap_or(false) {
                         JsonbType::Int64
                     } else {
                         JsonbType::Float64
@@ -980,7 +981,7 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
 mod tests {
     use super::*;
     use arrow_array::builder::LargeBinaryBuilder;
-    use arrow_array::{BooleanArray, Int64Array};
+    use arrow_array::{BooleanArray, Float64Array, Int64Array};
 
     fn create_test_jsonb(json_str: &str) -> Vec<u8> {
         jsonb::parse_value(json_str.as_bytes()).unwrap().to_vec()
@@ -1128,6 +1129,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_get_float_udf() -> Result<()> {
+        let json = r#"{
+            "float_decimal": 1.5,
+            "float_neg": -2.5,
+            "float_int_value": 1.0,
+            "float_exp": 1e2,
+            "int_pos": 42,
+            "int_neg": -7,
+            "big_int": 9223372036854775808,
+            "str_num": "3.5",
+            "bool_true": true,
+            "null_val": null
+        }"#;
+        let jsonb_bytes = create_test_jsonb(json);
+
+        let mut binary_builder = LargeBinaryBuilder::new();
+        for _ in 0..11 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
+        let jsonb_array = Arc::new(binary_builder.finish());
+        let key_array = Arc::new(StringArray::from(vec![
+            Some("float_decimal"),
+            Some("float_neg"),
+            Some("float_int_value"),
+            Some("float_exp"),
+            Some("int_pos"),
+            Some("int_neg"),
+            Some("big_int"),
+            Some("str_num"),
+            Some("bool_true"),
+            Some("null_val"),
+            Some("missing"),
+        ]));
+
+        let result = json_get_float_impl(&[jsonb_array, key_array])?;
+        let float_array = result.as_any().downcast_ref::<Float64Array>().unwrap();
+
+        assert_eq!(float_array.len(), 11);
+        assert_eq!(float_array.value(0), 1.5);
+        assert_eq!(float_array.value(1), -2.5);
+        assert_eq!(float_array.value(2), 1.0);
+        assert_eq!(float_array.value(3), 100.0);
+        assert_eq!(float_array.value(4), 42.0);
+        assert_eq!(float_array.value(5), -7.0);
+        // 2^63 is exactly representable in f64.
+        assert_eq!(float_array.value(6), 9223372036854775808.0);
+        assert_eq!(float_array.value(7), 3.5);
+        assert_eq!(float_array.value(8), 1.0); // jsonb converts true to 1.0
+        assert!(float_array.is_null(9));
+        assert!(float_array.is_null(10));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_json_get_bool_udf() -> Result<()> {
         let json =
             r#"{"bool_true": true, "bool_false": false, "str_true": "true", "str_false": "false"}"#;
@@ -1223,6 +1279,45 @@ mod tests {
         assert_eq!(int_array.value(1), 3);
         assert_eq!(int_array.value(2), 2);
         assert!(int_array.is_null(3));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_extract_with_type() -> Result<()> {
+        use arrow_array::StructArray;
+        use arrow_array::UInt8Array;
+
+        let cases: &[(&str, JsonbType)] = &[
+            (r#"{"v": 1}"#, JsonbType::Int64),
+            (r#"{"v": 0}"#, JsonbType::Int64),
+            (r#"{"v": -42}"#, JsonbType::Int64),
+            (r#"{"v": 9223372036854775807}"#, JsonbType::Int64), // i64::MAX
+            (r#"{"v": 9223372036854775808}"#, JsonbType::Float64), // i64::MAX + 1
+            (r#"{"v": 1.0}"#, JsonbType::Float64),
+            (r#"{"v": 2.7}"#, JsonbType::Float64),
+            (r#"{"v": 1.5}"#, JsonbType::Float64),
+            (r#"{"v": -1.5}"#, JsonbType::Float64),
+            (r#"{"v": 1e2}"#, JsonbType::Float64),
+        ];
+
+        for (json, expected) in cases {
+            let bytes = create_test_jsonb(json);
+            let mut binary_builder = LargeBinaryBuilder::new();
+            binary_builder.append_value(&bytes);
+            let jsonb_array: ArrayRef = Arc::new(binary_builder.finish());
+            let path_array: ArrayRef = Arc::new(StringArray::from(vec![Some("$.v")]));
+
+            let result = json_extract_with_type_impl(&[jsonb_array, path_array])?;
+            let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+            let type_tags = struct_array
+                .column_by_name("type_tag")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap();
+            assert_eq!(type_tags.value(0), expected.as_u8());
+        }
 
         Ok(())
     }

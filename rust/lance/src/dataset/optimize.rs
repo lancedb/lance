@@ -4564,4 +4564,104 @@ mod tests {
         // validate() should have turned off materialize_deletions since threshold >= 1.0
         assert!(!plan.options.materialize_deletions);
     }
+
+    // check_rewrite_txn takes the (None, Some(_)) branch when a Rewrite with
+    // defer_index_remap=true is committed against a previously committed
+    // CreateIndex, declaring COMPATIBLE without verifying that the Rewrite's
+    // FRI groups don't straddle the CreateIndex's fragment bitmap. When a
+    // group mixes indexed and unindexed fragments, commit succeeds and later
+    // queries fail at load_indices with "split of indexed and non-indexed
+    // data".
+    #[tokio::test]
+    async fn test_rewrite_fri_vs_create_index_conflict() {
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use futures::TryStreamExt;
+        use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+
+        async fn append_fragment(uri: &str, rows: u64) -> Dataset {
+            let reader = gen_batch()
+                .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+                .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
+            let params = WriteParams {
+                max_rows_per_file: rows as usize,
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            Dataset::write(reader, uri, Some(params)).await.unwrap()
+        }
+
+        let tmpdir = TempStrDir::default();
+        let uri = format!("file://{}", tmpdir.as_str());
+
+        // frag0 (256 rows) with a base IVF index.
+        let reader = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 256,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, true)
+            .await
+            .unwrap();
+
+        // Append frag1 (unindexed), snapshot a stale handle pointing here,
+        // then append frag2 (also unindexed).
+        dataset = append_fragment(&uri, 64).await;
+        let mut stale = dataset.clone();
+        dataset = append_fragment(&uri, 64).await;
+
+        // Plan + execute compaction of frag1+frag2 with deferred remap.
+        let options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        let snapshot = dataset.clone();
+        let completed: Vec<RewriteResult> = futures::stream::iter(plan.tasks.into_iter())
+            .map(|task| rewrite_files(Cow::Borrowed(&snapshot), task, &options))
+            .buffer_unordered(1)
+            .try_collect()
+            .await
+            .unwrap();
+
+        // optimize_indices on the stale handle indexes frag1 only (frag2
+        // didn't exist at that version), commits as CreateIndex. `dataset`
+        // stays at its pre-optimize version so the Rewrite commit has to
+        // conflict-check against this CreateIndex.
+        stale
+            .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        // Commit the pre-executed Rewrite. The FRI group [frag1, frag2]
+        // straddles the new CreateIndex bitmap (frag1 indexed, frag2 not), so
+        // check_rewrite_txn must reject this as a retryable conflict rather
+        // than letting it commit into a broken state that fails queries.
+        let err = commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("commit should fail with retryable conflict");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "unexpected error: {err}"
+        );
+    }
 }

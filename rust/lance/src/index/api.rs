@@ -80,6 +80,42 @@ impl IndexSegment {
     }
 }
 
+/// Convert an existing index segment representation into [`IndexSegment`].
+pub trait IntoIndexSegment {
+    /// Convert into an index segment.
+    fn into_index_segment(self) -> Result<IndexSegment>;
+}
+
+impl IntoIndexSegment for IndexSegment {
+    fn into_index_segment(self) -> Result<IndexSegment> {
+        Ok(self)
+    }
+}
+
+impl IntoIndexSegment for IndexMetadata {
+    fn into_index_segment(self) -> Result<IndexSegment> {
+        let fragment_bitmap = self.fragment_bitmap.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing fragment coverage",
+                self.uuid
+            ))
+        })?;
+        let index_details = self.index_details.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing index details",
+                self.uuid
+            ))
+        })?;
+
+        Ok(IndexSegment::new(
+            self.uuid,
+            fragment_bitmap.iter(),
+            index_details,
+            self.index_version,
+        ))
+    }
+}
+
 /// A plan for building one physical segment from one or more existing
 /// uncommitted index segments.
 #[derive(Debug, Clone, PartialEq)]
@@ -274,7 +310,7 @@ pub trait DatasetIndexExt {
         &mut self,
         index_name: &str,
         column: &str,
-        segments: Vec<IndexSegment>,
+        segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()>;
 
     async fn read_index_partition(

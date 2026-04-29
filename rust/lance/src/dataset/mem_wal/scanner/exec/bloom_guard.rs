@@ -60,7 +60,7 @@ pub struct BloomFilterGuardExec {
     /// Output schema.
     schema: SchemaRef,
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl BloomFilterGuardExec {
@@ -80,12 +80,12 @@ impl BloomFilterGuardExec {
     ) -> Self {
         let schema = input.schema();
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             input.pipeline_behavior(),
             input.boundedness(),
-        );
+        ));
 
         Self {
             input,
@@ -142,7 +142,7 @@ impl ExecutionPlan for BloomFilterGuardExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

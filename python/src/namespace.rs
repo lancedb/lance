@@ -86,7 +86,7 @@ impl DynamicContextProvider for PyDynamicContextProvider {
                 Ok(headers_py) => {
                     // Convert Python dict to Rust HashMap
                     let bound_headers = headers_py.bind(py);
-                    if let Ok(dict) = bound_headers.downcast::<PyDict>() {
+                    if let Ok(dict) = bound_headers.cast::<PyDict>() {
                         dict_to_hashmap(dict).unwrap_or_default()
                     } else {
                         log::warn!("Context provider did not return a dict");
@@ -1549,10 +1549,10 @@ pub fn extract_namespace_arc(
     namespace_client: &Bound<'_, PyAny>,
 ) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
     // Direct PyO3 class
-    if let Ok(dir_namespace_client) = namespace_client.downcast::<PyDirectoryNamespace>() {
+    if let Ok(dir_namespace_client) = namespace_client.cast::<PyDirectoryNamespace>() {
         return Ok(dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
-    if let Ok(rest_namespace_client) = namespace_client.downcast::<PyRestNamespace>() {
+    if let Ok(rest_namespace_client) = namespace_client.cast::<PyRestNamespace>() {
         return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
 
@@ -1565,13 +1565,13 @@ pub fn extract_namespace_arc(
             .unwrap_or_default();
 
         if type_name == "DirectoryNamespace" {
-            if let Ok(dir_namespace_client) = inner.downcast::<PyDirectoryNamespace>() {
+            if let Ok(dir_namespace_client) = inner.cast::<PyDirectoryNamespace>() {
                 return Ok(
                     dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>
                 );
             }
         } else if type_name == "RestNamespace"
-            && let Ok(rest_namespace_client) = inner.downcast::<PyRestNamespace>()
+            && let Ok(rest_namespace_client) = inner.cast::<PyRestNamespace>()
         {
             return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
         }

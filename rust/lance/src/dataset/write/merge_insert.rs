@@ -67,6 +67,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::{
     execution::{
@@ -80,6 +81,7 @@ use datafusion::{
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
+        sorts::sort::SortExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
     },
@@ -103,13 +105,12 @@ use lance_core::{
 };
 use lance_datafusion::{
     chunker::chunk_stream,
-    dataframe::DataFrameExt,
-    exec::{LanceExecutionOptions, analyze_plan, get_session_context},
-    utils::reader_to_stream,
-};
-use lance_datafusion::{
-    exec::{OneShotExec, execute_plan},
-    utils::StreamingWriteSource,
+    dataframe::BatchStreamGrouper,
+    exec::{
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan, execute_plan,
+        get_session_context,
+    },
+    utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
@@ -754,6 +755,7 @@ impl MergeInsertJob {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNull,
+                false,
             )
             .unwrap(),
         );
@@ -900,19 +902,44 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        let mut group_stream = session_ctx
+        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
+        // single batch that is larger than the memory pool, so we must
+        // rechunk oversized batches before they reach the sort.
+        const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
+        let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
-            .sort(vec![col(ROW_ADDR).sort(true, true)])?
-            .group_by_stream(&["_fragment_id"])
-            .await?;
+            .sort(vec![col(ROW_ADDR).sort(true, true)])?;
+        let sorted_plan = sorted.create_physical_plan().await?;
+        // Walk the physical plan and insert HardCapBatchSizeExec below every
+        // sort node so each input batch fits in the memory pool.
+        let capped_plan = sorted_plan
+            .transform_down(|node| {
+                if node.as_any().downcast_ref::<SortExec>().is_some() {
+                    let children = node.children();
+                    let new_children: Vec<Arc<dyn ExecutionPlan>> = children
+                        .into_iter()
+                        .map(|c| {
+                            Arc::new(HardCapBatchSizeExec::new(c.clone(), MAX_BATCH_BYTES))
+                                as Arc<dyn ExecutionPlan>
+                        })
+                        .collect();
+                    let new_node = node.with_new_children(new_children)?;
+                    Ok(Transformed::yes(new_node))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })?
+            .data;
+        let capped_stream = capped_plan.execute(0, session_ctx.task_ctx())?;
+        let mut group_stream = BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let task_limit = dataset.object_store().io_parallelism();
-        let mut reservation =
+        let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
         while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {
@@ -4262,9 +4289,8 @@ mod tests {
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
       HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        CooperativeExec
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-          row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+        row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -4311,8 +4337,7 @@ mod tests {
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        CooperativeExec
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -4359,8 +4384,7 @@ mod tests {
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        CooperativeExec
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"

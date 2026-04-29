@@ -34,9 +34,15 @@ use url::Url;
 use super::local::LocalObjectReader;
 #[cfg(target_os = "linux")]
 use crate::uring::{UringCurrentThreadReader, UringReader};
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) mod dynamic_credentials;
+#[cfg(any(feature = "oss", feature = "huggingface"))]
+pub(crate) mod dynamic_opendal;
 mod list_retry;
 pub mod providers;
 pub mod storage_options;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;

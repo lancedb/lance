@@ -452,8 +452,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
           CoalescePartitionsExec
             ProjectionExec: expr=[...]
               HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                CooperativeExec
-                  LanceRead: uri=test_dataset/data, projection=[id], ...
+                LanceRead: uri=test_dataset/data, projection=[id], ...
                 RepartitionExec: ...
                   ProjectionExec: expr=[..., true as __merge_source_sentinel]
                     StreamingTableExec: partition_sizes=1, ...
@@ -534,8 +533,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
                   HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                    CooperativeExec, elapsed=..., metrics=[]
-                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                     RepartitionExec: ...
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
                         StreamingTableExec: ..., metrics=[]
@@ -583,10 +581,12 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client: Optional[Any] = None,
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
+        self._base_store_params = base_store_params
 
         # Handle deprecation warning for index_cache_size
         if index_cache_size is not None:
@@ -621,6 +621,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client=namespace_client,
             table_id=table_id,
             namespace_client_managed_versioning=namespace_client_managed_versioning,
+            base_store_params=base_store_params,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -634,6 +635,7 @@ class LanceDataset(pa.dataset.Dataset):
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
         read_params: Optional[Dict[str, Any]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         return cls(
             uri,
@@ -642,6 +644,7 @@ class LanceDataset(pa.dataset.Dataset):
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
             read_params=read_params,
+            base_store_params=base_store_params,
         )
 
     def __reduce__(self):
@@ -652,6 +655,7 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.serialized_manifest(),
             self._default_scan_options,
             self._read_params,
+            self._base_store_params,
         )
 
     def __getstate__(self):
@@ -662,19 +666,22 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.serialized_manifest(),
             self._default_scan_options,
             self._read_params,
+            self._base_store_params,
         )
 
     def __setstate__(self, state):
-        # Handle backwards compatibility - state may not have read_params
+        # Handle backwards compatibility - state may not have read_params or
+        # base_store_params.
         (
             self._uri,
             self._storage_options,
             version,
             manifest,
             default_scan_options,
-            *rest,  # Capture optional read_params
+            *rest,  # Capture optional read_params and base_store_params.
         ) = state
         read_params = rest[0] if rest else None
+        base_store_params = rest[1] if len(rest) > 1 else None
         self._ds = _Dataset(
             self._uri,
             version,
@@ -682,9 +689,11 @@ class LanceDataset(pa.dataset.Dataset):
             manifest=manifest,
             default_scan_options=default_scan_options,
             read_params=read_params,
+            base_store_params=base_store_params,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
+        self._base_store_params = base_store_params
         self._namespace_client = None
         self._table_id = None
         self._namespace_client_managed_versioning = False
@@ -693,6 +702,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._uri = self._uri
         ds._storage_options = self._storage_options
+        ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
         ds._namespace_client_managed_versioning = (
@@ -792,6 +802,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = self._storage_options
+        ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
         ds._default_scan_options = self._default_scan_options
@@ -1159,6 +1170,13 @@ class LanceDataset(pa.dataset.Dataset):
         The version of the data storage format this dataset is using
         """
         return self._ds.data_storage_version
+
+    @property
+    def has_stable_row_ids(self) -> bool:
+        """
+        Whether this dataset has stable row IDs enabled
+        """
+        return self._ds.has_stable_row_ids
 
     @property
     def max_field_id(self) -> int:
@@ -3907,6 +3925,15 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.session()
 
     @staticmethod
+    def _inherit_base_store_params(
+        dataset_or_uri: Union[str, Path, LanceDataset, None],
+        base_store_params: Optional[Dict[str, Dict[str, str]]],
+    ) -> Optional[Dict[str, Dict[str, str]]]:
+        if base_store_params is None and isinstance(dataset_or_uri, LanceDataset):
+            return dataset_or_uri._base_store_params
+        return base_store_params
+
+    @staticmethod
     def _commit(
         base_uri: Union[str, Path],
         operation: LanceOperation.BaseOperation,
@@ -3935,6 +3962,7 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -4005,6 +4033,8 @@ class LanceDataset(pa.dataset.Dataset):
         table_id : List[str], optional
             The table identifier within the namespace (e.g., ["workspace", "table"]).
             Must be provided together with namespace_client.
+        base_store_params : dict of str to dict, optional
+            Runtime-only object store parameters keyed by base path URI.
 
         Returns
         -------
@@ -4032,6 +4062,10 @@ class LanceDataset(pa.dataset.Dataset):
         2  3  c
         3  4  d
         """
+        base_store_params = LanceDataset._inherit_base_store_params(
+            base_uri, base_store_params
+        )
+
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -4105,6 +4139,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
+        ds._base_store_params = base_store_params
         ds._namespace_client = namespace_client
         ds._table_id = table_id
         ds._namespace_client_managed_versioning = namespace_client_managed_versioning
@@ -4123,6 +4158,7 @@ class LanceDataset(pa.dataset.Dataset):
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> BulkCommitResult:
         """Create a new version of dataset with multiple transactions.
 
@@ -4165,6 +4201,8 @@ class LanceDataset(pa.dataset.Dataset):
             the future.
         max_retries : int
             The maximum number of retries to perform when committing the dataset.
+        base_store_params : dict of str to dict, optional
+            Runtime-only object store parameters keyed by base path URI.
 
         Returns
         -------
@@ -4174,6 +4212,10 @@ class LanceDataset(pa.dataset.Dataset):
             merged: Transaction
                 The merged transaction that was applied to the dataset.
         """
+        base_store_params = LanceDataset._inherit_base_store_params(
+            dest, base_store_params
+        )
+
         if isinstance(dest, Path):
             dest = str(dest)
         elif isinstance(dest, LanceDataset):
@@ -4202,6 +4244,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = storage_options
+        ds._base_store_params = base_store_params
         ds._namespace_client = None
         ds._table_id = None
         ds._default_scan_options = None
@@ -6364,6 +6407,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     blob_pack_file_size_threshold: Optional[int] = None,
@@ -6461,6 +6505,12 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by base path URI. Each key
+        is a base path URI (e.g., "s3://bucket/path") and each value is a dict
+        of storage options (credentials, endpoint, etc.) for that base. These
+        are not persisted to the manifest. When a base has no explicit entry
+        here, the top-level ``storage_options`` is used as a fallback.
     external_blob_mode: {"reference", "ingest"}, default "reference"
         How external blob URIs are handled on write.
 
@@ -6581,6 +6631,7 @@ def write_dataset(
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
+    base_store_params = LanceDataset._inherit_base_store_params(uri, base_store_params)
 
     # Merge properties and commit_message with priority to commit_message
     merged_properties = _merge_message_to_properties(
@@ -6601,6 +6652,7 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "base_store_params": base_store_params,
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
@@ -6631,6 +6683,7 @@ def write_dataset(
 
     ds = LanceDataset.__new__(LanceDataset)
     ds._storage_options = storage_options
+    ds._base_store_params = base_store_params
     ds._namespace_client = namespace_client
     ds._table_id = table_id
     ds._namespace_client_managed_versioning = namespace_client_managed_versioning

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, fmt, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(test)]
 use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
@@ -29,7 +29,7 @@ use url::Url;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
-    StorageOptionsProvider,
+    dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{AimdThrottleConfig, AimdThrottledStore},
 };
 use lance_core::error::{Error, Result};
@@ -274,27 +274,20 @@ pub async fn build_aws_credential(
 
     let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
 
-    // If accessor has a provider, check whether it vends credentials.
-    // If it does, use DynamicStorageOptionsCredentialProvider for ongoing
-    // refresh. If not, fall through to the default credentials chain.
-    if let Some(accessor) = storage_options_accessor
-        && accessor.has_provider()
+    // Explicit aws_credentials takes precedence over dynamic credentials.
+    if credentials.is_none()
+        && let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
+            storage_options_accessor.clone(),
+        )
+        .await?
     {
-        // Explicit aws_credentials takes precedence
-        if let Some(creds) = credentials {
-            return Ok((creds, region));
-        }
+        return Ok((dynamic_creds, region));
+    }
 
-        // Check if the accessor's storage options contain credentials
-        let opts = accessor.get_storage_options().await?;
-        let s3_options = opts.as_s3_options();
-        if extract_static_s3_credentials(&s3_options).is_some() {
-            return Ok((
-                Arc::new(DynamicStorageOptionsCredentialProvider::new(accessor)),
-                region,
-            ));
-        }
-
+    if storage_options_accessor
+        .as_ref()
+        .is_some_and(|a| a.has_provider())
+    {
         log::debug!(
             "Storage options from provider do not contain explicit AWS credentials, \
              falling back to default AWS credentials chain."
@@ -467,106 +460,13 @@ impl ObjectStoreParams {
     }
 }
 
-/// AWS Credential Provider that delegates to StorageOptionsAccessor
-///
-/// This adapter converts storage options from a [`StorageOptionsAccessor`] into
-/// AWS-specific credentials that can be used with S3. All caching and refresh logic
-/// is handled by the accessor.
-///
-/// # Future Work
-///
-/// TODO: Support AWS/GCP/Azure together in a unified credential provider.
-/// Currently this is AWS-specific. Needs investigation of how GCP and Azure credential
-/// refresh mechanisms work and whether they can be unified with AWS's approach.
-///
-/// See: <https://github.com/lance-format/lance/pull/4905#discussion_r2474605265>
-pub struct DynamicStorageOptionsCredentialProvider {
-    accessor: Arc<StorageOptionsAccessor>,
-}
-
-impl fmt::Debug for DynamicStorageOptionsCredentialProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DynamicStorageOptionsCredentialProvider")
-            .field("accessor", &self.accessor)
-            .finish()
-    }
-}
-
-impl DynamicStorageOptionsCredentialProvider {
-    /// Create a new credential provider from a storage options accessor
-    pub fn new(accessor: Arc<StorageOptionsAccessor>) -> Self {
-        Self { accessor }
-    }
-
-    /// Create a new credential provider from a storage options provider
-    ///
-    /// This is a convenience constructor for backward compatibility.
-    /// The refresh offset will be extracted from storage options using
-    /// the `refresh_offset_millis` key, defaulting to 60 seconds.
-    ///
-    /// # Arguments
-    /// * `provider` - The storage options provider
-    pub fn from_provider(provider: Arc<dyn StorageOptionsProvider>) -> Self {
-        Self {
-            accessor: Arc::new(StorageOptionsAccessor::with_provider(provider)),
-        }
-    }
-
-    /// Create a new credential provider with initial credentials
-    ///
-    /// This is a convenience constructor for backward compatibility.
-    /// The refresh offset will be extracted from initial_options using
-    /// the `refresh_offset_millis` key, defaulting to 60 seconds.
-    ///
-    /// # Arguments
-    /// * `provider` - The storage options provider
-    /// * `initial_options` - Initial storage options to cache
-    pub fn from_provider_with_initial(
-        provider: Arc<dyn StorageOptionsProvider>,
-        initial_options: HashMap<String, String>,
-    ) -> Self {
-        Self {
-            accessor: Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                initial_options,
-                provider,
-            )),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialProvider for DynamicStorageOptionsCredentialProvider {
-    type Credential = ObjectStoreAwsCredential;
-
-    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-        let storage_options = self.accessor.get_storage_options().await.map_err(|e| {
-            object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: Box::new(e),
-            }
-        })?;
-
-        let s3_options = storage_options.as_s3_options();
-        let static_creds = extract_static_s3_credentials(&s3_options).ok_or_else(|| {
-            object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: "Missing required credentials in storage options".into(),
-            }
-        })?;
-
-        static_creds
-            .get_credential()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "DynamicStorageOptionsCredentialProvider",
-                source: Box::new(e),
-            })
-    }
-}
+pub type DynamicStorageOptionsCredentialProvider =
+    NamespaceCredentialsProvider<ObjectStoreAwsCredential>;
 
 #[cfg(test)]
 mod tests {
     use crate::object_store::ObjectStoreRegistry;
+    use crate::object_store::StorageOptionsProvider;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};

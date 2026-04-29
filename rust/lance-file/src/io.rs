@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use futures::{FutureExt, future::BoxFuture};
 use lance_encoding::EncodingsIo;
 use lance_io::scheduler::FileScheduler;
@@ -29,6 +31,13 @@ impl LanceEncodingsIo {
 }
 
 impl EncodingsIo for LanceEncodingsIo {
+    fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
+        Some(Arc::new(Self {
+            scheduler: self.scheduler.with_bypass_backpressure(),
+            read_chunk_size: self.read_chunk_size,
+        }))
+    }
+
     fn submit_request(
         &self,
         ranges: Vec<std::ops::Range<u64>>,
