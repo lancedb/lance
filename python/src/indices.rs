@@ -67,7 +67,11 @@ impl PyIndexConfig {
     }
 }
 
-#[pyclass(name = "IndexSegment", module = "lance.indices")]
+#[pyclass(
+    name = "IndexSegment",
+    module = "lance.indices",
+    skip_from_py_object
+)]
 #[derive(Debug, Clone)]
 pub struct PyIndexSegment {
     pub(crate) inner: IndexSegment,
@@ -106,7 +110,11 @@ impl PyIndexSegment {
     }
 }
 
-#[pyclass(name = "IndexSegmentPlan", module = "lance.indices")]
+#[pyclass(
+    name = "IndexSegmentPlan",
+    module = "lance.indices",
+    skip_from_py_object
+)]
 #[derive(Debug, Clone)]
 pub struct PyIndexSegmentPlan {
     pub(crate) inner: IndexSegmentPlan,

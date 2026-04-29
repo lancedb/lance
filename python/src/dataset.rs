@@ -356,7 +356,12 @@ impl MergeInsertBuilder {
     }
 }
 
-#[pyclass(name = "IndexSegmentBuilder", module = "lance", subclass)]
+#[pyclass(
+    name = "IndexSegmentBuilder",
+    module = "lance",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyIndexSegmentBuilder {
     dataset: Arc<LanceDataset>,
