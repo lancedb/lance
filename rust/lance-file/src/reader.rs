@@ -46,7 +46,7 @@ use lance_io::{
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
-    io::LanceEncodingsIo,
+    io::{LanceEncodingsIo, SentinelEncodingsIo},
     version::ConcreteFileVersion,
     writer::PAGE_BUFFER_ALIGNMENT,
 };
@@ -509,6 +509,32 @@ pub struct FileReader {
     core: FileReadCore,
     metadata: Arc<CachedFileMetadata>,
 }
+
+impl DeepSizeOf for FileReader {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        // Only count the metadata, which is the bulk of the reader's
+        // footprint and has DeepSizeOf. The other Arcs we hold are either
+        // back-references that would cause us to over-count (the `cache`
+        // points back into the very LanceCache we may be inserted into,
+        // which would inflate our reported size with the entire cache and
+        // recursively grow as more entries are inserted) or types without a
+        // DeepSizeOf impl (`scheduler`, `decoder_plugins`, `options`).
+        self.metadata.deep_size_of_children(ctx)
+    }
+}
+
+impl DeepSizeOf for ProjectedFileReader {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        // Same rationale as FileReader: only count the metadata. For Indexed
+        // providers, FileMetadataIndex does not implement DeepSizeOf so we
+        // conservatively report 0 for that variant.
+        match &self.core.metadata_provider {
+            FileMetadataProvider::Full(metadata) => metadata.deep_size_of_children(ctx),
+            FileMetadataProvider::Indexed(_) => 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Footer {
     #[allow(dead_code)]
@@ -689,6 +715,18 @@ impl FileReader {
         match self.core.scheduler.with_io_stats(stats) {
             Some(scheduler) => self.with_scheduler(scheduler),
             None => self.clone(),
+        }
+    }
+
+    /// Return a clone of this reader with a different [`FileReaderOptions`].
+    ///
+    /// Used when a reader is cached with the dataset's default options but a
+    /// specific read needs to override them (e.g. a per-scan decoder config or
+    /// batch size).
+    pub fn with_options(&self, options: FileReaderOptions) -> Self {
+        Self {
+            core: self.core.with_options(options),
+            metadata: self.metadata.clone(),
         }
     }
 
@@ -1398,6 +1436,39 @@ impl FileReader {
         let cache = Arc::new(cache.with_key_prefix(path.as_ref()));
         let core = FileReadCore::try_new(
             scheduler,
+            base_projection,
+            decoder_plugins,
+            FileMetadataProvider::Full(file_metadata.clone()),
+            cache,
+            options,
+        )?;
+        Ok(Self {
+            core,
+            metadata: file_metadata,
+        })
+    }
+
+    /// Build a [`FileReader`] without binding it to a real I/O scheduler.
+    ///
+    /// The returned reader holds a [`SentinelEncodingsIo`] in its scheduler
+    /// slot, so it cannot serve reads as-is — the caller MUST call
+    /// [`FileReader::with_scheduler`] to bind a real scheduler before any
+    /// read. Calling a read against the sentinel panics.
+    ///
+    /// This exists so that callers can cache a fully-projected, validated
+    /// `FileReader` across requests without the cache holding object stores
+    /// or open file handles.
+    pub fn try_open_unbound_with_file_metadata(
+        path: Path,
+        base_projection: Option<ReaderProjection>,
+        decoder_plugins: Arc<DecoderPlugins>,
+        file_metadata: Arc<CachedFileMetadata>,
+        cache: &LanceCache,
+        options: FileReaderOptions,
+    ) -> Result<Self> {
+        let cache = Arc::new(cache.with_key_prefix(path.as_ref()));
+        let core = FileReadCore::try_new(
+            Arc::new(SentinelEncodingsIo),
             base_projection,
             decoder_plugins,
             FileMetadataProvider::Full(file_metadata.clone()),
@@ -2155,6 +2226,17 @@ impl FileReadCore {
         }
     }
 
+    fn with_options(&self, options: FileReaderOptions) -> Self {
+        Self {
+            scheduler: self.scheduler.clone(),
+            base_projection: self.base_projection.clone(),
+            metadata_provider: self.metadata_provider.clone(),
+            decoder_plugins: self.decoder_plugins.clone(),
+            cache: self.cache.clone(),
+            options,
+        }
+    }
+
     fn version(&self) -> LanceFileVersion {
         self.metadata_provider.version()
     }
@@ -2512,6 +2594,13 @@ impl ProjectedFileReader {
     pub fn with_scheduler(&self, scheduler: Arc<dyn EncodingsIo>) -> Self {
         Self {
             core: self.core.with_scheduler(scheduler),
+        }
+    }
+
+    /// Returns a clone of this reader with different [`FileReaderOptions`].
+    pub fn with_options(&self, options: FileReaderOptions) -> Self {
+        Self {
+            core: self.core.with_options(options),
         }
     }
 

@@ -24,6 +24,7 @@ use lance_table::{
 };
 use object_store::path::Path;
 
+use crate::dataset::fragment::FragmentReaderTemplate;
 use crate::dataset::transaction::Transaction;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for dataset metadata.
@@ -240,6 +241,45 @@ impl CacheKey for RowIdSequenceKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
+    }
+}
+
+/// Cache key for the [`FragmentReaderTemplate`] that backs an opened
+/// [`crate::dataset::fragment::FragmentReader`].
+///
+/// The template holds metadata (deletion vector, row id sequence, row counts)
+/// plus pre-built per-data-file shapes (an unbound [`lance_file::reader::FileReader`],
+/// the data-file schema, and the field-id-to-column-index map). It is invariant
+/// to the projection or system column flags requested at open time, so the key
+/// only needs to identify the fragment within a manifest version.
+///
+/// Per-request bindings — the object store, scan scheduler, and open file
+/// handles — are intentionally **not** part of the cached value. Each
+/// `FileFragment::open` call rebinds the cached `FileReader` to a fresh
+/// `FileScheduler` against the caller's `ScanScheduler`, so per-request
+/// `with_object_store` wrappers and scan-scoped schedulers keep their
+/// isolation guarantees.
+///
+/// `manifest_version` is part of the key because a fragment's deletion file,
+/// row-id metadata, and data files can change between commits even though the
+/// fragment id stays the same — without it, callers would see stale data
+/// after operations like `delete`.
+#[derive(Debug)]
+pub struct FragmentReaderTemplateKey {
+    pub manifest_version: u64,
+    pub fragment_id: u64,
+}
+
+impl CacheKey for FragmentReaderTemplateKey {
+    type ValueType = FragmentReaderTemplate;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "fragment_reader_template/{}/{}",
+            self.manifest_version, self.fragment_id,
+        ))
+    }
+    fn type_name() -> &'static str {
+        "FragmentReaderTemplate"
     }
 }
 

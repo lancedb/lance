@@ -25,6 +25,7 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -44,7 +45,7 @@ use lance_file::reader::{
 };
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
-use lance_file::{LanceEncodingsIo, determine_file_version};
+use lance_file::{LanceEncodingsIo, SentinelEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -916,22 +917,43 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection, &read_config);
-        let deletion_vec_load = self.get_deletion_vector();
+        // For each v2 data file, open a `FileScheduler` once. We use the same
+        // scheduler for both populating the cache (on miss) and binding the
+        // cached reader (always), so the IO cost matches the pre-cache path.
+        // v1 data files are not cached and re-opened inside the legacy path.
+        let mut v2_schedulers: Vec<Option<(FileScheduler, u32)>> =
+            Vec::with_capacity(self.metadata.files.len());
+        for data_file in &self.metadata.files {
+            if data_file.is_legacy_file() {
+                v2_schedulers.push(None);
+                continue;
+            }
+            let path = self
+                .dataset
+                .data_file_dir(data_file)?
+                .join(data_file.path.as_str());
+            let (store_scheduler, reader_priority) = self
+                .resolve_store_scheduler(data_file, &read_config)
+                .await?;
+            let file_scheduler = store_scheduler
+                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
+                .await?;
+            v2_schedulers.push(Some((file_scheduler, reader_priority)));
+        }
 
-        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
-            futures::future::Either::Left(
-                load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
-            )
-        } else {
-            futures::future::Either::Right(futures::future::ready(Ok(None)))
+        let key = crate::session::caches::FragmentReaderTemplateKey {
+            manifest_version: self.dataset.manifest.version,
+            fragment_id: self.id() as u64,
         };
+        let template = self
+            .dataset
+            .metadata_cache
+            .get_or_insert_with_key(key, || self.load_fragment_reader_template(&v2_schedulers))
+            .await?;
 
-        let (opened_files, deletion_vec, row_id_sequence) =
-            join!(open_files, deletion_vec_load, row_id_load);
-        let opened_files = opened_files?;
-        let deletion_vec = deletion_vec?;
-        let row_id_sequence = row_id_sequence?;
+        let opened_files = self
+            .bind_readers(&template, &v2_schedulers, projection, &read_config)
+            .await?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -941,16 +963,14 @@ impl FileFragment {
             )));
         }
 
-        let num_physical_rows = self.physical_rows().await?;
-
         let mut reader = FragmentReader::try_new(
             self.id(),
-            deletion_vec,
-            row_id_sequence,
+            template.deletion_vec.clone(),
+            template.row_id_sequence.clone(),
             opened_files,
             ArrowSchema::from(projection),
-            self.count_rows(None).await?,
-            num_physical_rows,
+            template.num_rows,
+            template.num_physical_rows,
             Arc::new(self.metadata.clone()),
         )?;
 
@@ -981,6 +1001,222 @@ impl FileFragment {
         }
 
         Ok(reader)
+    }
+
+    /// Resolve the [`ScanScheduler`] and reader priority a v2 data file should
+    /// use, honoring `read_config` overrides and per-base bindings.
+    async fn resolve_store_scheduler(
+        &self,
+        data_file: &DataFile,
+        read_config: &FragReadConfig,
+    ) -> Result<(Arc<ScanScheduler>, u32)> {
+        if let Some(base_id) = data_file.base_id {
+            // TODO: make object stores for non-default bases reuse the same scan scheduler
+            //  currently we always create a new one
+            let object_store = self.dataset.object_store(Some(base_id)).await?;
+            let config = SchedulerConfig::max_bandwidth(&object_store);
+            Ok((
+                ScanScheduler::new(object_store, config),
+                read_config.reader_priority.unwrap_or(0),
+            ))
+        } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+            Ok((
+                scan_scheduler.clone(),
+                read_config.reader_priority.unwrap_or(0),
+            ))
+        } else {
+            Ok((
+                ScanScheduler::new(
+                    self.dataset.object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                ),
+                0,
+            ))
+        }
+    }
+
+    async fn load_fragment_reader_template(
+        &self,
+        v2_schedulers: &[Option<(FileScheduler, u32)>],
+    ) -> Result<FragmentReaderTemplate> {
+        let deletion_vec_load = self.get_deletion_vector();
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
+            futures::future::Either::Left(
+                load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
+            )
+        } else {
+            futures::future::Either::Right(futures::future::ready(Ok(None)))
+        };
+        let physical_rows_load = self.physical_rows();
+
+        let (deletion_vec, row_id_sequence, num_physical_rows) =
+            join!(deletion_vec_load, row_id_load, physical_rows_load);
+        let deletion_vec = deletion_vec?;
+        let row_id_sequence = row_id_sequence?;
+        let num_physical_rows = num_physical_rows?;
+
+        let num_deleted = deletion_vec.as_ref().map(|dv| dv.len()).unwrap_or(0);
+        let num_rows = num_physical_rows - num_deleted;
+
+        let mut data_files = Vec::with_capacity(self.metadata.files.len());
+        for (data_file, scheduler) in self.metadata.files.iter().zip(v2_schedulers.iter()) {
+            data_files.push(match scheduler {
+                Some((file_scheduler, _)) => Some(
+                    self.build_cached_data_file(data_file, file_scheduler)
+                        .await?,
+                ),
+                None => None,
+            });
+        }
+
+        Ok(FragmentReaderTemplate {
+            data_files,
+            deletion_vec,
+            row_id_sequence,
+            num_rows,
+            num_physical_rows,
+        })
+    }
+
+    async fn build_cached_data_file(
+        &self,
+        data_file: &DataFile,
+        file_scheduler: &FileScheduler,
+    ) -> Result<CachedDataFile> {
+        let full_schema = self.dataset.schema();
+        let data_file_schema = Arc::new(data_file.schema(full_schema));
+        let path = file_scheduler.reader().path().clone();
+        let file_metadata = self.get_file_metadata(file_scheduler).await?;
+        let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
+        let file_reader = Arc::new(
+            ProjectedFileReader::try_open_with_file_metadata(
+                Arc::new(SentinelEncodingsIo),
+                path,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                file_metadata,
+                &metadata_cache,
+                self.dataset.file_reader_options.clone().unwrap_or_default(),
+            )
+            .await?,
+        );
+
+        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+            data_file
+                .fields
+                .iter()
+                .copied()
+                .zip(data_file.column_indices.iter().copied())
+                .filter_map(|(field_id, column_index)| {
+                    if column_index < 0 {
+                        None
+                    } else {
+                        Some((field_id as u32, column_index as u32))
+                    }
+                }),
+        ));
+
+        Ok(CachedDataFile {
+            file_reader,
+            data_file_schema,
+            field_id_to_column_idx,
+        })
+    }
+
+    /// Build the per-data-file readers for one `open()` call by rebinding
+    /// each cached template entry against the file scheduler we already opened.
+    async fn bind_readers(
+        &self,
+        template: &FragmentReaderTemplate,
+        v2_schedulers: &[Option<(FileScheduler, u32)>],
+        projection: &Schema,
+        read_config: &FragReadConfig,
+    ) -> Result<Vec<Box<dyn GenericFileReader>>> {
+        let mut opened_files: Vec<Box<dyn GenericFileReader>> = Vec::new();
+        for ((data_file, cached), scheduler) in self
+            .metadata
+            .files
+            .iter()
+            .zip(template.data_files.iter())
+            .zip(v2_schedulers.iter())
+        {
+            let reader = match (cached, scheduler) {
+                (Some(cached), Some((file_scheduler, reader_priority))) => self.bind_v2_reader(
+                    cached,
+                    file_scheduler.clone(),
+                    *reader_priority,
+                    projection,
+                    read_config,
+                )?,
+                _ => {
+                    // v1 (or any uncached entry): fall back to the per-call open path.
+                    self.open_reader(data_file, Some(projection), read_config)
+                        .await?
+                }
+            };
+            if let Some(reader) = reader {
+                opened_files.push(reader);
+            }
+        }
+
+        // Pad with NullReader if the projection asks for fields that no data
+        // file contains.
+        let field_ids_in_files = opened_files
+            .iter()
+            .flat_map(|r| r.projection().fields_pre_order().map(|f| f.id))
+            .filter(|id| *id >= 0)
+            .collect::<HashSet<_>>();
+        let mut missing_fields = projection.field_ids();
+        missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
+        if !missing_fields.is_empty() {
+            let missing_projection = projection.project_by_ids(&missing_fields, true);
+            let null_reader = NullReader::new(
+                Arc::new(missing_projection),
+                template.num_physical_rows as u32,
+            );
+            opened_files.push(Box::new(null_reader));
+        }
+
+        Ok(opened_files)
+    }
+
+    fn bind_v2_reader(
+        &self,
+        cached: &CachedDataFile,
+        file_scheduler: FileScheduler,
+        reader_priority: u32,
+        projection: &Schema,
+        read_config: &FragReadConfig,
+    ) -> Result<Option<Box<dyn GenericFileReader>>> {
+        let schema_per_file =
+            Arc::new(projection.intersection_ignore_types(&cached.data_file_schema)?);
+        if schema_per_file.fields.is_empty() {
+            return Ok(None);
+        }
+
+        // Resolve per-call FileReaderOptions: read_config overrides dataset
+        // default. The cached FileReader was built with the dataset default,
+        // so swap in the resolved options if they differ.
+        let resolved_options = read_config
+            .file_reader_options
+            .clone()
+            .or_else(|| self.dataset.file_reader_options.clone())
+            .unwrap_or_default();
+        let read_chunk_size = resolved_options.read_chunk_size;
+        let mut bound = cached.file_reader.with_scheduler(Arc::new(
+            LanceEncodingsIo::new(file_scheduler.clone()).with_read_chunk_size(read_chunk_size),
+        ));
+        if read_config.file_reader_options.is_some() {
+            bound = bound.with_options(resolved_options);
+        }
+        let reader = v2_adapter::Reader::new(
+            Arc::new(bound),
+            schema_per_file,
+            cached.field_id_to_column_idx.clone(),
+            reader_priority,
+            file_scheduler,
+        );
+        Ok(Some(Box::new(reader)))
     }
 
     fn get_field_id_offset(data_file: &DataFile) -> u32 {
@@ -1205,6 +1441,7 @@ impl FileFragment {
         .boxed()
     }
 
+    #[cfg(test)]
     async fn open_readers(
         &self,
         projection: &Schema,
@@ -2298,6 +2535,59 @@ struct OverlayReadState {
     planner: Arc<OverlayReadPlanner>,
     fragment: Arc<FileFragment>,
     read_config: Arc<FragReadConfig>,
+}
+
+/// Cached, projection-independent shape of one v2 data file.
+///
+/// Holds the pre-computed schema work and a fully-projected
+/// [`ProjectedFileReader`] whose scheduler slot is a
+/// [`lance_file::io::SentinelEncodingsIo`]. Each `FileFragment::open` call
+/// rebinds this reader to a fresh [`FileScheduler`] against the caller's
+/// scheduler via `ProjectedFileReader::with_scheduler` — that's the only
+/// per-call work (besides opening the file handle), so the expensive bits —
+/// `data_file.schema`, the field-id→column-idx map,
+/// `ReaderProjection::from_whole_schema`, and `validate_projection` — run once.
+#[derive(Debug, Clone)]
+pub struct CachedDataFile {
+    /// ProjectedFileReader with `SentinelEncodingsIo` in its scheduler slot. Always
+    /// rebind via `with_scheduler` before issuing reads.
+    file_reader: Arc<ProjectedFileReader>,
+    /// Pre-computed `data_file.schema(dataset_schema)`. Intersect with the
+    /// caller's projection to get the per-file schema for the v2 adapter.
+    data_file_schema: Arc<Schema>,
+    field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+}
+
+impl DeepSizeOf for CachedDataFile {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        self.file_reader.deep_size_of_children(ctx)
+            + self.data_file_schema.deep_size_of_children(ctx)
+            + self.field_id_to_column_idx.deep_size_of_children(ctx)
+    }
+}
+
+/// Cached, projection- and scheduler-independent state of a fragment that
+/// backs [`FragmentReader`].
+///
+/// One entry per data file in `fragment.files`, in the same order. v1
+/// (legacy) data files are not cacheable (they own an `Arc<dyn Reader>`
+/// directly with no scheduler-swap method) and are stored as `None` — the
+/// `open()` path opens those per call.
+#[derive(Debug, Clone)]
+pub struct FragmentReaderTemplate {
+    pub(crate) data_files: Vec<Option<CachedDataFile>>,
+    pub(crate) deletion_vec: Option<Arc<DeletionVector>>,
+    pub(crate) row_id_sequence: Option<Arc<RowIdSequence>>,
+    pub(crate) num_rows: usize,
+    pub(crate) num_physical_rows: usize,
+}
+
+impl DeepSizeOf for FragmentReaderTemplate {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        self.data_files.deep_size_of_children(ctx)
+            + self.deletion_vec.deep_size_of_children(ctx)
+            + self.row_id_sequence.deep_size_of_children(ctx)
+    }
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -5959,6 +6249,111 @@ mod tests {
                 .await
                 .unwrap(),
             256
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_reader_template_is_cached(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        use crate::session::caches::FragmentReaderTemplateKey;
+
+        let test_dir = TempStrDir::default();
+        let dataset = create_dataset(&test_dir, data_storage_version).await;
+        // Use the first fragment so the `delete("i < 10")` below actually
+        // touches rows in this fragment (rows 0..40).
+        let fragment = dataset.get_fragments().into_iter().next().unwrap();
+        let projection = dataset.schema().project::<&str>(&["i"]).unwrap();
+
+        let key = FragmentReaderTemplateKey {
+            manifest_version: dataset.manifest.version,
+            fragment_id: fragment.id() as u64,
+        };
+
+        // Cold cache: no entry yet.
+        assert!(
+            dataset.metadata_cache.get_with_key(&key).await.is_none(),
+            "template should not be cached before first open"
+        );
+
+        let _reader1 = fragment
+            .open(&projection, FragReadConfig::default().with_row_id(true))
+            .await
+            .unwrap();
+        let cached = dataset
+            .metadata_cache
+            .get_with_key(&key)
+            .await
+            .expect("template should be cached after first open");
+        // For v2 datasets, the per-data-file shape (FileReader + schema +
+        // field-id map) is included in the cached template; for v1 the
+        // entries are `None` because v1 readers can't be rebound.
+        if data_storage_version == LanceFileVersion::Stable {
+            assert!(
+                cached.data_files.iter().all(|d| d.is_some()),
+                "v2 data files should each have a cached shape"
+            );
+        } else {
+            assert!(
+                cached.data_files.iter().all(|d| d.is_none()),
+                "v1 data files are not cacheable"
+            );
+        }
+
+        // Re-opening, even with different projections or flags, should reuse
+        // the template since it's projection- and flag-independent.
+        let hits_before = dataset.session().metadata_cache_stats().await.hits;
+        let _reader2 = fragment
+            .open(&projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let _reader3 = fragment
+            .open(dataset.schema(), FragReadConfig::default())
+            .await
+            .unwrap();
+        let hits_after = dataset.session().metadata_cache_stats().await.hits;
+        assert!(
+            hits_after > hits_before,
+            "subsequent opens should hit the template cache (before={hits_before}, after={hits_after})"
+        );
+
+        // After a commit that mutates fragments (delete), the cache must not
+        // hand back the stale template from the previous version.
+        let mut dataset = dataset;
+        dataset.delete("i < 10").await.unwrap();
+        let new_fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == fragment.id())
+            .unwrap();
+        let new_key = FragmentReaderTemplateKey {
+            manifest_version: dataset.manifest.version,
+            fragment_id: new_fragment.id() as u64,
+        };
+        assert_ne!(new_key.manifest_version, key.manifest_version);
+        assert!(
+            dataset
+                .metadata_cache
+                .get_with_key(&new_key)
+                .await
+                .is_none(),
+            "post-commit template must not be in the cache before re-open"
+        );
+        let _ = new_fragment
+            .open(&projection, FragReadConfig::default().with_row_id(true))
+            .await
+            .unwrap();
+        let cached_after = dataset
+            .metadata_cache
+            .get_with_key(&new_key)
+            .await
+            .expect("post-commit template should be cached after re-open");
+        assert_eq!(
+            cached_after.num_rows + cached_after.deletion_vec.as_ref().unwrap().len(),
+            cached_after.num_physical_rows,
+            "new template should reflect the post-delete deletion vector",
         );
     }
 
