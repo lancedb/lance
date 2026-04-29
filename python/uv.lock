@@ -417,20 +417,20 @@ wheels = [
 
 [[package]]
 name = "datafusion"
-version = "52.0.0"
+version = "53.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pyarrow", version = "21.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "pyarrow", version = "23.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "typing-extensions", marker = "python_full_version >= '3.10' and python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/58/04/4dabd255e04801b942221bf7eeea661f540d8c116e6b4a783fe2479410f0/datafusion-52.0.0.tar.gz", hash = "sha256:842cf9cdb523d04a053c5408da24645e3b2adce5d6c42ddc80a8c5edf9013ff3", size = 204988, upload-time = "2026-02-23T12:22:50.919Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/2b/0f96f12b70839c93930c4e17d767fc32b6c77d548c78784128049e944701/datafusion-53.0.0.tar.gz", hash = "sha256:ba9a5ec06b5453fbd8710d6aeeb515a8bcac4b6c140e254409bb53a5f322ef22", size = 224267, upload-time = "2026-04-13T00:45:02.686Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/77/38/66b2f2fd77d3fb66ff48a8922130379dece3ba6d2e29fc86fbb4298a874b/datafusion-52.0.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:999881df12ab78b6c8f04dd2056b24389374e93775a649ed20c5e35db2f42f65", size = 31473623, upload-time = "2026-02-23T12:22:30.437Z" },
-    { url = "https://files.pythonhosted.org/packages/d0/b5/ce6c6030fa8e4fc38d10d5c4aa9cc6fe1cda625e409a18eb08ea09a87c8d/datafusion-52.0.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:fd58e64158152f5c4a5836a3ce3bcca2a109d600c9ce7efdcf82e61c1ab0fbc8", size = 28108736, upload-time = "2026-02-23T12:22:33.5Z" },
-    { url = "https://files.pythonhosted.org/packages/d8/c1/d7ac9ddc9f54a8f178900f529a723d6121361111f0d0d2527bb47f86f6ce/datafusion-52.0.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ab3591904f32ce290ff7161fb804e1c7bf323de16e3ddc8cf1f76310e994208e", size = 30699663, upload-time = "2026-02-23T12:22:37.193Z" },
-    { url = "https://files.pythonhosted.org/packages/b0/2f/14cffc5305abe05d56f3e99e8054c96bd94411185de059a98fc1ca0e5ec0/datafusion-52.0.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ac4b364937c277bbfcac032dbc49d08c078b13ba3f8bfda117da5fda4ea328bc", size = 33050161, upload-time = "2026-02-23T12:22:40.858Z" },
-    { url = "https://files.pythonhosted.org/packages/24/ae/3fdea50fa88f304db96728a67deb6e07bb0d9a02f665ca09db4237a9a199/datafusion-52.0.0-cp310-abi3-win_amd64.whl", hash = "sha256:67e252ef20b918537c8fdb47e6c825c0bd639795e19715a85fedde331a83d2e1", size = 33717685, upload-time = "2026-02-23T12:22:44.463Z" },
+    { url = "https://files.pythonhosted.org/packages/af/4c/60e052813d81f1ffe3123ead013dbdd2cf961daa576cb9056cbb80228e6b/datafusion-53.0.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:a0bd1a98d736571321416dc4ed361a9d1225da1ec9f6c5fad818d75f547697a7", size = 35774913, upload-time = "2026-04-13T00:44:46.235Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/59/beabe5301df3338d8206446cd624079e43bdad46e20377a6336017fb6ccf/datafusion-53.0.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:ce186a8d2405afd67e11e2fb75715019f16b00d070b8d0da89d8aa61cc74c8b5", size = 32667118, upload-time = "2026-04-13T00:44:50.269Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/94/636ab61ade98395daea6e733e225e9c7beef111c7c5b575ac851513e203c/datafusion-53.0.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:288a00a7ef03e2807a4667683f7560efd80d60ed1d41696ac15ca9ded14c8251", size = 35585824, upload-time = "2026-04-13T00:44:53.683Z" },
+    { url = "https://files.pythonhosted.org/packages/34/80/b9f4889209af02f8d14bccb0e6f0519c329b072bc4d2595025a1303f144c/datafusion-53.0.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:8fef0004f0161fcfc556c025a7201f9cc3169aa3adb97a86419ebb34182d9efb", size = 38083690, upload-time = "2026-04-13T00:44:57.188Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/1a/ea4831fc6aeefedbcf186c9f6a273d507b1787c03cbb905bded7e1149a6a/datafusion-53.0.0-cp310-abi3-win_amd64.whl", hash = "sha256:4c8410f5f659b926677be6c7d443bbc05d825c078c970b7d8cf977ebcf948314", size = 38120687, upload-time = "2026-04-13T00:45:00.633Z" },
 ]
 
 [[package]]
@@ -2623,12 +2623,12 @@ torch = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", marker = "extra == 'tests'" },
-    { name = "datafusion", marker = "python_full_version >= '3.10' and extra == 'tests'", specifier = ">=52,<53" },
+    { name = "datafusion", marker = "python_full_version >= '3.10' and extra == 'tests'", specifier = ">=53,<54" },
     { name = "datasets", marker = "extra == 'tests'" },
     { name = "duckdb", marker = "extra == 'tests'" },
     { name = "geoarrow-rust-core", marker = "extra == 'geo'" },
     { name = "geoarrow-rust-io", marker = "extra == 'geo'" },
-    { name = "lance-namespace", specifier = ">=0.7.2,<8.0" },
+    { name = "lance-namespace", specifier = ">=0.7.2,<0.8" },
     { name = "ml-dtypes", marker = "extra == 'tests'" },
     { name = "numpy", specifier = ">=1.22" },
     { name = "pandas", marker = "extra == 'tests'" },
