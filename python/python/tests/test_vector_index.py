@@ -2788,6 +2788,41 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
     assert 0 < len(results) <= 5
 
 
+def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
+    ds = _make_sample_dataset_base(
+        tmp_path, "legacy_metadata_commit", n_rows=512, dim=32, max_rows_per_file=256
+    )
+    frags = ds.get_fragments()
+    assert len(frags) == 2
+
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+    )
+    base_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_FLAT",
+        "num_partitions": 2,
+        "ivf_centroids": ivf_model.centroids,
+    }
+    first = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[0].fragment_id],
+    )
+    second = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[1].fragment_id],
+    )
+
+    merged = ds.merge_existing_index_segments([first, second])
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
+
+    q = np.random.rand(32).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
 def test_index_segment_builder_builds_vector_segments(tmp_path):
     ds = _make_sample_dataset_base(tmp_path, "segment_builder_ds", 2000, 128)
     frags = ds.get_fragments()

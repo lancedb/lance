@@ -58,7 +58,9 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+use lance::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -377,6 +379,48 @@ impl PyIndexSegmentBuilder {
         }
         builder
     }
+}
+
+fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
+    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "Index metadata {} is missing fragment coverage",
+            metadata.uuid
+        ))
+    })?;
+    let index_details = metadata.index_details.ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "Index metadata {} is missing index details",
+            metadata.uuid
+        ))
+    })?;
+
+    Ok(IndexSegment::new(
+        metadata.uuid,
+        fragment_bitmap.iter(),
+        index_details,
+        metadata.index_version,
+    ))
+}
+
+fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
+    let mut extracted = Vec::new();
+    for item in segments.try_iter()? {
+        let item = item?;
+        match item.extract::<PyRef<'_, PyIndexSegment>>() {
+            Ok(segment) => extracted.push(segment.inner.clone()),
+            Err(segment_err) => match item.extract::<PyLance<IndexMetadata>>() {
+                Ok(metadata) => extracted.push(index_metadata_to_segment(metadata.0)?),
+                Err(metadata_err) => {
+                    return Err(PyTypeError::new_err(format!(
+                        "commit_existing_index_segments expected IndexSegment or Index items; \
+                         failed to read item as IndexSegment ({segment_err}) or Index ({metadata_err})"
+                    )));
+                }
+            },
+        }
+    }
+    Ok(extracted)
 }
 
 #[pymethods]
@@ -2287,13 +2331,10 @@ impl Dataset {
         &mut self,
         index_name: &str,
         column: &str,
-        segments: Vec<PyRef<'_, PyIndexSegment>>,
+        segments: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let segments = segments
-            .into_iter()
-            .map(|segment| segment.inner.clone())
-            .collect();
+        let segments = extract_index_segments(segments)?;
         rt().block_on(
             None,
             new_self.commit_existing_index_segments(index_name, column, segments),

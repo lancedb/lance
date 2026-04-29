@@ -3892,7 +3892,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.merge_existing_index_segments(segments)
 
     def commit_existing_index_segments(
-        self, index_name: str, column: str, segments: List[IndexSegment]
+        self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
     ) -> LanceDataset:
         """
         Commit built index segments as one logical index.
@@ -4756,6 +4756,7 @@ class Index:
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
+    index_details: Optional[Tuple[str, bytes]] = None
 
 
 class AutoCleanupConfig(TypedDict):
