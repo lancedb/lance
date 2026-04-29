@@ -98,7 +98,9 @@ public class Query {
     return queryParallelism;
   }
 
-  /** @deprecated Use {@link #getQueryParallelism()} instead. */
+  /**
+   * @deprecated Use {@link #getQueryParallelism()} instead.
+   */
   @Deprecated
   public int getPartitionParallelism() {
     return getQueryParallelism();
@@ -277,7 +279,9 @@ public class Query {
       return this;
     }
 
-    /** @deprecated Use {@link #setQueryParallelism(int)} instead. */
+    /**
+     * @deprecated Use {@link #setQueryParallelism(int)} instead.
+     */
     @Deprecated
     public Builder setPartitionParallelism(int queryParallelism) {
       return setQueryParallelism(queryParallelism);
