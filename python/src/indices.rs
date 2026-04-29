@@ -11,9 +11,9 @@ use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::DatasetIndexExt;
-use lance::index::{IndexSegment, IndexSegmentPlan};
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
+use lance::index::{IndexSegment, IndexSegmentPlan};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -127,12 +127,7 @@ impl PyIndexSegmentPlan {
 
     #[getter]
     fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner
-            .segments()
-            .iter()
-            .cloned()
-            .map(PyLance)
-            .collect()
+        self.inner.segments().iter().cloned().map(PyLance).collect()
     }
 
     #[getter]
