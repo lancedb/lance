@@ -68,7 +68,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DEFAULT_PARTITION_PARALLELISM, DIST_COL, Query};
+use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -1504,7 +1504,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: None,
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         });
         Ok(self)
@@ -1672,14 +1672,28 @@ impl Scanner {
         self
     }
 
-    /// Configure partition search concurrency for vector indices.
-    pub fn partition_parallelism(&mut self, partition_parallelism: i32) -> &mut Self {
+    /// Configure partition-search concurrency for each vector query.
+    ///
+    /// The default is 0.
+    /// Value 0 selects the automatic policy; today this resolves to 1 for the
+    /// sequential fast path unless an index implementation overrides it.
+    /// Value -1 uses the CPU pool size.
+    /// Value 1 uses the single-worker sequential partition search path.
+    /// Values >= 2 use the partition-parallel path and are clamped to the CPU
+    /// pool size by the execution layer.
+    pub fn query_parallelism(&mut self, query_parallelism: i32) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.partition_parallelism = partition_parallelism;
+            q.query_parallelism = query_parallelism;
         } else {
-            log::warn!("partition_parallelism is not set because nearest has not been called yet");
+            log::warn!("query_parallelism is not set because nearest has not been called yet");
         }
         self
+    }
+
+    /// Configure partition-search concurrency for each vector query.
+    #[deprecated(note = "Use query_parallelism instead")]
+    pub fn partition_parallelism(&mut self, query_parallelism: i32) -> &mut Self {
+        self.query_parallelism(query_parallelism)
     }
 
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
@@ -9921,7 +9935,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
-    async fn test_knn_partition_parallelism_defaults_and_setter() {
+    async fn test_knn_query_parallelism_defaults_and_setter() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -9929,19 +9943,19 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let mut scanner = test_ds.dataset.scan();
         scanner.nearest("vec", &query_vector, 5).unwrap();
         assert_eq!(
-            scanner.nearest_mut().unwrap().partition_parallelism,
-            DEFAULT_PARTITION_PARALLELISM
+            scanner.nearest_mut().unwrap().query_parallelism,
+            DEFAULT_QUERY_PARALLELISM
         );
 
-        scanner.partition_parallelism(4);
-        assert_eq!(scanner.nearest_mut().unwrap().partition_parallelism, 4);
+        scanner.query_parallelism(4);
+        assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, 4);
 
-        scanner.partition_parallelism(-1);
-        assert_eq!(scanner.nearest_mut().unwrap().partition_parallelism, -1);
+        scanner.query_parallelism(-1);
+        assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, -1);
     }
 
     #[tokio::test]
-    async fn test_ivf_pq_partition_parallelism_returns_same_results() {
+    async fn test_ivf_pq_query_parallelism_returns_same_results() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -9957,7 +9971,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         parallel
             .nearest("vec", &query_vector, 50)
             .unwrap()
-            .partition_parallelism(4);
+            .query_parallelism(4);
         let parallel_results = parallel.try_into_batch().await.unwrap();
 
         assert_eq!(sequential_results, parallel_results);

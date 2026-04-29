@@ -37,7 +37,7 @@ use crate::dataset::write::WriteParams;
 use lance_index::scalar::inverted::query::FtsQuery;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_index::vector::{DEFAULT_PARTITION_PARALLELISM, Query};
+use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn test_vector_filter_fts_search() {
         refine_factor: None,
         metric_type: Some(MetricType::L2),
         use_index: true,
-        partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+        query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
     };
 

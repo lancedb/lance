@@ -647,7 +647,7 @@ mod tests {
     use crate::index::vector::ivf::build_ivf_model;
     use lance_core::utils::mask::RowAddrMask;
     use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::vector::DEFAULT_PARTITION_PARALLELISM;
+    use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_testing::datagen::{
         generate_random_array_with_range, generate_random_array_with_seed,
@@ -897,7 +897,7 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
         let is_empty_threads = Arc::new(Mutex::new(Vec::new()));

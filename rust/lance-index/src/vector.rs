@@ -80,7 +80,9 @@ pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
     arrow_schema::Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
-pub const DEFAULT_PARTITION_PARALLELISM: i32 = 0;
+pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
+#[deprecated(note = "Use DEFAULT_QUERY_PARALLELISM instead")]
+pub const DEFAULT_PARTITION_PARALLELISM: i32 = DEFAULT_QUERY_PARALLELISM;
 
 /// Query parameters for the vector indices
 
@@ -127,15 +129,16 @@ pub struct Query {
     /// Whether to use an ANN index if available
     pub use_index: bool,
 
-    /// Maximum number of partitions to search concurrently.
+    /// Maximum partition-search concurrency for a single vector query.
     ///
-    /// Value 0 selects the automatic policy. The execution layer chooses the
-    /// concurrency based on the index implementation.
+    /// The default is 0.
+    /// Value 0 selects the automatic policy; today this resolves to 1 for the
+    /// sequential fast path unless an index implementation overrides it.
     /// Value -1 uses the CPU pool size.
     /// Value 1 uses the single-worker sequential partition search path.
     /// Values >= 2 use the partition-parallel path and are clamped to the CPU
     /// pool size by the execution layer.
-    pub partition_parallelism: i32,
+    pub query_parallelism: i32,
 
     /// the distance between the query and the centroid
     /// this is only used for IVF index with Rabit quantization
@@ -249,12 +252,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         false
     }
 
-    /// Choose partition search concurrency for `partition_parallelism = 0`.
+    /// Choose partition search concurrency for `query_parallelism = 0`.
     ///
     /// The default keeps the single-worker sequential path. Index
     /// implementations can override this when their sub-index search work does
     /// not benefit from the sequential fast path.
-    fn auto_partition_parallelism(&self, _cpu_pool_size: usize) -> usize {
+    fn auto_query_parallelism(&self, _cpu_pool_size: usize) -> usize {
         1
     }
 

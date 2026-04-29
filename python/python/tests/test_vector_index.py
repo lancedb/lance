@@ -1880,7 +1880,7 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
-def test_vector_index_with_partition_parallelism(indexed_dataset):
+def test_vector_index_with_query_parallelism(indexed_dataset):
     q = np.random.randn(128)
 
     sequential = indexed_dataset.to_table(
@@ -1888,10 +1888,45 @@ def test_vector_index_with_partition_parallelism(indexed_dataset):
             "column": "vector",
             "q": q,
             "k": 10,
-            "partition_parallelism": 0,
+            "query_parallelism": 0,
         }
     )
     parallel = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "query_parallelism": -1,
+        }
+    )
+
+    assert sequential == parallel
+
+
+def test_vector_index_invalid_query_parallelism(indexed_dataset):
+    with pytest.raises(ValueError, match="query_parallelism"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "query_parallelism": -2,
+            }
+        )
+
+
+def test_vector_index_partition_parallelism_alias(indexed_dataset):
+    q = np.random.randn(128)
+
+    with_new_name = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "query_parallelism": -1,
+        }
+    )
+    with_old_name = indexed_dataset.to_table(
         nearest={
             "column": "vector",
             "q": q,
@@ -1900,17 +1935,18 @@ def test_vector_index_with_partition_parallelism(indexed_dataset):
         }
     )
 
-    assert sequential == parallel
+    assert with_new_name == with_old_name
 
 
-def test_vector_index_invalid_partition_parallelism(indexed_dataset):
-    with pytest.raises(ValueError, match="partition_parallelism"):
+def test_vector_index_query_parallelism_rejects_conflicting_alias(indexed_dataset):
+    with pytest.raises(ValueError, match="query_parallelism and partition_parallelism"):
         indexed_dataset.scanner(
             nearest={
                 "column": "vector",
                 "q": np.random.randn(128),
                 "k": 10,
-                "partition_parallelism": -2,
+                "query_parallelism": 1,
+                "partition_parallelism": -1,
             }
         )
 

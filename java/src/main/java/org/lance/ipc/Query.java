@@ -31,7 +31,7 @@ public class Query {
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
-  private final int partitionParallelism;
+  private final int queryParallelism;
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
@@ -51,7 +51,7 @@ public class Query {
     this.refineFactor = builder.refineFactor;
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
-    this.partitionParallelism = builder.partitionParallelism;
+    this.queryParallelism = builder.queryParallelism;
   }
 
   public String getColumn() {
@@ -94,8 +94,14 @@ public class Query {
     return useIndex;
   }
 
+  public int getQueryParallelism() {
+    return queryParallelism;
+  }
+
+  /** @deprecated Use {@link #getQueryParallelism()} instead. */
+  @Deprecated
   public int getPartitionParallelism() {
-    return partitionParallelism;
+    return getQueryParallelism();
   }
 
   @Override
@@ -110,7 +116,7 @@ public class Query {
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
-        .add("partitionParallelism", partitionParallelism)
+        .add("queryParallelism", queryParallelism)
         .toString();
   }
 
@@ -124,7 +130,7 @@ public class Query {
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
-    private int partitionParallelism = 0;
+    private int queryParallelism = 0;
 
     /**
      * Sets the column to be searched.
@@ -254,21 +260,27 @@ public class Query {
     }
 
     /**
-     * Sets vector partition search concurrency.
+     * Sets vector partition search concurrency for each query.
      *
-     * <p>Value 0 uses the automatic policy, which currently maps to the single-worker sequential
-     * path. Value -1 uses the CPU pool size. Value 1 uses the single-worker sequential path. Values
-     * greater than or equal to 2 use the partition-parallel path and are clamped to the CPU pool
-     * size.
+     * <p>The default is 0. Value 0 uses the automatic policy, which currently maps to the
+     * single-worker sequential path. Value -1 uses the CPU pool size. Value 1 uses the
+     * single-worker sequential path. Values greater than or equal to 2 use the partition-parallel
+     * path and are clamped to the CPU pool size.
      *
-     * @param partitionParallelism The partition search concurrency policy.
+     * @param queryParallelism The partition search concurrency policy.
      * @return The Builder instance for method chaining.
      */
-    public Builder setPartitionParallelism(int partitionParallelism) {
+    public Builder setQueryParallelism(int queryParallelism) {
       Preconditions.checkArgument(
-          partitionParallelism >= -1, "Partition parallelism must be greater than or equal to -1");
-      this.partitionParallelism = partitionParallelism;
+          queryParallelism >= -1, "Query parallelism must be greater than or equal to -1");
+      this.queryParallelism = queryParallelism;
       return this;
+    }
+
+    /** @deprecated Use {@link #setQueryParallelism(int)} instead. */
+    @Deprecated
+    public Builder setPartitionParallelism(int queryParallelism) {
+      return setQueryParallelism(queryParallelism);
     }
 
     /**

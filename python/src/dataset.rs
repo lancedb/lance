@@ -75,7 +75,7 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        DEFAULT_PARTITION_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
+        DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
         ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
     },
 };
@@ -1101,7 +1101,7 @@ impl Dataset {
                 refine_factor,
                 use_index,
                 ef,
-                partition_parallelism,
+                query_parallelism,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1162,7 +1162,7 @@ impl Dataset {
                     if let Some(ef) = ef {
                         s = s.ef(ef);
                     }
-                    s = s.partition_parallelism(partition_parallelism);
+                    s = s.query_parallelism(query_parallelism);
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -4152,18 +4152,38 @@ type VectorQueryParams = (
     i32,
 );
 
-fn vector_query_partition_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<i32> {
-    if let Some(partition_parallelism) = dict.get_item("partition_parallelism")?
-        && !partition_parallelism.is_none()
-    {
-        let partition_parallelism = partition_parallelism.extract()?;
-        if partition_parallelism < -1 {
-            Err(PyValueError::new_err("partition_parallelism must be >= -1"))
-        } else {
-            Ok(partition_parallelism)
-        }
+fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
+    let query_parallelism = value.extract()?;
+    if query_parallelism < -1 {
+        Err(PyValueError::new_err("query_parallelism must be >= -1"))
     } else {
-        Ok(DEFAULT_PARTITION_PARALLELISM)
+        Ok(query_parallelism)
+    }
+}
+
+fn vector_query_query_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<i32> {
+    let query_parallelism = dict
+        .get_item("query_parallelism")?
+        .filter(|value| !value.is_none())
+        .map(|value| extract_query_parallelism(&value))
+        .transpose()?;
+    let partition_parallelism = dict
+        .get_item("partition_parallelism")?
+        .filter(|value| !value.is_none())
+        .map(|value| extract_query_parallelism(&value))
+        .transpose()?;
+
+    match (query_parallelism, partition_parallelism) {
+        (Some(query_parallelism), Some(partition_parallelism))
+            if query_parallelism != partition_parallelism =>
+        {
+            Err(PyValueError::new_err(
+                "query_parallelism and partition_parallelism cannot both be set to different values",
+            ))
+        }
+        (Some(query_parallelism), _) => Ok(query_parallelism),
+        (_, Some(partition_parallelism)) => Ok(partition_parallelism),
+        _ => Ok(DEFAULT_QUERY_PARALLELISM),
     }
 }
 
@@ -4272,7 +4292,7 @@ fn vector_query_params_from_dict(
         None
     };
 
-    let partition_parallelism = vector_query_partition_parallelism_from_dict(dict)?;
+    let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
 
     Ok((
         column,
@@ -4284,7 +4304,7 @@ fn vector_query_params_from_dict(
         refine_factor,
         use_index,
         ef,
-        partition_parallelism,
+        query_parallelism,
     ))
 }
 
@@ -4320,7 +4340,7 @@ impl PySearchFilter {
             refine_factor,
             use_index,
             ef,
-            partition_parallelism,
+            query_parallelism,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -4337,7 +4357,7 @@ impl PySearchFilter {
             refine_factor,
             metric_type,
             use_index,
-            partition_parallelism,
+            query_parallelism,
             dist_q_c: 0.0,
         };
 

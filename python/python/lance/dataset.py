@@ -5623,9 +5623,24 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
-        partition_parallelism: Optional[int] = None,
+        query_parallelism: Optional[int] = None,
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        partition_parallelism: Optional[int] = None,
     ) -> ScannerBuilder:
+        """Configure nearest neighbor search.
+
+        Parameters
+        ----------
+        query_parallelism: int, optional
+            Maximum partition-search concurrency for a single vector query.
+            The default is 0. Value 0 uses the automatic policy, which
+            currently maps to the single-worker sequential path. Value -1 uses
+            the CPU pool size. Value 1 uses the single-worker sequential path.
+            Values >= 2 use the partition-parallel path and are clamped to the
+            CPU pool size.
+        partition_parallelism: int, optional
+            Deprecated alias for query_parallelism.
+        """
         self._nearest = _build_vector_search_query(
             column,
             q,
@@ -5638,6 +5653,7 @@ class ScannerBuilder:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            query_parallelism=query_parallelism,
             partition_parallelism=partition_parallelism,
             distance_range=distance_range,
         )
@@ -6754,6 +6770,7 @@ def _build_vector_search_query(
     refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
+    query_parallelism: Optional[int] = None,
     partition_parallelism: Optional[int] = None,
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
@@ -6782,12 +6799,14 @@ def _build_vector_search_query(
         Whether to use the index for the search.
     ef: int, optional
         The ef parameter for HNSW search.
+    query_parallelism: int, optional
+        Maximum partition-search concurrency for a single vector query.
+        The default is 0. Value 0 uses the automatic policy, which currently
+        maps to the single-worker sequential path. Value -1 uses the CPU pool
+        size. Value 1 uses the single-worker sequential path. Values >= 2 use
+        the partition-parallel path and are clamped to the CPU pool size.
     partition_parallelism: int, optional
-        Maximum number of partitions to search concurrently. Value 0 uses the
-        automatic policy, which currently maps to the single-worker sequential
-        path. Value -1 uses the CPU pool size. Value 1 uses the single-worker
-        sequential path. Values >= 2 use the
-        partition-parallel path and are clamped to the CPU pool size.
+        Deprecated alias for query_parallelism.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -6855,10 +6874,21 @@ def _build_vector_search_query(
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
         raise ValueError(f"ef must be > 0 but got {ef}")
-    if partition_parallelism is not None:
+    if query_parallelism is not None and partition_parallelism is not None:
+        query_parallelism = operator.index(query_parallelism)
         partition_parallelism = operator.index(partition_parallelism)
-        if partition_parallelism < -1:
-            raise ValueError("partition_parallelism must be >= -1")
+        if query_parallelism != partition_parallelism:
+            raise ValueError(
+                "query_parallelism and partition_parallelism cannot both be set "
+                "to different values"
+            )
+    elif partition_parallelism is not None:
+        query_parallelism = operator.index(partition_parallelism)
+    elif query_parallelism is not None:
+        query_parallelism = operator.index(query_parallelism)
+
+    if query_parallelism is not None and query_parallelism < -1:
+        raise ValueError("query_parallelism must be >= -1")
 
     if distance_range is not None:
         if len(distance_range) != 2:
@@ -6876,7 +6906,7 @@ def _build_vector_search_query(
         "refine_factor": refine_factor,
         "use_index": use_index,
         "ef": ef,
-        "partition_parallelism": partition_parallelism,
+        "query_parallelism": query_parallelism,
         "distance_range": distance_range,
     }
 
@@ -7049,6 +7079,7 @@ class VectorSearchQuery:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        query_parallelism: Optional[int] = None,
         partition_parallelism: Optional[int] = None,
     ):
         self._inner = _build_vector_search_query(
@@ -7062,6 +7093,7 @@ class VectorSearchQuery:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            query_parallelism=query_parallelism,
             partition_parallelism=partition_parallelism,
         )
 

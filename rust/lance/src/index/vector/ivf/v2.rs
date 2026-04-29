@@ -565,6 +565,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         })
     }
 
+    async fn prepare_partition_without_prefilter_wait(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionSearch<S, Q>> {
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        Ok(PreparedPartitionSearch {
+            query: query.clone(),
+            pre_filter,
+            partition_id,
+            partition_centroid: self.ivf.centroid(partition_id),
+            part_entry,
+            _marker: PhantomData,
+        })
+    }
+
     fn run_prepared_partition_search(
         distance_type: DistanceType,
         prepared: PreparedPartitionSearch<S, Q>,
@@ -1143,7 +1161,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         true
     }
 
-    fn auto_partition_parallelism(&self, cpu_pool_size: usize) -> usize {
+    fn auto_query_parallelism(&self, cpu_pool_size: usize) -> usize {
         if S::supports_global_topk_heap() {
             1
         } else {
@@ -1181,6 +1199,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+            pre_filter.wait_for_ready().await?;
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepared = stream::iter(start_idx..end_idx)
@@ -1193,7 +1212,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let metrics = prepare_metrics.clone();
                     async move {
                         index
-                            .prepare_partition(
+                            .prepare_partition_without_prefilter_wait(
                                 part_id as usize,
                                 &query,
                                 pre_filter,

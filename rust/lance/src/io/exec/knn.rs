@@ -784,22 +784,22 @@ impl PartitionSearchControl for LatePartitionSearchControl {
     }
 }
 
-fn effective_partition_parallelism(query: &Query, index: &dyn VectorIndex) -> usize {
+fn effective_query_parallelism(query: &Query, index: &dyn VectorIndex) -> usize {
     let cpu_pool_size = get_num_compute_intensive_cpus();
-    effective_partition_parallelism_for(
+    effective_query_parallelism_for(
         query,
         cpu_pool_size,
-        index.auto_partition_parallelism(cpu_pool_size),
+        index.auto_query_parallelism(cpu_pool_size),
     )
 }
 
-fn effective_partition_parallelism_for(
+fn effective_query_parallelism_for(
     query: &Query,
     cpu_pool_size: usize,
     auto_parallelism: usize,
 ) -> usize {
     let cpu_pool_size = cpu_pool_size.max(1);
-    match query.partition_parallelism {
+    match query.query_parallelism {
         -1 => cpu_pool_size,
         0 => auto_parallelism.clamp(1, cpu_pool_size),
         n if n > 0 => (n as usize).min(cpu_pool_size).max(1),
@@ -924,8 +924,8 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
-            let partition_parallelism = effective_partition_parallelism(&query, index.as_ref());
-            if partition_parallelism <= 1 {
+            let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+            if query_parallelism <= 1 {
                 return stream::once(async move {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
                     let index_metrics: Arc<dyn MetricsCollector> =
@@ -989,7 +989,7 @@ impl ANNIvfSubIndexExec {
                     let found_so_far = state_clone.num_results_found.load(Ordering::Relaxed);
                     std::future::ready(found_so_far < max_results)
                 })
-                .buffered(partition_parallelism)
+                .buffered(query_parallelism)
                 .boxed()
         });
         stream.flatten()
@@ -1006,8 +1006,8 @@ impl ANNIvfSubIndexExec {
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
-        let partition_parallelism = effective_partition_parallelism(&query, index.as_ref());
-        if partition_parallelism <= 1 {
+        let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+        if query_parallelism <= 1 {
             metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
                 let prefilter: Arc<dyn PreFilter> = prefilter;
@@ -1060,7 +1060,7 @@ impl ANNIvfSubIndexExec {
                     Ok(batch)
                 }
             })
-            .buffered(partition_parallelism)
+            .buffered(query_parallelism)
             .boxed()
     }
 }
@@ -1534,7 +1534,7 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::vector::{DEFAULT_PARTITION_PARALLELISM, PreparedPartitionSearchHandle};
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
     use lance_index::{Index, IndexType};
     use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
@@ -1561,31 +1561,31 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         }
     }
 
     #[test]
-    fn test_effective_partition_parallelism_clamps_to_cpu_pool() {
+    fn test_effective_query_parallelism_clamps_to_cpu_pool() {
         let mut query = base_query();
 
-        query.partition_parallelism = -1;
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 16);
+        query.query_parallelism = -1;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
 
-        query.partition_parallelism = 0;
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 1);
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 8), 8);
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 128), 16);
+        query.query_parallelism = 0;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 1);
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 8);
+        assert_eq!(effective_query_parallelism_for(&query, 16, 128), 16);
 
-        query.partition_parallelism = 1;
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 8), 1);
+        query.query_parallelism = 1;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 1);
 
-        query.partition_parallelism = 4;
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 4);
+        query.query_parallelism = 4;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 4);
 
-        query.partition_parallelism = 128;
-        assert_eq!(effective_partition_parallelism_for(&query, 16, 1), 16);
+        query.query_parallelism = 128;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
     }
 
     #[derive(Debug, DeepSizeOf)]
@@ -2288,7 +2288,7 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::Cosine),
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
 

@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_index::pb as index_pb;
-use lance_index::vector::{DEFAULT_PARTITION_PARALLELISM, Query};
+use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
@@ -99,7 +99,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         metric_type,
         use_index: query.use_index,
         dist_q_c: Some(query.dist_q_c),
-        partition_parallelism: Some(query.partition_parallelism),
+        partition_parallelism: Some(query.query_parallelism),
     })
 }
 
@@ -127,9 +127,9 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
-        partition_parallelism: proto
+        query_parallelism: proto
             .partition_parallelism
-            .unwrap_or(DEFAULT_PARTITION_PARALLELISM),
+            .unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
     })
 }
@@ -324,7 +324,7 @@ mod tests {
             refine_factor: Some(2),
             metric_type: Some(DistanceType::Cosine),
             use_index: true,
-            partition_parallelism: -1,
+            query_parallelism: -1,
             dist_q_c: 0.42,
         };
 
@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(query.refine_factor, back.refine_factor);
         assert_eq!(query.metric_type, back.metric_type);
         assert_eq!(query.use_index, back.use_index);
-        assert_eq!(query.partition_parallelism, back.partition_parallelism);
+        assert_eq!(query.query_parallelism, back.query_parallelism);
         assert_eq!(query.dist_q_c, back.dist_q_c);
         assert_eq!(query.key.len(), back.key.len());
         assert_eq!(query.key.data_type(), back.key.data_type());
@@ -362,7 +362,7 @@ mod tests {
             refine_factor: None,
             metric_type: None,
             use_index: false,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
 
@@ -433,7 +433,7 @@ mod tests {
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
 
@@ -480,7 +480,7 @@ mod tests {
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
 
@@ -543,7 +543,7 @@ mod tests {
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
-            partition_parallelism: DEFAULT_PARTITION_PARALLELISM,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =

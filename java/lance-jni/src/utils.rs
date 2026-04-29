@@ -207,8 +207,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         };
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
-        let partition_parallelism = env
-            .call_method(&java_obj, "getPartitionParallelism", "()I", &[])?
+        let query_parallelism = env
+            .call_method(&java_obj, "getQueryParallelism", "()I", &[])?
             .i()?;
 
         Ok(Query {
@@ -224,7 +224,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             metric_type: distance_type,
             use_index,
             dist_q_c: 0.0,
-            partition_parallelism,
+            query_parallelism,
         })
     })?;
 

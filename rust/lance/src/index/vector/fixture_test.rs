@@ -266,7 +266,7 @@ mod test {
                 refine_factor: None,
                 metric_type: Some(metric),
                 use_index: true,
-                partition_parallelism: lance_index::vector::DEFAULT_PARTITION_PARALLELISM,
+                query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                 dist_q_c: 0.0,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
