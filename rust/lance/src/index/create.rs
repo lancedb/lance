@@ -290,6 +290,30 @@ impl<'a> CreateIndexBuilder<'a> {
                 )
                 .await?
             }
+            (IndexType::SuffixArray, LANCE_SCALAR_INDEX) => {
+                // Plugin-based suffix array index — params already specify the
+                // index type name ("suffixarray") used for plugin dispatch.
+                let params = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .ok_or_else(|| {
+                        Error::index(
+                            "SuffixArray index type must take a ScalarIndexParams".to_string(),
+                        )
+                    })?;
+                build_scalar_index(
+                    self.dataset,
+                    column,
+                    &index_id.to_string(),
+                    params,
+                    train,
+                    self.fragments.clone(),
+                    None,
+                    self.progress.clone(),
+                )
+                .await?
+            }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
                 let inverted_params = self

@@ -843,6 +843,195 @@ class LanceDataset(pa.dataset.Dataset):
         )
         return json.loads(self._ds.index_statistics(index_name))
 
+    def suffix_array_count(
+        self,
+        index_name: str,
+        query: Union[str, bytes],
+    ) -> int:
+        """Count occurrences of a pattern in a suffix array index.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the SUFFIX_ARRAY index to query.
+        query : str or bytes
+            Pattern to count. Strings are encoded as UTF-8.
+
+        Returns
+        -------
+        int
+            Number of times the pattern appears in the indexed corpus.
+
+        Examples
+        --------
+        >>> # After creating a suffix array index:
+        >>> # ds.create_index("text", index_type="SUFFIX_ARRAY", name="sa_idx")
+        >>> # ds.suffix_array_count("sa_idx", "the")
+        """
+        if isinstance(query, str):
+            query = query.encode("utf-8")
+        return self._ds.suffix_array_count(index_name, query)
+
+    def suffix_array_search(
+        self,
+        index_name: str,
+        query: Union[str, bytes],
+        max_results: Optional[int] = None,
+    ) -> list[int]:
+        """Search for byte positions of a pattern in a suffix array index.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the SUFFIX_ARRAY index to query.
+        query : str or bytes
+            Pattern to search for. Strings are encoded as UTF-8.
+        max_results : int, optional
+            Maximum number of positions to return. Default 100.
+
+        Returns
+        -------
+        list[int]
+            Byte positions within the corpus where the pattern occurs.
+
+        Examples
+        --------
+        >>> # After creating a suffix array index:
+        >>> # ds.create_index("text", index_type="SUFFIX_ARRAY", name="sa_idx")
+        >>> # ds.suffix_array_search("sa_idx", "fox", max_results=10)
+        """
+        if isinstance(query, str):
+            query = query.encode("utf-8")
+        return self._ds.suffix_array_search(index_name, query, max_results)
+
+    def suffix_array_prob(
+        self,
+        index_name: str,
+        prompt: Union[str, bytes],
+        continuation: Union[str, bytes],
+    ) -> dict:
+        """Compute conditional probability P(continuation | prompt).
+
+        Uses the suffix array index to compute:
+        ``P(continuation | prompt) = count(prompt + continuation) / count(prompt)``
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the SUFFIX_ARRAY index to query.
+        prompt : str or bytes
+            The conditioning context. Strings are encoded as UTF-8.
+        continuation : str or bytes
+            The continuation to compute probability for. Strings are encoded
+            as UTF-8.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - ``prompt_cnt`` (int): number of prompt occurrences
+            - ``cont_cnt`` (int): number of prompt+continuation occurrences
+            - ``prob`` (float): conditional probability
+        """
+        if isinstance(prompt, str):
+            prompt = prompt.encode("utf-8")
+        if isinstance(continuation, str):
+            continuation = continuation.encode("utf-8")
+        prompt_cnt, cont_cnt, prob = self._ds.suffix_array_prob(
+            index_name, prompt, continuation
+        )
+        return {"prompt_cnt": prompt_cnt, "cont_cnt": cont_cnt, "prob": prob}
+
+    def suffix_array_ntd(
+        self,
+        index_name: str,
+        prompt: Union[str, bytes],
+        max_support: Optional[int] = None,
+    ) -> dict:
+        """Compute next-byte distribution after a prompt.
+
+        For each possible next byte after the prompt, returns the count and
+        probability using a divide-and-conquer algorithm over the suffix array.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the SUFFIX_ARRAY index to query.
+        prompt : str or bytes
+            The conditioning context. Strings are encoded as UTF-8.
+        max_support : int, optional
+            Maximum entries to scan. If the prompt count exceeds this,
+            uses approximate sampling mode.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - ``prompt_cnt`` (int): number of prompt occurrences
+            - ``approximate`` (bool): whether approximate mode was used
+            - ``distribution`` (list[dict]): list of entries, each with
+              ``byte`` (int), ``count`` (int), ``prob`` (float), sorted by
+              count descending
+        """
+        if isinstance(prompt, str):
+            prompt = prompt.encode("utf-8")
+        prompt_cnt, approximate, dist_tuples = self._ds.suffix_array_ntd(
+            index_name, prompt, max_support
+        )
+        distribution = [
+            {"byte": b, "count": c, "prob": p} for b, c, p in dist_tuples
+        ]
+        return {
+            "prompt_cnt": prompt_cnt,
+            "approximate": approximate,
+            "distribution": distribution,
+        }
+
+    def suffix_array_infgram_prob(
+        self,
+        index_name: str,
+        prompt: Union[str, bytes],
+        continuation: Union[str, bytes],
+    ) -> dict:
+        """Compute infinity-gram probability with backoff.
+
+        Finds the longest suffix of the prompt that has nonzero count in the
+        corpus, then computes ``P(continuation | longest_suffix)``. Uses binary
+        lifting for efficient suffix search.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the SUFFIX_ARRAY index to query.
+        prompt : str or bytes
+            The conditioning context. Strings are encoded as UTF-8.
+        continuation : str or bytes
+            The continuation to compute probability for.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - ``prompt_cnt`` (int): count of the effective suffix
+            - ``cont_cnt`` (int): count of effective suffix + continuation
+            - ``prob`` (float): conditional probability
+            - ``effective_suffix_len`` (int): length of the longest suffix
+              of prompt with nonzero count
+        """
+        if isinstance(prompt, str):
+            prompt = prompt.encode("utf-8")
+        if isinstance(continuation, str):
+            continuation = continuation.encode("utf-8")
+        prompt_cnt, cont_cnt, prob, suffix_len = (
+            self._ds.suffix_array_infgram_prob(index_name, prompt, continuation)
+        )
+        return {
+            "prompt_cnt": prompt_cnt,
+            "cont_cnt": cont_cnt,
+            "prob": prob,
+            "effective_suffix_len": suffix_len,
+        }
+
     @property
     def has_index(self):
         return len(self.describe_indices()) > 0
@@ -3035,12 +3224,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "SUFFIX_ARRAY",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE", or "SUFFIX_ARRAY" are '
+                        f"supported for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3072,6 +3262,17 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type == "SUFFIX_ARRAY":
+                if (
+                    not pa.types.is_string(field_type)
+                    and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"SUFFIX_ARRAY index column {column} must be string or binary"
+                        f", but got {field_type}"
+                    )
             elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):

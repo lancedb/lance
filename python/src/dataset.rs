@@ -83,6 +83,7 @@ use lance_index::{
 };
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
+    scalar::suffix_array::SuffixArrayQuery,
 };
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
@@ -904,6 +905,292 @@ impl Dataset {
                     index_name, err
                 )),
             })
+    }
+
+    /// Count occurrences of a byte pattern in a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// query : bytes
+    ///     Byte pattern to count.
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///     Number of occurrences.
+    fn suffix_array_count(&self, index_name: String, query: Vec<u8>) -> PyResult<u64> {
+        rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            let sa_query = SuffixArrayQuery::Count { query_bytes: query };
+            let result = index.search(&sa_query, &NoOpMetricsCollector).await?;
+            match result {
+                lance_index::scalar::SearchResult::Exact(row_set) => {
+                    // Count is encoded as a synthetic row address
+                    let count: u64 = row_set
+                        .true_rows()
+                        .row_addrs()
+                        .map(|addrs| addrs.map(u64::from).sum())
+                        .unwrap_or(0);
+                    Ok(count)
+                }
+                _ => Ok(0),
+            }
+        })?
+        .map_err(|err| PyIOError::new_err(format!("Suffix array count failed: {}", err)))
+    }
+
+    /// Search for positions of a byte pattern in a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// query : bytes
+    ///     Byte pattern to search for.
+    /// max_results : int, optional
+    ///     Maximum number of positions to return. Default 100.
+    ///
+    /// Returns
+    /// -------
+    /// list[int]
+    ///     Byte positions within the corpus where the pattern occurs.
+    fn suffix_array_search(
+        &self,
+        index_name: String,
+        query: Vec<u8>,
+        max_results: Option<usize>,
+    ) -> PyResult<Vec<u64>> {
+        let max_results = max_results.unwrap_or(100);
+        rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            let sa_query = SuffixArrayQuery::Search {
+                query_bytes: query,
+                max_results,
+            };
+            let result = index.search(&sa_query, &NoOpMetricsCollector).await?;
+            match result {
+                lance_index::scalar::SearchResult::Exact(row_set) => {
+                    let positions: Vec<u64> = row_set
+                        .true_rows()
+                        .row_addrs()
+                        .map(|addrs| addrs.map(u64::from).collect())
+                        .unwrap_or_default();
+                    Ok(positions)
+                }
+                _ => Ok(vec![]),
+            }
+        })?
+        .map_err(|err| PyIOError::new_err(format!("Suffix array search failed: {}", err)))
+    }
+
+    /// Compute conditional probability P(continuation | prompt) using a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// prompt : bytes
+    ///     The conditioning context.
+    /// continuation : bytes
+    ///     The continuation to compute probability for.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Dictionary with keys: "prompt_cnt", "cont_cnt", "prob".
+    fn suffix_array_prob(
+        &self,
+        index_name: String,
+        prompt: Vec<u8>,
+        continuation: Vec<u8>,
+    ) -> PyResult<(u64, u64, f64)> {
+        let result = rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+
+            Ok(sa_index.compute_prob(&prompt, &continuation))
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(format!("Suffix array prob failed: {}", err)))?;
+
+        Ok((result.prompt_cnt, result.cont_cnt, result.prob))
+    }
+
+    /// Compute next-byte distribution after a prompt using a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// prompt : bytes
+    ///     The conditioning context.
+    /// max_support : int, optional
+    ///     Maximum entries to scan; uses approximate mode if exceeded.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Dictionary with keys: "prompt_cnt", "approximate", "distribution"
+    ///     where distribution is a list of dicts with "byte", "count", "prob".
+    fn suffix_array_ntd(
+        &self,
+        index_name: String,
+        prompt: Vec<u8>,
+        max_support: Option<u64>,
+    ) -> PyResult<(u64, bool, Vec<(u8, u64, f64)>)> {
+        let result = rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+
+            Ok(sa_index.compute_ntd(&prompt, max_support))
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(format!("Suffix array ntd failed: {}", err)))?;
+
+        let distribution: Vec<(u8, u64, f64)> = result
+            .distribution
+            .iter()
+            .map(|e| (e.byte_value, e.count, e.prob))
+            .collect();
+        Ok((result.prompt_cnt, result.approximate, distribution))
+    }
+
+    /// Compute infinity-gram probability with backoff using a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// prompt : bytes
+    ///     The conditioning context.
+    /// continuation : bytes
+    ///     The continuation to compute probability for.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Dictionary with keys: "prompt_cnt", "cont_cnt", "prob",
+    ///     "effective_suffix_len".
+    fn suffix_array_infgram_prob(
+        &self,
+        index_name: String,
+        prompt: Vec<u8>,
+        continuation: Vec<u8>,
+    ) -> PyResult<(u64, u64, f64, usize)> {
+        let result = rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+
+            Ok(sa_index.compute_infgram_prob(&prompt, &continuation))
+        })?
+        .map_err(|err: lance::Error| {
+            PyIOError::new_err(format!("Suffix array infgram_prob failed: {}", err))
+        })?;
+
+        Ok((
+            result.prob_result.prompt_cnt,
+            result.prob_result.cont_cnt,
+            result.prob_result.prob,
+            result.effective_suffix_len,
+        ))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
@@ -2144,6 +2431,7 @@ impl Dataset {
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
+            "SUFFIX_ARRAY" => IndexType::SuffixArray,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
@@ -2182,6 +2470,10 @@ impl Dataset {
             }),
             "RTREE" => Box::new(ScalarIndexParams {
                 index_type: "rtree".to_string(),
+                params: None,
+            }),
+            "SUFFIX_ARRAY" => Box::new(ScalarIndexParams {
+                index_type: "suffixarray".to_string(),
                 params: None,
             }),
             "SCALAR" => {

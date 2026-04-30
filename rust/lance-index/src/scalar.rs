@@ -42,6 +42,7 @@ pub mod ngram;
 pub mod registry;
 #[cfg(feature = "geo")]
 pub mod rtree;
+pub mod suffix_array;
 pub mod zoned;
 pub mod zonemap;
 

@@ -191,3 +191,15 @@ message JsonIndexDetails {
 message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
+
+// Suffix array index for n-gram counting and text search.
+message SuffixArrayIndexDetails {
+  uint32 token_width = 1;
+  uint32 pointer_width = 2;
+  uint64 total_tokens = 3;
+  uint64 total_documents = 4;
+  uint64 corpus_bytes = 5;
+  optional string tokenizer_name = 6;
+  optional uint32 vocab_size = 7;
+  optional uint32 separator_token_id = 8;
+}
