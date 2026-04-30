@@ -262,6 +262,15 @@ impl IntoJava for JLance<Option<usize>> {
     }
 }
 
+impl IntoJava for JLance<Option<&str>> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(match self.0 {
+            Some(value) => env.new_string(value)?.into(),
+            None => JObject::null(),
+        })
+    }
+}
+
 impl FromJObjectWithEnv<Option<i64>> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Option<i64>> {
         let ret = if self.is_null() {

@@ -1912,8 +1912,12 @@ impl Dataset {
 
         for (tag_name, tag_content) in tags {
             let dict = PyDict::new(py);
+            dict.set_item("branch", tag_content.branch.clone())?;
             dict.set_item("version", tag_content.version)?;
+            dict.set_item("created_at", tag_content.created_at)?;
+            dict.set_item("updated_at", tag_content.updated_at)?;
             dict.set_item("manifest_size", tag_content.manifest_size)?;
+            dict.set_item("metadata", tag_content.metadata.clone())?;
 
             pylist.append((tag_name.as_str(), dict))?;
         }
@@ -1930,7 +1934,10 @@ impl Dataset {
             let dict = PyDict::new(py);
             dict.set_item("branch", v.branch.clone())?;
             dict.set_item("version", v.version)?;
+            dict.set_item("created_at", v.created_at)?;
+            dict.set_item("updated_at", v.updated_at)?;
             dict.set_item("manifest_size", v.manifest_size)?;
+            dict.set_item("metadata", v.metadata.clone())?;
             pytags.set_item(k, dict.into_py_any(py)?)?;
         }
         pytags.into_py_any(py)
@@ -1981,6 +1988,15 @@ impl Dataset {
         rt().block_on(
             None,
             self.ds.as_ref().tags().update(tag.as_str(), reference),
+        )?
+        .infer_error()?;
+        Ok(())
+    }
+
+    fn replace_tag_metadata(&self, tag: String, metadata: HashMap<String, String>) -> PyResult<()> {
+        rt().block_on(
+            None,
+            self.ds.as_ref().tags().replace_metadata(&tag, metadata),
         )?
         .infer_error()?;
         Ok(())
@@ -2054,9 +2070,26 @@ impl Dataset {
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
+            dict.set_item("metadata", meta.metadata.clone())?;
             pybranches.set_item(name, dict.into_py_any(py)?)?;
         }
         Ok(pybranches.into())
+    }
+
+    fn replace_branch_metadata(
+        &self,
+        branch: String,
+        metadata: HashMap<String, String>,
+    ) -> PyResult<()> {
+        rt().block_on(
+            None,
+            self.ds
+                .as_ref()
+                .branches()
+                .replace_metadata(&branch, metadata),
+        )?
+        .infer_error()?;
+        Ok(())
     }
 
     /// List branches ordered by parent_version
@@ -2089,6 +2122,7 @@ impl Dataset {
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
+            dict.set_item("metadata", meta.metadata.clone())?;
             out.push((name, dict.into_py_any(py)?));
         }
         Ok(out)

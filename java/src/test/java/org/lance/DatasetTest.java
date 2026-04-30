@@ -61,6 +61,7 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -317,8 +318,15 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         dataset.tags().create("tag1", Ref.ofMain());
-        assertEquals(1, dataset.tags().list().size());
-        assertEquals(1, dataset.tags().list().get(0).getVersion());
+        dataset.tags().replaceMetadata("tag1", Map.of("description", "primary tag"));
+        List<Tag> tags = dataset.tags().list();
+        Tag tag1 = tags.get(0);
+        assertEquals(1, tags.size());
+        assertEquals(1, tag1.getVersion());
+        assertEquals(Map.of("description", "primary tag"), tag1.getMetadata());
+        assertTrue(tag1.getCreatedAt().isPresent());
+        assertTrue(tag1.getUpdatedAt().isPresent());
+        assertEquals(tag1.getCreatedAt(), tag1.getUpdatedAt());
         assertEquals(1, dataset.tags().getVersion("tag1"));
       }
 
@@ -332,12 +340,67 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
         assertEquals(2, dataset2.tags().getVersion("tag2"));
-        dataset2.tags().update("tag2", Ref.ofMain(1));
+        dataset2.tags().replaceMetadata("tag2", Map.of("description", "rollback tag"));
+        Instant tag2CreatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getCreatedAt()
+                .orElseThrow();
+        Instant tag2UpdatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getUpdatedAt()
+                .orElseThrow();
+        assertEquals(tag2CreatedAt, tag2UpdatedAt);
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
-        assertEquals(1, dataset2.tags().list().get(1).getVersion());
+        assertEquals(2, dataset2.tags().list().get(1).getVersion());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
+        assertEquals(2, dataset2.tags().getVersion("tag2"));
+        assertEquals(
+            Map.of("description", "rollback tag"),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
+        dataset2.tags().update("tag2", Ref.ofMain(1));
+        Instant updatedTag2CreatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getCreatedAt()
+                .orElseThrow();
+        Instant updatedTag2UpdatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getUpdatedAt()
+                .orElseThrow();
         assertEquals(1, dataset2.tags().getVersion("tag2"));
+        assertEquals(updatedTag2CreatedAt, tag2CreatedAt);
+        assertFalse(updatedTag2UpdatedAt.isBefore(tag2UpdatedAt));
+        assertEquals(
+            Map.of("description", "rollback tag"),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
+        dataset2.tags().replaceMetadata("tag2", Collections.emptyMap());
+        assertEquals(
+            Collections.emptyMap(),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
         dataset2.tags().delete("tag2");
         assertEquals(1, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
@@ -357,6 +420,7 @@ public class DatasetTest {
 
         try (Dataset branch = dataset2.createBranch("branch", Ref.ofMain(2))) {
           branch.tags().create("tag_on_branch", Ref.ofBranch("branch"));
+          branch.tags().replaceMetadata("tag_on_branch", Map.of("description", "branch tag"));
           assertEquals(2, dataset2.tags().getVersion("tag_on_branch"));
           List<Tag> tags = dataset2.tags().list();
           Optional<Tag> tagOptional =
@@ -367,6 +431,7 @@ public class DatasetTest {
           assertTrue(tagOptional.isPresent());
           assertEquals(2, tagOptional.get().getVersion());
           assertEquals(Optional.of("branch"), tagOptional.get().getBranch());
+          assertEquals(Map.of("description", "branch tag"), tagOptional.get().getMetadata());
 
           dataset2.tags().update("tag1", Ref.ofBranch("branch"));
           tags = dataset2.tags().list();
@@ -1784,6 +1849,19 @@ public class DatasetTest {
                   assertFalse(branch1Meta.getBranchIdentifier().get(0).getUuid().isEmpty());
                   assertTrue(branch1Meta.getCreateAt() > 0);
                   assertTrue(branch1Meta.getManifestSize() > 0);
+                  assertEquals(Collections.emptyMap(), branch1Meta.getMetadata());
+                  mainV2
+                      .branches()
+                      .replaceMetadata("branch1", Map.of("description", "long-lived branch"));
+                  branches = branch2V4.branches().list();
+                  b1 = branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  assertTrue(b1.isPresent());
+                  assertEquals(Map.of("description", "long-lived branch"), b1.get().getMetadata());
+                  mainV2.branches().replaceMetadata("branch1", Collections.emptyMap());
+                  branches = branch2V4.branches().list();
+                  b1 = branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  assertTrue(b1.isPresent());
+                  assertEquals(Collections.emptyMap(), b1.get().getMetadata());
 
                   assertEquals("branch2", branch2Meta.getName());
                   assertTrue(branch2Meta.getParentBranch().isPresent());

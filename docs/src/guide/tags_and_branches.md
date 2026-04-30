@@ -36,10 +36,10 @@ print(ds.tags.list())
 # {}
 ds.tags.create("v1-prod", (None, 1))
 print(ds.tags.list())
-# {'v1-prod': {'version': 1, 'manifest_size': ...}}
+# {'v1-prod': {'version': 1, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...}}
 ds.tags.update("v1-prod", (None, 2))
 print(ds.tags.list())
-# {'v1-prod': {'version': 2, 'manifest_size': ...}}
+# {'v1-prod': {'version': 2, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...}}
 ds.tags.delete("v1-prod")
 print(ds.tags.list())
 # {}
@@ -47,10 +47,10 @@ print(ds.tags.list_ordered())
 # []
 ds.tags.create("v1-prod", (None, 1))
 print(ds.tags.list_ordered())
-# [('v1-prod', {'version': 1, 'manifest_size': ...})]
+# [('v1-prod', {'version': 1, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...})]
 ds.tags.update("v1-prod", (None, 2))
 print(ds.tags.list_ordered())
-# [('v1-prod', {'version': 2, 'manifest_size': ...})]
+# [('v1-prod', {'version': 2, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...})]
 ds.tags.delete("v1-prod")
 print(ds.tags.list_ordered())
 # []
