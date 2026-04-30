@@ -8,14 +8,19 @@ use arrow::array::{AsArray, BooleanBuilder};
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Float32Array, OffsetSizeTrait, RecordBatch, UInt64Array};
 use arrow_schema::DataType;
-use datafusion::common::Statistics;
+use datafusion::common::{NullEquality, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::future::try_join_all;
 use futures::stream::{self};
@@ -1560,6 +1565,74 @@ impl ExecutionPlan for BoostQueryExec {
     }
 }
 
+/// Identifies which clause of a [`BooleanQuery`] a list of child execs
+/// belongs to. Used by [`build_boolean_query_children`] to pick the
+/// right exec shape per slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolSlot {
+    Should,
+    Must,
+    MustNot,
+}
+
+/// Combine N children into the per-slot exec shape that
+/// [`BooleanQueryExec::new`] expects. Used by `Scanner::plan_fts` to
+/// assemble the per-slot exec shape:
+///
+/// | slot      | 0 children                 | 1 child       | N children                                          |
+/// |-----------|----------------------------|---------------|-----------------------------------------------------|
+/// | Should    | `Some(EmptyExec(FTS))`     | `Some(child)` | `Some(Union -> Repartition(RoundRobinBatch(1)))`    |
+/// | Must      | `None`                     | `Some(child)` | `Some(chained HashJoin on row_id)`                  |
+/// | MustNot   | `Some(EmptyExec(FTS))`     | `Some(child)` | `Some(Union -> Repartition(RoundRobinBatch(1)))`    |
+///
+/// Errors only on internal invariants (HashJoin construction, Schema
+/// lookups). Returns `Result<Option<Arc<dyn ExecutionPlan>>>` so the
+/// `Must` slot's `None` case is naturally expressible.
+pub fn build_boolean_query_children(
+    slot: BoolSlot,
+    mut children: Vec<Arc<dyn ExecutionPlan>>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    match slot {
+        BoolSlot::Should | BoolSlot::MustNot => {
+            if children.is_empty() {
+                Ok(Some(Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))))
+            } else if children.len() == 1 {
+                Ok(Some(children.pop().unwrap()))
+            } else {
+                let unioned = UnionExec::try_new(children)?;
+                Ok(Some(Arc::new(RepartitionExec::try_new(
+                    unioned,
+                    Partitioning::RoundRobinBatch(1),
+                )?)))
+            }
+        }
+        BoolSlot::Must => {
+            let mut joined: Option<Arc<dyn ExecutionPlan>> = None;
+            for plan in children {
+                if let Some(left) = joined {
+                    joined = Some(Arc::new(HashJoinExec::try_new(
+                        left,
+                        plan,
+                        vec![(
+                            Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                            Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                        )],
+                        None,
+                        &datafusion_expr::JoinType::Inner,
+                        None,
+                        PartitionMode::CollectLeft,
+                        NullEquality::NullEqualsNothing,
+                        false,
+                    )?) as _);
+                } else {
+                    joined = Some(plan);
+                }
+            }
+            Ok(joined)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BooleanQueryExec {
     query: BooleanQuery,
@@ -1851,7 +1924,7 @@ mod tests {
         PhraseQuery, collect_query_tokens, has_query_token,
     };
     use lance_index::scalar::inverted::{
-        InvertedIndex, Language, SCORE_COL, build_global_bm25_scorer,
+        FTS_SCHEMA, InvertedIndex, Language, SCORE_COL, build_global_bm25_scorer,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -1867,10 +1940,14 @@ mod tests {
     };
 
     use super::{
-        BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
-        open_fts_segments,
+        BoolSlot, BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
+        PhraseQueryExec, build_boolean_query_children, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::union::UnionExec;
+    use datafusion_physical_plan::joins::HashJoinExec;
 
     #[derive(Default)]
     struct StatsHolder {
@@ -2370,5 +2447,114 @@ mod tests {
             out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             out
         }
+    }
+
+    fn empty_fts_child() -> Arc<dyn ExecutionPlan> {
+        Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+    }
+
+    #[test]
+    fn build_boolean_should_empty_returns_empty_exec() {
+        let plan = build_boolean_query_children(BoolSlot::Should, vec![])
+            .unwrap()
+            .expect("Should slot always returns Some");
+        assert!(
+            plan.as_any().downcast_ref::<EmptyExec>().is_some(),
+            "expected EmptyExec for empty Should slot, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn build_boolean_should_single_child_passthrough() {
+        let child = empty_fts_child();
+        let child_ptr = Arc::as_ptr(&child);
+        let plan = build_boolean_query_children(BoolSlot::Should, vec![child])
+            .unwrap()
+            .expect("Should slot always returns Some");
+        assert_eq!(
+            Arc::as_ptr(&plan),
+            child_ptr,
+            "single-child Should should return the child unchanged"
+        );
+    }
+
+    #[test]
+    fn build_boolean_should_multi_child_union_repartition() {
+        let plan = build_boolean_query_children(
+            BoolSlot::Should,
+            vec![empty_fts_child(), empty_fts_child()],
+        )
+        .unwrap()
+        .expect("Should slot always returns Some");
+        let repartition = plan
+            .as_any()
+            .downcast_ref::<RepartitionExec>()
+            .expect("multi-child Should should be wrapped in RepartitionExec");
+        let inner = repartition
+            .input()
+            .as_any()
+            .downcast_ref::<UnionExec>()
+            .expect("RepartitionExec should wrap a UnionExec");
+        assert_eq!(inner.children().len(), 2);
+    }
+
+    #[test]
+    fn build_boolean_must_empty_returns_none() {
+        let plan = build_boolean_query_children(BoolSlot::Must, vec![]).unwrap();
+        assert!(plan.is_none(), "empty Must slot should return None");
+    }
+
+    #[test]
+    fn build_boolean_must_single_child_passthrough_some() {
+        let child = empty_fts_child();
+        let child_ptr = Arc::as_ptr(&child);
+        let plan = build_boolean_query_children(BoolSlot::Must, vec![child])
+            .unwrap()
+            .expect("single-child Must should be Some");
+        assert_eq!(
+            Arc::as_ptr(&plan),
+            child_ptr,
+            "single-child Must should return the child unchanged"
+        );
+    }
+
+    #[test]
+    fn build_boolean_must_multi_child_chained_hashjoin() {
+        let children = vec![empty_fts_child(), empty_fts_child(), empty_fts_child()];
+        let n = children.len();
+        let plan = build_boolean_query_children(BoolSlot::Must, children)
+            .unwrap()
+            .expect("multi-child Must should be Some");
+
+        // Walk the left spine: each layer is a HashJoinExec whose left child is
+        // either another HashJoinExec or the original leaf. With N children
+        // there are N-1 joins.
+        let mut joins = 0usize;
+        let mut current: Arc<dyn ExecutionPlan> = plan;
+        while let Some(join) = current.clone().as_any().downcast_ref::<HashJoinExec>() {
+            joins += 1;
+            current = join.children()[0].clone();
+        }
+        assert_eq!(joins, n - 1, "expected {} joins for {n} children", n - 1);
+    }
+
+    #[test]
+    fn build_boolean_must_not_multi_child_union_repartition() {
+        let plan = build_boolean_query_children(
+            BoolSlot::MustNot,
+            vec![empty_fts_child(), empty_fts_child()],
+        )
+        .unwrap()
+        .expect("MustNot slot always returns Some");
+        let repartition = plan
+            .as_any()
+            .downcast_ref::<RepartitionExec>()
+            .expect("multi-child MustNot should be wrapped in RepartitionExec");
+        let inner = repartition
+            .input()
+            .as_any()
+            .downcast_ref::<UnionExec>()
+            .expect("RepartitionExec should wrap a UnionExec");
+        assert_eq!(inner.children().len(), 2);
     }
 }
