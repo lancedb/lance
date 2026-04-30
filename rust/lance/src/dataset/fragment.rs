@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
-    RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
+    Array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
@@ -23,6 +24,7 @@ use futures::future::try_join_all;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
@@ -48,6 +50,7 @@ use lance_table::utils::stream::{
     ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
     wrap_with_row_id_and_delete,
 };
+use roaring::RoaringBitmap;
 
 use self::write::FragmentCreateBuilder;
 
@@ -60,6 +63,16 @@ use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::io::deletion::read_dataset_deletion_file;
+
+/// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
+/// and physical row offsets that matched the join (for stable row-id version metadata).
+#[derive(Debug, Clone)]
+pub struct FragmentUpdateColumnsResult {
+    pub fragment: Fragment,
+    pub fields_modified: Vec<u32>,
+    /// Physical row offsets (0-based within this fragment) whose columns were rewritten from the right-hand stream.
+    pub matched_offsets: RoaringBitmap,
+}
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -1602,12 +1615,27 @@ impl FileFragment {
         Ok(self)
     }
 
+    /// Same as [`Self::update_columns_with_offsets`] but discards the matched row offsets.
+    /// Use [`Self::update_columns_with_offsets`] if you need per-row version metadata for stable row IDs.
     pub async fn update_columns(
         &mut self,
         right_stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
     ) -> Result<(Fragment, Vec<u32>)> {
+        let r = self
+            .update_columns_with_offsets(right_stream, left_on, right_on)
+            .await?;
+        Ok((r.fragment, r.fields_modified))
+    }
+
+    /// Same operation as [`Self::update_columns`], and also returns matched physical row offsets for stable row IDs.
+    pub async fn update_columns_with_offsets(
+        &mut self,
+        right_stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<FragmentUpdateColumnsResult> {
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(format!(
                 "Column {} does not exist in the left side fragment",
@@ -1647,6 +1675,11 @@ impl FileFragment {
         let mut read_columns: Vec<String> =
             write_schema.fields.iter().map(|f| f.name.clone()).collect();
         read_columns.push(left_on.to_string());
+        // Physical positions for matched rows are taken from `_rowaddr` (fragment id + row offset).
+        // The updater scans live rows in physical order; `_rowaddr` encodes the slot index used by row-level version metadata.
+        if !read_columns.iter().any(|n| n.as_str() == ROW_ADDR) {
+            read_columns.push(ROW_ADDR.to_string());
+        }
         let mut updater = self
             .updater(
                 Some(&read_columns),
@@ -1654,11 +1687,32 @@ impl FileFragment {
                 None,
             )
             .await?;
-        // Hash join
+        // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
+        let mut matched_offsets = RoaringBitmap::new();
+        let frag_id_u32 = u32::try_from(self.metadata.id).map_err(|_| {
+            Error::invalid_input(format!(
+                "Fragment id {} does not fit RowAddress fragment id",
+                self.metadata.id
+            ))
+        })?;
         while let Some(batch) = updater.next().await? {
+            let index_column = batch[left_on].clone();
+            let matched = joiner.matched_join_rows(index_column.clone())?;
+            if let Some(addr_col) = batch.column_by_name(ROW_ADDR) {
+                let addrs = as_primitive_array::<UInt64Type>(addr_col.as_ref());
+                for row_idx in 0..batch.num_rows() {
+                    if !matched[row_idx] || addrs.is_null(row_idx) {
+                        continue;
+                    }
+                    let addr = RowAddress::from(addrs.value(row_idx));
+                    if addr.fragment_id() == frag_id_u32 {
+                        matched_offsets.insert(addr.row_offset());
+                    }
+                }
+            }
             let updated_batch = joiner
-                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset())
+                .collect_with_fallback(batch, index_column, self.dataset())
                 .await?;
             updater.update(updated_batch).await?;
         }
@@ -1689,8 +1743,11 @@ impl FileFragment {
             .iter()
             .filter_map(|&i| u32::try_from(i).ok())
             .collect();
-        // Note: updated field should be returned when committing, waiting to be done
-        Ok((updated_fragment, updated_fields))
+        Ok(FragmentUpdateColumnsResult {
+            fragment: updated_fragment,
+            fields_modified: updated_fields,
+            matched_offsets,
+        })
     }
 
     /// Append new columns to the fragment
@@ -2647,12 +2704,13 @@ mod tests {
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+    use std::collections::HashMap;
 
     use super::*;
     use crate::{
         dataset::{
             InsertBuilder,
-            transaction::{Operation, UpdateMode},
+            transaction::{Operation, UpdateMode, UpdatedFragmentOffsets},
         },
         session::Session,
         utils::test::TestDatasetGenerator,
@@ -2851,19 +2909,29 @@ mod tests {
             vec![Ok(update_batch1)].into_iter(),
             schema1,
         ));
-        let (updated_fragment1, fields_modified1) = fragment1
-            .update_columns(right_stream1, ROW_ID, ROW_ID)
+        let u1 = fragment1
+            .update_columns_with_offsets(right_stream1, ROW_ID, ROW_ID)
             .await
             .unwrap();
+        assert_eq!(u1.matched_offsets.iter().count(), 38);
+        assert!(!u1.matched_offsets.contains(0));
+        assert!(!u1.matched_offsets.contains(3));
+        assert!(u1.matched_offsets.contains(1));
+        assert!(u1.matched_offsets.contains(39));
+        let frag_id_1 = u1.fragment.id;
+        let matched_1 = u1.matched_offsets;
         let op1 = Operation::Update {
             removed_fragment_ids: vec![],
-            updated_fragments: vec![updated_fragment1],
+            updated_fragments: vec![u1.fragment],
             new_fragments: vec![],
-            fields_modified: fields_modified1,
+            fields_modified: u1.fields_modified,
             merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                frag_id_1, matched_1,
+            )]))),
         };
         let mut dataset1 = Dataset::commit(
             test_uri,
@@ -2924,19 +2992,27 @@ mod tests {
             vec![Ok(update_batch2)].into_iter(),
             schema2,
         ));
-        let (updated_fragment2, fields_modified2) = fragment2
-            .update_columns(right_stream2, "i", "i1")
+        let u2 = fragment2
+            .update_columns_with_offsets(right_stream2, "i", "i1")
             .await
             .unwrap();
+        assert_eq!(u2.matched_offsets.iter().count(), 38);
+        assert!(!u2.matched_offsets.contains(0));
+        assert!(!u2.matched_offsets.contains(3));
+        let frag_id_2 = u2.fragment.id;
+        let matched_2 = u2.matched_offsets;
         let op = Operation::Update {
             removed_fragment_ids: vec![],
-            updated_fragments: vec![updated_fragment2],
+            updated_fragments: vec![u2.fragment],
             new_fragments: vec![],
-            fields_modified: fields_modified2,
+            fields_modified: u2.fields_modified,
             merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                frag_id_2, matched_2,
+            )]))),
         };
         let dataset2 = Dataset::commit(
             test_uri,

@@ -377,6 +377,7 @@ impl UpdateJob {
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
             inserted_rows_filter: None,
+            updated_fragment_offsets: None,
         };
 
         let transaction = Transaction::new(dataset.manifest.version, operation, None);

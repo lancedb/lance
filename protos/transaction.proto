@@ -227,6 +227,11 @@ message Transaction {
     }
   }
 
+  // Serialized as sorted distinct local physical row offsets within the fragment (0-based).
+  message UInt32List {
+    repeated uint32 values = 1;
+  }
+
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows
@@ -248,6 +253,8 @@ message Transaction {
     // Filter for checking existence of keys in newly inserted rows, used for conflict detection.
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
+    // Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
+    map<uint64, UInt32List> updated_fragment_offsets = 9;
   }
 
   // The mode of update operation
