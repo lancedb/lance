@@ -1489,6 +1489,25 @@ pub async fn commit_compaction(
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
 
+    // Determine the earliest version at which compaction tasks were planned/executed.
+    //
+    // In distributed mode (e.g. Spark) the caller opens *two separate* Dataset
+    // handles: one for `plan_compaction` (at version V) and a fresh one for
+    // `commit_compaction` (at the latest version V+N).  Using `dataset.manifest.version`
+    // (= V+N) as the transaction's `read_version` would cause the conflict checker to
+    // scan only versions after V+N — finding nothing — and therefore silently skip any
+    // concurrent DELETE/UPDATE that landed between V and V+N, resurrecting deleted rows.
+    //
+    // By anchoring `read_version` to the minimum version carried in the RewriteResults
+    // we ensure the conflict checker covers the full range [V, V+N] and will reject the
+    // commit with a retryable conflict error if a concurrent write touched the same
+    // fragments.
+    let tasks_read_version = completed_tasks
+        .iter()
+        .map(|t| t.read_version)
+        .min()
+        .unwrap_or(dataset.manifest.version);
+
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
@@ -1587,7 +1606,14 @@ pub async fn commit_compaction(
     };
 
     let transaction = TransactionBuilder::new(
-        dataset.manifest.version,
+        // Use the version at which the compaction tasks were *planned*, not the
+        // version of the dataset handle passed to this function.  In distributed
+        // mode the caller may open a fresh dataset at a later version (V+N), but
+        // the tasks were executed against an older snapshot (V).  Anchoring the
+        // transaction to V ensures the OCC conflict checker scans all writes that
+        // landed between V and the commit point, detecting concurrent DELETE
+        // transactions that would otherwise cause deleted rows to reappear.
+        tasks_read_version,
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
@@ -4665,6 +4691,128 @@ mod tests {
         assert!(
             matches!(err, Error::RetryableCommitConflict { .. }),
             "unexpected error: {err}"
+        );
+    }
+
+    /// Reproduce the distributed-compaction concurrent-delete data-resurrection bug.
+    ///
+    /// In the distributed (Spark) path the caller opens **two separate** `Dataset` handles:
+    ///
+    /// 1. dataset_plan  — used for `plan_compaction` (version = V)
+    /// 2. dataset_commit — opened **fresh** for `commit_compaction` (version = V+N)
+    ///
+    /// Because `commit_compaction` builds the `Rewrite` transaction with
+    /// `dataset.manifest.version` (= V+N), `load_and_sort_new_transactions` only
+    /// scans versions after V+N and finds nothing.  Any concurrent DELETE that
+    /// happened between V and V+N is silently ignored, causing the deleted rows to
+    /// reappear in the compacted fragment.
+    ///
+    /// After the fix, `commit_compaction` uses `min(tasks.read_version)` (= V) as
+    /// the transaction `read_version`, so the conflict checker correctly loads and
+    /// rejects the DELETE, returning a retryable conflict error instead of silently
+    /// resurrecting data.
+    #[tokio::test]
+    async fn test_distributed_compact_concurrent_delete_no_resurrection() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Write 4 fragments × 1 000 rows each (a=0..4000).
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..4_000))],
+        )
+        .unwrap();
+        let mut dataset_plan = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset_plan.manifest.version, 1);
+        assert_eq!(dataset_plan.get_fragments().len(), 4);
+
+        // ── Step 1: plan compaction at version V=1 ───────────────────────────────
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset_plan, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1, "expected one compaction task");
+
+        // ── Step 2: execute tasks (simulating distributed executors at V=1) ──────
+        // Clone dataset_plan so the closure can own its copy while the original
+        // remains available for the concurrent DELETE in Step 3.
+        let dataset_for_tasks = dataset_plan.clone();
+        let results: Vec<RewriteResult> = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| {
+                let ds = dataset_for_tasks.clone();
+                async move {
+                    // Executors open the dataset at the planned read_version
+                    task.execute(&ds).await.unwrap()
+                }
+            })
+            .collect()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].read_version, 1,
+            "tasks must carry read_version=1"
+        );
+
+        // ── Step 3: concurrent DELETE commits at V=2 ─────────────────────────────
+        // Delete rows where a < 1000 (the first 1 000 rows in fragment 0).
+        dataset_plan.delete("a < 1000").await.unwrap();
+        assert_eq!(dataset_plan.manifest.version, 2);
+
+        // ── Step 4: the Spark driver opens a *fresh* dataset (latest = V=2) ──────
+        // This is exactly what OptimizeExec.scala does for commitCompaction.
+        let mut dataset_commit = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(
+            dataset_commit.manifest.version, 2,
+            "fresh dataset must be at the post-delete version"
+        );
+
+        // ── Step 5: commit_compaction with the stale results ─────────────────────
+        let commit_result = commit_compaction(
+            &mut dataset_commit,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await;
+
+        // ── Step 6: assert correct behaviour ─────────────────────────────────────
+        // BEFORE fix: commit_result is Ok(…) and the deleted rows are resurrected.
+        // AFTER  fix: commit_result is Err(retryable conflict), protecting data integrity.
+        assert!(
+            commit_result.is_err(),
+            "commit_compaction must fail with a conflict error when a concurrent \
+             DELETE touched the same fragments; got Ok instead — deleted rows were \
+             silently resurrected"
+        );
+        let err_msg = commit_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("retryable")
+                || err_msg.contains("conflict")
+                || err_msg.contains("preempted"),
+            "expected a retryable conflict error, got: {err_msg}"
+        );
+
+        // The on-disk table must still reflect the DELETE (a < 1000 remains absent).
+        let latest = Dataset::open(test_uri).await.unwrap();
+        let row_count = latest
+            .count_rows(Some("a < 1000".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            row_count, 0,
+            "rows deleted before compaction must not be resurrected; found {row_count}"
         );
     }
 }
