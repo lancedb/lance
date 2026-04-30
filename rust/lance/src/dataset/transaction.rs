@@ -49,28 +49,27 @@ use uuid::Uuid;
 /// Version 1 is the initial dataset version in the Lance format.
 const UNKNOWN_CREATED_AT_VERSION: u64 = 1;
 
-/// Look up the `created_at` version for a single row ID in `row_id_to_source`.
+/// Look up the `created_at` version for a single row ID.
 ///
-/// Walks the original fragment's `created_at_version_meta` to find the version
-/// at the given offset. Returns [`UNKNOWN_CREATED_AT_VERSION`] for any failure
-/// (missing metadata, decode error, out-of-range offset, unmapped row ID).
+/// Uses `row_id_to_source` to find the originating fragment and row offset, then
+/// performs a O(K) random-access lookup via [`RowDatasetVersionSequence::version_at`]
+/// on the pre-decoded sequence in `version_cache` (keyed by fragment ID).
+///
+/// Returns [`UNKNOWN_CREATED_AT_VERSION`] for any failure: unmapped row ID, missing
+/// cache entry (fragment had no `created_at_version_meta` or it failed to decode),
+/// or an out-of-range offset.
 fn resolve_created_at_version(
     row_id: u64,
     row_id_to_source: &HashMap<u64, (&Fragment, usize)>,
+    version_cache: &HashMap<u64, RowDatasetVersionSequence>,
 ) -> u64 {
     let Some((orig_frag, row_offset)) = row_id_to_source.get(&row_id) else {
         return UNKNOWN_CREATED_AT_VERSION;
     };
-    let Some(created_meta) = &orig_frag.created_at_version_meta else {
+    let Some(seq) = version_cache.get(&orig_frag.id) else {
         return UNKNOWN_CREATED_AT_VERSION;
     };
-    match created_meta.load_sequence() {
-        Ok(seq) => seq
-            .versions()
-            .nth(*row_offset)
-            .unwrap_or(UNKNOWN_CREATED_AT_VERSION),
-        Err(_) => UNKNOWN_CREATED_AT_VERSION,
-    }
+    seq.version_at(*row_offset).unwrap_or(UNKNOWN_CREATED_AT_VERSION)
 }
 
 /// For each new fragment produced by an update, set `created_at_version_meta`
@@ -92,25 +91,60 @@ fn resolve_update_version_metadata(
         .collect();
 
     let mut row_id_to_source: HashMap<u64, (&Fragment, usize)> = HashMap::new();
-    // Stable row IDs must be globally unique among *live* rows, but after a rewrite-style
-    // update the same stable ID can appear twice in `existing_fragments`: once in an older
-    // fragment's inline `row_id_meta` at the original row offset (rows may be soft-deleted
-    // via a deletion vector) and again in a newer fragment holding rewritten data. For
-    // `created_at` we need the mapping from the original fragment/offset; that is always the
-    // first occurrence when fragments are processed in ascending `id` order.
-    let mut sorted_frags: Vec<&Fragment> = existing_fragments.iter().collect();
-    sorted_frags.sort_by_key(|f| f.id);
-    for frag in sorted_frags {
-        if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
-            && let Ok(seq) = read_row_ids(data)
-        {
-            for (offset, rid) in seq.iter().enumerate() {
-                if needed_row_ids.contains(&rid) {
-                    row_id_to_source.entry(rid).or_insert((frag, offset));
+
+    if !needed_row_ids.is_empty() {
+        // Compute the bounding range of the needed set once.  Any fragment whose
+        // entire row-id range lies outside [needed_min, needed_max] cannot contain
+        // any needed ID and can be skipped before the inner per-row loop.
+        let needed_min = *needed_row_ids.iter().min().unwrap();
+        let needed_max = *needed_row_ids.iter().max().unwrap();
+
+        // Stable row IDs must be globally unique among *live* rows, but after a rewrite-style
+        // update the same stable ID can appear twice in `existing_fragments`: once in an older
+        // fragment's inline `row_id_meta` at the original row offset (rows may be soft-deleted
+        // via a deletion vector) and again in a newer fragment holding rewritten data. For
+        // `created_at` we need the mapping from the original fragment/offset; that is always the
+        // first occurrence when fragments are processed in ascending `id` order.
+        let mut sorted_frags: Vec<&Fragment> = existing_fragments.iter().collect();
+        sorted_frags.sort_by_key(|f| f.id);
+        for frag in sorted_frags {
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
+                && let Ok(seq) = read_row_ids(data)
+            {
+                // Range pre-filter: skip the per-row inner loop when the fragment's
+                // bounding row-id range has no overlap with [needed_min, needed_max].
+                // row_id_range() returns None for empty sequences, which are also skipped.
+                // This is a conservative check (may produce false positives for sparse
+                // segments) but never skips a fragment that actually contains a needed ID.
+                if seq
+                    .row_id_range()
+                    .is_none_or(|r| *r.end() < needed_min || *r.start() > needed_max)
+                {
+                    continue;
+                }
+
+                for (offset, rid) in seq.iter().enumerate() {
+                    if needed_row_ids.contains(&rid) {
+                        row_id_to_source.entry(rid).or_insert((frag, offset));
+                    }
                 }
             }
         }
     }
+
+    // Pre-decode the `created_at` version sequence for each source fragment exactly
+    // once.  Without this cache, resolve_created_at_version would call load_sequence()
+    // (a protobuf decode) for every single updated row, even when many rows originate
+    // from the same fragment.
+    let source_frag_ids: HashSet<u64> = row_id_to_source.values().map(|(f, _)| f.id).collect();
+    let version_cache: HashMap<u64, RowDatasetVersionSequence> = existing_fragments
+        .iter()
+        .filter(|f| source_frag_ids.contains(&f.id))
+        .filter_map(|frag| {
+            let seq = frag.created_at_version_meta.as_ref()?.load_sequence().ok()?;
+            Some((frag.id, seq))
+        })
+        .collect();
 
     for fragment in new_fragments.iter_mut() {
         let row_ids = match &fragment.row_id_meta {
@@ -130,7 +164,7 @@ fn resolve_update_version_metadata(
             let physical_rows = fragment.physical_rows.unwrap_or(0);
             let created_at_versions: Vec<u64> = row_ids
                 .iter()
-                .map(|rid| resolve_created_at_version(rid, &row_id_to_source))
+                .map(|rid| resolve_created_at_version(rid, &row_id_to_source, &version_cache))
                 .collect();
             debug_assert_eq!(created_at_versions.len(), physical_rows);
 
@@ -4891,6 +4925,266 @@ mod tests {
         // Corrupt metadata causes decode to fail → falls back to UNKNOWN_CREATED_AT_VERSION (1)
         assert_eq!(created_at_versions(&result, 10), vec![1]);
         assert_eq!(last_updated_at_versions(&result, 10), vec![5]);
+    }
+
+    // --- Proposal 1: range pre-filter ---
+
+    /// Fragments whose row-ID range lies entirely outside the needed set must not
+    /// affect the result.  Here fragment 1 has IDs [1000, 1001] which are far above
+    /// the needed range [10, 11]; it is skipped by the range pre-filter and its
+    /// created_at version (version 99) must never appear in the output.
+    #[test]
+    fn test_update_version_tracking_range_filter_skips_non_overlapping_fragment() {
+        // Fragment in range – IDs [10, 11], created_at = 5
+        let in_range_seq = RowIdSequence::from([10u64, 11].as_slice());
+        let in_range_created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..2),
+                version: 5,
+            }],
+        };
+        let in_range_frag = Fragment {
+            id: 1,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: Some(
+                RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
+            ),
+            last_updated_at_version_meta: None,
+        };
+
+        // Fragment outside range – IDs [1000, 1001], created_at = 99 (must never appear)
+        let out_of_range_seq = RowIdSequence::from([1000u64, 1001].as_slice());
+        let out_of_range_created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..2),
+                version: 99,
+            }],
+        };
+        let out_of_range_frag = Fragment {
+            id: 2,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: Some(
+                RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
+            ),
+            last_updated_at_version_meta: None,
+        };
+
+        // New fragment rewrites both rows from the in-range fragment
+        let new_seq = RowIdSequence::from([10u64, 11].as_slice());
+        let new_frag = Fragment {
+            id: 10,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![in_range_frag, out_of_range_frag]);
+        let (result, _) = update_txn(vec![new_frag])
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // Both rows originate from the in-range fragment (version 5).
+        // The out-of-range fragment's version 99 must not appear.
+        assert_eq!(created_at_versions(&result, 10), vec![5, 5]);
+        assert_eq!(last_updated_at_versions(&result, 10), vec![5, 5]);
+    }
+
+    /// When the needed row IDs fall exactly at the boundary of a fragment's range,
+    /// the range pre-filter must NOT skip the fragment (boundary values are inclusive).
+    #[test]
+    fn test_update_version_tracking_range_filter_boundary_inclusive() {
+        // Fragment IDs [10, 11, 12], created_at = 7
+        let seq = RowIdSequence::from([10u64, 11, 12].as_slice());
+        let created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..3),
+                version: 7,
+            }],
+        };
+        let existing = Fragment {
+            id: 1,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
+            physical_rows: Some(3),
+            created_at_version_meta: Some(
+                RowDatasetVersionMeta::from_sequence(&created).unwrap(),
+            ),
+            last_updated_at_version_meta: None,
+        };
+
+        // New fragment takes the boundary IDs: 10 (min) and 12 (max)
+        let new_seq = RowIdSequence::from([10u64, 12].as_slice());
+        let new_frag = Fragment {
+            id: 10,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![existing]);
+        let (result, _) = update_txn(vec![new_frag])
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // Boundary IDs must be found and resolved correctly
+        assert_eq!(created_at_versions(&result, 10), vec![7, 7]);
+    }
+
+    // --- Proposal 2: version sequence cache ---
+
+    /// When multiple updated rows all originate from the same source fragment,
+    /// the created_at version sequence for that fragment must be decoded exactly
+    /// once (not once per row).  The observable correctness requirement is that
+    /// all rows get the right version regardless of how many there are.
+    #[test]
+    fn test_update_version_tracking_many_rows_same_source_fragment() {
+        // Source fragment: 100 rows with IDs 0..100, mixed versions (2 runs).
+        // First 50 rows at version 3, next 50 rows at version 4.
+        let src_ids: Vec<u64> = (0u64..100).collect();
+        let src_seq = RowIdSequence::from(src_ids.as_slice());
+        let src_created = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..50),
+                    version: 3,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..50),
+                    version: 4,
+                },
+            ],
+        };
+        let src_frag = Fragment {
+            id: 1,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq))),
+            physical_rows: Some(100),
+            created_at_version_meta: Some(
+                RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
+            ),
+            last_updated_at_version_meta: None,
+        };
+
+        // New fragment rewrites all 100 rows preserving their stable IDs.
+        let new_seq = RowIdSequence::from(src_ids.as_slice());
+        let new_frag = Fragment {
+            id: 10,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            physical_rows: Some(100),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![src_frag]);
+        let (result, _) = update_txn(vec![new_frag])
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let versions = created_at_versions(&result, 10);
+        assert_eq!(versions.len(), 100);
+        // First 50 rows came from version 3, next 50 from version 4
+        assert!(versions[..50].iter().all(|&v| v == 3));
+        assert!(versions[50..].iter().all(|&v| v == 4));
+    }
+
+    /// Rows originating from multiple distinct source fragments must each get
+    /// the version from their own source, even when all cached together.
+    #[test]
+    fn test_update_version_tracking_cache_multiple_source_fragments() {
+        let seq_a = RowIdSequence::from([10u64, 11, 12].as_slice());
+        let created_a = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..3),
+                version: 2,
+            }],
+        };
+        let seq_b = RowIdSequence::from([20u64, 21, 22].as_slice());
+        let created_b = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..3),
+                version: 8,
+            }],
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![
+            Fragment {
+                id: 1,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a))),
+                physical_rows: Some(3),
+                created_at_version_meta: Some(
+                    RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
+                ),
+                last_updated_at_version_meta: None,
+            },
+            Fragment {
+                id: 2,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b))),
+                physical_rows: Some(3),
+                created_at_version_meta: Some(
+                    RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
+                ),
+                last_updated_at_version_meta: None,
+            },
+        ]);
+
+        // New fragment takes rows from both sources: 12 (frag A, offset 2) and 20 (frag B, offset 0)
+        let new_seq = RowIdSequence::from([12u64, 20].as_slice());
+        let new_frag = Fragment {
+            id: 10,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+
+        let (result, _) = update_txn(vec![new_frag])
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // Row 12 → frag A offset 2 → version 2; row 20 → frag B offset 0 → version 8
+        assert_eq!(created_at_versions(&result, 10), vec![2, 8]);
     }
 
     #[test]
