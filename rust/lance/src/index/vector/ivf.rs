@@ -49,7 +49,7 @@ use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
-    utils::parse::str_is_truthy,
+    utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
 use lance_file::{
@@ -978,8 +978,8 @@ pub const LANCE_INCLUDE_VECTOR_CENTROIDS_ENV: &str = "LANCE_INCLUDE_VECTOR_CENTR
 /// Read the centroids for inclusion in index stats, honoring
 /// `LANCE_INCLUDE_VECTOR_CENTROIDS`.
 ///
-/// - If the env var is set to a truthy value (per `str_is_truthy`), returns
-///   the converted centroids.
+/// - If the env var is set to a truthy value (per `parse_env_as_bool`),
+///   returns the converted centroids.
 /// - If the env var is set to any other value, returns `Ok(None)` without
 ///   reading the centroids.
 /// - If unset, returns the converted centroids and logs a one-time
@@ -990,24 +990,20 @@ pub(crate) fn maybe_centroids_for_stats(
     use std::sync::Once;
     static WARN_ONCE: Once = Once::new();
 
-    match std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV) {
-        Ok(val) => {
-            if !str_is_truthy(val.trim()) {
-                return Ok(None);
-            }
-        }
-        Err(_) => {
-            WARN_ONCE.call_once(|| {
-                warn!(
-                    "Vector index statistics currently include centroids, which can use \
-                     significant memory for large indexes. In a future release, centroids \
-                     will be excluded from statistics by default. Set {}=true to preserve \
-                     the current behavior (and silence this warning), or {}=false to opt \
-                     in to the new behavior now.",
-                    LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, LANCE_INCLUDE_VECTOR_CENTROIDS_ENV
-                );
-            });
-        }
+    if std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).is_err() {
+        WARN_ONCE.call_once(|| {
+            warn!(
+                "Vector index statistics currently include centroids, which can use \
+                 significant memory for large indexes. In a future release, centroids \
+                 will be excluded from statistics by default. Set {}=true to preserve \
+                 the current behavior (and silence this warning), or {}=false to opt \
+                 in to the new behavior now.",
+                LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, LANCE_INCLUDE_VECTOR_CENTROIDS_ENV
+            );
+        });
+    }
+    if !parse_env_as_bool(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, true) {
+        return Ok(None);
     }
     Ok(Some(centroids_to_vectors(centroids)?))
 }
