@@ -71,7 +71,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
 
-use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
+use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
 /// Serializable state of an IVF index, sufficient to reconstruct the index
 /// without re-reading global buffers from object storage.
@@ -999,7 +999,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             })
             .collect::<Vec<_>>();
 
-        let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
+        let centroid_vecs = maybe_centroids_for_stats(self.ivf.centroids.as_ref().unwrap())?;
 
         let (sub_index_type, quantization_type) = self.sub_index_type();
         let index_type = index_type_string(sub_index_type, quantization_type);
