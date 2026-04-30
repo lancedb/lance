@@ -6973,7 +6973,6 @@ class VectorIndexReader:
     """
     This class allows you to initialize a reader for a specific vector index,
     retrieve the number of partitions,
-    access the centroids of the index,
     and read specific partitions of the index.
 
     Parameters
@@ -7029,22 +7028,6 @@ class VectorIndexReader:
         """
 
         return self.stats["indices"][0]["num_partitions"]
-
-    def centroids(self) -> np.ndarray:
-        """
-        Returns the centroids of the index
-
-        Returns
-        -------
-        np.ndarray
-            The centroids of IVF
-            with shape (num_partitions, dim)
-        """
-        # when we have more delta indices,
-        # they are with the same centroids
-        return np.array(
-            self.dataset._ds.get_index_centroids(self.stats["indices"][0]["centroids"])
-        )
 
     def read_partition(
         self, partition_id: int, *, with_vector: bool = False

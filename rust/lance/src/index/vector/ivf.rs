@@ -49,6 +49,7 @@ use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
+    utils::parse::str_is_truthy,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
 use lance_file::{
@@ -969,17 +970,18 @@ pub struct IvfIndexStatistics {
 
 /// Environment variable controlling whether vector index statistics include
 /// the centroid vectors. When unset, centroids are still included for
-/// backward compatibility, but a one-time warning is logged. Set to "false"
-/// (or "0") to omit centroids from stats; set to "true" (or "1") to keep
-/// the current behavior without the warning.
+/// backward compatibility, but a one-time warning is logged. Set to a truthy
+/// value (e.g. `1`, `true`) to keep the current behavior without the warning,
+/// or any other value (e.g. `0`, `false`) to omit centroids from stats.
 pub const LANCE_INCLUDE_VECTOR_CENTROIDS_ENV: &str = "LANCE_INCLUDE_VECTOR_CENTROIDS";
 
 /// Read the centroids for inclusion in index stats, honoring
 /// `LANCE_INCLUDE_VECTOR_CENTROIDS`.
 ///
-/// - If the env var is set to a falsy value ("false"/"0", case-insensitive),
-///   returns `Ok(None)` without reading the centroids.
-/// - If set to any other value, returns the converted centroids.
+/// - If the env var is set to a truthy value (per `str_is_truthy`), returns
+///   the converted centroids.
+/// - If the env var is set to any other value, returns `Ok(None)` without
+///   reading the centroids.
 /// - If unset, returns the converted centroids and logs a one-time
 ///   deprecation warning that the default will change in a future release.
 pub(crate) fn maybe_centroids_for_stats(
@@ -990,8 +992,7 @@ pub(crate) fn maybe_centroids_for_stats(
 
     match std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV) {
         Ok(val) => {
-            let trimmed = val.trim();
-            if trimmed == "0" || trimmed.eq_ignore_ascii_case("false") {
+            if !str_is_truthy(val.trim()) {
                 return Ok(None);
             }
         }
@@ -2737,6 +2738,7 @@ mod tests {
     fn test_maybe_centroids_for_stats_env_var() {
         let centroids = Float32Array::from(vec![1.0_f32, 2.0, 3.0, 4.0]);
         let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
+        let expected = Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
 
         // Save the original value so we can restore it afterwards.
         let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
@@ -2745,43 +2747,31 @@ mod tests {
         unsafe {
             std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV);
         }
-        let result = maybe_centroids_for_stats(&centroids).unwrap();
-        assert_eq!(result, Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]));
+        assert_eq!(maybe_centroids_for_stats(&centroids).unwrap(), expected);
 
-        // "true" → centroids included.
-        unsafe {
-            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "true");
+        // Truthy values → centroids included.
+        for truthy in ["1", "true", "TRUE", "on", "yes", "y"] {
+            unsafe {
+                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, truthy);
+            }
+            assert_eq!(
+                maybe_centroids_for_stats(&centroids).unwrap(),
+                expected,
+                "expected centroids to be included for {truthy:?}",
+            );
         }
-        let result = maybe_centroids_for_stats(&centroids).unwrap();
-        assert_eq!(result, Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]));
 
-        // "1" → centroids included.
-        unsafe {
-            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "1");
+        // Non-truthy values → centroids omitted.
+        for falsy in ["0", "false", "FALSE", "no", "off"] {
+            unsafe {
+                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, falsy);
+            }
+            assert_eq!(
+                maybe_centroids_for_stats(&centroids).unwrap(),
+                None,
+                "expected centroids to be omitted for {falsy:?}",
+            );
         }
-        let result = maybe_centroids_for_stats(&centroids).unwrap();
-        assert_eq!(result, Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]));
-
-        // "false" → centroids omitted.
-        unsafe {
-            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "false");
-        }
-        let result = maybe_centroids_for_stats(&centroids).unwrap();
-        assert_eq!(result, None);
-
-        // "FALSE" (case-insensitive) → centroids omitted.
-        unsafe {
-            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "FALSE");
-        }
-        let result = maybe_centroids_for_stats(&centroids).unwrap();
-        assert_eq!(result, None);
-
-        // "0" → centroids omitted.
-        unsafe {
-            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "0");
-        }
-        let result = maybe_centroids_for_stats(&centroids).unwrap();
-        assert_eq!(result, None);
 
         // Restore original value.
         unsafe {
