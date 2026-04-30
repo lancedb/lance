@@ -108,7 +108,7 @@ impl VectorIndexExec {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, false));
+        fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
         }

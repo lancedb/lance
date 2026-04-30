@@ -67,7 +67,7 @@ pub trait PartitionSearchControl: Send + Sync {
 
 pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::new(|| {
     arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
-        Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
+        Field::new(DIST_COL, arrow_schema::DataType::Float32, true),
         ROW_ID_FIELD.clone(),
     ]))
 });
@@ -184,7 +184,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// Schema::new(vec![
     ///   Field::new("_rowid", DataType::UInt64, true),
-    ///   Field::new("_distance", DataType::Float32, false),
+    ///   Field::new("_distance", DataType::Float32, true),
     /// ]);
     /// ```
     ///

@@ -386,7 +386,7 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
-            Field::new("_distance", DataType::Float32, false),
+            Field::new("_distance", DataType::Float32, true),
             Field::new(MEMTABLE_GEN_COLUMN, DataType::UInt64, false),
         ]))
     }
