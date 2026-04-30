@@ -118,11 +118,14 @@ pub(crate) async fn build_segment(
     Ok(built_segment)
 }
 
-/// Load all committed inverted-index segments that belong to the same named index.
-pub(crate) async fn load_segments(
-    dataset: &Dataset,
-    column: &str,
-) -> Result<Option<Vec<IndexMetadata>>> {
+/// Load all committed inverted-index segments that belong to the same named
+/// FTS index on `column`.
+///
+/// Returns `Ok(None)` if no FTS index exists on the column. When an index
+/// exists, the returned vector contains every committed segment's
+/// [`IndexMetadata`] (UUID, fragment coverage, index details). All segments
+/// must share the same indexed fields; mismatched fields return an error.
+pub async fn load_segments(dataset: &Dataset, column: &str) -> Result<Option<Vec<IndexMetadata>>> {
     let Some(index_meta) = dataset
         .load_scalar_index(
             lance_index::IndexCriteria::default()
@@ -152,8 +155,14 @@ pub(crate) async fn load_segments(
     Ok(Some(indices))
 }
 
-/// Load and validate the shared inverted-index details across committed segments.
-pub(crate) async fn load_segment_details(
+/// Load and validate the shared [`InvertedIndexDetails`] across committed
+/// segments returned by [`load_segments`].
+///
+/// All segments are required to agree on their decoded `InvertedIndexDetails`
+/// payload (analyzer, tokenizer, position settings, etc.); inconsistent
+/// segments return an error. Returns the canonical details that may be used
+/// when constructing a tokenizer or running a query against the index.
+pub async fn load_segment_details(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],

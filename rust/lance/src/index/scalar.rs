@@ -6,6 +6,8 @@
 
 pub(crate) mod inverted;
 
+pub use inverted::{load_segment_details, load_segments};
+
 use std::sync::{Arc, LazyLock};
 
 use crate::index::DatasetIndexExt;
