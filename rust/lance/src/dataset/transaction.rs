@@ -69,7 +69,8 @@ fn resolve_created_at_version(
     let Some(seq) = version_cache.get(&orig_frag.id) else {
         return UNKNOWN_CREATED_AT_VERSION;
     };
-    seq.version_at(*row_offset).unwrap_or(UNKNOWN_CREATED_AT_VERSION)
+    seq.version_at(*row_offset)
+        .unwrap_or(UNKNOWN_CREATED_AT_VERSION)
 }
 
 /// For each new fragment produced by an update, set `created_at_version_meta`
@@ -141,7 +142,11 @@ fn resolve_update_version_metadata(
         .iter()
         .filter(|f| source_frag_ids.contains(&f.id))
         .filter_map(|frag| {
-            let seq = frag.created_at_version_meta.as_ref()?.load_sequence().ok()?;
+            let seq = frag
+                .created_at_version_meta
+                .as_ref()?
+                .load_sequence()
+                .ok()?;
             Some((frag.id, seq))
         })
         .collect();
@@ -5021,9 +5026,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
             physical_rows: Some(3),
-            created_at_version_meta: Some(
-                RowDatasetVersionMeta::from_sequence(&created).unwrap(),
-            ),
+            created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
         };
 
