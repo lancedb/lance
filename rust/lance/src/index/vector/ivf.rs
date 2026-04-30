@@ -49,6 +49,7 @@ use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
+    utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
 use lance_file::{
@@ -961,9 +962,50 @@ pub struct IvfIndexStatistics {
     num_partitions: usize,
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
-    centroids: Vec<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    centroids: Option<Vec<Vec<f32>>>,
     loss: Option<f64>,
     index_file_version: IndexFileVersion,
+}
+
+/// Environment variable controlling whether vector index statistics include
+/// the centroid vectors. When unset, centroids are still included for
+/// backward compatibility, but a one-time warning is logged. Set to a truthy
+/// value (e.g. `1`, `true`) to keep the current behavior without the warning,
+/// or any other value (e.g. `0`, `false`) to omit centroids from stats.
+pub const LANCE_INCLUDE_VECTOR_CENTROIDS_ENV: &str = "LANCE_INCLUDE_VECTOR_CENTROIDS";
+
+/// Read the centroids for inclusion in index stats, honoring
+/// `LANCE_INCLUDE_VECTOR_CENTROIDS`.
+///
+/// - If the env var is set to a truthy value (per `parse_env_as_bool`),
+///   returns the converted centroids.
+/// - If the env var is set to any other value, returns `Ok(None)` without
+///   reading the centroids.
+/// - If unset, returns the converted centroids and logs a one-time
+///   deprecation warning that the default will change in a future release.
+pub(crate) fn maybe_centroids_for_stats(
+    centroids: &FixedSizeListArray,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+
+    if std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).is_err() {
+        WARN_ONCE.call_once(|| {
+            warn!(
+                "Vector index statistics currently include centroids, which can use \
+                 significant memory for large indexes. In a future release, centroids \
+                 will be excluded from statistics by default. Set {}=true to preserve \
+                 the current behavior (and silence this warning), or {}=false to opt \
+                 in to the new behavior now.",
+                LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, LANCE_INCLUDE_VECTOR_CENTROIDS_ENV
+            );
+        });
+    }
+    if !parse_env_as_bool(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, true) {
+        return Ok(None);
+    }
+    Ok(Some(centroids_to_vectors(centroids)?))
 }
 
 fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
@@ -1056,7 +1098,7 @@ impl Index for IVFIndex {
             })
             .collect::<Vec<_>>();
 
-        let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
+        let centroid_vecs = maybe_centroids_for_stats(self.ivf.centroids.as_ref().unwrap())?;
 
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: self.index_type().to_string(),
@@ -2683,6 +2725,93 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    // Verifies LANCE_INCLUDE_VECTOR_CENTROIDS env var is honored by
+    // maybe_centroids_for_stats. The env var is process-global, so this test
+    // is serialized against any other test that touches the same key.
+    #[test]
+    #[serial_test::serial(LANCE_INCLUDE_VECTOR_CENTROIDS)]
+    fn test_maybe_centroids_for_stats_env_var() {
+        let centroids = Float32Array::from(vec![1.0_f32, 2.0, 3.0, 4.0]);
+        let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
+        let expected = Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+
+        // Save the original value so we can restore it afterwards.
+        let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
+
+        // Unset → centroids included (with one-time warning).
+        unsafe {
+            std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV);
+        }
+        assert_eq!(maybe_centroids_for_stats(&centroids).unwrap(), expected);
+
+        // Truthy values → centroids included.
+        for truthy in ["1", "true", "TRUE", "on", "yes", "y"] {
+            unsafe {
+                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, truthy);
+            }
+            assert_eq!(
+                maybe_centroids_for_stats(&centroids).unwrap(),
+                expected,
+                "expected centroids to be included for {truthy:?}",
+            );
+        }
+
+        // Non-truthy values → centroids omitted.
+        for falsy in ["0", "false", "FALSE", "no", "off"] {
+            unsafe {
+                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, falsy);
+            }
+            assert_eq!(
+                maybe_centroids_for_stats(&centroids).unwrap(),
+                None,
+                "expected centroids to be omitted for {falsy:?}",
+            );
+        }
+
+        // Restore original value.
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, v),
+                None => std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV),
+            }
+        }
+    }
+
+    // Verifies that when centroids are omitted via the env var, the
+    // serialized stats JSON does not contain the `centroids` field at all
+    // (instead of an explicit null), since downstream code distinguishes
+    // missing from null.
+    #[test]
+    #[serial_test::serial(LANCE_INCLUDE_VECTOR_CENTROIDS)]
+    fn test_stats_centroids_omitted_when_disabled() {
+        let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
+
+        unsafe {
+            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "false");
+        }
+        let stats = IvfIndexStatistics {
+            index_type: "IVF_PQ".to_string(),
+            uuid: "uuid".to_string(),
+            uri: "uri".to_string(),
+            metric_type: "l2".to_string(),
+            num_partitions: 0,
+            sub_index: serde_json::Value::Null,
+            partitions: vec![],
+            centroids: None,
+            loss: None,
+            index_file_version: IndexFileVersion::V3,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(json.get("centroids").is_none());
+
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, v),
+                None => std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV),
+            }
+        }
+    }
 
     /// This goal of this function is to generate data that behaves in a very deterministic way so that
     /// we can evaluate the correctness of an IVF_PQ implementation.  Currently it is restricted to the

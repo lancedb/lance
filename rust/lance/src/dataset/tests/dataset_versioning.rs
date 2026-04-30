@@ -19,6 +19,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use mock_instant::thread_local::MockClock;
 
 use crate::dataset::refs::branch_contents_path;
 use futures::TryStreamExt;
@@ -324,7 +325,12 @@ async fn test_tag(
         "Ref not found error: tag tag1 does not exist"
     );
 
+    MockClock::set_system_time(std::time::Duration::from_secs(1));
     dataset.tags().create("tag1", 1).await.unwrap();
+    let mut tag_map = dataset.tags().list().await.unwrap();
+    let tag1_meta = tag_map.remove("tag1").unwrap();
+    assert_eq!(tag1_meta.created_at, tag1_meta.updated_at);
+    assert!(tag1_meta.created_at.is_some());
 
     assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
 
@@ -405,11 +411,24 @@ async fn test_tag(
         "Version not found error: version main:3 does not exist"
     );
 
+    let tag1_before_update = dataset.tags().get("tag1").await.unwrap();
+    MockClock::set_system_time(std::time::Duration::from_secs(2));
     dataset.tags().update("tag1", 2).await.unwrap();
+    let tag1_after_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(tag1_after_update.created_at, tag1_before_update.created_at);
+    assert!(tag1_after_update.updated_at > tag1_before_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 2);
 
+    let tag1_before_second_update = dataset.tags().get("tag1").await.unwrap();
+    MockClock::set_system_time(std::time::Duration::from_secs(3));
     dataset.tags().update("tag1", 1).await.unwrap();
+    let tag1_after_second_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(
+        tag1_after_second_update.created_at,
+        tag1_before_second_update.created_at
+    );
+    assert!(tag1_after_second_update.updated_at > tag1_before_second_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
 }

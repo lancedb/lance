@@ -2959,6 +2959,15 @@ impl Dataset {
                 )
                 .await
             }
+            IndexType::Bitmap => {
+                lance_index::scalar::bitmap::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                    progress,
+                )
+                .await
+            }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \
@@ -3235,9 +3244,13 @@ pub(crate) async fn write_manifest_file(
     mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
+        // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
+        // Preserve it here so this second apply_feature_flags call does not clear it
+        // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
+        let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
         apply_feature_flags(
             manifest,
-            config.use_stable_row_ids,
+            use_stable_row_ids,
             config.disable_transaction_file,
         )?;
     }

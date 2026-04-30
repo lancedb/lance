@@ -11,7 +11,7 @@
 //! metadata. Use [read_row_ids] and [write_row_ids] to read and write these
 //! sequences. The on-disk format is designed to align well with the in-memory
 //! representation, to avoid unnecessary deserialization.
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
@@ -116,6 +116,29 @@ impl RowIdSequence {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Returns the bounding range `[min, max]` across all row IDs in this sequence,
+    /// or `None` if the sequence contains no values.
+    ///
+    /// This is a conservative bounding box: a value falling within the returned range
+    /// is not guaranteed to exist in the sequence (segments may be sparse), but any
+    /// value that *does* exist is guaranteed to fall within the range.  This makes
+    /// the result suitable as a cheap pre-filter before a full scan.
+    pub fn row_id_range(&self) -> Option<RangeInclusive<u64>> {
+        let min = self
+            .0
+            .iter()
+            .filter_map(|s| s.range())
+            .map(|r| *r.start())
+            .min()?;
+        let max = self
+            .0
+            .iter()
+            .filter_map(|s| s.range())
+            .map(|r| *r.end())
+            .max()?;
+        Some(min..=max)
     }
 
     /// Combines this row id sequence with another row id sequence.
@@ -1306,5 +1329,36 @@ mod test {
 
         let elements: Vec<u64> = result[0].iter().collect();
         assert_eq!(elements, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_row_id_range_empty() {
+        let seq = RowIdSequence::from(0u64..0);
+        assert_eq!(seq.row_id_range(), None);
+    }
+
+    #[test]
+    fn test_row_id_range_single_contiguous() {
+        let seq = RowIdSequence::from(10u64..20);
+        assert_eq!(seq.row_id_range(), Some(10..=19));
+    }
+
+    #[test]
+    fn test_row_id_range_unsorted_array() {
+        // Array variant: range() returns min..=max as bounding box
+        let seq = RowIdSequence::from([50u64, 10, 30].as_slice());
+        let r = seq.row_id_range().unwrap();
+        assert!(*r.start() <= 10);
+        assert!(*r.end() >= 50);
+    }
+
+    #[test]
+    fn test_row_id_range_multi_segment() {
+        // Two disjoint ranges; bounding box should span both
+        let mut seq = RowIdSequence::from(0u64..5);
+        seq.extend(RowIdSequence::from(100u64..105));
+        let r = seq.row_id_range().unwrap();
+        assert_eq!(*r.start(), 0);
+        assert_eq!(*r.end(), 104);
     }
 }

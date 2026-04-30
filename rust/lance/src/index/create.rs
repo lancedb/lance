@@ -789,6 +789,7 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
+    use serde_json::json;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -1391,6 +1392,153 @@ mod tests {
             !merge_tags.iter().any(|e| e == "start:merge_lookups"),
             "fragment-based distributed BTREE merge should not use merge_lookups"
         );
+    }
+
+    #[tokio::test]
+    async fn test_distributed_build_bitmap() {
+        use datafusion::common::ScalarValue;
+        use lance_core::utils::mask::RowSetOps;
+        use lance_index::scalar::{SargableQuery, SearchResult, bitmap::BITMAP_LOOKUP_NAME};
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "category",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = (0..4)
+            .map(
+                |fragment_id| -> std::result::Result<_, arrow_schema::ArrowError> {
+                    let values = vec![fragment_id, fragment_id, fragment_id + 10, fragment_id + 10];
+                    Ok(RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(values))],
+                    )
+                    .unwrap())
+                },
+            )
+            .collect::<Vec<_>>();
+        let reader = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let base_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let fragments = dataset.get_fragments();
+        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+        let mut shard_metadata = None;
+        let shard_groups = fragment_ids.chunks(2).collect::<Vec<_>>();
+
+        for (shard_id, fragment_group) in shard_groups.iter().enumerate() {
+            let params = base_params
+                .clone()
+                .with_params(&json!({ "shard_id": shard_id as u32 }));
+            let index_metadata =
+                CreateIndexBuilder::new(&mut dataset, &["category"], IndexType::Bitmap, &params)
+                    .name("distributed_bitmap".to_string())
+                    .fragments(fragment_group.to_vec())
+                    .index_uuid(shared_uuid.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            if shard_metadata.is_none() {
+                shard_metadata = Some(index_metadata);
+            }
+        }
+
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::Bitmap,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+
+        let mut committed_index_metadata = shard_metadata.unwrap();
+        committed_index_metadata.fragment_bitmap = Some(fragment_ids.iter().copied().collect());
+        committed_index_metadata.files = Some(
+            list_index_files_with_sizes(
+                dataset.object_store(),
+                &dataset.indices_dir().child(shared_uuid.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        committed_index_metadata.dataset_version = dataset.manifest.version;
+
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![committed_index_metadata],
+                removed_indices: vec![],
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&dataset_uri).await.unwrap();
+        let indices = dataset
+            .load_indices_by_name("distributed_bitmap")
+            .await
+            .unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            fragment_ids
+        );
+
+        let files = index.files.as_ref().unwrap();
+        assert!(files.iter().any(|file| file.path == BITMAP_LOOKUP_NAME));
+        assert!(
+            files.iter().all(|file| !file.path.starts_with("part_")),
+            "committed bitmap index should only reference merged files"
+        );
+
+        let scalar_index = crate::index::scalar::open_scalar_index(
+            &dataset,
+            "category",
+            index,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scalar_index.index_type(), IndexType::Bitmap);
+
+        let query_result = scalar_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(2))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let SearchResult::Exact(query_rows) = query_result else {
+            panic!("expected exact bitmap result");
+        };
+        assert_eq!(query_rows.true_rows().len(), Some(2));
     }
 
     #[tokio::test]

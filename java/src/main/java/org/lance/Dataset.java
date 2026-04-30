@@ -1811,6 +1811,15 @@ public class Dataset implements Closeable {
       }
     }
 
+    public void replaceMetadata(String tag, Map<String, String> metadata) {
+      Preconditions.checkArgument(tag != null, "tag cannot be null");
+      Preconditions.checkArgument(metadata != null, "metadata cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeReplaceTagMetadata(tag, metadata);
+      }
+    }
+
     /**
      * List all tags of the dataset.
      *
@@ -1861,6 +1870,15 @@ public class Dataset implements Closeable {
       try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         return nativeListBranches();
+      }
+    }
+
+    public void replaceMetadata(String branchName, Map<String, String> metadata) {
+      Preconditions.checkArgument(branchName != null, "branchName cannot be null");
+      Preconditions.checkArgument(metadata != null, "metadata cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeReplaceBranchMetadata(branchName, metadata);
       }
     }
   }
@@ -1948,6 +1966,8 @@ public class Dataset implements Closeable {
 
   private native void nativeUpdateTag(String tag, Ref ref);
 
+  private native void nativeReplaceTagMetadata(String tag, Map<String, String> metadata);
+
   private native List<Tag> nativeListTags();
 
   private native long nativeGetVersionByTag(String tag);
@@ -1961,6 +1981,8 @@ public class Dataset implements Closeable {
   private native void nativeDeleteBranch(String branch);
 
   private native List<Branch> nativeListBranches();
+
+  private native void nativeReplaceBranchMetadata(String branch, Map<String, String> metadata);
 
   public Dataset shallowClone(String targetPath, Ref ref) {
     return shallowClone(targetPath, ref, null);

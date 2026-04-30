@@ -323,14 +323,24 @@ impl FragReuseIndex {
 
                 if removed > 0 {
                     if removed != group.old_frags.len() {
-                        // This should never happen because we always commit a full rewrite group
-                        // and we always reindex either the entire group or nothing.
-                        // We use invalid input to be consistent with
-                        // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(format!(
-                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                            group.old_frags
-                        )));
+                        // Straddle: the index covered only part of this rewrite
+                        // group. Caused by the bug fixed in
+                        // <https://github.com/lance-format/lance/pull/6610>.
+                        // We've already removed the indexed old_frags from the
+                        // bitmap above; deliberately do NOT insert new_frags,
+                        // since the merged fragment also contains rows that
+                        // were never indexed. Affected rows fall through to
+                        // flat scan until the next optimize_indices. The fix
+                        // is persisted on the next write via build_manifest.
+                        tracing::warn!(
+                            "Healing straddling fragment-reuse rewrite group in index bitmap: \
+                             group {:?} was only partially indexed ({} of {} old fragments). \
+                             Affected rows will use flat scan until the next optimize_indices.",
+                            group.old_frags,
+                            removed,
+                            group.old_frags.len(),
+                        );
+                        continue;
                     }
 
                     for new_frag in group.new_frags.iter() {

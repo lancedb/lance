@@ -7138,4 +7138,68 @@ mod tests {
         assert_eq!(desc.index_type(), "IVF_FLAT");
         assert!(!desc.field_ids().is_empty());
     }
+
+    /// FRI-straddle corruption (PR #6610) used to panic in `load_indices`.
+    /// The fixture is a pre-#6610 dataset where a user index's
+    /// `fragment_bitmap` only partially covers a rewrite group. After the
+    /// tolerant-load fix `load_indices` returns Ok; affected old-frag IDs
+    /// are dropped, no new-frag IDs are inserted, and `validate()` succeeds.
+    #[tokio::test]
+    async fn test_load_indices_tolerates_fri_straddle() {
+        let tmp = copy_test_data_to_tmp("fri_straddle_pre_6610/fri_straddle_dataset").unwrap();
+        let uri = format!("file://{}", tmp.std_path().display());
+        let dataset = Dataset::open(&uri).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(!indices.is_empty());
+        dataset.validate().await.unwrap();
+    }
+
+    /// Any commit reseeds indices via `load_indices` → `build_manifest`,
+    /// so a single no-op write persists the cleaned bitmap to disk.
+    #[tokio::test]
+    async fn test_auto_heal_persists_cleaned_bitmap() {
+        use lance_table::io::manifest::read_manifest_indexes;
+
+        let tmp = copy_test_data_to_tmp("fri_straddle_pre_6610/fri_straddle_dataset").unwrap();
+        let uri = format!("file://{}", tmp.std_path().display());
+
+        // Sanity: the on-disk fixture has at least one straddling segment.
+        let pre = Dataset::open(&uri).await.unwrap();
+        let raw_pre =
+            read_manifest_indexes(&pre.object_store, &pre.manifest_location, &pre.manifest)
+                .await
+                .unwrap();
+        let cleaned = pre.load_indices().await.unwrap();
+        let any_changed = raw_pre
+            .iter()
+            .zip(cleaned.iter())
+            .any(|(r, c)| r.fragment_bitmap != c.fragment_bitmap);
+        assert!(
+            any_changed,
+            "fixture should have at least one segment whose bitmap is cleaned at load"
+        );
+        drop(pre);
+
+        // No-op delete commits a fresh manifest seeded from cleaned indices.
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset.delete("false").await.unwrap();
+
+        // Reopen and read raw manifest indices: cleaned bitmaps now persisted.
+        let healed = Dataset::open(&uri).await.unwrap();
+        let raw_post = read_manifest_indexes(
+            &healed.object_store,
+            &healed.manifest_location,
+            &healed.manifest,
+        )
+        .await
+        .unwrap();
+        let cleaned_post = healed.load_indices().await.unwrap();
+        for (r, c) in raw_post.iter().zip(cleaned_post.iter()) {
+            assert_eq!(
+                r.fragment_bitmap, c.fragment_bitmap,
+                "after auto-heal, raw on-disk bitmap should match cleaned bitmap"
+            );
+        }
+    }
 }

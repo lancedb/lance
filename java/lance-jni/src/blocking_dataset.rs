@@ -10,7 +10,7 @@ use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
-    get_scalar_index_params, get_vector_index_params, to_rust_map,
+    get_scalar_index_params, get_vector_index_params, to_java_map, to_rust_map,
 };
 use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
@@ -310,6 +310,24 @@ impl BlockingDataset {
 
     pub fn update_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
         RT.block_on(self.inner.tags().update(tag, reference))?;
+        Ok(())
+    }
+
+    pub fn replace_tag_metadata(
+        &mut self,
+        tag: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.tags().replace_metadata(tag, metadata))?;
+        Ok(())
+    }
+
+    pub fn replace_branch_metadata(
+        &mut self,
+        branch: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.branches().replace_metadata(branch, metadata))?;
         Ok(())
     }
 
@@ -2454,6 +2472,26 @@ fn inner_add_columns_by_schema(
 //////////////////////////////
 // Tag operation Methods    //
 //////////////////////////////
+fn optional_datetime_to_java_instant<'local>(
+    env: &mut JNIEnv<'local>,
+    timestamp: Option<&DateTime<Utc>>,
+) -> Result<JObject<'local>> {
+    if let Some(timestamp) = timestamp {
+        let seconds = timestamp.timestamp();
+        let nanos = timestamp.timestamp_subsec_nanos() as i64;
+        Ok(env
+            .call_static_method(
+                "java/time/Instant",
+                "ofEpochSecond",
+                "(JJ)Ljava/time/Instant;",
+                &[JValue::Long(seconds), JValue::Long(nanos)],
+            )?
+            .l()?)
+    } else {
+        Ok(JObject::null())
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeListTags<'local>(
     mut env: JNIEnv<'local>,
@@ -2466,27 +2504,34 @@ fn inner_list_tags<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
-    let tag_map = {
+    let mut tags: Vec<_> = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_tags()?
+        dataset_guard.list_tags()?.into_iter().collect()
     };
+    tags.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
-    for (tag_name, tag_contents) in tag_map {
+    for (tag_name, tag_contents) in tags {
         let branch_name: JObject = if let Some(branch_name) = tag_contents.branch.as_ref() {
             env.new_string(branch_name)?.into()
         } else {
             JObject::null()
         };
+        let created_at = optional_datetime_to_java_instant(env, tag_contents.created_at.as_ref())?;
+        let updated_at = optional_datetime_to_java_instant(env, tag_contents.updated_at.as_ref())?;
+        let java_metadata = to_java_map(env, &tag_contents.metadata)?;
         let java_tag = env.new_object(
             "org/lance/Tag",
-            "(Ljava/lang/String;Ljava/lang/String;JI)V",
+            "(Ljava/lang/String;Ljava/lang/String;JILjava/time/Instant;Ljava/time/Instant;Ljava/util/Map;)V",
             &[
                 JValue::Object(&env.new_string(tag_name)?.into()),
                 JValue::Object(&branch_name),
                 JValue::Long(tag_contents.version as i64),
                 JValue::Int(tag_contents.manifest_size as i32),
+                JValue::Object(&created_at),
+                JValue::Object(&updated_at),
+                JValue::Object(&java_metadata),
             ],
         )?;
         env.call_method(
@@ -2569,6 +2614,32 @@ fn inner_update_tag(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeReplaceTagMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jmetadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_tag_metadata(&mut env, java_dataset, jtag_name, jmetadata)
+    )
+}
+
+fn inner_replace_tag_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jtag_name: JString,
+    jmetadata: JObject,
+) -> Result<()> {
+    let tag = jtag_name.extract(env)?;
+    let metadata = extract_metadata_map(env, &jmetadata)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_tag_metadata(tag.as_str(), metadata)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionByTag(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -2607,11 +2678,12 @@ fn inner_list_branches<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
-    let branches = {
+    let mut branches: Vec<_> = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_branches()?
+        dataset_guard.list_branches()?.into_iter().collect()
     };
+    branches.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
     for (name, contents) in branches {
@@ -2640,9 +2712,10 @@ fn inner_list_branches<'local>(
                 &[JValue::Object(&jmapping)],
             )?;
         }
+        let java_metadata = to_java_map(env, &contents.metadata)?;
         let jbranch = env.new_object(
             "org/lance/Branch",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;JJI)V",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/util/List;JJILjava/util/Map;)V",
             &[
                 JValue::Object(&jname),
                 JValue::Object(&jparent),
@@ -2650,6 +2723,7 @@ fn inner_list_branches<'local>(
                 JValue::Long(contents.parent_version as i64),
                 JValue::Long(contents.create_at as i64),
                 JValue::Int(contents.manifest_size as i32),
+                JValue::Object(&java_metadata),
             ],
         )?;
         env.call_method(
@@ -2698,6 +2772,37 @@ fn inner_create_branch<'local>(
         BlockingDataset { inner }
     };
     new_blocking_dataset.into_java(env)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeReplaceBranchMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jbranch: JString,
+    jmetadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_branch_metadata(&mut env, java_dataset, jbranch, jmetadata)
+    )
+}
+
+fn inner_replace_branch_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jbranch: JString,
+    jmetadata: JObject,
+) -> Result<()> {
+    let branch: String = jbranch.extract(env)?;
+    let metadata = extract_metadata_map(env, &jmetadata)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.replace_branch_metadata(&branch, metadata)
+}
+
+fn extract_metadata_map(env: &mut JNIEnv, jmetadata: &JObject) -> Result<HashMap<String, String>> {
+    let jmap = JMap::from_env(env, jmetadata)?;
+    to_rust_map(env, &jmap)
 }
 
 fn transform_jref_to_ref(jref: JObject, env: &mut JNIEnv) -> Result<Ref> {

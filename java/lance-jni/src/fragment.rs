@@ -8,12 +8,15 @@ use arrow_schema::DataType;
 use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
     JNIEnv,
-    objects::{JObject, JString},
-    sys::{jint, jlong},
+    objects::{JClass, JLongArray, JObject, JString},
+    sys::{jint, jlong, jstring},
 };
 use lance::datatypes::Schema;
-use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
+use lance::table::format::{
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+};
 use lance_io::utils::CachedFileSize;
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
@@ -496,6 +499,32 @@ fn inner_update_column<'local>(
     result.into_java(env)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_RowIdMeta_nativeEncodeRowIds(
+    mut env: JNIEnv,
+    _cls: JClass,
+    row_ids: JLongArray,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        inner_encode_row_ids(&mut env, &row_ids)
+            .and_then(|json| env.new_string(json).map_err(Error::from)),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String> {
+    let len = env.get_array_length(row_ids)?;
+    let mut buf: Vec<i64> = vec![0; len as usize];
+    env.get_long_array_region(row_ids, 0, buf.as_mut_slice())?;
+    let ids: Vec<u64> = buf.into_iter().map(|x| x as u64).collect();
+    let seq = RowIdSequence::from(ids.as_slice());
+    let meta = RowIdMeta::Inline(write_row_ids(&seq));
+    let json = serde_json::to_string(&meta)?;
+    Ok(json)
+}
+
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
@@ -504,9 +533,11 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
+const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
+const VERSION_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResult";
 const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/FragmentMetadata;Lorg/lance/schema/LanceSchema;)V";
@@ -621,6 +652,18 @@ impl IntoJava for &RowIdMeta {
     }
 }
 
+impl IntoJava for &RowDatasetVersionMeta {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let json_str = serde_json::to_string(self)?;
+        let json = env.new_string(json_str)?.into();
+        Ok(env.new_object(
+            VERSION_META_CLASS,
+            VERSION_META_CONSTRUCTOR_SIG,
+            &[JValueGen::Object(&json)],
+        )?)
+    }
+}
+
 impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let files = self.files.clone();
@@ -634,6 +677,14 @@ impl IntoJava for &Fragment {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
+        let created_at = match &self.created_at_version_meta {
+            Some(m) => m.into_java(env)?,
+            None => JObject::null(),
+        };
+        let last_updated_at = match &self.last_updated_at_version_meta {
+            Some(m) => m.into_java(env)?,
+            None => JObject::null(),
+        };
 
         env.new_object(
             FRAGMENT_METADATA_CLASS,
@@ -644,6 +695,8 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(physical_rows),
                 JValueGen::Object(&deletion_file),
                 JValueGen::Object(&row_id_meta),
+                JValueGen::Object(&created_at),
+                JValueGen::Object(&last_updated_at),
             ],
         )
         .map_err(|e| {
@@ -663,6 +716,38 @@ impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
     }
 }
 
+impl FromJObjectWithEnv<RowDatasetVersionMeta> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<RowDatasetVersionMeta> {
+        let metadata = env
+            .call_method(self, "getMetadata", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let s: String = env.get_string(&JString::from(metadata))?.into();
+        let meta: RowDatasetVersionMeta = serde_json::from_str(&s)?;
+        Ok(meta)
+    }
+}
+
+/// Extract an optional field from a Java object by calling a getter method.
+/// Returns `None` if the getter returns null, otherwise deserializes the JObject.
+fn extract_nullable_field<T>(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method: &str,
+    class: &str,
+) -> Result<Option<T>>
+where
+    for<'a> JObject<'a>: FromJObjectWithEnv<T>,
+{
+    let result = env
+        .call_method(obj, method, format!("()L{};", class), &[])?
+        .l()?;
+    if result.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(result.extract_object(env)?))
+    }
+}
+
 impl FromJObjectWithEnv<Fragment> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Fragment> {
         let id = env.call_method(self, "getId", "()I", &[])?.i()? as u64;
@@ -675,41 +760,23 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         for f in file_objs {
             files.push(f.extract_object(env)?);
         }
-        let deletion_file = env
-            .call_method(
-                self,
-                "getDeletionFile",
-                format!("()L{};", DELETE_FILE_CLASS),
-                &[],
-            )?
-            .l()?;
-        let deletion_file = if deletion_file.is_null() {
-            None
-        } else {
-            Some(deletion_file.extract_object(env)?)
-        };
 
-        let row_id_meta = env
-            .call_method(
-                self,
-                "getRowIdMeta",
-                format!("()L{};", ROW_ID_META_CLASS),
-                &[],
-            )?
-            .l()?;
-        let row_id_meta = if row_id_meta.is_null() {
-            None
-        } else {
-            Some(row_id_meta.extract_object(env)?)
-        };
+        let deletion_file =
+            extract_nullable_field(env, self, "getDeletionFile", DELETE_FILE_CLASS)?;
+        let row_id_meta = extract_nullable_field(env, self, "getRowIdMeta", ROW_ID_META_CLASS)?;
+        let created_at_version_meta =
+            extract_nullable_field(env, self, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
+        let last_updated_at_version_meta =
+            extract_nullable_field(env, self, "getLastUpdatedAtVersionMeta", VERSION_META_CLASS)?;
+
         Ok(Fragment {
             id,
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
             row_id_meta,
-            created_at_version_meta: None,
-            last_updated_at_version_meta: None,
+            created_at_version_meta,
+            last_updated_at_version_meta,
         })
     }
 }

@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
@@ -221,7 +223,10 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference).await?;
+        let now = utc_now();
+        let tag_contents = self
+            .build_tag_content_by_ref(reference, Some(now), Some(now))
+            .await?;
 
         self.object_store()
             .put(
@@ -257,7 +262,15 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference).await?;
+        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let updated_reference = self
+            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
+            .await?;
+        tag_contents.branch = updated_reference.branch;
+        tag_contents.version = updated_reference.version;
+        tag_contents.created_at = updated_reference.created_at;
+        tag_contents.updated_at = updated_reference.updated_at;
+        tag_contents.manifest_size = updated_reference.manifest_size;
 
         self.object_store()
             .put(
@@ -268,7 +281,39 @@ impl Tags<'_> {
             .map(|_| ())
     }
 
-    async fn build_tag_content_by_ref(&self, reference: impl Into<Ref>) -> Result<TagContents> {
+    pub async fn replace_metadata(
+        &self,
+        tag: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        check_valid_tag(tag)?;
+
+        let root_location = self.refs.root()?;
+        let tag_file = tag_path(&root_location.path, tag);
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        tag_contents.metadata = metadata;
+
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn build_tag_content_by_ref(
+        &self,
+        reference: impl Into<Ref>,
+        created_at: Option<DateTime<Utc>>,
+        updated_at: Option<DateTime<Utc>>,
+    ) -> Result<TagContents> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
             Version(branch, version_number) => (branch, version_number),
@@ -313,7 +358,10 @@ impl Tags<'_> {
         let tag_contents = TagContents {
             branch,
             version: manifest_file.version,
+            created_at,
+            updated_at,
             manifest_size,
+            metadata: HashMap::new(),
         };
         Ok(tag_contents)
     }
@@ -455,7 +503,36 @@ impl Branches<'_> {
             } else {
                 self.object_store().size(&manifest_file.path).await? as usize
             },
+            metadata: HashMap::new(),
         };
+
+        self.object_store()
+            .put(
+                &branch_file,
+                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn replace_metadata(
+        &self,
+        branch: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        check_valid_branch(branch)?;
+
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch);
+        if !self.object_store().exists(&branch_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("branch {} does not exist", branch),
+            });
+        }
+
+        let mut branch_contents =
+            BranchContents::from_path(&branch_file, self.object_store()).await?;
+        branch_contents.metadata = metadata;
 
         self.object_store()
             .put(
@@ -654,7 +731,16 @@ impl<'a> BranchRelativePath<'a> {
 pub struct TagContents {
     pub branch: Option<String>,
     pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     pub manifest_size: usize,
+    /// Metadata associated with this tag.
+    ///
+    /// Missing metadata is deserialized as an empty map.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,6 +752,11 @@ pub struct BranchContents {
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
     pub manifest_size: usize,
+    /// Metadata associated with this branch.
+    ///
+    /// Missing metadata is deserialized as an empty map.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1073,6 +1164,7 @@ mod tests {
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
+            metadata: HashMap::from([("description".to_string(), "production branch".to_string())]),
         };
 
         // Test serialization
@@ -1081,6 +1173,7 @@ mod tests {
         assert!(json.contains("parentVersion"));
         assert!(json.contains("createAt"));
         assert!(json.contains("manifestSize"));
+        assert!(json.contains("metadata"));
 
         // Test deserialization
         let deserialized: BranchContents = serde_json::from_str(&json).unwrap();
@@ -1088,6 +1181,12 @@ mod tests {
         assert_eq!(deserialized.parent_version, branch_contents.parent_version);
         assert_eq!(deserialized.create_at, branch_contents.create_at);
         assert_eq!(deserialized.manifest_size, branch_contents.manifest_size);
+        assert_eq!(deserialized.metadata, branch_contents.metadata);
+
+        // Backward compatibility: older serialized content does not include metadata.
+        let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
+        let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy_deserialized.metadata.is_empty());
     }
 
     #[tokio::test]
@@ -1095,20 +1194,59 @@ mod tests {
         let tag_contents = TagContents {
             branch: Some("feature".to_string()),
             version: 10,
+            created_at: Some(chrono::DateTime::from_timestamp(1_234_567_000, 456_000_000).unwrap()),
+            updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
             manifest_size: 2048,
+            metadata: HashMap::from([("channel".to_string(), "release".to_string())]),
         };
 
         // Test serialization
         let json = serde_json::to_string(&tag_contents).unwrap();
         assert!(json.contains("branch"));
         assert!(json.contains("version"));
+        assert!(json.contains("createdAt"));
+        assert!(json.contains("updatedAt"));
         assert!(json.contains("manifestSize"));
+        assert!(json.contains("metadata"));
 
         // Test deserialization
         let deserialized: TagContents = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
+        assert_eq!(deserialized.created_at, tag_contents.created_at);
+        assert_eq!(deserialized.updated_at, tag_contents.updated_at);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
+        assert_eq!(deserialized.metadata, tag_contents.metadata);
+
+        let tag_contents_without_created_at = TagContents {
+            branch: Some("feature".to_string()),
+            version: 10,
+            created_at: None,
+            updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
+            manifest_size: 2048,
+            metadata: HashMap::new(),
+        };
+        let json_without_created_at =
+            serde_json::to_string(&tag_contents_without_created_at).unwrap();
+        assert!(!json_without_created_at.contains("createdAt"));
+        assert!(json_without_created_at.contains("updatedAt"));
+
+        // Backward compatibility: older serialized content does not include timestamps or metadata.
+        let legacy_json = r#"{"branch":"feature","version":10,"manifestSize":2048}"#;
+        let legacy_deserialized: TagContents = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_deserialized.created_at, None);
+        assert_eq!(legacy_deserialized.updated_at, None);
+        assert!(legacy_deserialized.metadata.is_empty());
+
+        let legacy_updated_only_json = r#"{"branch":"feature","version":10,"updatedAt":"2009-02-13T23:31:30.123Z","manifestSize":2048}"#;
+        let legacy_updated_only_deserialized: TagContents =
+            serde_json::from_str(legacy_updated_only_json).unwrap();
+        assert_eq!(legacy_updated_only_deserialized.created_at, None);
+        assert_eq!(
+            legacy_updated_only_deserialized.updated_at,
+            Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap())
+        );
+        assert!(legacy_updated_only_deserialized.metadata.is_empty());
     }
 
     #[rstest]
@@ -1191,6 +1329,7 @@ mod tests {
                 parent_version: parent_ver,
                 create_at: 0,
                 manifest_size: 1,
+                metadata: HashMap::new(),
             }
         }
         let mut contents = HashMap::new();
