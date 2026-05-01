@@ -4758,6 +4758,7 @@ dependencies = [
  "arrow-select",
  "async-trait",
  "bytes",
+ "criterion",
  "futures",
  "lance",
  "lance-arrow",

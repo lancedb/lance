@@ -33,7 +33,12 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+criterion.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "queue_write"
+harness = false
