@@ -189,11 +189,18 @@ async fn write_segment(
     })
 }
 
+/// Sentinel byte placed between documents in text-level (byte) SA indices.
+/// Prevents cross-document boundary matches. 0x00 cannot appear in valid
+/// UTF-8 text, so it's safe to use as a separator.
+const TEXT_SEPARATOR_BYTE: u8 = 0x00;
+
 /// Extract text bytes from a column array, appending to `out`.
 /// Also records the cumulative byte offset after each document in `doc_offsets`.
 /// When `case_insensitive` is true, text is lowercased before appending.
 /// For list<int16/int32> columns, each element's tokens are serialized as
 /// fixed-width little-endian integers with a separator token between documents.
+/// A sentinel byte (0x00) is inserted between text documents to prevent
+/// cross-document boundary matches.
 /// Returns the number of non-null rows processed.
 fn extract_bytes(
     col: &dyn arrow_array::Array,
@@ -215,6 +222,7 @@ fn extract_bytes(
                     } else {
                         out.extend_from_slice(arr.value(i).as_bytes());
                     }
+                    out.push(TEXT_SEPARATOR_BYTE);
                     doc_offsets.push(out.len() as u64);
                     docs += 1;
                 }
@@ -231,6 +239,7 @@ fn extract_bytes(
                     } else {
                         out.extend_from_slice(arr.value(i).as_bytes());
                     }
+                    out.push(TEXT_SEPARATOR_BYTE);
                     doc_offsets.push(out.len() as u64);
                     docs += 1;
                 }
@@ -243,6 +252,7 @@ fn extract_bytes(
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
                     out.extend_from_slice(arr.value(i));
+                    out.push(TEXT_SEPARATOR_BYTE);
                     doc_offsets.push(out.len() as u64);
                     docs += 1;
                 }
@@ -255,6 +265,7 @@ fn extract_bytes(
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
                     out.extend_from_slice(arr.value(i));
+                    out.push(TEXT_SEPARATOR_BYTE);
                     doc_offsets.push(out.len() as u64);
                     docs += 1;
                 }
