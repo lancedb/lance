@@ -1396,16 +1396,24 @@ impl Operation {
         match (self, other) {
             (
                 Self::UpdateConfig {
+                    table_metadata_updates,
                     schema_metadata_updates,
                     field_metadata_updates,
                     ..
                 },
                 Self::UpdateConfig {
+                    table_metadata_updates: other_table_metadata,
                     schema_metadata_updates: other_schema_metadata,
                     field_metadata_updates: other_field_metadata,
                     ..
                 },
             ) => {
+                if Self::update_maps_conflict(
+                    table_metadata_updates.as_ref(),
+                    other_table_metadata.as_ref(),
+                ) {
+                    return true;
+                }
                 if schema_metadata_updates.is_some() && other_schema_metadata.is_some() {
                     return true;
                 }
@@ -1420,6 +1428,24 @@ impl Operation {
             }
             _ => false,
         }
+    }
+
+    fn update_maps_conflict(left: Option<&UpdateMap>, right: Option<&UpdateMap>) -> bool {
+        let (Some(left), Some(right)) = (left, right) else {
+            return false;
+        };
+        if left.replace || right.replace {
+            return true;
+        }
+        let left_keys = left
+            .update_entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<HashSet<_>>();
+        right
+            .update_entries
+            .iter()
+            .any(|entry| left_keys.contains(entry.key.as_str()))
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
@@ -3581,6 +3607,30 @@ mod tests {
             base_id: None,
             files: None,
         }
+    }
+
+    fn table_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            }),
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_table_metadata_conflicts_on_same_key() {
+        let left = table_metadata_update(vec![("key", Some("1"))], false);
+        let same_key = table_metadata_update(vec![("key", Some("2"))], false);
+        let different_key = table_metadata_update(vec![("other", Some("2"))], false);
+        let replace = table_metadata_update(vec![("other", Some("2"))], true);
+
+        assert!(left.modifies_same_metadata(&same_key));
+        assert!(!left.modifies_same_metadata(&different_key));
+        assert!(left.modifies_same_metadata(&replace));
     }
 
     #[test]

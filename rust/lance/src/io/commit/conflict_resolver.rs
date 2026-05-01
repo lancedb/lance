@@ -1803,6 +1803,70 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
+    fn create_table_metadata_update_for_test(
+        entries: Vec<(&str, Option<&str>)>,
+        replace: bool,
+    ) -> Operation {
+        use crate::dataset::transaction::{UpdateMap, UpdateMapEntry};
+
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            }),
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_table_metadata_update_config_conflict_resolution() {
+        let dataset = test_dataset(10, 2).await;
+        let txn = Transaction::new_from_version(
+            1,
+            create_table_metadata_update_for_test(vec![("key", Some("1"))], false),
+        );
+
+        let same_key = Transaction::new_from_version(
+            2,
+            create_table_metadata_update_for_test(vec![("key", Some("2"))], false),
+        );
+        let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&same_key, 2);
+        assert!(
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "same table metadata key update should conflict, got {:?}",
+            result
+        );
+
+        let different_key = Transaction::new_from_version(
+            2,
+            create_table_metadata_update_for_test(vec![("other", Some("2"))], false),
+        );
+        let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), None)
+            .await
+            .unwrap();
+        assert!(rebase.check_txn(&different_key, 2).is_ok());
+
+        let replace = Transaction::new_from_version(
+            2,
+            create_table_metadata_update_for_test(vec![("other", Some("2"))], true),
+        );
+        let mut rebase = TransactionRebase::try_new(&dataset, txn, None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&replace, 2);
+        assert!(
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "table metadata replacement should conflict, got {:?}",
+            result
+        );
+    }
+
     #[tokio::test]
     async fn test_non_overlapping_rebase_delete_update() {
         let dataset = test_dataset(5, 5).await;

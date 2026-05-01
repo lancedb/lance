@@ -4749,6 +4749,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-queue"
+version = "6.1.0-beta.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "bytes",
+ "futures",
+ "lance",
+ "lance-arrow",
+ "lance-core",
+ "lance-index",
+ "lance-io",
+ "lance-namespace",
+ "object_store 0.12.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lance-table"
 version = "6.1.0-beta.0"
 dependencies = [
