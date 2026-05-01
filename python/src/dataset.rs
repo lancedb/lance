@@ -75,7 +75,7 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
+    scalar::{FullTextSearchQuery, InfgramSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
         ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
@@ -1279,7 +1279,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, infgram_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1303,6 +1303,7 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
         full_text_query: Option<&Bound<'_, PyAny>>,
+        infgram_query: Option<&Bound<'_, PyAny>>,
         late_materialization: Option<Bound<PyAny>>,
         blob_handling: Option<Bound<PyAny>>,
         use_scalar_index: Option<bool>,
@@ -1420,6 +1421,43 @@ impl Dataset {
 
             scanner
                 .full_text_search(fts_query)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(infgram_query) = infgram_query {
+            let infgram = if let Ok(query_str) = infgram_query.extract::<String>() {
+                // Simple string query: infgram_query="fox"
+                InfgramSearchQuery::new(query_str)
+            } else if let Ok(dict) = infgram_query.cast::<PyDict>() {
+                let query_val = dict
+                    .get_item("query")?
+                    .ok_or_else(|| PyKeyError::new_err("infgram_query must contain 'query' key"))?;
+
+                // Check if query is a list of ints (token IDs) or a string
+                let mut q = if let Ok(tokens) = query_val.extract::<Vec<i64>>() {
+                    InfgramSearchQuery::new_tokens(tokens)
+                } else {
+                    InfgramSearchQuery::new(query_val.to_string())
+                };
+
+                if let Some(col) = dict.get_item("column")? {
+                    if !col.is_none() {
+                        q = q.with_column(col.extract::<String>()?);
+                    }
+                }
+                if let Some(lim) = dict.get_item("limit")? {
+                    if !lim.is_none() {
+                        q = q.with_limit(Some(lim.extract::<usize>()?));
+                    }
+                }
+                q
+            } else {
+                return Err(PyValueError::new_err(
+                    "infgram_query must be a string or dict with 'query' (str or list[int]), \
+                     optional 'column', optional 'limit'",
+                ));
+            };
+            scanner
+                .infgram_search(infgram)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
@@ -2506,10 +2544,38 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
-            "SUFFIX_ARRAY" => Box::new(ScalarIndexParams {
-                index_type: "suffixarray".to_string(),
-                params: None,
-            }),
+            "SUFFIX_ARRAY" => {
+                let mut sa_params = serde_json::Map::new();
+                if let Some(kwargs) = kwargs {
+                    if let Some(ci) = kwargs.get_item("case_insensitive")? {
+                        if ci.extract::<bool>()? {
+                            sa_params.insert(
+                                "case_insensitive".to_string(),
+                                serde_json::Value::Bool(true),
+                            );
+                        }
+                    }
+                    if let Some(sep) = kwargs.get_item("separator_token_id")? {
+                        if !sep.is_none() {
+                            sa_params.insert(
+                                "separator_token_id".to_string(),
+                                serde_json::Value::Number(
+                                    serde_json::Number::from(sep.extract::<u32>()?)
+                                ),
+                            );
+                        }
+                    }
+                }
+                let params_json = if sa_params.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(sa_params).to_string())
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "suffixarray".to_string(),
+                    params: params_json,
+                })
+            },
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(

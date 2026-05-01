@@ -50,6 +50,11 @@ pub struct SuffixArraySegment {
     pub pointer_width: u8,
     /// Total number of entries in the suffix array.
     pub total_entries: u64,
+    /// Cumulative byte offsets marking the end of each document.
+    /// `doc_offsets[i]` is the byte offset where document `i` ends.
+    /// Document `i` spans `[doc_offsets[i-1], doc_offsets[i])` (with doc_offsets[-1] = 0).
+    /// Empty if document retrieval is not available (legacy indices).
+    pub doc_offsets: Vec<u64>,
 }
 
 impl SuffixArraySegment {
@@ -72,6 +77,13 @@ impl SuffixArraySegment {
 /// transparently across segments.
 pub struct SuffixArrayIndex {
     segments: Vec<SuffixArraySegment>,
+    /// When true, the corpus was lowercased at build time.
+    /// Queries must be lowercased before searching.
+    case_insensitive: bool,
+    /// Bytes per token unit. 1 for byte-level (text), 2 for int16/uint16,
+    /// 4 for int32/uint32. Queries on token-level indices are constrained
+    /// to positions aligned to `token_width` boundaries.
+    token_width: u8,
 }
 
 impl std::fmt::Debug for SuffixArrayIndex {
@@ -94,7 +106,11 @@ impl DeepSizeOf for SuffixArrayIndex {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.segments
             .iter()
-            .map(|s| s.tokenized.len() + s.suffix_array.len())
+            .map(|s| {
+                s.tokenized.len()
+                    + s.suffix_array.len()
+                    + s.doc_offsets.len() * std::mem::size_of::<u64>()
+            })
             .sum()
     }
 }
@@ -121,6 +137,8 @@ impl Index for SuffixArrayIndex {
             "num_segments": self.segments.len(),
             "total_tokenized_bytes": self.segments.iter().map(|s| s.tokenized.len()).sum::<usize>(),
             "total_entries": self.segments.iter().map(|s| s.total_entries).sum::<u64>(),
+            "case_insensitive": self.case_insensitive,
+            "token_width": self.token_width,
         }))
     }
 
@@ -154,9 +172,20 @@ impl ScalarIndex for SuffixArrayIndex {
                 ))
             })?;
 
+        // Helper: lowercase bytes if the index was built case-insensitively.
+        // Only valid for UTF-8 text (not raw binary).
+        let maybe_lower = |bytes: &[u8]| -> Vec<u8> {
+            if self.case_insensitive {
+                String::from_utf8_lossy(bytes).to_lowercase().into_bytes()
+            } else {
+                bytes.to_vec()
+            }
+        };
+
         match sa_query {
             SuffixArrayQuery::Count { query_bytes } => {
-                let n = self.total_count(query_bytes);
+                let qb = maybe_lower(query_bytes);
+                let n = self.total_count(&qb);
                 let mut map = RowAddrTreeMap::new();
                 if n > 0 {
                     map.insert(n);
@@ -169,32 +198,11 @@ impl ScalarIndex for SuffixArrayIndex {
                 query_bytes,
                 max_results,
             } => {
+                let qb = maybe_lower(query_bytes);
+                let row_ids = self.search_rows(&qb, *max_results);
                 let mut map = RowAddrTreeMap::new();
-                let mut remaining = *max_results;
-                let mut text_offset: u64 = 0;
-
-                for seg in &self.segments {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let (lo, hi) = query::sa_find(
-                        &seg.tokenized,
-                        &seg.suffix_array,
-                        seg.pointer_width as usize,
-                        seg.total_entries,
-                        query_bytes,
-                    );
-                    let seg_results = ((hi - lo) as usize).min(remaining);
-                    for rank in lo..lo + seg_results as u64 {
-                        let pos = query::read_pointer(
-                            &seg.suffix_array,
-                            rank,
-                            seg.pointer_width as usize,
-                        );
-                        map.insert(text_offset + pos);
-                    }
-                    remaining -= seg_results;
-                    text_offset += seg.tokenized.len() as u64;
+                for row_id in &row_ids {
+                    map.insert(*row_id);
                 }
                 Ok(SearchResult::Exact(
                     lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
@@ -204,7 +212,9 @@ impl ScalarIndex for SuffixArrayIndex {
                 prompt_bytes,
                 continuation_bytes,
             } => {
-                let result = self.compute_prob(prompt_bytes, continuation_bytes);
+                let pb = maybe_lower(prompt_bytes);
+                let cb = maybe_lower(continuation_bytes);
+                let result = self.compute_prob(&pb, &cb);
                 let mut map = RowAddrTreeMap::new();
                 if result.cont_cnt > 0 {
                     map.insert(result.cont_cnt);
@@ -217,7 +227,8 @@ impl ScalarIndex for SuffixArrayIndex {
                 prompt_bytes,
                 max_support,
             } => {
-                let result = self.compute_ntd(prompt_bytes, *max_support);
+                let pb = maybe_lower(prompt_bytes);
+                let result = self.compute_ntd(&pb, *max_support);
                 let mut map = RowAddrTreeMap::new();
                 if result.prompt_cnt > 0 {
                     map.insert(result.prompt_cnt);
@@ -230,7 +241,9 @@ impl ScalarIndex for SuffixArrayIndex {
                 prompt_bytes,
                 continuation_bytes,
             } => {
-                let result = self.compute_infgram_prob(prompt_bytes, continuation_bytes);
+                let pb = maybe_lower(prompt_bytes);
+                let cb = maybe_lower(continuation_bytes);
+                let result = self.compute_infgram_prob(&pb, &cb);
                 let mut map = RowAddrTreeMap::new();
                 if result.prob_result.cont_cnt > 0 {
                     map.insert(result.prob_result.cont_cnt);
@@ -290,13 +303,26 @@ impl SuffixArrayIndex {
                 suffix_array,
                 pointer_width,
                 total_entries,
+                doc_offsets: Vec::new(),
             }],
+            case_insensitive: false,
+            token_width: 1,
         }
+    }
+
+    /// Whether this index was built with case-insensitive (lowercased) text.
+    pub fn case_insensitive(&self) -> bool {
+        self.case_insensitive
+    }
+
+    /// Token width (bytes per token unit). 1 = byte-level, 2 = int16, 4 = int32.
+    pub fn token_width(&self) -> u8 {
+        self.token_width
     }
 
     /// Create a multi-segment SuffixArrayIndex from pre-loaded segments.
     pub fn from_segments(segments: Vec<SuffixArraySegment>) -> Self {
-        Self { segments }
+        Self { segments, case_insensitive: false, token_width: 1 }
     }
 
     /// Load a single-segment SuffixArrayIndex from an IndexStore (v0 format).
@@ -306,8 +332,10 @@ impl SuffixArrayIndex {
         _cache: &lance_core::cache::LanceCache,
         pointer_width: u8,
         total_entries: u64,
+        case_insensitive: bool,
+        token_width: u8,
     ) -> Result<Arc<Self>> {
-        let seg = Self::load_segment(store.as_ref(), "tokenized.bin", "suffix_array.bin").await?;
+        let seg = Self::load_segment(store.as_ref(), "tokenized.bin", "suffix_array.bin", None).await?;
         // Override metadata from protobuf (v0 format stores it at top level)
         Ok(Arc::new(Self {
             segments: vec![SuffixArraySegment {
@@ -315,7 +343,10 @@ impl SuffixArrayIndex {
                 suffix_array: seg.suffix_array,
                 pointer_width,
                 total_entries,
+                doc_offsets: seg.doc_offsets,
             }],
+            case_insensitive,
+            token_width,
         }))
     }
 
@@ -323,20 +354,29 @@ impl SuffixArrayIndex {
     pub async fn load_multi(
         store: Arc<dyn IndexStore>,
         segment_infos: &[crate::pb::SuffixArraySegmentInfo],
+        case_insensitive: bool,
+        token_width: u8,
     ) -> Result<Arc<Self>> {
         let mut segments = Vec::with_capacity(segment_infos.len());
         for (i, info) in segment_infos.iter().enumerate() {
             let tok_name = format!("segment_{i}_tokenized.bin");
             let sa_name = format!("segment_{i}_suffix_array.bin");
-            let seg = Self::load_segment(store.as_ref(), &tok_name, &sa_name).await?;
+            let offsets_name = format!("segment_{i}_doc_offsets.bin");
+            let seg = Self::load_segment(
+                store.as_ref(),
+                &tok_name,
+                &sa_name,
+                Some(&offsets_name),
+            ).await?;
             segments.push(SuffixArraySegment {
                 tokenized: seg.tokenized,
                 suffix_array: seg.suffix_array,
                 pointer_width: info.pointer_width as u8,
                 total_entries: info.total_entries,
+                doc_offsets: seg.doc_offsets,
             });
         }
-        Ok(Arc::new(Self { segments }))
+        Ok(Arc::new(Self { segments, case_insensitive, token_width }))
     }
 
     /// Load one segment's files from the store.
@@ -344,6 +384,7 @@ impl SuffixArrayIndex {
         store: &dyn IndexStore,
         tok_filename: &str,
         sa_filename: &str,
+        offsets_filename: Option<&str>,
     ) -> Result<SuffixArraySegment> {
         let tokenized_reader = store.open_index_file(tok_filename).await?;
         let sa_reader = store.open_index_file(sa_filename).await?;
@@ -372,6 +413,33 @@ impl SuffixArrayIndex {
             })?;
         let suffix_array = Bytes::copy_from_slice(sa_col.value(0));
 
+        // Try to load doc_offsets (optional — may not exist for legacy indices)
+        let doc_offsets = if let Some(offsets_name) = offsets_filename {
+            match store.open_index_file(offsets_name).await {
+                Ok(offsets_reader) => {
+                    let offsets_batch = offsets_reader.read_record_batch(0, 1).await?;
+                    let offsets_col = offsets_batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeBinaryArray>()
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "{offsets_name} should contain a LargeBinary column"
+                            ))
+                        })?;
+                    let offsets_bytes = offsets_col.value(0);
+                    // Parse packed u64 values from little-endian bytes
+                    offsets_bytes
+                        .chunks_exact(8)
+                        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect()
+                }
+                Err(_) => Vec::new(), // File not found — legacy index
+            }
+        } else {
+            Vec::new()
+        };
+
         // Derive metadata from loaded data (will be overridden by caller
         // with protobuf metadata for v0 format).
         Ok(SuffixArraySegment {
@@ -379,14 +447,106 @@ impl SuffixArrayIndex {
             total_entries: 0,
             tokenized,
             suffix_array,
+            doc_offsets,
         })
     }
 
     // ─── Multi-segment query aggregation ─────────────────────────────────────
 
     /// Count occurrences of a pattern across all segments.
+    /// For token-level indices (`token_width > 1`), only counts matches
+    /// at token-aligned positions.
     pub fn total_count(&self, query: &[u8]) -> u64 {
-        self.segments.iter().map(|seg| seg.count(query)).sum()
+        if self.token_width <= 1 {
+            // Byte-level: use fast count (SA range size)
+            self.segments.iter().map(|seg| seg.count(query)).sum()
+        } else {
+            // Token-level: must check alignment of each match
+            let tw = self.token_width as usize;
+            let mut total = 0u64;
+            for seg in &self.segments {
+                let (lo, hi) = query::sa_find(
+                    &seg.tokenized,
+                    &seg.suffix_array,
+                    seg.pointer_width as usize,
+                    seg.total_entries,
+                    query,
+                );
+                for rank in lo..hi {
+                    let byte_pos = query::read_pointer(
+                        &seg.suffix_array,
+                        rank,
+                        seg.pointer_width as usize,
+                    );
+                    if (byte_pos as usize) % tw == 0 {
+                        total += 1;
+                    }
+                }
+            }
+            total
+        }
+    }
+
+    /// Search for byte positions matching a pattern and resolve them to
+    /// row (document) indices using doc_offsets. Returns deduplicated,
+    /// sorted row indices.
+    ///
+    /// For token-level indices (`token_width > 1`), only matches at
+    /// token-aligned positions (`pos % token_width == 0`) are included.
+    pub fn search_rows(
+        &self,
+        query: &[u8],
+        max_results: usize,
+    ) -> Vec<u64> {
+        let tw = self.token_width as usize;
+        let mut row_ids = Vec::new();
+        let mut remaining = max_results;
+        let mut doc_base: u64 = 0; // cumulative doc count across segments
+
+        for seg in &self.segments {
+            if remaining == 0 {
+                break;
+            }
+            let (lo, hi) = query::sa_find(
+                &seg.tokenized,
+                &seg.suffix_array,
+                seg.pointer_width as usize,
+                seg.total_entries,
+                query,
+            );
+
+            if seg.doc_offsets.is_empty() {
+                // No doc_offsets — can't resolve to rows
+                let seg_results = ((hi - lo) as usize).min(remaining);
+                remaining = remaining.saturating_sub(seg_results);
+            } else {
+                for rank in lo..hi {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let byte_pos = query::read_pointer(
+                        &seg.suffix_array,
+                        rank,
+                        seg.pointer_width as usize,
+                    );
+                    // For token-level SA, skip matches not aligned to token boundaries
+                    if tw > 1 && (byte_pos as usize) % tw != 0 {
+                        continue;
+                    }
+                    // Binary search: find first offset > byte_pos
+                    let local_doc = seg.doc_offsets.partition_point(|&o| o <= byte_pos) as u64;
+                    row_ids.push(doc_base + local_doc);
+                    remaining -= 1;
+                }
+            }
+
+            doc_base += seg.doc_offsets.len() as u64;
+        }
+
+        // Deduplicate and sort
+        row_ids.sort_unstable();
+        row_ids.dedup();
+        row_ids
     }
 
     /// Compute conditional probability P(continuation | prompt)

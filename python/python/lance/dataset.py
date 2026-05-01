@@ -842,194 +842,102 @@ class LanceDataset(pa.dataset.Dataset):
         )
         return json.loads(self._ds.index_statistics(index_name))
 
-    def suffix_array_count(
+    def _suffix_array_info(
         self,
         index_name: str,
         query: Union[str, bytes],
-    ) -> int:
-        """Count occurrences of a pattern in a suffix array index.
-
-        Parameters
-        ----------
-        index_name : str
-            Name of the SUFFIX_ARRAY index to query.
-        query : str or bytes
-            Pattern to count. Strings are encoded as UTF-8.
-
-        Returns
-        -------
-        int
-            Number of times the pattern appears in the indexed corpus.
-
-        Examples
-        --------
-        >>> # After creating a suffix array index:
-        >>> # ds.create_index("text", index_type="SUFFIX_ARRAY", name="sa_idx")
-        >>> # ds.suffix_array_count("sa_idx", "the")
-        """
-        if isinstance(query, str):
-            query = query.encode("utf-8")
-        return self._ds.suffix_array_count(index_name, query)
-
-    def suffix_array_search(
-        self,
-        index_name: str,
-        query: Union[str, bytes],
+        *,
+        operation: str = "count",
+        continuation: Optional[Union[str, bytes]] = None,
         max_results: Optional[int] = None,
-    ) -> list[int]:
-        """Search for byte positions of a pattern in a suffix array index.
-
-        Parameters
-        ----------
-        index_name : str
-            Name of the SUFFIX_ARRAY index to query.
-        query : str or bytes
-            Pattern to search for. Strings are encoded as UTF-8.
-        max_results : int, optional
-            Maximum number of positions to return. Default 100.
-
-        Returns
-        -------
-        list[int]
-            Byte positions within the corpus where the pattern occurs.
-
-        Examples
-        --------
-        >>> # After creating a suffix array index:
-        >>> # ds.create_index("text", index_type="SUFFIX_ARRAY", name="sa_idx")
-        >>> # ds.suffix_array_search("sa_idx", "fox", max_results=10)
-        """
-        if isinstance(query, str):
-            query = query.encode("utf-8")
-        return self._ds.suffix_array_search(index_name, query, max_results)
-
-    def suffix_array_prob(
-        self,
-        index_name: str,
-        prompt: Union[str, bytes],
-        continuation: Union[str, bytes],
-    ) -> dict:
-        """Compute conditional probability P(continuation | prompt).
-
-        Uses the suffix array index to compute:
-        ``P(continuation | prompt) = count(prompt + continuation) / count(prompt)``
-
-        Parameters
-        ----------
-        index_name : str
-            Name of the SUFFIX_ARRAY index to query.
-        prompt : str or bytes
-            The conditioning context. Strings are encoded as UTF-8.
-        continuation : str or bytes
-            The continuation to compute probability for. Strings are encoded
-            as UTF-8.
-
-        Returns
-        -------
-        dict
-            Dictionary with keys:
-            - ``prompt_cnt`` (int): number of prompt occurrences
-            - ``cont_cnt`` (int): number of prompt+continuation occurrences
-            - ``prob`` (float): conditional probability
-        """
-        if isinstance(prompt, str):
-            prompt = prompt.encode("utf-8")
-        if isinstance(continuation, str):
-            continuation = continuation.encode("utf-8")
-        prompt_cnt, cont_cnt, prob = self._ds.suffix_array_prob(
-            index_name, prompt, continuation
-        )
-        return {"prompt_cnt": prompt_cnt, "cont_cnt": cont_cnt, "prob": prob}
-
-    def suffix_array_ntd(
-        self,
-        index_name: str,
-        prompt: Union[str, bytes],
         max_support: Optional[int] = None,
     ) -> dict:
-        """Compute next-byte distribution after a prompt.
+        """Low-level suffix array index query.
 
-        For each possible next byte after the prompt, returns the count and
-        probability using a divide-and-conquer algorithm over the suffix array.
+        Unified private interface for all suffix array operations.
 
         Parameters
         ----------
         index_name : str
             Name of the SUFFIX_ARRAY index to query.
-        prompt : str or bytes
-            The conditioning context. Strings are encoded as UTF-8.
+        query : str or bytes
+            The query pattern or prompt. Strings are encoded as UTF-8.
+        operation : str
+            One of: "count", "search", "prob", "ntd", "infgram_prob".
+        continuation : str or bytes, optional
+            Required for "prob" and "infgram_prob" operations.
+        max_results : int, optional
+            For "search" operation: max positions to return.
         max_support : int, optional
-            Maximum entries to scan. If the prompt count exceeds this,
-            uses approximate sampling mode.
+            For "ntd" operation: max entries to scan before approximate mode.
 
         Returns
         -------
         dict
-            Dictionary with keys:
-            - ``prompt_cnt`` (int): number of prompt occurrences
-            - ``approximate`` (bool): whether approximate mode was used
-            - ``distribution`` (list[dict]): list of entries, each with
-              ``byte`` (int), ``count`` (int), ``prob`` (float), sorted by
-              count descending
+            Result dictionary whose contents depend on the operation:
+            - ``count``: {"count": int}
+            - ``search``: {"positions": list[int]}
+            - ``prob``: {"prompt_cnt": int, "cont_cnt": int, "prob": float}
+            - ``ntd``: {"prompt_cnt": int, "approximate": bool,
+              "distribution": list[dict]}
+            - ``infgram_prob``: {"prompt_cnt": int, "cont_cnt": int,
+              "prob": float, "effective_suffix_len": int}
         """
-        if isinstance(prompt, str):
-            prompt = prompt.encode("utf-8")
-        prompt_cnt, approximate, dist_tuples = self._ds.suffix_array_ntd(
-            index_name, prompt, max_support
-        )
-        distribution = [
-            {"byte": b, "count": c, "prob": p} for b, c, p in dist_tuples
-        ]
-        return {
-            "prompt_cnt": prompt_cnt,
-            "approximate": approximate,
-            "distribution": distribution,
-        }
+        if isinstance(query, str):
+            query = query.encode("utf-8")
 
-    def suffix_array_infgram_prob(
-        self,
-        index_name: str,
-        prompt: Union[str, bytes],
-        continuation: Union[str, bytes],
-    ) -> dict:
-        """Compute infinity-gram probability with backoff.
-
-        Finds the longest suffix of the prompt that has nonzero count in the
-        corpus, then computes ``P(continuation | longest_suffix)``. Uses binary
-        lifting for efficient suffix search.
-
-        Parameters
-        ----------
-        index_name : str
-            Name of the SUFFIX_ARRAY index to query.
-        prompt : str or bytes
-            The conditioning context. Strings are encoded as UTF-8.
-        continuation : str or bytes
-            The continuation to compute probability for.
-
-        Returns
-        -------
-        dict
-            Dictionary with keys:
-            - ``prompt_cnt`` (int): count of the effective suffix
-            - ``cont_cnt`` (int): count of effective suffix + continuation
-            - ``prob`` (float): conditional probability
-            - ``effective_suffix_len`` (int): length of the longest suffix
-              of prompt with nonzero count
-        """
-        if isinstance(prompt, str):
-            prompt = prompt.encode("utf-8")
-        if isinstance(continuation, str):
-            continuation = continuation.encode("utf-8")
-        prompt_cnt, cont_cnt, prob, suffix_len = (
-            self._ds.suffix_array_infgram_prob(index_name, prompt, continuation)
-        )
-        return {
-            "prompt_cnt": prompt_cnt,
-            "cont_cnt": cont_cnt,
-            "prob": prob,
-            "effective_suffix_len": suffix_len,
-        }
+        if operation == "count":
+            n = self._ds.suffix_array_count(index_name, query)
+            return {"count": n}
+        elif operation == "search":
+            positions = self._ds.suffix_array_search(
+                index_name, query, max_results
+            )
+            return {"positions": positions}
+        elif operation == "prob":
+            if continuation is None:
+                raise ValueError("continuation is required for 'prob' operation")
+            if isinstance(continuation, str):
+                continuation = continuation.encode("utf-8")
+            prompt_cnt, cont_cnt, prob = self._ds.suffix_array_prob(
+                index_name, query, continuation
+            )
+            return {"prompt_cnt": prompt_cnt, "cont_cnt": cont_cnt, "prob": prob}
+        elif operation == "ntd":
+            prompt_cnt, approximate, dist_tuples = self._ds.suffix_array_ntd(
+                index_name, query, max_support
+            )
+            distribution = [
+                {"byte": b, "count": c, "prob": p} for b, c, p in dist_tuples
+            ]
+            return {
+                "prompt_cnt": prompt_cnt,
+                "approximate": approximate,
+                "distribution": distribution,
+            }
+        elif operation == "infgram_prob":
+            if continuation is None:
+                raise ValueError(
+                    "continuation is required for 'infgram_prob' operation"
+                )
+            if isinstance(continuation, str):
+                continuation = continuation.encode("utf-8")
+            prompt_cnt, cont_cnt, prob, suffix_len = (
+                self._ds.suffix_array_infgram_prob(
+                    index_name, query, continuation
+                )
+            )
+            return {
+                "prompt_cnt": prompt_cnt,
+                "cont_cnt": cont_cnt,
+                "prob": prob,
+                "effective_suffix_len": suffix_len,
+            }
+        else:
+            raise ValueError(
+                f"Unknown operation '{operation}'. "
+                f"Must be one of: count, search, prob, ntd, infgram_prob"
+            )
 
     @property
     def has_index(self):
@@ -1056,6 +964,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        infgram_query: Optional[Union[str, dict]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -1332,6 +1241,11 @@ class LanceDataset(pa.dataset.Dataset):
                 builder = builder.full_text_search(full_text_query)
             elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
+        if infgram_query is not None:
+            if isinstance(infgram_query, str):
+                builder = builder.infgram_search(infgram_query)
+            elif isinstance(infgram_query, dict):
+                builder = builder.infgram_search(**infgram_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
         return builder.to_scanner()
@@ -2997,6 +2911,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["SUFFIX_ARRAY"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3086,7 +3001,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"SUFFIX_ARRAY"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3162,6 +3077,10 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        case_insensitive: bool, default False
+            This is for the ``SUFFIX_ARRAY`` index. If True, all text will be
+            lowercased at build time and queries will be lowercased before
+            searching. This enables case-insensitive substring matching.
 
         Examples
         --------
@@ -3267,10 +3186,22 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_large_string(field_type)
                     and not pa.types.is_binary(field_type)
                     and not pa.types.is_large_binary(field_type)
+                    and not (
+                        (pa.types.is_list(field_type) or pa.types.is_large_list(field_type))
+                        and field_type.value_type
+                        in (
+                            pa.int16(),
+                            pa.uint16(),
+                            pa.int32(),
+                            pa.uint32(),
+                            pa.int64(),
+                            pa.uint64(),
+                        )
+                    )
                 ):
                     raise TypeError(
-                        f"SUFFIX_ARRAY index column {column} must be string or binary"
-                        f", but got {field_type}"
+                        f"SUFFIX_ARRAY index column {column} must be string, binary,"
+                        f" or list<int16/int32/int64>, but got {field_type}"
                     )
             elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
@@ -5545,6 +5476,7 @@ class ScannerBuilder:
         self._use_stats = True
         self._fast_search = False
         self._full_text_query = None
+        self._infgram_query = None
         self._use_scalar_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
@@ -5915,6 +5847,36 @@ class ScannerBuilder:
             }
         return self
 
+    def infgram_search(
+        self,
+        query: str,
+        column: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> ScannerBuilder:
+        """
+        Filter rows by infini-gram (suffix array) search.
+
+        Returns rows containing the given pattern, with a `_count` column
+        indicating presence. Must create a suffix array index on the target
+        column before searching.
+
+        Parameters
+        ----------
+        query : str
+            The text pattern to search for.
+        column : str, optional
+            The column to search in. If None, searches the first
+            suffix-array-indexed column.
+        limit : int, optional
+            Maximum number of matching rows to return.
+        """
+        self._infgram_query = {
+            "query": query,
+            "column": column,
+            "limit": limit,
+        }
+        return self
+
     def scan_stats_callback(
         self, callback: Callable[[ScanStatistics], None]
     ) -> ScannerBuilder:
@@ -5997,6 +5959,7 @@ class ScannerBuilder:
             self._substrait_filter,
             self._fast_search,
             self._full_text_query,
+            self._infgram_query,
             self._late_materialization,
             self._blob_handling,
             self._use_scalar_index,

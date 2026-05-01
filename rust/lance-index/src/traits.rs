@@ -17,6 +17,8 @@ pub struct IndexCriteria<'a> {
     pub must_support_fts: bool,
     /// If true, only consider indices that support exact equality
     pub must_support_exact_equality: bool,
+    /// If true, only consider suffix array indices (for infini-gram queries)
+    pub must_support_suffix_array: bool,
 }
 
 impl<'a> IndexCriteria<'a> {
@@ -45,6 +47,12 @@ impl<'a> IndexCriteria<'a> {
     /// or an index like a bloom filter
     pub fn supports_exact_equality(mut self) -> Self {
         self.must_support_exact_equality = true;
+        self
+    }
+
+    /// Only consider suffix array indices (for infini-gram queries)
+    pub fn supports_suffix_array(mut self) -> Self {
+        self.must_support_suffix_array = true;
         self
     }
 }

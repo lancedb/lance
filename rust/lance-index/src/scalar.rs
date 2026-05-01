@@ -361,6 +361,66 @@ impl FullTextSearchQuery {
     }
 }
 
+/// An infini-gram search query for suffix array indices.
+///
+/// Searches for documents containing the given pattern and returns
+/// matching row IDs with occurrence counts.
+///
+/// Supports two query modes:
+/// - Text mode: `query` is a string pattern (for byte-level SA indices)
+/// - Token mode: `query_tokens` is a list of token IDs (for token-level SA indices)
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfgramSearchQuery {
+    /// The text pattern to search for (byte-level queries).
+    pub query: String,
+
+    /// Optional pre-tokenized query (token IDs). When set, the query
+    /// is serialized as fixed-width integers matching the index's
+    /// `token_width`. Takes precedence over `query`.
+    pub query_tokens: Option<Vec<i64>>,
+
+    /// Optional column to search over. If None, searches the first
+    /// suffix array-indexed column.
+    pub column: Option<String>,
+
+    /// Maximum number of results to return.
+    pub limit: Option<usize>,
+}
+
+impl InfgramSearchQuery {
+    /// Create a new infini-gram search query.
+    pub fn new(query: String) -> Self {
+        Self {
+            query,
+            query_tokens: None,
+            column: None,
+            limit: None,
+        }
+    }
+
+    /// Create a new token-level infini-gram search query.
+    pub fn new_tokens(tokens: Vec<i64>) -> Self {
+        Self {
+            query: String::new(),
+            query_tokens: Some(tokens),
+            column: None,
+            limit: None,
+        }
+    }
+
+    /// Set the column to search over.
+    pub fn with_column(mut self, column: String) -> Self {
+        self.column = Some(column);
+        self
+    }
+
+    /// Set the maximum number of results.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
 /// A query that a basic scalar index (e.g. btree / bitmap) can satisfy
 ///
 /// This is a subset of expression operators that is often referred to as the

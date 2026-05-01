@@ -241,6 +241,11 @@ impl IndexDetails {
         self.0.type_url.ends_with("InvertedIndexDetails")
     }
 
+    /// Returns true if the index is a suffix array index (for infini-gram queries)
+    pub fn supports_suffix_array(&self) -> bool {
+        self.0.type_url.ends_with("SuffixArrayIndexDetails")
+    }
+
     /// Returns the plugin for the index
     pub fn get_plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
         SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(self.0.as_ref())
@@ -516,6 +521,10 @@ pub fn index_matches_criteria(
             return Ok(false);
         }
 
+        if criteria.must_support_suffix_array && !index_details.supports_suffix_array() {
+            return Ok(false);
+        }
+
         // We should not use FTS / NGram indices for exact equality queries
         // (i.e. merge insert with a join on the indexed column)
         if criteria.must_support_exact_equality {
@@ -655,12 +664,7 @@ mod tests {
     fn test_index_matches_criteria_vector_index() {
         let index1 = make_index_metadata("vector_index", 1, Some(IndexType::Vector));
 
-        let criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
-            has_name: None,
-        };
+        let criteria = IndexCriteria::default();
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
         let schema = lance_core::datatypes::Schema {
@@ -681,12 +685,7 @@ mod tests {
         let inverted_index = make_index_metadata("inverted_index", 1, Some(IndexType::Inverted));
         let ngram_index = make_index_metadata("ngram_index", 1, Some(IndexType::NGram));
 
-        let criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
-            has_name: None,
-        };
+        let criteria = IndexCriteria::default();
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
         let schema = lance_core::datatypes::Schema {
@@ -703,10 +702,8 @@ mod tests {
 
         // test for_column
         let mut criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
             for_column: Some("mycol"),
-            has_name: None,
+            ..Default::default()
         };
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
@@ -719,10 +716,8 @@ mod tests {
 
         // test has_name
         let mut criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
             has_name: Some("btree_index"),
+            ..Default::default()
         };
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
@@ -741,10 +736,8 @@ mod tests {
 
         // test supports_exact_equality
         let mut criteria = IndexCriteria {
-            must_support_fts: false,
             must_support_exact_equality: true,
-            for_column: None,
-            has_name: None,
+            ..Default::default()
         };
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
@@ -761,12 +754,7 @@ mod tests {
         assert!(!result);
 
         // test multiple indices
-        let mut criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
-            has_name: None,
-        };
+        let mut criteria = IndexCriteria::default();
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
