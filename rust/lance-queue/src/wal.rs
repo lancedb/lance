@@ -23,6 +23,7 @@ use crate::shard_wal_path;
 
 const WRITER_EPOCH_KEY: &str = "writer_epoch";
 const QUEUE_PARTITION_KEY: &str = "lance_queue_partition";
+const QUEUE_PRODUCER_ID_KEY: &str = "lance_queue_producer_id";
 const QUEUE_SHARD_ID_KEY: &str = "lance_queue_shard_id";
 const FIRST_WAL_ENTRY_POSITION: u64 = 1;
 const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
@@ -33,6 +34,8 @@ const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 pub struct WalAppendResult {
     /// Queue partition id.
     pub partition_id: u32,
+    /// Producer shard slot id.
+    pub producer_id: u32,
     /// MemWAL shard id used by this partition.
     pub shard_id: Uuid,
     /// WAL entry position written.
@@ -50,6 +53,8 @@ pub struct WalAppendResult {
 pub struct QueueEntry {
     /// Queue partition id.
     pub partition_id: u32,
+    /// Producer shard slot id.
+    pub producer_id: u32,
     /// MemWAL shard id used by this partition.
     pub shard_id: Uuid,
     /// WAL entry position.
@@ -65,6 +70,7 @@ pub struct WalAppender {
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     partition_id: u32,
+    producer_id: u32,
     shard_id: Uuid,
     shard_spec_id: u32,
     writer_epoch: Mutex<Option<u64>>,
@@ -77,8 +83,50 @@ impl WalAppender {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
+        producer_id: u32,
         shard_id: Uuid,
         shard_spec_id: u32,
+    ) -> Self {
+        Self::new_internal(
+            object_store,
+            base_path,
+            partition_id,
+            producer_id,
+            shard_id,
+            shard_spec_id,
+            None,
+        )
+    }
+
+    /// Create a WAL appender with an already-claimed writer epoch.
+    pub fn new_with_writer_epoch(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        partition_id: u32,
+        producer_id: u32,
+        shard_id: Uuid,
+        shard_spec_id: u32,
+        writer_epoch: u64,
+    ) -> Self {
+        Self::new_internal(
+            object_store,
+            base_path,
+            partition_id,
+            producer_id,
+            shard_id,
+            shard_spec_id,
+            Some(writer_epoch),
+        )
+    }
+
+    fn new_internal(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        partition_id: u32,
+        producer_id: u32,
+        shard_id: Uuid,
+        shard_spec_id: u32,
+        writer_epoch: Option<u64>,
     ) -> Self {
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
@@ -91,9 +139,10 @@ impl WalAppender {
             wal_dir: shard_wal_path(&base_path, &shard_id),
             manifest_store,
             partition_id,
+            producer_id,
             shard_id,
             shard_spec_id,
-            writer_epoch: Mutex::new(None),
+            writer_epoch: Mutex::new(writer_epoch),
             next_entry_position: Mutex::new(None),
         }
     }
@@ -102,10 +151,10 @@ impl WalAppender {
     pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
         validate_batches(&batches)?;
         let writer_epoch = self.writer_epoch().await?;
-        self.manifest_store.check_fenced(writer_epoch).await?;
         let wal_data = Bytes::from(serialize_batches(
             &batches,
             self.partition_id,
+            self.producer_id,
             self.shard_id,
             writer_epoch,
         )?);
@@ -127,6 +176,7 @@ impl WalAppender {
                 ))
             })?;
             let filename = wal_entry_filename(entry_position);
+            self.manifest_store.check_fenced(writer_epoch).await?;
             match put_create(
                 self.object_store.as_ref(),
                 &self.wal_dir,
@@ -143,6 +193,7 @@ impl WalAppender {
                     )?);
                     return Ok(WalAppendResult {
                         partition_id: self.partition_id,
+                        producer_id: self.producer_id,
                         shard_id: self.shard_id,
                         entry_position,
                         num_batches,
@@ -216,6 +267,12 @@ impl WalAppender {
         *writer_epoch = Some(epoch);
         Ok(epoch)
     }
+
+    /// Check that this appender's writer epoch has not been fenced.
+    pub async fn check_fenced(&self) -> Result<()> {
+        let writer_epoch = self.writer_epoch().await?;
+        self.manifest_store.check_fenced(writer_epoch).await
+    }
 }
 
 /// Ordered reader for MemWAL-compatible queue WAL entries.
@@ -224,6 +281,7 @@ pub struct WalTailer {
     object_store: Arc<ObjectStore>,
     wal_dir: Path,
     partition_id: u32,
+    producer_id: u32,
     shard_id: Uuid,
 }
 
@@ -233,12 +291,14 @@ impl WalTailer {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
+        producer_id: u32,
         shard_id: Uuid,
     ) -> Self {
         Self {
             object_store,
             wal_dir: shard_wal_path(&base_path, &shard_id),
             partition_id,
+            producer_id,
             shard_id,
         }
     }
@@ -263,10 +323,11 @@ impl WalTailer {
                 path, self.partition_id, self.shard_id, e
             ))
         })?;
-        let batches = read_batches(bytes, self.partition_id, self.shard_id)?;
+        let batches = read_batches(bytes, self.partition_id, self.producer_id, self.shard_id)?;
 
         Ok(Some(QueueEntry {
             partition_id: self.partition_id,
+            producer_id: self.producer_id,
             shard_id: self.shard_id,
             entry_position,
             batches,
@@ -329,6 +390,7 @@ fn validate_batches(batches: &[RecordBatch]) -> Result<()> {
 fn serialize_batches(
     batches: &[RecordBatch],
     partition_id: u32,
+    producer_id: u32,
     shard_id: Uuid,
     writer_epoch: u64,
 ) -> Result<Vec<u8>> {
@@ -336,6 +398,7 @@ fn serialize_batches(
     let mut metadata = schema.metadata().clone();
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
     metadata.insert(QUEUE_PARTITION_KEY.to_string(), partition_id.to_string());
+    metadata.insert(QUEUE_PRODUCER_ID_KEY.to_string(), producer_id.to_string());
     metadata.insert(QUEUE_SHARD_ID_KEY.to_string(), shard_id.to_string());
     let schema_with_metadata = Arc::new(ArrowSchema::new_with_metadata(
         schema.fields().to_vec(),
@@ -359,11 +422,21 @@ fn serialize_batches(
     Ok(buffer)
 }
 
-fn read_batches(bytes: Bytes, partition_id: u32, shard_id: Uuid) -> Result<Vec<RecordBatch>> {
+fn read_batches(
+    bytes: Bytes,
+    partition_id: u32,
+    producer_id: u32,
+    shard_id: Uuid,
+) -> Result<Vec<RecordBatch>> {
     let cursor = Cursor::new(bytes);
     let reader = StreamReader::try_new(cursor, None)
         .map_err(|e| Error::io(format!("failed to open WAL IPC stream reader: {}", e)))?;
-    validate_wal_schema_metadata(reader.schema().metadata(), partition_id, shard_id)?;
+    validate_wal_schema_metadata(
+        reader.schema().metadata(),
+        partition_id,
+        producer_id,
+        shard_id,
+    )?;
 
     let mut batches = Vec::new();
     for batch in reader {
@@ -377,6 +450,7 @@ fn read_batches(bytes: Bytes, partition_id: u32, shard_id: Uuid) -> Result<Vec<R
 fn validate_wal_schema_metadata(
     metadata: &HashMap<String, String>,
     partition_id: u32,
+    producer_id: u32,
     shard_id: Uuid,
 ) -> Result<()> {
     let actual_partition_id = metadata
@@ -393,6 +467,23 @@ fn validate_wal_schema_metadata(
         return Err(Error::io(format!(
             "WAL entry partition metadata mismatch: expected {}, got {}",
             partition_id, actual_partition_id
+        )));
+    }
+
+    let actual_producer_id = metadata
+        .get(QUEUE_PRODUCER_ID_KEY)
+        .ok_or_else(|| Error::io("WAL entry is missing queue producer metadata"))?
+        .parse::<u32>()
+        .map_err(|e| {
+            Error::io(format!(
+                "failed to parse WAL queue producer metadata: {}",
+                e
+            ))
+        })?;
+    if actual_producer_id != producer_id {
+        return Err(Error::io(format!(
+            "WAL entry producer metadata mismatch: expected {}, got {}",
+            producer_id, actual_producer_id
         )));
     }
 
@@ -418,8 +509,10 @@ fn strip_internal_wal_metadata(batch: RecordBatch) -> Result<RecordBatch> {
     let mut metadata = schema.metadata().clone();
     let removed_writer_epoch = metadata.remove(WRITER_EPOCH_KEY).is_some();
     let removed_partition_id = metadata.remove(QUEUE_PARTITION_KEY).is_some();
+    let removed_producer_id = metadata.remove(QUEUE_PRODUCER_ID_KEY).is_some();
     let removed_shard_id = metadata.remove(QUEUE_SHARD_ID_KEY).is_some();
-    let had_internal_metadata = removed_writer_epoch || removed_partition_id || removed_shard_id;
+    let had_internal_metadata =
+        removed_writer_epoch || removed_partition_id || removed_producer_id || removed_shard_id;
     if !had_internal_metadata {
         return Ok(batch);
     }

@@ -30,6 +30,7 @@ pub enum StartPosition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerGroupOffset {
     pub partition_id: u32,
+    pub producer_id: u32,
     pub next_entry_position: u64,
 }
 
@@ -42,15 +43,27 @@ pub fn read_all_group_offsets(
     let mut offsets = table_metadata
         .iter()
         .filter_map(|(key, value)| {
-            let partition = key
+            let shard_key = key
                 .strip_prefix(&prefix)?
                 .strip_suffix(GROUP_OFFSET_SUFFIX)?;
-            Some((partition, value, key))
+            Some((shard_key, value, key))
         })
-        .map(|(partition, value, key)| {
+        .map(|(shard_key, value, key)| {
+            let (partition, producer) = shard_key.split_once('.').ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "failed to parse consumer group offset metadata key '{}': expected partition.producer",
+                    key
+                ))
+            })?;
             let partition_id = partition.parse::<u32>().map_err(|e| {
                 Error::invalid_input(format!(
                     "failed to parse consumer group offset partition from metadata key '{}': {}",
+                    key, e
+                ))
+            })?;
+            let producer_id = producer.parse::<u32>().map_err(|e| {
+                Error::invalid_input(format!(
+                    "failed to parse consumer group offset producer from metadata key '{}': {}",
                     key, e
                 ))
             })?;
@@ -62,11 +75,12 @@ pub fn read_all_group_offsets(
             })?;
             Ok(ConsumerGroupOffset {
                 partition_id,
+                producer_id,
                 next_entry_position,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    offsets.sort_by_key(|offset| offset.partition_id);
+    offsets.sort_by_key(|offset| (offset.partition_id, offset.producer_id));
     Ok(offsets)
 }
 
@@ -144,13 +158,17 @@ fn offset_updates(
         .filter_map(|requested| {
             let existing = existing_offsets
                 .iter()
-                .find(|offset| offset.partition_id == requested.partition_id)
+                .find(|offset| {
+                    offset.partition_id == requested.partition_id
+                        && offset.producer_id == requested.producer_id
+                })
                 .map(|offset| offset.next_entry_position)
                 .unwrap_or(0);
             if requested.next_entry_position < existing {
                 tracing::warn!(
                     group_id,
                     partition_id = requested.partition_id,
+                    producer_id = requested.producer_id,
                     existing_next_entry_position = existing,
                     requested_next_entry_position = requested.next_entry_position,
                     "dropping stale consumer group offset commit"
@@ -159,7 +177,7 @@ fn offset_updates(
             let next_entry_position = existing.max(requested.next_entry_position);
             (next_entry_position > existing).then(|| {
                 (
-                    group_offset_key(group_id, requested.partition_id),
+                    group_offset_key(group_id, requested.partition_id, requested.producer_id),
                     next_entry_position.to_string(),
                 )
             })
@@ -171,11 +189,12 @@ fn group_offset_key_prefix(group_id: &str) -> String {
     format!("{GROUP_OFFSET_PREFIX}.{group_id}.commits.")
 }
 
-fn group_offset_key(group_id: &str, partition_id: u32) -> String {
+fn group_offset_key(group_id: &str, partition_id: u32, producer_id: u32) -> String {
     format!(
-        "{}{}{}",
+        "{}{}.{}{}",
         group_offset_key_prefix(group_id),
         partition_id,
+        producer_id,
         GROUP_OFFSET_SUFFIX
     )
 }

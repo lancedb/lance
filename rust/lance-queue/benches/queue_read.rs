@@ -4,8 +4,9 @@
 //! Matrix benchmark for Lance queue consumer read throughput.
 //!
 //! The benchmark writes CSV rows to stdout and, when `RESULT_CSV` is set, to a
-//! file. Each case creates a single-partition queue, seeds it before timing,
-//! and then measures raw consumer poll throughput.
+//! file. Each case creates a single-logical-partition queue, seeds it before
+//! timing, and then measures raw consumer poll throughput across all producer
+//! shards for that logical partition.
 //!
 //! ## Running against S3
 //!
@@ -21,7 +22,7 @@
 //! - `DATASET_PREFIX`: Base URI for queue tables. If not set, uses a temporary local directory.
 //! - `PAYLOAD_BYTES`: Approximate bytes in each JSON payload body string (default: `256`).
 //! - `REPEATS`: Repeated measurements per scenario (default: `3`).
-//! - `READ_CASES`: Optional explicit cases as `name:rows:write_batch_size:poll_entries:decode_messages` separated by `;`.
+//! - `READ_CASES`: Optional explicit cases as `name:producers:rows:write_batch_size:poll_entries:decode_messages` separated by `;`.
 //! - `RESULT_CSV`: Optional output CSV file path.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -30,25 +31,28 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use futures::future::try_join_all;
 use lance_core::{Error, Result};
-use lance_queue::{ConsumerConfig, PollOptions, Queue, StartPosition};
+use lance_queue::{ConsumerConfig, PollOptions, Producer, Queue, StartPosition};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const DEFAULT_PAYLOAD_BYTES: usize = 256;
 const DEFAULT_REPEATS: usize = 3;
-const DEFAULT_CASES: &[(&str, usize, usize, usize, bool)] = &[
-    ("read_50k_poll32", 50_000, 5_000, 32, false),
-    ("read_200k_poll1", 200_000, 5_000, 1, false),
-    ("read_200k_poll8", 200_000, 5_000, 8, false),
-    ("read_200k_poll32", 200_000, 5_000, 32, false),
-    ("read_500k_poll32", 500_000, 5_000, 32, false),
-    ("read_decode_200k_poll32", 200_000, 5_000, 32, true),
+const DEFAULT_CASES: &[(&str, u32, usize, usize, usize, bool)] = &[
+    ("read_prod1_50k_poll32", 1, 50_000, 5_000, 32, false),
+    ("read_prod1_200k_poll1", 1, 200_000, 5_000, 1, false),
+    ("read_prod1_200k_poll8", 1, 200_000, 5_000, 8, false),
+    ("read_prod1_200k_poll32", 1, 200_000, 5_000, 32, false),
+    ("read_prod4_200k_poll32", 4, 200_000, 5_000, 32, false),
+    ("read_prod8_500k_poll32", 8, 500_000, 5_000, 32, false),
+    ("read_decode_prod1_200k_poll32", 1, 200_000, 5_000, 32, true),
 ];
 
 #[derive(Debug, Clone)]
 struct ReadCase {
     name: String,
+    producer_count: u32,
     rows: usize,
     write_batch_size: usize,
     poll_entries: usize,
@@ -64,6 +68,7 @@ struct InputBatch {
 #[derive(Debug, Clone)]
 struct ReadMeasurement {
     case_name: String,
+    producer_count: u32,
     rows: usize,
     write_batch_size: usize,
     poll_entries: usize,
@@ -87,13 +92,14 @@ impl ReadMeasurement {
     }
 
     fn csv_header() -> &'static str {
-        "benchmark,case,rows,write_batch_size,poll_entries,payload_bytes,decode_messages,repeat,elapsed_seconds,rows_per_second,input_mib_per_second,wal_entries_read,arrow_batches_read,polls"
+        "benchmark,case,producer_count,rows,write_batch_size,poll_entries,payload_bytes,decode_messages,repeat,elapsed_seconds,rows_per_second,input_mib_per_second,wal_entries_read,arrow_batches_read,polls"
     }
 
     fn csv_row(&self) -> String {
         format!(
-            "read,{},{},{},{},{},{},{},{:.6},{:.3},{:.3},{},{},{}",
+            "read,{},{},{},{},{},{},{},{},{:.6},{:.3},{:.3},{},{},{}",
             self.case_name,
+            self.producer_count,
             self.rows,
             self.write_batch_size,
             self.poll_entries,
@@ -140,20 +146,22 @@ fn parse_cases() -> Vec<ReadCase> {
             .split(';')
             .filter_map(|case| {
                 let parts = case.split(':').collect::<Vec<_>>();
-                if parts.len() != 5 {
+                if parts.len() != 6 {
                     eprintln!("Ignoring invalid READ_CASES entry '{case}'");
                     return None;
                 }
-                let rows = parts[1].parse::<usize>().ok()?;
-                let write_batch_size = parts[2].parse::<usize>().ok()?;
-                let poll_entries = parts[3].parse::<usize>().ok()?;
-                let decode_messages = parse_bool(parts[4])?;
-                if rows == 0 || write_batch_size == 0 || poll_entries == 0 {
+                let producer_count = parts[1].parse::<u32>().ok()?;
+                let rows = parts[2].parse::<usize>().ok()?;
+                let write_batch_size = parts[3].parse::<usize>().ok()?;
+                let poll_entries = parts[4].parse::<usize>().ok()?;
+                let decode_messages = parse_bool(parts[5])?;
+                if producer_count == 0 || rows == 0 || write_batch_size == 0 || poll_entries == 0 {
                     eprintln!("Ignoring non-positive READ_CASES entry '{case}'");
                     return None;
                 }
                 Some(ReadCase {
                     name: parts[0].to_string(),
+                    producer_count,
                     rows,
                     write_batch_size,
                     poll_entries,
@@ -169,12 +177,15 @@ fn parse_cases() -> Vec<ReadCase> {
     DEFAULT_CASES
         .iter()
         .map(
-            |(name, rows, write_batch_size, poll_entries, decode_messages)| ReadCase {
-                name: (*name).to_string(),
-                rows: *rows,
-                write_batch_size: *write_batch_size,
-                poll_entries: *poll_entries,
-                decode_messages: *decode_messages,
+            |(name, producer_count, rows, write_batch_size, poll_entries, decode_messages)| {
+                ReadCase {
+                    name: (*name).to_string(),
+                    producer_count: *producer_count,
+                    rows: *rows,
+                    write_batch_size: *write_batch_size,
+                    poll_entries: *poll_entries,
+                    decode_messages: *decode_messages,
+                }
             },
         )
         .collect()
@@ -191,18 +202,32 @@ fn queue_uri(prefix: &str, case_name: &str, repeat: usize) -> String {
     )
 }
 
-fn make_input_batches(rows: usize, batch_size: usize, payload_bytes: usize) -> Vec<InputBatch> {
+fn rows_for_producer(total_rows: usize, producer_count: u32, producer_id: u32) -> usize {
+    let producer_count = producer_count as usize;
+    let producer_id = producer_id as usize;
+    let base = total_rows / producer_count;
+    let remainder = total_rows % producer_count;
+    base + usize::from(producer_id < remainder)
+}
+
+fn make_input_batches(
+    producer_id: u32,
+    rows: usize,
+    batch_size: usize,
+    payload_bytes: usize,
+) -> Vec<InputBatch> {
     let body = "x".repeat(payload_bytes);
     let mut batches = Vec::with_capacity(rows.div_ceil(batch_size));
     let mut next_row = 0usize;
     while next_row < rows {
         let rows_in_batch = batch_size.min(rows - next_row);
         let ids = (0..rows_in_batch)
-            .map(|idx| format!("message-{}", next_row + idx))
+            .map(|idx| format!("producer-{producer_id}-message-{}", next_row + idx))
             .collect::<Vec<_>>();
         let payloads = (0..rows_in_batch)
             .map(|idx| {
                 json!({
+                    "producer_id": producer_id,
                     "row": next_row + idx,
                     "body": body,
                 })
@@ -214,9 +239,28 @@ fn make_input_batches(rows: usize, batch_size: usize, payload_bytes: usize) -> V
     batches
 }
 
-fn input_bytes(batches: &[InputBatch]) -> u64 {
-    batches
+fn make_batches_by_producer(
+    producer_count: u32,
+    rows: usize,
+    batch_size: usize,
+    payload_bytes: usize,
+) -> Vec<Vec<InputBatch>> {
+    (0..producer_count)
+        .map(|producer_id| {
+            make_input_batches(
+                producer_id,
+                rows_for_producer(rows, producer_count, producer_id),
+                batch_size,
+                payload_bytes,
+            )
+        })
+        .collect()
+}
+
+fn input_bytes(batches_by_producer: &[Vec<InputBatch>]) -> u64 {
+    batches_by_producer
         .iter()
+        .flatten()
         .map(|batch| {
             batch.ids.iter().map(|id| id.len() as u64).sum::<u64>()
                 + batch
@@ -226,6 +270,31 @@ fn input_bytes(batches: &[InputBatch]) -> u64 {
                     .sum::<u64>()
         })
         .sum()
+}
+
+async fn seed_queue(
+    producers: &[Producer],
+    batches_by_producer: Vec<Vec<InputBatch>>,
+) -> Result<()> {
+    let mut iterators = batches_by_producer
+        .into_iter()
+        .map(Vec::into_iter)
+        .collect::<Vec<_>>();
+
+    loop {
+        let mut produce_futures = Vec::with_capacity(producers.len());
+        for (producer, batches) in producers.iter().zip(iterators.iter_mut()) {
+            if let Some(batch) = batches.next() {
+                produce_futures.push(producer.send_batch(batch.ids, batch.payloads));
+            }
+        }
+        if produce_futures.is_empty() {
+            break;
+        }
+        try_join_all(produce_futures).await?;
+    }
+
+    Ok(())
 }
 
 fn map_io_error(context: &str, error: std::io::Error) -> Error {
@@ -263,28 +332,29 @@ fn write_measurement(
     Ok(())
 }
 
-async fn seed_queue(queue: &Queue, batches: Vec<InputBatch>) -> Result<()> {
-    let producer = queue.producer();
-    for batch in batches {
-        producer.send_batch(batch.ids, batch.payloads).await?;
-    }
-    Ok(())
-}
-
 async fn run_case(
     dataset_prefix: &str,
     payload_bytes: usize,
     repeat: usize,
     case: &ReadCase,
 ) -> Result<ReadMeasurement> {
-    let input_batches = make_input_batches(case.rows, case.write_batch_size, payload_bytes);
+    let input_batches = make_batches_by_producer(
+        case.producer_count,
+        case.rows,
+        case.write_batch_size,
+        payload_bytes,
+    );
     let input_bytes = input_bytes(&input_batches);
     let queue = Queue::builder()
         .uri(queue_uri(dataset_prefix, &case.name, repeat))
         .partition_count(1)
+        .producer_count(case.producer_count)
         .create()
         .await?;
-    seed_queue(&queue, input_batches).await?;
+    let producers = (0..case.producer_count)
+        .map(|producer_id| queue.producer(producer_id))
+        .collect::<Result<Vec<_>>>()?;
+    seed_queue(&producers, input_batches).await?;
 
     let mut consumer = queue
         .consumer(
@@ -334,6 +404,7 @@ async fn run_case(
 
     Ok(ReadMeasurement {
         case_name: case.name.clone(),
+        producer_count: case.producer_count,
         rows: case.rows,
         write_batch_size: case.write_batch_size,
         poll_entries: case.poll_entries,

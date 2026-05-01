@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchIterator, StringArray,
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use arrow_select::take::take_record_batch;
@@ -41,15 +41,18 @@ use partition::{Partitioner, consumer_slot_for_partition};
 pub use wal::{QueueEntry, WalAppendResult, WalAppender, WalTailer};
 
 const QUEUE_ID_COLUMN: &str = "id";
+const QUEUE_PRODUCER_ID_COLUMN: &str = "producer_id";
 const QUEUE_PAYLOAD_COLUMN: &str = "payload";
 const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
 const QUEUE_SHARD_SPEC_ID: u32 = 1;
-const QUEUE_SHARD_FIELD_ID: &str = "primary_key_bucket";
+const QUEUE_PARTITION_FIELD_ID: &str = "queue_partition_id";
+const QUEUE_PRODUCER_FIELD_ID: &str = "producer_id";
 
 /// Configuration for creating a queue.
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     partition_count: u32,
+    producer_count: u32,
 }
 
 impl QueueConfig {
@@ -63,11 +66,20 @@ impl QueueConfig {
         self.partition_count = partition_count;
         self
     }
+
+    /// Set the number of producer shard slots per logical queue partition.
+    pub fn with_producer_count(mut self, producer_count: u32) -> Self {
+        self.producer_count = producer_count;
+        self
+    }
 }
 
 impl Default for QueueConfig {
     fn default() -> Self {
-        Self { partition_count: 1 }
+        Self {
+            partition_count: 1,
+            producer_count: 1,
+        }
     }
 }
 
@@ -132,6 +144,12 @@ impl QueueBuilder {
         self
     }
 
+    /// Set the number of producer shard slots per logical queue partition.
+    pub fn producer_count(mut self, producer_count: u32) -> Self {
+        self.config = self.config.with_producer_count(producer_count);
+        self
+    }
+
     /// Create the queue table and initialize its MemWAL index.
     pub async fn create(self) -> Result<Queue> {
         let Self { target, config } = self;
@@ -168,9 +186,11 @@ fn required_target(target: Option<QueueTarget>) -> Result<QueueTarget> {
 /// Queue partition metadata derived from the table's MemWAL shard snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuePartition {
-    /// Stable partition id.
+    /// Logical queue partition id derived from `id`.
     pub partition_id: u32,
-    /// MemWAL shard id used to store this partition's WAL files.
+    /// Producer shard slot id.
+    pub producer_id: u32,
+    /// MemWAL shard id used to store this physical producer shard's WAL files.
     pub shard_id: Uuid,
     /// MemWAL shard spec used to route rows to this partition.
     pub shard_spec_id: u32,
@@ -186,6 +206,8 @@ pub struct Queue {
     schema: Arc<ArrowSchema>,
     primary_key_columns: Arc<Vec<String>>,
     mem_wal_index_details: Arc<MemWalIndexDetails>,
+    partition_count: u32,
+    producer_count: u32,
     partitions: Arc<Vec<QueuePartition>>,
 }
 
@@ -204,6 +226,7 @@ impl Queue {
     pub async fn create_with_config(uri: impl AsRef<str>, config: QueueConfig) -> Result<Self> {
         QueueBuilder::from_uri(uri.as_ref())
             .partition_count(config.partition_count)
+            .producer_count(config.producer_count)
             .create()
             .await
     }
@@ -226,6 +249,18 @@ impl Queue {
             )
         })?;
         let partitions = queue_partitions(&dataset, &mem_wal_index_details).await?;
+        let partition_count = partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .max()
+            .map(|partition_id| partition_id + 1)
+            .unwrap_or(0);
+        let producer_count = partitions
+            .iter()
+            .map(|partition| partition.producer_id)
+            .max()
+            .map(|producer_id| producer_id + 1)
+            .unwrap_or(0);
         let schema = Arc::new(ArrowSchema::from(lance_schema));
         Ok(Self {
             uri,
@@ -235,6 +270,8 @@ impl Queue {
             schema,
             primary_key_columns: Arc::new(primary_key_columns),
             mem_wal_index_details: Arc::new(mem_wal_index_details),
+            partition_count,
+            producer_count,
             partitions: Arc::new(partitions),
         })
     }
@@ -246,7 +283,12 @@ impl Queue {
 
     /// Number of queue partitions.
     pub fn partition_count(&self) -> u32 {
-        self.partitions.len() as u32
+        self.partition_count
+    }
+
+    /// Number of configured producer shard slots.
+    pub fn producer_count(&self) -> u32 {
+        self.producer_count
     }
 
     /// Primary key columns used for hash partitioning.
@@ -269,31 +311,14 @@ impl Queue {
         &self.schema
     }
 
-    /// Queue partition metadata.
+    /// Physical queue shard metadata.
     pub fn partitions(&self) -> &[QueuePartition] {
         self.partitions.as_slice()
     }
 
     /// Create a producer for this queue.
-    pub fn producer(&self) -> Producer {
-        let appenders = self
-            .partitions
-            .iter()
-            .map(|partition| {
-                WalAppender::new(
-                    self.object_store.clone(),
-                    self.base_path.clone(),
-                    partition.partition_id,
-                    partition.shard_id,
-                    partition.shard_spec_id,
-                )
-            })
-            .collect();
-
-        Producer {
-            queue: self.clone(),
-            appenders: Arc::new(appenders),
-        }
+    pub fn producer(&self, producer_id: u32) -> Result<Producer> {
+        Producer::new(self.clone(), producer_id)
     }
 
     /// Create a consumer for this queue.
@@ -301,25 +326,30 @@ impl Queue {
         Consumer::open(self.clone(), config).await
     }
 
-    fn partition(&self, partition_id: u32) -> Result<&QueuePartition> {
+    fn partition(&self, partition_id: u32, producer_id: u32) -> Result<&QueuePartition> {
         self.partitions
-            .get(partition_id as usize)
-            .filter(|partition| partition.partition_id == partition_id)
+            .iter()
+            .find(|partition| {
+                partition.partition_id == partition_id && partition.producer_id == producer_id
+            })
             .ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "partition_id {} is out of range for queue with {} partitions",
+                    "partition_id {} producer_id {} is out of range for queue with {} partitions and {} producer slots",
                     partition_id,
-                    self.partition_count()
+                    producer_id,
+                    self.partition_count(),
+                    self.producer_count()
                 ))
             })
     }
 
-    fn wal_tailer(&self, partition_id: u32) -> Result<WalTailer> {
-        let partition = self.partition(partition_id)?;
+    fn wal_tailer(&self, partition_id: u32, producer_id: u32) -> Result<WalTailer> {
+        let partition = self.partition(partition_id, producer_id)?;
         Ok(WalTailer::new(
             self.object_store.clone(),
             self.base_path.clone(),
             partition.partition_id,
+            partition.producer_id,
             partition.shard_id,
         ))
     }
@@ -342,6 +372,11 @@ async fn create_queue(target: QueueTarget, config: QueueConfig) -> Result<Queue>
             "partition_count must be greater than 0",
         ));
     }
+    if config.producer_count == 0 {
+        return Err(Error::invalid_input(
+            "producer_count must be greater than 0",
+        ));
+    }
     if config.partition_count > i32::MAX as u32 {
         return Err(Error::invalid_input(format!(
             "partition_count {} exceeds supported maximum {}",
@@ -349,6 +384,22 @@ async fn create_queue(target: QueueTarget, config: QueueConfig) -> Result<Queue>
             i32::MAX
         )));
     }
+    if config.producer_count > i32::MAX as u32 {
+        return Err(Error::invalid_input(format!(
+            "producer_count {} exceeds supported maximum {}",
+            config.producer_count,
+            i32::MAX
+        )));
+    }
+    let num_shards = config
+        .partition_count
+        .checked_mul(config.producer_count)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "partition_count {} * producer_count {} overflows u32",
+                config.partition_count, config.producer_count
+            ))
+        })?;
 
     let schema = queue_schema();
     let reader = RecordBatchIterator::new(
@@ -374,13 +425,17 @@ async fn create_queue(target: QueueTarget, config: QueueConfig) -> Result<Queue>
     };
 
     let lance_schema = dataset.schema();
-    let shard_spec = queue_shard_spec(config.partition_count, lance_schema)?;
-    let initial_shards = (0..config.partition_count)
-        .map(|partition_id| {
-            MemWalShardSnapshot::new(Uuid::new_v4(), QUEUE_SHARD_SPEC_ID)
-                .with_shard_field_value(QUEUE_SHARD_FIELD_ID, partition_id as i32)
-        })
-        .collect();
+    let shard_spec = queue_shard_spec(config.partition_count, config.producer_count, lance_schema)?;
+    let mut initial_shards = Vec::with_capacity(num_shards as usize);
+    for partition_id in 0..config.partition_count {
+        for producer_id in 0..config.producer_count {
+            initial_shards.push(
+                MemWalShardSnapshot::new(Uuid::new_v4(), QUEUE_SHARD_SPEC_ID)
+                    .with_shard_field_value(QUEUE_PARTITION_FIELD_ID, partition_id as i32)
+                    .with_shard_field_value(QUEUE_PRODUCER_FIELD_ID, producer_id as i32),
+            );
+        }
+    }
     dataset
         .initialize_mem_wal_with_shards(
             MemWalConfig {
@@ -388,7 +443,7 @@ async fn create_queue(target: QueueTarget, config: QueueConfig) -> Result<Queue>
                 maintained_indexes: Vec::new(),
             },
             MemWalShardConfig {
-                num_shards: config.partition_count,
+                num_shards,
                 initial_shards,
             },
         )
@@ -410,6 +465,7 @@ fn queue_schema() -> Arc<ArrowSchema> {
         HashMap::from([(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]);
     Arc::new(ArrowSchema::new(vec![
         Field::new(QUEUE_ID_COLUMN, DataType::Utf8, false).with_metadata(id_metadata),
+        Field::new(QUEUE_PRODUCER_ID_COLUMN, DataType::UInt32, false),
         json_field(QUEUE_PAYLOAD_COLUMN, false),
     ]))
 }
@@ -418,7 +474,7 @@ fn validate_queue_schema(schema: &LanceSchema) -> Result<()> {
     let arrow_schema = ArrowSchema::from(schema);
     if arrow_schema.fields() != queue_schema().fields() {
         return Err(Error::invalid_input(format!(
-            "queue table schema must be fixed id/payload schema: expected fields {:?}, got fields {:?}",
+            "queue table schema must be fixed id/producer_id/payload schema: expected fields {:?}, got fields {:?}",
             queue_schema().fields(),
             arrow_schema.fields()
         )));
@@ -441,7 +497,11 @@ fn primary_key_columns(schema: &LanceSchema) -> Result<Vec<String>> {
         .collect())
 }
 
-fn queue_shard_spec(partition_count: u32, schema: &LanceSchema) -> Result<ShardSpec> {
+fn queue_shard_spec(
+    partition_count: u32,
+    producer_count: u32,
+    schema: &LanceSchema,
+) -> Result<ShardSpec> {
     let primary_key_fields = schema.unenforced_primary_key();
     let source_ids = primary_key_fields
         .iter()
@@ -455,21 +515,37 @@ fn queue_shard_spec(partition_count: u32, schema: &LanceSchema) -> Result<ShardS
 
     let mut parameters = HashMap::new();
     parameters.insert("num_buckets".to_string(), partition_count.to_string());
+    let mut producer_parameters = HashMap::new();
+    producer_parameters.insert(
+        "source_column".to_string(),
+        QUEUE_PRODUCER_ID_COLUMN.to_string(),
+    );
+    producer_parameters.insert("producer_count".to_string(), producer_count.to_string());
 
     Ok(ShardSpec {
         spec_id: QUEUE_SHARD_SPEC_ID,
-        fields: vec![ShardField {
-            field_id: QUEUE_SHARD_FIELD_ID.to_string(),
-            source_ids,
-            transform: Some(if primary_key_fields.len() == 1 {
-                "bucket".to_string()
-            } else {
-                "multi_bucket".to_string()
-            }),
-            expression: None,
-            result_type: "int32".to_string(),
-            parameters,
-        }],
+        fields: vec![
+            ShardField {
+                field_id: QUEUE_PARTITION_FIELD_ID.to_string(),
+                source_ids,
+                transform: Some(if primary_key_fields.len() == 1 {
+                    "bucket".to_string()
+                } else {
+                    "multi_bucket".to_string()
+                }),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters,
+            },
+            ShardField {
+                field_id: QUEUE_PRODUCER_FIELD_ID.to_string(),
+                source_ids: vec![schema.field_id(QUEUE_PRODUCER_ID_COLUMN)?],
+                transform: Some("identity".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: producer_parameters,
+            },
+        ],
     })
 }
 
@@ -484,6 +560,28 @@ async fn queue_partitions(
     }
 
     let shard_spec = queue_shard_spec_from_details(details)?;
+    let partition_count = shard_spec.fields[0]
+        .parameters
+        .get("num_buckets")
+        .ok_or_else(|| Error::invalid_input("queue MemWAL shard spec is missing num_buckets"))?
+        .parse::<u32>()
+        .map_err(|e| {
+            Error::invalid_input(format!(
+                "queue MemWAL shard spec has invalid num_buckets: {}",
+                e
+            ))
+        })?;
+    let producer_count = shard_spec.fields[1]
+        .parameters
+        .get("producer_count")
+        .ok_or_else(|| Error::invalid_input("queue MemWAL shard spec is missing producer_count"))?
+        .parse::<u32>()
+        .map_err(|e| {
+            Error::invalid_input(format!(
+                "queue MemWAL shard spec has invalid producer_count: {}",
+                e
+            ))
+        })?;
     let snapshots = dataset.mem_wal_shard_snapshots().await?;
     if snapshots.len() != details.num_shards as usize {
         return Err(Error::invalid_input(format!(
@@ -499,42 +597,86 @@ async fn queue_partitions(
         if snapshot.shard_spec_id != shard_spec.spec_id {
             continue;
         }
-        let bucket = snapshot
+        let partition_bucket = snapshot
             .shard_field_values
-            .get(QUEUE_SHARD_FIELD_ID)
+            .get(QUEUE_PARTITION_FIELD_ID)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "queue MemWAL shard snapshot for shard {} is missing '{}' field",
-                    snapshot.shard_id, QUEUE_SHARD_FIELD_ID
+                    snapshot.shard_id, QUEUE_PARTITION_FIELD_ID
                 ))
             })?;
-        if *bucket < 0 || *bucket as u32 >= details.num_shards {
+        let producer_bucket = snapshot
+            .shard_field_values
+            .get(QUEUE_PRODUCER_FIELD_ID)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "queue MemWAL shard snapshot for shard {} is missing '{}' field",
+                    snapshot.shard_id, QUEUE_PRODUCER_FIELD_ID
+                ))
+            })?;
+        if *partition_bucket < 0 || *partition_bucket as u32 >= partition_count {
             return Err(Error::invalid_input(format!(
-                "queue MemWAL shard snapshot bucket {} is outside [0, {})",
-                bucket, details.num_shards
+                "queue MemWAL shard snapshot partition bucket {} is outside [0, {})",
+                partition_bucket, partition_count
             )));
         }
-        let partition_id = *bucket as u32;
-        if !seen.insert(partition_id) {
+        if *producer_bucket < 0 {
             return Err(Error::invalid_input(format!(
-                "queue MemWAL shard snapshots contain duplicate partition_id {}",
-                partition_id
+                "queue MemWAL shard snapshot producer bucket {} is negative",
+                producer_bucket
+            )));
+        }
+        if *producer_bucket as u32 >= producer_count {
+            return Err(Error::invalid_input(format!(
+                "queue MemWAL shard snapshot producer bucket {} is outside [0, {})",
+                producer_bucket, producer_count
+            )));
+        }
+        let partition_id = *partition_bucket as u32;
+        let producer_id = *producer_bucket as u32;
+        if !seen.insert((partition_id, producer_id)) {
+            return Err(Error::invalid_input(format!(
+                "queue MemWAL shard snapshots contain duplicate partition_id {} producer_id {}",
+                partition_id, producer_id
             )));
         }
         partitions.push(QueuePartition {
             partition_id,
+            producer_id,
             shard_id: snapshot.shard_id,
             shard_spec_id: snapshot.shard_spec_id,
         });
     }
 
-    partitions.sort_by_key(|partition| partition.partition_id);
+    partitions.sort_by_key(|partition| (partition.partition_id, partition.producer_id));
     if partitions.len() != details.num_shards as usize {
         return Err(Error::invalid_input(format!(
-            "queue MemWAL shard snapshots cover {} partitions but num_shards is {}",
+            "queue MemWAL shard snapshots cover {} physical producer shards but num_shards is {}",
             partitions.len(),
             details.num_shards
         )));
+    }
+
+    if partition_count
+        .checked_mul(producer_count)
+        .filter(|expected| *expected == details.num_shards)
+        .is_none()
+    {
+        return Err(Error::invalid_input(format!(
+            "queue MemWAL num_shards {} is not divisible by logical partition_count {}",
+            details.num_shards, partition_count
+        )));
+    }
+    for partition_id in 0..partition_count {
+        for producer_id in 0..producer_count {
+            if !seen.contains(&(partition_id, producer_id)) {
+                return Err(Error::invalid_input(format!(
+                    "queue MemWAL shard snapshots are missing partition_id {} producer_id {}",
+                    partition_id, producer_id
+                )));
+            }
+        }
     }
     Ok(partitions)
 }
@@ -544,34 +686,36 @@ fn queue_shard_spec_from_details(details: &MemWalIndexDetails) -> Result<&ShardS
         .shard_specs
         .iter()
         .filter(|spec| {
-            spec.fields.len() == 1
-                && spec.fields[0].field_id == QUEUE_SHARD_FIELD_ID
+            spec.fields.len() == 2
+                && spec.fields[0].field_id == QUEUE_PARTITION_FIELD_ID
                 && spec.fields[0].result_type == "int32"
+                && spec.fields[1].field_id == QUEUE_PRODUCER_FIELD_ID
+                && spec.fields[1].result_type == "int32"
         })
         .collect::<Vec<_>>();
     if matching.len() != 1 {
         return Err(Error::invalid_input(format!(
-            "queue MemWAL index must contain exactly one '{}' shard spec, found {}",
-            QUEUE_SHARD_FIELD_ID,
+            "queue MemWAL index must contain exactly one partition+producer shard spec, found {}",
             matching.len()
         )));
     }
 
     let spec = matching[0];
-    let field = &spec.fields[0];
-    match field.transform.as_deref() {
+    let partition_field = &spec.fields[0];
+    match partition_field.transform.as_deref() {
         Some("bucket") | Some("multi_bucket") => {}
         other => {
             return Err(Error::invalid_input(format!(
-                "queue MemWAL shard spec must use bucket or multi_bucket transform, got {:?}",
+                "queue MemWAL partition shard field must use bucket or multi_bucket transform, got {:?}",
                 other
             )));
         }
     }
-    if field.parameters.get("num_buckets") != Some(&details.num_shards.to_string()) {
+    let producer_field = &spec.fields[1];
+    if producer_field.transform.as_deref() != Some("identity") {
         return Err(Error::invalid_input(format!(
-            "queue MemWAL shard spec num_buckets does not match num_shards {}",
-            details.num_shards
+            "queue MemWAL producer shard field must use identity transform, got {:?}",
+            producer_field.transform
         )));
     }
     Ok(spec)
@@ -581,10 +725,45 @@ fn queue_shard_spec_from_details(details: &MemWalIndexDetails) -> Result<&ShardS
 #[derive(Debug, Clone)]
 pub struct Producer {
     queue: Queue,
+    producer_id: u32,
     appenders: Arc<Vec<WalAppender>>,
 }
 
 impl Producer {
+    fn new(queue: Queue, producer_id: u32) -> Result<Self> {
+        if producer_id >= queue.producer_count() {
+            return Err(Error::invalid_input(format!(
+                "producer_id {} is out of range for queue with {} producer slots",
+                producer_id,
+                queue.producer_count()
+            )));
+        }
+
+        let mut appenders = Vec::with_capacity(queue.partition_count() as usize);
+        for partition_id in 0..queue.partition_count() {
+            let partition = queue.partition(partition_id, producer_id)?;
+            appenders.push(WalAppender::new(
+                queue.object_store.clone(),
+                queue.base_path.clone(),
+                partition.partition_id,
+                partition.producer_id,
+                partition.shard_id,
+                partition.shard_spec_id,
+            ));
+        }
+
+        Ok(Self {
+            queue,
+            producer_id,
+            appenders: Arc::new(appenders),
+        })
+    }
+
+    /// Producer shard slot id used by this producer.
+    pub fn producer_id(&self) -> u32 {
+        self.producer_id
+    }
+
     /// Send one JSON payload.
     pub async fn send(&self, id: impl Into<String>, payload: Value) -> Result<ProduceResult> {
         self.send_batch([id], [payload]).await
@@ -599,7 +778,8 @@ impl Producer {
     {
         let ids = ids.into_iter().map(Into::into).collect::<Vec<_>>();
         let payloads = payloads.into_iter().collect::<Vec<_>>();
-        self.send_record_batch(message_batch(ids, payloads)?).await
+        self.send_record_batch(message_batch(ids, payloads, self.producer_id)?)
+            .await
     }
 
     async fn send_record_batch(&self, batch: RecordBatch) -> Result<ProduceResult> {
@@ -614,12 +794,12 @@ impl Producer {
         )?;
         let partitioned_batches = partitioner.partition_batch(&batch)?;
 
-        let mut append_futures = Vec::with_capacity(partitioned_batches.len());
+        let mut produce_futures = Vec::with_capacity(partitioned_batches.len());
         for (partition_id, partition_batch) in partitioned_batches {
             let appender = self.appender(partition_id)?;
-            append_futures.push(async move { appender.append(vec![partition_batch]).await });
+            produce_futures.push(async move { appender.append(vec![partition_batch]).await });
         }
-        let entries = try_join_all(append_futures).await?;
+        let entries = try_join_all(produce_futures).await?;
 
         Ok(ProduceResult {
             num_rows: batch.num_rows(),
@@ -647,7 +827,7 @@ impl Producer {
     }
 
     fn appender(&self, partition_id: u32) -> Result<&WalAppender> {
-        self.queue.partition(partition_id)?;
+        self.queue.partition(partition_id, self.producer_id)?;
         self.appenders.get(partition_id as usize).ok_or_else(|| {
             Error::invalid_input(format!(
                 "partition_id {} is out of range for queue with {} partitions",
@@ -735,7 +915,7 @@ impl ConsumerConfig {
 /// Poll options.
 #[derive(Debug, Clone)]
 pub struct PollOptions {
-    /// Maximum WAL entries to read from each assigned partition.
+    /// Maximum WAL entries to read from each assigned physical producer shard.
     pub max_entries_per_partition: usize,
 }
 
@@ -752,6 +932,8 @@ impl Default for PollOptions {
 pub struct QueueBatch {
     /// Partition this batch came from.
     pub partition_id: u32,
+    /// Producer shard this batch came from.
+    pub producer_id: u32,
     /// WAL entry position.
     pub entry_position: u64,
     /// Next offset to commit after processing this batch.
@@ -771,6 +953,7 @@ impl QueueBatch {
 
         Ok(Self {
             partition_id: entry.partition_id,
+            producer_id: entry.producer_id,
             entry_position: entry.entry_position,
             next_entry_position,
             batches: entry.batches,
@@ -798,7 +981,8 @@ pub struct Consumer {
     queue: Queue,
     group_id: String,
     assigned_partitions: Vec<u32>,
-    next_entry_positions: HashMap<u32, u64>,
+    assigned_shards: Vec<(u32, u32)>,
+    next_entry_positions: HashMap<(u32, u32), u64>,
 }
 
 impl Consumer {
@@ -809,34 +993,53 @@ impl Consumer {
 
         let mut metadata_dataset = queue.dataset.as_ref().clone();
         metadata_dataset.checkout_latest().await?;
-        let committed_positions: HashMap<u32, u64> =
+        let committed_positions: HashMap<(u32, u32), u64> =
             metadata::read_all_group_offsets(metadata_dataset.metadata(), &config.group_id)?
                 .into_iter()
-                .map(|offset| (offset.partition_id, offset.next_entry_position))
+                .map(|offset| {
+                    (
+                        (offset.partition_id, offset.producer_id),
+                        offset.next_entry_position,
+                    )
+                })
                 .collect();
 
-        let mut next_entry_positions = HashMap::with_capacity(assigned_partitions.len());
-        for partition_id in &assigned_partitions {
-            let position = if let Some(position) = committed_positions.get(partition_id) {
+        let assigned_shards = assigned_partitions
+            .iter()
+            .flat_map(|partition_id| {
+                (0..queue.producer_count()).map(|producer_id| (*partition_id, producer_id))
+            })
+            .collect::<Vec<_>>();
+        let mut next_entry_positions = HashMap::with_capacity(assigned_shards.len());
+        for (partition_id, producer_id) in &assigned_shards {
+            let key = (*partition_id, *producer_id);
+            let position = if let Some(position) = committed_positions.get(&key) {
                 *position
             } else {
                 match config.start_position {
                     StartPosition::Earliest => {
-                        queue.wal_tailer(*partition_id)?.first_position().await?
+                        queue
+                            .wal_tailer(*partition_id, *producer_id)?
+                            .first_position()
+                            .await?
                     }
                     StartPosition::Latest => {
-                        queue.wal_tailer(*partition_id)?.next_position().await?
+                        queue
+                            .wal_tailer(*partition_id, *producer_id)?
+                            .next_position()
+                            .await?
                     }
                 }
             };
 
-            next_entry_positions.insert(*partition_id, position);
+            next_entry_positions.insert(key, position);
         }
 
         Ok(Self {
             queue,
             group_id: config.group_id,
             assigned_partitions,
+            assigned_shards,
             next_entry_positions,
         })
     }
@@ -846,7 +1049,7 @@ impl Consumer {
         &self.assigned_partitions
     }
 
-    /// Poll at most one WAL entry from each assigned partition.
+    /// Poll at most one WAL entry from each assigned physical producer shard.
     ///
     /// If reading any assigned partition fails, the entire poll fails and the
     /// consumer keeps its previous in-memory offsets.
@@ -867,13 +1070,14 @@ impl Consumer {
 
         let mut out = Vec::new();
         let mut next_entry_positions = self.next_entry_positions.clone();
-        for partition_id in &self.assigned_partitions {
-            let tailer = self.queue.wal_tailer(*partition_id)?;
+        for (partition_id, producer_id) in &self.assigned_shards {
+            let tailer = self.queue.wal_tailer(*partition_id, *producer_id)?;
             for _ in 0..options.max_entries_per_partition {
-                let position = *next_entry_positions.get(partition_id).ok_or_else(|| {
+                let key = (*partition_id, *producer_id);
+                let position = *next_entry_positions.get(&key).ok_or_else(|| {
                     Error::internal(format!(
-                        "missing next entry position for assigned partition_id {}",
-                        partition_id
+                        "missing next entry position for assigned partition_id {} producer_id {}",
+                        partition_id, producer_id
                     ))
                 })?;
 
@@ -882,7 +1086,7 @@ impl Consumer {
                 };
 
                 let batch = QueueBatch::from_entry(entry)?;
-                next_entry_positions.insert(*partition_id, batch.next_entry_position);
+                next_entry_positions.insert(key, batch.next_entry_position);
                 out.push(batch);
             }
         }
@@ -893,7 +1097,7 @@ impl Consumer {
 
     /// Commit offsets for processed queue batches.
     pub async fn commit(&self, batches: &[QueueBatch]) -> Result<()> {
-        let mut latest = HashMap::<u32, u64>::new();
+        let mut latest = HashMap::<(u32, u32), u64>::new();
         for batch in batches {
             if !self.assigned_partitions.contains(&batch.partition_id) {
                 return Err(Error::invalid_input(format!(
@@ -901,19 +1105,23 @@ impl Consumer {
                     batch.partition_id
                 )));
             }
-            self.queue.partition(batch.partition_id)?;
+            self.queue
+                .partition(batch.partition_id, batch.producer_id)?;
             latest
-                .entry(batch.partition_id)
+                .entry((batch.partition_id, batch.producer_id))
                 .and_modify(|position| *position = (*position).max(batch.next_entry_position))
                 .or_insert(batch.next_entry_position);
         }
 
         let offsets = latest
             .into_iter()
-            .map(|(partition_id, next_entry_position)| ConsumerGroupOffset {
-                partition_id,
-                next_entry_position,
-            })
+            .map(
+                |((partition_id, producer_id), next_entry_position)| ConsumerGroupOffset {
+                    partition_id,
+                    producer_id,
+                    next_entry_position,
+                },
+            )
             .collect::<Vec<_>>();
         metadata::write_group_offsets(self.queue.dataset.as_ref(), &self.group_id, &offsets)
             .await?;
@@ -923,17 +1131,18 @@ impl Consumer {
 
     /// Commit the consumer's current in-memory offsets.
     pub async fn commit_current(&self) -> Result<()> {
-        let mut offsets = Vec::with_capacity(self.assigned_partitions.len());
-        for partition_id in &self.assigned_partitions {
-            let next_entry_position =
-                *self.next_entry_positions.get(partition_id).ok_or_else(|| {
-                    Error::internal(format!(
-                        "missing next entry position for assigned partition_id {}",
-                        partition_id
-                    ))
-                })?;
+        let mut offsets = Vec::with_capacity(self.assigned_shards.len());
+        for (partition_id, producer_id) in &self.assigned_shards {
+            let key = (*partition_id, *producer_id);
+            let next_entry_position = *self.next_entry_positions.get(&key).ok_or_else(|| {
+                Error::internal(format!(
+                    "missing next entry position for assigned partition_id {} producer_id {}",
+                    partition_id, producer_id
+                ))
+            })?;
             offsets.push(ConsumerGroupOffset {
                 partition_id: *partition_id,
+                producer_id: *producer_id,
                 next_entry_position,
             });
         }
@@ -945,11 +1154,7 @@ impl Consumer {
 
 fn assigned_consumer_partitions(queue: &Queue, assignment: ConsumerAssignment) -> Result<Vec<u32>> {
     match assignment {
-        ConsumerAssignment::All => Ok(queue
-            .partitions
-            .iter()
-            .map(|partition| partition.partition_id)
-            .collect()),
+        ConsumerAssignment::All => Ok((0..queue.partition_count()).collect()),
         ConsumerAssignment::ConsumerPartition {
             partition_count,
             partition_id,
@@ -977,12 +1182,10 @@ fn assigned_hashed_partitions(
         )));
     }
 
-    queue
-        .partitions
-        .iter()
-        .filter_map(|partition| {
-            match consumer_slot_for_partition(partition.partition_id, partition_count) {
-                Ok(slot_id) if slot_id == partition_id => Some(Ok(partition.partition_id)),
+    (0..queue.partition_count())
+        .filter_map(|queue_partition_id| {
+            match consumer_slot_for_partition(queue_partition_id, partition_count) {
+                Ok(slot_id) if slot_id == partition_id => Some(Ok(queue_partition_id)),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             }
@@ -993,7 +1196,7 @@ fn assigned_hashed_partitions(
 fn validate_manual_partitions(queue: &Queue, partitions: Vec<u32>) -> Result<Vec<u32>> {
     let mut seen = HashSet::with_capacity(partitions.len());
     for partition_id in &partitions {
-        queue.partition(*partition_id)?;
+        validate_logical_partition(queue, *partition_id)?;
         if !seen.insert(*partition_id) {
             return Err(Error::invalid_input(format!(
                 "partition_id {} is assigned more than once",
@@ -1004,7 +1207,18 @@ fn validate_manual_partitions(queue: &Queue, partitions: Vec<u32>) -> Result<Vec
     Ok(partitions)
 }
 
-fn message_batch(ids: Vec<String>, payloads: Vec<Value>) -> Result<RecordBatch> {
+fn validate_logical_partition(queue: &Queue, partition_id: u32) -> Result<()> {
+    if partition_id >= queue.partition_count() {
+        return Err(Error::invalid_input(format!(
+            "partition_id {} is out of range for queue with {} logical partitions",
+            partition_id,
+            queue.partition_count()
+        )));
+    }
+    Ok(())
+}
+
+fn message_batch(ids: Vec<String>, payloads: Vec<Value>, producer_id: u32) -> Result<RecordBatch> {
     if ids.len() != payloads.len() {
         return Err(Error::invalid_input(format!(
             "ids length ({}) must match payloads length ({})",
@@ -1034,6 +1248,7 @@ fn message_batch(ids: Vec<String>, payloads: Vec<Value>) -> Result<RecordBatch> 
         queue_schema(),
         vec![
             Arc::new(StringArray::from(ids)) as ArrayRef,
+            Arc::new(UInt32Array::from_value(producer_id, payload_strings.len())) as ArrayRef,
             Arc::new(payload) as ArrayRef,
         ],
     )
@@ -1174,15 +1389,6 @@ mod tests {
         format!("file://{}", temp_dir.path().display())
     }
 
-    fn batch(ids: Vec<i32>) -> RecordBatch {
-        let message_ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let payloads = ids
-            .iter()
-            .map(|id| json!({ "value": id }))
-            .collect::<Vec<_>>();
-        message_batch(message_ids, payloads).unwrap()
-    }
-
     fn mismatched_batch(ids: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -1197,6 +1403,58 @@ mod tests {
             .map(|id| json!({ "value": id }))
             .collect::<Vec<_>>();
         (ids, payloads)
+    }
+
+    async fn produce_to_partition(
+        queue: &Queue,
+        producer_id: u32,
+        partition_id: u32,
+        values: Vec<i32>,
+    ) -> ProduceResult {
+        let batch = batch_for_partition(queue, producer_id, partition_id, values);
+        queue
+            .producer(producer_id)
+            .unwrap()
+            .send_to_partition(partition_id, vec![batch])
+            .await
+            .unwrap()
+    }
+
+    fn batch_for_partition(
+        queue: &Queue,
+        producer_id: u32,
+        partition_id: u32,
+        values: Vec<i32>,
+    ) -> RecordBatch {
+        let mut ids = Vec::with_capacity(values.len());
+        let mut payloads = Vec::with_capacity(values.len());
+        for value in values {
+            ids.push(id_for_partition(queue, producer_id, partition_id, value));
+            payloads.push(json!({ "value": value }));
+        }
+        message_batch(ids, payloads, producer_id).unwrap()
+    }
+
+    fn id_for_partition(queue: &Queue, producer_id: u32, partition_id: u32, value: i32) -> String {
+        let partitioner = Partitioner::new(
+            queue.partition_count(),
+            queue.primary_key_columns().to_vec(),
+        )
+        .unwrap();
+        for nonce in 0..10_000 {
+            let id = format!("partition-{partition_id}-value-{value}-{nonce}");
+            let candidate = message_batch(
+                vec![id.clone()],
+                vec![json!({ "value": value })],
+                producer_id,
+            )
+            .unwrap();
+            let partitions = partitioner.partition_batch(&candidate).unwrap();
+            if partitions.len() == 1 && partitions[0].0 == partition_id {
+                return id;
+            }
+        }
+        panic!("failed to find id for partition {partition_id}");
     }
 
     fn count_rows(batches: &[QueueBatch]) -> usize {
@@ -1214,19 +1472,36 @@ mod tests {
         let (store, base_path) = ObjectStore::from_uri(&uri).await.unwrap();
         let shard_id = Uuid::new_v4();
 
-        let appender = WalAppender::new(store.clone(), base_path.clone(), 0, shard_id, 1);
-        let first = appender.append(vec![batch(vec![1, 2])]).await.unwrap();
-        let second = appender.append(vec![batch(vec![3])]).await.unwrap();
+        let appender = WalAppender::new(store.clone(), base_path.clone(), 0, 7, shard_id, 1);
+        let first = appender
+            .append(vec![
+                message_batch(
+                    vec!["1".to_string(), "2".to_string()],
+                    vec![json!({ "value": 1 }), json!({ "value": 2 })],
+                    7,
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let second = appender
+            .append(vec![
+                message_batch(vec!["3".to_string()], vec![json!({ "value": 3 })], 7).unwrap(),
+            ])
+            .await
+            .unwrap();
 
         assert_eq!(first.entry_position, 1);
+        assert_eq!(first.producer_id, 7);
         assert_eq!(first.num_rows, 2);
         assert_eq!(second.entry_position, 2);
 
-        let tailer = WalTailer::new(store, base_path, 0, shard_id);
+        let tailer = WalTailer::new(store, base_path, 0, 7, shard_id);
         let first_read = tailer.read_entry(1).await.unwrap().unwrap();
         let second_read = tailer.read_entry(2).await.unwrap().unwrap();
         let missing = tailer.read_entry(3).await.unwrap();
 
+        assert_eq!(first_read.producer_id, 7);
         assert_eq!(first_read.batches.len(), 1);
         assert_eq!(first_read.batches[0].num_rows(), 2);
         assert_eq!(second_read.batches[0].num_rows(), 1);
@@ -1247,11 +1522,17 @@ mod tests {
         assert_eq!(queue.primary_key_columns(), &["id".to_string()]);
 
         let (ids, payloads) = message_values(0, 20);
-        let result = queue.producer().send_batch(ids, payloads).await.unwrap();
+        let result = queue
+            .producer(0)
+            .unwrap()
+            .send_batch(ids, payloads)
+            .await
+            .unwrap();
 
         assert_eq!(result.num_rows, 20);
         assert_eq!(result.entries.len(), 2);
         assert!(result.entries.iter().all(|entry| entry.num_rows > 0));
+        assert!(result.entries.iter().all(|entry| entry.producer_id == 0));
     }
 
     #[tokio::test]
@@ -1261,7 +1542,8 @@ mod tests {
         let queue = Queue::builder().uri(&uri).create().await.unwrap();
 
         queue
-            .producer()
+            .producer(0)
+            .unwrap()
             .send("message-1", json!({ "kind": "created", "version": 1 }))
             .await
             .unwrap();
@@ -1282,23 +1564,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_independent_producers_do_not_fence_each_other() {
+    async fn test_producer_rejects_empty_or_mismatched_batches() {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = queue_uri(&temp_dir);
         let queue = Queue::builder().uri(&uri).create().await.unwrap();
-        let first = queue.producer();
-        let second = queue.producer();
+        let producer = queue.producer(0).unwrap();
 
-        first
-            .send_to_partition(0, vec![batch(vec![1])])
+        let err = producer
+            .send_batch(["message-1"], Vec::<Value>::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ids length"), "{}", err);
+
+        let err = producer
+            .send_batch(Vec::<String>::new(), Vec::<Value>::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty message batch"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_producer_count_defines_physical_shards() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = queue_uri(&temp_dir);
+        let queue = Queue::builder()
+            .uri(&uri)
+            .partition_count(1)
+            .producer_count(2)
+            .create()
             .await
             .unwrap();
-        second
-            .send_to_partition(0, vec![batch(vec![2])])
+
+        assert_eq!(queue.partition_count(), 1);
+        assert_eq!(queue.producer_count(), 2);
+        assert!(queue.producer(2).is_err());
+        queue
+            .producer(0)
+            .unwrap()
+            .send("same-key", json!({ "producer": 0 }))
             .await
             .unwrap();
-        first
-            .send_to_partition(0, vec![batch(vec![3])])
+        queue
+            .producer(1)
+            .unwrap()
+            .send("same-key", json!({ "producer": 1 }))
             .await
             .unwrap();
 
@@ -1306,13 +1615,30 @@ mod tests {
             .consumer(ConsumerConfig::new("multi-producer-group"))
             .await
             .unwrap();
-        let polled = consumer
-            .poll_with_options(PollOptions {
-                max_entries_per_partition: 3,
-            })
-            .await
-            .unwrap();
-        assert_eq!(count_rows(&polled), 3);
+        let polled = consumer.poll().await.unwrap();
+        let producer_ids = polled
+            .iter()
+            .map(|batch| batch.producer_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(count_rows(&polled), 2);
+        assert_eq!(producer_ids, std::collections::HashSet::from([0, 1]));
+        consumer.commit_current().await.unwrap();
+
+        let mut metadata_dataset = queue.dataset().clone();
+        metadata_dataset.checkout_latest().await.unwrap();
+        assert_eq!(
+            metadata_dataset
+                .metadata()
+                .get("lance_queue.group.multi-producer-group.commits.0.0.next_entry_position"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            metadata_dataset
+                .metadata()
+                .get("lance_queue.group.multi-producer-group.commits.0.1.next_entry_position"),
+            Some(&"2".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1330,11 +1656,29 @@ mod tests {
         assert_eq!(queue.schema().fields(), reopened.schema().fields());
 
         let err = reopened
-            .producer()
+            .producer(0)
+            .unwrap()
             .send_to_partition(0, vec![mismatched_batch(vec![1])])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("schema does not match"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_table_without_mem_wal_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = queue_uri(&temp_dir);
+        let schema = queue_schema();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(RecordBatch::new_empty(schema.clone()))].into_iter(),
+            schema,
+        );
+        Dataset::write(reader, &uri, Some(queue_write_params()))
+            .await
+            .unwrap();
+
+        let err = Queue::builder().uri(&uri).open().await.unwrap_err();
+        assert!(err.to_string().contains("missing MemWAL index"), "{}", err);
     }
 
     #[tokio::test]
@@ -1367,15 +1711,16 @@ mod tests {
         let queue = Queue::builder()
             .uri(&uri)
             .partition_count(4)
+            .producer_count(3)
             .create()
             .await
             .unwrap();
 
         let details = queue.mem_wal_index_details();
-        assert_eq!(details.num_shards, 4);
+        assert_eq!(details.num_shards, 12);
         assert_eq!(details.shard_specs.len(), 1);
         assert_eq!(details.shard_specs[0].spec_id, 1);
-        assert_eq!(details.shard_specs[0].fields.len(), 1);
+        assert_eq!(details.shard_specs[0].fields.len(), 2);
         assert_eq!(
             details.shard_specs[0].fields[0].transform.as_deref(),
             Some("bucket")
@@ -1386,7 +1731,21 @@ mod tests {
                 .get("num_buckets"),
             Some(&"4".to_string())
         );
+        assert_eq!(
+            details.shard_specs[0].fields[1].transform.as_deref(),
+            Some("identity")
+        );
+        assert_eq!(
+            details.shard_specs[0].fields[1]
+                .parameters
+                .get("producer_count"),
+            Some(&"3".to_string())
+        );
         assert_eq!(queue.partitions()[0].shard_spec_id, 1);
+        assert_eq!(queue.partitions()[0].partition_id, 0);
+        assert_eq!(queue.partitions()[0].producer_id, 0);
+        assert_eq!(queue.partitions().last().unwrap().partition_id, 3);
+        assert_eq!(queue.partitions().last().unwrap().producer_id, 2);
 
         let mem_wal_index = queue
             .dataset()
@@ -1410,6 +1769,8 @@ mod tests {
             id_field.metadata().get(LANCE_UNENFORCED_PRIMARY_KEY),
             Some(&"true".to_string())
         );
+        let producer_id_field = schema.field_with_name(QUEUE_PRODUCER_ID_COLUMN).unwrap();
+        assert_eq!(producer_id_field.data_type(), &DataType::UInt32);
         assert!(is_json_field(
             schema.field_with_name(QUEUE_PAYLOAD_COLUMN).unwrap()
         ));
@@ -1438,12 +1799,10 @@ mod tests {
             .await
             .unwrap();
 
-        let producer = queue.producer();
-        let first = producer
-            .send_to_partition(1, vec![batch(vec![1, 2])])
-            .await
-            .unwrap();
-        assert_eq!(first.entries[0].partition_id, 1);
+        let first = produce_to_partition(&queue, 0, 1, vec![1, 2]).await;
+        let first = first.entries.first().unwrap();
+        assert_eq!(first.partition_id, 1);
+        assert_eq!(first.producer_id, 0);
 
         let mut latest = queue
             .consumer(
@@ -1455,10 +1814,7 @@ mod tests {
             .unwrap();
         assert!(latest.poll().await.unwrap().is_empty());
 
-        producer
-            .send_to_partition(1, vec![batch(vec![3])])
-            .await
-            .unwrap();
+        produce_to_partition(&queue, 0, 1, vec![3]).await;
         let polled = latest.poll().await.unwrap();
         assert_eq!(count_rows(&polled), 1);
         latest.commit_current().await.unwrap();
@@ -1475,11 +1831,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = queue_uri(&temp_dir);
         let queue = Queue::builder().uri(&uri).create().await.unwrap();
-        let producer = queue.producer();
-        producer
-            .send_to_partition(0, vec![batch(vec![1])])
-            .await
-            .unwrap();
+        produce_to_partition(&queue, 0, 0, vec![1]).await;
 
         let mut consumer = queue
             .consumer(ConsumerConfig::new("requeue-group"))
@@ -1488,7 +1840,9 @@ mod tests {
         let polled = consumer.poll().await.unwrap();
         assert_eq!(polled.len(), 1);
 
-        producer
+        queue
+            .producer(0)
+            .unwrap()
             .send_to_partition(0, polled[0].batches.clone())
             .await
             .unwrap();
@@ -1508,7 +1862,12 @@ mod tests {
             .unwrap();
 
         let (ids, payloads) = message_values(0, 20);
-        queue.producer().send_batch(ids, payloads).await.unwrap();
+        queue
+            .producer(0)
+            .unwrap()
+            .send_batch(ids, payloads)
+            .await
+            .unwrap();
 
         let mut consumer = queue
             .consumer(ConsumerConfig::new("group-a"))
@@ -1523,13 +1882,13 @@ mod tests {
         assert_eq!(
             metadata_dataset
                 .metadata()
-                .get("lance_queue.group.group-a.commits.0.next_entry_position"),
+                .get("lance_queue.group.group-a.commits.0.0.next_entry_position"),
             Some(&"2".to_string())
         );
         assert_eq!(
             metadata_dataset
                 .metadata()
-                .get("lance_queue.group.group-a.commits.1.next_entry_position"),
+                .get("lance_queue.group.group-a.commits.1.0.next_entry_position"),
             Some(&"2".to_string())
         );
         assert!(!temp_dir.path().join("_lance_queue").exists());
@@ -1541,7 +1900,12 @@ mod tests {
         assert!(resumed.poll().await.unwrap().is_empty());
 
         let (ids, payloads) = message_values(20, 30);
-        queue.producer().send_batch(ids, payloads).await.unwrap();
+        queue
+            .producer(0)
+            .unwrap()
+            .send_batch(ids, payloads)
+            .await
+            .unwrap();
         let second_poll = resumed.poll().await.unwrap();
         assert_eq!(count_rows(&second_poll), 10);
     }
@@ -1556,12 +1920,8 @@ mod tests {
             .create()
             .await
             .unwrap();
-        let producer = queue.producer();
         for partition_id in 0..queue.partition_count() {
-            producer
-                .send_to_partition(partition_id, vec![batch(vec![partition_id as i32])])
-                .await
-                .unwrap();
+            produce_to_partition(&queue, 0, partition_id, vec![partition_id as i32]).await;
         }
 
         let mut assigned = std::collections::HashSet::new();
@@ -1618,15 +1978,8 @@ mod tests {
             .create()
             .await
             .unwrap();
-        let producer = queue.producer();
-        producer
-            .send_to_partition(0, vec![batch(vec![1])])
-            .await
-            .unwrap();
-        producer
-            .send_to_partition(1, vec![batch(vec![2])])
-            .await
-            .unwrap();
+        produce_to_partition(&queue, 0, 0, vec![1]).await;
+        produce_to_partition(&queue, 0, 1, vec![2]).await;
 
         let mut left = queue
             .consumer(ConsumerConfig::new("merged-group").with_partitions([0]))
@@ -1661,11 +2014,7 @@ mod tests {
             .create()
             .await
             .unwrap();
-        queue
-            .producer()
-            .send_to_partition(0, vec![batch(vec![1])])
-            .await
-            .unwrap();
+        produce_to_partition(&queue, 0, 0, vec![1]).await;
 
         let shard_id = queue.partitions()[1].shard_id;
         let corrupt_wal_dir = temp_dir
@@ -1700,15 +2049,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = queue_uri(&temp_dir);
         let queue = Queue::builder().uri(&uri).create().await.unwrap();
-        let producer = queue.producer();
-        producer
-            .send_to_partition(0, vec![batch(vec![1])])
-            .await
-            .unwrap();
-        producer
-            .send_to_partition(0, vec![batch(vec![2])])
-            .await
-            .unwrap();
+        produce_to_partition(&queue, 0, 0, vec![1]).await;
+        produce_to_partition(&queue, 0, 0, vec![2]).await;
 
         let mut consumer = queue
             .consumer(ConsumerConfig::new("monotonic-group"))
@@ -1730,7 +2072,7 @@ mod tests {
         assert_eq!(
             metadata_dataset
                 .metadata()
-                .get("lance_queue.group.monotonic-group.commits.0.next_entry_position"),
+                .get("lance_queue.group.monotonic-group.commits.0.0.next_entry_position"),
             Some(&"3".to_string())
         );
 

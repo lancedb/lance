@@ -124,10 +124,14 @@ pub trait DatasetMemWalExt {
     }
 
     /// Return the MemWAL index details for this dataset, if MemWAL is initialized.
-    async fn mem_wal_index_details(&self) -> Result<Option<MemWalIndexDetails>>;
+    async fn mem_wal_index_details(&self) -> Result<Option<MemWalIndexDetails>> {
+        Ok(None)
+    }
 
     /// Return inline MemWAL shard snapshots for this dataset.
-    async fn mem_wal_shard_snapshots(&self) -> Result<Vec<MemWalShardSnapshot>>;
+    async fn mem_wal_shard_snapshots(&self) -> Result<Vec<MemWalShardSnapshot>> {
+        Ok(Vec::new())
+    }
 
     /// Get a ShardWriter for the specified shard.
     ///
@@ -349,7 +353,7 @@ async fn initialize_mem_wal_impl(
 
 const SNAPSHOT_SHARD_ID_COLUMN: &str = "shard_id";
 const SNAPSHOT_SHARD_SPEC_ID_COLUMN: &str = "shard_spec_id";
-const SNAPSHOT_SHARD_FIELD_PREFIX: &str = "region_field_";
+const SNAPSHOT_SHARD_FIELD_PREFIX: &str = "shard_field_";
 
 fn encode_inline_shard_snapshots(snapshots: &[MemWalShardSnapshot]) -> Result<Option<Vec<u8>>> {
     if snapshots.is_empty() {
