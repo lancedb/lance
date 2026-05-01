@@ -6,6 +6,8 @@ use std::io::Result;
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=protos");
+    println!("cargo:rerun-if-changed=csrc/libsais.c");
+    println!("cargo:rerun-if-changed=csrc/libsais.h");
 
     #[cfg(feature = "protoc")]
     // Use vendored protobuf compiler if requested.
@@ -20,6 +22,16 @@ fn main() -> Result<()> {
         &["./protos/index.proto", "./protos/index_old.proto"],
         &["./protos"],
     )?;
+
+    // Compile vendored libsais (Ilya Grebnov's SA-IS implementation)
+    // for fast O(N) suffix array construction.
+    cc::Build::new()
+        .file("csrc/libsais.c")
+        .include("csrc")
+        .opt_level(3)
+        .flag_if_supported("-march=native")
+        .flag_if_supported("-mtune=native")
+        .compile("sais");
 
     let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")
         .or_else(|e| match e {

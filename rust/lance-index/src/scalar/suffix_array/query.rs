@@ -572,7 +572,7 @@ mod tests {
     fn build_test_index(data: &[u8]) -> (Vec<u8>, u64) {
         let sa = build_suffix_array(data);
         let n = sa.len() as u64;
-        let compact = compact_suffix_array(&sa, 8).unwrap();
+        let compact = compact_suffix_array(&sa, 4).unwrap();
         (compact, n)
     }
 
@@ -581,15 +581,15 @@ mod tests {
         let data = b"banana";
         let (sa, n) = build_test_index(data);
 
-        assert_eq!(count(data, &sa, 8, n, b"a"), 3);
-        assert_eq!(count(data, &sa, 8, n, b"an"), 2);
-        assert_eq!(count(data, &sa, 8, n, b"ana"), 2);
-        assert_eq!(count(data, &sa, 8, n, b"ban"), 1);
-        assert_eq!(count(data, &sa, 8, n, b"banana"), 1);
-        assert_eq!(count(data, &sa, 8, n, b"xyz"), 0);
-        assert_eq!(count(data, &sa, 8, n, b"bananaa"), 0);
-        assert_eq!(count(data, &sa, 8, n, b"na"), 2);
-        assert_eq!(count(data, &sa, 8, n, b"n"), 2);
+        assert_eq!(count(data, &sa, 4, n, b"a"), 3);
+        assert_eq!(count(data, &sa, 4, n, b"an"), 2);
+        assert_eq!(count(data, &sa, 4, n, b"ana"), 2);
+        assert_eq!(count(data, &sa, 4, n, b"ban"), 1);
+        assert_eq!(count(data, &sa, 4, n, b"banana"), 1);
+        assert_eq!(count(data, &sa, 4, n, b"xyz"), 0);
+        assert_eq!(count(data, &sa, 4, n, b"bananaa"), 0);
+        assert_eq!(count(data, &sa, 4, n, b"na"), 2);
+        assert_eq!(count(data, &sa, 4, n, b"n"), 2);
     }
 
     #[test]
@@ -597,40 +597,40 @@ mod tests {
         let data = b"banana";
         let (sa, n) = build_test_index(data);
         // Empty query matches everything
-        assert_eq!(count(data, &sa, 8, n, b""), n);
+        assert_eq!(count(data, &sa, 4, n, b""), n);
     }
 
     #[test]
     fn test_count_empty_data() {
         let data = b"";
         let (sa, n) = build_test_index(data);
-        assert_eq!(count(data, &sa, 8, n, b"a"), 0);
+        assert_eq!(count(data, &sa, 4, n, b"a"), 0);
     }
 
     #[test]
     fn test_count_single_char() {
         let data = b"a";
         let (sa, n) = build_test_index(data);
-        assert_eq!(count(data, &sa, 8, n, b"a"), 1);
-        assert_eq!(count(data, &sa, 8, n, b"b"), 0);
+        assert_eq!(count(data, &sa, 4, n, b"a"), 1);
+        assert_eq!(count(data, &sa, 4, n, b"b"), 0);
     }
 
     #[test]
     fn test_count_repeated() {
         let data = b"aaaa";
         let (sa, n) = build_test_index(data);
-        assert_eq!(count(data, &sa, 8, n, b"a"), 4);
-        assert_eq!(count(data, &sa, 8, n, b"aa"), 3);
-        assert_eq!(count(data, &sa, 8, n, b"aaa"), 2);
-        assert_eq!(count(data, &sa, 8, n, b"aaaa"), 1);
-        assert_eq!(count(data, &sa, 8, n, b"aaaaa"), 0);
+        assert_eq!(count(data, &sa, 4, n, b"a"), 4);
+        assert_eq!(count(data, &sa, 4, n, b"aa"), 3);
+        assert_eq!(count(data, &sa, 4, n, b"aaa"), 2);
+        assert_eq!(count(data, &sa, 4, n, b"aaaa"), 1);
+        assert_eq!(count(data, &sa, 4, n, b"aaaaa"), 0);
     }
 
     #[test]
     fn test_sa_find_boundaries() {
         let data = b"abracadabra";
         let (sa, n) = build_test_index(data);
-        let (lo, hi) = sa_find(data, &sa, 8, n, b"abra");
+        let (lo, hi) = sa_find(data, &sa, 4, n, b"abra");
         assert_eq!(hi - lo, 2); // "abra" appears twice
     }
 
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_read_pointer_various_widths() {
-        let val: u64 = 0x0102030405060708;
+        let val: u32 = 0x05060708;
         let bytes = val.to_le_bytes();
 
         // 1 byte
@@ -657,9 +657,7 @@ mod tests {
         // 2 bytes
         assert_eq!(read_pointer(&bytes[..2], 0, 2), 0x0708);
         // 4 bytes
-        assert_eq!(read_pointer(&bytes[..4], 0, 4), 0x05060708);
-        // 8 bytes
-        assert_eq!(read_pointer(&bytes, 0, 8), val);
+        assert_eq!(read_pointer(&bytes, 0, 4), 0x05060708);
     }
 
     #[test]
@@ -686,7 +684,7 @@ mod tests {
         let data = b"abcabcabc";
         let (sa, n) = build_test_index(data);
 
-        let result = prob(data, &sa, 8, n, b"abc", b"a");
+        let result = prob(data, &sa, 4, n, b"abc", b"a");
         assert_eq!(result.prompt_cnt, 3); // "abc" appears 3 times
         assert_eq!(result.cont_cnt, 2); // "abca" appears 2 times
         assert!((result.prob - 2.0 / 3.0).abs() < 1e-10);
@@ -697,7 +695,7 @@ mod tests {
         let data = b"hello world";
         let (sa, n) = build_test_index(data);
 
-        let result = prob(data, &sa, 8, n, b"xyz", b"a");
+        let result = prob(data, &sa, 4, n, b"xyz", b"a");
         assert_eq!(result.prompt_cnt, 0);
         assert_eq!(result.cont_cnt, 0);
         assert_eq!(result.prob, 0.0);
@@ -708,7 +706,7 @@ mod tests {
         let data = b"hello world";
         let (sa, n) = build_test_index(data);
 
-        let result = prob(data, &sa, 8, n, b"hello", b"xyz");
+        let result = prob(data, &sa, 4, n, b"hello", b"xyz");
         assert_eq!(result.prompt_cnt, 1);
         assert_eq!(result.cont_cnt, 0);
         assert_eq!(result.prob, 0.0);
@@ -720,7 +718,7 @@ mod tests {
         let data = b"aaaa";
         let (sa, n) = build_test_index(data);
 
-        let result = prob(data, &sa, 8, n, b"aaa", b"a");
+        let result = prob(data, &sa, 4, n, b"aaa", b"a");
         assert_eq!(result.prompt_cnt, 2); // "aaa" appears 2 times
         assert_eq!(result.cont_cnt, 1); // "aaaa" appears 1 time
         assert!((result.prob - 0.5).abs() < 1e-10);
@@ -732,7 +730,7 @@ mod tests {
         let data = b"abacad";
         let (sa, n) = build_test_index(data);
 
-        let result = next_byte_distribution(data, &sa, 8, n, b"a", None);
+        let result = next_byte_distribution(data, &sa, 4, n, b"a", None);
         assert_eq!(result.prompt_cnt, 3); // "a" appears 3 times
         assert!(!result.approximate);
         assert_eq!(result.distribution.len(), 3); // b, c, d
@@ -756,7 +754,7 @@ mod tests {
         let data = b"banana";
         let (sa, n) = build_test_index(data);
 
-        let result = next_byte_distribution(data, &sa, 8, n, b"an", None);
+        let result = next_byte_distribution(data, &sa, 4, n, b"an", None);
         assert_eq!(result.prompt_cnt, 2);
         assert_eq!(result.distribution.len(), 1);
         assert_eq!(result.distribution[0].byte_value, b'a');
@@ -769,7 +767,7 @@ mod tests {
         let data = b"hello";
         let (sa, n) = build_test_index(data);
 
-        let result = next_byte_distribution(data, &sa, 8, n, b"xyz", None);
+        let result = next_byte_distribution(data, &sa, 4, n, b"xyz", None);
         assert_eq!(result.prompt_cnt, 0);
         assert!(result.distribution.is_empty());
     }
@@ -780,7 +778,7 @@ mod tests {
         let data = b"abababababababababab"; // "ab" repeated 10 times (minus last char)
         let (sa, n) = build_test_index(data);
 
-        let result = next_byte_distribution(data, &sa, 8, n, b"a", Some(3));
+        let result = next_byte_distribution(data, &sa, 4, n, b"a", Some(3));
         // "a" appears 10 times in this string, max_support=3 triggers approximate mode
         assert!(result.approximate);
     }
@@ -791,7 +789,7 @@ mod tests {
         let data = b"banana";
         let (sa, n) = build_test_index(data);
 
-        let result = next_byte_distribution(data, &sa, 8, n, b"na", None);
+        let result = next_byte_distribution(data, &sa, 4, n, b"na", None);
         // "na" appears twice: "nan" and "na$" (end of string)
         assert_eq!(result.prompt_cnt, 2);
         // Only one entry should be present (for 'n'), the other "na" is at end
@@ -808,7 +806,7 @@ mod tests {
         let data = b"abcabcabc";
         let (sa, n) = build_test_index(data);
 
-        let result = infgram_prob(data, &sa, 8, n, b"abc", b"a");
+        let result = infgram_prob(data, &sa, 4, n, b"abc", b"a");
         assert_eq!(result.effective_suffix_len, 3); // Full prompt "abc" is found
         assert_eq!(result.prob_result.prompt_cnt, 3);
         assert_eq!(result.prob_result.cont_cnt, 2);
@@ -821,7 +819,7 @@ mod tests {
         let (sa, n) = build_test_index(data);
 
         // "abc" is not in the corpus, but "bc" is (2 times)
-        let result = infgram_prob(data, &sa, 8, n, b"abc", b"y");
+        let result = infgram_prob(data, &sa, 4, n, b"abc", b"y");
         assert_eq!(result.effective_suffix_len, 2); // Backed off to "bc"
         assert_eq!(result.prob_result.prompt_cnt, 2); // "bc" appears 2 times
         assert_eq!(result.prob_result.cont_cnt, 2); // "bcy" appears 2 times
@@ -833,7 +831,7 @@ mod tests {
         let (sa, n) = build_test_index(data);
 
         // Nothing in the prompt exists in the corpus as a suffix
-        let result = infgram_prob(data, &sa, 8, n, b"xyz", b"a");
+        let result = infgram_prob(data, &sa, 4, n, b"xyz", b"a");
         assert_eq!(result.effective_suffix_len, 0);
         assert_eq!(result.prob_result.prompt_cnt, 0);
         assert_eq!(result.prob_result.prob, 0.0);
@@ -844,7 +842,7 @@ mod tests {
         let data = b"hello";
         let (sa, n) = build_test_index(data);
 
-        let result = infgram_prob(data, &sa, 8, n, b"", b"h");
+        let result = infgram_prob(data, &sa, 4, n, b"", b"h");
         assert_eq!(result.effective_suffix_len, 0);
         // With empty prompt, count("") = n, count("h") = 1
         assert_eq!(result.prob_result.cont_cnt, 1);
@@ -856,7 +854,7 @@ mod tests {
         let data = b"abcdef";
         let (sa, n) = build_test_index(data);
 
-        let result = infgram_prob(data, &sa, 8, n, b"xyz", b"a");
+        let result = infgram_prob(data, &sa, 4, n, b"xyz", b"a");
         // None of x, y, z exist in "abcdef" — wait, no.
         // Actually let's check: does 'z' exist? No. Does 'y' exist? No. Does 'x' exist? No.
         assert_eq!(result.effective_suffix_len, 0);
@@ -871,13 +869,13 @@ mod tests {
 
         let prompt = b"the ";
         let continuation = b"cat";
-        let result = prob(data, &sa, 8, n, prompt, continuation);
+        let result = prob(data, &sa, 4, n, prompt, continuation);
 
-        let prompt_cnt = count(data, &sa, 8, n, prompt);
+        let prompt_cnt = count(data, &sa, 4, n, prompt);
         let mut full = Vec::new();
         full.extend_from_slice(prompt);
         full.extend_from_slice(continuation);
-        let cont_cnt = count(data, &sa, 8, n, &full);
+        let cont_cnt = count(data, &sa, 4, n, &full);
 
         assert_eq!(result.prompt_cnt, prompt_cnt);
         assert_eq!(result.cont_cnt, cont_cnt);
@@ -890,7 +888,7 @@ mod tests {
         let data = b"abcabdabe";
         let (sa, n) = build_test_index(data);
 
-        let result = next_byte_distribution(data, &sa, 8, n, b"ab", None);
+        let result = next_byte_distribution(data, &sa, 4, n, b"ab", None);
         assert_eq!(result.prompt_cnt, 3); // "ab" appears 3 times
 
         // The sum of distribution counts should equal prompt_cnt
@@ -902,7 +900,7 @@ mod tests {
         for entry in &result.distribution {
             let mut query = Vec::from(b"ab".as_slice());
             query.push(entry.byte_value);
-            let cnt = count(data, &sa, 8, n, &query);
+            let cnt = count(data, &sa, 4, n, &query);
             assert_eq!(cnt, entry.count);
         }
     }

@@ -192,9 +192,23 @@ message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
 
+// Per-segment metadata for multi-segment suffix array indices.
+// Each segment covers a group of fragments and has its own SA.
+message SuffixArraySegmentInfo {
+  uint32 pointer_width = 1;
+  uint64 total_entries = 2;
+  uint64 corpus_bytes = 3;
+}
+
 // Suffix array index for n-gram counting and text search.
+// Supports multi-segment storage: when the corpus exceeds ~2 GB,
+// the text is split into segments, each with its own suffix array.
+// Queries aggregate results across all segments.
 message SuffixArrayIndexDetails {
   uint32 token_width = 1;
+  // Single-segment fields (kept for backwards compatibility).
+  // When num_segments == 0, these describe the sole segment whose
+  // files are named tokenized.bin / suffix_array.bin.
   uint32 pointer_width = 2;
   uint64 total_tokens = 3;
   uint64 total_documents = 4;
@@ -202,4 +216,8 @@ message SuffixArrayIndexDetails {
   optional string tokenizer_name = 6;
   optional uint32 vocab_size = 7;
   optional uint32 separator_token_id = 8;
+  // Multi-segment fields. When num_segments > 0, per-segment files
+  // are named segment_{i}_tokenized.bin / segment_{i}_suffix_array.bin.
+  uint32 num_segments = 9;
+  repeated SuffixArraySegmentInfo segments = 10;
 }

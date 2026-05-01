@@ -11,6 +11,6 @@ mod index;
 mod plugin;
 mod query;
 
-pub use index::SuffixArrayIndex;
+pub use index::{SuffixArrayIndex, SuffixArraySegment};
 pub use plugin::SuffixArrayIndexPlugin;
 pub use query::SuffixArrayQuery;
