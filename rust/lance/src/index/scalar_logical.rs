@@ -184,6 +184,10 @@ fn combine_search_results(results: Vec<SearchResult>) -> Result<SearchResult> {
                 saw_at_least = true;
                 sets.push(set);
             }
+            // Segments are unioned; "AtMost everything" absorbs every other
+            // AtMost result, so a single Indeterminate segment makes the
+            // logical result Indeterminate as well.
+            SearchResult::Indeterminate => return Ok(SearchResult::Indeterminate),
         }
     }
 

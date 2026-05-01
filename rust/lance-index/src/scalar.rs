@@ -777,6 +777,13 @@ pub enum SearchResult {
     /// No scalar index actually returns this today but it can arise from
     /// boolean operations (e.g. NOT(AtMost(x)) == AtLeast(NOT(x)))
     AtLeast(NullableRowAddrSet),
+    /// The index abandoned the search and produced no refinement at all.
+    ///
+    /// Equivalent in meaning to "AtMost: every row in the dataset" — every
+    /// row is a possible match and downstream code must recheck. Used when
+    /// the index determines that producing an actual row id set would not
+    /// pay back the cost (e.g. the matching pages cover most of the data).
+    Indeterminate,
 }
 
 impl SearchResult {
@@ -797,19 +804,30 @@ impl SearchResult {
             Self::Exact(row_ids) => Self::Exact(row_ids.with_nulls(nulls.into())),
             Self::AtMost(row_ids) => Self::AtMost(row_ids.with_nulls(nulls.into())),
             Self::AtLeast(row_ids) => Self::AtLeast(row_ids.with_nulls(nulls.into())),
+            Self::Indeterminate => Self::Indeterminate,
         }
     }
 
     pub fn row_addrs(&self) -> &NullableRowAddrSet {
+        static EMPTY: std::sync::LazyLock<NullableRowAddrSet> =
+            std::sync::LazyLock::new(NullableRowAddrSet::empty);
         match self {
             Self::Exact(row_addrs) => row_addrs,
             Self::AtMost(row_addrs) => row_addrs,
             Self::AtLeast(row_addrs) => row_addrs,
+            // Indeterminate carries no specific row ids; return an empty set so
+            // existing callers work, but use `is_indeterminate` if you need to
+            // distinguish "no matches" from "every row matches with recheck".
+            Self::Indeterminate => &EMPTY,
         }
     }
 
     pub fn is_exact(&self) -> bool {
         matches!(self, Self::Exact(_))
+    }
+
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self, Self::Indeterminate)
     }
 }
 

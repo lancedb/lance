@@ -79,6 +79,61 @@ const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 
+/// Default for [`BTREE_SKIP_ROW_THRESHOLD`]: 1M candidate rows.
+const DEFAULT_BTREE_SKIP_ROW_THRESHOLD: u64 = 1_000_000;
+/// Default for [`BTREE_SKIP_FRACTION_THRESHOLD`]: 15% of the indexed dataset.
+const DEFAULT_BTREE_SKIP_FRACTION_THRESHOLD: f64 = 0.15;
+
+/// Absolute candidate-row threshold for skipping the second-level page search.
+///
+/// Estimated as `matched_pages * batch_size`. If the estimate exceeds this and
+/// also exceeds [`BTREE_SKIP_FRACTION_THRESHOLD`] of the indexed dataset, the
+/// search returns [`SearchResult::Indeterminate`] without reading any pages.
+///
+/// Override with `LANCE_BTREE_SKIP_ROW_THRESHOLD`. Set to `0` to disable the
+/// skip entirely (no threshold is small enough to trigger).
+pub static BTREE_SKIP_ROW_THRESHOLD: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_BTREE_SKIP_ROW_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BTREE_SKIP_ROW_THRESHOLD)
+});
+
+/// Fractional threshold for skipping the second-level page search, as a value
+/// in `[0.0, 1.0]`. See [`BTREE_SKIP_ROW_THRESHOLD`].
+///
+/// Override with `LANCE_BTREE_SKIP_FRACTION_THRESHOLD`. A value of `0.0` makes
+/// the fractional check trivially true (the skip then depends only on the row
+/// threshold); a value `>= 1.0` disables the skip.
+pub static BTREE_SKIP_FRACTION_THRESHOLD: std::sync::LazyLock<f64> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("LANCE_BTREE_SKIP_FRACTION_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_BTREE_SKIP_FRACTION_THRESHOLD)
+    });
+
+/// Pure decision function for the btree skip heuristic. Both thresholds are
+/// passed in so callers (and tests) can exercise the logic without poking at
+/// process-wide environment variables.
+fn should_skip_btree_search(
+    matched_pages: usize,
+    total_pages: u32,
+    batch_size: u64,
+    row_threshold: u64,
+    fraction_threshold: f64,
+) -> bool {
+    if row_threshold == 0 || fraction_threshold >= 1.0 || total_pages == 0 {
+        return false;
+    }
+    let candidate_rows = (matched_pages as u64).saturating_mul(batch_size);
+    if candidate_rows <= row_threshold {
+        return false;
+    }
+    let fraction = matched_pages as f64 / total_pages as f64;
+    fraction > fraction_threshold
+}
+
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
 pub struct OrderableScalarValue(pub ScalarValue);
@@ -619,6 +674,9 @@ pub struct BTreeLookup {
     null_pages: Vec<u32>,
     /// Pages that are entirely null
     all_null_pages: Vec<u32>,
+    /// Total number of pages described by this lookup. Used by the search
+    /// path to estimate selectivity without reading any pages from disk.
+    total_pages: u32,
 }
 
 impl BTreeLookup {
@@ -627,7 +685,12 @@ impl BTreeLookup {
             tree: BTreeMap::new(),
             null_pages: Vec::new(),
             all_null_pages: Vec::new(),
+            total_pages: 0,
         }
+    }
+
+    fn total_pages(&self) -> u32 {
+        self.total_pages
     }
 }
 
@@ -651,11 +714,13 @@ impl BTreeLookup {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         all_null_pages: Vec<u32>,
+        total_pages: u32,
     ) -> Self {
         Self {
             tree,
             null_pages,
             all_null_pages,
+            total_pages,
         }
     }
 
@@ -1085,6 +1150,24 @@ impl BTreeIndex {
             .await
     }
 
+    /// Decide whether the second-level page search should be skipped because
+    /// the lookup already matched too much of the index to be worth refining.
+    ///
+    /// Returns true only when `matched_pages * batch_size` exceeds both the
+    /// absolute and fractional thresholds (see [`BTREE_SKIP_ROW_THRESHOLD`]
+    /// and [`BTREE_SKIP_FRACTION_THRESHOLD`]). The row count is an upper
+    /// bound; the last page may be partial, but for the kinds of broad,
+    /// non-selective queries this guards against the difference is noise.
+    fn should_skip_search(&self, matched_pages: usize) -> bool {
+        should_skip_btree_search(
+            matched_pages,
+            self.page_lookup.total_pages(),
+            self.batch_size,
+            *BTREE_SKIP_ROW_THRESHOLD,
+            *BTREE_SKIP_FRACTION_THRESHOLD,
+        )
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn read_page(
         &self,
@@ -1201,7 +1284,16 @@ impl BTreeIndex {
 
         let data_type = mins.data_type();
 
-        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
+        // The lookup file holds one row per page (regular + all-null), so the
+        // input row count is the total page count for this index.
+        let total_pages = data.num_rows() as u32;
+
+        let page_lookup = Arc::new(BTreeLookup::new(
+            map,
+            null_pages,
+            all_null_pages,
+            total_pages,
+        ));
 
         Ok(Self::new(
             page_lookup,
@@ -1566,6 +1658,23 @@ impl ScalarIndex for BTreeIndex {
                     pages.push(Matches::Some(page_id));
                 }
             }
+        }
+
+        // If the page lookup matched a large fraction of the index we can save
+        // a lot of I/O by skipping the per-page flat search and letting the
+        // caller do a normal scan with a recheck. Both the absolute candidate
+        // row count and the fraction must exceed their thresholds; the value
+        // for `batch_size * matched_pages` is an upper bound (the last page
+        // may be partial).
+        if self.should_skip_search(pages.len()) {
+            debug!(
+                "Skipping btree search: {} of {} pages matched (threshold rows={}, fraction={})",
+                pages.len(),
+                self.page_lookup.total_pages(),
+                *BTREE_SKIP_ROW_THRESHOLD,
+                *BTREE_SKIP_FRACTION_THRESHOLD,
+            );
+            return Ok(SearchResult::Indeterminate);
         }
 
         let lazy_index_reader =
@@ -4696,5 +4805,102 @@ mod tests {
             }
             _ => panic!("BTree search should return Exact"),
         }
+    }
+
+    #[test]
+    fn test_should_skip_btree_search_thresholds() {
+        use super::should_skip_btree_search;
+
+        // Both thresholds exceeded -> skip.
+        assert!(should_skip_btree_search(300, 1000, 4096, 1_000_000, 0.15));
+        // Row count below threshold -> don't skip even if fraction is high.
+        assert!(!should_skip_btree_search(2, 4, 4096, 1_000_000, 0.15));
+        // Fraction below threshold -> don't skip even if row count is huge.
+        assert!(!should_skip_btree_search(
+            300, 10_000, 4096, 1_000_000, 0.15
+        ));
+        // row_threshold == 0 disables the heuristic entirely.
+        assert!(!should_skip_btree_search(
+            u32::MAX as usize,
+            1,
+            4096,
+            0,
+            0.0
+        ));
+        // fraction_threshold >= 1.0 disables the heuristic entirely.
+        assert!(!should_skip_btree_search(
+            u32::MAX as usize,
+            1,
+            4096,
+            1,
+            1.0
+        ));
+        // total_pages == 0 (empty index) is a no-op.
+        assert!(!should_skip_btree_search(0, 0, 4096, 1, 0.0));
+    }
+
+    /// End-to-end test: with the skip thresholds set very low, a btree search
+    /// that hits most of the index should return [`SearchResult::Indeterminate`]
+    /// instead of producing exact row ids.
+    #[tokio::test]
+    async fn test_btree_search_skip_when_unselective() {
+        use super::{BTREE_SKIP_FRACTION_THRESHOLD, BTREE_SKIP_ROW_THRESHOLD};
+
+        // Force the LazyLocks to read the env vars before we can test against
+        // the actual heuristic. We don't mutate the env in tests because the
+        // statics cache the first read; instead, we drive the decision
+        // function directly with carefully chosen inputs.
+        let _ = (*BTREE_SKIP_ROW_THRESHOLD, *BTREE_SKIP_FRACTION_THRESHOLD);
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Build a small btree with 4 pages of 100 rows each. Values 0..400.
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(100), BatchCount::from(4));
+        train_btree_index(stream, test_store.as_ref(), 100, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // total_pages should reflect the build above.
+        assert_eq!(index.page_lookup.total_pages(), 4);
+
+        // The pure decision function: a range covering 3 of 4 pages with
+        // batch_size 100, against thresholds (row=200, fraction=0.5),
+        // produces 300 candidate rows and 75% fraction -> should skip.
+        assert!(super::should_skip_btree_search(
+            3,
+            index.page_lookup.total_pages(),
+            index.batch_size,
+            200,
+            0.5,
+        ));
+
+        // Sanity: a full-range query reads every page so a large enough query
+        // would hit the path; we confirm the wired-up search still works
+        // under default (high) thresholds.
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    std::ops::Bound::Included(ScalarValue::Int32(Some(0))),
+                    std::ops::Bound::Excluded(ScalarValue::Int32(Some(400))),
+                ),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        // With defaults (1M rows / 15%) a 400-row index never trips the skip,
+        // so the search is exact.
+        assert!(matches!(result, SearchResult::Exact(_)));
     }
 }

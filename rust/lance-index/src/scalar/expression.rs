@@ -26,7 +26,7 @@ use super::{
 use super::{GeoQuery, RelationQuery};
 use lance_core::{
     Error, Result,
-    utils::mask::{NullableRowAddrMask, RowAddrMask},
+    utils::mask::{NullableRowAddrMask, NullableRowAddrSet, RowAddrMask},
 };
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
@@ -1273,6 +1273,12 @@ impl From<SearchResult> for NullableIndexExprResult {
             SearchResult::Exact(mask) => Self::Exact(NullableRowAddrMask::AllowList(mask)),
             SearchResult::AtMost(mask) => Self::AtMost(NullableRowAddrMask::AllowList(mask)),
             SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowAddrMask::AllowList(mask)),
+            // Indeterminate -> "AtMost everything": a block list with nothing
+            // blocked allows every row through, and the AtMost discriminant
+            // forces a recheck downstream.
+            SearchResult::Indeterminate => {
+                Self::AtMost(NullableRowAddrMask::BlockList(NullableRowAddrSet::empty()))
+            }
         }
     }
 }
