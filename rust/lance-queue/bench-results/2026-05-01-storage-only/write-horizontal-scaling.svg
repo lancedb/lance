@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="430" viewBox="0 0 880 430">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="440.0" y="26" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#1f2937">Write Throughput vs Physical Shards</text>
+<line x1="78" y1="344" x2="852" y2="344" stroke="#94a3b8"/>
+<line x1="78" y1="48" x2="78" y2="344" stroke="#94a3b8"/>
+<line x1="78" y1="344.0" x2="852" y2="344.0" stroke="#e5e7eb"/>
+<text x="68" y="348.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">0</text>
+<line x1="78" y1="284.8" x2="852" y2="284.8" stroke="#e5e7eb"/>
+<text x="68" y="288.8" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">39,211</text>
+<line x1="78" y1="225.6" x2="852" y2="225.6" stroke="#e5e7eb"/>
+<text x="68" y="229.6" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">78,421</text>
+<line x1="78" y1="166.4" x2="852" y2="166.4" stroke="#e5e7eb"/>
+<text x="68" y="170.4" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">117,632</text>
+<line x1="78" y1="107.2" x2="852" y2="107.2" stroke="#e5e7eb"/>
+<text x="68" y="111.2" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">156,843</text>
+<line x1="78" y1="48.0" x2="852" y2="48.0" stroke="#e5e7eb"/>
+<text x="68" y="52.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">196,053</text>
+<polyline points="78.0,302.0 271.5,270.3 465.0,213.4 658.5,93.2 852.0,99.7" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="78.0" cy="302.0" r="5" fill="#2563eb"/>
+<text x="78.0" y="292.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">27,807</text>
+<text transform="translate(78.0,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">1 shards (1p/1prod)</text>
+<circle cx="271.5" cy="270.3" r="5" fill="#2563eb"/>
+<text x="271.5" y="260.3" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">48,819</text>
+<text transform="translate(271.5,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">4 shards (2p/2prod)</text>
+<circle cx="465.0" cy="213.4" r="5" fill="#2563eb"/>
+<text x="465.0" y="203.4" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">86,482</text>
+<text transform="translate(465.0,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">16 shards (4p/4prod)</text>
+<circle cx="658.5" cy="93.2" r="5" fill="#2563eb"/>
+<text x="658.5" y="83.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">166,147</text>
+<text transform="translate(658.5,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">40 shards (4p/10prod)</text>
+<circle cx="852.0" cy="99.7" r="5" fill="#2563eb"/>
+<text x="852.0" y="89.7" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">161,794</text>
+<text transform="translate(852.0,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">128 shards (8p/16prod)</text>
+<text transform="translate(18,196.0) rotate(-90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#334155">Rows / second</text>
+<text x="465.0" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#334155">Logical partitions and producer slots</text>
+</svg>

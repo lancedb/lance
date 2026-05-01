@@ -1,0 +1,13 @@
+benchmark,case,producer_count,rows,write_batch_size,poll_entries,payload_bytes,decode_messages,repeat,elapsed_seconds,rows_per_second,input_mib_per_second,wal_entries_read,arrow_batches_read,polls
+read,read_prod1_50k_poll32,1,50000,5000,32,256,false,0,0.843767,59258.063,18.002,10,10,1
+read,read_prod1_50k_poll32,1,50000,5000,32,256,false,1,0.814975,61351.607,18.639,10,10,1
+read,read_prod1_200k_poll1,1,200000,5000,1,256,false,0,4.469168,44751.059,13.652,40,40,40
+read,read_prod1_200k_poll1,1,200000,5000,1,256,false,1,4.787966,41771.388,12.743,40,40,40
+read,read_prod1_200k_poll8,1,200000,5000,8,256,false,0,4.572047,43744.086,13.345,40,40,5
+read,read_prod1_200k_poll8,1,200000,5000,8,256,false,1,4.397448,45480.923,13.875,40,40,5
+read,read_prod1_200k_poll32,1,200000,5000,32,256,false,0,4.637547,43126.245,13.157,40,40,2
+read,read_prod1_200k_poll32,1,200000,5000,32,256,false,1,4.166130,48006.188,14.645,40,40,2
+read,read_prod1_500k_poll32,1,500000,5000,32,256,false,0,12.523479,39925.009,12.205,100,100,4
+read,read_prod1_500k_poll32,1,500000,5000,32,256,false,1,12.183639,41038.641,12.546,100,100,4
+read,read_decode_prod1_200k_poll32,1,200000,5000,32,256,true,0,4.330480,46184.255,14.089,40,40,2
+read,read_decode_prod1_200k_poll32,1,200000,5000,32,256,true,1,5.399573,37039.963,11.300,40,40,2

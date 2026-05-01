@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="430" viewBox="0 0 880 430">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="440.0" y="26" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#1f2937">Write Throughput vs Row Count (4 partitions, 10 producers)</text>
+<line x1="78" y1="344" x2="852" y2="344" stroke="#94a3b8"/>
+<line x1="78" y1="48" x2="78" y2="344" stroke="#94a3b8"/>
+<line x1="78" y1="344.0" x2="852" y2="344.0" stroke="#e5e7eb"/>
+<text x="68" y="348.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">0</text>
+<line x1="78" y1="284.8" x2="852" y2="284.8" stroke="#e5e7eb"/>
+<text x="68" y="288.8" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">40,442</text>
+<line x1="78" y1="225.6" x2="852" y2="225.6" stroke="#e5e7eb"/>
+<text x="68" y="229.6" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">80,884</text>
+<line x1="78" y1="166.4" x2="852" y2="166.4" stroke="#e5e7eb"/>
+<text x="68" y="170.4" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">121,327</text>
+<line x1="78" y1="107.2" x2="852" y2="107.2" stroke="#e5e7eb"/>
+<text x="68" y="111.2" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">161,769</text>
+<line x1="78" y1="48.0" x2="852" y2="48.0" stroke="#e5e7eb"/>
+<text x="68" y="52.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">202,211</text>
+<polyline points="78.0,123.0 465.0,112.2 852.0,93.2" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="78.0" cy="123.0" r="5" fill="#2563eb"/>
+<text x="78.0" y="113.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">150,968</text>
+<text transform="translate(78.0,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">50,000 rows</text>
+<circle cx="465.0" cy="112.2" r="5" fill="#2563eb"/>
+<text x="465.0" y="102.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">158,338</text>
+<text transform="translate(465.0,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">200,000 rows</text>
+<circle cx="852.0" cy="93.2" r="5" fill="#2563eb"/>
+<text x="852.0" y="83.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">171,365</text>
+<text transform="translate(852.0,364) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">500,000 rows</text>
+<text transform="translate(18,196.0) rotate(-90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#334155">Rows / second</text>
+</svg>

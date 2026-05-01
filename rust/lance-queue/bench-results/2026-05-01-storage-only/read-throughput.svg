@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="440" viewBox="0 0 920 440">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="460.0" y="26" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#1f2937">Single-Partition Read Throughput</text>
+<line x1="78" y1="334" x2="892" y2="334" stroke="#94a3b8"/>
+<line x1="78" y1="48" x2="78" y2="334" stroke="#94a3b8"/>
+<line x1="78" y1="334.0" x2="892" y2="334.0" stroke="#e5e7eb"/>
+<text x="68" y="338.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">0</text>
+<line x1="78" y1="276.8" x2="892" y2="276.8" stroke="#e5e7eb"/>
+<text x="68" y="280.8" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">14,232</text>
+<line x1="78" y1="219.6" x2="892" y2="219.6" stroke="#e5e7eb"/>
+<text x="68" y="223.6" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">28,464</text>
+<line x1="78" y1="162.4" x2="892" y2="162.4" stroke="#e5e7eb"/>
+<text x="68" y="166.4" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">42,696</text>
+<line x1="78" y1="105.2" x2="892" y2="105.2" stroke="#e5e7eb"/>
+<text x="68" y="109.2" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">56,928</text>
+<line x1="78" y1="48.0" x2="892" y2="48.0" stroke="#e5e7eb"/>
+<text x="68" y="52.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#475569">71,160</text>
+<rect x="96.0" y="91.6" width="114.7" height="242.4" fill="#0f766e"/>
+<text x="153.3" y="83.6" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">60,305</text>
+<text transform="translate(153.3,354) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">50k poll32</text>
+<rect x="228.7" y="160.1" width="114.7" height="173.9" fill="#0f766e"/>
+<text x="286.0" y="152.1" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">43,261</text>
+<text transform="translate(286.0,354) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">200k poll1</text>
+<rect x="361.3" y="154.7" width="114.7" height="179.3" fill="#0f766e"/>
+<text x="418.7" y="146.7" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">44,613</text>
+<text transform="translate(418.7,354) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">200k poll8</text>
+<rect x="494.0" y="150.9" width="114.7" height="183.1" fill="#0f766e"/>
+<text x="551.3" y="142.9" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">45,566</text>
+<text transform="translate(551.3,354) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">200k poll32</text>
+<rect x="626.7" y="171.3" width="114.7" height="162.7" fill="#0f766e"/>
+<text x="684.0" y="163.3" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">40,482</text>
+<text transform="translate(684.0,354) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">500k poll32</text>
+<rect x="759.3" y="166.8" width="114.7" height="167.2" fill="#0f766e"/>
+<text x="816.7" y="158.8" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#111827">41,612</text>
+<text transform="translate(816.7,354) rotate(35)" text-anchor="start" font-family="Arial, sans-serif" font-size="11" fill="#475569">200k decode</text>
+<text transform="translate(18,191.0) rotate(-90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#334155">Rows / second</text>
+</svg>
