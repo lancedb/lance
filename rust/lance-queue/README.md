@@ -148,3 +148,7 @@ lance_queue.group.<group>.commits.<partition>.next_entry_position
 
 Queue table creation disables automatic cleanup so WAL maintenance can be
 handled explicitly by future queue maintenance processes.
+
+The crate enables the AWS object-store provider by default. Disable default
+features for local-only builds, or enable `azure` / `gcp` for those object-store
+providers.

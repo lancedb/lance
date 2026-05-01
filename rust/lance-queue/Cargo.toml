@@ -36,6 +36,12 @@ async-trait.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 
+[features]
+default = ["aws"]
+aws = ["lance/aws", "lance-io/aws"]
+azure = ["lance/azure", "lance-io/azure"]
+gcp = ["lance/gcp", "lance-io/gcp"]
+
 [lints]
 workspace = true
 
