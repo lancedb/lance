@@ -48,3 +48,7 @@ workspace = true
 [[bench]]
 name = "queue_write"
 harness = false
+
+[[bench]]
+name = "queue_read"
+harness = false

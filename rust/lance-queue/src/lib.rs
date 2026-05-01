@@ -18,6 +18,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use arrow_select::take::take_record_batch;
+use futures::future::try_join_all;
 use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance::dataset::builder::DatasetBuilder;
@@ -613,11 +614,12 @@ impl Producer {
         )?;
         let partitioned_batches = partitioner.partition_batch(&batch)?;
 
-        let mut entries = Vec::with_capacity(partitioned_batches.len());
+        let mut append_futures = Vec::with_capacity(partitioned_batches.len());
         for (partition_id, partition_batch) in partitioned_batches {
             let appender = self.appender(partition_id)?;
-            entries.push(appender.append(vec![partition_batch]).await?);
+            append_futures.push(async move { appender.append(vec![partition_batch]).await });
         }
+        let entries = try_join_all(append_futures).await?;
 
         Ok(ProduceResult {
             num_rows: batch.num_rows(),
