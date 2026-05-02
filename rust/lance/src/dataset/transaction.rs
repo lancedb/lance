@@ -2029,13 +2029,15 @@ impl Transaction {
                                 }
                             }
                             None => {
-                                // Fragment id not present in the previous manifest (Merge may append
-                                // ids beyond the original list). Apply the same full-fragment
-                                // last_updated refresh as for a rewrite.
+                                // Brand-new fragment ID not present in the previous manifest.
+                                // Set both last_updated and created version meta, consistent
+                                // with Append/Overwrite for genuinely new fragments.
                                 lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                                     fragment,
                                     new_version,
                                 )?;
+                                fragment.created_at_version_meta =
+                                    fragment.last_updated_at_version_meta.clone();
                             }
                         }
                     }
@@ -3527,7 +3529,20 @@ fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Res
 #[inline]
 fn merge_fragment_physically_rewritten(prev: &Fragment, merged: &Fragment) -> bool {
     debug_assert_eq!(prev.id, merged.id);
-    prev.files != merged.files
+    if prev.files.len() != merged.files.len() {
+        return true;
+    }
+    // Compare identity fields only. file_size_bytes is an AtomicU64 cache that
+    // concurrent scans can populate in place on the manifest's DataFile, so it
+    // must not be part of the rewrite check.
+    prev.files.iter().zip(merged.files.iter()).any(|(p, m)| {
+        p.path != m.path
+            || p.fields != m.fields
+            || p.column_indices != m.column_indices
+            || p.file_major_version != m.file_major_version
+            || p.file_minor_version != m.file_minor_version
+            || p.base_id != m.base_id
+    })
 }
 
 /// Validate that Merge operations preserve all original fragments.
@@ -4709,7 +4724,7 @@ mod tests {
             id: 0,
             files: vec![mk_file("before.lance")],
             deletion_file: None,
-            row_id_meta: row_id_meta.clone(),
+            row_id_meta,
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4802,7 +4817,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
-            last_updated_at_version_meta: Some(meta_v1.clone()),
+            last_updated_at_version_meta: Some(meta_v1),
             created_at_version_meta: None,
         };
 
@@ -4894,6 +4909,94 @@ mod tests {
             out.fragments[0].last_updated_at_version_meta.is_none(),
             "without stable row IDs, Merge must not populate per-row last_updated metadata"
         );
+    }
+
+    #[test]
+    fn merge_build_manifest_sets_both_version_meta_for_new_fragment_id_stable_row_ids() {
+        use lance_file::version::LanceFileVersion;
+        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // Existing fragment (id=0) with stable row IDs
+        let row_ids_0 = RowIdSequence::from([10u64, 11, 12].as_slice());
+        let existing_fragment = Fragment {
+            id: 0,
+            files: vec![mk_file("existing.lance")],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
+            physical_rows: Some(3),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let mut manifest = Manifest::new(
+            lance_schema.clone(),
+            Arc::new(vec![existing_fragment.clone()]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+        manifest.next_row_id = 100;
+        manifest.version = 1;
+
+        // New fragment (id=1) not present in prev manifest — exercises the None branch
+        let row_ids_1 = RowIdSequence::from([20u64, 21, 22, 23].as_slice());
+        let new_fragment = Fragment {
+            id: 1,
+            files: vec![mk_file("new.lance")],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: vec![existing_fragment, new_fragment],
+                schema: lance_schema,
+            },
+            None,
+        );
+
+        let (out, _) = tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(out.version, 2);
+
+        let new_frag = out.fragments.iter().find(|f| f.id == 1).unwrap();
+
+        // last_updated_at_version must be set to the commit version
+        let last_updated_seq = new_frag
+            .last_updated_at_version_meta
+            .as_ref()
+            .expect("new fragment must have last_updated_at_version_meta")
+            .load_sequence()
+            .unwrap();
+        assert_eq!(last_updated_seq.version_at(0).unwrap(), 2);
+        assert_eq!(last_updated_seq.version_at(3).unwrap(), 2);
+
+        // created_at_version must also be set — must not be None
+        let created_seq = new_frag
+            .created_at_version_meta
+            .as_ref()
+            .expect("new fragment must have created_at_version_meta")
+            .load_sequence()
+            .unwrap();
+        assert_eq!(created_seq.version_at(0).unwrap(), 2);
+        assert_eq!(created_seq.version_at(3).unwrap(), 2);
     }
 
     #[test]
