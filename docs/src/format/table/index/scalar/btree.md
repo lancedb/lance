@@ -56,3 +56,38 @@ The BTree index provides exact results for the following query types:
 | **Range**  | `column BETWEEN a AND b`  | BTree traversal for pages overlapping the range, then search each sub-index |
 | **IsIn**   | `column IN (v1, v2, ...)` | Multiple BTree lookups, union results from all matching sub-indices         |
 | **IsNull** | `column IS NULL`          | Returns rows from all pages where null_count > 0                            |
+
+## Skipping the Sub-Index Search for Unselective Queries
+
+A BTree search has two stages: an in-memory page lookup that selects which pages
+might contain matches, followed by a per-page sub-index search that reads each
+matching page from `page_data.lance` and returns row IDs. When the page lookup
+already matches a large fraction of the index, the second stage rarely refines
+the result enough to repay its I/O — the caller is usually better off doing a
+normal scan with a recheck on the predicate.
+
+When this triggers, `BTreeIndex::search` returns the `Indeterminate` search
+result (semantically: "every row could match, recheck downstream") without
+loading any pages. The query planner then falls back to a filtered scan.
+
+The decision is gated by **two thresholds**, both of which must be exceeded
+for the skip to fire:
+
+| Environment variable                    | Default     | Effect                                                                                                                         |
+|-----------------------------------------|-------------|--------------------------------------------------------------------------------------------------------------------------------|
+| `LANCE_BTREE_SKIP_ROW_THRESHOLD`        | `1000000`   | Absolute candidate-row threshold. Estimated as `matched_pages * batch_size`. Set to `0` to disable the skip entirely.          |
+| `LANCE_BTREE_SKIP_FRACTION_THRESHOLD`   | `0.15`      | Fractional threshold: `matched_pages / total_pages`. Set to `1.0` (or higher) to disable the skip entirely.                     |
+
+Both checks have to pass before the skip is taken — the matched portion has to
+be both absolutely large *and* a meaningful slice of the dataset. In particular,
+small indices never trip the skip (with a 4096-row batch size the row threshold
+alone requires the index to span ~244 pages or more).
+
+!!! note
+    These defaults assume that the cost of loading many btree pages is
+    comparable to or worse than the cost of a fallback scan. That holds for
+    cold object storage with high per-page latency, but on warm or local
+    storage btree page reads often coalesce into a single sequential read and
+    are cheaper than the fallback. Tune (or disable) the thresholds for your
+    storage class — see the [BTree Index performance guide](../../../../guide/performance.md#btree-index)
+    for end-to-end guidance.

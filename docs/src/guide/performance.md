@@ -269,6 +269,38 @@ query. When the BTree index is not fully loaded into the index cache, the search
 that need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
 pages were loaded from disk to satisfy a query.
 
+#### Skipping the Sub-Index Search for Unselective Queries
+
+A BTree search has two phases: a cheap in-memory page lookup, then a more
+expensive read of each matching page from disk plus a flat search of its
+contents. When the page lookup matches a large fraction of the index the
+second phase rarely refines the result enough to repay the I/O — the planner
+is usually better off doing a normal scan with a predicate recheck.
+
+To avoid that wasted work, `BTreeIndex::search` will short-circuit the
+sub-index phase and return an `Indeterminate` result (signalling "every row
+could match, recheck downstream") when both of the following are true:
+
+| Environment variable                    | Default     | Meaning                                                                                                       |
+|-----------------------------------------|-------------|---------------------------------------------------------------------------------------------------------------|
+| `LANCE_BTREE_SKIP_ROW_THRESHOLD`        | `1000000`   | Skip when `matched_pages * batch_size` exceeds this many candidate rows. Set to `0` to disable the skip.       |
+| `LANCE_BTREE_SKIP_FRACTION_THRESHOLD`   | `0.15`      | Skip when `matched_pages / total_pages` exceeds this fraction. Set to `1.0` to disable the skip.               |
+
+Both must be exceeded — the matched portion has to be absolutely large *and* a
+meaningful slice of the dataset before the skip fires. Small indices never
+trip the skip (with the default 4096-row batch size the row threshold alone
+requires the index to span at least ~244 pages).
+
+The right values are workload-dependent. The defaults assume the cost of
+loading many btree pages is comparable to or worse than scanning the
+indexed column — true for cold object storage with high per-page latency,
+but often false for warm or local storage where btree page reads coalesce
+into a single sequential read. If your storage is fast or warm, raise the
+fraction threshold to `1.0` (or set the row threshold to `0`) to disable the
+skip; if your storage is cold and benchmarks show the fallback scan is
+faster than reading thousands of small btree pages, the defaults are a
+reasonable starting point.
+
 ### Bitmap Index
 
 The Bitmap index is an inverted lookup table that stores a bitmap for each possible value in the column. These bitmaps are compressed and serialized as a [Roaring Bitmap](https://roaringbitmap.org/).

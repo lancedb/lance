@@ -4903,4 +4903,111 @@ mod tests {
         // so the search is exact.
         assert!(matches!(result, SearchResult::Exact(_)));
     }
+
+    /// Manual benchmark: invoke twice with different env var values and
+    /// compare. The default thresholds are loaded once via LazyLock so each
+    /// run measures one configuration.
+    ///
+    /// ```text
+    /// # baseline (skip disabled — set the row threshold above the index size):
+    /// LANCE_BTREE_SKIP_ROW_THRESHOLD=10000000000 \
+    ///   cargo test -p lance-index --release --lib \
+    ///   bench_btree_skip_unselective -- --ignored --nocapture
+    ///
+    /// # default thresholds (skip enabled at 1M rows / 15%):
+    ///   cargo test -p lance-index --release --lib \
+    ///   bench_btree_skip_unselective -- --ignored --nocapture
+    /// ```
+    #[ignore = "manual benchmark, see comment for usage"]
+    #[tokio::test]
+    async fn bench_btree_skip_unselective() {
+        use std::time::Instant;
+
+        const TOTAL_ROWS: u64 = 5_000_000;
+        const BATCH_ROWS: u64 = 10_000;
+        const NUM_BATCHES: u32 = (TOTAL_ROWS / BATCH_ROWS) as u32;
+        const ITERATIONS: u32 = 20;
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        eprintln!("[bench] building btree on {} rows...", TOTAL_ROWS);
+        let build_start = Instant::now();
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(
+                RowCount::from(BATCH_ROWS),
+                BatchCount::from(NUM_BATCHES),
+            );
+        train_btree_index(
+            stream,
+            test_store.as_ref(),
+            super::DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "[bench] index built in {:.2}s",
+            build_start.elapsed().as_secs_f64()
+        );
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        eprintln!(
+            "[bench] total_pages = {}, batch_size = {}",
+            index.page_lookup.total_pages(),
+            index.batch_size
+        );
+        eprintln!(
+            "[bench] LANCE_BTREE_SKIP_ROW_THRESHOLD = {}",
+            *super::BTREE_SKIP_ROW_THRESHOLD
+        );
+        eprintln!(
+            "[bench] LANCE_BTREE_SKIP_FRACTION_THRESHOLD = {}",
+            *super::BTREE_SKIP_FRACTION_THRESHOLD
+        );
+
+        // Sweep a few selectivities so we can see whether skip kicks in only
+        // for the unselective queries we care about.
+        for pct in [1u32, 10, 50, 90] {
+            let upper = (TOTAL_ROWS as i32) * (pct as i32) / 100;
+            let query = SargableQuery::Range(
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Excluded(ScalarValue::Int32(Some(upper))),
+            );
+
+            // Warm-up + result-shape probe.
+            let probe = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            let result_kind = match &probe {
+                SearchResult::Exact(_) => "Exact",
+                SearchResult::AtMost(_) => "AtMost",
+                SearchResult::AtLeast(_) => "AtLeast",
+                SearchResult::Indeterminate => "Indeterminate",
+            };
+
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..ITERATIONS {
+                let index =
+                    BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+                        .await
+                        .unwrap();
+                let t = Instant::now();
+                let _ = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+                total += t.elapsed();
+            }
+            let avg_ms = total.as_secs_f64() * 1000.0 / ITERATIONS as f64;
+            eprintln!(
+                "[bench] selectivity={:>3}%  variant={:<14}  avg={:>8.3} ms",
+                pct, result_kind, avg_ms,
+            );
+        }
+    }
 }
