@@ -34,8 +34,8 @@ const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 pub struct WalAppendResult {
     /// Topic partition id.
     pub partition_id: u32,
-    /// Producer shard slot id.
-    pub producer_id: u32,
+    /// Producer shard id.
+    pub producer_id: String,
     /// MemWAL shard id used by this partition.
     pub shard_id: Uuid,
     /// WAL entry position written.
@@ -53,8 +53,8 @@ pub struct WalAppendResult {
 pub struct TopicEntry {
     /// Topic partition id.
     pub partition_id: u32,
-    /// Producer shard slot id.
-    pub producer_id: u32,
+    /// Producer shard id.
+    pub producer_id: String,
     /// MemWAL shard id used by this partition.
     pub shard_id: Uuid,
     /// WAL entry position.
@@ -63,29 +63,30 @@ pub struct TopicEntry {
     pub batches: Vec<RecordBatch>,
 }
 
-/// Per-partition producer writer using MemWAL-compatible storage layout.
+/// WAL appender for a single physical shard with epoch fencing.
 #[derive(Debug)]
-pub struct PartitionWriter {
+pub struct WalAppender {
     object_store: Arc<ObjectStore>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     partition_id: u32,
-    producer_id: u32,
+    producer_id: String,
     shard_id: Uuid,
     writer_epoch: u64,
     next_entry_position: Mutex<Option<u64>>,
 }
 
-impl PartitionWriter {
+impl WalAppender {
     /// Open a partition writer and claim a new writer epoch.
     pub async fn open(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
-        producer_id: u32,
+        producer_id: impl Into<String>,
         shard_id: Uuid,
         shard_spec_id: u32,
     ) -> Result<Self> {
+        let producer_id = producer_id.into();
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
@@ -110,11 +111,12 @@ impl PartitionWriter {
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
-        producer_id: u32,
+        producer_id: impl Into<String>,
         shard_id: Uuid,
         _shard_spec_id: u32,
         writer_epoch: u64,
     ) -> Self {
+        let producer_id = producer_id.into();
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
@@ -139,7 +141,7 @@ impl PartitionWriter {
         let wal_data = Bytes::from(serialize_batches(
             &batches,
             self.partition_id,
-            self.producer_id,
+            &self.producer_id,
             self.shard_id,
             self.writer_epoch,
         )?);
@@ -177,7 +179,7 @@ impl PartitionWriter {
                     )?);
                     return Ok(WalAppendResult {
                         partition_id: self.partition_id,
-                        producer_id: self.producer_id,
+                        producer_id: self.producer_id.clone(),
                         shard_id: self.shard_id,
                         entry_position,
                         num_batches,
@@ -245,35 +247,62 @@ impl PartitionWriter {
     }
 }
 
+const MAX_CURSOR_PROBE: u64 = 4096;
+
 /// Ordered reader for MemWAL-compatible topic WAL entries.
 #[derive(Debug, Clone)]
 pub struct WalTailer {
     object_store: Arc<ObjectStore>,
     wal_dir: Path,
+    manifest_store: Arc<ShardManifestStore>,
     partition_id: u32,
-    producer_id: u32,
+    producer_id: String,
     shard_id: Uuid,
+    update_cursor: bool,
 }
 
 impl WalTailer {
-    /// Create a WAL tailer for a topic partition.
+    /// Create a WAL tailer for a topic partition shard.
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
-        producer_id: u32,
+        producer_id: impl Into<String>,
         shard_id: Uuid,
     ) -> Self {
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            object_store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
         Self {
             object_store,
             wal_dir: shard_wal_path(&base_path, &shard_id),
+            manifest_store,
             partition_id,
-            producer_id,
+            producer_id: producer_id.into(),
             shard_id,
+            update_cursor: false,
         }
     }
 
+    /// Enable async best-effort cursor updates on read.
+    ///
+    /// When enabled, successful `read_entry` calls asynchronously update
+    /// `wal_entry_position_last_seen` in the shard manifest. Only enable this
+    /// for shards that do not have active writers claiming epochs, such as
+    /// consumer group offset shards.
+    pub fn with_cursor_updates(mut self, enabled: bool) -> Self {
+        self.update_cursor = enabled;
+        self
+    }
+
     /// Read a WAL entry. Returns `None` if the entry does not exist yet.
+    ///
+    /// When cursor updates are enabled via [`with_cursor_updates`], successful
+    /// reads asynchronously update `wal_entry_position_last_seen` in the shard
+    /// manifest as a best-effort hint for future tailers.
     pub async fn read_entry(&self, entry_position: u64) -> Result<Option<TopicEntry>> {
         let path = self.entry_path(entry_position);
         let data = match self.object_store.inner.get(&path).await {
@@ -293,19 +322,33 @@ impl WalTailer {
                 path, self.partition_id, self.shard_id, e
             ))
         })?;
-        let batches = read_batches(bytes, self.partition_id, self.producer_id, self.shard_id)?;
+        let batches = read_batches(bytes, self.partition_id, &self.producer_id, self.shard_id)?;
+
+        if self.update_cursor {
+            self.fire_cursor_update(entry_position);
+        }
 
         Ok(Some(TopicEntry {
             partition_id: self.partition_id,
-            producer_id: self.producer_id,
+            producer_id: self.producer_id.clone(),
             shard_id: self.shard_id,
             entry_position,
             batches,
         }))
     }
 
-    /// Find the next position after the currently listed entries.
+    /// Find the next append position.
+    ///
+    /// Uses `wal_entry_position_last_seen` from the shard manifest as a probe
+    /// hint and scans forward to find the true tip. Falls back to a full
+    /// directory listing if the hint is unavailable or stale.
     pub async fn next_position(&self) -> Result<u64> {
+        if let Some(hint) = self.manifest_cursor_hint().await
+            && hint >= FIRST_WAL_ENTRY_POSITION
+            && let Some(tip) = self.probe_forward(hint).await?
+        {
+            return Ok(tip);
+        }
         next_position_from_listing(
             self.object_store.as_ref(),
             &self.wal_dir,
@@ -326,9 +369,69 @@ impl WalTailer {
         .await
     }
 
+    /// Read `wal_entry_position_last_seen` from the shard manifest as a hint.
+    async fn manifest_cursor_hint(&self) -> Option<u64> {
+        let manifest = self.manifest_store.read_latest().await.ok()??;
+        let hint = manifest.wal_entry_position_last_seen;
+        if hint > 0 { Some(hint) } else { None }
+    }
+
+    /// Probe forward from `hint` to find the actual next position.
+    ///
+    /// Returns `None` if the hint entry itself does not exist (stale cursor),
+    /// causing the caller to fall back to listing.
+    async fn probe_forward(&self, hint: u64) -> Result<Option<u64>> {
+        if !self.entry_exists(hint).await? {
+            return Ok(None);
+        }
+        let mut pos = hint + 1;
+        while pos - hint <= MAX_CURSOR_PROBE {
+            if !self.entry_exists(pos).await? {
+                return Ok(Some(pos));
+            }
+            pos += 1;
+        }
+        // Exceeded probe limit — fall back to listing
+        Ok(None)
+    }
+
+    async fn entry_exists(&self, entry_position: u64) -> Result<bool> {
+        let path = self.entry_path(entry_position);
+        match self.object_store.inner.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(Error::io(format!(
+                "failed to check WAL entry {} for shard {}: {}",
+                entry_position, self.shard_id, e
+            ))),
+        }
+    }
+
+    /// Fire-and-forget update of `wal_entry_position_last_seen` in the shard manifest.
+    fn fire_cursor_update(&self, entry_position: u64) {
+        let manifest_store = self.manifest_store.clone();
+        tokio::spawn(async move {
+            let _ = update_manifest_cursor(&manifest_store, entry_position).await;
+        });
+    }
+
     fn entry_path(&self, entry_position: u64) -> Path {
         self.wal_dir.child(wal_entry_filename(entry_position))
     }
+}
+
+async fn update_manifest_cursor(manifest_store: &ShardManifestStore, entry_position: u64) {
+    let Ok(Some(manifest)) = manifest_store.read_latest().await else {
+        return;
+    };
+    if entry_position <= manifest.wal_entry_position_last_seen {
+        return;
+    }
+    let mut updated = manifest;
+    updated.version += 1;
+    updated.wal_entry_position_last_seen = entry_position;
+    // Best-effort: silently ignore version conflicts or any other write errors.
+    let _ = manifest_store.write(&updated).await;
 }
 
 fn validate_batches(batches: &[RecordBatch]) -> Result<()> {
@@ -360,7 +463,7 @@ fn validate_batches(batches: &[RecordBatch]) -> Result<()> {
 fn serialize_batches(
     batches: &[RecordBatch],
     partition_id: u32,
-    producer_id: u32,
+    producer_id: &str,
     shard_id: Uuid,
     writer_epoch: u64,
 ) -> Result<Vec<u8>> {
@@ -368,7 +471,7 @@ fn serialize_batches(
     let mut metadata = schema.metadata().clone();
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
     metadata.insert(TOPIC_PARTITION_KEY.to_string(), partition_id.to_string());
-    metadata.insert(TOPIC_PRODUCER_ID_KEY.to_string(), producer_id.to_string());
+    metadata.insert(TOPIC_PRODUCER_ID_KEY.to_string(), producer_id.to_owned());
     metadata.insert(TOPIC_SHARD_ID_KEY.to_string(), shard_id.to_string());
     let schema_with_metadata = Arc::new(ArrowSchema::new_with_metadata(
         schema.fields().to_vec(),
@@ -395,7 +498,7 @@ fn serialize_batches(
 fn read_batches(
     bytes: Bytes,
     partition_id: u32,
-    producer_id: u32,
+    producer_id: &str,
     shard_id: Uuid,
 ) -> Result<Vec<RecordBatch>> {
     let cursor = Cursor::new(bytes);
@@ -420,7 +523,7 @@ fn read_batches(
 fn validate_wal_schema_metadata(
     metadata: &HashMap<String, String>,
     partition_id: u32,
-    producer_id: u32,
+    producer_id: &str,
     shard_id: Uuid,
 ) -> Result<()> {
     let actual_partition_id = metadata
@@ -442,14 +545,7 @@ fn validate_wal_schema_metadata(
 
     let actual_producer_id = metadata
         .get(TOPIC_PRODUCER_ID_KEY)
-        .ok_or_else(|| Error::io("WAL entry is missing topic producer metadata"))?
-        .parse::<u32>()
-        .map_err(|e| {
-            Error::io(format!(
-                "failed to parse WAL topic producer metadata: {}",
-                e
-            ))
-        })?;
+        .ok_or_else(|| Error::io("WAL entry is missing topic producer metadata"))?;
     if actual_producer_id != producer_id {
         return Err(Error::io(format!(
             "WAL entry producer metadata mismatch: expected {}, got {}",

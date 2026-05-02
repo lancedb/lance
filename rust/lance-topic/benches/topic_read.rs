@@ -29,11 +29,12 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::try_join_all;
 use lance_core::{Error, Result};
-use lance_topic::{PollOptions, Producer, StartPosition, Topic};
+use lance_topic::{Producer, Topic, TopicBatch, WalTailer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -351,15 +352,33 @@ async fn run_case(
         .await?;
     let producers = try_join_all((0..case.producer_count).map(|producer_id| {
         let topic = topic.clone();
-        async move { topic.producer(producer_id).await }
+        async move { topic.producer(format!("producer-{}", producer_id)).await }
     }))
     .await?;
     seed_topic(&producers, input_batches).await?;
 
-    let mut consumer = topic.partition_reader(0, StartPosition::Earliest).await?;
-    let options = PollOptions {
-        max_entries_per_partition: case.poll_entries,
-    };
+    topic.refresh_partitions().await?;
+    let partitions = topic.partitions()?;
+    let object_store: Arc<lance_io::object_store::ObjectStore> =
+        Arc::new(topic.dataset().object_store().clone());
+    let base_path = topic.dataset().branch_location().path;
+    let tailers: Vec<WalTailer> = partitions
+        .iter()
+        .filter(|p| p.partition_id == 0)
+        .map(|p| {
+            WalTailer::new(
+                object_store.clone(),
+                base_path.clone(),
+                p.partition_id,
+                p.producer_id.clone(),
+                p.shard_id,
+            )
+        })
+        .collect();
+    let mut next_positions = Vec::new();
+    for tailer in &tailers {
+        next_positions.push(tailer.first_position().await?);
+    }
 
     let start = Instant::now();
     let mut rows_read = 0usize;
@@ -367,24 +386,33 @@ async fn run_case(
     let mut arrow_batches_read = 0usize;
     let mut polls = 0usize;
     while rows_read < case.rows {
-        let batches = consumer.poll_with_options(options.clone()).await?;
+        let mut any_read = false;
+        for (idx, tailer) in tailers.iter().enumerate() {
+            for _ in 0..case.poll_entries {
+                match tailer.read_entry(next_positions[idx]).await? {
+                    Some(entry) => {
+                        any_read = true;
+                        next_positions[idx] += 1;
+                        let batch = TopicBatch::from_entry(entry)?;
+                        if case.decode_messages {
+                            let messages = batch.messages()?;
+                            rows_read += messages.len();
+                        } else {
+                            rows_read += batch.num_rows();
+                        }
+                        wal_entries_read += 1;
+                        arrow_batches_read += batch.batches.len();
+                    }
+                    None => break,
+                }
+            }
+        }
         polls += 1;
-        if batches.is_empty() {
+        if !any_read {
             return Err(Error::io(format!(
                 "read benchmark case '{}' reached end of WAL after {} rows, expected {}",
                 case.name, rows_read, case.rows
             )));
-        }
-
-        for batch in batches {
-            if case.decode_messages {
-                let messages = batch.messages()?;
-                rows_read += messages.len();
-            } else {
-                rows_read += batch.num_rows();
-            }
-            wal_entries_read += 1;
-            arrow_batches_read += batch.batches.len();
         }
     }
     let elapsed = start.elapsed();

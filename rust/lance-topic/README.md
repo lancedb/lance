@@ -1,60 +1,265 @@
 # lance-topic
 
-`lance-topic` is an experimental Kafka-like topic API backed by a real Lance
-table and MemWAL shard WAL files. It is currently a storage-only design: there
-is no topic server in this crate.
+`lance-topic` is an experimental Kafka-like topic API backed by Lance tables
+and MemWAL shard WAL files. It is a storage-only design with no topic server.
 
-Topic creation owns the table schema:
+## Architecture
 
-- `id: Utf8` as the Lance unenforced primary key and logical partitioning key
-- `producer_id: UInt32` as the producer shard slot
-- `payload: lance.json` for JSON payloads
+All components are backed by Lance tables with MemWAL shards on shared
+storage. There are no servers — producers, consumers, and consumer groups
+coordinate through storage-level fencing and atomic writes.
 
-The logical topic partition is computed from `id` only. The physical WAL shard
-is `(logical partition, producer_id)`. Opening a producer creates and claims
-one partition writer for every logical partition, so a fleet can add producer
-ids without updating topic metadata. A consumer assigned to a logical partition
-refreshes shard discovery and reads every discovered producer shard for that
-partition.
+```
+                       ┌──────────────────────────────────────────────────┐
+   Producers           │ Topic (Lance Table + MemWAL)                     │
+                       │                                                  │
+ ┌──────────┐  send    │ Partition 0     Partition 1     ...  Partition N │
+ │ server-1 │ ──────── │ ┌───────────┐  ┌───────────┐       ┌───────────┐ │
+ └──────────┘          │ │ WAL shard │  │ WAL shard │       │ WAL shard │ │
+                       │ │(server-1) │  │(server-1) │       │(server-1) │ │
+ ┌──────────┐  send    │ ├───────────┤  ├───────────┤       ├───────────┤ │
+ │ server-2 │ ──────── │ │ WAL shard │  │ WAL shard │       │ WAL shard │ │
+ └──────────┘          │ │(server-2) │  │(server-2) │       │(server-2) │ │
+                       │ └───────────┘  └───────────┘       └───────────┘ │
+                       └───────┬──────────────┬───────────────────────────┘
+                               │              │
+                   poll        │              │         poll
+              ┌────────────────┘              └───────────────────┐
+              │                                                   │
+ ┌────────────┴────────────────────────────────────────────────┐  │
+ │ Consumer Group "billing" (Lance Table + MemWAL)             │  │
+ │                                                             │  │
+ │ Consumer 0 → assigned partitions [0, 2]                     │  │
+ │ Consumer 1 → assigned partitions [1, 3]                     │  │
+ │                                                             │  │
+ │ Table schema:                                               │  │
+ │   consumer_position | topic_partition_id | producer_id | ...│  │
+ │                                                             │  │
+ │ _mem_wal/ shards (one per consumer position + partition):   │  │
+ │ ┌───────────────┐ ┌───────────────┐                         │  │
+ │ │ WAL shard     │ │ WAL shard     │                         │  │
+ │ │ (pos=0, p0)   │ │ (pos=0, p2)   │ ← Consumer 0 writes     │  │
+ │ └───────────────┘ └───────────────┘   committed offsets     │  │
+ │ ┌───────────────┐ ┌───────────────┐                         │  │
+ │ │ WAL shard     │ │ WAL shard     │                         │  │
+ │ │ (pos=1, p1)   │ │ (pos=1, p3)   │ ← Consumer 1 writes     │  │
+ │ └───────────────┘ └───────────────┘   committed offsets     │  │
+ │                                                             │  │
+ │ Each offset entry records:                                  │  │
+ │   (topic_partition_id, producer_id) → next_entry_position   │  │
+ └─────────────────────────────────────────────────────────────┘  │
+                                                                  │
+ ┌────────────────────────────────────────────────────────────────┴┐
+ │ Consumer Group "analytics" (Lance Table + MemWAL)               │
+ │                                                                 │
+ │ Consumer 0 → assigned partitions [0, 1, 2, 3]                   │
+ │ _mem_wal/ shards: (pos=0, p0), (pos=0, p1), ...                 │
+ └─────────────────────────────────────────────────────────────────┘
+```
 
-## Create or Open a Topic
+- A **Topic** is one Lance table. Its `_mem_wal/` shards store message data,
+  keyed by `(logical_partition, producer_id)`.
+- **Producers** write to the topic's WAL shards. Each producer owns one shard
+  per partition. Multiple producers share the same topic without coordination.
+- A **Consumer Group** is a separate Lance table with its own `_mem_wal/`
+  shards that store committed offsets. Each group independently tracks
+  progress against the topic.
+- **Consumers** within a group are assigned partitions by position. Each
+  consumer polls all producer shards for its assigned partitions.
 
-Topic creation hides the Lance schema, primary-key metadata, table creation,
-automatic-cleanup disabling, and MemWAL setup.
+### Topic
+
+A topic is a Lance table with a fixed schema:
+
+- `id: Utf8` — unenforced primary key and logical partition key
+- `producer_id: Utf8` — producer shard identifier
+- `payload: lance.json` — JSON message payload
+
+### Partitions and Shards
+
+The topic has N logical partitions configured at creation time. The logical
+partition for a message is determined by hashing `id` (Murmur3 bucket). Each
+`(logical_partition, producer_id)` pair maps to one physical MemWAL shard with
+a deterministic UUID. This means:
+
+- Multiple producers can write to the same topic without coordination
+- Each producer owns its own set of physical shards (one per logical partition)
+- A logical partition may contain entries from many producers
+
+```
+Topic (4 partitions, 2 producers)
+├── Logical Partition 0
+│   ├── Physical Shard (partition=0, producer="server-1")  →  _mem_wal/{uuid}/wal/
+│   └── Physical Shard (partition=0, producer="server-2")  →  _mem_wal/{uuid}/wal/
+├── Logical Partition 1
+│   ├── Physical Shard (partition=1, producer="server-1")
+│   └── Physical Shard (partition=1, producer="server-2")
+├── Logical Partition 2
+│   └── ...
+└── Logical Partition 3
+    └── ...
+```
+
+Physical shards are not predeclared. Opening a producer creates and claims
+shards on demand. Shard discovery happens by listing `_mem_wal/` directories
+and reading each shard's latest manifest.
+
+### WAL Appender
+
+Note: WAL appender is a concept defined in the Lance MemWAL specification. See
+the MemWAL spec for details on shard manifests, epoch fencing, and the
+WAL file layout.
+
+Each physical shard is written by a `WalAppender`. A WAL appender owns a
+single shard and writes Arrow IPC entries as sequentially numbered files under
+`_mem_wal/{shard_uuid}/wal/`. Each shard has a manifest that tracks the
+current `writer_epoch` — a monotonically increasing fencing token.
+
+When a producer opens, it creates one WAL appender per logical partition.
+Each appender claims a fresh writer epoch by atomically updating its shard
+manifest. A successful `send` writes a WAL entry file using atomic
+put-if-not-exists. The appender does not read the manifest on the hot write
+path — a successful WAL file create is accepted as the winning append.
+
+If a WAL file create fails (conflict with another writer), the appender
+rechecks the shard manifest. If a newer epoch exists, the appender is fenced.
+Once any appender is fenced, the entire producer is terminally fenced — all
+further sends fail immediately without attempting to reclaim. This means a
+producer with the same `producer_id` can only be replaced, never shared.
+
+Consumer group offset writers use the same WAL appender mechanism. Each
+consumer claims appender epochs for its assigned consumer group shards,
+providing the same hard fencing guarantee: if a new consumer with the same
+position opens, the old consumer's offset writers are fenced.
+
+### Delivery Semantics
+
+- At-least-once delivery. Producer retries may duplicate messages if the
+  WAL entry was committed but the caller did not receive acknowledgement.
+- `send_batch` is best-effort across partitions — some partitions may
+  succeed before another fails. It is not transactional.
+- Offsets are entry-level WAL positions, not row-level.
+- If any shard fails during consumer `poll`, the whole poll fails and the
+  consumer keeps its previous in-memory offsets.
+
+### Consumer Groups
+
+A consumer group is a separate Lance table with its own MemWAL shards. Both
+the topic table and its consumer group tables are managed through a Lance
+namespace client. A namespace resolves a multi-segment table ID to a physical
+storage location. The table ID is a logical path — not a filesystem path.
+
+```
+Namespace (e.g. DirectoryNamespace at /data/lance)
+│
+├── Table ID: ["website", "events"]
+│   ← Topic table (schema: id, producer_id, payload)
+│   └── _mem_wal/
+│       ├── {shard-uuid-1}/  (partition=0, producer="server-1")
+│       ├── {shard-uuid-2}/  (partition=0, producer="server-2")
+│       └── ...
+│
+├── Table ID: ["website", "events", "consumer_group", "billing-service"]
+│   ← Consumer group table (schema: consumer_position, topic_partition_id,
+│      producer_id, next_entry_position)
+│   └── _mem_wal/
+│       ├── {shard-uuid}/  (position=0, partition=0)
+│       └── ...
+│
+└── Table ID: ["website", "events", "consumer_group", "analytics"]
+    ← Another consumer group
+    └── ...
+```
+
+The topic table ID is provided at creation (e.g. `["website", "events"]`).
+Consumer group table IDs are derived by appending
+`["consumer_group", "<group_id>"]` to the topic's table ID. The namespace
+client resolves each table ID independently to its own Lance dataset with its
+own manifest and WAL directory.
+
+Each consumer group tracks committed offsets per `(topic_partition_id,
+producer_id)`. Consumers are identified by a 0-indexed position within a
+declared total count. Partitions are assigned deterministically using
+rendezvous hashing over `(partition_id, position)` — each consumer can
+independently compute its assignment without coordination.
+
+```
+Consumer Group "billing-service" (3 consumers, 4 topic partitions)
+├── Consumer 0  →  assigned partitions [0, 2]
+├── Consumer 1  →  assigned partitions [1]
+└── Consumer 2  →  assigned partitions [3]
+```
+
+The consumer group table schema is:
+
+- `consumer_position: UInt32` — consumer position (unenforced primary key)
+- `topic_partition_id: UInt32` — topic partition being tracked
+- `producer_id: Utf8` — producer shard being tracked
+- `next_entry_position: UInt64` — next WAL entry to read
+
+Its MemWAL shard spec is `identity(consumer_position),
+identity(topic_partition_id)`. Each consumer claims writer epochs for its
+assigned partition shards. Consumers use hard fencing: if a new consumer with
+the same position starts, the old one is terminally fenced.
+
+If the total consumer count exceeds the topic's partition count, excess
+consumers are idle (assigned zero partitions).
+
+### WAL Tailer
+
+Note: WAL Tailer is a concept defined in the Lance MemWAL specification. See the
+MemWAL spec for details on WAL entry format and position semantics.
+
+A `WalTailer` reads entries from a single physical shard. It is the
+underlying read primitive used by both consumers (to read topic data) and
+consumer group stores (to replay committed offsets).
+
+Each WAL entry is a self-contained Arrow IPC file. The tailer reads entries
+by position — sequential integers starting from 1. When determining the
+next available position, the tailer uses the shard manifest's
+`wal_entry_position_last_seen` field as a starting hint and probes forward
+to find the true tip, avoiding a full directory listing when the hint is
+recent. If the hint is stale or unavailable, it falls back to listing.
+
+### MemWAL Usage
+
+The topic system works without any background maintenance. Producers append
+to WAL shards and consumers read from them indefinitely.
+
+However, the underlying Lance MemWAL supports flushing WAL entries into
+Flushed MemTables and merging Flushed MemTables into the base Lance table, 
+updating the MemWAL index with shard snapshots along the way. When this maintenance 
+is performed, all historical topic messages and consumer group offset commits
+become regular Lance table data. This means users get a full history of
+all events and consumer activity as queryable Lance datasets, where they
+can create vector indices, scalar indices, and full-text indices to run
+search and analytics leveraging all Lance capabilities — unifying real-time
+streaming and offline training and analytics into the same storage backend.
+
+## Examples
+
+### Create or Open a Topic
 
 ```rust
-use lance_topic::Topic;
-
-# async fn example() -> lance_core::Result<()> {
 let topic = Topic::builder()
-    .directory("/tmp/lance-topics", ["events"])
+    .directory("/tmp/lance-topics", ["website", "events"])
     .partition_count(4)
     .create()
     .await?;
 
 let reopened = Topic::builder()
-    .directory("/tmp/lance-topics", ["events"])
+    .directory("/tmp/lance-topics", ["website", "events"])
     .open()
     .await?;
-# Ok(())
-# }
 ```
 
-`directory(root, table_id)` is the default path and builds a directory
-namespace client internally. For catalog-backed tables, use
-`namespace(namespace_client, table_id)`.
+`directory(root, table_id)` builds a directory namespace client internally.
+For catalog-backed tables, use `namespace(namespace_client, table_id)`.
 
-## Produce Messages
-
-Each running producer uses a stable `producer_id`. Producers send JSON payloads
-keyed by `id`; `id` is always the topic partition key.
+### Produce Messages
 
 ```rust
-use lance_topic::Topic;
-use serde_json::json;
-
-# async fn example(topic: Topic) -> lance_core::Result<()> {
-let producer = topic.producer(7).await?;
+let producer = topic.producer("producer-server-1").await?;
 
 producer
     .send("order-123", json!({ "status": "created", "total": 42.50 }))
@@ -69,45 +274,26 @@ producer
         ],
     )
     .await?;
-# Ok(())
-# }
 ```
 
-`send` and `send_batch` acknowledge only after the corresponding WAL entry or
-entries are written. `send_batch` does not defer durability beyond the call; its
-batch size is the number of messages in one producer call and therefore the WAL
-entry granularity per touched logical partition.
+`send` and `send_batch` acknowledge after the WAL entry is written.
+`send_batch` commits one WAL entry per touched logical partition.
 
-`Topic::producer(producer_id)` claims a fresh writer epoch for every logical
-partition. If another producer with the same `producer_id` starts later, the
-older producer detects fencing when a later WAL create conflict or put failure
-causes it to recheck the shard manifest. A successful WAL create is accepted as
-the winning append. Once any partition writer is fenced, the whole producer
-instance is terminally fenced and later sends fail without trying to reclaim.
+### Consumer Groups
 
-## Consume Messages
-
-A consumer group is a named logical subscription. Consumers in the same group
-share progress through a nested Lance consumer-group table. A consumer has a
-stable string `consumer_id`. Active consumers are discovered from the group
-table and topic partitions are assigned with rendezvous hashing over
-`(group_id, logical partition id, consumer_id)`. The assignment ignores
-`producer_id`, and each assigned logical partition includes every producer
-shard.
-`Topic::consumer_group(group_id).create()` creates the nested consumer-group
-table and then opens it. Use `.open()` for an existing group.
-`TopicConsumerGroup::consumer_config(consumer_id)` builds a consumer config for
-that group.
+Create or open a consumer group, then create consumers with a position and
+total count:
 
 ```rust
-use lance_topic::{ConsumerConfig, Topic};
-
-# async fn example(topic: Topic) -> lance_core::Result<()> {
 let group = topic.consumer_group("billing-service").create().await?;
-let mut consumer = group
-    .consumer(group.consumer_config("billing-worker-1").build())
-    .await?;
+let mut consumer = group.consumer(0, 8).await?;
+```
 
+### Consume Messages
+
+Poll messages from a consumer and acknowledge the messages after processing:
+
+```rust
 let batches = consumer.poll().await?;
 for batch in &batches {
     for message in batch.messages()? {
@@ -116,110 +302,4 @@ for batch in &batches {
 }
 
 consumer.commit(&batches).await?;
-# Ok(())
-# }
 ```
-
-For multiple consumers in one group, each running process uses a distinct
-string consumer id:
-
-```rust
-use lance_topic::{ConsumerConfig, Topic};
-
-# async fn example(topic: Topic) -> lance_core::Result<()> {
-let group = topic.consumer_group("billing-service").open().await?;
-let mut consumer = group
-    .consumer(
-        group
-            .consumer_config("billing-worker-2")
-            .build(),
-    )
-    .await?;
-
-let assigned = consumer.assigned_partitions();
-let batches = consumer.poll().await?;
-consumer.commit(&batches).await?;
-# Ok(())
-# }
-```
-
-Manual logical-partition reads are available through `PartitionReader` for
-diagnostics and controlled replay. This reader is not a consumer group member
-and does not commit consumer group offsets.
-
-```rust
-use lance_topic::{Topic, StartPosition};
-
-# async fn example(topic: Topic) -> lance_core::Result<()> {
-let mut reader = topic.partition_reader(0, StartPosition::Earliest).await?;
-let batches = reader.poll().await?;
-# Ok(())
-# }
-```
-
-## Delivery Semantics
-
-- Delivery is at least once.
-- Producer retries may duplicate messages if the WAL entry was committed but
-  the caller did not receive the acknowledgement.
-- `send_batch` is best-effort across touched logical partitions and is not
-  transactional. Some partitions may have appended before another partition
-  returns an error.
-- If any producer partition writer is fenced, the producer instance is
-  terminally fenced.
-- Offsets are entry-level WAL positions, not row-level offsets.
-- Consumer group progress is tracked per `(logical partition, producer_id)`.
-- Offset commits are monotonic when replayed. If multiple commits exist for the
-  same `(logical partition, producer_id)`, the greatest next-entry position is
-  used.
-- If any assigned physical producer shard fails during `poll`, the whole poll
-  fails and the consumer keeps its previous in-memory offsets.
-- If any consumer group WAL writer owned by a consumer is fenced, the consumer
-  instance is terminally fenced and should be recreated.
-
-## Storage Notes
-
-Topic data is rooted at a real Lance table. The table's `__lance_mem_wal` index
-stores the shard spec: hash/bucket over `id` with `num_buckets = N`, and
-identity over `producer_id`. Physical producer shards are not predeclared.
-Topic open and consumer poll discover physical shards by listing `_mem_wal/`
-shard directories and reading each shard's latest manifest instead of relying
-on the MemWAL index snapshot as the discovery path.
-Topic-created shard UUIDs are deterministic for `(logical partition,
-producer_id)`, so producers with the same `producer_id` contend on the same
-partition writer manifests and are fenced by epoch.
-
-Consumer groups are nested Lance tables at
-`<topic table id>/consumer_group/<group_id>`. Their WAL shard spec is
-`identity(consumer_id), identity(topic_partition_id)`. Opening a consumer
-claims a writer epoch independently for every logical topic partition under
-that `consumer_id`, writes heartbeat events for membership, and writes offset
-commit events per `(logical partition, producer_id)`.
-
-Consumer group offsets are stored in a separate Lance table whose namespace id
-is the topic table id with `consumer_group/<group>` appended. For a topic table
-id `["ns1", "topic1"]`, group `billing-service` stores offsets in
-`["ns1", "topic1", "consumer_group", "billing-service"]`.
-
-The consumer group table schema is:
-
-- `consumer_id: Utf8`
-- `event_type: Utf8`
-- `topic_partition_id: UInt32`
-- `producer_id: UInt32?`
-- `next_entry_position: UInt64?`
-- `lease_expires_at_ms: UInt64?`
-
-Its MemWAL shard spec is `identity(consumer_id), identity(topic_partition_id)`.
-Each consumer claims writer epochs for its consumer/partition shards and
-appends heartbeat and offset-commit events as WAL entries. Reads replay every
-consumer-group shard and take the maximum committed `next_entry_position` for
-each `(topic_partition_id, producer_id)`, preserving monotonic offset behavior
-when assignments change.
-
-Topic table creation disables automatic cleanup so WAL maintenance can be
-handled explicitly by future topic maintenance processes.
-
-The crate enables the AWS object-store provider by default. Disable default
-features for local-only builds, or enable `azure` / `gcp` for those object-store
-providers.

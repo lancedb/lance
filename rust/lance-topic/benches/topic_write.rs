@@ -361,7 +361,7 @@ async fn run_case(
         .await?;
     let producers = try_join_all((0..case.producer_count).map(|producer_id| {
         let topic = topic.clone();
-        async move { topic.producer(producer_id).await }
+        async move { topic.producer(format!("producer-{}", producer_id)).await }
     }))
     .await?;
 

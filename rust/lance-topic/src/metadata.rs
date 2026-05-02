@@ -21,7 +21,7 @@ pub enum StartPosition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerGroupOffset {
     pub partition_id: u32,
-    pub producer_id: u32,
+    pub producer_id: String,
     pub next_entry_position: u64,
 }
 
@@ -46,13 +46,6 @@ pub fn validate_group_id(group_id: &str) -> Result<()> {
             "consumer group_id '{}' cannot contain '$'",
             group_id
         )));
-    }
-    Ok(())
-}
-
-pub fn validate_consumer_id(consumer_id: &str) -> Result<()> {
-    if consumer_id.is_empty() {
-        return Err(Error::invalid_input("consumer_id cannot be empty"));
     }
     Ok(())
 }

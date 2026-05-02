@@ -24,21 +24,20 @@ pub struct Partitioner {
     primary_key_columns: Vec<String>,
 }
 
-pub fn assigned_consumer_for_partition<'a>(
-    group_id: &str,
-    partition_id: u32,
-    consumer_ids: &'a [String],
-) -> Option<&'a str> {
-    let mut best = consumer_ids.first()?;
-    let mut best_score = consumer_assignment_score(group_id, partition_id, best);
-    for consumer_id in &consumer_ids[1..] {
-        let score = consumer_assignment_score(group_id, partition_id, consumer_id);
-        if score > best_score || (score == best_score && consumer_id < best) {
-            best = consumer_id;
+pub fn assigned_position_for_partition(partition_id: u32, total: u32) -> u32 {
+    if total <= 1 {
+        return 0;
+    }
+    let mut best_position = 0u32;
+    let mut best_score = position_assignment_score(partition_id, 0);
+    for position in 1..total {
+        let score = position_assignment_score(partition_id, position);
+        if score > best_score {
+            best_position = position;
             best_score = score;
         }
     }
-    Some(best.as_str())
+    best_position
 }
 
 impl Partitioner {
@@ -116,12 +115,11 @@ impl Partitioner {
     }
 }
 
-fn consumer_assignment_score(group_id: &str, partition_id: u32, consumer_id: &str) -> u32 {
+fn position_assignment_score(partition_id: u32, position: u32) -> u32 {
     let mut hasher = StableHasher::new();
-    hasher.write_bytes(b"lance_topic_consumer_assignment_v1");
-    hash_len_prefixed(group_id.as_bytes(), &mut hasher);
+    hasher.write_bytes(b"lance_topic_consumer_assignment_v3");
     hasher.write_bytes(&partition_id.to_le_bytes());
-    hash_len_prefixed(consumer_id.as_bytes(), &mut hasher);
+    hasher.write_bytes(&position.to_le_bytes());
     hasher.finish()
 }
 
