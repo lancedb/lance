@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Matrix benchmark for Lance queue consumer read throughput.
+//! Matrix benchmark for Lance topic consumer read throughput.
 //!
 //! The benchmark writes CSV rows to stdout and, when `RESULT_CSV` is set, to a
-//! file. Each case creates a single-logical-partition queue, seeds it before
+//! file. Each case creates a single-logical-partition topic, seeds it before
 //! timing, and then measures raw consumer poll throughput across all producer
 //! shards for that logical partition.
 //!
@@ -12,14 +12,14 @@
 //!
 //! ```bash
 //! export AWS_DEFAULT_REGION=us-east-1
-//! export DATASET_PREFIX=s3://your-bucket/bench/lance_queue
-//! export RESULT_CSV=/tmp/lance_queue_read.csv
-//! cargo bench -p lance-queue --bench queue_read
+//! export DATASET_PREFIX=s3://your-bucket/bench/lance_topic
+//! export RESULT_CSV=/tmp/lance_topic_read.csv
+//! cargo bench -p lance-topic --bench topic_read
 //! ```
 //!
 //! ## Configuration
 //!
-//! - `DATASET_PREFIX`: Base URI for queue tables. If not set, uses a temporary local directory.
+//! - `DATASET_PREFIX`: Directory namespace root URI for topic tables. If not set, uses a temporary local directory.
 //! - `PAYLOAD_BYTES`: Approximate bytes in each JSON payload body string (default: `256`).
 //! - `REPEATS`: Repeated measurements per scenario (default: `3`).
 //! - `READ_CASES`: Optional explicit cases as `name:producers:rows:write_batch_size:poll_entries:decode_messages` separated by `;`.
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::try_join_all;
 use lance_core::{Error, Result};
-use lance_queue::{ConsumerConfig, PollOptions, Producer, Queue, StartPosition};
+use lance_topic::{PollOptions, Producer, StartPosition, Topic};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -126,7 +126,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn get_dataset_prefix() -> String {
     std::env::var("DATASET_PREFIX").unwrap_or_else(|_| {
         let temp_dir =
-            std::env::temp_dir().join(format!("lance_queue_read_bench_{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lance_topic_read_bench_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("failed to create benchmark temp directory");
         temp_dir.to_string_lossy().to_string()
     })
@@ -191,15 +191,14 @@ fn parse_cases() -> Vec<ReadCase> {
         .collect()
 }
 
-fn queue_uri(prefix: &str, case_name: &str, repeat: usize) -> String {
+fn topic_table_id(case_name: &str, repeat: usize) -> Vec<String> {
     let safe_case_name = case_name.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_");
-    format!(
-        "{}/queue_read_{}_r{}_{}",
-        prefix.trim_end_matches('/'),
+    vec![format!(
+        "topic_read_{}_r{}_{}",
         safe_case_name,
         repeat,
         Uuid::new_v4()
-    )
+    )]
 }
 
 fn rows_for_producer(total_rows: usize, producer_count: u32, producer_id: u32) -> usize {
@@ -272,7 +271,7 @@ fn input_bytes(batches_by_producer: &[Vec<InputBatch>]) -> u64 {
         .sum()
 }
 
-async fn seed_queue(
+async fn seed_topic(
     producers: &[Producer],
     batches_by_producer: Vec<Vec<InputBatch>>,
 ) -> Result<()> {
@@ -345,24 +344,19 @@ async fn run_case(
         payload_bytes,
     );
     let input_bytes = input_bytes(&input_batches);
-    let queue = Queue::builder()
-        .uri(queue_uri(dataset_prefix, &case.name, repeat))
+    let topic = Topic::builder()
+        .directory(dataset_prefix, topic_table_id(&case.name, repeat))
         .partition_count(1)
-        .producer_count(case.producer_count)
         .create()
         .await?;
-    let producers = (0..case.producer_count)
-        .map(|producer_id| queue.producer(producer_id))
-        .collect::<Result<Vec<_>>>()?;
-    seed_queue(&producers, input_batches).await?;
+    let producers = try_join_all((0..case.producer_count).map(|producer_id| {
+        let topic = topic.clone();
+        async move { topic.producer(producer_id).await }
+    }))
+    .await?;
+    seed_topic(&producers, input_batches).await?;
 
-    let mut consumer = queue
-        .consumer(
-            ConsumerConfig::new(format!("read-bench-{repeat}"))
-                .with_partitions([0])
-                .with_start_position(StartPosition::Earliest),
-        )
-        .await?;
+    let mut consumer = topic.partition_reader(0, StartPosition::Earliest).await?;
     let options = PollOptions {
         max_entries_per_partition: case.poll_entries,
     };
@@ -427,7 +421,7 @@ async fn main() -> Result<()> {
     let repeats = env_usize("REPEATS", DEFAULT_REPEATS).max(1);
     let mut writer = result_writer()?;
 
-    println!("=== Lance Queue Read Benchmark ===");
+    println!("=== Lance Topic Read Benchmark ===");
     println!("dataset_prefix={dataset_prefix}");
     println!("payload_bytes={payload_bytes}");
     println!("repeats={repeats}");

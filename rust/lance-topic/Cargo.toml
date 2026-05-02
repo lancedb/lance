@@ -1,15 +1,18 @@
 [package]
-name = "lance-queue"
+name = "lance-topic"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-description = "Queue and stream primitives backed by Lance MemWAL files"
+description = "Topic and stream primitives backed by Lance MemWAL files"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+
+[lib]
+doctest = false
 
 [dependencies]
 arrow-array.workspace = true
@@ -24,6 +27,7 @@ lance-core.workspace = true
 lance-index.workspace = true
 lance-io.workspace = true
 lance-namespace.workspace = true
+lance-namespace-impls.workspace = true
 object_store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,7 +36,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 
@@ -46,9 +49,9 @@ gcp = ["lance/gcp", "lance-io/gcp"]
 workspace = true
 
 [[bench]]
-name = "queue_write"
+name = "topic_write"
 harness = false
 
 [[bench]]
-name = "queue_read"
+name = "topic_read"
 harness = false

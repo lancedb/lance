@@ -1,14 +1,14 @@
-# Lance Queue Storage-Only S3 Benchmark Report
+# Lance Topic Storage-Only S3 Benchmark Report
 
 Run date: 2026-05-01
 
 ## Setup
 
 - Host: EC2 `c7i.8xlarge` in `us-east-1`, Ubuntu 24.04, repository Rust toolchain 1.94.0.
-- Storage: `s3://lance-bench-054483968661-shared/codex/lance_queue_storage_20260501_105034`.
+- Storage: `s3://lance-bench-054483968661-shared/codex/lance_topic_storage_20260501_105034`.
 - Payload: fixed JSON payload with a 256-byte body string.
 - Repeats: 2 per case. Tables and graphs below use the arithmetic mean.
-- Queue model: storage-only Lance table plus MemWAL shards. Physical shard count is `logical_partition_count * producer_count`.
+- Topic model: storage-only Lance table plus MemWAL shards. Physical shard count is `logical_partition_count * producer_count`.
 
 `batch_size` is the number of messages passed to one producer call. `send(id, payload)` is equivalent to `batch_size = 1` and acknowledges after that single message is committed to WAL. `send_batch(ids, payloads)` acknowledges after the corresponding WAL entry or entries are committed; if a batch routes to multiple logical partitions, the producer writes one WAL entry per nonempty physical shard.
 
@@ -78,6 +78,6 @@ Single-partition reads were roughly 40k-60k rows/s from S3 in this matrix. Incre
 
 ## Caveats
 
-- The benchmark measures queue WAL append and tail performance only. It does not include future maintenance work that compacts WAL into flushed MemTables or merges flushed MemTables into the base table.
+- The benchmark measures topic WAL append and tail performance only. It does not include future maintenance work that compacts WAL into flushed MemTables or merges flushed MemTables into the base table.
 - Read benchmarking used one logical partition and one producer shard, matching the current requirement for single-partition read performance.
 - Low batch-size write cases intentionally use fewer total rows because every producer call creates a separate S3 WAL entry.

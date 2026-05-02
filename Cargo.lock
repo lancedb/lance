@@ -4749,33 +4749,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lance-queue"
-version = "6.1.0-beta.0"
-dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "arrow-select",
- "async-trait",
- "bytes",
- "criterion",
- "futures",
- "lance",
- "lance-arrow",
- "lance-core",
- "lance-index",
- "lance-io",
- "lance-namespace",
- "object_store 0.12.5",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "lance-table"
 version = "6.1.0-beta.0"
 dependencies = [
@@ -4864,6 +4837,33 @@ dependencies = [
  "snafu",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "lance-topic"
+version = "6.1.0-beta.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
+ "bytes",
+ "criterion",
+ "futures",
+ "lance",
+ "lance-arrow",
+ "lance-core",
+ "lance-index",
+ "lance-io",
+ "lance-namespace",
+ "lance-namespace-impls",
+ "object_store 0.12.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

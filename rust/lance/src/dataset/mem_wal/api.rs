@@ -7,17 +7,21 @@
 //! on a Dataset.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::index::DatasetIndexExt;
 use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray, UInt32Array};
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
-use lance_core::{Error, Result};
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardSpec};
+use bytes::Bytes;
+use lance_core::{Error, Result, datatypes::Schema as LanceSchema};
+use lance_encoding::{
+    decoder::{DecoderPlugins, FilterExpression, decode_batch},
+    encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
+    version::LanceFileVersion,
+};
+use lance_file::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardManifest, ShardSpec};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_io::object_store::ObjectStore;
@@ -31,6 +35,8 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::ShardWriterConfig;
+use super::manifest::ShardManifestStore;
+use super::util::list_shard_manifests_latest;
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
 
@@ -64,8 +70,10 @@ pub struct MemWalShardSnapshot {
     pub shard_id: Uuid,
     /// Shard spec id used by this shard.
     pub shard_spec_id: u32,
-    /// Computed shard field values, keyed by shard field id.
+    /// Computed int32 shard field values, keyed by shard field id.
     pub shard_field_values: HashMap<String, i32>,
+    /// Computed string shard field values, keyed by shard field id.
+    pub shard_field_string_values: HashMap<String, String>,
 }
 
 impl MemWalShardSnapshot {
@@ -75,6 +83,7 @@ impl MemWalShardSnapshot {
             shard_id,
             shard_spec_id,
             shard_field_values: HashMap::new(),
+            shard_field_string_values: HashMap::new(),
         }
     }
 
@@ -82,6 +91,28 @@ impl MemWalShardSnapshot {
     pub fn with_shard_field_value(mut self, field_id: impl Into<String>, value: i32) -> Self {
         self.shard_field_values.insert(field_id.into(), value);
         self
+    }
+
+    /// Add a computed string shard field value.
+    pub fn with_shard_field_string_value(
+        mut self,
+        field_id: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.shard_field_string_values
+            .insert(field_id.into(), value.into());
+        self
+    }
+}
+
+impl From<ShardManifest> for MemWalShardSnapshot {
+    fn from(manifest: ShardManifest) -> Self {
+        Self {
+            shard_id: manifest.shard_id,
+            shard_spec_id: manifest.shard_spec_id,
+            shard_field_values: manifest.shard_field_values,
+            shard_field_string_values: manifest.shard_field_string_values,
+        }
     }
 }
 
@@ -128,8 +159,17 @@ pub trait DatasetMemWalExt {
         Ok(None)
     }
 
-    /// Return inline MemWAL shard snapshots for this dataset.
-    async fn mem_wal_shard_snapshots(&self) -> Result<Vec<MemWalShardSnapshot>> {
+    /// List MemWAL shards from the point-in-time index snapshot.
+    async fn list_mem_wal_shards_snapshot(&self) -> Result<Vec<MemWalShardSnapshot>> {
+        Ok(Vec::new())
+    }
+
+    /// List current MemWAL shards from object storage.
+    ///
+    /// The MemWAL index may contain point-in-time shard snapshots for read
+    /// optimization. This method lists shard manifests in storage and is
+    /// therefore the discovery path for the current shard set.
+    async fn list_mem_wal_shards_latest(&self) -> Result<Vec<MemWalShardSnapshot>> {
         Ok(Vec::new())
     }
 
@@ -181,7 +221,7 @@ impl DatasetMemWalExt for Dataset {
         load_mem_wal_index_details(index_meta).map(Some)
     }
 
-    async fn mem_wal_shard_snapshots(&self) -> Result<Vec<MemWalShardSnapshot>> {
+    async fn list_mem_wal_shards_snapshot(&self) -> Result<Vec<MemWalShardSnapshot>> {
         let Some(details) = self.mem_wal_index_details().await? else {
             return Ok(Vec::new());
         };
@@ -189,7 +229,17 @@ impl DatasetMemWalExt for Dataset {
             return Ok(Vec::new());
         };
 
-        decode_inline_shard_snapshots(&inline_snapshots)
+        decode_inline_shard_snapshots(&inline_snapshots).await
+    }
+
+    async fn list_mem_wal_shards_latest(&self) -> Result<Vec<MemWalShardSnapshot>> {
+        Ok(
+            list_shard_manifests_latest(self.object_store(), &self.branch_location().path)
+                .await?
+                .into_iter()
+                .map(MemWalShardSnapshot::from)
+                .collect(),
+        )
     }
 
     async fn mem_wal_writer(
@@ -322,7 +372,8 @@ async fn initialize_mem_wal_impl(
             shard_config.initial_shards.len()
         )));
     }
-    let inline_snapshots = encode_inline_shard_snapshots(&shard_config.initial_shards)?;
+    initialize_shard_manifests(dataset, &shard_config.initial_shards).await?;
+    let inline_snapshots = encode_inline_shard_snapshots(&shard_config.initial_shards).await?;
 
     let details = MemWalIndexDetails {
         num_shards,
@@ -351,18 +402,49 @@ async fn initialize_mem_wal_impl(
     Ok(())
 }
 
+async fn initialize_shard_manifests(
+    dataset: &Dataset,
+    initial_shards: &[MemWalShardSnapshot],
+) -> Result<()> {
+    let object_store = Arc::new(dataset.object_store().clone());
+    let base_path = dataset.branch_location().path.clone();
+    let writes = initial_shards.iter().map(|snapshot| {
+        let shard_spec_id = snapshot.shard_spec_id;
+        let shard_field_values = snapshot.shard_field_values.clone();
+        let shard_field_string_values = snapshot.shard_field_string_values.clone();
+        let manifest_store =
+            ShardManifestStore::new(object_store.clone(), &base_path, snapshot.shard_id, 2);
+        async move {
+            manifest_store
+                .initialize_shard_with_string_values(
+                    shard_spec_id,
+                    shard_field_values,
+                    shard_field_string_values,
+                )
+                .await
+        }
+    });
+    futures::future::try_join_all(writes).await?;
+    Ok(())
+}
+
 const SNAPSHOT_SHARD_ID_COLUMN: &str = "shard_id";
 const SNAPSHOT_SHARD_SPEC_ID_COLUMN: &str = "shard_spec_id";
 const SNAPSHOT_SHARD_FIELD_PREFIX: &str = "shard_field_";
+const SNAPSHOT_SHARD_STRING_FIELD_PREFIX: &str = "shard_string_field_";
 
-fn encode_inline_shard_snapshots(snapshots: &[MemWalShardSnapshot]) -> Result<Option<Vec<u8>>> {
+async fn encode_inline_shard_snapshots(
+    snapshots: &[MemWalShardSnapshot],
+) -> Result<Option<Vec<u8>>> {
     if snapshots.is_empty() {
         return Ok(None);
     }
 
     let mut shard_field_ids = BTreeSet::new();
+    let mut shard_string_field_ids = BTreeSet::new();
     for snapshot in snapshots {
         shard_field_ids.extend(snapshot.shard_field_values.keys().cloned());
+        shard_string_field_ids.extend(snapshot.shard_field_string_values.keys().cloned());
     }
 
     let mut fields = vec![
@@ -373,6 +455,13 @@ fn encode_inline_shard_snapshots(snapshots: &[MemWalShardSnapshot]) -> Result<Op
         ArrowField::new(
             format!("{SNAPSHOT_SHARD_FIELD_PREFIX}{field_id}"),
             DataType::Int32,
+            true,
+        )
+    }));
+    fields.extend(shard_string_field_ids.iter().map(|field_id| {
+        ArrowField::new(
+            format!("{SNAPSHOT_SHARD_STRING_FIELD_PREFIX}{field_id}"),
+            DataType::Utf8,
             true,
         )
     }));
@@ -393,49 +482,54 @@ fn encode_inline_shard_snapshots(snapshots: &[MemWalShardSnapshot]) -> Result<Op
             |snapshot| snapshot.shard_field_values.get(&field_id).copied(),
         ))));
     }
+    for field_id in shard_string_field_ids {
+        columns.push(Arc::new(StringArray::from_iter(snapshots.iter().map(
+            |snapshot| {
+                snapshot
+                    .shard_field_string_values
+                    .get(&field_id)
+                    .map(String::as_str)
+            },
+        ))));
+    }
 
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| Error::io(format!("failed to build MemWAL shard snapshot batch: {e}")))?;
 
-    let mut buffer = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buffer, &schema).map_err(|e| {
-            Error::io(format!(
-                "failed to create Arrow IPC writer for MemWAL shard snapshots: {e}"
-            ))
-        })?;
-        writer.write(&batch).map_err(|e| {
-            Error::io(format!(
-                "failed to write MemWAL shard snapshots to Arrow IPC: {e}"
-            ))
-        })?;
-        writer.finish().map_err(|e| {
-            Error::io(format!(
-                "failed to finish MemWAL shard snapshots Arrow IPC: {e}"
-            ))
-        })?;
-    }
+    let version = LanceFileVersion::default();
+    let options = EncodingOptions {
+        version,
+        ..Default::default()
+    };
+    let lance_schema = LanceSchema::try_from(schema.as_ref())?;
+    let encoding_strategy = default_encoding_strategy(version);
+    let encoded_batch = encode_batch(
+        &batch,
+        Arc::new(lance_schema),
+        encoding_strategy.as_ref(),
+        &options,
+    )
+    .await?;
 
-    Ok(Some(buffer))
+    Ok(Some(
+        encoded_batch.try_to_self_described_lance(version)?.to_vec(),
+    ))
 }
 
-fn decode_inline_shard_snapshots(bytes: &[u8]) -> Result<Vec<MemWalShardSnapshot>> {
-    let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| {
-        Error::io(format!(
-            "failed to open MemWAL shard snapshots Arrow IPC stream: {e}"
-        ))
-    })?;
+async fn decode_inline_shard_snapshots(bytes: &[u8]) -> Result<Vec<MemWalShardSnapshot>> {
+    let version = LanceFileVersion::default();
+    let encoded_batch = EncodedBatch::try_from_self_described_lance(Bytes::copy_from_slice(bytes))?;
+    let batch = decode_batch(
+        &encoded_batch,
+        &FilterExpression::no_filter(),
+        Arc::<DecoderPlugins>::default(),
+        false,
+        version,
+        None,
+    )
+    .await?;
 
-    let mut snapshots = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(|e| {
-            Error::io(format!(
-                "failed to read MemWAL shard snapshot Arrow IPC batch: {e}"
-            ))
-        })?;
-        snapshots.extend(decode_shard_snapshot_batch(&batch)?);
-    }
-    Ok(snapshots)
+    decode_shard_snapshot_batch(&batch)
 }
 
 fn decode_shard_snapshot_batch(batch: &RecordBatch) -> Result<Vec<MemWalShardSnapshot>> {
@@ -480,6 +574,18 @@ fn decode_shard_snapshot_batch(batch: &RecordBatch) -> Result<Vec<MemWalShardSna
                 .map(|field_id| (idx, field_id.to_string()))
         })
         .collect::<Vec<_>>();
+    let shard_string_field_columns = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, field)| {
+            field
+                .name()
+                .strip_prefix(SNAPSHOT_SHARD_STRING_FIELD_PREFIX)
+                .map(|field_id| (idx, field_id.to_string()))
+        })
+        .collect::<Vec<_>>();
 
     let mut snapshots = Vec::with_capacity(batch.num_rows());
     for row_idx in 0..batch.num_rows() {
@@ -504,6 +610,22 @@ fn decode_shard_snapshot_batch(batch: &RecordBatch) -> Result<Vec<MemWalShardSna
                 snapshot
                     .shard_field_values
                     .insert(field_id.clone(), array.value(row_idx));
+            }
+        }
+        for (column_idx, field_id) in &shard_string_field_columns {
+            let array = batch
+                .column(*column_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::io(format!(
+                        "MemWAL shard snapshot string field column '{SNAPSHOT_SHARD_STRING_FIELD_PREFIX}{field_id}' must be Utf8"
+                    ))
+                })?;
+            if !array.is_null(row_idx) {
+                snapshot
+                    .shard_field_string_values
+                    .insert(field_id.clone(), array.value(row_idx).to_string());
             }
         }
 

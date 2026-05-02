@@ -24,23 +24,21 @@ pub struct Partitioner {
     primary_key_columns: Vec<String>,
 }
 
-pub fn consumer_slot_for_partition(partition_id: u32, slot_count: u32) -> Result<u32> {
-    if slot_count == 0 {
-        return Err(Error::invalid_input(
-            "consumer partition_count must be greater than 0",
-        ));
-    }
-
-    let mut best_slot = 0;
-    let mut best_score = consumer_assignment_score(partition_id, 0);
-    for slot_id in 1..slot_count {
-        let score = consumer_assignment_score(partition_id, slot_id);
-        if score > best_score {
-            best_slot = slot_id;
+pub fn assigned_consumer_for_partition<'a>(
+    group_id: &str,
+    partition_id: u32,
+    consumer_ids: &'a [String],
+) -> Option<&'a str> {
+    let mut best = consumer_ids.first()?;
+    let mut best_score = consumer_assignment_score(group_id, partition_id, best);
+    for consumer_id in &consumer_ids[1..] {
+        let score = consumer_assignment_score(group_id, partition_id, consumer_id);
+        if score > best_score || (score == best_score && consumer_id < best) {
+            best = consumer_id;
             best_score = score;
         }
     }
-    Ok(best_slot)
+    Some(best.as_str())
 }
 
 impl Partitioner {
@@ -52,7 +50,7 @@ impl Partitioner {
         }
         if primary_key_columns.is_empty() {
             return Err(Error::invalid_input(
-                "queue producer requires unenforced primary key columns",
+                "topic producer requires unenforced primary key columns",
             ));
         }
         Ok(Self {
@@ -118,12 +116,13 @@ impl Partitioner {
     }
 }
 
-fn consumer_assignment_score(partition_id: u32, slot_id: u32) -> u32 {
-    let mut bytes = Vec::with_capacity(40);
-    bytes.extend_from_slice(b"lance_queue_consumer_assignment_v1");
-    bytes.extend_from_slice(&partition_id.to_le_bytes());
-    bytes.extend_from_slice(&slot_id.to_le_bytes());
-    murmur3_x86_32(&bytes, 0)
+fn consumer_assignment_score(group_id: &str, partition_id: u32, consumer_id: &str) -> u32 {
+    let mut hasher = StableHasher::new();
+    hasher.write_bytes(b"lance_topic_consumer_assignment_v1");
+    hash_len_prefixed(group_id.as_bytes(), &mut hasher);
+    hasher.write_bytes(&partition_id.to_le_bytes());
+    hash_len_prefixed(consumer_id.as_bytes(), &mut hasher);
+    hasher.finish()
 }
 
 struct StableHasher {
@@ -153,7 +152,7 @@ fn non_negative_murmur_bucket(hash: u32) -> u32 {
     signed.unsigned_abs()
 }
 
-fn murmur3_x86_32(bytes: &[u8], seed: u32) -> u32 {
+pub fn murmur3_x86_32(bytes: &[u8], seed: u32) -> u32 {
     const C1: u32 = 0xcc9e2d51;
     const C2: u32 = 0x1b873593;
 
@@ -300,7 +299,7 @@ fn hash_value(array: &dyn Array, row_idx: usize, hasher: &mut StableHasher) -> R
         }
         other => {
             return Err(Error::invalid_input(format!(
-                "unsupported primary key data type for queue partitioning: {}",
+                "unsupported primary key data type for topic partitioning: {}",
                 other
             )));
         }

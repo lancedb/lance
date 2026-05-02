@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Matrix benchmark for Lance queue producer write throughput.
+//! Matrix benchmark for Lance topic producer write throughput.
 //!
 //! The benchmark writes CSV rows to stdout and, when `RESULT_CSV` is set, to a
 //! file. It is intended for longer S3 runs where we want trends across logical
@@ -12,14 +12,14 @@
 //!
 //! ```bash
 //! export AWS_DEFAULT_REGION=us-east-1
-//! export DATASET_PREFIX=s3://your-bucket/bench/lance_queue
-//! export RESULT_CSV=/tmp/lance_queue_write.csv
-//! cargo bench -p lance-queue --bench queue_write
+//! export DATASET_PREFIX=s3://your-bucket/bench/lance_topic
+//! export RESULT_CSV=/tmp/lance_topic_write.csv
+//! cargo bench -p lance-topic --bench topic_write
 //! ```
 //!
 //! ## Configuration
 //!
-//! - `DATASET_PREFIX`: Base URI for queue tables. If not set, uses a temporary local directory.
+//! - `DATASET_PREFIX`: Directory namespace root URI for topic tables. If not set, uses a temporary local directory.
 //! - `PAYLOAD_BYTES`: Approximate bytes in each JSON payload body string (default: `256`).
 //! - `REPEATS`: Repeated measurements per scenario (default: `3`).
 //! - `WRITE_CASES`: Optional explicit cases as `name:partitions:producers:rows:batch_size` separated by `;`.
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::try_join_all;
 use lance_core::Result;
-use lance_queue::{Producer, Queue};
+use lance_topic::{Producer, Topic};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -139,7 +139,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn get_dataset_prefix() -> String {
     std::env::var("DATASET_PREFIX").unwrap_or_else(|_| {
-        let temp_dir = std::env::temp_dir().join(format!("lance_queue_bench_{}", Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir().join(format!("lance_topic_bench_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("failed to create benchmark temp directory");
         temp_dir.to_string_lossy().to_string()
     })
@@ -191,15 +191,14 @@ fn parse_cases() -> Vec<WriteCase> {
         .collect()
 }
 
-fn queue_uri(prefix: &str, case_name: &str, repeat: usize) -> String {
+fn topic_table_id(case_name: &str, repeat: usize) -> Vec<String> {
     let safe_case_name = case_name.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_");
-    format!(
-        "{}/queue_write_{}_r{}_{}",
-        prefix.trim_end_matches('/'),
+    vec![format!(
+        "topic_write_{}_r{}_{}",
         safe_case_name,
         repeat,
         Uuid::new_v4()
-    )
+    )]
 }
 
 fn rows_for_producer(total_rows: usize, producer_count: u32, producer_id: u32) -> usize {
@@ -355,15 +354,16 @@ async fn run_case(
         "message",
     );
     let input_bytes = input_bytes(&input_batches);
-    let queue = Queue::builder()
-        .uri(queue_uri(dataset_prefix, &case.name, repeat))
+    let topic = Topic::builder()
+        .directory(dataset_prefix, topic_table_id(&case.name, repeat))
         .partition_count(case.partition_count)
-        .producer_count(case.producer_count)
         .create()
         .await?;
-    let producers = (0..case.producer_count)
-        .map(|producer_id| queue.producer(producer_id))
-        .collect::<Result<Vec<_>>>()?;
+    let producers = try_join_all((0..case.producer_count).map(|producer_id| {
+        let topic = topic.clone();
+        async move { topic.producer(producer_id).await }
+    }))
+    .await?;
 
     let warmup = make_batches_by_producer(
         case.producer_count,
@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
     let repeats = env_usize("REPEATS", DEFAULT_REPEATS).max(1);
     let mut writer = result_writer()?;
 
-    println!("=== Lance Queue Write Benchmark ===");
+    println!("=== Lance Topic Write Benchmark ===");
     println!("dataset_prefix={dataset_prefix}");
     println!("payload_bytes={payload_bytes}");
     println!("repeats={repeats}");

@@ -27,6 +27,7 @@
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -123,6 +124,57 @@ impl ShardManifestStore {
             .map_err(|e| Error::io(format!("Failed to decode manifest protobuf: {}", e)))?;
 
         ShardManifest::try_from(pb_manifest)
+    }
+
+    /// Write an initial manifest for a newly-created shard.
+    ///
+    /// Initial manifests use writer epoch 0. A writer that claims the shard
+    /// will write a new manifest with epoch 1 before appending WAL entries.
+    pub async fn initialize_shard(
+        &self,
+        shard_spec_id: u32,
+        shard_field_values: HashMap<String, i32>,
+    ) -> Result<ShardManifest> {
+        self.initialize_shard_with_string_values(shard_spec_id, shard_field_values, HashMap::new())
+            .await
+    }
+
+    /// Write an initial manifest for a newly-created shard.
+    ///
+    /// This variant supports both int32-valued and string-valued shard fields.
+    pub async fn initialize_shard_with_string_values(
+        &self,
+        shard_spec_id: u32,
+        shard_field_values: HashMap<String, i32>,
+        shard_field_string_values: HashMap<String, String>,
+    ) -> Result<ShardManifest> {
+        let manifest = ShardManifest {
+            shard_id: self.shard_id,
+            version: 1,
+            shard_spec_id,
+            shard_field_values,
+            shard_field_string_values,
+            writer_epoch: 0,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            current_generation: 1,
+            flushed_generations: vec![],
+        };
+
+        match self.write(&manifest).await {
+            Ok(_) => Ok(manifest),
+            Err(error) => match self.read_latest().await? {
+                Some(existing)
+                    if existing.shard_spec_id == manifest.shard_spec_id
+                        && existing.shard_field_values == manifest.shard_field_values
+                        && existing.shard_field_string_values
+                            == manifest.shard_field_string_values =>
+                {
+                    Ok(existing)
+                }
+                _ => Err(error),
+            },
+        }
     }
 
     /// Write a new manifest version atomically.
@@ -392,6 +444,8 @@ impl ShardManifestStore {
                 shard_id: self.shard_id,
                 version: next_version,
                 shard_spec_id,
+                shard_field_values: HashMap::new(),
+                shard_field_string_values: HashMap::new(),
                 writer_epoch: next_epoch,
                 replay_after_wal_entry_position: 0,
                 wal_entry_position_last_seen: 0,
@@ -527,6 +581,8 @@ mod tests {
             shard_id,
             version,
             shard_spec_id: 0,
+            shard_field_values: HashMap::new(),
+            shard_field_string_values: HashMap::new(),
             writer_epoch: epoch,
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,

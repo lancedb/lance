@@ -2,34 +2,34 @@
 ++ case ":${PATH}:" in
 ++ export PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
 ++ PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
-+ cd /home/ubuntu/lance-queue-bench
++ cd /home/ubuntu/lance-topic-bench
 + export AWS_DEFAULT_REGION=us-east-1
 + AWS_DEFAULT_REGION=us-east-1
-+ export CARGO_TARGET_DIR=/home/ubuntu/lance-queue-target
-+ CARGO_TARGET_DIR=/home/ubuntu/lance-queue-target
++ export CARGO_TARGET_DIR=/home/ubuntu/lance-topic-target
++ CARGO_TARGET_DIR=/home/ubuntu/lance-topic-target
 + export PAYLOAD_BYTES=256
 + PAYLOAD_BYTES=256
 + export REPEATS=2
 + REPEATS=2
 ++ date +%Y%m%d_%H%M%S
 + RUN_ID=20260501_105034
-+ export DATASET_PREFIX=s3://lance-bench-054483968661-shared/codex/lance_queue_storage_20260501_105034
-+ DATASET_PREFIX=s3://lance-bench-054483968661-shared/codex/lance_queue_storage_20260501_105034
-+ rm -f /home/ubuntu/lance_queue_write.csv /home/ubuntu/lance_queue_read.csv
-+ export RESULT_CSV=/home/ubuntu/lance_queue_write.csv
-+ RESULT_CSV=/home/ubuntu/lance_queue_write.csv
++ export DATASET_PREFIX=s3://lance-bench-054483968661-shared/codex/lance_topic_storage_20260501_105034
++ DATASET_PREFIX=s3://lance-bench-054483968661-shared/codex/lance_topic_storage_20260501_105034
++ rm -f /home/ubuntu/lance_topic_write.csv /home/ubuntu/lance_topic_read.csv
++ export RESULT_CSV=/home/ubuntu/lance_topic_write.csv
++ RESULT_CSV=/home/ubuntu/lance_topic_write.csv
 + export 'WRITE_CASES=horizontal_p1_prod1:1:1:300000:5000;horizontal_p2_prod2:2:2:300000:5000;horizontal_p4_prod4:4:4:300000:5000;horizontal_p4_prod10:4:10:300000:5000;horizontal_p8_prod16:8:16:300000:5000;trend_50k_p4_prod10:4:10:50000:5000;trend_200k_p4_prod10:4:10:200000:5000;trend_500k_p4_prod10:4:10:500000:5000;batch_1_p1_prod1:1:1:2000:1;batch_10_p1_prod1:1:1:20000:10;batch_100_p1_prod1:1:1:100000:100;batch_1000_p1_prod1:1:1:200000:1000;batch_5000_p1_prod1:1:1:500000:5000;batch_10000_p1_prod1:1:1:500000:10000'
 + WRITE_CASES='horizontal_p1_prod1:1:1:300000:5000;horizontal_p2_prod2:2:2:300000:5000;horizontal_p4_prod4:4:4:300000:5000;horizontal_p4_prod10:4:10:300000:5000;horizontal_p8_prod16:8:16:300000:5000;trend_50k_p4_prod10:4:10:50000:5000;trend_200k_p4_prod10:4:10:200000:5000;trend_500k_p4_prod10:4:10:500000:5000;batch_1_p1_prod1:1:1:2000:1;batch_10_p1_prod1:1:1:20000:10;batch_100_p1_prod1:1:1:100000:100;batch_1000_p1_prod1:1:1:200000:1000;batch_5000_p1_prod1:1:1:500000:5000;batch_10000_p1_prod1:1:1:500000:10000'
-+ cargo bench -p lance-queue --bench queue_write
++ cargo bench -p lance-topic --bench topic_write
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of fp16 kernels
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of bf16 kernels
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of fp16 kernels
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of bf16 kernels
-   Compiling lance-queue v6.1.0-beta.0 (/home/ubuntu/lance-queue-bench/rust/lance-queue)
+   Compiling lance-topic v6.1.0-beta.0 (/home/ubuntu/lance-topic-bench/rust/lance-topic)
     Finished `bench` profile [optimized + debuginfo] target(s) in 1m 34s
-     Running benches/queue_write.rs (/home/ubuntu/lance-queue-target/release/deps/queue_write-67a835e3868fe2d1)
-=== Lance Queue Write Benchmark ===
-dataset_prefix=s3://lance-bench-054483968661-shared/codex/lance_queue_storage_20260501_105034
+     Running benches/topic_write.rs (/home/ubuntu/lance-topic-target/release/deps/topic_write-67a835e3868fe2d1)
+=== Lance Topic Write Benchmark ===
+dataset_prefix=s3://lance-bench-054483968661-shared/codex/lance_topic_storage_20260501_105034
 payload_bytes=256
 repeats=2
 cases=14
@@ -62,20 +62,20 @@ write,batch_5000_p1_prod1,1,1,1,500000,5000,256,0,19.217459,26018.007,8.152,8.86
 write,batch_5000_p1_prod1,1,1,1,500000,5000,256,1,18.571003,26923.694,8.436,9.170,178567072,100
 write,batch_10000_p1_prod1,1,1,1,500000,10000,256,0,11.687746,42779.848,13.404,14.565,178506512,50
 write,batch_10000_p1_prod1,1,1,1,500000,10000,256,1,11.496155,43492.803,13.628,14.808,178506512,50
-+ export RESULT_CSV=/home/ubuntu/lance_queue_read.csv
-+ RESULT_CSV=/home/ubuntu/lance_queue_read.csv
++ export RESULT_CSV=/home/ubuntu/lance_topic_read.csv
++ RESULT_CSV=/home/ubuntu/lance_topic_read.csv
 + export 'READ_CASES=read_prod1_50k_poll32:1:50000:5000:32:false;read_prod1_200k_poll1:1:200000:5000:1:false;read_prod1_200k_poll8:1:200000:5000:8:false;read_prod1_200k_poll32:1:200000:5000:32:false;read_prod1_500k_poll32:1:500000:5000:32:false;read_decode_prod1_200k_poll32:1:200000:5000:32:true'
 + READ_CASES='read_prod1_50k_poll32:1:50000:5000:32:false;read_prod1_200k_poll1:1:200000:5000:1:false;read_prod1_200k_poll8:1:200000:5000:8:false;read_prod1_200k_poll32:1:200000:5000:32:false;read_prod1_500k_poll32:1:500000:5000:32:false;read_decode_prod1_200k_poll32:1:200000:5000:32:true'
-+ cargo bench -p lance-queue --bench queue_read
++ cargo bench -p lance-topic --bench topic_read
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of fp16 kernels
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of bf16 kernels
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of fp16 kernels
 warning: lance-linalg@6.1.0-beta.0: fp16kernels feature is not enabled, skipping build of bf16 kernels
-   Compiling lance-queue v6.1.0-beta.0 (/home/ubuntu/lance-queue-bench/rust/lance-queue)
+   Compiling lance-topic v6.1.0-beta.0 (/home/ubuntu/lance-topic-bench/rust/lance-topic)
     Finished `bench` profile [optimized + debuginfo] target(s) in 1m 35s
-     Running benches/queue_read.rs (/home/ubuntu/lance-queue-target/release/deps/queue_read-e9eb197f2e38c3e0)
-=== Lance Queue Read Benchmark ===
-dataset_prefix=s3://lance-bench-054483968661-shared/codex/lance_queue_storage_20260501_105034
+     Running benches/topic_read.rs (/home/ubuntu/lance-topic-target/release/deps/topic_read-e9eb197f2e38c3e0)
+=== Lance Topic Read Benchmark ===
+dataset_prefix=s3://lance-bench-054483968661-shared/codex/lance_topic_storage_20260501_105034
 payload_bytes=256
 repeats=2
 cases=6

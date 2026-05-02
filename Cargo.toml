@@ -14,7 +14,7 @@ members = [
     "rust/lance-namespace",
     "rust/lance-namespace-impls",
     "rust/lance-namespace-datafusion",
-    "rust/lance-queue",
+    "rust/lance-topic",
     "rust/lance-tokenizer",
     "rust/lance-table",
     "rust/lance-test-macros",
@@ -70,7 +70,7 @@ lance-namespace = { version = "=6.1.0-beta.0", path = "./rust/lance-namespace" }
 lance-namespace-impls = { version = "=6.1.0-beta.0", path = "./rust/lance-namespace-impls" }
 lance-namespace-datafusion = { version = "=6.1.0-beta.0", path = "./rust/lance-namespace-datafusion" }
 lance-namespace-reqwest-client = "0.7.2"
-lance-queue = { version = "=6.1.0-beta.0", path = "./rust/lance-queue" }
+lance-topic = { version = "=6.1.0-beta.0", path = "./rust/lance-topic" }
 lance-tokenizer = { version = "=6.1.0-beta.0", path = "./rust/lance-tokenizer" }
 lance-table = { version = "=6.1.0-beta.0", path = "./rust/lance-table" }
 lance-test-macros = { version = "=6.1.0-beta.0", path = "./rust/lance-test-macros" }

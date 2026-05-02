@@ -18,13 +18,13 @@ use object_store::path::Path;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::metadata::{PutCreateError, put_create};
+use crate::metadata::{self, AppendError};
 use crate::shard_wal_path;
 
 const WRITER_EPOCH_KEY: &str = "writer_epoch";
-const QUEUE_PARTITION_KEY: &str = "lance_queue_partition";
-const QUEUE_PRODUCER_ID_KEY: &str = "lance_queue_producer_id";
-const QUEUE_SHARD_ID_KEY: &str = "lance_queue_shard_id";
+const TOPIC_PARTITION_KEY: &str = "lance_topic_partition";
+const TOPIC_PRODUCER_ID_KEY: &str = "lance_topic_producer_id";
+const TOPIC_SHARD_ID_KEY: &str = "lance_topic_shard_id";
 const FIRST_WAL_ENTRY_POSITION: u64 = 1;
 const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
 const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
@@ -32,7 +32,7 @@ const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 /// Result of appending a WAL entry.
 #[derive(Debug, Clone)]
 pub struct WalAppendResult {
-    /// Queue partition id.
+    /// Topic partition id.
     pub partition_id: u32,
     /// Producer shard slot id.
     pub producer_id: u32,
@@ -48,10 +48,10 @@ pub struct WalAppendResult {
     pub wal_bytes: usize,
 }
 
-/// A queue WAL entry read from storage.
+/// A topic WAL entry read from storage.
 #[derive(Debug, Clone)]
-pub struct QueueEntry {
-    /// Queue partition id.
+pub struct TopicEntry {
+    /// Topic partition id.
     pub partition_id: u32,
     /// Producer shard slot id.
     pub producer_id: u32,
@@ -63,70 +63,57 @@ pub struct QueueEntry {
     pub batches: Vec<RecordBatch>,
 }
 
-/// Standalone WAL appender using MemWAL-compatible storage layout.
+/// Per-partition producer writer using MemWAL-compatible storage layout.
 #[derive(Debug)]
-pub struct WalAppender {
+pub struct PartitionWriter {
     object_store: Arc<ObjectStore>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     partition_id: u32,
     producer_id: u32,
     shard_id: Uuid,
-    shard_spec_id: u32,
-    writer_epoch: Mutex<Option<u64>>,
+    writer_epoch: u64,
     next_entry_position: Mutex<Option<u64>>,
 }
 
-impl WalAppender {
-    /// Create a WAL appender for a queue partition.
-    pub fn new(
+impl PartitionWriter {
+    /// Open a partition writer and claim a new writer epoch.
+    pub async fn open(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
         producer_id: u32,
         shard_id: Uuid,
         shard_spec_id: u32,
-    ) -> Self {
-        Self::new_internal(
+    ) -> Result<Self> {
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            object_store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (writer_epoch, _) = manifest_store.claim_epoch(shard_spec_id).await?;
+        Ok(Self {
             object_store,
-            base_path,
+            wal_dir: shard_wal_path(&base_path, &shard_id),
+            manifest_store,
             partition_id,
             producer_id,
             shard_id,
-            shard_spec_id,
-            None,
-        )
+            writer_epoch,
+            next_entry_position: Mutex::new(None),
+        })
     }
 
-    /// Create a WAL appender with an already-claimed writer epoch.
+    /// Create a partition writer with an already-claimed writer epoch.
     pub fn new_with_writer_epoch(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         partition_id: u32,
         producer_id: u32,
         shard_id: Uuid,
-        shard_spec_id: u32,
+        _shard_spec_id: u32,
         writer_epoch: u64,
-    ) -> Self {
-        Self::new_internal(
-            object_store,
-            base_path,
-            partition_id,
-            producer_id,
-            shard_id,
-            shard_spec_id,
-            Some(writer_epoch),
-        )
-    }
-
-    fn new_internal(
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        partition_id: u32,
-        producer_id: u32,
-        shard_id: Uuid,
-        shard_spec_id: u32,
-        writer_epoch: Option<u64>,
     ) -> Self {
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
@@ -141,8 +128,7 @@ impl WalAppender {
             partition_id,
             producer_id,
             shard_id,
-            shard_spec_id,
-            writer_epoch: Mutex::new(writer_epoch),
+            writer_epoch,
             next_entry_position: Mutex::new(None),
         }
     }
@@ -150,13 +136,12 @@ impl WalAppender {
     /// Append batches as one durable WAL entry.
     pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
         validate_batches(&batches)?;
-        let writer_epoch = self.writer_epoch().await?;
         let wal_data = Bytes::from(serialize_batches(
             &batches,
             self.partition_id,
             self.producer_id,
             self.shard_id,
-            writer_epoch,
+            self.writer_epoch,
         )?);
         let wal_bytes = wal_data.len();
         let num_batches = batches.len();
@@ -176,8 +161,7 @@ impl WalAppender {
                 ))
             })?;
             let filename = wal_entry_filename(entry_position);
-            self.manifest_store.check_fenced(writer_epoch).await?;
-            match put_create(
+            match metadata::append(
                 self.object_store.as_ref(),
                 &self.wal_dir,
                 &filename,
@@ -201,7 +185,8 @@ impl WalAppender {
                         wal_bytes,
                     });
                 }
-                Err(PutCreateError::AlreadyExists) => {
+                Err(AppendError::AlreadyExists) => {
+                    self.check_fenced().await?;
                     create_conflicts += 1;
                     if create_conflicts >= MAX_APPEND_CREATE_CONFLICTS {
                         return Err(Error::io(format!(
@@ -219,7 +204,10 @@ impl WalAppender {
                         )?);
                     }
                 }
-                Err(PutCreateError::Other(error)) => return Err(error),
+                Err(AppendError::Other(error)) => {
+                    self.check_fenced().await?;
+                    return Err(error);
+                }
             }
         }
     }
@@ -235,7 +223,7 @@ impl WalAppender {
         .await
     }
 
-    /// Find the earliest listed WAL position, or the first valid queue WAL position.
+    /// Find the earliest listed WAL position, or the first valid topic WAL position.
     pub async fn first_position(&self) -> Result<u64> {
         first_position_from_listing(
             self.object_store.as_ref(),
@@ -247,35 +235,17 @@ impl WalAppender {
     }
 
     /// Writer epoch recorded in the shard manifest.
-    pub async fn writer_epoch(&self) -> Result<u64> {
-        let mut writer_epoch = self.writer_epoch.lock().await;
-        if let Some(epoch) = *writer_epoch {
-            return Ok(epoch);
-        }
-
-        let epoch = if let Some(manifest) = self.manifest_store.read_latest().await? {
-            manifest.writer_epoch
-        } else {
-            match self.manifest_store.claim_epoch(self.shard_spec_id).await {
-                Ok((epoch, _)) => epoch,
-                Err(error) => match self.manifest_store.read_latest().await? {
-                    Some(manifest) => manifest.writer_epoch,
-                    None => return Err(error),
-                },
-            }
-        };
-        *writer_epoch = Some(epoch);
-        Ok(epoch)
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
     }
 
-    /// Check that this appender's writer epoch has not been fenced.
+    /// Check that this writer's epoch has not been fenced.
     pub async fn check_fenced(&self) -> Result<()> {
-        let writer_epoch = self.writer_epoch().await?;
-        self.manifest_store.check_fenced(writer_epoch).await
+        self.manifest_store.check_fenced(self.writer_epoch).await
     }
 }
 
-/// Ordered reader for MemWAL-compatible queue WAL entries.
+/// Ordered reader for MemWAL-compatible topic WAL entries.
 #[derive(Debug, Clone)]
 pub struct WalTailer {
     object_store: Arc<ObjectStore>,
@@ -286,7 +256,7 @@ pub struct WalTailer {
 }
 
 impl WalTailer {
-    /// Create a WAL tailer for a queue partition.
+    /// Create a WAL tailer for a topic partition.
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: Path,
@@ -304,7 +274,7 @@ impl WalTailer {
     }
 
     /// Read a WAL entry. Returns `None` if the entry does not exist yet.
-    pub async fn read_entry(&self, entry_position: u64) -> Result<Option<QueueEntry>> {
+    pub async fn read_entry(&self, entry_position: u64) -> Result<Option<TopicEntry>> {
         let path = self.entry_path(entry_position);
         let data = match self.object_store.inner.get(&path).await {
             Ok(data) => data,
@@ -325,7 +295,7 @@ impl WalTailer {
         })?;
         let batches = read_batches(bytes, self.partition_id, self.producer_id, self.shard_id)?;
 
-        Ok(Some(QueueEntry {
+        Ok(Some(TopicEntry {
             partition_id: self.partition_id,
             producer_id: self.producer_id,
             shard_id: self.shard_id,
@@ -345,7 +315,7 @@ impl WalTailer {
         .await
     }
 
-    /// Find the earliest listed WAL position, or the first valid queue WAL position.
+    /// Find the earliest listed WAL position, or the first valid topic WAL position.
     pub async fn first_position(&self) -> Result<u64> {
         first_position_from_listing(
             self.object_store.as_ref(),
@@ -397,9 +367,9 @@ fn serialize_batches(
     let schema = batches[0].schema();
     let mut metadata = schema.metadata().clone();
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
-    metadata.insert(QUEUE_PARTITION_KEY.to_string(), partition_id.to_string());
-    metadata.insert(QUEUE_PRODUCER_ID_KEY.to_string(), producer_id.to_string());
-    metadata.insert(QUEUE_SHARD_ID_KEY.to_string(), shard_id.to_string());
+    metadata.insert(TOPIC_PARTITION_KEY.to_string(), partition_id.to_string());
+    metadata.insert(TOPIC_PRODUCER_ID_KEY.to_string(), producer_id.to_string());
+    metadata.insert(TOPIC_SHARD_ID_KEY.to_string(), shard_id.to_string());
     let schema_with_metadata = Arc::new(ArrowSchema::new_with_metadata(
         schema.fields().to_vec(),
         metadata,
@@ -454,12 +424,12 @@ fn validate_wal_schema_metadata(
     shard_id: Uuid,
 ) -> Result<()> {
     let actual_partition_id = metadata
-        .get(QUEUE_PARTITION_KEY)
-        .ok_or_else(|| Error::io("WAL entry is missing queue partition metadata"))?
+        .get(TOPIC_PARTITION_KEY)
+        .ok_or_else(|| Error::io("WAL entry is missing topic partition metadata"))?
         .parse::<u32>()
         .map_err(|e| {
             Error::io(format!(
-                "failed to parse WAL queue partition metadata: {}",
+                "failed to parse WAL topic partition metadata: {}",
                 e
             ))
         })?;
@@ -471,12 +441,12 @@ fn validate_wal_schema_metadata(
     }
 
     let actual_producer_id = metadata
-        .get(QUEUE_PRODUCER_ID_KEY)
-        .ok_or_else(|| Error::io("WAL entry is missing queue producer metadata"))?
+        .get(TOPIC_PRODUCER_ID_KEY)
+        .ok_or_else(|| Error::io("WAL entry is missing topic producer metadata"))?
         .parse::<u32>()
         .map_err(|e| {
             Error::io(format!(
-                "failed to parse WAL queue producer metadata: {}",
+                "failed to parse WAL topic producer metadata: {}",
                 e
             ))
         })?;
@@ -488,11 +458,11 @@ fn validate_wal_schema_metadata(
     }
 
     let actual_shard_id = metadata
-        .get(QUEUE_SHARD_ID_KEY)
-        .ok_or_else(|| Error::io("WAL entry is missing queue shard metadata"))
+        .get(TOPIC_SHARD_ID_KEY)
+        .ok_or_else(|| Error::io("WAL entry is missing topic shard metadata"))
         .and_then(|value| {
             Uuid::parse_str(value)
-                .map_err(|e| Error::io(format!("failed to parse WAL queue shard metadata: {}", e)))
+                .map_err(|e| Error::io(format!("failed to parse WAL topic shard metadata: {}", e)))
         })?;
     if actual_shard_id != shard_id {
         return Err(Error::io(format!(
@@ -508,9 +478,9 @@ fn strip_internal_wal_metadata(batch: RecordBatch) -> Result<RecordBatch> {
     let schema = batch.schema();
     let mut metadata = schema.metadata().clone();
     let removed_writer_epoch = metadata.remove(WRITER_EPOCH_KEY).is_some();
-    let removed_partition_id = metadata.remove(QUEUE_PARTITION_KEY).is_some();
-    let removed_producer_id = metadata.remove(QUEUE_PRODUCER_ID_KEY).is_some();
-    let removed_shard_id = metadata.remove(QUEUE_SHARD_ID_KEY).is_some();
+    let removed_partition_id = metadata.remove(TOPIC_PARTITION_KEY).is_some();
+    let removed_producer_id = metadata.remove(TOPIC_PRODUCER_ID_KEY).is_some();
+    let removed_shard_id = metadata.remove(TOPIC_SHARD_ID_KEY).is_some();
     let had_internal_metadata =
         removed_writer_epoch || removed_partition_id || removed_producer_id || removed_shard_id;
     if !had_internal_metadata {

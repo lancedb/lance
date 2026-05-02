@@ -3,8 +3,14 @@
 
 //! Utility functions for MemWAL operations.
 
+use lance_core::{Error, Result};
+use lance_index::mem_wal::ShardManifest;
+use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
+
+use super::manifest::ShardManifestStore;
 
 // ============================================================================
 // Watchable Cell
@@ -126,13 +132,52 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
     Some(bit_reverse_u64(reversed))
 }
 
+/// Path to the MemWAL root directory.
+///
+/// Returns: `{base_path}/_mem_wal/`
+pub fn mem_wal_path(base_path: &Path) -> Path {
+    base_path.child("_mem_wal")
+}
+
+/// List latest MemWAL shard manifests from shard directories in object storage.
+pub async fn list_shard_manifests_latest(
+    object_store: &ObjectStore,
+    base_path: &Path,
+) -> Result<Vec<ShardManifest>> {
+    let prefix = mem_wal_path(base_path);
+    let list_result = object_store
+        .inner
+        .list_with_delimiter(Some(&prefix))
+        .await
+        .map_err(|e| {
+            Error::io(format!(
+                "failed to list MemWAL shard directories at {}: {}",
+                prefix, e
+            ))
+        })?;
+    let mut snapshots = Vec::new();
+    for shard_prefix in list_result.common_prefixes {
+        let Some(shard_dir_name) = shard_prefix.filename() else {
+            continue;
+        };
+        let Ok(shard_id) = Uuid::parse_str(shard_dir_name) else {
+            continue;
+        };
+        let manifest_store =
+            ShardManifestStore::new(Arc::new(object_store.clone()), base_path, shard_id, 2);
+        if let Some(manifest) = manifest_store.read_latest().await? {
+            snapshots.push(manifest);
+        }
+    }
+    snapshots.sort_by_key(|snapshot| snapshot.shard_id);
+    Ok(snapshots)
+}
+
 /// Base path for a shard within the MemWAL directory.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/`
 pub fn shard_base_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    base_path
-        .child("_mem_wal")
-        .child(shard_id.as_hyphenated().to_string())
+    mem_wal_path(base_path).child(shard_id.as_hyphenated().to_string())
 }
 
 /// Path to the WAL directory for a shard.
@@ -270,6 +315,57 @@ mod tests {
         assert_eq!(
             shard_wal_path(&empty_base, &shard_id).as_ref(),
             "_mem_wal/550e8400-e29b-41d4-a716-446655440000/wal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_shard_manifests_latest() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+        let (object_store, base_path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let first_shard = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let second_shard = Uuid::parse_str("650e8400-e29b-41d4-a716-446655440001").unwrap();
+
+        ShardManifestStore::new(object_store.clone(), &base_path, first_shard, 2)
+            .initialize_shard(
+                7,
+                std::collections::HashMap::from([
+                    ("partition".to_string(), 0),
+                    ("producer".to_string(), 1),
+                ]),
+            )
+            .await
+            .unwrap();
+        ShardManifestStore::new(object_store.clone(), &base_path, second_shard, 2)
+            .initialize_shard(
+                7,
+                std::collections::HashMap::from([
+                    ("partition".to_string(), 1),
+                    ("producer".to_string(), 0),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let listed = list_shard_manifests_latest(&object_store, &base_path)
+            .await
+            .unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].shard_id, first_shard);
+        assert_eq!(listed[0].shard_spec_id, 7);
+        assert_eq!(
+            listed[0].shard_field_values.get("partition").copied(),
+            Some(0)
+        );
+        assert_eq!(listed[1].shard_id, second_shard);
+        assert!(
+            temp_dir
+                .path()
+                .join("_mem_wal")
+                .join(first_shard.to_string())
+                .join("manifest")
+                .exists()
         );
     }
 

@@ -153,6 +153,10 @@ pub struct ShardManifest {
     pub shard_id: Uuid,
     pub version: u64,
     pub shard_spec_id: u32,
+    /// Int32-valued computed shard fields, keyed by shard field id.
+    pub shard_field_values: HashMap<String, i32>,
+    /// Utf8-valued computed shard fields, keyed by shard field id.
+    pub shard_field_string_values: HashMap<String, String>,
     pub writer_epoch: u64,
     /// The most recent WAL entry position (0-based) flushed to a MemTable.
     /// Recovery replays from `replay_after_wal_entry_position + 1`.
@@ -165,7 +169,11 @@ pub struct ShardManifest {
 
 impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.flushed_generations.deep_size_of_children(context)
+        self.shard_field_values.deep_size_of_children(context)
+            + self
+                .shard_field_string_values
+                .deep_size_of_children(context)
+            + self.flushed_generations.deep_size_of_children(context)
     }
 }
 
@@ -175,6 +183,8 @@ impl From<&ShardManifest> for pb::ShardManifest {
             shard_id: Some((&rm.shard_id).into()),
             version: rm.version,
             shard_spec_id: rm.shard_spec_id,
+            shard_field_values: rm.shard_field_values.clone(),
+            shard_field_string_values: rm.shard_field_string_values.clone(),
             writer_epoch: rm.writer_epoch,
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
@@ -197,6 +207,8 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
             shard_id,
             version: rm.version,
             shard_spec_id: rm.shard_spec_id,
+            shard_field_values: rm.shard_field_values,
+            shard_field_string_values: rm.shard_field_string_values,
             writer_epoch: rm.writer_epoch,
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
