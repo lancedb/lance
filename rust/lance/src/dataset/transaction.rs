@@ -397,7 +397,7 @@ pub enum Operation {
         /// Only tracks keys from INSERT operations during merge insert, not updates.
         inserted_rows_filter: Option<KeyExistenceFilter>,
         /// Physical row offsets (per fragment) that matched `update_columns` for RewriteColumns.
-        /// `None` means callers did not supply offsets; [`build_manifest`] skips partial refresh then.
+        /// `None` means callers did not supply offsets; `build_manifest` skips partial refresh then.
         updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
     },
 
@@ -449,16 +449,10 @@ pub enum UpdateMode {
 
 /// Matched physical row offsets per fragment for a partial [`UpdateMode::RewriteColumns`] update.
 ///
-/// Used with stable row IDs so [`Transaction::build_manifest`] can refresh row-level version
+/// Used with stable row IDs so `build_manifest` can refresh row-level version
 /// metadata only for rows that were rewritten.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UpdatedFragmentOffsets(pub HashMap<u64, RoaringBitmap>);
-
-impl Default for UpdatedFragmentOffsets {
-    fn default() -> Self {
-        Self(HashMap::new())
-    }
-}
 
 impl DeepSizeOf for UpdatedFragmentOffsets {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
@@ -1899,28 +1893,33 @@ impl Transaction {
 
                 final_fragments.extend(updated_frags);
 
-                if next_row_id.is_some() && matches!(update_mode, Some(RewriteColumns)) {
-                    if let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets {
-                        if !off_map.is_empty() {
-                            let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
-                            let prev_version = current_manifest.map(|m| m.version).unwrap_or(0);
-                            for fragment in final_fragments.iter_mut() {
-                                let Some(bitmap) = off_map.get(&fragment.id) else {
-                                    continue;
-                                };
-                                if bitmap.is_empty() {
-                                    continue;
-                                }
-                                let offsets: Vec<usize> =
-                                    bitmap.iter().map(|o| o as usize).collect();
-                                lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
-                                    fragment,
-                                    &offsets,
-                                    new_version,
-                                    prev_version,
-                                )?;
-                            }
+                if next_row_id.is_some()
+                    && matches!(update_mode, Some(RewriteColumns))
+                    && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
+                    && !off_map.is_empty()
+                {
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    let prev_version = current_manifest.map(|m| m.version).unwrap_or(0);
+                    for fragment in final_fragments.iter_mut() {
+                        let Some(bitmap) = off_map.get(&fragment.id) else {
+                            continue;
+                        };
+                        if bitmap.is_empty() {
+                            continue;
                         }
+                        // Skip fragments with no existing version metadata: the helper
+                        // would fill unmatched rows with prev_version, fabricating a
+                        // last_updated stamp for rows that never had one.
+                        if fragment.last_updated_at_version_meta.is_none() {
+                            continue;
+                        }
+                        let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                            fragment,
+                            &offsets,
+                            new_version,
+                            prev_version,
+                        )?;
                     }
                 }
 
@@ -4620,6 +4619,62 @@ mod tests {
         let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
         assert!(result.is_ok());
         assert!(indices.is_empty());
+    }
+
+    /// When a fragment has no existing last_updated_at_version_meta (None), a
+    /// partial RewriteColumns refresh must leave it as None rather than fabricating
+    /// prev_version for unmatched rows.
+    #[test]
+    fn test_partial_rewrite_skips_fragment_with_no_version_meta() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+
+        let (major, minor) = lance_file::version::LanceFileVersion::Stable.to_numbers();
+        let data_file = DataFile::new("data.lance", vec![0], vec![0], major, minor, None, None);
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // Simulate a RewriteColumns update that matched offsets 1 and 3
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter([1u32, 3]))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        let (out, _) = tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert!(
+            out.fragments[0].last_updated_at_version_meta.is_none(),
+            "fragment with no prior version metadata must not have fabricated prev_version stamped on unmatched rows"
+        );
     }
 
     /// Partial RewriteColumns refresh in `build_manifest`: only matched physical

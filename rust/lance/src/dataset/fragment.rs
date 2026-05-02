@@ -1701,8 +1701,8 @@ impl FileFragment {
             let matched = joiner.matched_join_rows(index_column.clone())?;
             if let Some(addr_col) = batch.column_by_name(ROW_ADDR) {
                 let addrs = as_primitive_array::<UInt64Type>(addr_col.as_ref());
-                for row_idx in 0..batch.num_rows() {
-                    if !matched[row_idx] || addrs.is_null(row_idx) {
+                for (row_idx, &is_matched) in matched.iter().enumerate().take(batch.num_rows()) {
+                    if !is_matched || addrs.is_null(row_idx) {
                         continue;
                     }
                     let addr = RowAddress::from(addrs.value(row_idx));
