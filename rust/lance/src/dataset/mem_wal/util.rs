@@ -126,13 +126,18 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
     Some(bit_reverse_u64(reversed))
 }
 
+/// Path to the MemWAL root directory.
+///
+/// Returns: `{base_path}/_mem_wal/`
+pub fn mem_wal_path(base_path: &Path) -> Path {
+    base_path.child("_mem_wal")
+}
+
 /// Base path for a shard within the MemWAL directory.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/`
 pub fn shard_base_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    base_path
-        .child("_mem_wal")
-        .child(shard_id.as_hyphenated().to_string())
+    mem_wal_path(base_path).child(shard_id.as_hyphenated().to_string())
 }
 
 /// Path to the WAL directory for a shard.
@@ -238,6 +243,15 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_mem_wal_path() {
+        let base_path = Path::from("my/dataset");
+        assert_eq!(mem_wal_path(&base_path).as_ref(), "my/dataset/_mem_wal");
+
+        let empty_base = Path::from("");
+        assert_eq!(mem_wal_path(&empty_base).as_ref(), "_mem_wal");
     }
 
     #[test]

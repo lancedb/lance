@@ -16,15 +16,20 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
+use futures::StreamExt;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use tokio::sync::{mpsc, watch};
+use object_store::{PutMode, PutOptions};
+use tokio::sync::{Mutex, mpsc, watch};
 
 use tracing::instrument;
 use uuid::Uuid;
 
-use super::util::{WatchableOnceCell, shard_wal_path, wal_entry_filename};
+use super::manifest::ShardManifestStore;
+use super::util::{
+    WatchableOnceCell, parse_bit_reversed_filename, shard_wal_path, wal_entry_filename,
+};
 
 use super::index::IndexStore;
 use super::memtable::batch_store::{BatchStore, StoredBatch};
@@ -541,6 +546,496 @@ impl WalEntryData {
     }
 }
 
+// ============================================================================
+// Generic WAL Appender and Tailer
+// ============================================================================
+
+const FIRST_WAL_ENTRY_POSITION: u64 = 1;
+const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
+const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
+const MAX_CURSOR_PROBE: u64 = 4096;
+
+/// Result of appending a WAL entry.
+#[derive(Debug, Clone)]
+pub struct WalAppendResult {
+    pub shard_id: Uuid,
+    pub entry_position: u64,
+    pub num_batches: usize,
+    pub num_rows: usize,
+    pub wal_bytes: usize,
+}
+
+/// A WAL entry read from storage.
+#[derive(Debug, Clone)]
+pub struct WalReadEntry {
+    pub shard_id: Uuid,
+    pub entry_position: u64,
+    /// Writer epoch recorded in the WAL entry's IPC schema metadata.
+    /// Replay logic uses this to fence-check against the current epoch.
+    pub writer_epoch: u64,
+    pub batches: Vec<RecordBatch>,
+}
+
+/// WAL appender for a single MemWAL shard with epoch fencing.
+///
+/// Writes Arrow IPC entries atomically using put-if-not-exists. On conflict,
+/// retries with the next position. Checks fencing on conflict or PUT failure.
+#[derive(Debug)]
+pub struct WalAppender {
+    object_store: Arc<ObjectStore>,
+    wal_dir: Path,
+    manifest_store: Arc<ShardManifestStore>,
+    shard_id: Uuid,
+    writer_epoch: u64,
+    next_entry_position: Mutex<Option<u64>>,
+}
+
+impl WalAppender {
+    /// Open a WAL appender and claim a new writer epoch.
+    pub async fn open(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        shard_id: Uuid,
+        shard_spec_id: u32,
+    ) -> Result<Self> {
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            object_store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (writer_epoch, _) = manifest_store.claim_epoch(shard_spec_id).await?;
+        Ok(Self {
+            object_store,
+            wal_dir: shard_wal_path(&base_path, &shard_id),
+            manifest_store,
+            shard_id,
+            writer_epoch,
+            next_entry_position: Mutex::new(None),
+        })
+    }
+
+    /// Shard id.
+    pub fn shard_id(&self) -> Uuid {
+        self.shard_id
+    }
+
+    /// Writer epoch recorded in the shard manifest.
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+
+    /// Append batches as one durable WAL entry.
+    pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
+        validate_appender_batches(&batches)?;
+        let wal_data = Bytes::from(serialize_appender_batches(&batches, self.writer_epoch)?);
+        let wal_bytes = wal_data.len();
+        let num_batches = batches.len();
+        let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
+
+        let mut next_pos = self.next_entry_position.lock().await;
+        if next_pos.is_none() {
+            *next_pos = Some(self.scan_next_position().await?);
+        }
+
+        let mut conflicts = 0;
+        loop {
+            let pos = next_pos.ok_or_else(|| {
+                Error::internal(format!(
+                    "missing cached WAL position for shard {}",
+                    self.shard_id
+                ))
+            })?;
+            match atomic_put(
+                self.object_store.as_ref(),
+                &self.wal_dir,
+                &wal_entry_filename(pos),
+                wal_data.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    *next_pos = Some(pos.checked_add(1).ok_or_else(|| {
+                        Error::io(format!("WAL position overflow for shard {}", self.shard_id))
+                    })?);
+                    return Ok(WalAppendResult {
+                        shard_id: self.shard_id,
+                        entry_position: pos,
+                        num_batches,
+                        num_rows,
+                        wal_bytes,
+                    });
+                }
+                Err(AtomicPutError::AlreadyExists) => {
+                    self.check_fenced().await?;
+                    conflicts += 1;
+                    if conflicts >= MAX_APPEND_CREATE_CONFLICTS {
+                        return Err(Error::io(format!(
+                            "WAL append for shard {} failed after {} conflicts",
+                            self.shard_id, conflicts
+                        )));
+                    }
+                    if conflicts % APPEND_CONFLICT_REFRESH_INTERVAL == 0 {
+                        *next_pos = Some(self.scan_next_position().await?);
+                    } else {
+                        *next_pos = Some(pos.checked_add(1).ok_or_else(|| {
+                            Error::io(format!("WAL position overflow for shard {}", self.shard_id))
+                        })?);
+                    }
+                }
+                Err(AtomicPutError::Other(error)) => {
+                    self.check_fenced().await?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Check that this writer's epoch has not been fenced.
+    pub async fn check_fenced(&self) -> Result<()> {
+        self.manifest_store.check_fenced(self.writer_epoch).await
+    }
+
+    async fn scan_next_position(&self) -> Result<u64> {
+        scan_next_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
+    }
+}
+
+/// Ordered reader for MemWAL entries from a single shard.
+///
+/// Uses `wal_entry_position_last_seen` from the shard manifest as a cursor
+/// hint for `next_position()`, probing forward from the hint to find the true
+/// tip before falling back to a full directory listing.
+#[derive(Debug, Clone)]
+pub struct WalTailer {
+    object_store: Arc<ObjectStore>,
+    wal_dir: Path,
+    manifest_store: Arc<ShardManifestStore>,
+    shard_id: Uuid,
+    update_cursor: bool,
+}
+
+impl WalTailer {
+    /// Create a WAL tailer for a shard.
+    pub fn new(object_store: Arc<ObjectStore>, base_path: Path, shard_id: Uuid) -> Self {
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            object_store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        Self {
+            object_store,
+            wal_dir: shard_wal_path(&base_path, &shard_id),
+            manifest_store,
+            shard_id,
+            update_cursor: false,
+        }
+    }
+
+    /// Enable async best-effort cursor updates on read.
+    ///
+    /// When enabled, successful `read_entry` calls asynchronously update
+    /// `wal_entry_position_last_seen` in the shard manifest.
+    pub fn with_cursor_updates(mut self, enabled: bool) -> Self {
+        self.update_cursor = enabled;
+        self
+    }
+
+    /// Read a WAL entry at the given position. Returns `None` if no entry exists.
+    pub async fn read_entry(&self, entry_position: u64) -> Result<Option<WalReadEntry>> {
+        let path = self.wal_dir.child(wal_entry_filename(entry_position));
+        let data = match self.object_store.inner.get(&path).await {
+            Ok(data) => data,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(Error::io(format!(
+                    "failed to read WAL entry {} for shard {}: {}",
+                    entry_position, self.shard_id, e
+                )));
+            }
+        };
+        let bytes = data.bytes().await.map_err(|e| {
+            Error::io(format!(
+                "failed to read WAL entry bytes at {} for shard {}: {}",
+                path, self.shard_id, e
+            ))
+        })?;
+        let (writer_epoch, batches) = deserialize_appender_batches(bytes)?;
+
+        if self.update_cursor {
+            let ms = self.manifest_store.clone();
+            tokio::spawn(async move {
+                let _ = best_effort_cursor_update(&ms, entry_position).await;
+            });
+        }
+
+        Ok(Some(WalReadEntry {
+            shard_id: self.shard_id,
+            entry_position,
+            writer_epoch,
+            batches,
+        }))
+    }
+
+    /// Find the next append position (one past the latest entry).
+    pub async fn next_position(&self) -> Result<u64> {
+        if let Some(hint) = self.manifest_cursor_hint().await
+            && hint >= FIRST_WAL_ENTRY_POSITION
+            && let Some(tip) = self.probe_forward(hint).await?
+        {
+            return Ok(tip);
+        }
+        scan_next_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
+    }
+
+    /// Find the earliest listed WAL position.
+    pub async fn first_position(&self) -> Result<u64> {
+        scan_first_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
+    }
+
+    async fn manifest_cursor_hint(&self) -> Option<u64> {
+        let manifest = self.manifest_store.read_latest().await.ok()??;
+        let hint = manifest.wal_entry_position_last_seen;
+        if hint > 0 { Some(hint) } else { None }
+    }
+
+    async fn probe_forward(&self, hint: u64) -> Result<Option<u64>> {
+        let path = self.wal_dir.child(wal_entry_filename(hint));
+        match self.object_store.inner.head(&path).await {
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(Error::io(format!(
+                    "failed to check WAL entry {} for shard {}: {}",
+                    hint, self.shard_id, e
+                )));
+            }
+        }
+        let mut pos = hint + 1;
+        while pos - hint <= MAX_CURSOR_PROBE {
+            let p = self.wal_dir.child(wal_entry_filename(pos));
+            match self.object_store.inner.head(&p).await {
+                Ok(_) => pos += 1,
+                Err(object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
+                Err(e) => {
+                    return Err(Error::io(format!(
+                        "failed to check WAL entry {} for shard {}: {}",
+                        pos, self.shard_id, e
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+// --- helpers ---
+
+fn validate_appender_batches(batches: &[RecordBatch]) -> Result<()> {
+    if batches.is_empty() {
+        return Err(Error::invalid_input(
+            "cannot append an empty batch list to WAL",
+        ));
+    }
+    let schema = batches[0].schema();
+    for (idx, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            return Err(Error::invalid_input(format!(
+                "cannot append empty batch at index {} to WAL",
+                idx
+            )));
+        }
+        if batch.schema_ref().fields() != schema.fields() {
+            return Err(Error::invalid_input(format!(
+                "batch at index {} has a different schema from the first batch",
+                idx
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn serialize_appender_batches(batches: &[RecordBatch], writer_epoch: u64) -> Result<Vec<u8>> {
+    let schema = batches[0].schema();
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
+    let ipc_schema = Arc::new(ArrowSchema::new_with_metadata(
+        schema.fields().to_vec(),
+        metadata,
+    ));
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &ipc_schema)
+            .map_err(|e| Error::io(format!("failed to create Arrow IPC stream writer: {}", e)))?;
+        for batch in batches {
+            writer.write(batch).map_err(|e| {
+                Error::io(format!("failed to write batch to WAL IPC stream: {}", e))
+            })?;
+        }
+        writer
+            .finish()
+            .map_err(|e| Error::io(format!("failed to finish WAL IPC stream: {}", e)))?;
+    }
+    Ok(buffer)
+}
+
+fn deserialize_appender_batches(bytes: Bytes) -> Result<(u64, Vec<RecordBatch>)> {
+    let cursor = Cursor::new(bytes);
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| Error::io(format!("failed to open WAL IPC stream reader: {}", e)))?;
+    let schema = reader.schema();
+    let writer_epoch = schema
+        .metadata()
+        .get(WRITER_EPOCH_KEY)
+        .ok_or_else(|| Error::io(format!("WAL entry missing {} metadata", WRITER_EPOCH_KEY)))?
+        .parse::<u64>()
+        .map_err(|e| {
+            Error::io(format!(
+                "WAL entry has malformed {} metadata: {}",
+                WRITER_EPOCH_KEY, e
+            ))
+        })?;
+    let mut clean_metadata = schema.metadata().clone();
+    clean_metadata.remove(WRITER_EPOCH_KEY);
+    let logical_schema = Arc::new(ArrowSchema::new_with_metadata(
+        schema.fields().to_vec(),
+        clean_metadata,
+    ));
+    let mut batches = Vec::new();
+    for batch in reader {
+        let batch =
+            batch.map_err(|e| Error::io(format!("failed to read WAL IPC stream batch: {}", e)))?;
+        let clean = RecordBatch::try_new(logical_schema.clone(), batch.columns().to_vec())
+            .map_err(|e| Error::io(format!("failed to strip WAL metadata: {}", e)))?;
+        batches.push(clean);
+    }
+    Ok((writer_epoch, batches))
+}
+
+enum AtomicPutError {
+    AlreadyExists,
+    Other(Error),
+}
+
+async fn atomic_put(
+    object_store: &ObjectStore,
+    dir: &Path,
+    filename: &str,
+    bytes: Bytes,
+) -> std::result::Result<(), AtomicPutError> {
+    let path = dir.child(filename);
+    if object_store.is_local() {
+        let temp = dir.child(format!("{}.tmp.{}", filename, Uuid::new_v4()));
+        object_store
+            .inner
+            .put(&temp, bytes.into())
+            .await
+            .map_err(|e| {
+                AtomicPutError::Other(Error::io(format!("failed to write temp file: {}", e)))
+            })?;
+        match object_store.inner.rename_if_not_exists(&temp, &path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let _ = object_store.delete(&temp).await;
+                Err(AtomicPutError::AlreadyExists)
+            }
+            Err(e) => {
+                let _ = object_store.delete(&temp).await;
+                Err(AtomicPutError::Other(Error::io(format!(
+                    "failed to create {} atomically: {}",
+                    path, e
+                ))))
+            }
+        }
+    } else {
+        object_store
+            .inner
+            .put_opts(
+                &path,
+                bytes.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
+                _ => AtomicPutError::Other(Error::io(format!(
+                    "failed to create {} atomically: {}",
+                    path, e
+                ))),
+            })?;
+        Ok(())
+    }
+}
+
+async fn scan_next_position(
+    object_store: &ObjectStore,
+    wal_dir: &Path,
+    shard_id: Uuid,
+) -> Result<u64> {
+    let mut max_position = None::<u64>;
+    let mut stream = object_store.inner.list(Some(wal_dir));
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| {
+            Error::io(format!(
+                "failed to list WAL directory for shard {}: {}",
+                shard_id, e
+            ))
+        })?;
+        if let Some(filename) = meta.location.filename()
+            && let Some(position) = parse_bit_reversed_filename(filename)
+        {
+            max_position = Some(max_position.map_or(position, |max| max.max(position)));
+        }
+    }
+    match max_position {
+        Some(pos) => pos
+            .checked_add(1)
+            .ok_or_else(|| Error::io(format!("WAL position overflow for shard {}", shard_id))),
+        None => Ok(FIRST_WAL_ENTRY_POSITION),
+    }
+}
+
+async fn scan_first_position(
+    object_store: &ObjectStore,
+    wal_dir: &Path,
+    shard_id: Uuid,
+) -> Result<u64> {
+    let mut min_position = None::<u64>;
+    let mut stream = object_store.inner.list(Some(wal_dir));
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| {
+            Error::io(format!(
+                "failed to list WAL directory for shard {}: {}",
+                shard_id, e
+            ))
+        })?;
+        if let Some(filename) = meta.location.filename()
+            && let Some(position) = parse_bit_reversed_filename(filename)
+        {
+            min_position = Some(min_position.map_or(position, |min| min.min(position)));
+        }
+    }
+    Ok(min_position.unwrap_or(FIRST_WAL_ENTRY_POSITION))
+}
+
+async fn best_effort_cursor_update(manifest_store: &ShardManifestStore, entry_position: u64) {
+    let Ok(Some(manifest)) = manifest_store.read_latest().await else {
+        return;
+    };
+    if entry_position <= manifest.wal_entry_position_last_seen {
+        return;
+    }
+    let mut updated = manifest;
+    updated.version += 1;
+    updated.wal_entry_position_last_seen = entry_position;
+    let _ = manifest_store.write(&updated).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +1193,147 @@ mod tests {
         assert_eq!(wal_data.batches.len(), 2);
         assert_eq!(wal_data.batches[0].num_rows(), 10);
         assert_eq!(wal_data.batches[1].num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_wal_appender_and_tailer_round_trip() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        let appender = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(appender.shard_id(), shard_id);
+        assert_eq!(appender.writer_epoch(), 1);
+
+        let schema = create_test_schema();
+        let batch_a = create_test_batch(&schema, 4);
+        let batch_b = create_test_batch(&schema, 2);
+
+        let first = appender.append(vec![batch_a.clone()]).await.unwrap();
+        assert_eq!(first.entry_position, FIRST_WAL_ENTRY_POSITION);
+        assert_eq!(first.num_rows, 4);
+        assert_eq!(first.num_batches, 1);
+        assert!(first.wal_bytes > 0);
+
+        let second = appender.append(vec![batch_b.clone()]).await.unwrap();
+        assert_eq!(second.entry_position, FIRST_WAL_ENTRY_POSITION + 1);
+
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        assert_eq!(tailer.first_position().await.unwrap(), first.entry_position);
+        assert_eq!(
+            tailer.next_position().await.unwrap(),
+            second.entry_position + 1
+        );
+
+        let read = tailer
+            .read_entry(first.entry_position)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.shard_id, shard_id);
+        assert_eq!(read.writer_epoch, appender.writer_epoch());
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 4);
+        // Writer-epoch IPC metadata must be stripped from logical batches.
+        assert!(
+            !read.batches[0]
+                .schema()
+                .metadata()
+                .contains_key(WRITER_EPOCH_KEY)
+        );
+
+        assert!(tailer.read_entry(999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wal_appender_fenced_by_newer_writer() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        let first = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(first.writer_epoch(), 1);
+
+        let schema = create_test_schema();
+        let batch = create_test_batch(&schema, 1);
+        first.append(vec![batch.clone()]).await.unwrap();
+
+        let second = WalAppender::open(store, base_path, shard_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(second.writer_epoch(), 2);
+        // Newer writer races first to position 2.
+        second.append(vec![batch.clone()]).await.unwrap();
+
+        let err = first.check_fenced().await.unwrap_err();
+        assert!(
+            err.to_string().contains("Writer fenced"),
+            "expected fence error, got: {err}"
+        );
+
+        // Fenced writer's cached next_pos still points at 2; the conflict path
+        // must surface the fence error rather than silently advance.
+        let err = first.append(vec![batch]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Writer fenced"),
+            "expected fence error from append, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wal_appender_rejects_invalid_input() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let appender = WalAppender::open(store, base_path, shard_id, 0)
+            .await
+            .unwrap();
+        let err = appender.append(vec![]).await.unwrap_err();
+        assert!(err.to_string().contains("empty batch list"));
+
+        let schema = create_test_schema();
+        let zero = RecordBatch::new_empty(schema);
+        let err = appender.append(vec![zero]).await.unwrap_err();
+        assert!(err.to_string().contains("empty batch"));
+    }
+
+    #[tokio::test]
+    async fn test_wal_tailer_uses_manifest_cursor_hint() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let appender = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        for _ in 0..3 {
+            appender
+                .append(vec![create_test_batch(&schema, 1)])
+                .await
+                .unwrap();
+        }
+
+        let tailer =
+            WalTailer::new(store.clone(), base_path.clone(), shard_id).with_cursor_updates(true);
+        let entry = tailer.read_entry(2).await.unwrap().unwrap();
+        assert_eq!(entry.entry_position, 2);
+
+        // Best-effort cursor update is async; poll briefly until it lands.
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let mut hint = 0u64;
+        for _ in 0..50 {
+            if let Some(m) = manifest_store.read_latest().await.unwrap() {
+                hint = m.wal_entry_position_last_seen;
+                if hint >= 2 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(hint >= 2, "cursor hint never updated, last={hint}");
+
+        // next_position must still resolve to one past the last appended entry.
+        assert_eq!(tailer.next_position().await.unwrap(), 4);
     }
 }

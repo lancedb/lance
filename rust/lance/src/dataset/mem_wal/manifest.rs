@@ -27,6 +27,7 @@
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -123,6 +124,42 @@ impl ShardManifestStore {
             .map_err(|e| Error::io(format!("Failed to decode manifest protobuf: {}", e)))?;
 
         ShardManifest::try_from(pb_manifest)
+    }
+
+    /// Write an initial manifest for a newly-created shard.
+    ///
+    /// `shard_field_values` maps field_id to raw Arrow scalar bytes.
+    /// Initial manifests use writer epoch 0. A writer that claims the shard
+    /// will write a new manifest with epoch 1 before appending WAL entries.
+    pub async fn initialize_shard(
+        &self,
+        shard_spec_id: u32,
+        shard_field_values: HashMap<String, Vec<u8>>,
+    ) -> Result<ShardManifest> {
+        let manifest = ShardManifest {
+            shard_id: self.shard_id,
+            version: 1,
+            shard_spec_id,
+            shard_field_values,
+            writer_epoch: 0,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            current_generation: 1,
+            flushed_generations: vec![],
+        };
+
+        match self.write(&manifest).await {
+            Ok(_) => Ok(manifest),
+            Err(error) => match self.read_latest().await? {
+                Some(existing)
+                    if existing.shard_spec_id == manifest.shard_spec_id
+                        && existing.shard_field_values == manifest.shard_field_values =>
+                {
+                    Ok(existing)
+                }
+                _ => Err(error),
+            },
+        }
     }
 
     /// Write a new manifest version atomically.
@@ -392,6 +429,7 @@ impl ShardManifestStore {
                 shard_id: self.shard_id,
                 version: next_version,
                 shard_spec_id,
+                shard_field_values: HashMap::new(),
                 writer_epoch: next_epoch,
                 replay_after_wal_entry_position: 0,
                 wal_entry_position_last_seen: 0,
@@ -527,6 +565,7 @@ mod tests {
             shard_id,
             version,
             shard_spec_id: 0,
+            shard_field_values: HashMap::new(),
             writer_epoch: epoch,
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
@@ -611,5 +650,68 @@ mod tests {
         let manifest2 = create_test_manifest(shard_id, 1, 2);
         let result = manifest_store.write(&manifest2).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_shard_writes_v1_with_epoch_zero() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let mut field_values = HashMap::new();
+        field_values.insert("user_bucket".to_string(), 7i32.to_le_bytes().to_vec());
+
+        let manifest = manifest_store
+            .initialize_shard(3, field_values.clone())
+            .await
+            .unwrap();
+        assert_eq!(manifest.shard_id, shard_id);
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.writer_epoch, 0);
+        assert_eq!(manifest.shard_spec_id, 3);
+        assert_eq!(manifest.shard_field_values, field_values);
+
+        let loaded = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(loaded, manifest);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_shard_idempotent_on_match() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let mut field_values = HashMap::new();
+        field_values.insert("k".to_string(), b"v".to_vec());
+
+        let first = manifest_store
+            .initialize_shard(1, field_values.clone())
+            .await
+            .unwrap();
+        let second = manifest_store
+            .initialize_shard(1, field_values)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_shard_rejects_conflict_with_mismatch() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        manifest_store
+            .initialize_shard(1, HashMap::new())
+            .await
+            .unwrap();
+
+        let mut other = HashMap::new();
+        other.insert("k".to_string(), b"v".to_vec());
+        let result = manifest_store.initialize_shard(1, other).await;
+        assert!(
+            result.is_err(),
+            "second initialize_shard with different fields must fail"
+        );
     }
 }
