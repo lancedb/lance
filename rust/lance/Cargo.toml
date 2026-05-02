@@ -159,6 +159,10 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "merge_insert"
+harness = false
+
+[[bench]]
 name = "scan"
 harness = false
 
