@@ -135,6 +135,7 @@ impl ScopedFragmentRead {
             .with_row_address(self.projection.with_row_addr)
             .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.projection.with_row_created_at_version)
+            .with_row_deleted_at_version(self.projection.with_row_deleted_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
             .with_reader_priority(self.priority);
         if let Some(file_reader_options) = &self.file_reader_options {
@@ -396,13 +397,7 @@ impl FilteredReadStream {
         // not general enough" false positives from rustc
         let frag_futs = fragments
             .iter()
-            .map(|frag| {
-                Result::Ok(Self::load_fragment(
-                    dataset.clone(),
-                    frag.clone(),
-                    options.with_deleted_rows,
-                ))
-            })
+            .map(|frag| Result::Ok(Self::load_fragment(dataset.clone(), frag.clone())))
             .collect::<Vec<_>>();
         let loaded_fragments = futures::stream::iter(frag_futs)
             // Cannot use unordered because we need to populate logical_offset based on user-provided order
@@ -465,17 +460,12 @@ impl FilteredReadStream {
         })
     }
 
-    async fn load_fragment(
-        dataset: Arc<Dataset>,
-        frag: Fragment,
-        include_deleted_rows: bool,
-    ) -> Result<LoadedFragment> {
+    async fn load_fragment(dataset: Arc<Dataset>, frag: Fragment) -> Result<LoadedFragment> {
         let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
-        let deletion_vector = if include_deleted_rows {
-            None
-        } else {
-            file_fragment.get_deletion_vector().await?
-        };
+        // Always load the deletion vector. When include_deleted_rows is true, we still need DV
+        // to identify which physical rows were deleted so we can populate
+        // _row_deleted_at_version correctly and optionally mark _rowid as null.
+        let deletion_vector = file_fragment.get_deletion_vector().await?;
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
         let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
@@ -552,8 +542,12 @@ impl FilteredReadStream {
                 break;
             }
 
-            let mut to_read: Vec<Range<u64>> =
-                Self::full_frag_range(*num_physical_rows, deletion_vector);
+            let mut to_read: Vec<Range<u64>> = if options.with_deleted_rows {
+                // When including deleted rows, do not prune by DV; read the full physical range.
+                vec![0..*num_physical_rows]
+            } else {
+                Self::full_frag_range(*num_physical_rows, deletion_vector)
+            };
 
             if let Some(range_before_filter) = &options.scan_range_before_filter {
                 let range_start = range_offset;
@@ -1017,11 +1011,6 @@ impl FilteredReadStream {
                         let global_metrics = global_metrics_clone.clone();
                         let scan_scheduler = scan_scheduler_clone.clone();
                         async move {
-                            // This isn't quite right.  It's counting I/O time in addition to
-                            // compute time.
-                            //
-                            // TODO: Modify the "read task" concept to have a way of marking when
-                            // the 'wait' portion of the task is complete.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
                             let maybe_task = {
@@ -1088,6 +1077,8 @@ impl FilteredReadStream {
             .await?;
 
         if fragment_read_task.with_deleted_rows {
+            // Use make_deletions_null to retain physical rows for DV deletions while keeping
+            // system/meta columns intact and respecting non-nullability on data columns.
             fragment_reader.with_make_deletions_null();
         }
 
@@ -1168,7 +1159,6 @@ impl FilteredReadStream {
                                 "Error applying filter expression to batch: {e}"
                             ))
                         })?;
-                    // Drop any fields loaded purely for the purpose of applying the filter
                     Ok(batch.project_by_schema(output_schema.as_ref())?)
                 })
                 .boxed())
@@ -1536,14 +1526,9 @@ impl FilteredReadInternalPlan {
 impl FilteredReadExec {
     pub fn try_new(
         dataset: Arc<Dataset>,
-        mut options: FilteredReadOptions,
+        options: FilteredReadOptions,
         index_input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
-        if options.with_deleted_rows {
-            // Ensure we have the row id column if with_deleted_rows is set
-            options.projection = options.projection.with_row_id();
-        }
-
         if options.projection.is_empty() {
             return Err(Error::invalid_input_source("no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
                 .into()));
@@ -1663,14 +1648,12 @@ impl FilteredReadExec {
                     .clone()
                     .unwrap_or_else(|| dataset.fragments().clone());
 
-                let with_deleted_rows = options.with_deleted_rows;
                 let frag_futs = fragments
                     .iter()
                     .map(|frag| {
                         Result::Ok(FilteredReadStream::load_fragment(
                             dataset.clone(),
                             frag.clone(),
-                            with_deleted_rows,
                         ))
                     })
                     .collect::<Vec<_>>();

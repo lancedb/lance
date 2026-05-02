@@ -44,6 +44,9 @@ use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
+use lance_table::rowids::version::{
+    RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+};
 use lance_table::utils::stream::{
     ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
     wrap_with_row_id_and_delete,
@@ -608,6 +611,8 @@ pub struct FragReadConfig {
     pub with_row_last_updated_at_version: bool,
     // Add the created at version column
     pub with_row_created_at_version: bool,
+    // Add the deleted at version column
+    pub with_row_deleted_at_version: bool,
     /// The scan scheduler to use for reading data files.
     ///
     /// This should be specified if multiple readers are being used in
@@ -651,6 +656,12 @@ impl FragReadConfig {
             || self.with_row_address
             || self.with_row_last_updated_at_version
             || self.with_row_created_at_version
+            || self.with_row_deleted_at_version
+    }
+
+    pub fn with_row_deleted_at_version(mut self, value: bool) -> Self {
+        self.with_row_deleted_at_version = value;
+        self
     }
 
     pub fn with_scan_scheduler(mut self, value: Arc<ScanScheduler>) -> Self {
@@ -903,6 +914,9 @@ impl FileFragment {
         }
         if read_config.with_row_created_at_version {
             reader.with_row_created_at_version();
+        }
+        if read_config.with_row_deleted_at_version {
+            reader.with_row_deleted_at_version();
         }
 
         Ok(reader)
@@ -1836,6 +1850,56 @@ impl FileFragment {
         )
         .await?;
 
+        // Update deleted_at_version_meta only for datasets with stable row IDs
+        if self.dataset.manifest.uses_stable_row_ids() {
+            let current_version = self.dataset.version().version + 1;
+            let row_count = physical_rows;
+            let mut base_versions: Vec<u64> = vec![0u64; row_count];
+            if let Some(meta) = self.metadata.deleted_at_version_meta.as_ref()
+                && let Ok(prev_seq) = meta.load_sequence()
+            {
+                for (pos, slot) in base_versions.iter_mut().enumerate() {
+                    *slot = prev_seq.version_at(pos).unwrap_or(0);
+                }
+            }
+            // Mark deleted positions with current_version if not already set
+            let mut deleted_positions: Vec<usize> =
+                deletion_vector.into_iter().map(|p| p as usize).collect();
+            deleted_positions.sort_unstable();
+            for pos in deleted_positions.iter().copied() {
+                if pos < row_count && base_versions[pos] == 0 {
+                    base_versions[pos] = current_version;
+                }
+            }
+
+            let mut runs: Vec<RowDatasetVersionRun> = Vec::new();
+            if !base_versions.is_empty() {
+                let mut start = 0usize;
+                let mut curr_ver = base_versions[0];
+                for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
+                    if ver != curr_ver {
+                        runs.push(RowDatasetVersionRun {
+                            span: lance_table::rowids::segment::U64Segment::Range(
+                                start as u64..idx as u64,
+                            ),
+                            version: curr_ver,
+                        });
+                        start = idx;
+                        curr_ver = ver;
+                    }
+                }
+                runs.push(RowDatasetVersionRun {
+                    span: lance_table::rowids::segment::U64Segment::Range(
+                        start as u64..base_versions.len() as u64,
+                    ),
+                    version: curr_ver,
+                });
+            }
+            let seq = RowDatasetVersionSequence { runs };
+            let meta = RowDatasetVersionMeta::from_sequence(&seq)?;
+            self.metadata.deleted_at_version_meta = Some(meta);
+        }
+
         Ok(Some(self))
     }
 }
@@ -1934,6 +1998,9 @@ pub struct FragmentReader {
     /// True if we should generate a created at version column in output
     with_row_created_at_version: bool,
 
+    /// True if we should generate a deleted at version column in output
+    with_row_deleted_at_version: bool,
+
     /// If true, deleted rows will be set to null, which is fast
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
@@ -1946,6 +2013,9 @@ pub struct FragmentReader {
 
     /// The created_at version sequence (loaded from fragment metadata)
     created_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+
+    /// The deleted_at version sequence (loaded from fragment metadata)
+    deleted_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
 
     // total number of real rows in the fragment (num_physical_rows - num_deleted_rows)
     num_rows: usize,
@@ -1974,10 +2044,12 @@ impl Clone for FragmentReader {
             with_row_addr: self.with_row_addr,
             with_row_last_updated_at_version: self.with_row_last_updated_at_version,
             with_row_created_at_version: self.with_row_created_at_version,
+            with_row_deleted_at_version: self.with_row_deleted_at_version,
             make_deletions_null: self.make_deletions_null,
             fragment: self.fragment.clone(),
             last_updated_at_sequence: self.last_updated_at_sequence.clone(),
             created_at_sequence: self.created_at_sequence.clone(),
+            deleted_at_sequence: self.deleted_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
         }
@@ -2041,10 +2113,12 @@ impl FragmentReader {
             with_row_addr: false,
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
+            with_row_deleted_at_version: false,
             make_deletions_null: false,
             fragment,
             last_updated_at_sequence: None,
             created_at_sequence: None,
+            deleted_at_sequence: None,
             num_rows,
             num_physical_rows,
         })
@@ -2090,6 +2164,26 @@ impl FragmentReader {
             .output_schema
             .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())
             .expect("Table already has a column named _row_last_updated_at_version");
+
+        self
+    }
+
+    pub(crate) fn with_row_deleted_at_version(&mut self) -> &mut Self {
+        self.with_row_deleted_at_version = true;
+
+        // Load the version sequence if not already loaded
+        if self.deleted_at_sequence.is_none()
+            && let Some(meta) = &self.fragment.deleted_at_version_meta
+            && let Ok(sequence) = meta.load_sequence()
+        {
+            self.deleted_at_sequence = Some(Arc::new(sequence));
+        }
+
+        // Add the version column to the output schema
+        self.output_schema = self
+            .output_schema
+            .try_with_column(lance_core::ROW_DELETED_AT_VERSION_FIELD.clone())
+            .expect("Table already has a column named _row_deleted_at_version");
 
         self
     }
@@ -2283,8 +2377,10 @@ impl FragmentReader {
                 with_row_addr: self.with_row_addr,
                 with_row_last_updated_at_version: self.with_row_last_updated_at_version,
                 with_row_created_at_version: self.with_row_created_at_version,
+                with_row_deleted_at_version: self.with_row_deleted_at_version,
                 last_updated_at_sequence: self.last_updated_at_sequence.clone(),
                 created_at_sequence: self.created_at_sequence.clone(),
+                deleted_at_sequence: self.deleted_at_sequence.clone(),
                 make_deletions_null: self.make_deletions_null,
                 total_num_rows: first_reader.len() as u32,
             },
@@ -2376,8 +2472,10 @@ impl FragmentReader {
             with_row_addr: self.with_row_addr,
             with_row_last_updated_at_version: self.with_row_last_updated_at_version,
             with_row_created_at_version: self.with_row_created_at_version,
+            with_row_deleted_at_version: self.with_row_deleted_at_version,
             last_updated_at_sequence: self.last_updated_at_sequence.clone(),
             created_at_sequence: self.created_at_sequence.clone(),
+            deleted_at_sequence: self.deleted_at_sequence.clone(),
             params,
             total_num_rows,
         };
@@ -2442,6 +2540,7 @@ impl FragmentReader {
             + self.with_row_addr as usize
             + self.with_row_created_at_version as usize
             + self.with_row_last_updated_at_version as usize
+            + self.with_row_deleted_at_version as usize
     }
 
     /// Reads a range of rows from the fragment
@@ -2529,8 +2628,10 @@ impl FragmentReader {
             with_row_addr: self.with_row_addr,
             with_row_last_updated_at_version: self.with_row_last_updated_at_version,
             with_row_created_at_version: self.with_row_created_at_version,
+            with_row_deleted_at_version: self.with_row_deleted_at_version,
             last_updated_at_sequence: self.last_updated_at_sequence.clone(),
             created_at_sequence: self.created_at_sequence.clone(),
+            deleted_at_sequence: self.deleted_at_sequence.clone(),
             params: ReadBatchParams::Ranges(ranges),
             total_num_rows,
         };

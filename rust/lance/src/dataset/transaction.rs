@@ -3859,6 +3859,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3891,6 +3892,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3923,6 +3925,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3958,6 +3961,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3986,6 +3990,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -3995,6 +4000,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -4039,6 +4045,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -4580,6 +4587,7 @@ mod tests {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         let operation = Operation::Overwrite {
@@ -4668,6 +4676,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         let new_seq = RowIdSequence::from([100u64, 102].as_slice());
@@ -4678,6 +4687,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4723,6 +4733,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -4734,6 +4745,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
         ]);
 
@@ -4746,6 +4758,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4782,6 +4795,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         // New fragment has row 10 (known) and row 999 (unknown — freshly inserted)
@@ -4793,6 +4807,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4823,6 +4838,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4834,6 +4850,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(1),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4862,6 +4879,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4872,6 +4890,7 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(3),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4904,6 +4923,7 @@ mod tests {
                 vec![0xFFu8; 8].as_slice(),
             ))),
             last_updated_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         let new_seq = RowIdSequence::from([10u64].as_slice());
@@ -4914,6 +4934,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(1),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -4958,6 +4979,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         // Fragment outside range – IDs [1000, 1001], created_at = 99 (must never appear)
@@ -4978,6 +5000,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         // New fragment rewrites both rows from the in-range fragment
@@ -4989,6 +5012,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -5027,6 +5051,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -5039,6 +5064,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -5090,6 +5116,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            deleted_at_version_meta: None,
         };
 
         // New fragment rewrites all 100 rows preserving their stable IDs.
@@ -5101,6 +5128,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(100),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 
@@ -5151,6 +5179,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -5162,6 +5191,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                deleted_at_version_meta: None,
             },
         ]);
 
@@ -5174,6 +5204,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
             created_at_version_meta: None,
+            deleted_at_version_meta: None,
             last_updated_at_version_meta: None,
         };
 

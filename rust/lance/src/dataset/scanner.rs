@@ -1875,6 +1875,7 @@ impl Scanner {
             .with_row_addr()
             .with_row_last_updated_at_version()
             .with_row_created_at_version()
+            .with_row_deleted_at_version()
             .to_schema();
 
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
@@ -2658,6 +2659,7 @@ impl Scanner {
                 false
             } else if projection.with_row_last_updated_at_version
                 || projection.with_row_created_at_version
+                || projection.with_row_deleted_at_version
             {
                 // Version columns require ordered scanning because version metadata
                 // is indexed by position within each fragment
@@ -2693,6 +2695,9 @@ impl Scanner {
                 self.projection_plan
                     .physical_projection
                     .with_row_created_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_deleted_at_version,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -3461,6 +3466,7 @@ impl Scanner {
             false,
             false,
             false,
+            false,
             flat_fts_scan_schema,
             Arc::new(fragments),
             None,
@@ -3757,6 +3763,7 @@ impl Scanner {
                 false,
                 false,
                 false,
+                false,
                 vector_scan_projection,
                 Arc::new(fallback_fragments),
                 // Can't pushdown limit/offset in an ANN search
@@ -3959,6 +3966,9 @@ impl Scanner {
                 self.projection_plan
                     .physical_projection
                     .with_row_created_at_version,
+                self.projection_plan
+                    .physical_projection
+                    .with_row_deleted_at_version,
                 false,
                 scan_schema,
                 missing_frags.into(),
@@ -4001,6 +4011,7 @@ impl Scanner {
         with_row_address: bool,
         with_row_last_updated_at_version: bool,
         with_row_created_at_version: bool,
+        with_row_deleted_at_version: bool,
         with_make_deletions_null: bool,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
@@ -4021,6 +4032,7 @@ impl Scanner {
             with_row_address,
             with_row_last_updated_at_version,
             with_row_created_at_version,
+            with_row_deleted_at_version,
             with_make_deletions_null,
             projection,
             fragments,
@@ -4036,6 +4048,7 @@ impl Scanner {
         with_row_address: bool,
         with_row_last_updated_at_version: bool,
         with_row_created_at_version: bool,
+        with_row_deleted_at_version: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
@@ -4052,6 +4065,7 @@ impl Scanner {
             with_row_address,
             with_row_last_updated_at_version,
             with_row_created_at_version,
+            with_row_deleted_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
             file_reader_options: self.resolved_file_reader_options(),

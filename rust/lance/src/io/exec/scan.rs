@@ -292,7 +292,8 @@ impl LanceStream {
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
-                            .with_row_created_at_version(config.with_row_created_at_version);
+                            .with_row_created_at_version(config.with_row_created_at_version)
+                            .with_row_deleted_at_version(config.with_row_deleted_at_version);
                         if let Some(file_reader_options) = config.file_reader_options {
                             frag_config = frag_config.with_file_reader_options(file_reader_options);
                         }
@@ -390,7 +391,8 @@ impl LanceStream {
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
-                            .with_row_created_at_version(config.with_row_created_at_version),
+                            .with_row_created_at_version(config.with_row_created_at_version)
+                            .with_row_deleted_at_version(config.with_row_deleted_at_version),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -423,7 +425,8 @@ impl LanceStream {
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
-                            .with_row_created_at_version(config.with_row_created_at_version),
+                            .with_row_created_at_version(config.with_row_created_at_version)
+                            .with_row_deleted_at_version(config.with_row_deleted_at_version),
                         config.with_make_deletions_null,
                         None,
                     ))
@@ -490,6 +493,11 @@ impl RecordBatchStream for LanceStream {
                 .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
+        if self.config.with_row_deleted_at_version {
+            schema = schema
+                .try_with_column((*lance_core::ROW_DELETED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
         Arc::new(schema)
     }
 }
@@ -504,6 +512,7 @@ pub struct LanceScanConfig {
     pub with_row_address: bool,
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
+    pub with_row_deleted_at_version: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
     pub file_reader_options: Option<FileReaderOptions>,
@@ -522,6 +531,7 @@ impl Default for LanceScanConfig {
             with_row_address: false,
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
+            with_row_deleted_at_version: false,
             with_make_deletions_null: false,
             ordered_output: false,
             file_reader_options: None,
@@ -607,6 +617,11 @@ impl LanceScanExec {
         if config.with_row_created_at_version {
             output_schema = output_schema
                 .try_with_column((*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone())
+                .unwrap();
+        }
+        if config.with_row_deleted_at_version {
+            output_schema = output_schema
+                .try_with_column((*lance_core::ROW_DELETED_AT_VERSION_FIELD).clone())
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);

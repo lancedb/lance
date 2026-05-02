@@ -129,14 +129,25 @@ impl TakeStream {
                 ))
             })?;
 
-        let reader = Arc::new(
-            fragment
-                .open(
-                    &self.fields_to_take,
-                    FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone()),
-                )
-                .await?,
-        );
+        let mut reader = fragment
+            .open(
+                &self.fields_to_take,
+                FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone()),
+            )
+            .await?;
+
+        // If the output schema includes the deleted-at-version column, we must not
+        // filter out deleted rows when taking additional columns. Instead, preserve
+        // row count and make deleted rows null for data columns.
+        if self
+            .output_schema
+            .field_with_name(lance_core::ROW_DELETED_AT_VERSION)
+            .is_ok()
+        {
+            reader.with_make_deletions_null();
+        }
+
+        let reader = Arc::new(reader);
 
         let mut readers = self.readers_cache.lock().unwrap();
         readers.insert(fragment_id, reader.clone());

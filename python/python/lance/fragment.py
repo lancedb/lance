@@ -77,6 +77,8 @@ class FragmentMetadata:
         The row created at version metadata, if any.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
         The row last updated at version metadata, if any.
+    deleted_at_version_meta : Optional[RowDatasetVersionMeta]
+        The row deleted at version metadata, if any.
     """
 
     id: int
@@ -86,6 +88,7 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    deleted_at_version_meta: Optional[RowDatasetVersionMeta] = None
 
     @property
     def num_deletions(self) -> int:
@@ -132,6 +135,11 @@ class FragmentMetadata:
                 if self.last_updated_at_version_meta is not None
                 else None
             ),
+            deleted_at_version_meta=(
+                json.loads(self.deleted_at_version_meta.json())
+                if self.deleted_at_version_meta is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -158,6 +166,12 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        deleted_at_version_meta = json_data.get("deleted_at_version_meta")
+        if deleted_at_version_meta is not None:
+            deleted_at_version_meta = RowDatasetVersionMeta.from_json(
+                json.dumps(deleted_at_version_meta)
+            )
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -166,6 +180,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            deleted_at_version_meta=deleted_at_version_meta,
         )
 
 
