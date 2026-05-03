@@ -397,12 +397,15 @@ impl ShardManifestStore {
     /// 2. Incrementing the writer epoch
     /// 3. Atomically writing the new manifest
     ///
-    /// On version conflict, re-reads the manifest and only fails if another
-    /// writer has claimed a strictly higher epoch than the one we were
-    /// targeting. Equal-or-lower conflicts (for example, a tailer cursor
-    /// update, a concurrent `initialize_shard`, or another claimant racing
-    /// us at the same target epoch) trigger a retry; the next iteration
-    /// observes the new state and bumps to the next epoch.
+    /// On version conflict, re-reads the manifest and only retries when
+    /// the latest writer_epoch is strictly less than the epoch we were
+    /// targeting — meaning the version was bumped by something other than
+    /// a real claim (a tailer cursor update or a concurrent
+    /// `initialize_shard` writing epoch 0). If the latest writer_epoch
+    /// is equal to or greater than our target, the target epoch is
+    /// already claimed and this call fails. This preserves the
+    /// no-epoch-war guarantee for real claimants while tolerating benign
+    /// version bumps.
     ///
     /// # Returns
     ///
@@ -411,9 +414,9 @@ impl ShardManifestStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if another writer claimed a strictly higher epoch
-    /// than our target, or if the manifest stays contended past the retry
-    /// budget.
+    /// Returns an error if another writer claimed an equal-or-higher
+    /// epoch than our target, or if the manifest stays contended past
+    /// the retry budget.
     #[instrument(name = "manifest_claim_epoch", level = "info", skip_all, fields(shard_id = %self.shard_id, shard_spec_id))]
     pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
         const MAX_CLAIM_RETRIES: usize = 16;
@@ -460,9 +463,9 @@ impl ShardManifestStore {
                         .await?
                         .map(|m| m.writer_epoch)
                         .unwrap_or(0);
-                    if latest_epoch > next_epoch {
+                    if latest_epoch >= next_epoch {
                         return Err(Error::io(format!(
-                            "Failed to claim shard {} (version {}): another writer claimed epoch {} (> our target {}): {}",
+                            "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
                             self.shard_id, next_version, latest_epoch, next_epoch, write_err
                         )));
                     }
@@ -746,30 +749,6 @@ mod tests {
         assert_eq!(second_epoch, 2);
         assert_eq!(second.version, 3);
         assert_eq!(second.wal_entry_position_last_seen, 42);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_claim_epoch_both_succeed_with_distinct_epochs() {
-        // Two concurrent claim_epoch calls must both eventually succeed
-        // with distinct epochs. At least one is guaranteed to take the
-        // AlreadyExists retry path, exercising the conflict branch.
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let manifest_store = Arc::new(ShardManifestStore::new(store, &base_path, shard_id, 4));
-
-        let s1 = manifest_store.clone();
-        let s2 = manifest_store.clone();
-        let (r1, r2) = tokio::join!(
-            tokio::spawn(async move { s1.claim_epoch(0).await }),
-            tokio::spawn(async move { s2.claim_epoch(0).await }),
-        );
-
-        let (e1, _) = r1.unwrap().unwrap();
-        let (e2, _) = r2.unwrap().unwrap();
-        assert_ne!(e1, e2, "concurrent claims must end up with distinct epochs");
-        let mut epochs = [e1, e2];
-        epochs.sort();
-        assert_eq!(epochs, [1, 2]);
     }
 
     #[tokio::test]
