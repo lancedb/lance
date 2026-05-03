@@ -217,24 +217,29 @@ impl FileReader {
         cache: Option<&LanceCache>,
     ) -> Result<Arc<Option<PageTable>>> {
         // To prevent collisions, we cache this at a child path
-        Self::load_from_cache(cache, reader.path().child("stats").to_string(), |_| async {
-            let metadata = Self::read_metadata(reader, cache).await?;
+        Self::load_from_cache(
+            cache,
+            reader.path().clone().join("stats").to_string(),
+            |_| async {
+                let metadata = Self::read_metadata(reader, cache).await?;
 
-            if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
-                Ok(Some(
-                    PageTable::load(
-                        reader,
-                        stats_meta.page_table_position,
-                        /*min_field_id=*/ 0,
-                        /*max_field_id=*/ *stats_meta.leaf_field_ids.iter().max().unwrap(),
-                        /*num_batches=*/ 1,
-                    )
-                    .await?,
-                ))
-            } else {
-                Ok(None)
-            }
-        })
+                if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
+                    Ok(Some(
+                        PageTable::load(
+                            reader,
+                            stats_meta.page_table_position,
+                            /*min_field_id=*/ 0,
+                            /*max_field_id=*/
+                            *stats_meta.leaf_field_ids.iter().max().unwrap(),
+                            /*num_batches=*/ 1,
+                        )
+                        .await?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
         .await
     }
 

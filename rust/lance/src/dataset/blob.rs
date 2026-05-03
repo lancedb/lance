@@ -1820,7 +1820,7 @@ fn collect_blob_entries_v1(
                     blob_field_id, frag_id, row_addr
                 ))
             })?;
-            let data_file_path = dataset.data_dir().child(data_file.path.as_str());
+            let data_file_path = dataset.data_dir().clone().join(data_file.path.as_str());
             Ok(BlobEntry {
                 selection_index,
                 row_address: row_addr,
@@ -2040,7 +2040,7 @@ async fn resolve_blob_read_location(
         .data_file_for_field(blob_field_id)
         .ok_or_else(|| Error::internal("Data file not found for blob field".to_string()))?;
     let data_file_dir = dataset.data_file_dir(data_file)?;
-    let data_file_path = data_file_dir.child(data_file.path.as_str());
+    let data_file_path = data_file_dir.clone().join(data_file.path.as_str());
     let data_file_key = data_file_key_from_path(data_file.path.as_str()).to_string();
 
     let object_store = if let Some(base_id) = data_file.base_id {
@@ -2100,8 +2100,9 @@ mod tests {
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
     use object_store::{
-        Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-        ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+        Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+        MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        path::Path,
     };
     use tokio::sync::Notify;
     use url::Url;
@@ -2225,14 +2226,6 @@ mod tests {
 
     #[async_trait]
     impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
-        async fn put(
-            &self,
-            _location: &Path,
-            _bytes: PutPayload,
-        ) -> object_store::Result<PutResult> {
-            unimplemented!("put is not used by these tests")
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
@@ -2242,25 +2235,12 @@ mod tests {
             unimplemented!("put_opts is not used by these tests")
         }
 
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            unimplemented!("put_multipart is not used by these tests")
-        }
-
         async fn put_multipart_opts(
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
             unimplemented!("put_multipart_opts is not used by these tests")
-        }
-
-        async fn get(&self, _location: &Path) -> object_store::Result<GetResult> {
-            Err(object_store::Error::NotSupported {
-                source: "get is not used by these tests".into(),
-            })
         }
 
         async fn get_opts(
@@ -2286,8 +2266,11 @@ mod tests {
             })
         }
 
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!("delete is not used by these tests")
+        fn delete_stream(
+            &self,
+            _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!("delete_stream is not used by these tests")
         }
 
         fn list(
@@ -2304,12 +2287,13 @@ mod tests {
             unimplemented!("list_with_delimiter is not used by these tests")
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy is not used by these tests")
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy_if_not_exists is not used by these tests")
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!("copy_opts is not used by these tests")
         }
     }
 
@@ -2374,14 +2358,6 @@ mod tests {
 
     #[async_trait]
     impl object_store::ObjectStore for RecordingRangeObjectStore {
-        async fn put(
-            &self,
-            _location: &Path,
-            _bytes: PutPayload,
-        ) -> object_store::Result<PutResult> {
-            unimplemented!("put is not used by these tests")
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
@@ -2391,23 +2367,12 @@ mod tests {
             unimplemented!("put_opts is not used by these tests")
         }
 
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            unimplemented!("put_multipart is not used by these tests")
-        }
-
         async fn put_multipart_opts(
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
             unimplemented!("put_multipart_opts is not used by these tests")
-        }
-
-        async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-            self.get_opts(location, GetOptions::default()).await
         }
 
         async fn get_opts(
@@ -2439,12 +2404,11 @@ mod tests {
             })
         }
 
-        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-            Ok(self.object_meta(location))
-        }
-
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!("delete is not used by these tests")
+        fn delete_stream(
+            &self,
+            _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!("delete_stream is not used by these tests")
         }
 
         fn list(
@@ -2461,12 +2425,13 @@ mod tests {
             unimplemented!("list_with_delimiter is not used by these tests")
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy is not used by these tests")
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy_if_not_exists is not used by these tests")
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!("copy_opts is not used by these tests")
         }
     }
 
@@ -3631,7 +3596,7 @@ mod tests {
         .await
         .unwrap();
         let object_store = object_store.as_ref().clone();
-        let data_dir = base_path.child("data");
+        let data_dir = base_path.clone().join("data");
 
         let mut field = blob_field("blob", true);
         let mut metadata = field.metadata().clone();

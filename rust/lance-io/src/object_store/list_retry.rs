@@ -43,7 +43,7 @@ impl ListRetryStream {
             object_store::Error::NotFound { .. }
                 | object_store::Error::InvalidPath { .. }
                 | object_store::Error::NotSupported { .. }
-                | object_store::Error::NotImplemented
+                | object_store::Error::NotImplemented { .. }
         )
     }
 }

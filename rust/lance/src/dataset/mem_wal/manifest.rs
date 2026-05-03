@@ -27,6 +27,7 @@
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
 
+use object_store::ObjectStoreExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -106,7 +107,7 @@ impl ShardManifestStore {
     /// Read a specific manifest version.
     pub async fn read_version(&self, version: u64) -> Result<ShardManifest> {
         let filename = manifest_filename(version);
-        let path = self.manifest_dir.child(filename.as_str());
+        let path = self.manifest_dir.clone().join(filename.as_str());
 
         let data = self.object_store.inner.get(&path).await.map_err(|e| {
             Error::io(format!(
@@ -177,7 +178,7 @@ impl ShardManifestStore {
     pub async fn write(&self, manifest: &ShardManifest) -> Result<u64> {
         let version = manifest.version;
         let filename = manifest_filename(version);
-        let path = self.manifest_dir.child(filename.as_str());
+        let path = self.manifest_dir.clone().join(filename.as_str());
 
         let pb_manifest = pb::ShardManifest::from(manifest);
         let bytes = pb_manifest.encode_to_vec();
@@ -185,7 +186,7 @@ impl ShardManifestStore {
         if self.object_store.is_local() {
             // Local storage: Use temp file + atomic rename for fencing
             let temp_filename = format!("{}.tmp.{}", filename, uuid::Uuid::new_v4());
-            let temp_path = self.manifest_dir.child(temp_filename.as_str());
+            let temp_path = self.manifest_dir.clone().join(temp_filename.as_str());
 
             // Write to temp file
             self.object_store
@@ -302,7 +303,7 @@ impl ShardManifestStore {
     /// Check if a manifest version exists using HEAD request.
     async fn version_exists(&self, version: u64) -> Result<bool> {
         let filename = manifest_filename(version);
-        let path = self.manifest_dir.child(filename.as_str());
+        let path = self.manifest_dir.clone().join(filename.as_str());
 
         match self.object_store.inner.head(&path).await {
             Ok(_) => Ok(true),
@@ -316,7 +317,7 @@ impl ShardManifestStore {
 
     /// Read the version hint file.
     async fn read_version_hint(&self) -> Option<u64> {
-        let path = self.manifest_dir.child("version_hint.json");
+        let path = self.manifest_dir.clone().join("version_hint.json");
 
         let data = self.object_store.inner.get(&path).await.ok()?;
         let bytes = data.bytes().await.ok()?;
@@ -327,7 +328,7 @@ impl ShardManifestStore {
 
     /// Write the version hint file (best-effort, failures logged but ignored).
     async fn write_version_hint(&self, version: u64) {
-        let path = self.manifest_dir.child("version_hint.json");
+        let path = self.manifest_dir.clone().join("version_hint.json");
         let hint = VersionHint { version };
 
         match serde_json::to_vec(&hint) {

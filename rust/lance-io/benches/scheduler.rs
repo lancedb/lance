@@ -42,7 +42,7 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
         store_uri
     );
     let (obj_store, path) = ObjectStore::from_uri(&store_uri).await.unwrap();
-    let tmp_file = path.child("foo.file");
+    let tmp_file = path.clone().join("foo.file");
 
     let mut some_data = vec![0; num_bytes as usize];
     rand::rng().fill_bytes(&mut some_data);
