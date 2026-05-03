@@ -83,7 +83,6 @@ pub(crate) async fn read_transaction_file(
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
-        .clone()
         .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
@@ -107,7 +106,6 @@ async fn cleanup_transaction_file(
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
-        .clone()
         .join(transaction_file);
     if let Err(e) = object_store.delete(&path).await {
         log::warn!(
@@ -128,7 +126,6 @@ pub(crate) async fn write_transaction_file(
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
-        .clone()
         .join(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
@@ -603,14 +600,7 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         Either::Right(async {
                             object_store
-                                .size(
-                                    &dataset
-                                        .base
-                                        .clone()
-                                        .join("data")
-                                        .clone()
-                                        .join(file.path.clone()),
-                                )
+                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))
@@ -718,7 +708,6 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             let result = async {
                 let index_dir = dataset
                     .indice_files_dir(index)?
-                    .clone()
                     .join(index.uuid.to_string());
                 let object_store = dataset.object_store_for_index(index).await?;
                 list_index_files_with_sizes(&object_store, &index_dir).await

@@ -450,7 +450,6 @@ impl MemTableFlusher {
             let index_dir = gen_path
                 .clone()
                 .join("_indices")
-                .clone()
                 .join(index_uuid.to_string());
             let index_store = LanceIndexStore::new(
                 self.object_store.clone(),
@@ -591,7 +590,6 @@ impl MemTableFlusher {
         let index_dir = gen_path
             .clone()
             .join("_indices")
-            .clone()
             .join(index_uuid.to_string());
 
         // Get partition data from in-memory index with reversed row positions

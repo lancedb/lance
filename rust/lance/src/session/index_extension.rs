@@ -265,9 +265,7 @@ mod test {
             let store = dataset.object_store.clone();
             let path = dataset
                 .indices_dir()
-                .clone()
                 .join(uuid.to_string())
-                .clone()
                 .join(INDEX_FILE_NAME);
 
             let writer = store.create(&path).await.unwrap();

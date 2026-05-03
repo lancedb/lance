@@ -224,9 +224,7 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let base_location = base
         .extract_path(wrapped.session().store_registry())
         .unwrap()
-        .clone()
         .join("data")
-        .clone()
         .join("probe.lance");
 
     base_store.put(&base_location, b"hello").await.unwrap();

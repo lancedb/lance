@@ -56,12 +56,7 @@ async fn init_writer_if_necessary(
 ) -> Result<bool> {
     if current_writer.is_none() {
         let filename = format!("{}.lance", generate_random_filename());
-        let path = dataset
-            .base
-            .clone()
-            .join(DATA_DIR)
-            .clone()
-            .join(filename.as_str());
+        let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
         let writer = dataset.object_store.create(&path).await?;
         *current_writer = Some(writer);
         *current_filename = Some(filename);

@@ -2859,10 +2859,7 @@ async fn test_index_inherits_dataset_file_version() {
         .unwrap();
 
     // Get the index directory
-    let index_dir = dataset
-        .indices_dir()
-        .clone()
-        .join(index_meta.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
 
     // Open the index file and check its version
     let index_path = index_dir.clone().join("index.idx");
@@ -2970,10 +2967,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
         .unwrap();
 
     // Get the index directory
-    let index_dir = dataset
-        .indices_dir()
-        .clone()
-        .join(index_meta.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
 
     // Open the index file and check its version
     let index_path = index_dir.clone().join("index.idx");

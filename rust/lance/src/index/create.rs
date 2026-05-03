@@ -382,7 +382,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 let index_dir = self
                     .dataset
                     .indices_dir()
-                    .clone()
                     .join(output_index_uuid.to_string());
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
@@ -422,11 +421,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     todo!("create empty vector index when train=false");
                 }
                 // Capture file sizes after vector index creation
-                let index_dir = self
-                    .dataset
-                    .indices_dir()
-                    .clone()
-                    .join(index_id.to_string());
+                let index_dir = self.dataset.indices_dir().join(index_id.to_string());
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
@@ -1569,7 +1564,6 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid.to_string())
-                .clone()
                 .join(crate::index::INDEX_FILE_NAME);
             assert!(
                 dataset
@@ -1840,7 +1834,6 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid().to_string())
-                .clone()
                 .join(lance_index::scalar::inverted::METADATA_FILE);
             assert!(
                 dataset

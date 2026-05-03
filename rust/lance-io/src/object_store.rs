@@ -1395,7 +1395,7 @@ mod tests {
         use std::path::Prefix;
         use std::path::Prefix::*;
 
-        fn get_path_prefix(path: &StdPath) -> Prefix {
+        fn get_path_prefix(path: &StdPath) -> Prefix<'_> {
             match path.components().next().unwrap() {
                 Component::Prefix(prefix_component) => prefix_component.kind(),
                 _ => panic!(),

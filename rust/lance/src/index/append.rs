@@ -83,7 +83,6 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     let index_file = index_dir
         .clone()
         .join(index.uuid.to_string())
-        .clone()
         .join(INDEX_FILE_NAME);
     let object_store = dataset.object_store_for_index(index).await?;
     object_store.exists(&index_file).await
@@ -240,7 +239,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(None);
             }
 
-            let index_dir = dataset.indices_dir().clone().join(new_uuid.to_string());
+            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
             let new_fragment_bitmap = removed_segment
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
@@ -297,7 +296,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 }
             }
 
-            let index_dir = dataset.indices_dir().clone().join(new_uuid.to_string());
+            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
             Ok((

@@ -1820,7 +1820,7 @@ fn collect_blob_entries_v1(
                     blob_field_id, frag_id, row_addr
                 ))
             })?;
-            let data_file_path = dataset.data_dir().clone().join(data_file.path.as_str());
+            let data_file_path = dataset.data_dir().join(data_file.path.as_str());
             Ok(BlobEntry {
                 selection_index,
                 row_address: row_addr,

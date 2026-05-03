@@ -200,7 +200,7 @@ fn get_cached_readers(
 
     // Create filename with version to avoid collisions
     let filename = format!("bench_{}.lance", version);
-    let file_path = base_path.clone().join(filename.as_str());
+    let file_path = base_path.join(filename.as_str());
 
     // Generate data
     let data = lance_datagen::gen_batch()

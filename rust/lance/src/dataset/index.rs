@@ -148,7 +148,7 @@ pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
 #[async_trait]
 impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
-        let index_dir = dataset.indices_dir().clone().join(uuid);
+        let index_dir = dataset.indices_dir().join(uuid);
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         Ok(Self::with_format_version(
@@ -162,7 +162,6 @@ impl LanceIndexStoreExt for LanceIndexStore {
     async fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self> {
         let index_dir = dataset
             .indice_files_dir(index)?
-            .clone()
             .join(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
@@ -228,14 +227,8 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-        let first_segment_dir = dataset
-            .indices_dir()
-            .clone()
-            .join(first_segment_uuid.to_string());
-        let second_segment_dir = dataset
-            .indices_dir()
-            .clone()
-            .join(second_segment_uuid.to_string());
+        let first_segment_dir = dataset.indices_dir().join(first_segment_uuid.to_string());
+        let second_segment_dir = dataset.indices_dir().join(second_segment_uuid.to_string());
         for file_name in ["index.idx", "auxiliary.idx"] {
             dataset
                 .object_store

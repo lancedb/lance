@@ -1054,7 +1054,7 @@ impl Dataset {
             Transaction::try_from(tx).map(Some)?
         } else if let Some(path) = &self.manifest.transaction_file {
             // Fallback: read external transaction file if present
-            let path = self.transactions_dir().clone().join(path.as_str());
+            let path = self.transactions_dir().join(path.as_str());
             let data = self.object_store.inner.get(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)?
@@ -1958,7 +1958,7 @@ impl Dataset {
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
-                    Ok(path.clone().join(DATA_DIR))
+                    Ok(path.join(DATA_DIR))
                 } else {
                     Ok(path)
                 }
@@ -2051,7 +2051,7 @@ impl Dataset {
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
-                    Ok(path.clone().join(INDICES_DIR))
+                    Ok(path.join(INDICES_DIR))
                 } else {
                     // For non-dataset-root base paths, we assume the path already points to the indices directory
                     Ok(path)
@@ -2708,7 +2708,6 @@ impl Dataset {
             let index_root = base_root
                 .clone()
                 .join(INDICES_DIR)
-                .clone()
                 .join(index.uuid.to_string());
             let mut stream = self.object_store.read_dir_all(&index_root, None);
             while let Some(meta) = stream.next().await.transpose()? {
@@ -3040,7 +3039,7 @@ impl Dataset {
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
-        let index_dir = self.indices_dir().clone().join(index_uuid);
+        let index_dir = self.indices_dir().join(index_uuid);
         match index_type {
             IndexType::Inverted => {
                 // Call merge_index_files function for inverted index

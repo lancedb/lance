@@ -588,7 +588,7 @@ pub(crate) async fn build_distributed_vector_index(
 
     let segment_uuid = Uuid::parse_str(uuid)
         .map_err(|err| Error::invalid_input(format!("Invalid index UUID '{uuid}': {err}")))?;
-    let index_dir = dataset.indices_dir().clone().join(segment_uuid.to_string());
+    let index_dir = dataset.indices_dir().join(segment_uuid.to_string());
 
     let fragment_filter = fragment_ids.to_vec();
 
@@ -990,7 +990,7 @@ pub(crate) async fn build_vector_index(
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().clone().join(uuid),
+                        dataset.indices_dir().join(uuid),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1041,7 +1041,7 @@ pub(crate) async fn build_vector_index(
             let mut builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid),
+                dataset.indices_dir().join(uuid),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1227,7 +1227,7 @@ pub(crate) async fn build_vector_index_incremental(
         Some(progress.clone()),
     );
 
-    let index_dir = dataset.indices_dir().clone().join(uuid);
+    let index_dir = dataset.indices_dir().join(uuid);
 
     // Determine the index type and build incrementally
     let (sub_index_type, quantization_type) = existing_index.sub_index_type();
@@ -1586,11 +1586,7 @@ pub(crate) async fn open_vector_index_v2(
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
-            let aux_path = index_dir
-                .clone()
-                .join(uuid)
-                .clone()
-                .join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.clone().join(uuid).join(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = object_store.open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -1617,11 +1613,7 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
-            let aux_path = index_dir
-                .clone()
-                .join(uuid)
-                .clone()
-                .join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.clone().join(uuid).join(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = object_store.open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -1781,10 +1773,7 @@ pub async fn initialize_vector_index(
     .await?;
 
     // Capture file sizes for the new vector index
-    let index_dir = target_dataset
-        .indices_dir()
-        .clone()
-        .join(new_uuid.to_string());
+    let index_dir = target_dataset.indices_dir().join(new_uuid.to_string());
     let files = list_index_files_with_sizes(&target_dataset.object_store, &index_dir).await?;
 
     let field = target_dataset.schema().field(column_name).ok_or_else(|| {
@@ -2561,7 +2550,7 @@ mod tests {
 
         // Pre-create a malformed global training file that is missing the
         // `lance:global_ivf_centroids` metadata key.
-        let out_base = dataset.indices_dir().clone().join(&*uuid);
+        let out_base = dataset.indices_dir().join(&*uuid);
         let training_path = out_base.clone().join("global_training.idx");
 
         let writer = dataset

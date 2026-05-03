@@ -307,6 +307,7 @@ impl StorageOptionsAccessor {
     ///
     /// This bypasses the cache for callers that need to validate provider-vended
     /// credentials even when initial metadata has no expiration.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     pub(crate) async fn refresh_storage_options(&self) -> Result<super::StorageOptions> {
         let Some(provider) = &self.provider else {
             return self.get_storage_options().await;

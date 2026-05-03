@@ -292,11 +292,9 @@ impl<'a> CleanupTask<'a> {
             }
         }
         if let Some(relative_tx_path) = &manifest.transaction_file {
-            referenced_files.tx_paths.insert(
-                Path::parse(TRANSACTIONS_DIR)?
-                    .clone()
-                    .join(relative_tx_path.as_str()),
-            );
+            referenced_files
+                .tx_paths
+                .insert(Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str()));
         }
 
         for index in indexes {
@@ -1536,7 +1534,7 @@ mod tests {
     }
 
     async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
-        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         dataset
             .object_store
             .as_ref()
@@ -1557,9 +1555,7 @@ mod tests {
     ) -> Result<()> {
         let shard_dir = dataset
             .indices_dir()
-            .clone()
             .join(staging_uuid.to_string())
-            .clone()
             .join(format!("partial_{}", shard_uuid));
         dataset
             .object_store
@@ -2307,7 +2303,6 @@ mod tests {
                         .indices_dir()
                         .clone()
                         .join(seg_a.to_string())
-                        .clone()
                         .join("index.idx")
                 )
                 .await
@@ -2322,7 +2317,6 @@ mod tests {
                         .indices_dir()
                         .clone()
                         .join(seg_b.to_string())
-                        .clone()
                         .join("index.idx")
                 )
                 .await
@@ -2337,7 +2331,6 @@ mod tests {
                         .indices_dir()
                         .clone()
                         .join(seg_c.to_string())
-                        .clone()
                         .join("index.idx")
                 )
                 .await
@@ -2380,9 +2373,7 @@ mod tests {
                         .indices_dir()
                         .clone()
                         .join(staging_uuid.to_string())
-                        .clone()
                         .join(format!("partial_{}", shard_uuid))
-                        .clone()
                         .join("index.idx"),
                 )
                 .await
@@ -2397,7 +2388,6 @@ mod tests {
                         .indices_dir()
                         .clone()
                         .join(built_segment_uuid.to_string())
-                        .clone()
                         .join("index.idx"),
                 )
                 .await
@@ -2627,27 +2617,15 @@ mod tests {
                 .unwrap();
 
         // Create unmanaged directories/files under dataset root
-        let img = base.clone().join("images").clone().join("clip.mp4");
-        let misc = base.clone().join("misc").clone().join("notes.txt");
-        let branch_file = base
-            .clone()
-            .join("tree")
-            .clone()
-            .join("branchA")
-            .clone()
-            .join("data.bin");
+        let img = base.clone().join("images").join("clip.mp4");
+        let misc = base.clone().join("misc").join("notes.txt");
+        let branch_file = base.clone().join("tree").join("branchA").join("data.bin");
         os.put(&img, b"video").await.unwrap();
         os.put(&misc, b"notes").await.unwrap();
         os.put(&branch_file, b"branch").await.unwrap();
 
         // Create a temporary manifest file that should be cleaned
-        let tmp_manifest = base
-            .clone()
-            .join("_versions")
-            .clone()
-            .join(".tmp")
-            .clone()
-            .join("orphan");
+        let tmp_manifest = base.clone().join("_versions").join(".tmp").join("orphan");
         os.put(&tmp_manifest, b"tmp").await.unwrap();
         // Delete the _transactions directory so that we can test that if not_found err will be swallowed
         os.remove_dir_all(base.clone().join(TRANSACTIONS_DIR))

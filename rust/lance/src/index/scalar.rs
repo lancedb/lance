@@ -414,7 +414,7 @@ pub(crate) async fn infer_scalar_index_details(
         return Ok(index_details.0.clone());
     }
 
-    let index_dir = dataset.indice_files_dir(index)?.clone().join(uuid.clone());
+    let index_dir = dataset.indice_files_dir(index)?.join(uuid.clone());
     let col = dataset
         .schema()
         .field(column)

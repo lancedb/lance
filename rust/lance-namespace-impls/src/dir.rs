@@ -1880,7 +1880,6 @@ impl DirectoryNamespace {
         self.base_path
             .clone()
             .join(format!("{}.lance", table_name).as_str())
-            .clone()
             .join(".lance-reserved")
     }
 
@@ -1889,7 +1888,6 @@ impl DirectoryNamespace {
         self.base_path
             .clone()
             .join(format!("{}.lance", table_name).as_str())
-            .clone()
             .join(".lance-deregistered")
     }
 
@@ -7651,7 +7649,7 @@ mod tests {
             .unwrap();
 
         // Write to a staging location using the dataset's object_store
-        let staging_path = dataset.versions_dir().clone().join("staging_manifest");
+        let staging_path = dataset.versions_dir().join("staging_manifest");
         dataset
             .object_store(None)
             .await
@@ -7781,7 +7779,7 @@ mod tests {
             .unwrap();
 
         // Write to a staging location using the dataset's object_store
-        let staging_path = dataset.versions_dir().clone().join("staging_manifest");
+        let staging_path = dataset.versions_dir().join("staging_manifest");
         dataset
             .object_store(None)
             .await
@@ -9157,7 +9155,6 @@ mod tests {
 
             let staging_path = dataset
                 .versions_dir()
-                .clone()
                 .join(format!("staging_{}", table_name));
             dataset
                 .object_store(None)

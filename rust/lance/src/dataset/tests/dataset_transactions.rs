@@ -311,7 +311,6 @@ async fn test_inline_transaction() {
                 .base
                 .clone()
                 .join(TRANSACTIONS_DIR)
-                .clone()
                 .join(tx_file.as_str());
             let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
         }

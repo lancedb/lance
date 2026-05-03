@@ -84,26 +84,21 @@ pub enum ManifestNamingScheme {
 
 impl ManifestNamingScheme {
     pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
-        let directory = base.clone().join(VERSIONS_DIR);
         if is_detached_version(version) {
             // Detached versions should never show up first in a list operation which
             // means it needs to come lexicographically after all attached manifest
             // files and so we add the prefix `d`.  There is no need to invert the
             // version number since detached versions are not part of the version
-            let directory = base.clone().join(VERSIONS_DIR);
-            directory.clone().join(format!(
+            base.clone().join(VERSIONS_DIR).join(format!(
                 "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
             ))
         } else {
+            let directory = base.clone().join(VERSIONS_DIR);
             match self {
-                Self::V1 => directory
-                    .clone()
-                    .join(format!("{version}.{MANIFEST_EXTENSION}")),
+                Self::V1 => directory.join(format!("{version}.{MANIFEST_EXTENSION}")),
                 Self::V2 => {
                     let inverted_version = u64::MAX - version;
-                    directory
-                        .clone()
-                        .join(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
+                    directory.join(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
                 }
             }
         }

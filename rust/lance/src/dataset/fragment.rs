@@ -730,7 +730,7 @@ impl FileFragment {
         fragment_id: usize,
         physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let filepath = dataset.data_dir().clone().join(filename);
+        let filepath = dataset.data_dir().join(filename);
         let file_version =
             determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
 
@@ -944,7 +944,6 @@ impl FileFragment {
                 let path = self
                     .dataset
                     .data_file_dir(data_file)?
-                    .clone()
                     .join(data_file.path.as_str());
                 let object_store = self.dataset.object_store_for_data_file(data_file).await?;
                 let field_id_offset = Self::get_field_id_offset(data_file);
@@ -974,7 +973,6 @@ impl FileFragment {
             let path = self
                 .dataset
                 .data_file_dir(data_file)?
-                .clone()
                 .join(data_file.path.as_str());
             let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
                 // TODO: make object stores for non-default bases reuse the same scan scheduler
@@ -1230,7 +1228,6 @@ impl FileFragment {
                     return Err(Error::corrupt_file(
                         self.dataset
                             .data_file_dir(data_file)?
-                            .clone()
                             .join(data_file.path.as_str()),
                         format!(
                             "Field id {} is not in increasing order in fragment {:#?}",
@@ -1243,7 +1240,6 @@ impl FileFragment {
                     return Err(Error::corrupt_file(
                         self.dataset
                             .data_file_dir(data_file)?
-                            .clone()
                             .join(data_file.path.as_str()),
                         format!(
                             "Field id {} is duplicated in fragment {:#?}",
@@ -1260,7 +1256,6 @@ impl FileFragment {
             return Err(Error::corrupt_file(
                 self.dataset
                     .data_file_dir(&self.metadata.files[0])?
-                    .clone()
                     .join(self.metadata.files[0].path.as_str()),
                 "Fragment contains a mix of v1 and v2 data files".to_string(),
             ));
@@ -1296,7 +1291,6 @@ impl FileFragment {
                 let path = self
                     .dataset
                     .data_file_dir(data_file)?
-                    .clone()
                     .join(data_file.path.as_str());
                 return Err(Error::corrupt_file(
                     path,
@@ -1313,7 +1307,6 @@ impl FileFragment {
             return Err(Error::corrupt_file(
                 self.dataset
                     .data_file_dir(&self.metadata.files[0])?
-                    .clone()
                     .join(self.metadata.files[0].path.as_str()),
                 format!(
                     "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
@@ -3783,7 +3776,6 @@ mod tests {
             &base_path
                 .clone()
                 .join("data")
-                .clone()
                 .join(fragment.files[0].path.as_str()),
             schema.as_ref().try_into().unwrap(),
             10,
@@ -3967,7 +3959,7 @@ mod tests {
 
         let new_data = make_gen().into_batch_rows(RowCount::from(128)).unwrap();
         let store = ObjectStore::local();
-        let file_path = dataset.data_dir().clone().join("some_file.lance");
+        let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer =
             lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());

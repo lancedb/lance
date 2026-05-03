@@ -98,10 +98,7 @@ pub(crate) async fn build_segment(
         ));
     }
 
-    let index_dir = dataset
-        .indices_dir()
-        .clone()
-        .join(source_segment.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(source_segment.uuid.to_string());
     let metadata_path = index_dir
         .clone()
         .join(lance_index::scalar::inverted::METADATA_FILE);

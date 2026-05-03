@@ -1829,7 +1829,6 @@ mod tests {
         let path = base_path
             .clone()
             .join(DATA_DIR)
-            .clone()
             .join(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
         let reader = PreviousFileReader::try_new_from_reader(
