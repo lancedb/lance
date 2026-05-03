@@ -372,13 +372,26 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                let manifest = Arc::new(manifest);
+                let base_object_stores = Arc::new(
+                    Dataset::init_base_object_stores(
+                        &session,
+                        &manifest,
+                        dataset.store_params.as_deref(),
+                        dataset.base_store_params.as_ref(),
+                    )
+                    .await?,
+                );
+                Ok(Dataset {
+                    manifest,
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    base_object_stores,
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
                     object_store.clone(),
