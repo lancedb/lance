@@ -1659,7 +1659,7 @@ impl DatasetIndexInternalExt for Dataset {
             // Fall back to file existence check for older indices without file metadata
             let index_dir = self.indice_files_dir(&index_meta)?;
             let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
-            let object_store = self.object_store_for_index(&index_meta).await?;
+            let object_store = self.object_store_for_index(&index_meta)?;
             object_store.exists(&index_file).await?
         };
 
@@ -1712,7 +1712,7 @@ impl DatasetIndexInternalExt for Dataset {
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let object_store = self.object_store_for_index(&index_meta).await?;
+        let object_store = self.object_store_for_index(&index_meta)?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());

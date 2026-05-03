@@ -699,7 +699,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 let index_dir = dataset
                     .indice_files_dir(index)?
                     .child(index.uuid.to_string());
-                let object_store = dataset.object_store_for_index(index).await?;
+                let object_store = dataset.object_store_for_index(index)?;
                 list_index_files_with_sizes(&object_store, &index_dir).await
             }
             .await;

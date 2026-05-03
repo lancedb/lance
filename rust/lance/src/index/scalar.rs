@@ -426,7 +426,7 @@ pub(crate) async fn infer_scalar_index_details(
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
-    let object_store = dataset.object_store_for_index(index).await?;
+    let object_store = dataset.object_store_for_index(index)?;
     let index_details = if let DataType::List(_) = col.data_type() {
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
     } else if object_store.exists(&bitmap_page_lookup).await? {

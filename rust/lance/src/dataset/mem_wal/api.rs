@@ -147,7 +147,7 @@ impl DatasetMemWalExt for Dataset {
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
         let prefix = super::util::mem_wal_path(&self.branch_location().path);
-        let object_store = self.object_store(None).await?;
+        let object_store = self.object_store(None)?;
         let list_result = object_store
             .inner
             .list_with_delimiter(Some(&prefix))

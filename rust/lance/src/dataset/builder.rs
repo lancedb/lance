@@ -811,5 +811,6 @@ impl DatasetBuilder {
             store_params,
             base_store_params,
         )
+        .await
     }
 }

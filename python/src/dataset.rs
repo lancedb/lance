@@ -2536,18 +2536,14 @@ impl Dataset {
 
     /// Get a snapshot of current IO statistics without resetting counters
     fn io_stats_snapshot(&self) -> PyResult<IoStats> {
-        let object_store = rt()
-            .block_on(None, self.ds.object_store(None))?
-            .infer_error()?;
+        let object_store = self.ds.object_store(None).infer_error()?;
         let stats = object_store.io_stats_snapshot();
         Ok(IoStats::from_lance(stats))
     }
 
     /// Get incremental IO statistics for this dataset
     fn io_stats_incremental(&self) -> PyResult<IoStats> {
-        let object_store = rt()
-            .block_on(None, self.ds.object_store(None))?
-            .infer_error()?;
+        let object_store = self.ds.object_store(None).infer_error()?;
         let stats = object_store.io_stats_incremental();
         Ok(IoStats::from_lance(stats))
     }

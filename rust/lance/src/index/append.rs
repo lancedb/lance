@@ -83,7 +83,7 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     let index_file = index_dir
         .child(index.uuid.to_string())
         .child(INDEX_FILE_NAME);
-    let object_store = dataset.object_store_for_index(index).await?;
+    let object_store = dataset.object_store_for_index(index)?;
     object_store.exists(&index_file).await
 }
 

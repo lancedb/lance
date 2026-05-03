@@ -1582,7 +1582,7 @@ pub(crate) async fn open_vector_index_v2(
         .await?
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
     let index_dir = dataset.indice_files_dir(&index_meta)?;
-    let object_store = dataset.object_store_for_index(&index_meta).await?;
+    let object_store = dataset.object_store_for_index(&index_meta)?;
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {

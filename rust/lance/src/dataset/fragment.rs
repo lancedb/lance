@@ -932,7 +932,7 @@ impl FileFragment {
                     .dataset
                     .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
-                let object_store = self.dataset.object_store_for_data_file(data_file).await?;
+                let object_store = self.dataset.object_store_for_data_file(data_file)?;
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = PreviousFileReader::try_new_with_fragment_id(
                     &object_store,
@@ -964,7 +964,7 @@ impl FileFragment {
             let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
                 // TODO: make object stores for non-default bases reuse the same scan scheduler
                 //  currently we always create a new one
-                let object_store = self.dataset.object_store(Some(base_id)).await?;
+                let object_store = self.dataset.object_store(Some(base_id))?;
                 let config = SchedulerConfig::max_bandwidth(&object_store);
                 (
                     ScanScheduler::new(object_store, config),

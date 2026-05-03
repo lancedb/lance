@@ -186,6 +186,8 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    /// Pre-initialized object stores for additional base paths, keyed by base id.
+    pub(crate) base_object_stores: Arc<HashMap<u32, Arc<ObjectStore>>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -592,6 +594,7 @@ impl Dataset {
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
+        .await
     }
 
     pub(crate) async fn load_manifest(
@@ -699,7 +702,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn checkout_manifest(
+    async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         uri: String,
@@ -723,6 +726,13 @@ impl Dataset {
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+        let base_object_stores = Self::init_base_object_stores(
+            &session,
+            &manifest,
+            store_params.as_ref(),
+            base_store_params.as_ref(),
+        )
+        .await?;
         Ok(Self {
             object_store,
             base: base_path,
@@ -738,6 +748,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
+            base_object_stores: Arc::new(base_object_stores),
         })
     }
 
@@ -1720,6 +1731,18 @@ impl Dataset {
                     .collect(),
             )
         });
+        cloned.base_object_stores = Arc::new(
+            self.base_object_stores
+                .iter()
+                .map(|(base_id, store)| {
+                    let mut wrapped = store.as_ref().clone();
+                    for wrapper in &wrappers {
+                        wrapped.inner = wrapper.wrap(&wrapped.store_prefix, wrapped.inner.clone());
+                    }
+                    (*base_id, Arc::new(wrapped))
+                })
+                .collect(),
+        );
         cloned
     }
 
@@ -1742,21 +1765,15 @@ impl Dataset {
         store_params
     }
 
-    fn store_params_for_base(
-        &self,
+    fn build_store_params_for_base(
+        store_params: Option<&ObjectStoreParams>,
+        base_store_params: Option<&Arc<HashMap<String, ObjectStoreParams>>>,
         base_path: Option<&lance_table::format::BasePath>,
     ) -> ObjectStoreParams {
-        // Base-specific bindings are exact ObjectStoreParams keyed by
-        // `BasePath.path`. If a base has no explicit binding then reads fall back
-        // to the dataset-level default store params.
         base_path
-            .and_then(|base_path| {
-                self.base_store_params
-                    .as_ref()
-                    .and_then(|params| params.get(&base_path.path))
-            })
+            .and_then(|base_path| base_store_params.and_then(|params| params.get(&base_path.path)))
             .cloned()
-            .unwrap_or_else(|| self.store_params.as_deref().cloned().unwrap_or_default())
+            .unwrap_or_else(|| store_params.cloned().unwrap_or_default())
     }
 
     /// Returns the initial storage options used when opening this dataset, if any.
@@ -1860,7 +1877,7 @@ impl Dataset {
         let data_dir = self.data_file_dir_for_base(base_id)?;
         let filepath = data_dir.child(path);
 
-        let object_store = self.object_store(base_id).await?;
+        let object_store = self.object_store(base_id)?;
 
         // Get file size
         let file_size = object_store.size(&filepath).await?;
@@ -1966,52 +1983,60 @@ impl Dataset {
         }
     }
 
-    async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
-        let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
-            Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
-        })?;
-        let store_params = self.store_params_for_base(Some(base_path));
-
-        let (store, _) = ObjectStore::from_uri_and_params(
-            self.session.store_registry(),
-            &base_path.path,
-            &store_params,
-        )
-        .await?;
-
-        Ok(store)
+    pub(crate) async fn init_base_object_stores(
+        session: &Session,
+        manifest: &Manifest,
+        store_params: Option<&ObjectStoreParams>,
+        base_store_params: Option<&Arc<HashMap<String, ObjectStoreParams>>>,
+    ) -> Result<HashMap<u32, Arc<ObjectStore>>> {
+        let mut stores = HashMap::new();
+        for (base_id, base_path) in &manifest.base_paths {
+            let params =
+                Self::build_store_params_for_base(store_params, base_store_params, Some(base_path));
+            let (store, _) = ObjectStore::from_uri_and_params(
+                session.store_registry(),
+                &base_path.path,
+                &params,
+            )
+            .await?;
+            stores.insert(*base_id, store);
+        }
+        Ok(stores)
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
     ///
     /// Pass `None` to get the primary dataset object store. Pass `Some(base_id)`
     /// when resolving a file whose metadata references an additional base.
-    pub async fn object_store(&self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
+    pub fn object_store(&self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
         match base_id {
-            Some(base_id) => self.base_object_store(base_id).await,
+            Some(base_id) => self
+                .base_object_stores
+                .get(&base_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
+                }),
             None => Ok(self.object_store.clone()),
         }
     }
 
-    pub(crate) async fn object_store_for_data_file(
+    pub(crate) fn object_store_for_data_file(
         &self,
         data_file: &DataFile,
     ) -> Result<Arc<ObjectStore>> {
-        self.object_store(data_file.base_id).await
+        self.object_store(data_file.base_id)
     }
 
-    pub(crate) async fn object_store_for_deletion(
+    pub(crate) fn object_store_for_deletion(
         &self,
         deletion_file: &DeletionFile,
     ) -> Result<Arc<ObjectStore>> {
-        self.object_store(deletion_file.base_id).await
+        self.object_store(deletion_file.base_id)
     }
 
-    pub(crate) async fn object_store_for_index(
-        &self,
-        index: &IndexMetadata,
-    ) -> Result<Arc<ObjectStore>> {
-        self.object_store(index.base_id).await
+    pub(crate) fn object_store_for_index(&self, index: &IndexMetadata) -> Result<Arc<ObjectStore>> {
+        self.object_store(index.base_id)
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
@@ -2829,7 +2854,8 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.file_reader_options.clone(),
                         dataset.store_params.as_deref().cloned(),
                         dataset.base_store_params.clone(),
-                    )?;
+                    )
+                    .await?;
                     let loaded =
                         Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
                             Error::internal(format!(
@@ -2862,6 +2888,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.store_params.as_deref().cloned(),
                 dataset.base_store_params.clone(),
             )
+            .await
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
             // with the current manifest.
