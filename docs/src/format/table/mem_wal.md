@@ -174,7 +174,7 @@ Each shard has a manifest file. This is the source of truth for the state of a s
 The manifest contains:
 
 - **Fencing state**: `writer_epoch` as the latest writer fencing token, see [Writer Fencing](#writer-fencing) for more details.
-- **Shard assignment**: `shard_spec_id`, `shard_field_values`, and `shard_field_string_values` record how this shard maps to its shard spec. `shard_field_values` stores int32-valued shard fields and `shard_field_string_values` stores UTF-8 shard fields.
+- **Shard assignment**: `shard_spec_id` and `shard_field_values` record how this shard maps to its shard spec. `shard_field_values` is a map from shard field id to the raw Arrow scalar bytes of the computed value; the matching `ShardField.result_type` in the `ShardSpec` determines how to interpret each entry (e.g., 4 little-endian bytes for int32, raw UTF-8 bytes for utf8).
 - **WAL pointers**: `replay_after_wal_entry_position` (last entry position flushed to MemTable, 0-based), `wal_entry_position_last_seen` (last entry position seen at manifest update, 0-based)
 - **Generation trackers**: `current_generation` (next generation to flush), `flushed_generations` list of generation number and directory path pairs (e.g., generation 1 at `a1b2c3d4_gen_1`)
 
@@ -356,12 +356,11 @@ Shard snapshots are stored as a Lance file with one row per shard.
 The snapshot schema is optimized for shard discovery. Full mutable shard state
 remains in the authoritative shard manifest files.
 
-| Column                           | Type     | Description                                              |
-| -------------------------------- | -------- | -------------------------------------------------------- |
-| `shard_id`                       | `utf8`   | Shard UUID string                                       |
-| `shard_spec_id`                  | `uint32` | Shard spec ID (0 if manual)                             |
-| `shard_field_{field_id}`         | `int32`  | Int32 shard field value (one column per int shard field) |
-| `shard_string_field_{field_id}`  | `utf8`   | Utf8 shard field value (one column per string field)     |
+| Column                   | Type          | Description                                                                                                |
+| ------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `shard_id`               | `utf8`        | Shard UUID string                                                                                          |
+| `shard_spec_id`          | `uint32`      | Shard spec ID (0 if manual)                                                                                |
+| `shard_field_{field_id}` | varies        | One column per shard field defined in the shard spec, typed to match the field's `ShardField.result_type`. |
 
 For example, with a shard spec containing a field `user_bucket` of type `int32`:
 

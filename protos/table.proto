@@ -622,8 +622,7 @@ message IndexCatchupProgress {
 // authoritative in the shard manifest files.
 //   shard_id: utf8
 //   shard_spec_id: uint32
-//   shard_field_{field_id}: int32
-//   shard_string_field_{field_id}: utf8
+//   shard_field_{field_id}: typed per the matching ShardField.result_type
 message MemWalIndexDetails {
   // Snapshot timestamp (Unix timestamp in milliseconds).
   int64 snapshot_ts_millis = 1;

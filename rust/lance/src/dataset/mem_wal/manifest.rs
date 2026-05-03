@@ -397,9 +397,12 @@ impl ShardManifestStore {
     /// 2. Incrementing the writer epoch
     /// 3. Atomically writing the new manifest
     ///
-    /// If another writer has already claimed the shard (version conflict),
-    /// this fails immediately rather than retrying. This prevents "epoch wars"
-    /// where multiple writers keep fencing each other.
+    /// On version conflict, re-reads the manifest and only fails if another
+    /// writer has actually claimed an equal-or-higher epoch. Benign conflicts
+    /// where the version was bumped without claiming a new epoch (for
+    /// example, a tailer cursor update or a concurrent `initialize_shard`)
+    /// trigger a retry rather than a misleading "another writer" error.
+    /// This preserves the no-epoch-war guarantee for real claimants.
     ///
     /// # Returns
     ///
@@ -408,49 +411,73 @@ impl ShardManifestStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if another writer already claimed the shard.
+    /// Returns an error if another writer already claimed an equal-or-higher
+    /// epoch, or if the manifest stays contended past the retry budget.
     #[instrument(name = "manifest_claim_epoch", level = "info", skip_all, fields(shard_id = %self.shard_id, shard_spec_id))]
     pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
-        let current = self.read_latest().await?;
+        const MAX_CLAIM_RETRIES: usize = 16;
+        let mut last_write_err: Option<Error> = None;
+        for _ in 0..MAX_CLAIM_RETRIES {
+            let current = self.read_latest().await?;
 
-        let (next_version, next_epoch, base_manifest) = match current {
-            Some(m) => (m.version + 1, m.writer_epoch + 1, Some(m)),
-            None => (1, 1, None),
-        };
+            let (next_version, next_epoch, base_manifest) = match current {
+                Some(m) => (m.version + 1, m.writer_epoch + 1, Some(m)),
+                None => (1, 1, None),
+            };
 
-        let new_manifest = if let Some(base) = base_manifest {
-            ShardManifest {
-                version: next_version,
-                writer_epoch: next_epoch,
-                ..base
+            let new_manifest = if let Some(base) = base_manifest {
+                ShardManifest {
+                    version: next_version,
+                    writer_epoch: next_epoch,
+                    ..base
+                }
+            } else {
+                ShardManifest {
+                    shard_id: self.shard_id,
+                    version: next_version,
+                    shard_spec_id,
+                    shard_field_values: HashMap::new(),
+                    writer_epoch: next_epoch,
+                    replay_after_wal_entry_position: 0,
+                    wal_entry_position_last_seen: 0,
+                    current_generation: 1,
+                    flushed_generations: vec![],
+                }
+            };
+
+            match self.write(&new_manifest).await {
+                Ok(_) => {
+                    info!(
+                        "Claimed shard {} with epoch {} (version {})",
+                        self.shard_id, next_epoch, next_version
+                    );
+                    return Ok((next_epoch, new_manifest));
+                }
+                Err(write_err) => {
+                    let latest_epoch = self
+                        .read_latest()
+                        .await?
+                        .map(|m| m.writer_epoch)
+                        .unwrap_or(0);
+                    if latest_epoch >= next_epoch {
+                        return Err(Error::io(format!(
+                            "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
+                            self.shard_id, next_version, latest_epoch, next_epoch, write_err
+                        )));
+                    }
+                    last_write_err = Some(write_err);
+                }
             }
-        } else {
-            ShardManifest {
-                shard_id: self.shard_id,
-                version: next_version,
-                shard_spec_id,
-                shard_field_values: HashMap::new(),
-                writer_epoch: next_epoch,
-                replay_after_wal_entry_position: 0,
-                wal_entry_position_last_seen: 0,
-                current_generation: 1,
-                flushed_generations: vec![],
-            }
-        };
+        }
 
-        self.write(&new_manifest).await.map_err(|e| {
-            Error::io(format!(
-                "Failed to claim shard {} (version {}): another writer may have claimed it: {}",
-                self.shard_id, next_version, e
-            ))
-        })?;
-
-        info!(
-            "Claimed shard {} with epoch {} (version {})",
-            self.shard_id, next_epoch, next_version
-        );
-
-        Ok((next_epoch, new_manifest))
+        Err(Error::io(format!(
+            "Failed to claim shard {} after {} retries due to manifest contention: {}",
+            self.shard_id,
+            MAX_CLAIM_RETRIES,
+            last_write_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )))
     }
 
     /// Check if the given epoch has been fenced by a newer writer.
@@ -693,6 +720,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn test_claim_epoch_retries_through_benign_cursor_update() {
+        // Reproduces a tailer cursor update racing with claim_epoch on the
+        // same versioned manifest filename. The cursor update bumps the
+        // version without claiming an epoch; claim_epoch must retry rather
+        // than surface a misleading "another writer claimed it" error.
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        // Initial claim establishes epoch 1 at version 1.
+        let (first_epoch, first) = manifest_store.claim_epoch(0).await.unwrap();
+        assert_eq!(first_epoch, 1);
+        assert_eq!(first.version, 1);
+
+        // Simulate a tailer cursor update bumping the version but leaving
+        // the writer epoch unchanged.
+        let mut cursor_update = first.clone();
+        cursor_update.version += 1;
+        cursor_update.wal_entry_position_last_seen = 42;
+        manifest_store.write(&cursor_update).await.unwrap();
+
+        // Now an appender claims again. Without retry it would see the v2
+        // cursor update as a contention failure; with retry it observes the
+        // unchanged epoch and proceeds to v3 / epoch 2.
+        let (second_epoch, second) = manifest_store.claim_epoch(0).await.unwrap();
+        assert_eq!(second_epoch, 2);
+        assert_eq!(second.version, 3);
+        assert_eq!(second.wal_entry_position_last_seen, 42);
     }
 
     #[tokio::test]
