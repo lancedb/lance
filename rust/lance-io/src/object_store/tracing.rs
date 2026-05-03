@@ -61,7 +61,7 @@ impl std::fmt::Display for TracedObjectStore {
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl object_store::ObjectStore for TracedObjectStore {
-    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
+    #[instrument(level = "debug", skip(self, bytes, location, opts), fields(path = location.as_ref(), size = bytes.content_length()))]
     async fn put_opts(
         &self,
         location: &Path,
@@ -71,7 +71,7 @@ impl object_store::ObjectStore for TracedObjectStore {
         self.target.put_opts(location, bytes, opts).await
     }
 
-    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
+    #[instrument(level = "debug", skip(self, location, opts), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -133,12 +133,12 @@ impl object_store::ObjectStore for TracedObjectStore {
         self.target.list_with_delimiter(prefix).await
     }
 
-    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
+    #[instrument(level = "debug", skip(self, from, to, opts), fields(from = from.as_ref(), to = to.as_ref()))]
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.target.copy_opts(from, to, opts).await
     }
 
-    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
+    #[instrument(level = "debug", skip(self, from, to, opts), fields(from = from.as_ref(), to = to.as_ref()))]
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
         self.target.rename_opts(from, to, opts).await
     }
@@ -183,7 +183,7 @@ mod tests {
         let path = Path::from("a/b.bin");
         let data = b"hello world";
 
-        let span = expect::span().named("put");
+        let span = expect::span().named("put_opts");
         let (sub, handle) = subscriber::mock()
             .new_span(
                 span.clone().with_fields(
@@ -214,7 +214,7 @@ mod tests {
         let store = make_store();
         store.put(&path, payload(data)).await.unwrap();
 
-        let span = expect::span().named("get");
+        let span = expect::span().named("get_opts");
         let (sub, handle) = subscriber::mock()
             .new_span(
                 // size = Empty at span creation, so only path is visited.
@@ -244,18 +244,14 @@ mod tests {
         let range = 2u64..7u64;
         let size = range.end - range.start;
 
-        let span = expect::span().named("get_range");
+        let span = expect::span().named("get_opts");
         let (sub, handle) = subscriber::mock()
             .new_span(
-                // `range` is also captured automatically as a debug field since it
-                // is not in the skip list, so we don't use `.only()` here.
-                span.clone().with_fields(
-                    expect::field("path")
-                        .with_value(&"a/b.bin")
-                        .and(expect::field("size").with_value(&size)),
-                ),
+                span.clone()
+                    .with_fields(expect::field("path").with_value(&"a/b.bin").only()),
             )
             .enter(span.clone())
+            .record(span.clone(), expect::field("size").with_value(&size))
             .exit(span.clone())
             .run_with_handle();
 
@@ -303,17 +299,19 @@ mod tests {
     async fn test_head_records_path() {
         let path = Path::from("a/b.bin");
         let data = b"hello world";
+        let size = data.len() as u64;
 
         let store = make_store();
         store.put(&path, payload(data)).await.unwrap();
 
-        let span = expect::span().named("head");
+        let span = expect::span().named("get_opts");
         let (sub, handle) = subscriber::mock()
             .new_span(
                 span.clone()
                     .with_fields(expect::field("path").with_value(&"a/b.bin").only()),
             )
             .enter(span.clone())
+            .record(span.clone(), expect::field("size").with_value(&size))
             .exit(span.clone())
             .run_with_handle();
 
@@ -332,12 +330,9 @@ mod tests {
         let store = make_store();
         store.put(&path, payload(data)).await.unwrap();
 
-        let span = expect::span().named("delete");
+        let span = expect::span().named("delete_stream");
         let (sub, handle) = subscriber::mock()
-            .new_span(
-                span.clone()
-                    .with_fields(expect::field("path").with_value(&"a/b.bin").only()),
-            )
+            .new_span(span.clone())
             .enter(span.clone())
             .exit(span.clone())
             .run_with_handle();
@@ -358,7 +353,7 @@ mod tests {
         let store = make_store();
         store.put(&from, payload(data)).await.unwrap();
 
-        let span = expect::span().named("copy");
+        let span = expect::span().named("copy_opts");
         let (sub, handle) = subscriber::mock()
             .new_span(
                 span.clone().with_fields(
@@ -384,7 +379,7 @@ mod tests {
         let path = Path::from("a/b.bin");
         let data = b"hello world";
 
-        let put_mp_span = expect::span().named("put_multipart");
+        let put_mp_span = expect::span().named("put_multipart_opts");
         // Expect only the span creation; any subsequent enter/exit/record
         // events are not in the queue so they are silently ignored.
         let (sub, handle) = subscriber::mock()
