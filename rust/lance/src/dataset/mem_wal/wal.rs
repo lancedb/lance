@@ -550,7 +550,7 @@ impl WalEntryData {
 // Generic WAL Appender and Tailer
 // ============================================================================
 
-const FIRST_WAL_ENTRY_POSITION: u64 = 1;
+const FIRST_WAL_ENTRY_POSITION: u64 = 0;
 const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
 const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 const MAX_CURSOR_PROBE: u64 = 4096;
@@ -635,7 +635,7 @@ impl WalAppender {
 
         let mut next_pos = self.next_entry_position.lock().await;
         if next_pos.is_none() {
-            *next_pos = Some(self.scan_next_position().await?);
+            *next_pos = Some(self.discover_next_position().await?);
         }
 
         let mut conflicts = 0;
@@ -676,7 +676,7 @@ impl WalAppender {
                         )));
                     }
                     if conflicts % APPEND_CONFLICT_REFRESH_INTERVAL == 0 {
-                        *next_pos = Some(self.scan_next_position().await?);
+                        *next_pos = Some(self.discover_next_position().await?);
                     } else {
                         *next_pos = Some(pos.checked_add(1).ok_or_else(|| {
                             Error::io(format!("WAL position overflow for shard {}", self.shard_id))
@@ -696,7 +696,20 @@ impl WalAppender {
         self.manifest_store.check_fenced(self.writer_epoch).await
     }
 
-    async fn scan_next_position(&self) -> Result<u64> {
+    async fn discover_next_position(&self) -> Result<u64> {
+        if let Ok(Some(manifest)) = self.manifest_store.read_latest().await {
+            let hint = manifest.wal_entry_position_last_seen;
+            if let Some(tip) = probe_forward_from(
+                self.object_store.as_ref(),
+                &self.wal_dir,
+                self.shard_id,
+                hint,
+            )
+            .await?
+            {
+                return Ok(tip);
+            }
+        }
         scan_next_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
     }
 }
@@ -706,13 +719,15 @@ impl WalAppender {
 /// Uses `wal_entry_position_last_seen` from the shard manifest as a cursor
 /// hint for `next_position()`, probing forward from the hint to find the true
 /// tip before falling back to a full directory listing.
+///
+/// Successful `read_entry` calls asynchronously update
+/// `wal_entry_position_last_seen` in the shard manifest (fire-and-forget).
 #[derive(Debug, Clone)]
 pub struct WalTailer {
     object_store: Arc<ObjectStore>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     shard_id: Uuid,
-    update_cursor: bool,
 }
 
 impl WalTailer {
@@ -729,20 +744,12 @@ impl WalTailer {
             wal_dir: shard_wal_path(&base_path, &shard_id),
             manifest_store,
             shard_id,
-            update_cursor: false,
         }
     }
 
-    /// Enable async best-effort cursor updates on read.
-    ///
-    /// When enabled, successful `read_entry` calls asynchronously update
-    /// `wal_entry_position_last_seen` in the shard manifest.
-    pub fn with_cursor_updates(mut self, enabled: bool) -> Self {
-        self.update_cursor = enabled;
-        self
-    }
-
     /// Read a WAL entry at the given position. Returns `None` if no entry exists.
+    /// On success, asynchronously updates `wal_entry_position_last_seen` in the
+    /// shard manifest as a best-effort cursor hint for future readers.
     pub async fn read_entry(&self, entry_position: u64) -> Result<Option<WalReadEntry>> {
         let path = self.wal_dir.child(wal_entry_filename(entry_position));
         let data = match self.object_store.inner.get(&path).await {
@@ -763,12 +770,10 @@ impl WalTailer {
         })?;
         let (writer_epoch, batches) = deserialize_appender_batches(bytes)?;
 
-        if self.update_cursor {
-            let ms = self.manifest_store.clone();
-            tokio::spawn(async move {
-                let _ = best_effort_cursor_update(&ms, entry_position).await;
-            });
-        }
+        let ms = self.manifest_store.clone();
+        tokio::spawn(async move {
+            let _ = best_effort_cursor_update(&ms, entry_position).await;
+        });
 
         Ok(Some(WalReadEntry {
             shard_id: self.shard_id,
@@ -781,7 +786,6 @@ impl WalTailer {
     /// Find the next append position (one past the latest entry).
     pub async fn next_position(&self) -> Result<u64> {
         if let Some(hint) = self.manifest_cursor_hint().await
-            && hint >= FIRST_WAL_ENTRY_POSITION
             && let Some(tip) = self.probe_forward(hint).await?
         {
             return Ok(tip);
@@ -796,37 +800,17 @@ impl WalTailer {
 
     async fn manifest_cursor_hint(&self) -> Option<u64> {
         let manifest = self.manifest_store.read_latest().await.ok()??;
-        let hint = manifest.wal_entry_position_last_seen;
-        if hint > 0 { Some(hint) } else { None }
+        Some(manifest.wal_entry_position_last_seen)
     }
 
     async fn probe_forward(&self, hint: u64) -> Result<Option<u64>> {
-        let path = self.wal_dir.child(wal_entry_filename(hint));
-        match self.object_store.inner.head(&path).await {
-            Ok(_) => {}
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => {
-                return Err(Error::io(format!(
-                    "failed to check WAL entry {} for shard {}: {}",
-                    hint, self.shard_id, e
-                )));
-            }
-        }
-        let mut pos = hint + 1;
-        while pos - hint <= MAX_CURSOR_PROBE {
-            let p = self.wal_dir.child(wal_entry_filename(pos));
-            match self.object_store.inner.head(&p).await {
-                Ok(_) => pos += 1,
-                Err(object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
-                Err(e) => {
-                    return Err(Error::io(format!(
-                        "failed to check WAL entry {} for shard {}: {}",
-                        pos, self.shard_id, e
-                    )));
-                }
-            }
-        }
-        Ok(None)
+        probe_forward_from(
+            self.object_store.as_ref(),
+            &self.wal_dir,
+            self.shard_id,
+            hint,
+        )
+        .await
     }
 }
 
@@ -970,6 +954,42 @@ async fn atomic_put(
             })?;
         Ok(())
     }
+}
+
+/// Probe forward from a hint position to find the next unwritten position.
+/// Returns `None` if the hint position itself doesn't exist (stale hint).
+async fn probe_forward_from(
+    object_store: &ObjectStore,
+    wal_dir: &Path,
+    shard_id: Uuid,
+    hint: u64,
+) -> Result<Option<u64>> {
+    let path = wal_dir.child(wal_entry_filename(hint));
+    match object_store.inner.head(&path).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => {
+            return Err(Error::io(format!(
+                "failed to check WAL entry {} for shard {}: {}",
+                hint, shard_id, e
+            )));
+        }
+    }
+    let mut pos = hint + 1;
+    while pos - hint <= MAX_CURSOR_PROBE {
+        let p = wal_dir.child(wal_entry_filename(pos));
+        match object_store.inner.head(&p).await {
+            Ok(_) => pos += 1,
+            Err(object_store::Error::NotFound { .. }) => return Ok(Some(pos)),
+            Err(e) => {
+                return Err(Error::io(format!(
+                    "failed to check WAL entry {} for shard {}: {}",
+                    pos, shard_id, e
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 async fn scan_next_position(
@@ -1314,10 +1334,9 @@ mod tests {
                 .unwrap();
         }
 
-        let tailer =
-            WalTailer::new(store.clone(), base_path.clone(), shard_id).with_cursor_updates(true);
-        let entry = tailer.read_entry(2).await.unwrap().unwrap();
-        assert_eq!(entry.entry_position, 2);
+        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let entry = tailer.read_entry(1).await.unwrap().unwrap();
+        assert_eq!(entry.entry_position, 1);
 
         // Best-effort cursor update is async; poll briefly until it lands.
         let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
@@ -1325,15 +1344,15 @@ mod tests {
         for _ in 0..50 {
             if let Some(m) = manifest_store.read_latest().await.unwrap() {
                 hint = m.wal_entry_position_last_seen;
-                if hint >= 2 {
+                if hint >= 1 {
                     break;
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(hint >= 2, "cursor hint never updated, last={hint}");
+        assert!(hint >= 1, "cursor hint never updated, last={hint}");
 
         // next_position must still resolve to one past the last appended entry.
-        assert_eq!(tailer.next_position().await.unwrap(), 4);
+        assert_eq!(tailer.next_position().await.unwrap(), 3);
     }
 }
