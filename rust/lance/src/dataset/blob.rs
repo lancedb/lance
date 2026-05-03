@@ -2339,6 +2339,14 @@ mod tests {
             self.requested_ranges.lock().unwrap().clone()
         }
 
+        fn requested_blob_ranges(&self) -> Vec<Range<u64>> {
+            let full_object = 0..self.data.len() as u64;
+            self.requested_ranges()
+                .into_iter()
+                .filter(|range| range != &full_object)
+                .collect()
+        }
+
         fn object_meta(&self, location: &Path) -> ObjectMeta {
             ObjectMeta {
                 location: location.clone(),
@@ -2389,7 +2397,8 @@ mod tests {
                     });
                 }
             };
-            if let Some(gate) = &self.gate {
+            let is_full_object_probe = range.start == 0 && range.end == self.data.len() as u64;
+            if !is_full_object_probe && let Some(gate) = &self.gate {
                 gate.notified().await;
             }
             self.requested_ranges.lock().unwrap().push(range.clone());
@@ -2967,7 +2976,7 @@ mod tests {
         assert_eq!(chunks[1].as_ref(), b"bc");
         assert_eq!(chunks[2].as_ref(), b"de");
         assert!(chunks[3].is_empty());
-        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
     #[tokio::test]
@@ -2990,7 +2999,7 @@ mod tests {
         let (data1, data2) = tokio::join!(blob1.read(), blob2.read());
         assert_eq!(data1.unwrap().as_ref(), b"bcd");
         assert_eq!(data2.unwrap().as_ref(), b"efg");
-        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
     #[tokio::test]
@@ -3025,7 +3034,7 @@ mod tests {
         assert_eq!(blobs[0].data.as_ref(), b"efg");
         assert_eq!(blobs[1].row_address, 11);
         assert_eq!(blobs[1].data.as_ref(), b"bcd");
-        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
     #[tokio::test]

@@ -1382,8 +1382,8 @@ mod tests {
             policy.set_before_policy(
                 "block_commit",
                 Arc::new(|op, _| -> Result<()> {
-                    if op.contains("copy") {
-                        return Err(Error::internal("Copy blocked".to_string()));
+                    if op.contains("copy") || op.contains("rename") {
+                        return Err(Error::internal("Commit blocked".to_string()));
                     }
                     Ok(())
                 }),
