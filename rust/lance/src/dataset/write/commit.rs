@@ -390,11 +390,21 @@ impl<'a> CommitBuilder<'a> {
                     },
                 );
 
+                let manifest = Arc::new(manifest);
+                let base_object_stores = Arc::new(
+                    Dataset::init_base_object_stores(
+                        &session,
+                        &manifest,
+                        self.store_params.as_ref(),
+                        None,
+                    )
+                    .await?,
+                );
                 Ok(Dataset {
                     object_store,
                     base: base_path,
                     uri: uri.to_string(),
-                    manifest: Arc::new(manifest),
+                    manifest,
                     manifest_location,
                     session,
                     commit_handler,
@@ -405,6 +415,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores,
                 })
             }
         }

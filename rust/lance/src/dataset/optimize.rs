@@ -502,7 +502,7 @@ async fn can_use_binary_copy_impl(
 
             // check file global buffer
             let object_store = match data_file.base_id {
-                Some(base_id) => dataset.object_store(Some(base_id)).await?,
+                Some(base_id) => dataset.object_store(Some(base_id))?,
                 None => dataset.object_store.clone(),
             };
             let full_path = dataset

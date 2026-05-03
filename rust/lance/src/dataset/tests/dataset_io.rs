@@ -220,7 +220,7 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let request_tracker = Arc::new(IOTracker::default());
     let wrapped = dataset
         .with_object_store_wrappers(vec![request_tracker.clone() as Arc<dyn WrappingObjectStore>]);
-    let base_store = wrapped.object_store(Some(1)).await.unwrap();
+    let base_store = wrapped.object_store(Some(1)).unwrap();
     let base_location = base
         .extract_path(wrapped.session().store_registry())
         .unwrap()
@@ -460,9 +460,9 @@ async fn test_object_store_uses_runtime_base_store_params() {
         .await
         .unwrap();
 
-    let store_a = dataset.object_store(Some(1)).await.unwrap();
-    let store_a_again = dataset.object_store(Some(1)).await.unwrap();
-    let store_b = dataset.object_store(Some(2)).await.unwrap();
+    let store_a = dataset.object_store(Some(1)).unwrap();
+    let store_a_again = dataset.object_store(Some(1)).unwrap();
+    let store_b = dataset.object_store(Some(2)).unwrap();
 
     assert!(Arc::ptr_eq(&store_a, &store_a_again));
     assert!(!Arc::ptr_eq(&store_a, &store_b));
