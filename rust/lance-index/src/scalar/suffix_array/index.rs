@@ -887,7 +887,6 @@ impl SuffixArrayIndex {
         meta: &SegmentMeta,
         query: &[u8],
         tw: usize,
-        max_positions: u64,
     ) -> Result<HashMap<u64, Vec<u64>>> {
         let seg = self.get_segment(meta).await?;
         let pw = seg.pointer_width as usize;
@@ -908,13 +907,7 @@ impl SuffixArrayIndex {
             return Ok(local_docs);
         }
 
-        let effective_hi = if hi - lo > max_positions {
-            lo + max_positions
-        } else {
-            hi
-        };
-
-        let batch_count = effective_hi - lo;
+        let batch_count = hi - lo;
         let positions: Vec<u64> = if let Some(ref sa_cache) = seg.sa_cache {
             query::read_pointers_batch(sa_cache, lo, batch_count, pw).await?
         } else if let Some(ref sa) = seg.suffix_array {
@@ -1037,21 +1030,13 @@ impl SuffixArrayIndex {
     /// For token-level indices (`token_width > 1`), only matches at
     /// token-aligned positions (`pos % token_width == 0`) are included.
     ///
-    /// For very common queries (e.g., "the"), the SA range per segment can
-    /// contain millions of positions. To bound memory and time, we cap the
-    /// number of positions processed per segment at `MAX_POSITIONS_PER_SEGMENT`.
-    /// Since the SA is lexicographically sorted (not by document), sampling the
-    /// first N positions still covers many distinct documents, giving a good
-    /// approximation of per-document frequency for top-K selection.
+    /// All SA positions in the matching range are scanned (no sampling),
+    /// so ranking is independent of `limit` — matching inverted index behavior.
     pub async fn search_rows_scored(
         &self,
         query: &[u8],
         max_results: usize,
     ) -> Result<Vec<(u64, u32, Vec<u64>)>> {
-        let max_positions_per_segment: u64 = ((max_results as u64) * 100)
-            .max(1_000)
-            .min(200_000);
-
         let tw = self.token_width as usize;
         let concurrency = parallel_query_concurrency(self.segment_metas.len());
 
@@ -1076,7 +1061,7 @@ impl SuffixArrayIndex {
         // Query all active segments concurrently — each returns its own doc_positions
         let futures: Vec<_> = active_metas
             .iter()
-            .map(|meta| self.search_segment(meta, query, tw, max_positions_per_segment))
+            .map(|meta| self.search_segment(meta, query, tw))
             .collect();
         let segment_results: Vec<HashMap<u64, Vec<u64>>> = stream::iter(futures)
             .buffer_unordered(concurrency)
