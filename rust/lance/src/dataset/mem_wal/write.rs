@@ -192,19 +192,17 @@ pub struct ShardWriterConfig {
     /// - No MemTable / BatchStore / IndexStore is allocated.
     /// - `index_configs` must be empty (validated at open time).
     /// - No MemTable freezing or Lance file flushing happens.
-    /// - No MemTable-bytes backpressure (`max_unflushed_memtable_bytes` is ignored).
-    /// - Each WAL flush drains the pending-batch queue, so the in-memory
-    ///   footprint is bounded by `max_wal_buffer_size` /
-    ///   `max_wal_flush_interval`.
+    /// - `max_unflushed_memtable_bytes` is reused as the backpressure
+    ///   budget for the WAL-only pending-batch queue: `put` blocks while
+    ///   the queue's estimated bytes meet or exceed this threshold.
     /// - The async batched WAL pipeline still runs, driven by the same
     ///   `max_wal_buffer_size`, `max_wal_flush_interval`, and
     ///   `durable_write` settings as MemTable mode.
     ///
     /// MemTable-tied tunables (`max_memtable_size`, `max_memtable_rows`,
-    /// `max_memtable_batches`, `max_unflushed_memtable_bytes`,
-    /// `ivf_index_partition_capacity_safety_factor`, `sync_indexed_write`,
-    /// `async_index_buffer_rows`, `async_index_interval`) are ignored when
-    /// `enable_memtable == false`.
+    /// `max_memtable_batches`, `ivf_index_partition_capacity_safety_factor`,
+    /// `sync_indexed_write`, `async_index_buffer_rows`,
+    /// `async_index_interval`) are ignored when `enable_memtable == false`.
     ///
     /// For raw single-entry synchronous atomic appends with no buffering and
     /// no background tasks, use `WalAppender` directly — it is a strictly
@@ -1059,13 +1057,18 @@ impl ShardWriter {
             shard_id, epoch, manifest.current_generation, config.enable_memtable
         );
 
-        // Create WAL appender (owns object store, epoch, and position state).
+        // Create WAL appender (owns object store, epoch, and position
+        // state). Seed the appender's stats hint from the manifest so
+        // `wal_stats().next_wal_entry_position` reflects the post-recovery
+        // cursor immediately on reopen instead of reading 0 until the
+        // first append has discovered the true tip.
         let wal_appender = Arc::new(WalAppender::with_claimed_epoch(
             object_store.clone(),
             base_path.clone(),
             shard_id,
             manifest_store.clone(),
             epoch,
+            manifest.wal_entry_position_last_seen.saturating_add(1),
         ));
 
         // Create WAL flusher backed by the shared appender.
@@ -2738,6 +2741,56 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    /// Regression: `wal_stats().next_wal_entry_position` must reflect the
+    /// post-recovery cursor immediately on reopen, not 0 until the first
+    /// append discovers the tip. Pre-fix the appender's hint was seeded at
+    /// 0 and only updated after the first successful append, so external
+    /// monitors saw 0 between open and first put on a shard with prior
+    /// entries.
+    #[tokio::test]
+    async fn test_wal_stats_seeded_from_manifest_on_reopen() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        // First writer creates a shard, writes one entry, closes.
+        let writer1 = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            wal_only_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer1
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        writer1.close().await.unwrap();
+
+        // Reopen: stats must reflect the post-recovery cursor immediately,
+        // before any put has happened on this writer.
+        let writer2 = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            wal_only_config(shard_id),
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let next = writer2.wal_stats().next_wal_entry_position;
+        assert!(
+            next >= 1,
+            "expected wal_stats to reflect post-recovery cursor (>= 1) on reopen, got {next}"
+        );
+
+        writer2.close().await.unwrap();
     }
 
     /// Regression test for the size-based trigger after a drain.

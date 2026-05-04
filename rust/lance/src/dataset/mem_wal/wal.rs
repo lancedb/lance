@@ -703,8 +703,9 @@ pub struct WalAppender {
     writer_epoch: u64,
     next_entry_position: Mutex<Option<u64>>,
     /// Mirrors `next_entry_position` for cheap sync observability (stats).
-    /// Updated after each successful append. Stays at 0 until the first
-    /// append discovers the starting position.
+    /// Seeded at construction from `manifest.wal_entry_position_last_seen + 1`
+    /// so reopened shards report the post-recovery cursor immediately;
+    /// updated after each successful append.
     next_entry_position_hint: AtomicU64,
 }
 
@@ -722,25 +723,36 @@ impl WalAppender {
             shard_id,
             2,
         ));
-        let (writer_epoch, _) = manifest_store.claim_epoch(shard_spec_id).await?;
+        let (writer_epoch, manifest) = manifest_store.claim_epoch(shard_spec_id).await?;
+        let position_hint = manifest.wal_entry_position_last_seen.saturating_add(1);
         Ok(Self::with_claimed_epoch(
             object_store,
             base_path,
             shard_id,
             manifest_store,
             writer_epoch,
+            position_hint,
         ))
     }
 
     /// Create a WAL appender for a shard whose epoch was already claimed by
     /// the caller (e.g. `ShardWriter::open` claims once then injects the
     /// resulting epoch into both the shard writer and its appender).
+    ///
+    /// `next_entry_position_hint_seed` should be
+    /// `manifest.wal_entry_position_last_seen + 1` so the sync observability
+    /// accessor (`next_entry_position_hint` / `WalFlusher::next_wal_entry_position`)
+    /// reflects the post-recovery cursor immediately after open instead of
+    /// reading 0 until the first append has discovered the true tip. The
+    /// authoritative position counter is still discovered lazily on the
+    /// first append.
     pub(crate) fn with_claimed_epoch(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         shard_id: Uuid,
         manifest_store: Arc<ShardManifestStore>,
         writer_epoch: u64,
+        next_entry_position_hint_seed: u64,
     ) -> Self {
         Self {
             object_store,
@@ -749,7 +761,7 @@ impl WalAppender {
             shard_id,
             writer_epoch,
             next_entry_position: Mutex::new(None),
-            next_entry_position_hint: AtomicU64::new(0),
+            next_entry_position_hint: AtomicU64::new(next_entry_position_hint_seed),
         }
     }
 
@@ -769,9 +781,11 @@ impl WalAppender {
     }
 
     /// Cheap sync accessor for the next entry position the appender will
-    /// assign on its next `append`. Returns `0` before the first append has
-    /// happened (the appender discovers the starting position lazily). Used
-    /// for stats observability; not authoritative.
+    /// assign on its next `append`. Seeded from the shard manifest at
+    /// construction (so reopened shards report the post-recovery cursor
+    /// immediately) and updated after each successful append. Used for
+    /// stats observability; not authoritative — the actual next position
+    /// is discovered lazily by `append`.
     pub(crate) fn next_entry_position_hint(&self) -> u64 {
         self.next_entry_position_hint.load(Ordering::SeqCst)
     }
@@ -1267,6 +1281,8 @@ mod tests {
             shard_id,
             manifest_store,
             writer_epoch,
+            // Tests start with no entries, so seed the hint at 0.
+            0,
         ));
         WalFlusher::new(appender)
     }
