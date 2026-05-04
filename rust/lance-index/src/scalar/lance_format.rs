@@ -354,11 +354,7 @@ impl IndexStore for LanceIndexStore {
 
     async fn write_raw_file(&self, name: &str, data: &[u8]) -> Result<()> {
         let path = self.index_dir.child(name);
-        self.object_store
-            .inner
-            .put(&path, Bytes::copy_from_slice(data).into())
-            .await
-            .map_err(|e| Error::io(e.to_string()))?;
+        self.object_store.put(&path, data).await?;
         Ok(())
     }
 
@@ -367,24 +363,17 @@ impl IndexStore for LanceIndexStore {
         name: &str,
         range: std::ops::Range<usize>,
     ) -> Result<Bytes> {
-        let path = self.index_dir.child(name);
-        let range_u64 = (range.start as u64)..(range.end as u64);
         self.object_store
-            .inner
-            .get_range(&path, range_u64)
+            .read_one_range(&self.index_dir.child(name), range)
             .await
-            .map_err(|e| Error::io(e.to_string()))
     }
 
     async fn raw_file_size(&self, name: &str) -> Result<usize> {
-        let path = self.index_dir.child(name);
-        let meta = self
+        let size = self
             .object_store
-            .inner
-            .head(&path)
-            .await
-            .map_err(|e| Error::io(e.to_string()))?;
-        Ok(meta.size as usize)
+            .size(&self.index_dir.child(name))
+            .await?;
+        Ok(size as usize)
     }
 }
 
