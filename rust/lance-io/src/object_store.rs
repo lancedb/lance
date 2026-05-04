@@ -20,7 +20,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
 use object_store::DynObjectStore;
-use object_store::Error as ObjectStoreError;
+use object_store::ObjectStoreExt as OSObjectStoreExt;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -837,9 +837,15 @@ impl ObjectStore {
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
     ) -> BoxStream<'a, Result<Path>> {
-        self.inner
-            .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
-            .err_into::<Error>()
+        let store = Arc::clone(&self.inner);
+        locations
+            .and_then(move |location| {
+                let store = Arc::clone(&store);
+                async move {
+                    store.delete(&location).await?;
+                    Ok(location)
+                }
+            })
             .boxed()
     }
 
@@ -1107,7 +1113,7 @@ mod tests {
             format!("{tmp_path}/bar/foo.lance/../foo.lance"),
         ] {
             let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store.as_ref(), &path.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
@@ -1219,7 +1225,7 @@ mod tests {
         set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
         let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -1230,7 +1236,7 @@ mod tests {
         let uri = "~/foo.lance";
         write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -1249,7 +1255,7 @@ mod tests {
         .unwrap();
         let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
 
-        let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
+        let sub_dirs = store.read_dir(base.clone().join("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
     }
 
@@ -1287,7 +1293,10 @@ mod tests {
             url
         };
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
-        store.remove_dir_all(base.child("foo")).await.unwrap();
+        store
+            .remove_dir_all(base.clone().join("foo"))
+            .await
+            .unwrap();
 
         assert!(!path.join("foo").exists());
     }
@@ -1386,7 +1395,7 @@ mod tests {
         use std::path::Prefix;
         use std::path::Prefix::*;
 
-        fn get_path_prefix(path: &StdPath) -> Prefix {
+        fn get_path_prefix(path: &StdPath) -> Prefix<'_> {
             match path.components().next().unwrap() {
                 Component::Prefix(prefix_component) => prefix_component.kind(),
                 _ => panic!(),
@@ -1415,7 +1424,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store.as_ref(), &base.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &base.clone().join("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");
@@ -1439,7 +1448,7 @@ mod tests {
             .unwrap();
 
         // Create paths relative to the ObjectStore base
-        let from_path = base_path.child(source_file_name);
+        let from_path = base_path.clone().join(source_file_name);
 
         // Use object_store::Path::parse for the destination
         let dest_file = dest_dir.join("copied_file.txt");
@@ -1471,7 +1480,7 @@ mod tests {
             .unwrap();
 
         // Create paths
-        let from_path = base_path.child(source_file_name);
+        let from_path = base_path.clone().join(source_file_name);
 
         // Create destination with nested directories that don't exist yet
         let dest_file = dest_dir.join("nested").join("dirs").join("copied_file.txt");

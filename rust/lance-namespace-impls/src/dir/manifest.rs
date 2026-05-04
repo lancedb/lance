@@ -910,7 +910,9 @@ impl ManifestNamespace {
         object_store: &ObjectStore,
         table_path: &Path,
     ) -> Result<bool> {
-        let versions_path = table_path.child(lance_table::io::commit::VERSIONS_DIR);
+        let versions_path = table_path
+            .clone()
+            .join(lance_table::io::commit::VERSIONS_DIR);
         // `_versions/` should only contain manifest files, so probing the first entry is enough
         // to distinguish declared-only tables (empty `_versions/`) from created tables.
         Ok(object_store
@@ -921,7 +923,8 @@ impl ManifestNamespace {
     }
 
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
-        Self::path_has_actual_manifests(&self.object_store, &self.base_path.child(location)).await
+        Self::path_has_actual_manifests(&self.object_store, &self.base_path.clone().join(location))
+            .await
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
@@ -2370,7 +2373,7 @@ impl LanceNamespace for ManifestNamespace {
                 self.delete_from_manifest(&object_id).boxed().await?;
 
                 // Delete physical data directory using the dir_name from manifest
-                let table_path = self.base_path.child(info.location.as_str());
+                let table_path = self.base_path.clone().join(info.location.as_str());
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
@@ -2663,7 +2666,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_path = self.base_path.child(dir_name.as_str());
+        let table_path = self.base_path.clone().join(dir_name.as_str());
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
@@ -2681,7 +2684,7 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         // Create the .lance-reserved file to mark the table as existing
-        let reserved_file_path = table_path.child(".lance-reserved");
+        let reserved_file_path = table_path.clone().join(".lance-reserved");
 
         self.object_store
             .create(&reserved_file_path)

@@ -42,8 +42,9 @@ pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &Deletio
         ..
     } = deletion_file;
     let suffix = file_type.suffix();
-    base.child(DELETIONS_DIR)
-        .child(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
+    base.clone()
+        .join(DELETIONS_DIR)
+        .join(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
 }
 
 pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFile) -> String {
@@ -218,6 +219,7 @@ pub async fn read_deletion_file(
 mod test {
 
     use super::*;
+    use object_store::ObjectStoreExt;
 
     #[tokio::test]
     async fn test_write_no_deletions() {

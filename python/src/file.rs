@@ -36,7 +36,7 @@ use lance_io::{
     traits::Writer,
     utils::CachedFileSize,
 };
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyRuntimeError},

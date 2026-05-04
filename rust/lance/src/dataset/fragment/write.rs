@@ -137,7 +137,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let data_file_key = generate_random_filename();
         let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
@@ -247,7 +247,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         .await?;
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,

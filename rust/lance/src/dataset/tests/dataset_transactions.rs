@@ -26,6 +26,7 @@ use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance_datafusion::udf::register_functions;
+use object_store::ObjectStoreExt;
 
 #[tokio::test]
 async fn test_read_transaction_properties() {
@@ -306,7 +307,11 @@ async fn test_inline_transaction() {
 
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
-            let tx_path = ds.base.child(TRANSACTIONS_DIR).child(tx_file.as_str());
+            let tx_path = ds
+                .base
+                .clone()
+                .join(TRANSACTIONS_DIR)
+                .join(tx_file.as_str());
             let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }

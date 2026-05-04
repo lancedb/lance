@@ -19,6 +19,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{PutMode, PutOptions};
 use tokio::sync::{Mutex, mpsc, watch};
@@ -481,7 +482,7 @@ impl WalFlusher {
     /// Get the path for a WAL entry.
     pub fn wal_entry_path(&self, wal_entry_position: u64) -> Path {
         let filename = wal_entry_filename(wal_entry_position);
-        self.wal_dir.child(filename.as_str())
+        self.wal_dir.clone().join(filename.as_str())
     }
 }
 
@@ -751,7 +752,10 @@ impl WalTailer {
     /// On success, asynchronously updates `wal_entry_position_last_seen` in the
     /// shard manifest as a best-effort cursor hint for future readers.
     pub async fn read_entry(&self, entry_position: u64) -> Result<Option<WalReadEntry>> {
-        let path = self.wal_dir.child(wal_entry_filename(entry_position));
+        let path = self
+            .wal_dir
+            .clone()
+            .join(wal_entry_filename(entry_position));
         let data = match self.object_store.inner.get(&path).await {
             Ok(data) => data,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -908,9 +912,11 @@ async fn atomic_put(
     filename: &str,
     bytes: Bytes,
 ) -> std::result::Result<(), AtomicPutError> {
-    let path = dir.child(filename);
+    let path = dir.clone().join(filename);
     if object_store.is_local() {
-        let temp = dir.child(format!("{}.tmp.{}", filename, Uuid::new_v4()));
+        let temp = dir
+            .clone()
+            .join(format!("{}.tmp.{}", filename, Uuid::new_v4()));
         object_store
             .inner
             .put(&temp, bytes.into())
@@ -964,7 +970,7 @@ async fn probe_forward_from(
     shard_id: Uuid,
     hint: u64,
 ) -> Result<Option<u64>> {
-    let path = wal_dir.child(wal_entry_filename(hint));
+    let path = wal_dir.clone().join(wal_entry_filename(hint));
     match object_store.inner.head(&path).await {
         Ok(_) => {}
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -977,7 +983,7 @@ async fn probe_forward_from(
     }
     let mut pos = hint + 1;
     while pos - hint <= MAX_CURSOR_PROBE {
-        let p = wal_dir.child(wal_entry_filename(pos));
+        let p = wal_dir.clone().join(wal_entry_filename(pos));
         match object_store.inner.head(&p).await {
             Ok(_) => pos += 1,
             Err(object_store::Error::NotFound { .. }) => return Ok(Some(pos)),

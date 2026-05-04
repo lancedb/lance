@@ -10,8 +10,9 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
-    Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
+    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    Result as OSResult,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -184,12 +185,12 @@ impl ObjectStore for ProxyObjectStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.before_method("get_opts", location)?;
-        self.target.get_opts(location, options).await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        self.before_method("get_range", location)?;
-        self.target.get_range(location, range).await
+        let is_head = options.head;
+        let mut result = self.target.get_opts(location, options).await?;
+        if is_head {
+            result.meta = self.transform_meta("head", result.meta)?;
+        }
+        Ok(result)
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
@@ -197,15 +198,24 @@ impl ObjectStore for ProxyObjectStore {
         self.target.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        self.before_method("head", location)?;
-        let meta = self.target.head(location).await?;
-        self.transform_meta("head", meta)
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        self.before_method("delete", location)?;
-        self.target.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        let policy = Arc::clone(&self.policy);
+        let checked = locations
+            .and_then(move |location| {
+                let result = {
+                    let policy = policy.lock().unwrap();
+                    policy
+                        .before_policies
+                        .values()
+                        .try_for_each(|policy| policy("delete", &location).map_err(OSError::from))
+                };
+                future::ready(result.map(|_| location))
+            })
+            .boxed();
+        self.target.delete_stream(checked)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -229,19 +239,14 @@ impl ObjectStore for ProxyObjectStore {
         self.target.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.before_method("copy", from)?;
-        self.target.copy(from, to).await
+        self.target.copy_opts(from, to, opts).await
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
         self.before_method("rename", from)?;
-        self.target.rename(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.before_method("copy_if_not_exists", from)?;
-        self.target.copy_if_not_exists(from, to).await
+        self.target.rename_opts(from, to, opts).await
     }
 }
 
@@ -268,20 +273,15 @@ impl ObjectStore for CountingObjectStore {
         self.target.get_opts(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        self.target.get_range(location, range).await
-    }
-
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.target.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        self.target.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        self.target.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -294,15 +294,7 @@ impl ObjectStore for CountingObjectStore {
         self.target.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.target.copy(from, to).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.target.rename(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.target.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, opts).await
     }
 }

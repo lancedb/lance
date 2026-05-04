@@ -1030,8 +1030,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let is_flat = quantization_type == QuantizationType::Flat;
 
         // prepare the final writers
-        let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-        let index_path = self.index_dir.child(INDEX_FILE_NAME);
+        let storage_path = self.index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let index_path = self.index_dir.clone().join(INDEX_FILE_NAME);
 
         let writer_options = FileWriterOptions {
             format_version: Some(self.format_version),

@@ -161,7 +161,7 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-        let index_dir = dataset.indices_dir().child(uuid.to_string());
+        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
         let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         new_indices.push(IndexMetadata {
             uuid,
@@ -538,7 +538,7 @@ pub(crate) async fn remap_index(
             .await?;
 
             // Capture file sizes for the vector index
-            let index_dir = dataset.indices_dir().child(new_id.to_string());
+            let index_dir = dataset.indices_dir().join(new_id.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
             CreatedIndex {
@@ -1658,7 +1658,7 @@ impl DatasetIndexInternalExt for Dataset {
         } else {
             // Fall back to file existence check for older indices without file metadata
             let index_dir = self.indice_files_dir(&index_meta)?;
-            let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
+            let index_file = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
             let object_store = self.object_store_for_index(&index_meta).await?;
             object_store.exists(&index_file).await?
         };
@@ -1733,7 +1733,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
+        let index_file = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
@@ -2411,6 +2411,7 @@ mod tests {
     use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
+    use object_store::ObjectStoreExt;
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
 
@@ -2424,8 +2425,8 @@ mod tests {
     ) -> IndexMetadata {
         let index_path = dataset
             .indices_dir()
-            .child(uuid.to_string())
-            .child(INDEX_FILE_NAME);
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
         dataset
             .object_store
             .as_ref()
@@ -2947,8 +2948,8 @@ mod tests {
         let lookup_path = dataset
             .indice_files_dir(index_meta)
             .unwrap()
-            .child(index_meta.uuid.to_string())
-            .child(BITMAP_LOOKUP_NAME);
+            .join(index_meta.uuid.to_string())
+            .join(BITMAP_LOOKUP_NAME);
         let meta = dataset.object_store.inner.head(&lookup_path).await.unwrap();
         assert!(
             meta.size >= 1_000_000,
