@@ -825,7 +825,7 @@ async fn test_branch() {
     let test_path = tempdir.obj_path();
     let branches = dataset
         .object_store
-        .read_dir(test_path.child("tree"))
+        .read_dir(test_path.clone().join("tree"))
         .await
         .unwrap();
     assert!(branches.is_empty());

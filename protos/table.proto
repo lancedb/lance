@@ -537,6 +537,12 @@ message ShardManifest {
   // A value of 0 indicates a manually-created shard not governed by any spec.
   uint32 shard_spec_id = 10;
 
+  // Computed shard field values as raw Arrow scalar bytes, keyed by shard
+  // field id. The byte encoding follows Arrow's little-endian convention:
+  // int32 is 4 LE bytes, utf8 is raw UTF-8 bytes, etc. The receiver looks
+  // up the result_type from the ShardSpec to interpret each value.
+  repeated ShardFieldEntry shard_field_entries = 14;
+
   // Writer fencing token - monotonically increasing.
   // A writer must increment this when claiming the shard.
   uint64 writer_epoch = 2;
@@ -557,6 +563,16 @@ message ShardManifest {
 
   // List of flushed MemTable generations and their directory paths.
   repeated FlushedGeneration flushed_generations = 8;
+}
+
+// A shard field value stored as raw Arrow scalar bytes.
+message ShardFieldEntry {
+  // Shard field id (matches ShardField.field_id in the ShardSpec).
+  string field_id = 1;
+
+  // Raw Arrow scalar value bytes in little-endian encoding.
+  // The data type is determined by the result_type of the matching ShardField.
+  bytes value = 2;
 }
 
 // A flushed MemTable generation and its storage location.
@@ -596,20 +612,17 @@ message IndexCatchupProgress {
 // - Shard state snapshots
 //
 // Writers read this index to get configuration before writing.
-// Readers read this index to discover shards and their state.
+// Readers may use shard snapshots in this index as a point-in-time
+// optimization. Readers that need the latest shard set should list shard
+// directories in storage and read each shard's latest manifest.
 // A background process updates the index periodically to keep shard snapshots current.
 //
 // Shard snapshots are stored as a Lance file with one row per shard.
-// The schema has one column per ShardManifest field, with shard fields as columns:
-//   shard_id: fixed_size_binary(16)  -- UUID bytes
-//   version: uint64
+// The schema records shard discovery fields. Full mutable shard state remains
+// authoritative in the shard manifest files.
+//   shard_id: utf8
 //   shard_spec_id: uint32
-//   writer_epoch: uint64
-//   replay_after_wal_entry_position: uint64
-//   wal_entry_position_last_seen: uint64
-//   current_generation: uint64
-//   merged_generation: uint64
-//   flushed_generations: list<struct<generation: uint64, path: string>>
+//   shard_field_{field_id}: typed per the matching ShardField.result_type
 message MemWalIndexDetails {
   // Snapshot timestamp (Unix timestamp in milliseconds).
   int64 snapshot_ts_millis = 1;
@@ -690,4 +703,3 @@ message ShardField {
   // Transform parameters (e.g., num_buckets for bucket transform).
   map<string, string> parameters = 6;
 }
-

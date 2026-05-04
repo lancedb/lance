@@ -157,7 +157,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
         Ok(Self {
-            store: dataset.object_store().clone(),
+            store: dataset.object_store.as_ref().clone(),
             column,
             index_dir,
             distance_type,
@@ -224,7 +224,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
         Ok(Self {
-            store: dataset.object_store().clone(),
+            store: dataset.object_store.as_ref().clone(),
             column,
             index_dir,
             distance_type: ivf_index.metric_type(),
@@ -1030,8 +1030,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let is_flat = quantization_type == QuantizationType::Flat;
 
         // prepare the final writers
-        let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-        let index_path = self.index_dir.child(INDEX_FILE_NAME);
+        let storage_path = self.index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let index_path = self.index_dir.clone().join(INDEX_FILE_NAME);
 
         let writer_options = FileWriterOptions {
             format_version: Some(self.format_version),

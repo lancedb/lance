@@ -35,6 +35,7 @@ use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
 use std::collections::HashMap;
@@ -1185,7 +1186,7 @@ impl DirectoryNamespace {
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
         let table_path = self.object_store_path_from_uri(table_uri)?;
-        let versions_dir = table_path.child(VERSIONS_DIR);
+        let versions_dir = table_path.clone().join(VERSIONS_DIR);
         let manifest_metas: Vec<_> = self
             .object_store
             .read_dir_all(&versions_dir, None)
@@ -1870,21 +1871,24 @@ impl DirectoryNamespace {
     /// Get the object store path for a table (relative to base_path)
     fn table_path(&self, table_name: &str) -> Path {
         self.base_path
-            .child(format!("{}.lance", table_name).as_str())
+            .clone()
+            .join(format!("{}.lance", table_name).as_str())
     }
 
     /// Get the reserved file path for a table
     fn table_reserved_file_path(&self, table_name: &str) -> Path {
         self.base_path
-            .child(format!("{}.lance", table_name).as_str())
-            .child(".lance-reserved")
+            .clone()
+            .join(format!("{}.lance", table_name).as_str())
+            .join(".lance-reserved")
     }
 
     /// Get the deregistered marker file path for a table
     fn table_deregistered_file_path(&self, table_name: &str) -> Path {
         self.base_path
-            .child(format!("{}.lance", table_name).as_str())
-            .child(".lance-deregistered")
+            .clone()
+            .join(format!("{}.lance", table_name).as_str())
+            .join(".lance-deregistered")
     }
 
     /// Atomically check table existence and deregistration status.
@@ -2093,12 +2097,13 @@ impl DirectoryNamespace {
         for te in table_entries {
             let table_uri = self.resolve_table_location(&te.table_id).await?;
             let table_path = self.object_store_path_from_uri(&table_uri)?;
-            let versions_dir_path = table_path.child(VERSIONS_DIR);
+            let versions_dir_path = table_path.clone().join(VERSIONS_DIR);
 
             for (start, end) in &te.ranges {
                 for version in *start..=*end {
-                    let version_path =
-                        versions_dir_path.child(format!("{}.manifest", version as u64));
+                    let version_path = versions_dir_path
+                        .clone()
+                        .join(format!("{}.manifest", version as u64));
                     match self.object_store.inner.delete(&version_path).await {
                         Ok(_) => {
                             deleted_count += 1;
@@ -2825,7 +2830,8 @@ impl LanceNamespace for DirectoryNamespace {
             .await
         {
             Ok(()) => Ok(()),
-            Err(ObjectStoreError::NotImplemented) | Err(ObjectStoreError::NotSupported { .. }) => {
+            Err(ObjectStoreError::NotImplemented { .. })
+            | Err(ObjectStoreError::NotSupported { .. }) => {
                 let manifest_data = self
                     .object_store
                     .inner
@@ -7610,7 +7616,9 @@ mod tests {
         // Use dataset's object_store to find and copy the manifest
         let versions_path = dataset.versions_dir();
         let manifest_metas: Vec<_> = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .list(Some(&versions_path))
             .try_collect()
@@ -7629,7 +7637,9 @@ mod tests {
 
         // Read the existing manifest data
         let manifest_data = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .get(&manifest_meta.location)
             .await
@@ -7639,9 +7649,11 @@ mod tests {
             .unwrap();
 
         // Write to a staging location using the dataset's object_store
-        let staging_path = dataset.versions_dir().child("staging_manifest");
+        let staging_path = dataset.versions_dir().join("staging_manifest");
         dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .put(&staging_path, manifest_data.into())
             .await
@@ -7666,7 +7678,13 @@ mod tests {
             .version
             .expect("response should contain version info");
         let version_2_path = Path::parse(&version_info.manifest_path).unwrap();
-        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        let head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&version_2_path)
+            .await;
         assert!(
             head_result.is_ok(),
             "Version 2 manifest should exist at {}",
@@ -7674,7 +7692,13 @@ mod tests {
         );
 
         // Verify the staging file has been deleted
-        let staging_head_result = dataset.object_store().inner.head(&staging_path).await;
+        let staging_head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&staging_path)
+            .await;
         assert!(
             staging_head_result.is_err(),
             "Staging manifest should have been deleted after create_table_version"
@@ -7722,7 +7746,9 @@ mod tests {
         // Use dataset's object_store to find and copy the manifest
         let versions_path = dataset.versions_dir();
         let manifest_metas: Vec<_> = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .list(Some(&versions_path))
             .try_collect()
@@ -7741,7 +7767,9 @@ mod tests {
 
         // Read the existing manifest data
         let manifest_data = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .get(&manifest_meta.location)
             .await
@@ -7751,9 +7779,11 @@ mod tests {
             .unwrap();
 
         // Write to a staging location using the dataset's object_store
-        let staging_path = dataset.versions_dir().child("staging_manifest");
+        let staging_path = dataset.versions_dir().join("staging_manifest");
         dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .put(&staging_path, manifest_data.into())
             .await
@@ -7792,7 +7822,13 @@ mod tests {
         );
 
         // Verify version 2 still exists using the dataset's object_store
-        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        let head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&version_2_path)
+            .await;
         assert!(
             head_result.is_ok(),
             "Version 2 manifest should still exist at {}",
@@ -8229,7 +8265,9 @@ mod tests {
             // Verify version 2 was created using the dataset's object_store
             // List manifests in the versions directory to find the V2 named manifest
             let manifest_metas: Vec<_> = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .list(Some(&dataset.versions_dir()))
                 .try_collect()
@@ -9084,7 +9122,9 @@ mod tests {
             // Find existing manifest and create a staging copy
             let versions_path = dataset.versions_dir();
             let manifest_metas: Vec<_> = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .list(Some(&versions_path))
                 .try_collect()
@@ -9102,7 +9142,9 @@ mod tests {
                 .expect("No manifest file found");
 
             let manifest_data = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .get(&manifest_meta.location)
                 .await
@@ -9113,9 +9155,11 @@ mod tests {
 
             let staging_path = dataset
                 .versions_dir()
-                .child(format!("staging_{}", table_name));
+                .join(format!("staging_{}", table_name));
             dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .put(&staging_path, manifest_data.into())
                 .await

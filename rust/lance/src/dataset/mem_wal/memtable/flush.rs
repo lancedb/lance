@@ -14,6 +14,7 @@ use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
@@ -108,7 +109,7 @@ impl MemTableFlusher {
 
         let rows_flushed = self.write_data_file(&gen_path, memtable).await?;
 
-        let bloom_path = gen_path.child("bloom_filter.bin");
+        let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
@@ -281,7 +282,7 @@ impl MemTableFlusher {
                 .await?;
         }
 
-        let bloom_path = gen_path.child("bloom_filter.bin");
+        let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
@@ -446,7 +447,10 @@ impl MemTableFlusher {
 
             // Create the index store for writing
             let index_uuid = uuid::Uuid::new_v4();
-            let index_dir = gen_path.child("_indices").child(index_uuid.to_string());
+            let index_dir = gen_path
+                .clone()
+                .join("_indices")
+                .join(index_uuid.to_string());
             let index_store = LanceIndexStore::new(
                 self.object_store.clone(),
                 index_dir.clone(),
@@ -583,7 +587,10 @@ impl MemTableFlusher {
         use std::sync::Arc;
 
         let index_uuid = uuid::Uuid::new_v4();
-        let index_dir = gen_path.child("_indices").child(index_uuid.to_string());
+        let index_dir = gen_path
+            .clone()
+            .join("_indices")
+            .join(index_uuid.to_string());
 
         // Get partition data from in-memory index with reversed row positions
         // since the flushed data is in reverse order.
@@ -610,8 +617,8 @@ impl MemTableFlusher {
         let index_schema: ArrowSchema = FlatIndex::schema().as_ref().clone();
 
         // Create file writers
-        let storage_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-        let index_path = index_dir.child(INDEX_FILE_NAME);
+        let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let index_path = index_dir.clone().join(INDEX_FILE_NAME);
 
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,

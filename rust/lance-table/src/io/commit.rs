@@ -39,6 +39,7 @@ use futures::{
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
+use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
@@ -83,22 +84,21 @@ pub enum ManifestNamingScheme {
 
 impl ManifestNamingScheme {
     pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
-        let directory = base.child(VERSIONS_DIR);
         if is_detached_version(version) {
             // Detached versions should never show up first in a list operation which
             // means it needs to come lexicographically after all attached manifest
             // files and so we add the prefix `d`.  There is no need to invert the
             // version number since detached versions are not part of the version
-            let directory = base.child(VERSIONS_DIR);
-            directory.child(format!(
+            base.clone().join(VERSIONS_DIR).join(format!(
                 "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
             ))
         } else {
+            let directory = base.clone().join(VERSIONS_DIR);
             match self {
-                Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
+                Self::V1 => directory.join(format!("{version}.{MANIFEST_EXTENSION}")),
                 Self::V2 => {
                     let inverted_version = u64::MAX - version;
-                    directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
+                    directory.join(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
                 }
             }
         }
@@ -168,7 +168,7 @@ impl ManifestNamingScheme {
 pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Path) -> Result<()> {
     object_store
         .inner
-        .list(Some(&dataset_base.child(VERSIONS_DIR)))
+        .list(Some(&dataset_base.clone().join(VERSIONS_DIR)))
         .try_filter(|res| {
             let res = if let Some(filename) = res.location.filename() {
                 ManifestNamingScheme::detect_scheme(filename) == Some(ManifestNamingScheme::V1)
@@ -271,7 +271,7 @@ async fn current_manifest_path(
         return Ok(location);
     }
 
-    let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
+    let manifest_files = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
         let filename = res.location.filename().unwrap();
@@ -361,7 +361,9 @@ async fn current_manifest_path(
                 e_tag: current_meta.e_tag,
             })
         }
-        (None, _) => Err(Error::not_found(base.child(VERSIONS_DIR).to_string())),
+        (None, _) => Err(Error::not_found(
+            base.clone().join(VERSIONS_DIR).to_string(),
+        )),
     }
 }
 
@@ -369,7 +371,7 @@ async fn current_manifest_path(
 // object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
 fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
-    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
+    let path = lance_io::local::to_local_path(&base.clone().join(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
     let mut latest_entry: Option<(u64, DirEntry)> = None;
@@ -435,7 +437,7 @@ fn list_manifests<'a>(
     object_store: &'a dyn OSObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
     object_store
-        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
+        .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -467,7 +469,7 @@ pub fn list_detached_manifests<'a>(
     object_store: &'a dyn OSObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
     object_store
-        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
+        .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -1188,11 +1190,11 @@ mod tests {
     async fn test_manifest_naming_migration() {
         let object_store = ObjectStore::memory();
         let base = Path::from("base");
-        let versions_dir = base.child(VERSIONS_DIR);
+        let versions_dir = base.clone().join(VERSIONS_DIR);
 
         // Write two v1 files and one v1
         let original_files = vec![
-            versions_dir.child("irrelevant"),
+            versions_dir.clone().join("irrelevant"),
             ManifestNamingScheme::V1.manifest_path(&base, 0),
             ManifestNamingScheme::V2.manifest_path(&base, 1),
         ];
@@ -1205,7 +1207,7 @@ mod tests {
         let expected_files = vec![
             ManifestNamingScheme::V2.manifest_path(&base, 1),
             ManifestNamingScheme::V2.manifest_path(&base, 0),
-            versions_dir.child("irrelevant"),
+            versions_dir.clone().join("irrelevant"),
         ];
         let actual_files = object_store
             .inner
@@ -1229,7 +1231,7 @@ mod tests {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
             tempdir = TempObjDir::default();
-            let path = tempdir.child("base");
+            let path = tempdir.clone().join("base");
             let store = Box::new(ObjectStore::local());
             assert!(!store.list_is_lexically_ordered);
             (store, path)
@@ -1315,7 +1317,7 @@ mod tests {
 
         let object_store = ObjectStore::memory();
         let base = Path::from("base");
-        let versions_dir = base.child(VERSIONS_DIR);
+        let versions_dir = base.clone().join(VERSIONS_DIR);
 
         // Create some regular manifests
         for version in [1, 2, 3] {
@@ -1330,7 +1332,7 @@ mod tests {
             300 | DETACHED_VERSION_MASK,
         ];
         for version in &detached_versions {
-            let path = versions_dir.child(format!("d{}.manifest", version));
+            let path = versions_dir.clone().join(format!("d{}.manifest", version));
             object_store.put(&path, b"".as_slice()).await.unwrap();
         }
 

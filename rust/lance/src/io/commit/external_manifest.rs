@@ -15,8 +15,7 @@ mod test {
     };
     use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
+    use object_store::{ObjectStoreExt, local::LocalFileSystem, path::Path};
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -308,8 +307,9 @@ mod test {
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
         // Move version 6 to a temporary location, put that in the store.
         let base_path = Path::parse(ds_uri).unwrap();
-        let version_six_staging_location =
-            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
+        let version_six_staging_location = base_path
+            .clone()
+            .join(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
             .rename(
                 &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),

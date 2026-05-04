@@ -278,7 +278,7 @@ impl<'a> CleanupTask<'a> {
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
-                let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
             }
@@ -294,7 +294,7 @@ impl<'a> CleanupTask<'a> {
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
                 .tx_paths
-                .insert(Path::parse(TRANSACTIONS_DIR)?.child(relative_tx_path.as_str()));
+                .insert(Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str()));
         }
 
         for index in indexes {
@@ -804,7 +804,8 @@ impl<'a> CleanupTask<'a> {
                     if let Some(base_path) = base_path
                         && base_path.path == self.dataset.uri
                     {
-                        let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                        let full_data_path =
+                            self.dataset.data_dir().clone().join(file.path.as_str());
                         let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                         inspection
                             .verified_files
@@ -1381,8 +1382,8 @@ mod tests {
             policy.set_before_policy(
                 "block_commit",
                 Arc::new(|op, _| -> Result<()> {
-                    if op.contains("copy") {
-                        return Err(Error::internal("Copy blocked".to_string()));
+                    if op.contains("copy") || op.contains("rename") {
+                        return Err(Error::internal("Commit blocked".to_string()));
                     }
                     Ok(())
                 }),
@@ -1533,14 +1534,16 @@ mod tests {
     }
 
     async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
-        let index_dir = dataset.indices_dir().child(uuid.to_string());
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         dataset
-            .object_store()
-            .put(&index_dir.child("index.idx"), b"idx")
+            .object_store
+            .as_ref()
+            .put(&index_dir.clone().join("index.idx"), b"idx")
             .await?;
         dataset
-            .object_store()
-            .put(&index_dir.child("auxiliary.idx"), b"aux")
+            .object_store
+            .as_ref()
+            .put(&index_dir.clone().join("auxiliary.idx"), b"aux")
             .await?;
         Ok(())
     }
@@ -1552,15 +1555,17 @@ mod tests {
     ) -> Result<()> {
         let shard_dir = dataset
             .indices_dir()
-            .child(staging_uuid.to_string())
-            .child(format!("partial_{}", shard_uuid));
+            .join(staging_uuid.to_string())
+            .join(format!("partial_{}", shard_uuid));
         dataset
-            .object_store()
-            .put(&shard_dir.child("index.idx"), b"idx")
+            .object_store
+            .as_ref()
+            .put(&shard_dir.clone().join("index.idx"), b"idx")
             .await?;
         dataset
-            .object_store()
-            .put(&shard_dir.child("auxiliary.idx"), b"aux")
+            .object_store
+            .as_ref()
+            .put(&shard_dir.clone().join("auxiliary.idx"), b"aux")
             .await?;
         Ok(())
     }
@@ -2291,36 +2296,42 @@ mod tests {
         assert_eq!(removed.index_files_removed, 2);
         assert!(
             !dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
-                        .child(seg_a.to_string())
-                        .child("index.idx")
+                        .clone()
+                        .join(seg_a.to_string())
+                        .join("index.idx")
                 )
                 .await
                 .unwrap()
         );
         assert!(
             dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
-                        .child(seg_b.to_string())
-                        .child("index.idx")
+                        .clone()
+                        .join(seg_b.to_string())
+                        .join("index.idx")
                 )
                 .await
                 .unwrap()
         );
         assert!(
             dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
-                        .child(seg_c.to_string())
-                        .child("index.idx")
+                        .clone()
+                        .join(seg_c.to_string())
+                        .join("index.idx")
                 )
                 .await
                 .unwrap()
@@ -2355,25 +2366,29 @@ mod tests {
         assert_eq!(removed.index_files_removed, 4);
         assert!(
             !dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
-                        .child(staging_uuid.to_string())
-                        .child(format!("partial_{}", shard_uuid))
-                        .child("index.idx"),
+                        .clone()
+                        .join(staging_uuid.to_string())
+                        .join(format!("partial_{}", shard_uuid))
+                        .join("index.idx"),
                 )
                 .await
                 .unwrap()
         );
         assert!(
             !dataset
-                .object_store()
+                .object_store
+                .as_ref()
                 .exists(
                     &dataset
                         .indices_dir()
-                        .child(built_segment_uuid.to_string())
-                        .child("index.idx"),
+                        .clone()
+                        .join(built_segment_uuid.to_string())
+                        .join("index.idx"),
                 )
                 .await
                 .unwrap()
@@ -2602,18 +2617,18 @@ mod tests {
                 .unwrap();
 
         // Create unmanaged directories/files under dataset root
-        let img = base.child("images").child("clip.mp4");
-        let misc = base.child("misc").child("notes.txt");
-        let branch_file = base.child("tree").child("branchA").child("data.bin");
+        let img = base.clone().join("images").join("clip.mp4");
+        let misc = base.clone().join("misc").join("notes.txt");
+        let branch_file = base.clone().join("tree").join("branchA").join("data.bin");
         os.put(&img, b"video").await.unwrap();
         os.put(&misc, b"notes").await.unwrap();
         os.put(&branch_file, b"branch").await.unwrap();
 
         // Create a temporary manifest file that should be cleaned
-        let tmp_manifest = base.child("_versions").child(".tmp").child("orphan");
+        let tmp_manifest = base.clone().join("_versions").join(".tmp").join("orphan");
         os.put(&tmp_manifest, b"tmp").await.unwrap();
         // Delete the _transactions directory so that we can test that if not_found err will be swallowed
-        os.remove_dir_all(base.child(TRANSACTIONS_DIR))
+        os.remove_dir_all(base.clone().join(TRANSACTIONS_DIR))
             .await
             .unwrap();
 
@@ -2938,7 +2953,7 @@ mod tests {
                 Ok(count)
             }
 
-            let manifest_dir = branch_path.child("_versions");
+            let manifest_dir = branch_path.clone().join("_versions");
             self.counts.num_manifest_files = count_dir(
                 &self.dataset.object_store,
                 &manifest_dir,
@@ -2948,20 +2963,20 @@ mod tests {
             .unwrap_or(0);
 
             // Transactions: count files under _transactions (extension .txn)
-            let txn_dir = branch_path.child("_transactions");
+            let txn_dir = branch_path.clone().join("_transactions");
             self.counts.num_tx_files =
                 count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
                     .await
                     .unwrap_or(0);
 
             // Indices: count files under _indices
-            let idx_dir = branch_path.child(crate::dataset::INDICES_DIR);
+            let idx_dir = branch_path.clone().join(crate::dataset::INDICES_DIR);
             self.counts.num_index_files = count_dir(&self.dataset.object_store, &idx_dir, None)
                 .await
                 .unwrap_or(0);
 
             // Deletions: count files under _deletions (extensions .arrow / .bin)
-            let del_dir = branch_path.child("_deletions");
+            let del_dir = branch_path.clone().join("_deletions");
             self.counts.num_delete_files = count_dir(
                 &self.dataset.object_store,
                 &del_dir,
@@ -2971,7 +2986,7 @@ mod tests {
             .unwrap_or(0);
 
             // Data files: count .lance files under data/
-            let data_dir = branch_path.child(crate::dataset::DATA_DIR);
+            let data_dir = branch_path.clone().join(crate::dataset::DATA_DIR);
             self.counts.num_data_files =
                 count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
                     .await

@@ -255,7 +255,7 @@ impl IndexStore for LanceIndexStore {
         name: &str,
         schema: Arc<Schema>,
     ) -> Result<Box<dyn IndexWriter>> {
-        let path = self.index_dir.child(name);
+        let path = self.index_dir.clone().join(name);
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
         let writer = current_writer::FileWriter::try_new(
@@ -270,7 +270,7 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let path = self.index_dir.child(name);
+        let path = self.index_dir.clone().join(name);
         // Use cached file size if available, otherwise unknown (requires HEAD call)
         let cached_size = self
             .file_sizes
@@ -291,7 +291,7 @@ impl IndexStore for LanceIndexStore {
             Err(e) => {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
-                    let path = self.index_dir.child(name);
+                    let path = self.index_dir.clone().join(name);
                     let file_reader = PreviousFileReader::try_new_self_described(
                         &self.object_store,
                         &path,
@@ -307,7 +307,7 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
-        let path = self.index_dir.child(name);
+        let path = self.index_dir.clone().join(name);
 
         let other_store = dest_store.as_any().downcast_ref::<Self>();
         match other_store {
@@ -315,7 +315,7 @@ impl IndexStore for LanceIndexStore {
                 // If both this store and the destination are lance stores we can use object_store's copy
                 // This does blindly assume that both stores are using the same underlying object_store
                 // but there is no easy way to verify this and it happens to always be true at the moment
-                let dest_path = dest_store.index_dir.child(name);
+                let dest_path = dest_store.index_dir.clone().join(name);
                 self.object_store.copy(&path, &dest_path).await
             }
             _ => {
@@ -337,14 +337,14 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
-        let path = self.index_dir.child(name);
-        let new_path = self.index_dir.child(new_name);
+        let path = self.index_dir.clone().join(name);
+        let new_path = self.index_dir.clone().join(new_name);
         self.object_store.copy(&path, &new_path).await?;
         self.object_store.delete(&path).await
     }
 
     async fn delete_index_file(&self, name: &str) -> Result<()> {
-        let path = self.index_dir.child(name);
+        let path = self.index_dir.clone().join(name);
         self.object_store.delete(&path).await
     }
 

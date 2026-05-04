@@ -60,7 +60,7 @@ use lance_datafusion::{
 };
 use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
-use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, path::Path};
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -1219,7 +1219,22 @@ impl BTreeIndex {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
+        let (page_lookup_file, standalone_partition_page_file) =
+            match store.open_index_file(BTREE_LOOKUP_NAME).await {
+                Ok(page_lookup_file) => (page_lookup_file, None),
+                Err(original_err) if is_missing_lookup_error(&original_err) => {
+                    let files = store.list_files_with_sizes().await?;
+                    let Some((lookup_file, page_file)) = find_single_partition_files(&files)?
+                    else {
+                        return Err(original_err);
+                    };
+                    (
+                        store.open_index_file(lookup_file).await?,
+                        Some(page_file.to_string()),
+                    )
+                }
+                Err(other_err) => return Err(other_err),
+            };
         let num_rows_in_lookup = page_lookup_file.num_rows();
         let serialized_lookup = page_lookup_file
             .read_range(0..num_rows_in_lookup, None)
@@ -1239,7 +1254,17 @@ impl BTreeIndex {
         // For range-partitioned indices, construct the `ranges_to_files` map.
         // This converts the list of (partition ID, page count) from metadata into a map
         // from a global page range to its corresponding file and starting offset.
-        let ranges_to_files = if range_partitioned {
+        let ranges_to_files = if let Some(page_file_name) = standalone_partition_page_file {
+            let page_numbers = serialized_lookup
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let max_page_number = page_numbers.values().iter().copied().max().unwrap_or(0);
+            let mut range_map = RangeInclusiveMap::new();
+            range_map.insert(0..=max_page_number, (page_file_name, 0));
+            Some(Arc::new(range_map))
+        } else if range_partitioned {
             let part_sizes_str = file_schema
             .metadata
             .get(PAGE_NUM_PER_RANGE_PARTITION_META_KEY)
@@ -1989,6 +2014,49 @@ async fn list_page_lookup_files(
     }
 
     Ok((part_page_files, part_lookup_files))
+}
+
+fn find_single_partition_files(
+    files: &[lance_table::format::IndexFile],
+) -> Result<Option<(&str, &str)>> {
+    let lookup_files = files
+        .iter()
+        .filter_map(|file| {
+            (file.path.starts_with("part_") && file.path.ends_with("_page_lookup.lance"))
+                .then_some(file.path.as_str())
+        })
+        .collect::<Vec<_>>();
+    let page_files = files
+        .iter()
+        .filter_map(|file| {
+            (file.path.starts_with("part_") && file.path.ends_with("_page_data.lance"))
+                .then_some(file.path.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    if lookup_files.len() != 1 || page_files.len() != 1 {
+        return Ok(None);
+    }
+
+    let lookup_partition_id = extract_partition_id(lookup_files[0])?;
+    let page_partition_id = extract_partition_id(page_files[0])?;
+    if lookup_partition_id != page_partition_id {
+        return Ok(None);
+    }
+
+    Ok(Some((lookup_files[0], page_files[0])))
+}
+
+fn is_missing_lookup_error(err: &Error) -> bool {
+    matches!(err, Error::NotFound { .. })
+        || matches!(
+            err,
+            Error::IO { source, .. }
+                if source
+                    .downcast_ref::<ObjectStoreError>()
+                    .map(|os_err| matches!(os_err, ObjectStoreError::NotFound { .. }))
+                    .unwrap_or(false)
+        )
 }
 
 /// Merge multiple partition page / lookup files into a complete metadata file

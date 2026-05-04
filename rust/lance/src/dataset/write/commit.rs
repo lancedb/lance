@@ -540,7 +540,7 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
         assert_io_gt!(io_stats, write_iops, 0);
 
@@ -556,7 +556,7 @@ mod tests {
             // we shouldn't need to read anything from disk. Except we do need
             // to check for the latest version to see if we need to do conflict
             // resolution.
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 1, "check latest version, i = {} ", i);
             // Should see 2 IOPs:
             // 1. Write the transaction files
@@ -574,7 +574,7 @@ mod tests {
         // Session should still be re-used
         // However, the dataset needs to be loaded and the read version checked out,
         // so an additional 4 IOPs are needed.
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 10);
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
     }
@@ -619,7 +619,7 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store().io_stats_incremental(); // Reset the stats
+        dataset.object_store.as_ref().io_stats_incremental(); // Reset the stats
         let read_version = dataset.manifest().version;
         let new_ds = CommitBuilder::new(Arc::new(dataset))
             .execute(sample_transaction(read_version))
@@ -627,7 +627,7 @@ mod tests {
             .unwrap();
 
         // Assert io requests
-        let io_stats = new_ds.object_store().io_stats_incremental();
+        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
         // This could be zero, if we decided to be optimistic. However, that
         // would mean two wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
@@ -685,14 +685,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         let new_ds = CommitBuilder::new(original_dataset.clone())
             .execute(sample_transaction(original_dataset.manifest().version))
             .await
             .unwrap();
 
-        let io_stats = new_ds.object_store().io_stats_incremental();
+        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
 
         // If there is a conflict with two transaction, the retry should require io requests:
         // * 1 list version
@@ -755,6 +755,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             read_version: 1,
             tag: None,

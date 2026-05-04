@@ -81,9 +81,11 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
 
     let index_dir = dataset.indice_files_dir(index)?;
     let index_file = index_dir
-        .child(index.uuid.to_string())
-        .child(INDEX_FILE_NAME);
-    dataset.object_store.exists(&index_file).await
+        .clone()
+        .join(index.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let object_store = dataset.object_store_for_index(index).await?;
+    object_store.exists(&index_file).await
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -237,7 +239,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(None);
             }
 
-            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
             let new_fragment_bitmap = removed_segment
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
@@ -294,7 +296,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 }
             }
 
-            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
             Ok((
@@ -567,7 +569,7 @@ mod tests {
         );
 
         // There should be two indices directories existed.
-        let object_store = dataset.object_store();
+        let object_store = dataset.object_store.as_ref();
         let index_dirs = object_store.read_dir(dataset.indices_dir()).await.unwrap();
         assert_eq!(index_dirs.len(), 2);
 

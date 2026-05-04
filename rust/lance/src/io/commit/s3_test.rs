@@ -217,7 +217,7 @@ async fn test_concurrent_writers() {
         .await
         .unwrap();
     // Commit: 2 IOPs. 1 for transaction file, 1 for manifest file
-    let io_stats = dataset.object_store().io_stats_incremental();
+    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 2);
     let dataset = Arc::new(dataset);
     let old_version = dataset.manifest().version;
@@ -304,7 +304,7 @@ async fn test_ddb_open_iops() {
     //    * write staged file
     //    * copy to final file
     //    * delete staged file
-    let io_stats = committed_ds.object_store().io_stats_incremental();
+    let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
     assert_io_eq!(io_stats, read_iops, 1);
 
@@ -316,7 +316,7 @@ async fn test_ddb_open_iops() {
         .load()
         .await
         .unwrap();
-    let io_stats = dataset.object_store().io_stats_incremental();
+    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Open dataset can be read with 1 IOP, just to read the manifest.
     // Looking up latest manifest is handled in dynamodb.
     assert_io_eq!(io_stats, read_iops, 1);
@@ -331,7 +331,7 @@ async fn test_ddb_open_iops() {
         .execute(vec![data.clone()])
         .await
         .unwrap();
-    let io_stats = dataset.object_store().io_stats_incremental();
+    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
     // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
@@ -340,7 +340,7 @@ async fn test_ddb_open_iops() {
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
-    let io_stats = dataset.object_store().io_stats_incremental();
+    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Checkout: 1 IOPS: manifest file
     assert_io_eq!(io_stats, read_iops, 1);
     assert_io_eq!(io_stats, write_iops, 0);

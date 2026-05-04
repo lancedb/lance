@@ -27,6 +27,8 @@
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
 
+use object_store::ObjectStoreExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -105,7 +107,7 @@ impl ShardManifestStore {
     /// Read a specific manifest version.
     pub async fn read_version(&self, version: u64) -> Result<ShardManifest> {
         let filename = manifest_filename(version);
-        let path = self.manifest_dir.child(filename.as_str());
+        let path = self.manifest_dir.clone().join(filename.as_str());
 
         let data = self.object_store.inner.get(&path).await.map_err(|e| {
             Error::io(format!(
@@ -125,6 +127,42 @@ impl ShardManifestStore {
         ShardManifest::try_from(pb_manifest)
     }
 
+    /// Write an initial manifest for a newly-created shard.
+    ///
+    /// `shard_field_values` maps field_id to raw Arrow scalar bytes.
+    /// Initial manifests use writer epoch 0. A writer that claims the shard
+    /// will write a new manifest with epoch 1 before appending WAL entries.
+    pub async fn initialize_shard(
+        &self,
+        shard_spec_id: u32,
+        shard_field_values: HashMap<String, Vec<u8>>,
+    ) -> Result<ShardManifest> {
+        let manifest = ShardManifest {
+            shard_id: self.shard_id,
+            version: 1,
+            shard_spec_id,
+            shard_field_values,
+            writer_epoch: 0,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            current_generation: 1,
+            flushed_generations: vec![],
+        };
+
+        match self.write(&manifest).await {
+            Ok(_) => Ok(manifest),
+            Err(error) => match self.read_latest().await? {
+                Some(existing)
+                    if existing.shard_spec_id == manifest.shard_spec_id
+                        && existing.shard_field_values == manifest.shard_field_values =>
+                {
+                    Ok(existing)
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
     /// Write a new manifest version atomically.
     ///
     /// Uses storage-appropriate strategy:
@@ -140,7 +178,7 @@ impl ShardManifestStore {
     pub async fn write(&self, manifest: &ShardManifest) -> Result<u64> {
         let version = manifest.version;
         let filename = manifest_filename(version);
-        let path = self.manifest_dir.child(filename.as_str());
+        let path = self.manifest_dir.clone().join(filename.as_str());
 
         let pb_manifest = pb::ShardManifest::from(manifest);
         let bytes = pb_manifest.encode_to_vec();
@@ -148,7 +186,7 @@ impl ShardManifestStore {
         if self.object_store.is_local() {
             // Local storage: Use temp file + atomic rename for fencing
             let temp_filename = format!("{}.tmp.{}", filename, uuid::Uuid::new_v4());
-            let temp_path = self.manifest_dir.child(temp_filename.as_str());
+            let temp_path = self.manifest_dir.clone().join(temp_filename.as_str());
 
             // Write to temp file
             self.object_store
@@ -265,7 +303,7 @@ impl ShardManifestStore {
     /// Check if a manifest version exists using HEAD request.
     async fn version_exists(&self, version: u64) -> Result<bool> {
         let filename = manifest_filename(version);
-        let path = self.manifest_dir.child(filename.as_str());
+        let path = self.manifest_dir.clone().join(filename.as_str());
 
         match self.object_store.inner.head(&path).await {
             Ok(_) => Ok(true),
@@ -279,7 +317,7 @@ impl ShardManifestStore {
 
     /// Read the version hint file.
     async fn read_version_hint(&self) -> Option<u64> {
-        let path = self.manifest_dir.child("version_hint.json");
+        let path = self.manifest_dir.clone().join("version_hint.json");
 
         let data = self.object_store.inner.get(&path).await.ok()?;
         let bytes = data.bytes().await.ok()?;
@@ -290,7 +328,7 @@ impl ShardManifestStore {
 
     /// Write the version hint file (best-effort, failures logged but ignored).
     async fn write_version_hint(&self, version: u64) {
-        let path = self.manifest_dir.child("version_hint.json");
+        let path = self.manifest_dir.clone().join("version_hint.json");
         let hint = VersionHint { version };
 
         match serde_json::to_vec(&hint) {
@@ -360,9 +398,15 @@ impl ShardManifestStore {
     /// 2. Incrementing the writer epoch
     /// 3. Atomically writing the new manifest
     ///
-    /// If another writer has already claimed the shard (version conflict),
-    /// this fails immediately rather than retrying. This prevents "epoch wars"
-    /// where multiple writers keep fencing each other.
+    /// On version conflict, re-reads the manifest and only retries when
+    /// the latest writer_epoch is strictly less than the epoch we were
+    /// targeting — meaning the version was bumped by something other than
+    /// a real claim (a tailer cursor update or a concurrent
+    /// `initialize_shard` writing epoch 0). If the latest writer_epoch
+    /// is equal to or greater than our target, the target epoch is
+    /// already claimed and this call fails. This preserves the
+    /// no-epoch-war guarantee for real claimants while tolerating benign
+    /// version bumps.
     ///
     /// # Returns
     ///
@@ -371,48 +415,74 @@ impl ShardManifestStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if another writer already claimed the shard.
+    /// Returns an error if another writer claimed an equal-or-higher
+    /// epoch than our target, or if the manifest stays contended past
+    /// the retry budget.
     #[instrument(name = "manifest_claim_epoch", level = "info", skip_all, fields(shard_id = %self.shard_id, shard_spec_id))]
     pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
-        let current = self.read_latest().await?;
+        const MAX_CLAIM_RETRIES: usize = 16;
+        let mut last_write_err: Option<Error> = None;
+        for _ in 0..MAX_CLAIM_RETRIES {
+            let current = self.read_latest().await?;
 
-        let (next_version, next_epoch, base_manifest) = match current {
-            Some(m) => (m.version + 1, m.writer_epoch + 1, Some(m)),
-            None => (1, 1, None),
-        };
+            let (next_version, next_epoch, base_manifest) = match current {
+                Some(m) => (m.version + 1, m.writer_epoch + 1, Some(m)),
+                None => (1, 1, None),
+            };
 
-        let new_manifest = if let Some(base) = base_manifest {
-            ShardManifest {
-                version: next_version,
-                writer_epoch: next_epoch,
-                ..base
+            let new_manifest = if let Some(base) = base_manifest {
+                ShardManifest {
+                    version: next_version,
+                    writer_epoch: next_epoch,
+                    ..base
+                }
+            } else {
+                ShardManifest {
+                    shard_id: self.shard_id,
+                    version: next_version,
+                    shard_spec_id,
+                    shard_field_values: HashMap::new(),
+                    writer_epoch: next_epoch,
+                    replay_after_wal_entry_position: 0,
+                    wal_entry_position_last_seen: 0,
+                    current_generation: 1,
+                    flushed_generations: vec![],
+                }
+            };
+
+            match self.write(&new_manifest).await {
+                Ok(_) => {
+                    info!(
+                        "Claimed shard {} with epoch {} (version {})",
+                        self.shard_id, next_epoch, next_version
+                    );
+                    return Ok((next_epoch, new_manifest));
+                }
+                Err(write_err) => {
+                    let latest_epoch = self
+                        .read_latest()
+                        .await?
+                        .map(|m| m.writer_epoch)
+                        .unwrap_or(0);
+                    if latest_epoch >= next_epoch {
+                        return Err(Error::io(format!(
+                            "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
+                            self.shard_id, next_version, latest_epoch, next_epoch, write_err
+                        )));
+                    }
+                    last_write_err = Some(write_err);
+                }
             }
-        } else {
-            ShardManifest {
-                shard_id: self.shard_id,
-                version: next_version,
-                shard_spec_id,
-                writer_epoch: next_epoch,
-                replay_after_wal_entry_position: 0,
-                wal_entry_position_last_seen: 0,
-                current_generation: 1,
-                flushed_generations: vec![],
-            }
-        };
+        }
 
-        self.write(&new_manifest).await.map_err(|e| {
-            Error::io(format!(
-                "Failed to claim shard {} (version {}): another writer may have claimed it: {}",
-                self.shard_id, next_version, e
-            ))
-        })?;
-
-        info!(
-            "Claimed shard {} with epoch {} (version {})",
-            self.shard_id, next_epoch, next_version
-        );
-
-        Ok((next_epoch, new_manifest))
+        Err(Error::io(format!(
+            "Failed to claim shard {} after {} retries due to manifest contention: {}",
+            self.shard_id,
+            MAX_CLAIM_RETRIES,
+            last_write_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )))
     }
 
     /// Check if the given epoch has been fenced by a newer writer.
@@ -527,6 +597,7 @@ mod tests {
             shard_id,
             version,
             shard_spec_id: 0,
+            shard_field_values: HashMap::new(),
             writer_epoch: epoch,
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
@@ -611,5 +682,93 @@ mod tests {
         let manifest2 = create_test_manifest(shard_id, 1, 2);
         let result = manifest_store.write(&manifest2).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_shard_writes_v1_with_epoch_zero() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let mut field_values = HashMap::new();
+        field_values.insert("user_bucket".to_string(), 7i32.to_le_bytes().to_vec());
+
+        let manifest = manifest_store
+            .initialize_shard(3, field_values.clone())
+            .await
+            .unwrap();
+        assert_eq!(manifest.shard_id, shard_id);
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.writer_epoch, 0);
+        assert_eq!(manifest.shard_spec_id, 3);
+        assert_eq!(manifest.shard_field_values, field_values);
+
+        let loaded = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(loaded, manifest);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_shard_idempotent_on_match() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let mut field_values = HashMap::new();
+        field_values.insert("k".to_string(), b"v".to_vec());
+
+        let first = manifest_store
+            .initialize_shard(1, field_values.clone())
+            .await
+            .unwrap();
+        let second = manifest_store
+            .initialize_shard(1, field_values)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn test_claim_epoch_after_cursor_update() {
+        // After a tailer cursor update bumps the manifest version without
+        // claiming an epoch, the next claim_epoch should observe the new
+        // state and produce the next epoch — this guards against treating
+        // a cursor update as a real claimant.
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let (first_epoch, first) = manifest_store.claim_epoch(0).await.unwrap();
+        assert_eq!(first_epoch, 1);
+        assert_eq!(first.version, 1);
+
+        let mut cursor_update = first.clone();
+        cursor_update.version += 1;
+        cursor_update.wal_entry_position_last_seen = 42;
+        manifest_store.write(&cursor_update).await.unwrap();
+
+        let (second_epoch, second) = manifest_store.claim_epoch(0).await.unwrap();
+        assert_eq!(second_epoch, 2);
+        assert_eq!(second.version, 3);
+        assert_eq!(second.wal_entry_position_last_seen, 42);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_shard_rejects_conflict_with_mismatch() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        manifest_store
+            .initialize_shard(1, HashMap::new())
+            .await
+            .unwrap();
+
+        let mut other = HashMap::new();
+        other.insert("k".to_string(), b"v".to_vec());
+        let result = manifest_store.initialize_shard(1, other).await;
+        assert!(
+            result.is_err(),
+            "second initialize_shard with different fields must fail"
+        );
     }
 }

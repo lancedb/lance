@@ -42,7 +42,7 @@ fn bench_reader(c: &mut Criterion) {
             .block_on(ObjectStore::from_uri(&tmpdir.path_str()))
             .unwrap();
 
-        let file_path = base_path.child("foo.lance");
+        let file_path = base_path.clone().join("foo.lance");
         let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
 
         let mut writer = FileWriter::try_new(
@@ -200,7 +200,7 @@ fn get_cached_readers(
 
     // Create filename with version to avoid collisions
     let filename = format!("bench_{}.lance", version);
-    let file_path = base_path.child(filename.as_str());
+    let file_path = base_path.join(filename.as_str());
 
     // Generate data
     let data = lance_datagen::gen_batch()

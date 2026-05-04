@@ -45,13 +45,14 @@ A table has at most one MemWAL index. It stores:
 - **Configuration**: Shard specs defining how rows map to shards, and which indexes to maintain
 - **Merge progress**: Last generation merged to base table for each shard
 - **Index catchup progress**: Which merged generation each base table index has been rebuilt to cover
-- **Shard snapshots**: Snapshot of all shard states for read optimization
+- **Shard snapshots**: Point-in-time snapshot of shard states for read optimization
 
 The index is the source of truth for **configuration**, **merge progress** and **index catchup progress**
 Writers and mergers read the MemWAL index to get these configurations before writing.
 
 Each [shard's manifest](#shard-manifest) is authoritative for its own state.
-Readers use **shard snapshots** is a read-only optimization to see a point-in-time view of all shards without the need to open each shard manifest.
+Readers may use **shard snapshots** as a read-only optimization to see a point-in-time view of shards without opening each shard manifest.
+Readers that need the latest shard set must discover shard directories in storage and read each shard's latest manifest.
 
 See [MemWAL Index Details](#memwal-index-details) for the complete structure.
 
@@ -173,6 +174,7 @@ Each shard has a manifest file. This is the source of truth for the state of a s
 The manifest contains:
 
 - **Fencing state**: `writer_epoch` as the latest writer fencing token, see [Writer Fencing](#writer-fencing) for more details.
+- **Shard assignment**: `shard_spec_id` and `shard_field_values` record how this shard maps to its shard spec. `shard_field_values` is a map from shard field id to the raw Arrow scalar bytes of the computed value; the matching `ShardField.result_type` in the `ShardSpec` determines how to interpret each entry (e.g., 4 little-endian bytes for int32, raw UTF-8 bytes for utf8).
 - **WAL pointers**: `replay_after_wal_entry_position` (last entry position flushed to MemTable, 0-based), `wal_entry_position_last_seen` (last entry position seen at manifest update, 0-based)
 - **Generation trackers**: `current_generation` (next generation to flush), `flushed_generations` list of generation number and directory path pairs (e.g., generation 1 at `a1b2c3d4_gen_1`)
 
@@ -258,8 +260,17 @@ The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` pro
 
 ### Shard Identifier
 
-Each shard has a unique identifier across all shards following UUID v4 standard.
-When a new shard is created, it is assigned a new identifier.
+Each shard has a unique UUID identifier within the table.
+When a new shard is created, implementations may assign either a random UUID or
+a deterministic UUID derived from the shard assignment when deterministic
+writer fencing is required.
+
+### Shard Discovery
+
+The MemWAL index can store shard snapshots for read optimization, but those snapshots may lag the latest shard set.
+Implementations that need to discover the current shard set should list `_mem_wal/` shard directories and read each shard's latest [shard manifest](#shard-manifest).
+
+Each shard manifest records the shard UUID, shard spec ID, and computed shard field values needed to map the shard back to a shard spec assignment.
 
 ### Shard Spec
 
@@ -342,28 +353,25 @@ This file uses standard Lance format with the shard snapshot schema, enabling ef
 ### Shard Snapshot Arrow Schema
 
 Shard snapshots are stored as a Lance file with one row per shard.
-The schema has one column per `ShardManifest` field plus shard spec columns:
+The snapshot schema is optimized for shard discovery. Full mutable shard state
+remains in the authoritative shard manifest files.
 
-| Column                            | Type                                             | Description                                              |
-| --------------------------------- | ------------------------------------------------ | -------------------------------------------------------- |
-| `shard_id`                       | `fixed_size_binary(16)`                          | Shard UUID bytes                                        |
-| `version`                         | `uint64`                                         | Shard manifest version                                  |
-| `shard_spec_id`                  | `uint32`                                         | Shard spec ID (0 if manual)                             |
-| `writer_epoch`                    | `uint64`                                         | Writer fencing token                                     |
-| `replay_after_wal_entry_position` | `uint64`                                         | Last WAL entry position (0-based) flushed to MemTable    |
-| `wal_entry_position_last_seen`    | `uint64`                                         | Last WAL entry position (0-based) seen (hint)            |
-| `current_generation`              | `uint64`                                         | Next generation to flush                                 |
-| `flushed_generations`             | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths                                   |
-| `region_field_{field_id}`         | varies                                           | Shard field value (one column per field in shard spec) |
+| Column                   | Type          | Description                                                                                                |
+| ------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `shard_id`               | `utf8`        | Shard UUID string                                                                                          |
+| `shard_spec_id`          | `uint32`      | Shard spec ID (0 if manual)                                                                                |
+| `shard_field_{field_id}` | varies        | One column per shard field defined in the shard spec, typed to match the field's `ShardField.result_type`. |
 
 For example, with a shard spec containing a field `user_bucket` of type `int32`:
 
 | Column                     | Type    | Description                  |
 | -------------------------- | ------- | ---------------------------- |
 | ...                        | ...     | (base columns above)         |
-| `region_field_user_bucket` | `int32` | Bucket value for this shard |
+| `shard_field_user_bucket`  | `int32` | Bucket value for this shard |
 
-This schema directly corresponds to the fields in the `ShardManifest` protobuf message plus the computed shard field values.
+This schema records the fields needed to map each shard back to its shard spec
+assignment. Readers that need fencing epochs, WAL positions, or flushed
+generation state must read the latest shard manifests directly.
 
 ## Storage Layout
 

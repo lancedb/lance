@@ -1078,7 +1078,11 @@ async fn test_replace_dataset() {
         .await
         .unwrap();
 
-    ds.object_store().remove_dir_all(test_path).await.unwrap();
+    ds.object_store
+        .as_ref()
+        .remove_dir_all(test_path)
+        .await
+        .unwrap();
 
     let ds2 = InsertBuilder::new(&test_uri)
         .execute(vec![data2.clone()])
@@ -1899,7 +1903,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         ],
     )
     .unwrap();
-    let replacement_path = dataset.data_dir().child("replacement.lance");
+    let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
         .object_store
         .create(&replacement_path)
@@ -2076,7 +2080,7 @@ async fn test_vector_index_after_data_replacement() {
     )
     .unwrap();
 
-    let replacement_path = dataset.data_dir().child("replacement.lance");
+    let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
         .object_store
         .create(&replacement_path)

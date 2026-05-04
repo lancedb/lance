@@ -48,6 +48,8 @@ pub(crate) struct FragmentMergeResult {
 pub(crate) struct FragmentUpdateResult {
     updated_fragment: Fragment,
     fields_modified: Vec<u32>,
+    /// Physical row offsets that received column updates (from `_rowaddr` low bits).
+    updated_row_offsets: Vec<i64>,
 }
 
 //////////////////
@@ -490,11 +492,13 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let (updated_fragment, fields_modified) =
-        RT.block_on(fragment.update_columns(reader, &left_on_str, &right_on_str))?;
+    let r =
+        RT.block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
+    let updated_row_offsets: Vec<i64> = r.matched_offsets.iter().map(|o| o as i64).collect();
     let result = FragmentUpdateResult {
-        updated_fragment,
-        fields_modified,
+        updated_fragment: r.fragment,
+        fields_modified: r.fields_modified,
+        updated_row_offsets,
     };
     result.into_java(env)
 }
@@ -542,7 +546,7 @@ const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResul
 const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/FragmentMetadata;Lorg/lance/schema/LanceSchema;)V";
 const FRAGMENT_UPDATE_RESULT_CLASS: &str = "org/lance/fragment/FragmentUpdateResult";
-const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J)V";
+const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J[J)V";
 
 impl IntoJava for &FragmentMergeResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -563,12 +567,14 @@ impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let java_updated_fragment = self.updated_fragment.into_java(env)?;
         let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
+        let java_updated_row_offsets = JLance(self.updated_row_offsets.clone()).into_java(env)?;
         Ok(env.new_object(
             FRAGMENT_UPDATE_RESULT_CLASS,
             FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
             &[
                 JValueGen::Object(&java_updated_fragment),
                 JValueGen::Object(&java_fields_modified),
+                JValueGen::Object(&java_updated_row_offsets),
             ],
         )?)
     }

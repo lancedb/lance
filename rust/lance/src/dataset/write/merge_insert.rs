@@ -938,7 +938,7 @@ impl MergeInsertJob {
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
-        let task_limit = dataset.object_store().io_parallelism();
+        let task_limit = dataset.object_store.as_ref().io_parallelism();
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
@@ -1650,6 +1650,7 @@ impl MergeInsertJob {
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
+                updated_fragment_offsets: None,
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1724,6 +1725,7 @@ impl MergeInsertJob {
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: None, // not implemented for v1
+                updated_fragment_offsets: None,
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
@@ -4579,7 +4581,7 @@ mod tests {
             .await
             .unwrap();
         let tx_path = committed.manifest().transaction_file.clone().unwrap();
-        let tx_read = read_transaction_file(dataset.object_store(), &dataset.base, &tx_path)
+        let tx_read = read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
             .await
             .unwrap();
         // Check that inserted_rows_filter is present in the Operation::Update

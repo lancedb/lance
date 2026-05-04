@@ -113,7 +113,25 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
 }
 
 fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
-    let operator = Operator::from_iter::<Huggingface>(config_map)
+    let repo_type = config_map
+        .get("repo_type")
+        .ok_or_else(|| Error::invalid_input("Huggingface repo_type is required"))?;
+    let repo_id = config_map
+        .get("repo_id")
+        .ok_or_else(|| Error::invalid_input("Huggingface repo_id is required"))?;
+
+    let mut builder = Huggingface::default().repo_type(repo_type).repo_id(repo_id);
+    if let Some(revision) = config_map.get("revision") {
+        builder = builder.revision(revision);
+    }
+    if let Some(root) = config_map.get("root") {
+        builder = builder.root(root);
+    }
+    if let Some(token) = config_map.get("token") {
+        builder = builder.token(token);
+    }
+
+    let operator = Operator::new(builder)
         .map_err(|e| {
             Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
         })?

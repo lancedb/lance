@@ -140,7 +140,7 @@ impl DatasetPreFilter {
                     let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
                     Ok::<_, crate::Error>((row_ids?, deletion_vector?))
                 })
-                .buffer_unordered(dataset.object_store().io_parallelism())
+                .buffer_unordered(dataset.object_store.as_ref().io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await
         }
@@ -241,12 +241,20 @@ impl DatasetPreFilter {
         // outside the index bitmap. This can happen when a fragment's data was
         // modified but the index was not rewritten (e.g. after DataReplacement
         // or partial merge_insert).
-        let needs_allow_list = if restrict_to_fragments {
+        //
+        // We materialize the set of non-index fragments here so the slow path
+        // below can fold them into the deletion mask as Full blocks instead of
+        // computing AllowList(Full) - BlockList(Partial), which forces
+        // RoaringBitmap::full() per fragment in RowAddrTreeMap::sub_assign and
+        // is the dominant cost on every merge_insert call.
+        let non_index_frags: Option<RoaringBitmap> = if restrict_to_fragments {
             let dataset_frag_ids: RoaringBitmap = frag_map.keys().copied().collect();
-            !dataset_frag_ids.is_subset(&fragments)
+            let outside = &dataset_frag_ids - &fragments;
+            (!outside.is_empty()).then_some(outside)
         } else {
-            false
+            None
         };
+        let needs_allow_list = non_index_frags.is_some();
         for frag_id in fragments.iter() {
             let frag = frag_map.get(&frag_id);
             if let Some(frag) = frag {
@@ -270,21 +278,29 @@ impl DatasetPreFilter {
             }
             Some(async move { Ok(Arc::new(RowAddrMask::from_allowed(allow_list))) }.boxed())
         } else {
-            // There are deletions/missing frags. Build the deletion mask and
-            // optionally combine it with the fragment allow-list.
+            // There are deletions/missing frags. Build the deletion mask and,
+            // if needed, fold the non-index fragments into it as Full blocks.
+            // Equivalent to BlockList(deletions) | BlockList(non_index) — but
+            // expressed via insert_fragment so we never materialize a
+            // RoaringBitmap::full() per fragment.
             let fut =
                 Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files);
-            if needs_allow_list {
+            if let Some(non_index_frags) = non_index_frags {
                 Some(
                     async move {
                         let deletion_mask = fut.await?;
-                        let mut allow_list = RowAddrTreeMap::new();
-                        for frag_id in fragments.iter() {
-                            allow_list.insert_fragment(frag_id);
+                        let mut combined = match &*deletion_mask {
+                            RowAddrMask::BlockList(b) => b.clone(),
+                            RowAddrMask::AllowList(_) => {
+                                // do_create_deletion_mask only returns BlockList; this is
+                                // defensive and should be unreachable.
+                                return Ok(deletion_mask);
+                            }
+                        };
+                        for frag_id in non_index_frags.iter() {
+                            combined.insert_fragment(frag_id);
                         }
-                        Ok(Arc::new(
-                            (*deletion_mask).clone() & RowAddrMask::from_allowed(allow_list),
-                        ))
+                        Ok(Arc::new(RowAddrMask::from_block(combined)))
                     }
                     .boxed(),
                 )

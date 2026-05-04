@@ -406,7 +406,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let index_dir = self
                     .dataset
                     .indices_dir()
-                    .child(output_index_uuid.to_string());
+                    .join(output_index_uuid.to_string());
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
@@ -445,7 +445,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     todo!("create empty vector index when train=false");
                 }
                 // Capture file sizes after vector index creation
-                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let index_dir = self.dataset.indices_dir().join(index_id.to_string());
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
@@ -748,7 +748,7 @@ impl<'a> IndexSegmentBuilder<'a> {
             | IndexType::IvfHnswPq
             | IndexType::IvfHnswSq => {
                 crate::index::vector::ivf::build_segment(
-                    self.dataset.object_store(),
+                    self.dataset.object_store.as_ref(),
                     &self.dataset.indices_dir(),
                     plan,
                 )
@@ -1473,8 +1473,8 @@ mod tests {
         committed_index_metadata.fragment_bitmap = Some(fragment_ids.iter().copied().collect());
         committed_index_metadata.files = Some(
             list_index_files_with_sizes(
-                dataset.object_store(),
-                &dataset.indices_dir().child(shared_uuid.clone()),
+                dataset.object_store.as_ref(),
+                &dataset.indices_dir().clone().join(shared_uuid.clone()),
             )
             .await
             .unwrap(),
@@ -1586,9 +1586,17 @@ mod tests {
                     .unwrap();
             let segment_index = dataset
                 .indices_dir()
-                .child(segment.uuid.to_string())
-                .child(crate::index::INDEX_FILE_NAME);
-            assert!(dataset.object_store().exists(&segment_index).await.unwrap());
+                .clone()
+                .join(segment.uuid.to_string())
+                .join(crate::index::INDEX_FILE_NAME);
+            assert!(
+                dataset
+                    .object_store
+                    .as_ref()
+                    .exists(&segment_index)
+                    .await
+                    .unwrap()
+            );
             input_segments.push(segment);
         }
 
@@ -1848,9 +1856,17 @@ mod tests {
         for segment in &segments {
             let metadata_path = dataset
                 .indices_dir()
-                .child(segment.uuid().to_string())
-                .child(lance_index::scalar::inverted::METADATA_FILE);
-            assert!(dataset.object_store().exists(&metadata_path).await.unwrap());
+                .clone()
+                .join(segment.uuid().to_string())
+                .join(lance_index::scalar::inverted::METADATA_FILE);
+            assert!(
+                dataset
+                    .object_store
+                    .as_ref()
+                    .exists(&metadata_path)
+                    .await
+                    .unwrap()
+            );
         }
 
         dataset

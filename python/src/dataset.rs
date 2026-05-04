@@ -146,6 +146,14 @@ fn configure_read_blobs_builder(
     builder
 }
 
+fn stats_log_interval_from_millis(ms: u64) -> Option<std::time::Duration> {
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
+
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
     if reader.is_instance_of::<Scanner>() {
@@ -354,6 +362,25 @@ impl MergeInsertBuilder {
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    /// Mark MemWAL generations as merged into the base table.
+    ///
+    /// Call this when executing a merge_insert that incorporates MemWAL
+    /// flushed generation data. This updates the MemWAL generation tracking
+    /// to prevent duplicate merges.
+    pub fn mark_generations_as_merged<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        generations: Vec<Bound<'a, crate::mem_wal::PyMergedGeneration>>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        use lance_index::mem_wal::MergedGeneration;
+
+        let gens: Vec<MergedGeneration> = generations
+            .iter()
+            .map(|g| g.borrow().to_lance())
+            .collect::<PyResult<_>>()?;
+        slf.builder.mark_generations_as_merged(gens);
+        Ok(slf)
     }
 }
 
@@ -2912,15 +2939,21 @@ impl Dataset {
     }
 
     /// Get a snapshot of current IO statistics without resetting counters
-    fn io_stats_snapshot(&self) -> IoStats {
-        let stats = self.ds.object_store().io_stats_snapshot();
-        IoStats::from_lance(stats)
+    fn io_stats_snapshot(&self) -> PyResult<IoStats> {
+        let object_store = rt()
+            .block_on(None, self.ds.object_store(None))?
+            .infer_error()?;
+        let stats = object_store.io_stats_snapshot();
+        Ok(IoStats::from_lance(stats))
     }
 
     /// Get incremental IO statistics for this dataset
-    fn io_stats_incremental(&self) -> IoStats {
-        let stats = self.ds.object_store().io_stats_incremental();
-        IoStats::from_lance(stats)
+    fn io_stats_incremental(&self) -> PyResult<IoStats> {
+        let object_store = rt()
+            .block_on(None, self.ds.object_store(None))?
+            .infer_error()?;
+        let stats = object_store.io_stats_incremental();
+        Ok(IoStats::from_lance(stats))
     }
 
     #[staticmethod]
@@ -3508,6 +3541,165 @@ impl Dataset {
         let ds = self.ds.as_ref().clone();
         let builder = ds.delta();
         Ok(DatasetDeltaBuilder { builder })
+    }
+
+    /// Initialize MemWAL on this dataset.
+    ///
+    /// Must be called once before any `mem_wal_writer()` calls.
+    /// Requires the dataset schema to have at least one field with
+    /// the `lance-schema:unenforced-primary-key` metadata.
+    #[pyo3(signature=(maintained_indexes=None, region_spec=None))]
+    fn initialize_mem_wal(
+        &mut self,
+        py: Python<'_>,
+        maintained_indexes: Option<Vec<String>>,
+        region_spec: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+        use lance_index::mem_wal::{ShardField as RegionField, ShardSpec as RegionSpec};
+        use std::collections::HashMap;
+
+        let region_spec_rust = if let Some(spec) = region_spec {
+            let spec_id: u32 = spec.getattr("spec_id")?.extract()?;
+            let fields_py: Vec<Bound<'_, PyAny>> = spec.getattr("fields")?.extract()?;
+            let fields = fields_py
+                .iter()
+                .map(|f| -> PyResult<RegionField> {
+                    Ok(RegionField {
+                        field_id: f.getattr("field_id")?.extract()?,
+                        source_ids: f.getattr("source_ids")?.extract()?,
+                        transform: f.getattr("transform")?.extract()?,
+                        expression: f.getattr("expression")?.extract()?,
+                        result_type: f.getattr("result_type")?.extract()?,
+                        parameters: f
+                            .getattr("parameters")?
+                            .extract::<HashMap<String, String>>()?,
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            Some(RegionSpec { spec_id, fields })
+        } else {
+            None
+        };
+
+        let config = lance::dataset::mem_wal::MemWalConfig {
+            shard_spec: region_spec_rust,
+            maintained_indexes: maintained_indexes.unwrap_or_default(),
+        };
+        let mut ds = Arc::clone(&self.ds);
+        let new_ds = rt()
+            .block_on(Some(py), async move {
+                Arc::make_mut(&mut ds).initialize_mem_wal(config).await?;
+                Ok::<Arc<LanceDataset>, lance_core::Error>(ds)
+            })?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        self.ds = new_ds;
+        Ok(())
+    }
+
+    /// Get a RegionWriter for the specified region.
+    ///
+    /// `initialize_mem_wal()` must be called before using this method.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(
+        region_id,
+        *,
+        durable_write=None,
+        sync_indexed_write=None,
+        max_wal_buffer_size=None,
+        max_wal_flush_interval_ms=None,
+        max_memtable_size=None,
+        max_memtable_rows=None,
+        max_memtable_batches=None,
+        max_unflushed_memtable_bytes=None,
+        ivf_index_partition_capacity_safety_factor=None,
+        manifest_scan_batch_size=None,
+        async_index_buffer_rows=None,
+        async_index_interval_ms=None,
+        backpressure_log_interval_ms=None,
+        stats_log_interval_ms=None,
+    ))]
+    fn mem_wal_writer(
+        &self,
+        py: Python<'_>,
+        region_id: String,
+        durable_write: Option<bool>,
+        sync_indexed_write: Option<bool>,
+        max_wal_buffer_size: Option<usize>,
+        max_wal_flush_interval_ms: Option<u64>,
+        max_memtable_size: Option<usize>,
+        max_memtable_rows: Option<usize>,
+        max_memtable_batches: Option<usize>,
+        max_unflushed_memtable_bytes: Option<usize>,
+        ivf_index_partition_capacity_safety_factor: Option<usize>,
+        manifest_scan_batch_size: Option<usize>,
+        async_index_buffer_rows: Option<usize>,
+        async_index_interval_ms: Option<u64>,
+        backpressure_log_interval_ms: Option<u64>,
+        stats_log_interval_ms: Option<u64>,
+    ) -> PyResult<crate::mem_wal::PyRegionWriter> {
+        use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig as RegionWriterConfig};
+
+        let uuid = uuid::Uuid::parse_str(&region_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
+
+        let mut config = RegionWriterConfig::default();
+        if let Some(v) = durable_write {
+            config = config.with_durable_write(v);
+        }
+        if let Some(v) = sync_indexed_write {
+            config = config.with_sync_indexed_write(v);
+        }
+        if let Some(v) = max_wal_buffer_size {
+            config = config.with_max_wal_buffer_size(v);
+        }
+        if let Some(v) = max_wal_flush_interval_ms {
+            config = config.with_max_wal_flush_interval(std::time::Duration::from_millis(v));
+        }
+        if let Some(v) = max_memtable_size {
+            config = config.with_max_memtable_size(v);
+        }
+        if let Some(v) = max_memtable_rows {
+            config = config.with_max_memtable_rows(v);
+        }
+        if let Some(v) = max_memtable_batches {
+            config = config.with_max_memtable_batches(v);
+        }
+        if let Some(v) = max_unflushed_memtable_bytes {
+            config = config.with_max_unflushed_memtable_bytes(v);
+        }
+        if let Some(v) = ivf_index_partition_capacity_safety_factor {
+            config = config.with_ivf_index_partition_capacity_safety_factor(v);
+        }
+        if let Some(v) = manifest_scan_batch_size {
+            config = config.with_manifest_scan_batch_size(v);
+        }
+        if let Some(v) = async_index_buffer_rows {
+            config = config.with_async_index_buffer_rows(v);
+        }
+        if let Some(v) = async_index_interval_ms {
+            config = config.with_async_index_interval(std::time::Duration::from_millis(v));
+        }
+        if let Some(v) = backpressure_log_interval_ms {
+            config = config.with_backpressure_log_interval(std::time::Duration::from_millis(v));
+        }
+        if let Some(v) = stats_log_interval_ms {
+            config = config.with_stats_log_interval(stats_log_interval_from_millis(v));
+        }
+
+        let ds = self.ds.clone();
+        let writer = rt()
+            .block_on(
+                Some(py),
+                async move { ds.mem_wal_writer(uuid, config).await },
+            )?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+        Ok(crate::mem_wal::PyRegionWriter::new(
+            writer,
+            uuid,
+            self.ds.clone(),
+        ))
     }
 }
 

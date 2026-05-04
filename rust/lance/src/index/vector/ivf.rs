@@ -407,11 +407,11 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store();
+    let object_store = dataset.object_store.as_ref();
     let index_file = dataset
         .indices_dir()
-        .child(new_uuid.to_string())
-        .child(INDEX_FILE_NAME);
+        .join(new_uuid.to_string())
+        .join(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
 
     let first_idx = existing_indices[0]
@@ -440,8 +440,8 @@ pub(crate) async fn optimize_vector_indices(
     {
         let aux_file = dataset
             .indices_dir()
-            .child(new_uuid.to_string())
-            .child(INDEX_AUXILIARY_FILE_NAME);
+            .join(new_uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
             Arc::new(dataset),
@@ -482,7 +482,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let existing_indices = existing_indices.to_vec();
 
     let new_uuid = Uuid::new_v4();
-    let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
     let ivf_model = existing_indices[0].ivf_model();
     let quantizer = existing_indices[0].quantizer();
     let distance_type = existing_indices[0].metric_type();
@@ -1565,7 +1565,7 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     write_ivf_pq_file(
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         dataset.indices_dir(),
         column,
         index_name,
@@ -1695,7 +1695,7 @@ pub(crate) async fn remap_index_file_v3(
     column: String,
 ) -> Result<()> {
     let dataset = dataset.clone();
-    let index_dir = dataset.indices_dir().child(new_uuid);
+    let index_dir = dataset.indices_dir().join(new_uuid);
     let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
     match index.sub_index_type() {
         (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
@@ -1795,9 +1795,9 @@ pub(crate) async fn remap_index_file(
     column: String,
     transforms: Vec<pb::Transform>,
 ) -> Result<()> {
-    let object_store = dataset.object_store();
-    let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
-    let new_path = dataset.indices_dir().child(new_uuid).child(INDEX_FILE_NAME);
+    let object_store = dataset.object_store.as_ref();
+    let old_path = dataset.indices_dir().join(old_uuid).join(INDEX_FILE_NAME);
+    let new_path = dataset.indices_dir().join(new_uuid).join(INDEX_FILE_NAME);
 
     let reader: Arc<dyn Reader> = object_store.open(&old_path).await?.into();
     let mut writer = object_store.create(&new_path).await?;
@@ -1864,7 +1864,7 @@ async fn write_ivf_pq_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let path = index_dir.child(uuid).child(INDEX_FILE_NAME);
+    let path = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
     let start = std::time::Instant::now();
@@ -1915,11 +1915,11 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
-    let obj_store = dataset.object_store();
+    let obj_store = dataset.object_store.as_ref();
     let path = dataset
         .indices_dir()
-        .child(index_id.to_string())
-        .child("index.idx");
+        .join(index_id.to_string())
+        .join("index.idx");
     let mut writer = obj_store.create(&path).await?;
     write_pq_partitions(writer.as_mut(), &mut ivf, Some(streams), None).await?;
 
@@ -1957,8 +1957,8 @@ async fn write_ivf_hnsw_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store();
-    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let object_store = dataset.object_store.as_ref();
+    let path = dataset.indices_dir().join(uuid).join(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
@@ -1979,8 +1979,8 @@ async fn write_ivf_hnsw_file(
 
     let aux_path = dataset
         .indices_dir()
-        .child(uuid)
-        .child(INDEX_AUXILIARY_FILE_NAME);
+        .join(uuid)
+        .join(INDEX_AUXILIARY_FILE_NAME);
     let aux_writer = object_store.create(&aux_path).await?;
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
@@ -2178,7 +2178,7 @@ pub(crate) async fn build_segment(
         return Ok(built_segment);
     }
 
-    let final_dir = indices_dir.child(built_segment.uuid().to_string());
+    let final_dir = indices_dir.clone().join(built_segment.uuid().to_string());
     merge_segments_to_dir(
         object_store,
         indices_dir,
@@ -2236,7 +2236,7 @@ pub(crate) async fn merge_segments_with_progress(
 
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
-    let final_dir = indices_dir.child(segment_uuid.to_string());
+    let final_dir = indices_dir.clone().join(segment_uuid.to_string());
     merge_segments_to_dir(
         object_store,
         indices_dir,
@@ -2285,16 +2285,18 @@ async fn merge_segments_to_dir(
         .iter()
         .map(|segment| {
             indices_dir
-                .child(segment.uuid.to_string())
-                .child(INDEX_AUXILIARY_FILE_NAME)
+                .clone()
+                .join(segment.uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME)
         })
         .collect::<Vec<_>>();
     let source_index_paths = segments
         .iter()
         .map(|segment| {
             indices_dir
-                .child(segment.uuid.to_string())
-                .child(INDEX_FILE_NAME)
+                .clone()
+                .join(segment.uuid.to_string())
+                .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
 
@@ -2399,7 +2401,7 @@ async fn write_root_vector_index_from_auxiliary(
     centroid_source_index_paths: &[Path],
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
-    let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
@@ -2490,7 +2492,7 @@ async fn write_root_vector_index_from_auxiliary(
         };
 
     // Write root index.idx via V2 writer so downstream opens through v2 path.
-    let index_path = index_dir.child(INDEX_FILE_NAME);
+    let index_path = index_dir.clone().join(INDEX_FILE_NAME);
     let obj_writer = object_store.create(&index_path).await?;
     progress
         .stage_start("write_root_index", Some(1), "files")
@@ -4392,11 +4394,11 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -4413,7 +4415,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -4423,7 +4425,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -4467,11 +4469,11 @@ mod tests {
             .clone();
 
         // Reset IO stats after migration and sampling.
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -4487,7 +4489,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -4497,7 +4499,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached).
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 

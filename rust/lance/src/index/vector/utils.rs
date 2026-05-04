@@ -490,12 +490,12 @@ fn sample_training_data_scan(
     num_rows: usize,
     byte_width: usize,
 ) -> Result<crate::dataset::scanner::DatasetRecordBatchStream> {
-    let block_size = dataset.object_store().block_size();
+    let block_size = dataset.object_store.as_ref().block_size();
     let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
     Ok(dataset.take_scan(
         Box::pin(futures::stream::iter(ranges).map(Ok)),
         Arc::new(dataset.schema().project(&[column])?),
-        dataset.object_store().io_parallelism(),
+        dataset.object_store.as_ref().io_parallelism(),
     ))
 }
 

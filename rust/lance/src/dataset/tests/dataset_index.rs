@@ -2859,10 +2859,10 @@ async fn test_index_inherits_dataset_file_version() {
         .unwrap();
 
     // Get the index directory
-    let index_dir = dataset.indices_dir().child(index_meta.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
 
     // Open the index file and check its version
-    let index_path = index_dir.child("index.idx");
+    let index_path = index_dir.clone().join("index.idx");
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -2891,7 +2891,7 @@ async fn test_index_inherits_dataset_file_version() {
     );
 
     // Also check the auxiliary file if it exists
-    let aux_path = index_dir.child("auxiliary.idx");
+    let aux_path = index_dir.clone().join("auxiliary.idx");
     if dataset
         .object_store
         .exists(&aux_path)
@@ -2967,10 +2967,10 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
         .unwrap();
 
     // Get the index directory
-    let index_dir = dataset.indices_dir().child(index_meta.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
 
     // Open the index file and check its version
-    let index_path = index_dir.child("index.idx");
+    let index_path = index_dir.clone().join("index.idx");
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),

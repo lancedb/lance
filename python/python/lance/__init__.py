@@ -33,6 +33,17 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
+from .mem_wal import (
+    ExecutionPlan,
+    LsmPointLookupPlanner,
+    LsmScanner,
+    LsmVectorSearchPlanner,
+    MergedGeneration,
+    RegionField,
+    RegionSnapshot,
+    RegionSpec,
+    RegionWriter,
+)
 from .namespace import (
     DescribeTableRequest,
     LanceNamespace,
@@ -83,6 +94,15 @@ __all__ = [
     "write_dataset",
     "FFILanceTableProvider",
     "IndexProgress",
+    "ExecutionPlan",
+    "LsmPointLookupPlanner",
+    "LsmScanner",
+    "LsmVectorSearchPlanner",
+    "MergedGeneration",
+    "RegionField",
+    "RegionSpec",
+    "RegionSnapshot",
+    "RegionWriter",
 ]
 
 

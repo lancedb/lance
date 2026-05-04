@@ -843,20 +843,20 @@ impl BranchIdentifier {
 }
 
 pub fn base_tags_path(base_path: &Path) -> Path {
-    base_path.child("_refs").child("tags")
+    base_path.clone().join("_refs").join("tags")
 }
 
 pub fn base_branches_contents_path(base_path: &Path) -> Path {
-    base_path.child("_refs").child("branches")
+    base_path.clone().join("_refs").join("branches")
 }
 
 pub fn tag_path(base_path: &Path, branch: &str) -> Path {
-    base_tags_path(base_path).child(format!("{}.json", branch))
+    base_tags_path(base_path).join(format!("{}.json", branch))
 }
 
 // Note: child will encode '/' to '%2F'
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
-    base_branches_contents_path(base_path).child(format!("{}.json", branch))
+    base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
 
 pub(crate) fn normalize_branch(branch: Option<&str>) -> String {

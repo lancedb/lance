@@ -202,6 +202,14 @@ impl IntoJava for JLance<Vec<u32>> {
     }
 }
 
+impl IntoJava for JLance<Vec<i64>> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let arr = env.new_long_array(self.0.len() as i32)?;
+        env.set_long_array_region(&arr, 0, &self.0)?;
+        Ok(arr.into())
+    }
+}
+
 impl IntoJava for JLance<usize> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0 as i64)])?)

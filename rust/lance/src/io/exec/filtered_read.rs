@@ -657,7 +657,10 @@ impl FilteredReadStream {
     ) -> Vec<ScopedFragmentRead> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
-                std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
+                std::cmp::max(
+                    dataset.object_store.as_ref().block_size() / 4,
+                    BATCH_SIZE_FALLBACK,
+                )
             }) as u32
         });
         let projection = Arc::new(options.projection.clone());

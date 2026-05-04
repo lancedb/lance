@@ -525,8 +525,9 @@ async fn do_load_shuffled_vectors(
     .infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    let index_dir = ds.indices_dir().child(index_id.to_string());
-    let files = list_index_files_with_sizes(ds.object_store(), &index_dir)
+    let index_dir = ds.indices_dir().clone().join(index_id.to_string());
+    let object_store = ds.object_store(None).await.infer_error()?;
+    let files = list_index_files_with_sizes(object_store.as_ref(), &index_dir)
         .await
         .infer_error()?;
     let metadata = IndexMetadata {
