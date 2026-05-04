@@ -235,7 +235,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         };
 
         if Self::can_accelerate_queries(&index_details) {
-            Some(Box::new(FtsQueryParser::new(index_name)))
+            Some(Box::new(FtsQueryParser::new(
+                index_name,
+                self.name().to_string(),
+            )))
         } else {
             None
         }
