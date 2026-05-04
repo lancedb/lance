@@ -191,7 +191,8 @@ public abstract class FullTextQuery {
 
     @Override
     public int hashCode() {
-      return Objects.hash(queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
+      return Objects.hash(
+          queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
     }
 
     @Override
