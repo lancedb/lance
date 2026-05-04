@@ -707,7 +707,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-        let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
+        let uri = index_dir.clone().join(uuid.as_str()).join(INDEX_FILE_NAME);
         let cached_size = file_sizes
             .get(INDEX_FILE_NAME)
             .map(|&size| CachedFileSize::new(size))
@@ -755,8 +755,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             scheduler
                 .open_file(
                     &index_dir
-                        .child(uuid.as_str())
-                        .child(INDEX_AUXILIARY_FILE_NAME),
+                        .clone()
+                        .join(uuid.as_str())
+                        .join(INDEX_AUXILIARY_FILE_NAME),
                     &aux_cached_size,
                 )
                 .await?,
@@ -776,8 +777,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
             .await;
         let aux_path = index_dir
-            .child(uuid.as_str())
-            .child(INDEX_AUXILIARY_FILE_NAME);
+            .clone()
+            .join(uuid.as_str())
+            .join(INDEX_AUXILIARY_FILE_NAME);
         file_metadata_cache
             .with_key_prefix(aux_path.as_ref())
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
@@ -1460,7 +1462,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let mut parts: Vec<_> = index_path.parts().collect();
     parts.pop();
     let dir: Path = parts.into_iter().collect();
-    let aux_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
     let readers_key = CachedIndexReadersKey {
         uuid: state.uuid.clone(),
@@ -1663,8 +1665,8 @@ mod tests {
     ) -> RabitQuantizationMetadata {
         let index_path = dataset
             .indices_dir()
-            .child(index_uuid)
-            .child(INDEX_AUXILIARY_FILE_NAME);
+            .join(index_uuid)
+            .join(INDEX_AUXILIARY_FILE_NAME);
         let file_scheduler = scheduler
             .open_file(&index_path, &CachedFileSize::unknown())
             .await
@@ -1690,8 +1692,8 @@ mod tests {
     ) -> ScalarQuantizationMetadata {
         let index_path = dataset
             .indices_dir()
-            .child(index_uuid)
-            .child(INDEX_AUXILIARY_FILE_NAME);
+            .join(index_uuid)
+            .join(INDEX_AUXILIARY_FILE_NAME);
         let file_scheduler = scheduler
             .open_file(&index_path, &CachedFileSize::unknown())
             .await
@@ -2859,8 +2861,9 @@ mod tests {
         for segment in &segments {
             let segment_index = ds_split
                 .indices_dir()
-                .child(segment.uuid().to_string())
-                .child(crate::index::INDEX_FILE_NAME);
+                .clone()
+                .join(segment.uuid().to_string())
+                .join(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
                     .object_store
@@ -4465,20 +4468,20 @@ mod tests {
         use crate::dataset::transaction::{Operation, Transaction};
 
         let obj_store = Arc::new(ObjectStore::local());
-        let old_dir = dataset.indices_dir().child(old_meta.uuid.to_string());
+        let old_dir = dataset.indices_dir().join(old_meta.uuid.to_string());
         let new_uuid = uuid::Uuid::new_v4();
-        let new_dir = dataset.indices_dir().child(new_uuid.to_string());
+        let new_dir = dataset.indices_dir().join(new_uuid.to_string());
 
         // Copy the main index file to the new directory unchanged.
         obj_store
             .copy(
-                &old_dir.child(super::INDEX_FILE_NAME),
-                &new_dir.child(super::INDEX_FILE_NAME),
+                &old_dir.clone().join(super::INDEX_FILE_NAME),
+                &new_dir.clone().join(super::INDEX_FILE_NAME),
             )
             .await?;
 
         // Read the original auxiliary file.
-        let old_aux_path = old_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let old_aux_path = old_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let scheduler =
             ScanScheduler::new(obj_store.clone(), SchedulerConfig::default_for_testing());
         let reader = FileReader::try_open(
@@ -4497,7 +4500,7 @@ mod tests {
         let batch = reader
             .read_range(0..reader.num_rows() as usize, None)
             .await?;
-        let new_aux_path = new_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut writer = FileWriter::try_new(
             obj_store.create(&new_aux_path).await?,
             batch.schema_ref().as_ref().try_into()?,
@@ -4568,10 +4571,10 @@ mod tests {
             scheduler: Arc<ScanScheduler>,
         ) -> ProductQuantizationMetadata {
             let index = dataset.load_indices().await.unwrap();
-            let index_path = dataset.indices_dir().child(index[0].uuid.to_string());
+            let index_path = dataset.indices_dir().join(index[0].uuid.to_string());
             let file_scheduler = scheduler
                 .open_file(
-                    &index_path.child(INDEX_AUXILIARY_FILE_NAME),
+                    &index_path.clone().join(INDEX_AUXILIARY_FILE_NAME),
                     &CachedFileSize::unknown(),
                 )
                 .await

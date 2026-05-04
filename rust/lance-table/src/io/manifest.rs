@@ -8,6 +8,7 @@ use lance_arrow::DataTypeExt;
 use lance_file::{
     previous::writer::ManifestProvider as PreviousManifestProvider, version::LanceFileVersion,
 };
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use std::collections::HashMap;

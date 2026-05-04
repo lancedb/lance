@@ -30,10 +30,13 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
+#[cfg(test)]
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+    UploadPart,
 };
 use rand::Rng;
 use tokio::sync::Mutex;
@@ -615,12 +618,6 @@ impl AimdThrottledStore {
 #[async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for AimdThrottledStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        self.write
-            .throttled(|| self.target.put(location, bytes.clone()))
-            .await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -630,17 +627,6 @@ impl ObjectStore for AimdThrottledStore {
         self.write
             .throttled(|| self.target.put_opts(location, bytes.clone(), opts.clone()))
             .await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-        let target = self
-            .write
-            .throttled(|| self.target.put_multipart(location))
-            .await?;
-        Ok(Box::new(ThrottledMultipartUpload {
-            target,
-            write: Arc::clone(&self.write),
-        }))
     }
 
     async fn put_multipart_opts(
@@ -658,19 +644,9 @@ impl ObjectStore for AimdThrottledStore {
         }))
     }
 
-    async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        self.read.throttled(|| self.target.get(location)).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.read
             .throttled(|| self.target.get_opts(location, options.clone()))
-            .await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        self.read
-            .throttled(|| self.target.get_range(location, range.clone()))
             .await
     }
 
@@ -680,22 +656,15 @@ impl ObjectStore for AimdThrottledStore {
             .await
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        self.read.throttled(|| self.target.head(location)).await
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        self.delete.throttled(|| self.target.delete(location)).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, OSResult<Path>>,
-    ) -> BoxStream<'a, OSResult<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        let delete = Arc::clone(&self.delete);
         self.target
             .delete_stream(locations)
-            .map(|item| {
-                self.delete.observe_outcome(&item);
+            .map(move |item| {
+                delete.observe_outcome(&item);
                 item
             })
             .boxed()
@@ -733,23 +702,15 @@ impl ObjectStore for AimdThrottledStore {
             .await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.write.throttled(|| self.target.copy(from, to)).await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.write.throttled(|| self.target.rename(from, to)).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.write
-            .throttled(|| self.target.rename_if_not_exists(from, to))
+            .throttled(|| self.target.copy_opts(from, to, opts.clone()))
             .await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
         self.write
-            .throttled(|| self.target.copy_if_not_exists(from, to))
+            .throttled(|| self.target.rename_opts(from, to, opts.clone()))
             .await
     }
 }
@@ -966,9 +927,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for ThrottlingListMockStore {
-        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-            self.inner.put(location, bytes).await
-        }
         async fn put_opts(
             &self,
             location: &Path,
@@ -977,9 +935,6 @@ mod tests {
         ) -> OSResult<PutResult> {
             self.inner.put_opts(location, bytes, opts).await
         }
-        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
-        }
         async fn put_multipart_opts(
             &self,
             location: &Path,
@@ -987,28 +942,16 @@ mod tests {
         ) -> OSResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get(&self, location: &Path) -> OSResult<GetResult> {
-            self.inner.get(location).await
-        }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             self.inner.get_opts(location, options).await
-        }
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-            self.inner.get_range(location, range).await
         }
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
-        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-            self.inner.head(location).await
-        }
-        async fn delete(&self, location: &Path) -> OSResult<()> {
-            self.inner.delete(location).await
-        }
-        fn delete_stream<'a>(
-            &'a self,
-            locations: BoxStream<'a, OSResult<Path>>,
-        ) -> BoxStream<'a, OSResult<Path>> {
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
             self.inner.delete_stream(locations)
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -1033,17 +976,8 @@ mod tests {
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename(from, to).await
-        }
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
     }
 
@@ -1216,10 +1150,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for RateLimitingMockStore {
-        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-            self.inner.put(location, bytes).await
-        }
-
         async fn put_opts(
             &self,
             location: &Path,
@@ -1227,10 +1157,6 @@ mod tests {
             opts: PutOptions,
         ) -> OSResult<PutResult> {
             self.inner.put_opts(location, bytes, opts).await
-        }
-
-        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
         }
 
         async fn put_multipart_opts(
@@ -1241,25 +1167,9 @@ mod tests {
             self.inner.put_multipart_opts(location, opts).await
         }
 
-        async fn get(&self, location: &Path) -> OSResult<GetResult> {
-            if self.check_rate() {
-                self.inner.get(location).await
-            } else {
-                Err(Self::throttle_error())
-            }
-        }
-
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             if self.check_rate() {
                 self.inner.get_opts(location, options).await
-            } else {
-                Err(Self::throttle_error())
-            }
-        }
-
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-            if self.check_rate() {
-                self.inner.get_range(location, range).await
             } else {
                 Err(Self::throttle_error())
             }
@@ -1273,22 +1183,10 @@ mod tests {
             }
         }
 
-        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-            if self.check_rate() {
-                self.inner.head(location).await
-            } else {
-                Err(Self::throttle_error())
-            }
-        }
-
-        async fn delete(&self, location: &Path) -> OSResult<()> {
-            self.inner.delete(location).await
-        }
-
-        fn delete_stream<'a>(
-            &'a self,
-            locations: BoxStream<'a, OSResult<Path>>,
-        ) -> BoxStream<'a, OSResult<Path>> {
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
             self.inner.delete_stream(locations)
         }
 
@@ -1308,20 +1206,8 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename(from, to).await
-        }
-
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
     }
 
@@ -1460,9 +1346,6 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for RetryTestMockStore {
-        async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-            self.inner.put(location, bytes).await
-        }
         async fn put_opts(
             &self,
             location: &Path,
@@ -1471,9 +1354,6 @@ mod tests {
         ) -> OSResult<PutResult> {
             self.inner.put_opts(location, bytes, opts).await
         }
-        async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
-        }
         async fn put_multipart_opts(
             &self,
             location: &Path,
@@ -1481,7 +1361,7 @@ mod tests {
         ) -> OSResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             self.get_call_count.fetch_add(1, Ordering::Relaxed);
             let should_error = {
                 let mut remaining = self.errors_remaining.lock().unwrap();
@@ -1499,28 +1379,16 @@ mod tests {
                         .into(),
                 })
             } else {
-                self.inner.get(location).await
+                self.inner.get_opts(location, options).await
             }
-        }
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-            self.inner.get_range(location, range).await
         }
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
-        async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-            self.inner.head(location).await
-        }
-        async fn delete(&self, location: &Path) -> OSResult<()> {
-            self.inner.delete(location).await
-        }
-        fn delete_stream<'a>(
-            &'a self,
-            locations: BoxStream<'a, OSResult<Path>>,
-        ) -> BoxStream<'a, OSResult<Path>> {
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
             self.inner.delete_stream(locations)
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -1536,17 +1404,8 @@ mod tests {
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename(from, to).await
-        }
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.rename_if_not_exists(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
     }
 

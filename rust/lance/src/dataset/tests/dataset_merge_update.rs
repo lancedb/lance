@@ -1903,7 +1903,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         ],
     )
     .unwrap();
-    let replacement_path = dataset.data_dir().child("replacement.lance");
+    let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
         .object_store
         .create(&replacement_path)
@@ -2080,7 +2080,7 @@ async fn test_vector_index_after_data_replacement() {
     )
     .unwrap();
 
-    let replacement_path = dataset.data_dir().child("replacement.lance");
+    let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
         .object_store
         .create(&replacement_path)

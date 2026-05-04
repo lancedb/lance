@@ -8,8 +8,9 @@ use std::sync::Arc;
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as OSObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions,
 };
 use object_store_opendal::OpendalStore;
 use tokio::sync::RwLock;
@@ -169,12 +170,21 @@ impl OSObjectStore for DynamicOpenDalStore {
             .await
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
-            .delete(location)
-            .await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let this = self.clone();
+        stream::once(async move {
+            let store = this
+                .current_store()
+                .await
+                .map_err(|e| this.map_store_error(e))?;
+            Ok::<_, object_store::Error>((store, locations))
+        })
+        .map_ok(|(store, locations)| store.delete_stream(locations))
+        .try_flatten()
+        .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -198,35 +208,29 @@ impl OSObjectStore for DynamicOpenDalStore {
             .await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> object_store::Result<()> {
         self.current_store()
             .await
             .map_err(|e| self.map_store_error(e))?
-            .copy(from, to)
+            .copy_opts(from, to, opts)
             .await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: RenameOptions,
+    ) -> object_store::Result<()> {
         self.current_store()
             .await
             .map_err(|e| self.map_store_error(e))?
-            .copy_if_not_exists(from, to)
-            .await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
-            .rename(from, to)
-            .await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
-            .rename_if_not_exists(from, to)
+            .rename_opts(from, to, opts)
             .await
     }
 }

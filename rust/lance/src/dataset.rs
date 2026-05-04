@@ -53,6 +53,7 @@ use lance_table::io::commit::{
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -1053,7 +1054,7 @@ impl Dataset {
             Transaction::try_from(tx).map(Some)?
         } else if let Some(path) = &self.manifest.transaction_file {
             // Fallback: read external transaction file if present
-            let path = self.transactions_dir().child(path.as_str());
+            let path = self.transactions_dir().join(path.as_str());
             let data = self.object_store.inner.get(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)?
@@ -1822,23 +1823,23 @@ impl Dataset {
     }
 
     pub fn data_dir(&self) -> Path {
-        self.base.child(DATA_DIR)
+        self.base.clone().join(DATA_DIR)
     }
 
     pub fn indices_dir(&self) -> Path {
-        self.base.child(INDICES_DIR)
+        self.base.clone().join(INDICES_DIR)
     }
 
     pub fn transactions_dir(&self) -> Path {
-        self.base.child(TRANSACTIONS_DIR)
+        self.base.clone().join(TRANSACTIONS_DIR)
     }
 
     pub fn deletions_dir(&self) -> Path {
-        self.base.child(DELETIONS_DIR)
+        self.base.clone().join(DELETIONS_DIR)
     }
 
     pub fn versions_dir(&self) -> Path {
-        self.base.child(VERSIONS_DIR)
+        self.base.clone().join(VERSIONS_DIR)
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
@@ -1858,7 +1859,7 @@ impl Dataset {
     /// * `base_id` - The base path ID if the file is outside the dataset directory.
     pub async fn create_data_file(&self, path: &str, base_id: Option<u32>) -> Result<DataFile> {
         let data_dir = self.data_file_dir_for_base(base_id)?;
-        let filepath = data_dir.child(path);
+        let filepath = data_dir.clone().join(path);
 
         let object_store = self.object_store(base_id).await?;
 
@@ -1957,12 +1958,12 @@ impl Dataset {
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
-                    Ok(path.child(DATA_DIR))
+                    Ok(path.join(DATA_DIR))
                 } else {
                     Ok(path)
                 }
             }
-            None => Ok(self.base.child(DATA_DIR)),
+            None => Ok(self.base.clone().join(DATA_DIR)),
         }
     }
 
@@ -2050,13 +2051,13 @@ impl Dataset {
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
-                    Ok(path.child(INDICES_DIR))
+                    Ok(path.join(INDICES_DIR))
                 } else {
                     // For non-dataset-root base paths, we assume the path already points to the indices directory
                     Ok(path)
                 }
             }
-            None => Ok(self.base.child(INDICES_DIR)),
+            None => Ok(self.base.clone().join(INDICES_DIR)),
         }
     }
 
@@ -2569,7 +2570,7 @@ impl Dataset {
             let mut path = base.clone();
             for seg in relative_path.split('/') {
                 if !seg.is_empty() {
-                    path = path.child(seg);
+                    path = path.clone().join(seg);
                 }
             }
             path
@@ -2704,7 +2705,10 @@ impl Dataset {
             } else {
                 self.base.clone()
             };
-            let index_root = base_root.child(INDICES_DIR).child(index.uuid.to_string());
+            let index_root = base_root
+                .clone()
+                .join(INDICES_DIR)
+                .join(index.uuid.to_string());
             let mut stream = self.object_store.read_dir_all(&index_root, None);
             while let Some(meta) = stream.next().await.transpose()? {
                 if let Some(filename) = meta.location.filename() {
@@ -3035,7 +3039,7 @@ impl Dataset {
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
-        let index_dir = self.indices_dir().child(index_uuid);
+        let index_dir = self.indices_dir().join(index_uuid);
         match index_type {
             IndexType::Inverted => {
                 // Call merge_index_files function for inverted index

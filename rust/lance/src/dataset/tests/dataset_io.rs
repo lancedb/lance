@@ -37,6 +37,7 @@ use lance_file::version::LanceFileVersion;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::BasePath;
+use object_store::ObjectStoreExt;
 
 use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
@@ -47,7 +48,6 @@ use lance_io::object_store::{
 };
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
-use object_store::ObjectStore as _;
 use object_store::path::Path;
 use rstest::rstest;
 
@@ -224,8 +224,8 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let base_location = base
         .extract_path(wrapped.session().store_registry())
         .unwrap()
-        .child("data")
-        .child("probe.lance");
+        .join("data")
+        .join("probe.lance");
 
     base_store.put(&base_location, b"hello").await.unwrap();
     let _ = existing_tracker.incremental_stats();
@@ -1127,7 +1127,7 @@ async fn test_deep_clone(
 // Helper: count files under a dataset directory (data/_indices/_deletions)
 async fn count_files(store: &ObjectStore, root: &Path, prefix: &str) -> usize {
     use futures::StreamExt;
-    let dir = root.child(prefix);
+    let dir = root.clone().join(prefix);
     let mut stream = store.read_dir_all(&dir, None);
     let mut count: usize = 0;
     while stream.next().await.transpose().unwrap().is_some() {

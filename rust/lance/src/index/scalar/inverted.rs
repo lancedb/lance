@@ -98,8 +98,10 @@ pub(crate) async fn build_segment(
         ));
     }
 
-    let index_dir = dataset.indices_dir().child(source_segment.uuid.to_string());
-    let metadata_path = index_dir.child(lance_index::scalar::inverted::METADATA_FILE);
+    let index_dir = dataset.indices_dir().join(source_segment.uuid.to_string());
+    let metadata_path = index_dir
+        .clone()
+        .join(lance_index::scalar::inverted::METADATA_FILE);
     if dataset.object_store.as_ref().exists(&metadata_path).await? {
         return Ok(built_segment);
     }

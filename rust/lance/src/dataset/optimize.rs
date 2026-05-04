@@ -507,7 +507,8 @@ async fn can_use_binary_copy_impl(
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
-                .child(data_file.path.as_str());
+                .clone()
+                .join(data_file.path.as_str());
             let scan_scheduler = ScanScheduler::new(
                 object_store.clone(),
                 SchedulerConfig::max_bandwidth(&object_store),

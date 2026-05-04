@@ -284,8 +284,12 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
     let sem = Arc::new(Semaphore::new(*HNSW_PARTITIONS_BUILD_PARALLEL));
     for part_id in 0..ivf.num_partitions() {
-        part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
-        aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
+        part_files.push(tmp_part_dir.clone().join(format!("hnsw_part_{}", part_id)));
+        aux_part_files.push(
+            tmp_part_dir
+                .clone()
+                .join(format!("hnsw_part_aux_{}", part_id)),
+        );
 
         let mut code_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];

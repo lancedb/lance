@@ -190,7 +190,7 @@ fn file_reader_take(
         let fragment = fragments.first().unwrap();
         assert_eq!(fragment.num_data_files(), 1);
         let file = fragment.metadata().files.first().unwrap();
-        let file_path = dataset.data_dir().child(file.path.as_str());
+        let file_path = dataset.data_dir().join(file.path.as_str());
 
         (dataset, file_path)
     });

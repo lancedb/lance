@@ -130,28 +130,28 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
 ///
 /// Returns: `{base_path}/_mem_wal/`
 pub fn mem_wal_path(base_path: &Path) -> Path {
-    base_path.child("_mem_wal")
+    base_path.clone().join("_mem_wal")
 }
 
 /// Base path for a shard within the MemWAL directory.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/`
 pub fn shard_base_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    mem_wal_path(base_path).child(shard_id.as_hyphenated().to_string())
+    mem_wal_path(base_path).join(shard_id.as_hyphenated().to_string())
 }
 
 /// Path to the WAL directory for a shard.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/wal/`
 pub fn shard_wal_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    shard_base_path(base_path, shard_id).child("wal")
+    shard_base_path(base_path, shard_id).join("wal")
 }
 
 /// Path to the manifest directory for a shard.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/manifest/`
 pub fn shard_manifest_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    shard_base_path(base_path, shard_id).child("manifest")
+    shard_base_path(base_path, shard_id).join("manifest")
 }
 
 /// Path to a flushed MemTable directory.
@@ -163,7 +163,7 @@ pub fn flushed_memtable_path(
     random_hash: &str,
     generation: u64,
 ) -> Path {
-    shard_base_path(base_path, shard_id).child(format!("{}_gen_{}", random_hash, generation))
+    shard_base_path(base_path, shard_id).join(format!("{}_gen_{}", random_hash, generation))
 }
 
 /// Generate an 8-character random hex string for flushed MemTable directories.

@@ -47,8 +47,8 @@ pub async fn load_frag_reuse_index_details(
         Some(Content::External(external_file)) => {
             let file_path = dataset
                 .indices_dir()
-                .child(index.uuid.to_string())
-                .child(external_file.path.clone());
+                .join(index.uuid.to_string())
+                .join(external_file.path.clone());
 
             // the file content will be cached in the index cache later
             // so we do not put it to the file cache
@@ -141,8 +141,8 @@ pub(crate) async fn build_frag_reuse_index_metadata(
     let proto = if new_index_details_proto.encoded_len() > 204800 {
         let file_path = dataset
             .indices_dir()
-            .child(index_id.to_string())
-            .child(FRAG_REUSE_DETAILS_FILE_NAME);
+            .join(index_id.to_string())
+            .join(FRAG_REUSE_DETAILS_FILE_NAME);
         let mut writer = dataset.object_store.create(&file_path).await?;
         writer
             .write_all(new_index_details_proto.encode_to_vec().as_slice())
