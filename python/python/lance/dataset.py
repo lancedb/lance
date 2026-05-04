@@ -5849,32 +5849,48 @@ class ScannerBuilder:
 
     def infgram_search(
         self,
-        query: str,
+        query: Optional[str] = None,
         column: Optional[str] = None,
         limit: Optional[int] = None,
+        clauses: Optional[List[List[str]]] = None,
     ) -> ScannerBuilder:
         """
         Filter rows by infini-gram (suffix array) search.
 
-        Returns rows containing the given pattern, with a `_count` column
-        indicating presence. Must create a suffix array index on the target
-        column before searching.
+        Returns rows containing the given pattern, with ``_count`` and
+        ``_positions`` columns. Must create a suffix array index on the
+        target column before searching.
 
         Parameters
         ----------
-        query : str
-            The text pattern to search for.
+        query : str, optional
+            The text pattern to search for. May contain AND/OR operators
+            (e.g. ``'"hello" AND "world"'``). Either ``query`` or
+            ``clauses`` must be provided.
         column : str, optional
             The column to search in. If None, searches the first
             suffix-array-indexed column.
         limit : int, optional
             Maximum number of matching rows to return.
+        clauses : list of list of str, optional
+            Boolean query in CNF form. Each inner list is an OR group;
+            the outer list is AND of groups. For example,
+            ``[["cat", "kitten"], ["dog"]]`` means
+            ``("cat" OR "kitten") AND "dog"``.
+            Mutually exclusive with ``query``.
         """
-        self._infgram_query = {
-            "query": query,
-            "column": column,
-            "limit": limit,
-        }
+        if clauses is not None:
+            self._infgram_query = {
+                "clauses": clauses,
+                "column": column,
+                "limit": limit,
+            }
+        else:
+            self._infgram_query = {
+                "query": query,
+                "column": column,
+                "limit": limit,
+            }
         return self
 
     def scan_stats_callback(

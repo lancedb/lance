@@ -1939,6 +1939,18 @@ impl Scanner {
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
             }
+            if self.infgram_query.is_some() {
+                let count_col = crate::io::exec::infgram::COUNT_COL;
+                if output_expr.iter().all(|(_, name)| name != count_col) {
+                    let count_expr = expressions::col(count_col, current_schema)?;
+                    output_expr.push((count_expr, count_col.to_string()));
+                }
+                let positions_col = crate::io::exec::infgram::POSITIONS_COL;
+                if output_expr.iter().all(|(_, name)| name != positions_col) {
+                    let positions_expr = expressions::col(positions_col, current_schema)?;
+                    output_expr.push((positions_expr, positions_col.to_string()));
+                }
+            }
         }
 
         if self.legacy_with_row_id {
@@ -2994,9 +3006,13 @@ impl Scanner {
 
         let query = self.infgram_query.as_ref().unwrap();
 
-        // Apply limit from scanner if query doesn't have its own
+        // Apply limit from scanner if query doesn't have its own.
+        // When a filter is present the limit must be applied *after* filtering
+        // (the downstream LimitExec handles it), so we leave the SA search
+        // unlimited to avoid discarding rows that would pass the filter.
+        let has_filter = self.filter.expr_filter.is_some();
         let mut query = query.clone();
-        if query.limit.is_none() {
+        if query.limit.is_none() && !has_filter {
             let search_limit = match (self.limit, self.offset) {
                 (Some(limit), Some(offset)) => Some((limit + offset) as usize),
                 (Some(limit), None) => Some(limit as usize),
@@ -3006,12 +3022,10 @@ impl Scanner {
             query = query.with_limit(search_limit);
         }
 
-        // For postfiltering, we skip scalar index prefilter
-        if !self.prefilter {
-            filter_plan.make_refine_only();
-        } else {
-            filter_plan.disable_refine();
-        }
+        // The SA index does not support inline prefiltering (unlike FTS which
+        // can intersect with a scalar-index bitmap).  Always apply the filter
+        // as a refine (postfilter) step so it is never silently dropped.
+        filter_plan.make_refine_only();
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
             crate::io::exec::infgram::InfgramSearchExec::new(

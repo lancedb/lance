@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use datafusion_common::Column;
 use datafusion_expr::Expr;
+use lance_core::Result;
 
 use crate::scalar::AnyQuery;
 
@@ -542,6 +543,22 @@ pub fn read_pointer(sa: &[u8], rank: u64, ptr_width: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Decode a contiguous range of SA pointers from an in-memory slice.
+///
+/// Reads ranks `[start_rank, start_rank + count)` and returns decoded values.
+pub fn read_pointers(sa: &[u8], start_rank: u64, count: u64, ptr_width: usize) -> Vec<u64> {
+    let count = count as usize;
+    let start = (start_rank as usize) * ptr_width;
+    let mut pointers = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = start + i * ptr_width;
+        let mut buf = [0u8; 8];
+        buf[..ptr_width].copy_from_slice(&sa[off..off + ptr_width]);
+        pointers.push(u64::from_le_bytes(buf));
+    }
+    pointers
+}
+
 /// Compare the suffix at `pos` in the tokenized data against the query.
 ///
 /// Only compares up to `query.len()` bytes of the suffix (prefix comparison).
@@ -562,6 +579,299 @@ fn compare_suffix(tokenized: &[u8], pos: u64, query: &[u8]) -> Ordering {
     } else {
         Ordering::Equal
     }
+}
+
+// ─── Block-cached async versions ────────────────────────────────────────────
+//
+// These mirror the synchronous functions above but read both tokenized data
+// AND the suffix array via `BlockCache` instead of `&[u8]`.
+// This eliminates the need to load the ~500 MB tokenized text and ~2 GB
+// suffix array for queries that only touch ~6 KB of actual data via binary search.
+
+use super::block_cache::BlockCache;
+
+/// Read a single pointer from the suffix array via block cache.
+pub async fn read_pointer_cached(
+    sa_cache: &BlockCache,
+    rank: u64,
+    ptr_width: usize,
+) -> Result<u64> {
+    let offset = (rank as usize) * ptr_width;
+    let data = sa_cache.read(offset, ptr_width).await?;
+    let mut buf = [0u8; 8];
+    buf[..ptr_width].copy_from_slice(&data);
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Read a contiguous range of SA pointers via block cache in a single read.
+///
+/// Ranks `[start_rank, start_rank + count)` are stored contiguously in the SA
+/// file. For 10K pointers × 5-byte width = 50 KB — fits in one 64 KB block,
+/// turning 10K individual S3 range reads into 1.
+pub async fn read_pointers_batch(
+    sa_cache: &BlockCache,
+    start_rank: u64,
+    count: u64,
+    ptr_width: usize,
+) -> Result<Vec<u64>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let start_offset = (start_rank as usize) * ptr_width;
+    let total_bytes = (count as usize) * ptr_width;
+    let data = sa_cache.read(start_offset, total_bytes).await?;
+
+    let mut pointers = Vec::with_capacity(count as usize);
+    for i in 0..(count as usize) {
+        let off = i * ptr_width;
+        let mut buf = [0u8; 8];
+        buf[..ptr_width].copy_from_slice(&data[off..off + ptr_width]);
+        pointers.push(u64::from_le_bytes(buf));
+    }
+    Ok(pointers)
+}
+
+/// Async suffix comparison: reads bytes via block cache.
+async fn compare_suffix_cached(
+    tok_cache: &BlockCache,
+    pos: u64,
+    query: &[u8],
+) -> Result<Ordering> {
+    let pos_usize = pos as usize;
+    let available = tok_cache.len().saturating_sub(pos_usize);
+    let cmp_len = available.min(query.len());
+    if cmp_len == 0 {
+        if query.is_empty() {
+            return Ok(Ordering::Equal);
+        }
+        return Ok(Ordering::Less);
+    }
+    let suffix_bytes = tok_cache.read(pos_usize, cmp_len).await?;
+    let cmp = suffix_bytes[..].cmp(&query[..cmp_len]);
+    if cmp != Ordering::Equal {
+        return Ok(cmp);
+    }
+    if available < query.len() {
+        Ok(Ordering::Less)
+    } else {
+        Ok(Ordering::Equal)
+    }
+}
+
+/// Async version of `sa_find` using block-cached reads for both
+/// tokenized data and the suffix array.
+///
+/// Same 3-phase binary search as the sync version:
+/// 1. Find any match
+/// 2. Refine left boundary
+/// 3. Refine right boundary
+///
+/// Each comparison reads through block caches (~64 KB blocks),
+/// so the full binary search (~60 reads) caches at most ~3.8 MB per file.
+pub async fn sa_find_cached(
+    tok_cache: &BlockCache,
+    sa_cache: &BlockCache,
+    ptr_width: usize,
+    total_entries: u64,
+    query: &[u8],
+) -> Result<(u64, u64)> {
+    let n = total_entries;
+    if n == 0 || query.is_empty() {
+        return Ok((0, n));
+    }
+
+    // Phase 1: find any matching position
+    let mut lo: u64 = 0;
+    let mut hi: u64 = n;
+    let mut found = false;
+    let mut mid: u64 = 0;
+    let orig_lo = lo;
+    let orig_hi = hi;
+
+    while lo < hi {
+        mid = lo + (hi - lo) / 2;
+        let ptr = read_pointer_cached(sa_cache, mid, ptr_width).await?;
+        let cmp = compare_suffix_cached(tok_cache, ptr, query).await?;
+        match cmp {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        return Ok((lo, lo));
+    }
+
+    // Phase 2: left boundary
+    let left = {
+        let mut l = orig_lo;
+        let mut r = mid;
+        while l < r {
+            let m = l + (r - l) / 2;
+            let ptr = read_pointer_cached(sa_cache, m, ptr_width).await?;
+            if compare_suffix_cached(tok_cache, ptr, query).await? == Ordering::Less {
+                l = m + 1;
+            } else {
+                r = m;
+            }
+        }
+        l
+    };
+
+    // Phase 3: right boundary
+    let right = {
+        let mut l = mid + 1;
+        let mut r = orig_hi;
+        while l < r {
+            let m = l + (r - l) / 2;
+            let ptr = read_pointer_cached(sa_cache, m, ptr_width).await?;
+            if compare_suffix_cached(tok_cache, ptr, query).await? == Ordering::Greater {
+                r = m;
+            } else {
+                l = m + 1;
+            }
+        }
+        l
+    };
+
+    Ok((left, right))
+}
+
+/// Async count using block-cached binary search.
+pub async fn count_cached(
+    tok_cache: &BlockCache,
+    sa_cache: &BlockCache,
+    ptr_width: usize,
+    total_entries: u64,
+    query: &[u8],
+) -> Result<u64> {
+    let (lo, hi) = sa_find_cached(tok_cache, sa_cache, ptr_width, total_entries, query).await?;
+    Ok(hi - lo)
+}
+
+/// Async next-byte at a given SA rank via block cache.
+async fn get_next_byte_cached(
+    tok_cache: &BlockCache,
+    sa_cache: &BlockCache,
+    ptr_width: usize,
+    prompt_len: usize,
+    rank: u64,
+) -> Result<Option<u8>> {
+    let pos = read_pointer_cached(sa_cache, rank, ptr_width).await? as usize;
+    let next_pos = pos + prompt_len;
+    if next_pos < tok_cache.len() {
+        let b = tok_cache.read(next_pos, 1).await?;
+        if b.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(b[0]))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// Async next-byte distribution using block-cached reads.
+pub async fn next_byte_distribution_cached(
+    tok_cache: &BlockCache,
+    sa_cache: &BlockCache,
+    ptr_width: usize,
+    total_entries: u64,
+    prompt: &[u8],
+    max_support: Option<u64>,
+) -> Result<NtdResult> {
+    let (lo, hi) = sa_find_cached(tok_cache, sa_cache, ptr_width, total_entries, prompt).await?;
+    let prompt_cnt = hi - lo;
+
+    if prompt_cnt == 0 {
+        return Ok(NtdResult {
+            prompt_cnt: 0,
+            distribution: Vec::new(),
+            approximate: false,
+        });
+    }
+
+    let approximate = max_support.is_some_and(|max| prompt_cnt > max);
+    let mut byte_counts: HashMap<u8, u64> = HashMap::new();
+    let prompt_len = prompt.len();
+
+    if approximate {
+        let max = max_support.unwrap();
+        let step = prompt_cnt / max;
+        for i in 0..max {
+            let rank = lo + i * step;
+            if let Some(b) = get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, rank).await? {
+                *byte_counts.entry(b).or_insert(0) += step;
+            }
+        }
+    } else {
+        // Divide-and-conquer over the SA range (async version)
+        ntd_divide_and_conquer_cached(
+            tok_cache, sa_cache, ptr_width, prompt_len, lo, hi, &mut byte_counts,
+        ).await?;
+    }
+
+    let mut distribution: Vec<NtdEntry> = byte_counts
+        .into_iter()
+        .map(|(byte_value, cnt)| NtdEntry {
+            byte_value,
+            count: cnt,
+            prob: cnt as f64 / prompt_cnt as f64,
+        })
+        .collect();
+    distribution.sort_by(|a, b| b.count.cmp(&a.count));
+
+    Ok(NtdResult {
+        prompt_cnt,
+        distribution,
+        approximate,
+    })
+}
+
+/// Async divide-and-conquer for next-byte distribution.
+async fn ntd_divide_and_conquer_cached(
+    tok_cache: &BlockCache,
+    sa_cache: &BlockCache,
+    ptr_width: usize,
+    prompt_len: usize,
+    lo: u64,
+    hi: u64,
+    byte_counts: &mut HashMap<u8, u64>,
+) -> Result<()> {
+    if lo >= hi {
+        return Ok(());
+    }
+
+    let first_byte = get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, lo).await?;
+    if hi - lo == 1 {
+        if let Some(b) = first_byte {
+            *byte_counts.entry(b).or_insert(0) += 1;
+        }
+        return Ok(());
+    }
+
+    let last_byte = get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, hi - 1).await?;
+
+    if first_byte == last_byte {
+        if let Some(b) = first_byte {
+            *byte_counts.entry(b).or_insert(0) += hi - lo;
+        }
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        // Use Box::pin for recursive async (avoids infinite type)
+        Box::pin(ntd_divide_and_conquer_cached(
+            tok_cache, sa_cache, ptr_width, prompt_len, lo, mid, byte_counts,
+        )).await?;
+        Box::pin(ntd_divide_and_conquer_cached(
+            tok_cache, sa_cache, ptr_width, prompt_len, mid, hi, byte_counts,
+        )).await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

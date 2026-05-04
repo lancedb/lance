@@ -1064,7 +1064,7 @@ impl Dataset {
                     lance::Error::invalid_input("Index is not a SuffixArrayIndex")
                 })?;
 
-            Ok(sa_index.compute_prob(&prompt, &continuation))
+            sa_index.compute_prob(&prompt, &continuation).await
         })?
         .map_err(|err: lance::Error| PyIOError::new_err(format!("Suffix array prob failed: {}", err)))?;
 
@@ -1119,7 +1119,7 @@ impl Dataset {
                     lance::Error::invalid_input("Index is not a SuffixArrayIndex")
                 })?;
 
-            Ok(sa_index.compute_ntd(&prompt, max_support))
+            sa_index.compute_ntd(&prompt, max_support).await
         })?
         .map_err(|err: lance::Error| PyIOError::new_err(format!("Suffix array ntd failed: {}", err)))?;
 
@@ -1179,7 +1179,7 @@ impl Dataset {
                     lance::Error::invalid_input("Index is not a SuffixArrayIndex")
                 })?;
 
-            Ok(sa_index.compute_infgram_prob(&prompt, &continuation))
+            sa_index.compute_infgram_prob(&prompt, &continuation).await
         })?
         .map_err(|err: lance::Error| {
             PyIOError::new_err(format!("Suffix array infgram_prob failed: {}", err))
@@ -1426,34 +1426,80 @@ impl Dataset {
         if let Some(infgram_query) = infgram_query {
             let infgram = if let Ok(query_str) = infgram_query.extract::<String>() {
                 // Simple string query: infgram_query="fox"
+                // May contain AND/OR operators — parsed by Rust at execution time
                 InfgramSearchQuery::new(query_str)
             } else if let Ok(dict) = infgram_query.cast::<PyDict>() {
-                let query_val = dict
-                    .get_item("query")?
-                    .ok_or_else(|| PyKeyError::new_err("infgram_query must contain 'query' key"))?;
-
-                // Check if query is a list of ints (token IDs) or a string
-                let mut q = if let Ok(tokens) = query_val.extract::<Vec<i64>>() {
-                    InfgramSearchQuery::new_tokens(tokens)
+                // Check for structured clauses: {"clauses": [["A", "B"], ["C"]]}
+                if let Some(clauses_val) = dict.get_item("clauses")? {
+                    if !clauses_val.is_none() {
+                        let clauses: Vec<Vec<String>> = clauses_val.extract()?;
+                        let mut q = InfgramSearchQuery::new_boolean(clauses);
+                        if let Some(col) = dict.get_item("column")? {
+                            if !col.is_none() {
+                                q = q.with_column(col.extract::<String>()?);
+                            }
+                        }
+                        if let Some(lim) = dict.get_item("limit")? {
+                            if !lim.is_none() {
+                                q = q.with_limit(Some(lim.extract::<usize>()?));
+                            }
+                        }
+                        q
+                    } else {
+                        // clauses is None, fall through to query-based path
+                        let query_val = dict
+                            .get_item("query")?
+                            .ok_or_else(|| PyKeyError::new_err(
+                                "infgram_query must contain 'query' or 'clauses' key"
+                            ))?;
+                        let mut q = if let Ok(tokens) = query_val.extract::<Vec<i64>>() {
+                            InfgramSearchQuery::new_tokens(tokens)
+                        } else {
+                            InfgramSearchQuery::new(query_val.to_string())
+                        };
+                        if let Some(col) = dict.get_item("column")? {
+                            if !col.is_none() {
+                                q = q.with_column(col.extract::<String>()?);
+                            }
+                        }
+                        if let Some(lim) = dict.get_item("limit")? {
+                            if !lim.is_none() {
+                                q = q.with_limit(Some(lim.extract::<usize>()?));
+                            }
+                        }
+                        q
+                    }
                 } else {
-                    InfgramSearchQuery::new(query_val.to_string())
-                };
+                    // No clauses key — use query-based path
+                    let query_val = dict
+                        .get_item("query")?
+                        .ok_or_else(|| PyKeyError::new_err(
+                            "infgram_query must contain 'query' or 'clauses' key"
+                        ))?;
 
-                if let Some(col) = dict.get_item("column")? {
-                    if !col.is_none() {
-                        q = q.with_column(col.extract::<String>()?);
+                    // Check if query is a list of ints (token IDs) or a string
+                    let mut q = if let Ok(tokens) = query_val.extract::<Vec<i64>>() {
+                        InfgramSearchQuery::new_tokens(tokens)
+                    } else {
+                        InfgramSearchQuery::new(query_val.to_string())
+                    };
+
+                    if let Some(col) = dict.get_item("column")? {
+                        if !col.is_none() {
+                            q = q.with_column(col.extract::<String>()?);
+                        }
                     }
-                }
-                if let Some(lim) = dict.get_item("limit")? {
-                    if !lim.is_none() {
-                        q = q.with_limit(Some(lim.extract::<usize>()?));
+                    if let Some(lim) = dict.get_item("limit")? {
+                        if !lim.is_none() {
+                            q = q.with_limit(Some(lim.extract::<usize>()?));
+                        }
                     }
+                    q
                 }
-                q
             } else {
                 return Err(PyValueError::new_err(
-                    "infgram_query must be a string or dict with 'query' (str or list[int]), \
-                     optional 'column', optional 'limit'",
+                    "infgram_query must be a string or dict with 'query' (str or list[int]) \
+                     or 'clauses' (list[list[str]]), optional 'column', optional 'limit'",
                 ));
             };
             scanner

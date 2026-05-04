@@ -351,6 +351,41 @@ impl IndexStore for LanceIndexStore {
     async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
         list_index_files_with_sizes(&self.object_store, &self.index_dir).await
     }
+
+    async fn write_raw_file(&self, name: &str, data: &[u8]) -> Result<()> {
+        let path = self.index_dir.child(name);
+        self.object_store
+            .inner
+            .put(&path, Bytes::copy_from_slice(data).into())
+            .await
+            .map_err(|e| Error::io(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_raw_range(
+        &self,
+        name: &str,
+        range: std::ops::Range<usize>,
+    ) -> Result<Bytes> {
+        let path = self.index_dir.child(name);
+        let range_u64 = (range.start as u64)..(range.end as u64);
+        self.object_store
+            .inner
+            .get_range(&path, range_u64)
+            .await
+            .map_err(|e| Error::io(e.to_string()))
+    }
+
+    async fn raw_file_size(&self, name: &str) -> Result<usize> {
+        let path = self.index_dir.child(name);
+        let meta = self
+            .object_store
+            .inner
+            .head(&path)
+            .await
+            .map_err(|e| Error::io(e.to_string()))?;
+        Ok(meta.size as usize)
+    }
 }
 
 #[cfg(test)]

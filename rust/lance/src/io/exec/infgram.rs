@@ -11,7 +11,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{UInt32Array, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -36,11 +36,19 @@ use lance_index::metrics::NoOpMetricsCollector;
 /// Column name for the occurrence count in infgram results.
 pub const COUNT_COL: &str = "_count";
 
-/// Schema for infgram search results: (ROW_ID, _count).
+/// Column name for the byte positions of matches within each document.
+pub const POSITIONS_COL: &str = "_positions";
+
+/// Schema for infgram search results: (ROW_ID, _count, _positions).
 pub static INFGRAM_SCHEMA: std::sync::LazyLock<SchemaRef> = std::sync::LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         ROW_ID_FIELD.clone(),
-        Field::new(COUNT_COL, DataType::Float32, true),
+        Field::new(COUNT_COL, DataType::UInt32, true),
+        Field::new(
+            POSITIONS_COL,
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, false))),
+            true,
+        ),
     ]))
 });
 
@@ -119,6 +127,7 @@ impl ExecutionPlan for InfgramSearchExec {
         let ds = self.dataset.clone();
         let query_text = self.query.query.clone();
         let query_tokens = self.query.query_tokens.clone();
+        let query_clauses = self.query.clauses.clone();
         let column = self.query.column.clone();
         let limit = self.query.limit;
 
@@ -178,19 +187,33 @@ impl ExecutionPlan for InfgramSearchExec {
                 )))?;
 
             if indices.is_empty() {
+                let empty_positions = {
+                    let values = Arc::new(UInt64Array::from(Vec::<u64>::new()));
+                    let offsets = arrow_buffer::OffsetBuffer::new(
+                        arrow_buffer::ScalarBuffer::from(vec![0i32]),
+                    );
+                    let field = Arc::new(Field::new("item", DataType::UInt64, false));
+                    ListArray::new(field, offsets, values, None)
+                };
                 let batch = RecordBatch::try_new(
                     INFGRAM_SCHEMA.clone(),
                     vec![
                         Arc::new(UInt64Array::from(Vec::<u64>::new())),
-                        Arc::new(Float32Array::from(Vec::<f32>::new())),
+                        Arc::new(UInt32Array::from(Vec::<u32>::new())),
+                        Arc::new(empty_positions),
                     ],
                 )?;
                 return Ok::<_, DataFusionError>(batch);
             }
 
-            // Open and query each segment
-            let mut all_row_ids = Vec::new();
+            // Open and query each index version, collecting scored results with positions
             let max_results = limit.unwrap_or(usize::MAX);
+            let mut all_scored: Vec<(u64, u32, Vec<u64>)> = Vec::new();
+
+            // Check if we have boolean clauses or parse the query for AND/OR
+            let parsed_clauses = query_clauses.or_else(|| {
+                InfgramSearchQuery::parse_boolean_query(&query_text)
+            });
 
             for meta in &indices {
                 let uuid = meta.uuid.to_string();
@@ -212,52 +235,96 @@ impl ExecutionPlan for InfgramSearchExec {
                         ))
                     })?;
 
-                // Build query bytes: either from token IDs or text string
-                let query_bytes = if let Some(ref tokens) = query_tokens {
-                    // Token-level query: serialize token IDs to bytes
-                    let tw = sa_index.token_width() as usize;
-                    let mut bytes = Vec::with_capacity(tokens.len() * tw);
-                    for &tok in tokens {
-                        match tw {
-                            2 => bytes.extend_from_slice(&(tok as i16).to_le_bytes()),
-                            4 => bytes.extend_from_slice(&(tok as i32).to_le_bytes()),
-                            _ => bytes.extend_from_slice(&(tok as u8).to_le_bytes()),
-                        }
-                    }
-                    bytes
-                } else if sa_index.case_insensitive() {
-                    query_text.to_lowercase().into_bytes()
+                if let Some(ref clauses) = parsed_clauses {
+                    // Boolean query: convert string clauses to byte clauses
+                    let byte_clauses: Vec<Vec<Vec<u8>>> = clauses
+                        .iter()
+                        .map(|or_group| {
+                            or_group
+                                .iter()
+                                .map(|term| {
+                                    if sa_index.case_insensitive() {
+                                        term.to_lowercase().into_bytes()
+                                    } else {
+                                        term.as_bytes().to_vec()
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                    let scored = sa_index
+                        .search_boolean(&byte_clauses, max_results)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    all_scored.extend(scored);
                 } else {
-                    query_text.as_bytes().to_vec()
-                };
-                let remaining = max_results.saturating_sub(all_row_ids.len());
-                if remaining == 0 {
-                    break;
+                    // Single-term query (backward compatible)
+                    let query_bytes = if let Some(ref tokens) = query_tokens {
+                        let tw = sa_index.token_width() as usize;
+                        let mut bytes = Vec::with_capacity(tokens.len() * tw);
+                        for &tok in tokens {
+                            match tw {
+                                2 => bytes.extend_from_slice(&(tok as i16).to_le_bytes()),
+                                4 => bytes.extend_from_slice(&(tok as i32).to_le_bytes()),
+                                _ => bytes.extend_from_slice(&(tok as u8).to_le_bytes()),
+                            }
+                        }
+                        bytes
+                    } else if sa_index.case_insensitive() {
+                        query_text.to_lowercase().into_bytes()
+                    } else {
+                        query_text.as_bytes().to_vec()
+                    };
+
+                    let scored = sa_index
+                        .search_rows_scored(&query_bytes, max_results)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    all_scored.extend(scored);
                 }
-
-                let row_ids = sa_index.search_rows(&query_bytes, remaining);
-                all_row_ids.extend(row_ids);
             }
 
-            // Deduplicate and sort
-            all_row_ids.sort_unstable();
-            all_row_ids.dedup();
-
-            // Truncate to limit
+            // If we collected from multiple index versions, re-sort and take top-K
+            all_scored.sort_by(|a, b| b.1.cmp(&a.1));
+            all_scored.dedup_by_key(|item| item.0); // dedup by row_id, keep highest score (first)
             if let Some(lim) = limit {
-                all_row_ids.truncate(lim);
+                all_scored.truncate(lim);
             }
 
-            // Score is 1.0 for matching rows (presence-based).
-            // Future: compute per-document frequency from the suffix array.
-            let num_results = all_row_ids.len();
-            let scores = vec![1.0f32; num_results];
+            // Unzip into separate arrays
+            let mut all_row_ids = Vec::with_capacity(all_scored.len());
+            let mut counts = Vec::with_capacity(all_scored.len());
+            let mut all_positions: Vec<Vec<u64>> = Vec::with_capacity(all_scored.len());
+            for (row_id, count, positions) in all_scored {
+                all_row_ids.push(row_id);
+                counts.push(count);
+                all_positions.push(positions);
+            }
+
+            // Build _positions ListArray
+            let positions_array = {
+                let mut offsets = Vec::with_capacity(all_positions.len() + 1);
+                let mut values = Vec::new();
+                offsets.push(0i32);
+                for positions in &all_positions {
+                    values.extend_from_slice(positions);
+                    offsets.push(values.len() as i32);
+                }
+                let values_array = Arc::new(UInt64Array::from(values));
+                let offsets_buffer = arrow_buffer::OffsetBuffer::new(
+                    arrow_buffer::ScalarBuffer::from(offsets),
+                );
+                let field = Arc::new(Field::new("item", DataType::UInt64, false));
+                ListArray::new(field, offsets_buffer, values_array, None)
+            };
 
             let batch = RecordBatch::try_new(
                 INFGRAM_SCHEMA.clone(),
                 vec![
                     Arc::new(UInt64Array::from(all_row_ids)),
-                    Arc::new(Float32Array::from(scores)),
+                    Arc::new(UInt32Array::from(counts)),
+                    Arc::new(positions_array),
                 ],
             )?;
             Ok::<_, DataFusionError>(batch)

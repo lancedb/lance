@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ID, Result};
 use prost::Message;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -36,6 +36,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex};
 
+use super::bloom::BloomFilter;
 use super::builder::{build_suffix_array, compact_suffix_array, compute_pointer_width, release_memory_to_os};
 use super::index::SuffixArrayIndex;
 
@@ -70,6 +71,13 @@ struct BuiltSegment {
     /// `doc_offsets[i]` is the byte offset in `text` where document `i` ends.
     /// Document `i` spans `[doc_offsets[i-1], doc_offsets[i])` (with doc_offsets[-1] = 0).
     doc_offsets: Vec<u64>,
+    /// Lance row IDs for each document.
+    /// `row_ids[i]` is the `_rowid` (fragment-encoded) for document `i`.
+    /// This allows `search_rows` to return correct row addresses.
+    row_ids: Vec<u64>,
+    /// Serialized bloom filter bytes for this segment's n-grams.
+    /// Used to quickly skip segments that definitely don't contain a query.
+    bloom_bytes: Vec<u8>,
 }
 
 /// Plugin for creating and loading suffix array indices.
@@ -104,7 +112,7 @@ impl TrainingRequest for SuffixArrayTrainingRequest {
     }
 }
 
-/// Write one pre-built segment's (text, compact_sa, doc_offsets) to the index store.
+/// Write one pre-built segment's (text, compact_sa, doc_offsets, row_ids) to the index store.
 async fn write_segment(
     index_store: &dyn IndexStore,
     built: &BuiltSegment,
@@ -113,49 +121,49 @@ async fn write_segment(
     let seg_idx = built.seg_idx;
 
     // Choose file names: single-segment uses legacy names for backwards compat
-    let (tok_name, sa_name, offsets_name) = if num_segments <= 1 {
+    let (tok_name, sa_name, offsets_name, row_ids_name, bloom_name) = if num_segments <= 1 {
         (
             "tokenized.bin".to_string(),
             "suffix_array.bin".to_string(),
             "doc_offsets.bin".to_string(),
+            "row_ids.bin".to_string(),
+            "bloom.bin".to_string(),
         )
     } else {
         (
             format!("segment_{seg_idx}_tokenized.bin"),
             format!("segment_{seg_idx}_suffix_array.bin"),
             format!("segment_{seg_idx}_doc_offsets.bin"),
+            format!("segment_{seg_idx}_row_ids.bin"),
+            format!("segment_{seg_idx}_bloom.bin"),
         )
     };
 
-    // Write tokenized text
-    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+    // Write tokenized text as Lance IPC format.
+    // The .raw file for block-cached reads is created lazily on first query,
+    // avoiding the 20 GB S3 upload during build (which doubled build time).
+    let tok_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
         "data",
         arrow_schema::DataType::LargeBinary,
         false,
     )]));
-    let batch = arrow_array::RecordBatch::try_new(
-        schema.clone(),
+    let tok_batch = arrow_array::RecordBatch::try_new(
+        tok_schema.clone(),
         vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![built.text.as_slice()]))],
     )?;
-    let mut writer = index_store.new_index_file(&tok_name, schema.clone()).await?;
-    writer.write_record_batch(batch).await?;
-    writer.finish().await?;
+    let mut tok_writer = index_store.new_index_file(&tok_name, tok_schema.clone()).await?;
+    tok_writer.write_record_batch(tok_batch).await?;
+    tok_writer.finish().await?;
 
-    // Write suffix array
-    let sa_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-        "data",
-        arrow_schema::DataType::LargeBinary,
-        false,
-    )]));
-    let sa_batch = arrow_array::RecordBatch::try_new(
-        sa_schema.clone(),
-        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
-            built.compact_sa.as_slice(),
-        ]))],
-    )?;
-    let mut sa_writer = index_store.new_index_file(&sa_name, sa_schema).await?;
-    sa_writer.write_record_batch(sa_batch).await?;
-    sa_writer.finish().await?;
+    // Write suffix array as raw bytes for block-cached queries.
+    // The .raw format enables 64 KB block-level S3 range reads instead
+    // of downloading the full 2 GB file. The metadata still references
+    // the .bin name; the load code derives .raw via .replace(".bin", ".raw")
+    // and tries it first, falling back to .bin for legacy indices.
+    let raw_sa_name = sa_name.replace(".bin", ".raw");
+    index_store
+        .write_raw_file(&raw_sa_name, &built.compact_sa)
+        .await?;
 
     // Write document offsets (u64 array, one per document)
     let offsets_bytes: Vec<u8> = built.doc_offsets.iter()
@@ -175,6 +183,43 @@ async fn write_segment(
     let mut offsets_writer = index_store.new_index_file(&offsets_name, offsets_schema).await?;
     offsets_writer.write_record_batch(offsets_batch).await?;
     offsets_writer.finish().await?;
+
+    // Write row IDs (u64 array, one per document — Lance row addresses)
+    let row_ids_bytes: Vec<u8> = built.row_ids.iter()
+        .flat_map(|r| r.to_le_bytes())
+        .collect();
+    let row_ids_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "data",
+        arrow_schema::DataType::LargeBinary,
+        false,
+    )]));
+    let row_ids_batch = arrow_array::RecordBatch::try_new(
+        row_ids_schema.clone(),
+        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            row_ids_bytes.as_slice(),
+        ]))],
+    )?;
+    let mut row_ids_writer = index_store.new_index_file(&row_ids_name, row_ids_schema).await?;
+    row_ids_writer.write_record_batch(row_ids_batch).await?;
+    row_ids_writer.finish().await?;
+
+    // Write bloom filter (serialized bytes for n-gram existence checks)
+    if !built.bloom_bytes.is_empty() {
+        let bloom_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "data",
+            arrow_schema::DataType::LargeBinary,
+            false,
+        )]));
+        let bloom_batch = arrow_array::RecordBatch::try_new(
+            bloom_schema.clone(),
+            vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                built.bloom_bytes.as_slice(),
+            ]))],
+        )?;
+        let mut bloom_writer = index_store.new_index_file(&bloom_name, bloom_schema).await?;
+        bloom_writer.write_record_batch(bloom_batch).await?;
+        bloom_writer.finish().await?;
+    }
 
     // Return freed memory to the OS. Without this, glibc retains freed pages
     // in the process address space, causing RSS to grow monotonically across
@@ -457,7 +502,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             })?
         };
         Ok(Box::new(SuffixArrayTrainingRequest {
-            criteria: TrainingCriteria::new(TrainingOrdering::None),
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
             params: build_params,
         }))
     }
@@ -557,7 +602,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
         let mut stream = data;
         let mut current_bytes: Vec<u8> = Vec::new();
         let mut current_doc_offsets: Vec<u64> = Vec::new();
-        let mut pending_segments: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+        let mut current_row_ids: Vec<u64> = Vec::new();
+        let mut pending_segments: Vec<(Vec<u8>, Vec<u64>, Vec<u64>)> = Vec::new();
         let mut total_documents: u64 = 0;
         let mut total_corpus_bytes: u64 = 0;
         let mut segment_infos: Vec<pb::SuffixArraySegmentInfo> = Vec::new();
@@ -567,19 +613,20 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
 
         // Helper closure to process a batch of segments
         async fn process_batch(
-            pending: &mut Vec<(Vec<u8>, Vec<u64>)>,
+            pending: &mut Vec<(Vec<u8>, Vec<u64>, Vec<u64>)>,
             parallel_threads: usize,
             seg_counter: &mut usize,
             batch_idx: &mut usize,
             segment_infos: &mut Vec<pb::SuffixArraySegmentInfo>,
             index_store: &dyn IndexStore,
+            token_width: u32,
         ) -> Result<()> {
             if pending.is_empty() {
                 return Ok(());
             }
 
             let batch_size = parallel_threads.min(pending.len());
-            let batch: Vec<(Vec<u8>, Vec<u64>)> = pending.drain(..batch_size).collect();
+            let batch: Vec<(Vec<u8>, Vec<u64>, Vec<u64>)> = pending.drain(..batch_size).collect();
             let seg_offset = *seg_counter;
             *seg_counter += batch_size;
 
@@ -603,7 +650,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 pool.install(|| {
                     batch.into_par_iter()
                         .enumerate()
-                        .map(|(i, (text, doc_offsets))| {
+                        .map(|(i, (text, doc_offsets, row_ids))| {
                             let seg_idx = seg_offset + i;
                             let seg_start = std::time::Instant::now();
                             let corpus_bytes = text.len() as u64;
@@ -624,6 +671,13 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                                 "Segment SA built"
                             );
 
+                            // Build bloom filter for fast segment skipping
+                            let bloom_bytes = if token_width > 1 {
+                                BloomFilter::from_text_token_aligned(&text, token_width as usize).to_bytes()
+                            } else {
+                                BloomFilter::from_text(&text).to_bytes()
+                            };
+
                             Ok(BuiltSegment {
                                 seg_idx,
                                 text,
@@ -631,6 +685,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                                 pointer_width,
                                 corpus_bytes,
                                 doc_offsets,
+                                row_ids,
+                                bloom_bytes,
                             })
                         })
                         .collect::<Result<Vec<_>>>()
@@ -660,14 +716,29 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             let col = batch.column(value_col_idx);
+
+            // Extract row IDs for non-null rows (same order as extract_bytes processes them)
+            let row_id_col = batch[ROW_ID]
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| Error::invalid_input(
+                    "Training data stream missing '_rowid' column (UInt64)"
+                ))?;
+            for i in 0..col.len() {
+                if !col.is_null(i) {
+                    current_row_ids.push(row_id_col.value(i));
+                }
+            }
+
             let docs = extract_bytes(col.as_ref(), &mut current_bytes, &mut current_doc_offsets, case_insensitive, separator_token_id)?;
             total_documents += docs;
 
             // Split off complete segments as we accumulate data.
-            // When splitting, doc_offsets need to be adjusted: offsets that fall
-            // within the split-off portion stay with that segment (rebased to 0),
-            // offsets beyond the split point remain in current_doc_offsets (rebased
-            // to the new segment start).
+            // When splitting, doc_offsets and row_ids need to be adjusted:
+            // offsets that fall within the split-off portion stay with that
+            // segment (rebased to 0), offsets beyond the split point remain
+            // in current_doc_offsets (rebased to the new segment start).
+            // row_ids are split at the same index as doc_offsets.
             while current_bytes.len() >= MAX_SEGMENT_BYTES {
                 let split_point = MAX_SEGMENT_BYTES as u64;
                 let rest = current_bytes.split_off(MAX_SEGMENT_BYTES);
@@ -678,16 +749,19 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 let split_idx = current_doc_offsets.partition_point(|&o| o <= split_point);
 
                 let seg_offsets: Vec<u64> = current_doc_offsets[..split_idx].to_vec();
+                let seg_row_ids: Vec<u64> = current_row_ids[..split_idx].to_vec();
                 // Rebase remaining offsets relative to the new segment start
                 let remaining_offsets: Vec<u64> = current_doc_offsets[split_idx..]
                     .iter()
                     .map(|&o| o - split_point)
                     .collect();
+                let remaining_row_ids: Vec<u64> = current_row_ids[split_idx..].to_vec();
 
                 let segment = std::mem::replace(&mut current_bytes, rest);
                 current_doc_offsets = remaining_offsets;
+                current_row_ids = remaining_row_ids;
                 total_corpus_bytes += segment.len() as u64;
-                pending_segments.push((segment, seg_offsets));
+                pending_segments.push((segment, seg_offsets, seg_row_ids));
 
                 // When we have a full batch, process it immediately
                 if pending_segments.len() >= parallel_threads {
@@ -698,6 +772,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                         &mut batch_idx,
                         &mut segment_infos,
                         index_store,
+                        token_width,
                     ).await?;
                 }
             }
@@ -706,7 +781,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
         // Push remaining bytes as the final segment
         if !current_bytes.is_empty() {
             total_corpus_bytes += current_bytes.len() as u64;
-            pending_segments.push((current_bytes, current_doc_offsets));
+            pending_segments.push((current_bytes, current_doc_offsets, current_row_ids));
         } else if !current_doc_offsets.is_empty() {
             // Edge case: last doc ended exactly at MAX_SEGMENT_BYTES
             // doc_offsets are empty vec (all docs were in split segment)
@@ -721,6 +796,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 &mut batch_idx,
                 &mut segment_infos,
                 index_store,
+                token_width,
             ).await?;
         }
 
@@ -736,6 +812,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 pointer_width: 1,
                 corpus_bytes: 0,
                 doc_offsets: Vec::new(),
+                row_ids: Vec::new(),
+                bloom_bytes: Vec::new(),
             };
             let info = write_segment(index_store, &empty_segment, 1).await?;
             segment_infos.push(info);
@@ -813,6 +891,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 &details.segments,
                 case_insensitive,
                 token_width,
+                cache,
             ).await? as Arc<dyn ScalarIndex>)
         } else {
             // Single-segment index (v0 / backwards compat)
@@ -1071,32 +1150,38 @@ mod tests {
 
         let index = SuffixArrayIndex::from_segments(vec![
             SuffixArraySegment {
-                tokenized: Bytes::from(text1.to_vec()),
-                suffix_array: Bytes::from(csa1),
+                tokenized: Some(Bytes::from(text1.to_vec())),
+                tokenized_cache: None,
+                suffix_array: Some(Bytes::from(csa1)),
+                sa_cache: None,
                 pointer_width: pw1 as u8,
                 total_entries: text1.len() as u64,
                 doc_offsets: vec![text1.len() as u64],
+                row_ids: vec![0],
             },
             SuffixArraySegment {
-                tokenized: Bytes::from(text2.to_vec()),
-                suffix_array: Bytes::from(csa2),
+                tokenized: Some(Bytes::from(text2.to_vec())),
+                tokenized_cache: None,
+                suffix_array: Some(Bytes::from(csa2)),
+                sa_cache: None,
                 pointer_width: pw2 as u8,
                 total_entries: text2.len() as u64,
                 doc_offsets: vec![text2.len() as u64],
+                row_ids: vec![1],
             },
         ]);
 
         // "the" appears 2 times in text1 + 2 times in text2 = 4
-        assert_eq!(index.total_count(b"the"), 4);
+        assert_eq!(index.total_count(b"the").await.unwrap(), 4);
         // "cat" appears once in text1 only
-        assert_eq!(index.total_count(b"cat"), 1);
+        assert_eq!(index.total_count(b"cat").await.unwrap(), 1);
         // "dog" appears once in text2 only
-        assert_eq!(index.total_count(b"dog"), 1);
+        assert_eq!(index.total_count(b"dog").await.unwrap(), 1);
         // "xyz" appears nowhere
-        assert_eq!(index.total_count(b"xyz"), 0);
+        assert_eq!(index.total_count(b"xyz").await.unwrap(), 0);
 
         // Test prob across segments
-        let prob_result = index.compute_prob(b"the ", b"cat");
+        let prob_result = index.compute_prob(b"the ", b"cat").await.unwrap();
         // "the " appears: text1 has "the cat" and "the mat" = 2, text2 has "the dog" and "the park" = 2, total = 4
         assert_eq!(prob_result.prompt_cnt, 4);
         // "the cat" appears once (text1 only)
@@ -1104,13 +1189,13 @@ mod tests {
         assert!((prob_result.prob - 0.25).abs() < 1e-10);
 
         // Test ntd across segments
-        let ntd_result = index.compute_ntd(b"the ", None);
+        let ntd_result = index.compute_ntd(b"the ", None).await.unwrap();
         assert_eq!(ntd_result.prompt_cnt, 4);
         // Should have 4 distinct next bytes: 'c', 'm', 'd', 'p'
         assert_eq!(ntd_result.distribution.len(), 4);
 
         // Test infgram_prob across segments
-        let igp = index.compute_infgram_prob(b"the ", b"cat");
+        let igp = index.compute_infgram_prob(b"the ", b"cat").await.unwrap();
         assert_eq!(igp.prob_result.prompt_cnt, 4);
         assert_eq!(igp.prob_result.cont_cnt, 1);
         assert_eq!(igp.effective_suffix_len, 4);

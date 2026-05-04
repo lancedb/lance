@@ -251,6 +251,38 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Returns a list of (relative_path, size_bytes) tuples.
     /// Used to capture file metadata after index creation/modification.
     async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>>;
+
+    /// Write raw bytes to a file (no Lance encoding).
+    ///
+    /// Used for large blobs that need random byte-range access (e.g., suffix
+    /// array tokenized text). Default implementation returns an error —
+    /// only stores backed by an object store support this.
+    async fn write_raw_file(&self, _name: &str, _data: &[u8]) -> Result<()> {
+        Err(Error::not_supported(
+            "raw file write is not supported by this index store",
+        ))
+    }
+
+    /// Read a byte range from a raw file.
+    ///
+    /// Returns the bytes in `[range.start, range.end)`. The file must have
+    /// been written with [`write_raw_file`](Self::write_raw_file).
+    async fn read_raw_range(
+        &self,
+        _name: &str,
+        _range: std::ops::Range<usize>,
+    ) -> Result<Bytes> {
+        Err(Error::not_supported(
+            "raw file range read is not supported by this index store",
+        ))
+    }
+
+    /// Get the size of a raw file in bytes.
+    async fn raw_file_size(&self, _name: &str) -> Result<usize> {
+        Err(Error::not_supported(
+            "raw file size is not supported by this index store",
+        ))
+    }
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -364,11 +396,20 @@ impl FullTextSearchQuery {
 /// An infini-gram search query for suffix array indices.
 ///
 /// Searches for documents containing the given pattern and returns
-/// matching row IDs with occurrence counts.
+/// matching row IDs with occurrence counts and byte positions.
 ///
 /// Supports two query modes:
 /// - Text mode: `query` is a string pattern (for byte-level SA indices)
 /// - Token mode: `query_tokens` is a list of token IDs (for token-level SA indices)
+///
+/// Supports boolean queries via `clauses` (CNF form):
+/// - Each inner Vec is an OR group (document matches if it contains ANY term)
+/// - Outer Vec is AND of all groups (document must match ALL groups)
+/// - Example: `[["NLP", "natural language"], ["deep learning"]]`
+///   means `("NLP" OR "natural language") AND "deep learning"`
+///
+/// If `clauses` is set, `query` is ignored. Otherwise `query` is treated
+/// as a single-term search (backward compatible).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InfgramSearchQuery {
     /// The text pattern to search for (byte-level queries).
@@ -385,6 +426,11 @@ pub struct InfgramSearchQuery {
 
     /// Maximum number of results to return.
     pub limit: Option<usize>,
+
+    /// Boolean query clauses in CNF form.
+    /// Each inner Vec is an OR group; outer Vec is AND of groups.
+    /// When set, `query` field is ignored.
+    pub clauses: Option<Vec<Vec<String>>>,
 }
 
 impl InfgramSearchQuery {
@@ -395,6 +441,7 @@ impl InfgramSearchQuery {
             query_tokens: None,
             column: None,
             limit: None,
+            clauses: None,
         }
     }
 
@@ -405,6 +452,18 @@ impl InfgramSearchQuery {
             query_tokens: Some(tokens),
             column: None,
             limit: None,
+            clauses: None,
+        }
+    }
+
+    /// Create a boolean query from CNF clauses.
+    pub fn new_boolean(clauses: Vec<Vec<String>>) -> Self {
+        Self {
+            query: String::new(),
+            query_tokens: None,
+            column: None,
+            limit: None,
+            clauses: Some(clauses),
         }
     }
 
@@ -418,6 +477,54 @@ impl InfgramSearchQuery {
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
         self
+    }
+
+    /// Parse a query string with AND/OR operators into CNF clauses.
+    ///
+    /// Per infini-gram convention, OR has higher precedence than AND:
+    /// - `"A" AND "B" OR "C"` → `[["A"], ["B", "C"]]`
+    /// - `"A" OR "B" AND "C" OR "D"` → `[["A", "B"], ["C", "D"]]`
+    ///
+    /// Terms can be quoted (`"exact phrase"`) or unquoted (single words).
+    /// Returns None if the query has no AND/OR operators.
+    pub fn parse_boolean_query(query: &str) -> Option<Vec<Vec<String>>> {
+        // Check if query contains AND/OR operators
+        if !query.contains(" AND ") && !query.contains(" OR ") {
+            return None;
+        }
+
+        let mut clauses: Vec<Vec<String>> = Vec::new();
+        // Split on AND first (lower precedence)
+        for and_group in query.split(" AND ") {
+            let and_group = and_group.trim();
+            if and_group.is_empty() {
+                continue;
+            }
+            // Each AND group may contain OR terms
+            let or_terms: Vec<String> = and_group
+                .split(" OR ")
+                .map(|t| {
+                    let t = t.trim();
+                    // Strip surrounding quotes if present
+                    if (t.starts_with('"') && t.ends_with('"'))
+                        || (t.starts_with('\'') && t.ends_with('\''))
+                    {
+                        t[1..t.len() - 1].to_string()
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .filter(|t| !t.is_empty())
+                .collect();
+            if !or_terms.is_empty() {
+                clauses.push(or_terms);
+            }
+        }
+        if clauses.is_empty() {
+            None
+        } else {
+            Some(clauses)
+        }
     }
 }
 
