@@ -783,6 +783,194 @@ mod tests {
         assert!(result);
     }
 
+    /// Regression guard for over-projection of `Map` siblings in
+    /// `Field::apply_projection`. Before the parent-selection guard,
+    /// every `Map` column in a schema survived every projection because
+    /// `apply_projection` cloned `Map` children unconditionally without
+    /// checking whether the parent itself was selected. On scalar-index
+    /// training scans this turned a single-column projection into a wide
+    /// one, ballooning the per-row tuple width fed into `SortExec` and
+    /// producing >100 GiB external-sort spills on tables with several
+    /// `Map` columns.
+    ///
+    /// Coverage:
+    ///
+    /// 1. Plain `Binary` siblings stay narrow — sanity check that
+    ///    non-Map schemas weren't affected by the bug.
+    /// 2. `Map` siblings stay narrow — the actual regression guard.
+    /// 3. The same `Map`-sibling schema scanned via `with_fragments`,
+    ///    the path `optimize_indices` uses for delta training scans.
+    /// 4. When the caller *does* request a Map column, the Map's
+    ///    internal children (entries struct + key/value) are still
+    ///    preserved (the original intent of PR #5349).
+    #[tokio::test]
+    async fn scan_training_data_does_not_pull_unrelated_map_siblings() {
+        use arrow_array::types::Int32Type;
+        use lance_datagen::ByteCount;
+        use lance_file::version::LanceFileVersion;
+
+        const FRAGMENTS: u32 = 2;
+        const ROWS_PER_FRAGMENT: u32 = 32;
+        const BINARY_BYTES: u64 = 20;
+
+        async fn projection_columns(dataset: &Dataset, column: &str) -> Vec<String> {
+            let mut scan = dataset.scan();
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                column.to_string(),
+            )]))
+            .unwrap();
+            scan.with_row_id();
+            scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])
+                .unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            // FilteredReadExec's Display emits `projection=[col1, col2, ...]`;
+            // pluck the column list out of the line. We do not depend on
+            // ordering or whitespace beyond the literal `projection=[` /
+            // `]` markers so the assertion stays robust to unrelated plan
+            // formatting changes.
+            let line = plan
+                .lines()
+                .find(|l| l.contains("projection=["))
+                .unwrap_or_else(|| panic!("LanceRead line missing in plan:\n{}", plan));
+            let start = line.find("projection=[").unwrap() + "projection=[".len();
+            let rest = &line[start..];
+            let end = rest.find(']').unwrap();
+            rest[..end]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+
+        // Variant 1: plain `Binary` siblings — sanity check that the prior
+        // narrow-projection behaviour still holds for non-Map schemas.
+        let bin_dataset = lance_datagen::gen_batch()
+            .col(
+                "bin_a",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col(
+                "bin_b",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col(
+                "bin_c",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col(
+                "bin_d",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(
+                FragmentCount::from(FRAGMENTS),
+                FragmentRowCount::from(ROWS_PER_FRAGMENT),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projection_columns(&bin_dataset, "idx").await,
+            vec!["idx".to_string()],
+            "binary-siblings schema must project only the requested column"
+        );
+
+        // Variant 2: `Map` siblings + a fixed-size `Binary` index column —
+        // the actual regression guard. Multiple Map types with different
+        // value shapes (`Utf8`, `List<Utf8>`, `Float64`) exercise the
+        // children-clone codepath across a few representative shapes.
+        let map_dir = TempStrDir::default();
+        let map_uri = format!("{}/maps", map_dir.as_str());
+        let map_params = crate::dataset::WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+            ..Default::default()
+        };
+        let map_dataset = lance_datagen::gen_batch()
+            .col("map_a", array::rand_map(&DataType::Utf8, &DataType::Utf8))
+            .col(
+                "map_b",
+                array::rand_map(
+                    &DataType::Utf8,
+                    &DataType::List(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::Utf8,
+                        true,
+                    ))),
+                ),
+            )
+            .col(
+                "map_c",
+                array::rand_map(&DataType::Utf8, &DataType::Float64),
+            )
+            .col(
+                "map_d",
+                array::rand_map(&DataType::Utf8, &DataType::Float64),
+            )
+            .col(
+                "indexed",
+                array::rand_fixedbin(ByteCount::from(BINARY_BYTES), false),
+            )
+            .into_dataset_with_params(
+                &map_uri,
+                FragmentCount::from(FRAGMENTS),
+                FragmentRowCount::from(ROWS_PER_FRAGMENT),
+                Some(map_params),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projection_columns(&map_dataset, "indexed").await,
+            vec!["indexed".to_string()],
+            "map-siblings schema must not pull unrelated Map columns into LanceRead"
+        );
+
+        // Variant 3: same dataset, exercising the `with_fragments` delta
+        // path used by `optimize_indices` for incremental BTree updates.
+        let frag = map_dataset.fragments().first().cloned().unwrap();
+        let mut scan = map_dataset.scan();
+        scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "indexed".to_string(),
+        )]))
+        .unwrap();
+        scan.with_row_id();
+        scan.with_fragments(vec![frag]);
+        scan.project_with_transform(&[(VALUE_COLUMN_NAME, "indexed")])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        let line = plan
+            .lines()
+            .find(|l| l.contains("projection=["))
+            .unwrap_or_else(|| panic!("LanceRead line missing:\n{}", plan));
+        assert!(
+            line.contains("projection=[indexed]"),
+            "with_fragments delta scan must also project only the indexed column; got:\n{}",
+            line
+        );
+
+        // Variant 4: when the Map column itself is requested, its internal
+        // children (entries struct with key/value) must still be preserved
+        // — this is the original intent of PR #5349 and the reason
+        // `apply_projection` clones the children whole-cloth for selected
+        // Map fields.
+        let mut scan = map_dataset.scan();
+        scan.project(&["map_c"]).unwrap();
+        let projected_schema = scan.schema().await.unwrap();
+        let projected = projected_schema.field_with_name("map_c").unwrap();
+        match projected.data_type() {
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(children) => {
+                    assert_eq!(
+                        children.len(),
+                        2,
+                        "selected Map column must keep its key/value entries struct"
+                    );
+                }
+                other => panic!("Map entries should be Struct, got {:?}", other),
+            },
+            other => panic!("expected Map type, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn test_load_training_data_addr_sort() {
         // Create test data using lance_datagen
