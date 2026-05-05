@@ -21,7 +21,6 @@
 #![allow(clippy::type_complexity)]
 
 use std::any::Any;
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,16 +49,18 @@ const MEM_HNSW_DIM_PLACEHOLDER: usize = 0;
 /// - Single writer (the MemTable's WAL flush handler thread).
 /// - Multiple concurrent readers (queries and the HNSW search algorithms).
 ///
-/// `vectors` and `row_positions` use `UnsafeCell` for interior mutation; the
-/// writer publishes new committed entries by bumping `committed_len` with a
-/// release store. Readers acquire-load `committed_len` and only read indices
-/// `< committed_len`.
+/// All buffer access goes through raw pointers — never `&Box<…>` or
+/// `&mut Box<…>` — to avoid creating aliasing references between the writer
+/// and concurrent readers. Slots are never overwritten after publication, so
+/// readers reading slot `i < committed_len` are safe for the lifetime of the
+/// storage.
 pub struct MemHnswStorage {
-    /// Vector data, layout `[v0, v1, ..., v_{capacity - 1}]` with each
-    /// `v_i` being `dim` consecutive `f32` slots. Total size = `capacity * dim`.
-    vectors: UnsafeCell<Box<[MaybeUninit<f32>]>>,
-    /// Row positions in the MemTable; one per slot, total size = `capacity`.
-    row_positions: UnsafeCell<Box<[MaybeUninit<u64>]>>,
+    /// Pointer to the start of the vector buffer. Owns
+    /// `capacity * dim * sizeof(f32)` bytes; freed in `Drop`.
+    vectors_ptr: *mut MaybeUninit<f32>,
+    /// Pointer to the start of the row-positions buffer. Owns
+    /// `capacity * sizeof(u64)` bytes; freed in `Drop`.
+    row_positions_ptr: *mut MaybeUninit<u64>,
     capacity: usize,
     dim: usize,
     distance_type: DistanceType,
@@ -70,26 +71,55 @@ pub struct MemHnswStorage {
 }
 
 // SAFETY: `MemHnswStorage` follows a single-writer multi-reader model. The
-// writer is the only mutator of the underlying `UnsafeCell` buffers; readers
-// only access indices `< committed_len`, and `committed_len` is published
-// with `Release` ordering so readers see initialized data.
+// writer is the only mutator of the underlying buffers; readers only access
+// indices `< committed_len`, and `committed_len` is published with `Release`
+// ordering so readers see initialized data. All buffer access uses raw
+// pointers to avoid Rust-level aliasing of references.
 unsafe impl Sync for MemHnswStorage {}
 unsafe impl Send for MemHnswStorage {}
+
+impl Drop for MemHnswStorage {
+    fn drop(&mut self) {
+        // Reconstruct the original boxed slices so their backing allocations
+        // are freed correctly. This is the only place a Rust reference to
+        // the buffers exists, and at this point we have `&mut self` so there
+        // are no concurrent readers.
+        unsafe {
+            let _: Box<[MaybeUninit<f32>]> = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.vectors_ptr,
+                self.capacity * self.dim,
+            ));
+            let _: Box<[MaybeUninit<u64>]> = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.row_positions_ptr,
+                self.capacity,
+            ));
+        }
+    }
+}
 
 impl MemHnswStorage {
     /// Create a storage pre-allocated for `capacity` vectors of `dim` floats.
     pub fn with_capacity(capacity: usize, dim: usize, distance_type: DistanceType) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
         assert!(dim > 0, "dim must be > 0");
+        assert!(
+            capacity <= u32::MAX as usize,
+            "MemHnswStorage capacity must fit in u32"
+        );
 
-        let mut vectors = Vec::with_capacity(capacity * dim);
-        for _ in 0..capacity * dim {
-            vectors.push(MaybeUninit::uninit());
-        }
-        let mut row_positions = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            row_positions.push(MaybeUninit::uninit());
-        }
+        // Allocate uninitialized buffers and leak them; they are freed in
+        // `Drop` by reconstructing the boxed slices.
+        let vectors: Box<[MaybeUninit<f32>]> = (0..capacity * dim)
+            .map(|_| MaybeUninit::uninit())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let row_positions: Box<[MaybeUninit<u64>]> = (0..capacity)
+            .map(|_| MaybeUninit::uninit())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let vectors_ptr: *mut MaybeUninit<f32> = Box::into_raw(vectors) as *mut MaybeUninit<f32>;
+        let row_positions_ptr: *mut MaybeUninit<u64> =
+            Box::into_raw(row_positions) as *mut MaybeUninit<u64>;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
@@ -104,8 +134,8 @@ impl MemHnswStorage {
         ]));
 
         Self {
-            vectors: UnsafeCell::new(vectors.into_boxed_slice()),
-            row_positions: UnsafeCell::new(row_positions.into_boxed_slice()),
+            vectors_ptr,
+            row_positions_ptr,
             capacity,
             dim,
             distance_type,
@@ -139,15 +169,17 @@ impl MemHnswStorage {
             )));
         }
 
-        // SAFETY: single writer, id < capacity.
+        // SAFETY: single writer, id < capacity. Slot at `id` was reserved by
+        // construction and is not concurrently read (readers only access
+        // indices < committed_len, which still equals `id` here).
         unsafe {
-            let vectors = &mut *self.vectors.get();
-            let base = id * self.dim;
+            let vec_base = self.vectors_ptr.add(id * self.dim);
             for (i, &v) in vector.iter().enumerate() {
-                vectors[base + i].write(v);
+                vec_base.add(i).write(MaybeUninit::new(v));
             }
-            let row_positions = &mut *self.row_positions.get();
-            row_positions[id].write(row_position);
+            self.row_positions_ptr
+                .add(id)
+                .write(MaybeUninit::new(row_position));
         }
 
         // Release publishes the writes above to readers.
@@ -158,22 +190,24 @@ impl MemHnswStorage {
     /// Get the row position for a committed id.
     pub fn row_position(&self, id: u32) -> u64 {
         debug_assert!((id as usize) < self.committed_len.load(Ordering::Acquire));
-        // SAFETY: id < committed_len => initialized.
-        unsafe { (*self.row_positions.get())[id as usize].assume_init() }
+        // SAFETY: id < committed_len => initialized; the slot is never
+        // overwritten after publication. We read the raw pointer without
+        // materializing any Rust reference to the surrounding buffer.
+        unsafe { self.row_positions_ptr.add(id as usize).read().assume_init() }
     }
 
     /// Get a slice view of the vector at id `id`. Lifetime is tied to the
     /// storage; the underlying memory is stable for the life of the storage.
     pub fn vector_slice(&self, id: u32) -> &[f32] {
         debug_assert!((id as usize) < self.committed_len.load(Ordering::Acquire));
-        // SAFETY: id < committed_len => initialized; storage is single-writer,
-        // and after Release on committed_len readers can safely read these
-        // bytes; no further writer touches them (the writer only writes new
-        // slots, never overwrites committed slots).
+        // SAFETY: id < committed_len => initialized; storage is single-writer
+        // and never overwrites committed slots, so the returned slice's
+        // bytes are stable for the storage's lifetime. We use raw pointer
+        // arithmetic to avoid creating any aliasing reference to the
+        // backing buffer.
         unsafe {
-            let vectors = &*self.vectors.get();
-            let base = (id as usize) * self.dim;
-            std::slice::from_raw_parts(vectors.as_ptr().add(base) as *const f32, self.dim)
+            let base = self.vectors_ptr.add((id as usize) * self.dim) as *const f32;
+            std::slice::from_raw_parts(base, self.dim)
         }
     }
 
@@ -324,11 +358,12 @@ impl VectorStore for MemHnswStorageView {
     fn row_ids(&self) -> impl Iterator<Item = &u64> {
         // SAFETY: visible_len <= storage.committed_len at snapshot time; the
         // first `visible_len` slots are initialized and stable for the life of
-        // the storage (single writer never overwrites committed entries).
-        let storage = &self.storage;
+        // the storage (single writer never overwrites committed entries). We
+        // build the slice from the raw pointer without materializing any
+        // reference to the surrounding buffer.
         let slice: &[u64] = unsafe {
             std::slice::from_raw_parts(
-                (*storage.row_positions.get()).as_ptr() as *const u64,
+                self.storage.row_positions_ptr as *const u64,
                 self.visible_len,
             )
         };
@@ -366,20 +401,35 @@ impl<'a> MemHnswDistCalc<'a> {
     }
 
     fn new_for_id(view: &'a MemHnswStorageView, id: u32) -> Self {
-        Self {
-            view,
-            query: view.vector_slice(id).to_vec(),
-        }
+        // The graph's `level_neighbors` lists are published via `ArcSwap`
+        // and may include ids beyond this view's snapshot — the writer
+        // could have appended a new vector and published reverse edges
+        // referencing it after this view was constructed. If the seed
+        // candidate is out of snapshot, we use an empty query as a
+        // tombstone; `distance()` returns +inf for any id so the search
+        // path drops the candidate.
+        let query = if (id as usize) < view.visible_len {
+            view.vector_slice(id).to_vec()
+        } else {
+            Vec::new()
+        };
+        Self { view, query }
     }
 }
 
 impl DistCalculator for MemHnswDistCalc<'_> {
     fn distance(&self, id: u32) -> f32 {
+        if self.query.is_empty() || (id as usize) >= self.view.visible_len {
+            return f32::INFINITY;
+        }
         let v = self.view.vector_slice(id);
         compute_distance(&self.query, v, self.view.storage.distance_type)
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+        if self.query.is_empty() {
+            return vec![f32::INFINITY; self.view.visible_len];
+        }
         let mut out = Vec::with_capacity(self.view.visible_len);
         for id in 0..self.view.visible_len as u32 {
             let v = self.view.vector_slice(id);
@@ -619,9 +669,16 @@ impl HnswMemIndex {
         let query_arr: ArrayRef = query.value(0);
         let candidates: Vec<OrderedNode> = state.builder.search(query_arr, k, ef_actual, &view);
 
+        // Drop any candidate id past the snapshot — see the long comment on
+        // `MemHnswDistCalc::new_for_id` for why ArcSwap-published neighbors
+        // can reference ids the view doesn't yet cover. Also drop +inf
+        // distances that the dist-calc tombstone produced for those ids.
         let mut out: Vec<(f32, RowPosition)> = candidates
             .into_iter()
             .filter_map(|n| {
+                if (n.id as usize) >= view.visible_len || !n.dist.0.is_finite() {
+                    return None;
+                }
                 let pos = view.row_pos(n.id);
                 if pos <= max_row_position {
                     Some((n.dist.0, pos))
@@ -796,5 +853,71 @@ mod tests {
         let query = FixedSizeListArray::try_new_from_values(inner, 4).unwrap();
         let results = index.search(&query, 5, None, u64::MAX).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_index_concurrent_insert_and_search() {
+        // One writer thread inserts vectors, multiple reader threads
+        // hammer `search` against the index. Verifies that a search
+        // executing while inserts are in flight doesn't read uninitialized
+        // memory or panic — the dist-calc bounds check should drop any
+        // neighbor id past the snapshot's visible range.
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering as StdOrdering};
+        use std::thread;
+
+        let dim = 16;
+        let n = 500;
+        let index = StdArc::new(HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
+            n,
+        ));
+
+        // Pre-insert one vector so the index has dim and an entry point.
+        let initial = make_batch(-1, 1, dim);
+        index.insert(&initial, 0).unwrap();
+
+        let stop = StdArc::new(AtomicBool::new(false));
+
+        // Reader threads
+        let mut reader_handles = Vec::new();
+        for _ in 0..4 {
+            let index = index.clone();
+            let stop = stop.clone();
+            reader_handles.push(thread::spawn(move || {
+                let inner = Float32Array::from(vec![0.5_f32; dim]);
+                let query = FixedSizeListArray::try_new_from_values(inner, dim as i32).unwrap();
+                let mut iters = 0u64;
+                while !stop.load(StdOrdering::Relaxed) {
+                    let _ = index.search(&query, 5, Some(32), u64::MAX).unwrap();
+                    iters += 1;
+                }
+                iters
+            }));
+        }
+
+        // Writer thread inserts the rest of the vectors one batch at a time.
+        let writer_index = index.clone();
+        let writer_handle = thread::spawn(move || {
+            for i in 1..(n / 5) {
+                let batch = make_batch(i as i32 * 5, 5, dim);
+                let row_offset = (i as u64) * 5 + 1; // offset by the initial 1-vector batch
+                writer_index.insert(&batch, row_offset).unwrap();
+            }
+        });
+
+        writer_handle.join().unwrap();
+        stop.store(true, StdOrdering::Release);
+        let mut total_reader_iters = 0u64;
+        for h in reader_handles {
+            total_reader_iters += h.join().unwrap();
+        }
+
+        // Sanity: at least the writer made progress and readers ran.
+        assert!(index.len() > 1);
+        assert!(total_reader_iters > 0);
     }
 }

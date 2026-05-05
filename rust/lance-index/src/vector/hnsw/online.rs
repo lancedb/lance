@@ -42,7 +42,7 @@ use super::builder::{HNSW, HnswBuildParams, HnswQueryParams};
 use super::select_neighbors_heuristic;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
-    Graph, OrderedFloat, OrderedNode, Visited, VisitedGenerator, beam_search, greedy_search,
+    Graph, OrderedFloat, OrderedNode, VisitedGenerator, beam_search, greedy_search,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -56,11 +56,11 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 pub struct OnlineGraphBuilderNode {
     /// Per-level read-visible neighbor lists. Length = target_level + 1.
     /// Empty `Arc<Vec<u32>>` means the node is allocated but not yet inserted.
-    pub level_neighbors: Vec<ArcSwap<Vec<u32>>>,
+    pub(crate) level_neighbors: Vec<ArcSwap<Vec<u32>>>,
     /// Writer-only per-level ranked neighbors used during prune.
-    pub level_neighbors_ranked: Mutex<Vec<Vec<OrderedNode>>>,
+    pub(crate) level_neighbors_ranked: Mutex<Vec<Vec<OrderedNode>>>,
     /// Convenience hot path mirror of `level_neighbors[0]`.
-    pub bottom_neighbors: ArcSwap<Vec<u32>>,
+    pub(crate) bottom_neighbors: ArcSwap<Vec<u32>>,
 }
 
 impl OnlineGraphBuilderNode {
@@ -326,10 +326,13 @@ impl OnlineHnswBuilder {
         }
 
         // Promote entry point if this node has a higher target level than the
-        // current entry point's target level.
+        // current entry point's target level. The contract is single-writer,
+        // so this CAS is uncontested in practice; we use CAS rather than a
+        // plain store to keep `entry_point` updates atomic against concurrent
+        // searches and to leave the door open if the writer ever becomes
+        // multi-threaded.
         let entry_target_level = nodes[entry as usize].target_level();
         if target_level > entry_target_level {
-            // Best-effort CAS: if another writer already promoted, no-op.
             let _ =
                 self.entry_point
                     .compare_exchange(entry, id, Ordering::AcqRel, Ordering::Acquire);
@@ -548,9 +551,6 @@ impl Graph for OnlineHnswBottomView<'_> {
         self.nodes[key as usize].bottom_neighbors.load_full()
     }
 }
-
-// Tell the compiler the `Visited` lifetime is local to the function.
-fn _assert_visited_lifetime<'a>(_: &'a Visited<'a>) {}
 
 #[cfg(test)]
 mod tests {
