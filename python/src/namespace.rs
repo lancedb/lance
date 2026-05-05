@@ -10,18 +10,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
-    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest,
-    AlterTableBackfillColumnsRequest, AlterTableDropColumnsRequest,
-    RefreshMaterializedViewRequest,
-    AlterTransactionRequest, AnalyzeTableQueryPlanRequest, CountTableRowsRequest,
-    CreateTableIndexRequest, CreateTableTagRequest, CreateTableVersionRequest,
-    CreateTableVersionResponse, DeleteFromTableRequest, DeleteTableTagRequest,
-    DescribeTableIndexStatsRequest, DescribeTableRequest, DescribeTableResponse,
-    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
-    DropTableIndexRequest, ExplainTableQueryPlanRequest, GetTableStatsRequest,
-    GetTableTagVersionRequest, InsertIntoTableRequest, ListTableIndicesRequest,
-    ListTableTagsRequest, ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
-    MergeInsertIntoTableRequest, QueryTableRequest, RestoreTableRequest, UpdateTableRequest,
+    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableBackfillColumnsRequest,
+    AlterTableDropColumnsRequest, AlterTransactionRequest, AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest, CreateTableIndexRequest, CreateTableTagRequest,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeleteFromTableRequest,
+    DeleteTableTagRequest, DescribeTableIndexStatsRequest, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DescribeTransactionRequest, DropTableIndexRequest, ExplainTableQueryPlanRequest,
+    GetTableStatsRequest, GetTableTagVersionRequest, InsertIntoTableRequest,
+    ListTableIndicesRequest, ListTableTagsRequest, ListTableVersionsRequest,
+    ListTableVersionsResponse, ListTablesRequest, MergeInsertIntoTableRequest, QueryTableRequest,
+    RefreshMaterializedViewRequest, RestoreTableRequest, UpdateTableRequest,
     UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;

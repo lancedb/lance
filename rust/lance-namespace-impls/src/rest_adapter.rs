@@ -1050,13 +1050,12 @@ async fn drop_table_index(
 
 async fn alter_table_add_columns(
     State(backend): State<Arc<dyn LanceNamespace>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableAddColumnsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
-    request.identity = extract_identity(&headers);
 
     match backend.alter_table_add_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -1066,13 +1065,12 @@ async fn alter_table_add_columns(
 
 async fn alter_table_alter_columns(
     State(backend): State<Arc<dyn LanceNamespace>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableAlterColumnsRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
-    request.identity = extract_identity(&headers);
 
     match backend.alter_table_alter_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),

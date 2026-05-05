@@ -2323,11 +2323,7 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTableBac
     ok_or_throw_with_return!(
         env,
         call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
-            RT.block_on(
-                namespace_client
-                    .inner
-                    .alter_table_backfill_columns(req),
-            )
+            RT.block_on(namespace_client.inner.alter_table_backfill_columns(req))
         }),
         std::ptr::null_mut()
     )
@@ -3270,11 +3266,7 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTableBackfill
     ok_or_throw_with_return!(
         env,
         call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
-            RT.block_on(
-                namespace_client
-                    .inner
-                    .alter_table_backfill_columns(req),
-            )
+            RT.block_on(namespace_client.inner.alter_table_backfill_columns(req))
         }),
         std::ptr::null_mut()
     )
