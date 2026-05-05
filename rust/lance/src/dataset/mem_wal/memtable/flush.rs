@@ -1062,7 +1062,7 @@ mod tests {
         crate::utils::test::assert_plan_node_equals(
             plan,
             "LanceRead: ...full_filter=id = Int32(5)...
-  ScalarIndexQuery: query=[id = 5]@id_btree",
+  ScalarIndexQuery: query=[id = 5]@id_btree(BTree)",
         )
         .await
         .unwrap();

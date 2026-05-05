@@ -262,13 +262,15 @@ impl ScalarQueryParser for MultiQueryParser {
 #[derive(Debug)]
 pub struct SargableQueryParser {
     index_name: String,
+    index_type: String,
     needs_recheck: bool,
 }
 
 impl SargableQueryParser {
-    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+    pub fn new(index_name: String, index_type: String, needs_recheck: bool) -> Self {
         Self {
             index_name,
+            index_type,
             needs_recheck,
         }
     }
@@ -304,6 +306,7 @@ impl ScalarQueryParser for SargableQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(query),
             self.needs_recheck,
         ))
@@ -317,6 +320,7 @@ impl ScalarQueryParser for SargableQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(query),
             self.needs_recheck,
         ))
@@ -326,6 +330,7 @@ impl ScalarQueryParser for SargableQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(SargableQuery::Equals(ScalarValue::Boolean(Some(value)))),
             self.needs_recheck,
         ))
@@ -335,6 +340,7 @@ impl ScalarQueryParser for SargableQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(SargableQuery::IsNull()),
             self.needs_recheck,
         ))
@@ -366,6 +372,7 @@ impl ScalarQueryParser for SargableQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(query),
             self.needs_recheck,
         ))
@@ -393,6 +400,7 @@ impl ScalarQueryParser for SargableQueryParser {
             return Some(IndexedExpression::index_query_with_recheck(
                 column.to_string(),
                 self.index_name.clone(),
+                self.index_type.clone(),
                 Arc::new(query),
                 self.needs_recheck,
             ));
@@ -433,6 +441,7 @@ impl ScalarQueryParser for SargableQueryParser {
         let scalar_query = Some(ScalarIndexExpr::Query(ScalarIndexSearch {
             column: column.to_string(),
             index_name: self.index_name.clone(),
+            index_type: self.index_type.clone(),
             query: Arc::new(query),
             needs_recheck: self.needs_recheck,
         }));
@@ -574,13 +583,15 @@ fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Opti
 #[derive(Debug)]
 pub struct BloomFilterQueryParser {
     index_name: String,
+    index_type: String,
     needs_recheck: bool,
 }
 
 impl BloomFilterQueryParser {
-    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+    pub fn new(index_name: String, index_type: String, needs_recheck: bool) -> Self {
         Self {
             index_name,
+            index_type,
             needs_recheck,
         }
     }
@@ -602,6 +613,7 @@ impl ScalarQueryParser for BloomFilterQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(query),
             self.needs_recheck,
         ))
@@ -611,6 +623,7 @@ impl ScalarQueryParser for BloomFilterQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(BloomFilterQuery::Equals(ScalarValue::Boolean(Some(value)))),
             self.needs_recheck,
         ))
@@ -620,6 +633,7 @@ impl ScalarQueryParser for BloomFilterQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(BloomFilterQuery::IsNull()),
             self.needs_recheck,
         ))
@@ -642,6 +656,7 @@ impl ScalarQueryParser for BloomFilterQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(query),
             self.needs_recheck,
         ))
@@ -663,11 +678,15 @@ impl ScalarQueryParser for BloomFilterQueryParser {
 #[derive(Debug)]
 pub struct LabelListQueryParser {
     index_name: String,
+    index_type: String,
 }
 
 impl LabelListQueryParser {
-    pub fn new(index_name: String) -> Self {
-        Self { index_name }
+    pub fn new(index_name: String, index_type: String) -> Self {
+        Self {
+            index_name,
+            index_type,
+        }
     }
 }
 
@@ -728,6 +747,7 @@ impl ScalarQueryParser for LabelListQueryParser {
             return Some(IndexedExpression::index_query(
                 column.to_string(),
                 self.index_name.clone(),
+                self.index_type.clone(),
                 Arc::new(query),
             ));
         }
@@ -747,6 +767,7 @@ impl ScalarQueryParser for LabelListQueryParser {
                 Some(IndexedExpression::index_query(
                     column.to_string(),
                     self.index_name.clone(),
+                    self.index_type.clone(),
                     Arc::new(query),
                 ))
             } else if func.name() == "array_has_any" {
@@ -754,6 +775,7 @@ impl ScalarQueryParser for LabelListQueryParser {
                 Some(IndexedExpression::index_query(
                     column.to_string(),
                     self.index_name.clone(),
+                    self.index_type.clone(),
                     Arc::new(query),
                 ))
             } else {
@@ -769,13 +791,15 @@ impl ScalarQueryParser for LabelListQueryParser {
 #[derive(Debug, Clone)]
 pub struct TextQueryParser {
     index_name: String,
+    index_type: String,
     needs_recheck: bool,
 }
 
 impl TextQueryParser {
-    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+    pub fn new(index_name: String, index_type: String, needs_recheck: bool) -> Self {
         Self {
             index_name,
+            index_type,
             needs_recheck,
         }
     }
@@ -830,6 +854,7 @@ impl ScalarQueryParser for TextQueryParser {
                     Some(IndexedExpression::index_query_with_recheck(
                         column.to_string(),
                         self.index_name.clone(),
+                        self.index_type.clone(),
                         Arc::new(query),
                         self.needs_recheck,
                     ))
@@ -849,11 +874,15 @@ impl ScalarQueryParser for TextQueryParser {
 #[derive(Debug, Clone)]
 pub struct FtsQueryParser {
     index_name: String,
+    index_type: String,
 }
 
 impl FtsQueryParser {
-    pub fn new(name: String) -> Self {
-        Self { index_name: name }
+    pub fn new(name: String, index_type: String) -> Self {
+        Self {
+            index_name: name,
+            index_type,
+        }
     }
 }
 
@@ -906,6 +935,7 @@ impl ScalarQueryParser for FtsQueryParser {
             return Some(IndexedExpression::index_query(
                 column.to_string(),
                 self.index_name.clone(),
+                self.index_type.clone(),
                 Arc::new(query),
             ));
         }
@@ -918,12 +948,16 @@ impl ScalarQueryParser for FtsQueryParser {
 #[derive(Debug, Clone)]
 pub struct GeoQueryParser {
     index_name: String,
+    index_type: String,
 }
 
 #[cfg(feature = "geo")]
 impl GeoQueryParser {
-    pub fn new(index_name: String) -> Self {
-        Self { index_name }
+    pub fn new(index_name: String, index_type: String) -> Self {
+        Self {
+            index_name,
+            index_type,
+        }
     }
 }
 
@@ -950,6 +984,7 @@ impl ScalarQueryParser for GeoQueryParser {
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
+            self.index_type.clone(),
             Arc::new(GeoQuery::IsNull),
             true,
         ))
@@ -996,6 +1031,7 @@ impl ScalarQueryParser for GeoQueryParser {
                     Some(IndexedExpression::index_query_with_recheck(
                         column.to_string(),
                         self.index_name.clone(),
+                        self.index_type.clone(),
                         Arc::new(query),
                         true,
                     ))
@@ -1012,6 +1048,7 @@ impl ScalarQueryParser for GeoQueryParser {
                     Some(IndexedExpression::index_query_with_recheck(
                         column.to_string(),
                         self.index_name.clone(),
+                        self.index_type.clone(),
                         Arc::new(query),
                         true,
                     ))
@@ -1033,11 +1070,17 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query
-    fn index_query(column: String, index_name: String, query: Arc<dyn AnyQuery>) -> Self {
+    fn index_query(
+        column: String,
+        index_name: String,
+        index_type: String,
+        query: Arc<dyn AnyQuery>,
+    ) -> Self {
         Self {
             scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
                 column,
                 index_name,
+                index_type,
                 query,
                 needs_recheck: false, // Default to false, will be set by parser
             })),
@@ -1049,6 +1092,7 @@ impl IndexedExpression {
     fn index_query_with_recheck(
         column: String,
         index_name: String,
+        index_type: String,
         query: Arc<dyn AnyQuery>,
         needs_recheck: bool,
     ) -> Self {
@@ -1056,6 +1100,7 @@ impl IndexedExpression {
             scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
                 column,
                 index_name,
+                index_type,
                 query,
                 needs_recheck,
             })),
@@ -1193,6 +1238,8 @@ pub struct ScalarIndexSearch {
     pub column: String,
     /// The name of the index to search
     pub index_name: String,
+    /// The type of the index being searched (e.g. "BTree", "Bitmap"), used for display purposes
+    pub index_type: String,
     /// The query to search for
     pub query: Arc<dyn AnyQuery>,
     /// If true, the query results are inexact and will need a recheck
@@ -1239,9 +1286,10 @@ impl std::fmt::Display for ScalarIndexExpr {
             Self::Or(lhs, rhs) => write!(f, "OR({},{})", lhs, rhs),
             Self::Query(search) => write!(
                 f,
-                "[{}]@{}",
+                "[{}]@{}({})",
                 search.query.format(&search.column),
-                search.index_name
+                search.index_name,
+                search.index_type
             ),
         }
     }
@@ -2166,6 +2214,7 @@ mod tests {
             Some(IndexedExpression::index_query(
                 col.to_string(),
                 format!("{}_idx", col),
+                "BTree".to_string(),
                 Arc::new(query),
             )),
             false,
@@ -2184,6 +2233,7 @@ mod tests {
             Some(IndexedExpression::index_query(
                 col.to_string(),
                 format!("{}_idx", col),
+                "BTree".to_string(),
                 Arc::new(query),
             )),
             true,
@@ -2203,6 +2253,7 @@ mod tests {
                 IndexedExpression::index_query(
                     col.to_string(),
                     format!("{}_idx", col),
+                    "BTree".to_string(),
                     Arc::new(query),
                 )
                 .maybe_not()
@@ -2219,28 +2270,44 @@ mod tests {
                 "color",
                 ColInfo::new(
                     DataType::Utf8,
-                    Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+                    Box::new(SargableQueryParser::new(
+                        "color_idx".to_string(),
+                        "BTree".to_string(),
+                        false,
+                    )),
                 ),
             ),
             (
                 "aisle",
                 ColInfo::new(
                     DataType::UInt32,
-                    Box::new(SargableQueryParser::new("aisle_idx".to_string(), false)),
+                    Box::new(SargableQueryParser::new(
+                        "aisle_idx".to_string(),
+                        "BTree".to_string(),
+                        false,
+                    )),
                 ),
             ),
             (
                 "on_sale",
                 ColInfo::new(
                     DataType::Boolean,
-                    Box::new(SargableQueryParser::new("on_sale_idx".to_string(), false)),
+                    Box::new(SargableQueryParser::new(
+                        "on_sale_idx".to_string(),
+                        "BTree".to_string(),
+                        false,
+                    )),
                 ),
             ),
             (
                 "price",
                 ColInfo::new(
                     DataType::Float32,
-                    Box::new(SargableQueryParser::new("price_idx".to_string(), false)),
+                    Box::new(SargableQueryParser::new(
+                        "price_idx".to_string(),
+                        "BTree".to_string(),
+                        false,
+                    )),
                 ),
             ),
             (
@@ -2249,7 +2316,11 @@ mod tests {
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
                         "$.name".to_string(),
-                        Box::new(SargableQueryParser::new("json_idx".to_string(), false)),
+                        Box::new(SargableQueryParser::new(
+                            "json_idx".to_string(),
+                            "BTree".to_string(),
+                            false,
+                        )),
                     )),
                 ),
             ),
@@ -2492,12 +2563,14 @@ mod tests {
         let left = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "aisle".to_string(),
             index_name: "aisle_idx".to_string(),
+            index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(10)))),
             needs_recheck: false,
         }));
         let right = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "color".to_string(),
             index_name: "color_idx".to_string(),
+            index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "blue".to_string(),
             )))),
@@ -2777,7 +2850,11 @@ mod tests {
             "color",
             ColInfo::new(
                 DataType::Utf8,
-                Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
             ),
         )]);
 
@@ -2873,7 +2950,11 @@ mod tests {
             "object_id",
             ColInfo::new(
                 DataType::Utf8,
-                Box::new(SargableQueryParser::new("object_id_idx".to_string(), false)),
+                Box::new(SargableQueryParser::new(
+                    "object_id_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
             ),
         )]);
 
@@ -2933,7 +3014,11 @@ mod tests {
             "color",
             ColInfo::new(
                 DataType::Utf8,
-                Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
             ),
         )]);
 

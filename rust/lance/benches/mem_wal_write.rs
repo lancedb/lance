@@ -39,6 +39,13 @@
 //!     - Available indexes: id_btree, text_fts, vector_ivfpq (all created on base table)
 //!     - Examples: `id_btree`, `id_btree,text_fts`, `vector_ivfpq`
 //!     - Use `none` to disable MemWAL index maintenance entirely
+//! - `ENABLE_MEMTABLE`: yes/no/both (default: yes) - whether the writer maintains an in-memory MemTable.
+//!   `yes` uses the standard MemTable + WAL pipeline (with optional indexes).
+//!   `no` uses WAL-only mode (no MemTable, no indexes, no Lance flushes; pure WAL throughput).
+//!   `both` runs each combination twice, once per mode, side-by-side.
+//!   When `no` or `both`, the WAL-only branch always runs with
+//!   `MEMWAL_MAINTAINED_INDEXES=none` and skips `INDEXED_WRITE=yes`
+//!   (sync-indexed writes require a MemTable).
 //! - `SAMPLE_SIZE`: Number of benchmark iterations (default: 10, minimum: 10)
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -115,6 +122,13 @@ fn get_durable_write_options() -> Vec<bool> {
 /// Get indexed write settings from environment.
 fn get_indexed_write_options() -> Vec<bool> {
     parse_yes_no_both("INDEXED_WRITE", "no")
+}
+
+/// Get enable_memtable settings from environment. Default `yes` keeps
+/// existing benchmark behavior; `no` runs WAL-only mode; `both` runs both
+/// modes side-by-side for comparison.
+fn get_enable_memtable_options() -> Vec<bool> {
+    parse_yes_no_both("ENABLE_MEMTABLE", "yes")
 }
 
 /// Get max WAL buffer size from environment or use default.
@@ -427,23 +441,30 @@ fn build_label(
     batch_size: usize,
     durable: bool,
     indexed: bool,
+    enable_memtable: bool,
     storage: &str,
 ) -> String {
     let durable_str = if durable { "durable" } else { "nondurable" };
     // sync_indexed_write controls sync vs async index updates
     let indexed_str = if indexed { "sync_idx" } else { "async_idx" };
+    let mode_str = if enable_memtable {
+        "memtable"
+    } else {
+        "wal_only"
+    };
     format!(
-        "{}x{} {} {} ({})",
-        num_batches, batch_size, durable_str, indexed_str, storage
+        "{}x{} {} {} {} ({})",
+        num_batches, batch_size, mode_str, durable_str, indexed_str, storage
     )
 }
 
 /// Build dataset name prefix from config options.
-fn build_name_prefix(durable: bool, indexed: bool) -> String {
+fn build_name_prefix(durable: bool, indexed: bool, enable_memtable: bool) -> String {
     let d = if durable { "d" } else { "nd" };
     // sync_indexed_write: sync (si) vs async (ai)
     let i = if indexed { "si" } else { "ai" };
-    format!("{}_{}", d, i)
+    let m = if enable_memtable { "mt" } else { "wo" };
+    format!("{}_{}_{}", m, d, i)
 }
 
 /// Benchmark Lance MemWAL write throughput.
@@ -468,6 +489,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
 
     let durable_options = get_durable_write_options();
     let indexed_options = get_indexed_write_options();
+    let enable_memtable_options = get_enable_memtable_options();
     let max_wal_buffer_size = get_max_wal_buffer_size();
     let max_flush_interval = get_max_flush_interval();
     let max_memtable_size = get_max_memtable_size();
@@ -524,44 +546,72 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
 
     // Generate benchmarks for all combinations
-    for &durable in &durable_options {
-        for &indexed in &indexed_options {
-            let label = build_label(num_batches, batch_size, durable, indexed, storage_label);
-            let name_prefix = build_name_prefix(durable, indexed);
+    for &enable_memtable in &enable_memtable_options {
+        for &durable in &durable_options {
+            for &indexed in &indexed_options {
+                if !enable_memtable && indexed {
+                    eprintln!(
+                        "Skipping wal_only + sync_idx (sync_indexed_write requires a MemTable)"
+                    );
+                    continue;
+                }
 
-            // Create dataset ONCE before benchmark iterations
-            // Each iteration will use a different shard on the same dataset
-            let dataset = rt.block_on(create_dataset(
-                &schema,
-                &name_prefix,
-                vector_dim,
-                &maintained_indexes,
-                &dataset_prefix,
-            ));
-            let dataset_uri = dataset.uri().to_string();
+                let label = build_label(
+                    num_batches,
+                    batch_size,
+                    durable,
+                    indexed,
+                    enable_memtable,
+                    storage_label,
+                );
+                let name_prefix = build_name_prefix(durable, indexed, enable_memtable);
 
-            // Pre-generate all batches before timing (outside iter_custom)
-            let batches: Arc<Vec<RecordBatch>> = Arc::new(
-                (0..num_batches)
-                    .map(|i| {
-                        create_test_batch(&schema, (i * batch_size) as i64, batch_size, vector_dim)
-                    })
-                    .collect(),
-            );
+                // WAL-only mode never uses indexes; force the dataset
+                // setup to skip the MemWAL index list.
+                let effective_indexes: Vec<String> = if enable_memtable {
+                    maintained_indexes.clone()
+                } else {
+                    Vec::new()
+                };
 
-            println!("Running: {}", label);
+                // Create dataset ONCE before benchmark iterations
+                // Each iteration will use a different shard on the same dataset
+                let dataset = rt.block_on(create_dataset(
+                    &schema,
+                    &name_prefix,
+                    vector_dim,
+                    &effective_indexes,
+                    &dataset_prefix,
+                ));
+                let dataset_uri = dataset.uri().to_string();
 
-            // Track if we've printed stats (only print once across all samples)
-            let stats_printed = Arc::new(AtomicBool::new(false));
+                // Pre-generate all batches before timing (outside iter_custom)
+                let batches: Arc<Vec<RecordBatch>> = Arc::new(
+                    (0..num_batches)
+                        .map(|i| {
+                            create_test_batch(
+                                &schema,
+                                (i * batch_size) as i64,
+                                batch_size,
+                                vector_dim,
+                            )
+                        })
+                        .collect(),
+                );
 
-            group.bench_with_input(
-                BenchmarkId::new("Lance MemWAL", &label),
-                &(batch_size, num_batches, durable, indexed, row_size_bytes),
-                |b, &(_batch_size, _num_batches, durable, indexed, row_size_bytes)| {
-                    let dataset_uri = dataset_uri.clone();
-                    let batches = batches.clone();
-                    let stats_printed = stats_printed.clone();
-                    b.to_async(&rt).iter_custom(|iters| {
+                println!("Running: {}", label);
+
+                // Track if we've printed stats (only print once across all samples)
+                let stats_printed = Arc::new(AtomicBool::new(false));
+
+                group.bench_with_input(
+                    BenchmarkId::new("Lance MemWAL", &label),
+                    &(batch_size, num_batches, durable, indexed, row_size_bytes),
+                    |b, &(_batch_size, _num_batches, durable, indexed, row_size_bytes)| {
+                        let dataset_uri = dataset_uri.clone();
+                        let batches = batches.clone();
+                        let stats_printed = stats_printed.clone();
+                        b.to_async(&rt).iter_custom(|iters| {
                         let dataset_uri = dataset_uri.clone();
                         let batches = batches.clone();
                         let stats_printed = stats_printed.clone();
@@ -599,6 +649,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     backpressure_log_interval: default_config
                                         .backpressure_log_interval,
                                     stats_log_interval: default_config.stats_log_interval,
+                                    enable_memtable,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)
@@ -647,8 +698,9 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                             total_duration
                         }
                     })
-                },
-            );
+                    },
+                );
+            }
         }
     }
 

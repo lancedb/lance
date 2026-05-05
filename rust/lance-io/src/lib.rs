@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-
-// Required after upstream opendal update — deeply nested type-erased layers
-// exceed the default 128 recursion limit during layout computation.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::{
     ops::{Range, RangeFrom, RangeFull, RangeTo},
