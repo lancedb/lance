@@ -427,10 +427,20 @@ pub struct InfgramSearchQuery {
     /// Maximum number of results to return.
     pub limit: Option<usize>,
 
-    /// Boolean query clauses in CNF form.
+    /// Boolean query clauses in CNF form (legacy).
     /// Each inner Vec is an OR group; outer Vec is AND of groups.
     /// When set, `query` field is ignored.
     pub clauses: Option<Vec<Vec<String>>>,
+
+    /// Occur-based boolean: patterns that MUST all appear.
+    pub must: Option<Vec<String>>,
+
+    /// Occur-based boolean: patterns where at least one SHOULD appear
+    /// (or boost score when MUST clauses are present).
+    pub should: Option<Vec<String>>,
+
+    /// Occur-based boolean: patterns that MUST NOT appear (excluded).
+    pub must_not: Option<Vec<String>>,
 }
 
 impl InfgramSearchQuery {
@@ -442,6 +452,9 @@ impl InfgramSearchQuery {
             column: None,
             limit: None,
             clauses: None,
+            must: None,
+            should: None,
+            must_not: None,
         }
     }
 
@@ -453,10 +466,13 @@ impl InfgramSearchQuery {
             column: None,
             limit: None,
             clauses: None,
+            must: None,
+            should: None,
+            must_not: None,
         }
     }
 
-    /// Create a boolean query from CNF clauses.
+    /// Create a boolean query from CNF clauses (legacy format).
     pub fn new_boolean(clauses: Vec<Vec<String>>) -> Self {
         Self {
             query: String::new(),
@@ -464,6 +480,27 @@ impl InfgramSearchQuery {
             column: None,
             limit: None,
             clauses: Some(clauses),
+            must: None,
+            should: None,
+            must_not: None,
+        }
+    }
+
+    /// Create a boolean query using Occur semantics (MUST / SHOULD / MUST_NOT).
+    pub fn new_boolean_occur(
+        must: Vec<String>,
+        should: Vec<String>,
+        must_not: Vec<String>,
+    ) -> Self {
+        Self {
+            query: String::new(),
+            query_tokens: None,
+            column: None,
+            limit: None,
+            clauses: None,
+            must: if must.is_empty() { None } else { Some(must) },
+            should: if should.is_empty() { None } else { Some(should) },
+            must_not: if must_not.is_empty() { None } else { Some(must_not) },
         }
     }
 

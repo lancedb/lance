@@ -1262,7 +1262,11 @@ class LanceDataset(pa.dataset.Dataset):
             elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if infgram_query is not None:
-            if isinstance(infgram_query, str):
+            from .query import InfgramQuery
+
+            if isinstance(infgram_query, InfgramQuery):
+                builder = builder.infgram_search(infgram_query)
+            elif isinstance(infgram_query, str):
                 builder = builder.infgram_search(infgram_query)
             elif isinstance(infgram_query, dict):
                 builder = builder.infgram_search(**infgram_query)
@@ -6050,7 +6054,7 @@ class ScannerBuilder:
 
     def infgram_search(
         self,
-        query: Optional[str] = None,
+        query=None,
         column: Optional[str] = None,
         limit: Optional[int] = None,
         clauses: Optional[List[List[str]]] = None,
@@ -6064,8 +6068,12 @@ class ScannerBuilder:
 
         Parameters
         ----------
-        query : str, optional
-            The text pattern to search for. May contain AND/OR operators
+        query : str or InfgramQuery or InfgramBooleanQuery, optional
+            The text pattern to search for. Can be a plain string, an
+            :class:`~lance.query.InfgramQuery`, or an
+            :class:`~lance.query.InfgramBooleanQuery` built with
+            ``Occur.MUST / SHOULD / MUST_NOT``.
+            May contain AND/OR operators when passed as a string
             (e.g. ``'"hello" AND "world"'``). Either ``query`` or
             ``clauses`` must be provided.
         column : str, optional
@@ -6080,6 +6088,23 @@ class ScannerBuilder:
             ``("cat" OR "kitten") AND "dog"``.
             Mutually exclusive with ``query``.
         """
+        from .query import InfgramBooleanQuery, InfgramQuery
+
+        if isinstance(query, InfgramBooleanQuery):
+            d = query._to_dict()
+            if column is not None:
+                d["column"] = column
+            d["limit"] = limit
+            self._infgram_query = d
+            return self
+        elif isinstance(query, InfgramQuery):
+            self._infgram_query = {
+                "query": query.pattern,
+                "column": column or query.column,
+                "limit": limit,
+            }
+            return self
+
         if clauses is not None:
             self._infgram_query = {
                 "clauses": clauses,

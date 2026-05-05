@@ -1456,8 +1456,52 @@ impl Dataset {
                 // May contain AND/OR operators — parsed by Rust at execution time
                 InfgramSearchQuery::new(query_str)
             } else if let Ok(dict) = infgram_query.cast::<PyDict>() {
-                // Check for structured clauses: {"clauses": [["A", "B"], ["C"]]}
-                if let Some(clauses_val) = dict.get_item("clauses")? {
+                // ---- Occur-based boolean: {"must": [...], "should": [...], "must_not": [...]} ----
+                if dict.get_item("must")?.is_some()
+                    || dict.get_item("should")?.is_some()
+                    || dict.get_item("must_not")?.is_some()
+                {
+                    // Helper: extract pattern strings from a list of {"pattern": "..."} dicts
+                    let extract_patterns = |key: &str| -> PyResult<Vec<String>> {
+                        match dict.get_item(key)? {
+                            Some(val) if !val.is_none() => {
+                                let list = val.downcast::<pyo3::types::PyList>()
+                                    .map_err(|_| PyValueError::new_err(
+                                        format!("infgram_query['{}'] must be a list", key)
+                                    ))?;
+                                let mut patterns = Vec::with_capacity(list.len());
+                                for item in list.iter() {
+                                    if let Ok(s) = item.extract::<String>() {
+                                        patterns.push(s);
+                                    } else if let Ok(d) = item.downcast::<PyDict>() {
+                                        if let Some(p) = d.get_item("pattern")? {
+                                            patterns.push(p.extract::<String>()?);
+                                        }
+                                    }
+                                }
+                                Ok(patterns)
+                            }
+                            _ => Ok(vec![]),
+                        }
+                    };
+                    let must = extract_patterns("must")?;
+                    let should = extract_patterns("should")?;
+                    let must_not = extract_patterns("must_not")?;
+                    let mut q = InfgramSearchQuery::new_boolean_occur(must, should, must_not);
+                    if let Some(col) = dict.get_item("column")? {
+                        if !col.is_none() {
+                            q = q.with_column(col.extract::<String>()?);
+                        }
+                    }
+                    if let Some(lim) = dict.get_item("limit")? {
+                        if !lim.is_none() {
+                            q = q.with_limit(Some(lim.extract::<usize>()?));
+                        }
+                    }
+                    q
+                }
+                // ---- Legacy CNF clauses: {"clauses": [["A", "B"], ["C"]]} ----
+                else if let Some(clauses_val) = dict.get_item("clauses")? {
                     if !clauses_val.is_none() {
                         let clauses: Vec<Vec<String>> = clauses_val.extract()?;
                         let mut q = InfgramSearchQuery::new_boolean(clauses);
@@ -1525,8 +1569,9 @@ impl Dataset {
                 }
             } else {
                 return Err(PyValueError::new_err(
-                    "infgram_query must be a string or dict with 'query' (str or list[int]) \
-                     or 'clauses' (list[list[str]]), optional 'column', optional 'limit'",
+                    "infgram_query must be a string, InfgramQuery, or dict with 'query' \
+                     (str or list[int]), 'clauses' (list[list[str]]), or \
+                     'must'/'should'/'must_not' (list[str/dict]); optional 'column', 'limit'",
                 ));
             };
             scanner

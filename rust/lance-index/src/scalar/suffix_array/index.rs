@@ -1209,6 +1209,121 @@ impl SuffixArrayIndex {
         Ok(results)
     }
 
+    /// Boolean search using Occur semantics (MUST / SHOULD / MUST_NOT).
+    ///
+    /// Follows Lucene/Tantivy conventions:
+    /// - **MUST**: document must contain ALL must patterns (intersection).
+    /// - **SHOULD**: if no MUST clauses, at least one SHOULD must match (union).
+    ///   If MUST clauses exist, SHOULD patterns only boost scores.
+    /// - **MUST_NOT**: documents matching any must_not pattern are excluded.
+    ///
+    /// Returns `Vec<(row_id, total_count, merged_positions)>` sorted by count descending.
+    pub async fn search_boolean_occur(
+        &self,
+        must: &[Vec<u8>],
+        should: &[Vec<u8>],
+        must_not: &[Vec<u8>],
+        max_results: usize,
+    ) -> Result<Vec<(u64, u32, Vec<u64>)>> {
+        if must.is_empty() && should.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. MUST: search each pattern, intersect result sets
+        let mut result_map: HashMap<u64, (u32, Vec<u64>)> = HashMap::new();
+        let has_must = !must.is_empty();
+
+        if has_must {
+            for (i, pattern) in must.iter().enumerate() {
+                let results = self.search_rows_scored(pattern, usize::MAX).await?;
+                if i == 0 {
+                    // First MUST pattern — seed the result map
+                    for (row_id, count, positions) in results {
+                        result_map.insert(row_id, (count, positions));
+                    }
+                } else {
+                    // Subsequent MUST patterns — intersect
+                    let hits: HashMap<u64, (u32, Vec<u64>)> =
+                        results.into_iter().map(|(r, c, p)| (r, (c, p))).collect();
+                    result_map.retain(|row_id, _| hits.contains_key(row_id));
+                    for (row_id, (count, positions)) in result_map.iter_mut() {
+                        if let Some((h_count, h_positions)) = hits.get(row_id) {
+                            *count += h_count;
+                            positions.extend(h_positions);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. SHOULD: search each pattern
+        if !should.is_empty() {
+            let mut should_map: HashMap<u64, (u32, Vec<u64>)> = HashMap::new();
+            for pattern in should {
+                let results = self.search_rows_scored(pattern, usize::MAX).await?;
+                for (row_id, count, positions) in results {
+                    let entry = should_map.entry(row_id).or_insert((0, Vec::new()));
+                    entry.0 += count;
+                    entry.1.extend(positions);
+                }
+            }
+
+            if has_must {
+                // SHOULD only boosts scores for documents already in result_map
+                for (row_id, (count, positions)) in result_map.iter_mut() {
+                    if let Some((s_count, s_positions)) = should_map.get(row_id) {
+                        *count += s_count;
+                        positions.extend(s_positions);
+                    }
+                }
+            } else {
+                // No MUST — SHOULD acts as the primary filter (union)
+                result_map = should_map;
+            }
+        }
+
+        // 3. MUST_NOT: exclude documents matching any must_not pattern
+        if !must_not.is_empty() {
+            let mut excluded: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for pattern in must_not {
+                let results = self.search_rows_scored(pattern, usize::MAX).await?;
+                for (row_id, _, _) in results {
+                    excluded.insert(row_id);
+                }
+            }
+            result_map.retain(|row_id, _| !excluded.contains(row_id));
+        }
+
+        // 4. Top-K by count using min-heap
+        let mut heap: BinaryHeap<Reverse<(u32, u64)>> = BinaryHeap::new();
+        for (row_id, (count, _)) in &result_map {
+            if heap.len() < max_results {
+                heap.push(Reverse((*count, *row_id)));
+            } else if let Some(&Reverse((min_count, _))) = heap.peek() {
+                if *count > min_count {
+                    heap.pop();
+                    heap.push(Reverse((*count, *row_id)));
+                }
+            }
+        }
+
+        let top_k: Vec<(u64, u32)> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((count, row_id))| (row_id, count))
+            .collect();
+
+        let mut results: Vec<(u64, u32, Vec<u64>)> = top_k
+            .into_iter()
+            .map(|(row_id, count)| {
+                let (_, positions) = result_map.remove(&row_id).unwrap_or_default();
+                (row_id, count, positions)
+            })
+            .collect();
+        results.reverse();
+        Ok(results)
+    }
+
     /// Search for matching rows without scoring (legacy API, used by ScalarIndex::search).
     /// Returns deduplicated, sorted row IDs.
     pub async fn search_rows(

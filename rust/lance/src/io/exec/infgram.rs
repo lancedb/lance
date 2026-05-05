@@ -128,6 +128,9 @@ impl ExecutionPlan for InfgramSearchExec {
         let query_text = self.query.query.clone();
         let query_tokens = self.query.query_tokens.clone();
         let query_clauses = self.query.clauses.clone();
+        let query_must = self.query.must.clone();
+        let query_should = self.query.should.clone();
+        let query_must_not = self.query.must_not.clone();
         let column = self.query.column.clone();
         let limit = self.query.limit;
 
@@ -235,7 +238,31 @@ impl ExecutionPlan for InfgramSearchExec {
                         ))
                     })?;
 
-                if let Some(ref clauses) = parsed_clauses {
+                if query_must.is_some() || query_should.is_some() || query_must_not.is_some() {
+                    // Occur-based boolean query (MUST / SHOULD / MUST_NOT)
+                    let to_bytes = |patterns: &Option<Vec<String>>| -> Vec<Vec<u8>> {
+                        patterns.as_ref().map_or_else(Vec::new, |pats| {
+                            pats.iter()
+                                .map(|t| {
+                                    if sa_index.case_insensitive() {
+                                        t.to_lowercase().into_bytes()
+                                    } else {
+                                        t.as_bytes().to_vec()
+                                    }
+                                })
+                                .collect()
+                        })
+                    };
+                    let must_bytes = to_bytes(&query_must);
+                    let should_bytes = to_bytes(&query_should);
+                    let must_not_bytes = to_bytes(&query_must_not);
+
+                    let scored = sa_index
+                        .search_boolean_occur(&must_bytes, &should_bytes, &must_not_bytes, max_results)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    all_scored.extend(scored);
+                } else if let Some(ref clauses) = parsed_clauses {
                     // Boolean query: convert string clauses to byte clauses
                     let byte_clauses: Vec<Vec<Vec<u8>>> = clauses
                         .iter()
