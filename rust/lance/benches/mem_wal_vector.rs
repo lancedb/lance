@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator};
+use arrow_array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::prelude::SessionContext;
@@ -138,7 +138,16 @@ fn create_batch(schema: &ArrowSchema, start_id: i64, n: usize, dim: usize) -> Re
     .unwrap()
 }
 
-fn create_query_vector(dim: usize) -> FixedSizeListArray {
+/// Build a flat Float32 query vector. `dataset.scan().nearest(...)` expects
+/// the query as a flat `Float32Array` for indexed search.
+fn create_query_flat(dim: usize) -> Float32Array {
+    let v: Vec<f32> = (0..dim).map(|d| 0.5 + (d as f32) * 0.001).collect();
+    Float32Array::from(v)
+}
+
+/// Build a FixedSizeList query vector. The LSM planner takes a single-row
+/// FSL.
+fn create_query_fsl(dim: usize) -> FixedSizeListArray {
     let mut b = FixedSizeListBuilder::new(Float32Builder::new(), dim as i32);
     for d in 0..dim {
         b.values().append_value(0.5 + (d as f32) * 0.001);
@@ -365,7 +374,7 @@ fn bench_vector_search(c: &mut Criterion) {
     // Baseline: KNN on base table only.
     group.bench_with_input(BenchmarkId::new("BaseTable_KNN", &label), &(), |b, _| {
         let dataset = ctx.base_dataset.clone();
-        let query = create_query_vector(ctx.vector_dim);
+        let query = create_query_flat(ctx.vector_dim);
         b.to_async(&rt).iter(|| {
             let dataset = dataset.clone();
             let query = query.clone();
@@ -397,7 +406,7 @@ fn bench_vector_search(c: &mut Criterion) {
             let pk_columns = ctx.pk_columns.clone();
             let schema = arrow_schema.clone();
             let active = active_memtable.clone();
-            let query = create_query_vector(ctx.vector_dim);
+            let query = create_query_fsl(ctx.vector_dim);
             b.to_async(&rt).iter(|| {
                 let dataset = dataset.clone();
                 let shard_snapshots = shard_snapshots.clone();
