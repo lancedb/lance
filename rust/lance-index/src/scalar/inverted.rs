@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod builder;
+mod cache_codec;
 mod encoding;
 mod index;
 mod iter;
