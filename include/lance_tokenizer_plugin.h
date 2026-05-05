@@ -14,24 +14,31 @@ extern "C" {
 
 /* Reentrancy contract.
  *
- * Plugin callbacks must not call back into Lance APIs from another thread
- * while a Lance-driven call is still on the stack — the host serializes
- * access to factory and tokenizer handles with a mutex held across the
- * entire callback, so any reentrant call that takes the same lock will
- * deadlock the host. In practice this means:
+ * Lance does not expose any callback API that a plugin can call back
+ * into; the only API surface the plugin sees is the vtable in this
+ * header, and Lance is the sole driver of those calls. The constraint
+ * the plugin must respect is therefore narrower than "do not call
+ * Lance":
  *
- *   - Do not spawn threads inside a callback that themselves call back
- *     into Lance through this API.
- *   - Do not share state across plugins such that one plugin's callback
- *     causes another plugin's callback (or the same plugin's callback
- *     against the same handle) to run reentrantly.
- *   - It is fine for callbacks to use threads internally to compute their
- *     result, as long as those threads do not re-enter Lance.
+ *   - Lance holds an internal mutex for the duration of each callback
+ *     against a given factory or tokenizer handle. A plugin callback
+ *     that synchronously waits for another thread which is itself in a
+ *     callback against the same handle will deadlock against that
+ *     mutex.
+ *   - In practice this means a callback must not block on another
+ *     thread that is, directly or indirectly, dispatching against the
+ *     same `LanceTokenizerFactory*` or `LanceTokenizer*`. It is fine for
+ *     callbacks to use internal worker threads that do their own
+ *     computation; the rule is purely about reentrant dispatch on the
+ *     same handle.
  *
- * Plugins may also assume their callbacks for a given handle are never
- * invoked concurrently by Lance itself — the host serializes calls per
- * factory and per tokenizer. Streams are exclusive (one live stream per
- * tokenizer), so per-stream state needs no internal locking.
+ * What the plugin can rely on:
+ *
+ *   - Lance never invokes callbacks for a single factory or tokenizer
+ *     handle concurrently. The mutex above serializes them per handle.
+ *   - Streams are exclusive: only one live `LanceTokenStream*` may exist
+ *     per `LanceTokenizer*` at a time, so per-stream scratch state needs
+ *     no internal locking.
  */
 
 /// A reference to a UTF-8 string. This provides a zero-copy way to pass strings between Rust and C.

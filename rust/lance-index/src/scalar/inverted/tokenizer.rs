@@ -434,6 +434,17 @@ impl InvertedIndexParams {
     /// absolute path exists there. Plugin tokenizers are currently intended
     /// for indexes that stay on a single host; portable basename + search
     /// directory resolution is a future extension.
+    ///
+    /// # Bindings
+    ///
+    /// The plugin tokenizer is exposed only through the Rust API today. The
+    /// Python (`pyo3`) and Java (JNI) bindings have not yet been extended
+    /// with `tokenizer_plugin_library` / `tokenizer_plugin_config`
+    /// parameters, so plugin tokenizers cannot be configured from those
+    /// languages. The conservative path is intentional: `dlopen` plus
+    /// untrusted index manifests (see the security section) means we want
+    /// the rollout to start with the smallest API surface and expand once
+    /// the security model is settled.
     pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(absolutize_plugin_path(library_path));
@@ -561,6 +572,18 @@ impl InvertedIndexParams {
                     "base_tokenizer is 'plugin' but tokenizer_plugin_library is not set",
                 )
             })?;
+
+            // Reject the empty string up front rather than letting it
+            // propagate into `libloading::Library::new`, which surfaces it as
+            // a relatively opaque platform-specific error (e.g.
+            // `dlopen("")` reports the executable's own image on macOS, and
+            // `LoadLibrary("")` returns ERROR_MOD_NOT_FOUND on Windows).
+            if plugin_path.is_empty() {
+                return Err(Error::invalid_input(
+                    "tokenizer_plugin_library is set to an empty string; \
+                     provide an absolute path to the plugin shared library",
+                ));
+            }
 
             let config = self.tokenizer_plugin_config.as_ref().ok_or_else(|| {
                 Error::invalid_input(
@@ -824,5 +847,33 @@ mod tests {
         params
             .build()
             .expect("default params must still build a simple tokenizer");
+    }
+
+    /// An empty `tokenizer_plugin_library` would otherwise descend into
+    /// `libloading::Library::new("")`, which surfaces a relatively
+    /// opaque platform-specific error (the executable's own image, or
+    /// `ERROR_MOD_NOT_FOUND` on Windows). The boundary check should turn
+    /// that into a self-explanatory error before we attempt to load.
+    #[cfg(feature = "tokenizer-plugin")]
+    #[test]
+    fn test_build_rejects_empty_plugin_library_path() {
+        let params = InvertedIndexParams {
+            base_tokenizer: "plugin".to_string(),
+            tokenizer_plugin_library: Some(String::new()),
+            tokenizer_plugin_config: Some("{}".to_string()),
+            ..InvertedIndexParams::default()
+        };
+
+        match params.build() {
+            Ok(_) => panic!("build must reject an empty plugin library path"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("empty string"),
+                    "error must call out the empty path, got: {}",
+                    msg
+                );
+            }
+        }
     }
 }

@@ -161,6 +161,14 @@ impl TokenizerPluginLibrary {
         }))
     }
 
+    // The `(*self.plugin).<callback>.unwrap()` pattern below (and at every
+    // other vtable dispatch site in this file) is sound because
+    // `TokenizerPluginLibrary::load` runs every plugin pointer through
+    // `verify_plugin_compat` → `validate_vtable`, which rejects the load
+    // unless all 10 required callbacks are `Some`. A `TokenizerPluginLibrary`
+    // therefore cannot exist with a NULL slot, so each `.unwrap()` is an
+    // invariant assertion rather than a fallible operation.
+
     pub fn name(&self) -> &str {
         unsafe {
             let name_ptr = ((*self.plugin).name.unwrap())();
@@ -487,12 +495,13 @@ impl Drop for PluginTokenStream<'_> {
 /// # Reentrancy
 ///
 /// Calls into the plugin's vtable happen with the `factory` mutex held.
-/// Plugin callbacks must therefore not call back into Lance from a thread
-/// they spawn while a Lance-driven call is still on the stack: any such
-/// reentrant call against the same handle would deadlock on the same
-/// mutex. The same constraint applies to `OwnedPluginTokenizerInstance`'s
-/// `tokenizer` mutex. See `include/lance_tokenizer_plugin.h` for the full
-/// ABI contract.
+/// A plugin callback that synchronously waits on another thread which is
+/// itself dispatching against the same factory handle will deadlock on
+/// that mutex; the same constraint applies to `OwnedPluginTokenizerInstance`'s
+/// `tokenizer` mutex. Lance does not expose any callback API that a plugin
+/// could "call back into", so the rule is purely about reentrant dispatch
+/// on the same handle from another thread the plugin spawned. See
+/// `include/lance_tokenizer_plugin.h` for the full ABI contract.
 pub struct OwnedPluginFactory {
     library: Arc<TokenizerPluginLibrary>,
     /// Raw factory handle from the C plugin, guarded by a Mutex.
@@ -554,7 +563,16 @@ impl OwnedPluginFactory {
     /// could write `let inst = factory.create_tokenizer()?; drop(factory);`
     /// and then dereference the freed factory state through `inst`.
     pub fn create_tokenizer(self: &Arc<Self>) -> Result<Arc<OwnedPluginTokenizerInstance>> {
-        let factory_ptr = self.factory.lock().expect("plugin factory mutex poisoned");
+        // Surface a poisoned factory mutex as a regular `Err` rather than
+        // propagating the panic that poisoned it. This keeps the public
+        // contract consistent with `OwnedPluginTokenizerInstance::create_stream`
+        // (which must report poisoning to release its `active_stream` slot)
+        // and lets callers see a single failure mode for "the underlying
+        // plugin handle is no longer trustworthy".
+        let factory_ptr = self
+            .factory
+            .lock()
+            .map_err(|e| Error::invalid_input(format!("plugin factory mutex poisoned: {}", e)))?;
         let mut error = CError::default();
         let tokenizer =
             unsafe { ((*self.library.plugin).create_tokenizer.unwrap())(*factory_ptr, &mut error) };
