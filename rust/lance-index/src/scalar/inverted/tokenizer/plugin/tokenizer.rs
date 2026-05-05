@@ -30,19 +30,32 @@ pub struct PluginTokenizer {
 impl PluginTokenizer {
     pub fn new(library_path: impl AsRef<Path>, config: impl Into<String>) -> Result<Self> {
         let library = TokenizerPluginLibrary::load(library_path)?;
+        let config = config.into();
+        // Eagerly create the factory so a malformed config surfaces here as a
+        // regular `Err` from `PluginTokenizer::new` / `params.build()`. Without
+        // this, validation is deferred to the first `token_stream_*()` call,
+        // where the failure can only be reported as a panic — turning a
+        // user-input error into a task/process crash during query or index
+        // build. The factory is also cached for reuse across tokenizations.
+        let factory = OwnedPluginFactory::new(Arc::clone(&library), &config)?;
         Ok(Self {
             library,
-            config: config.into(),
-            cached_factory: None,
+            config,
+            cached_factory: Some(factory),
         })
     }
 
-    pub fn from_library(library: Arc<TokenizerPluginLibrary>, config: impl Into<String>) -> Self {
-        Self {
+    pub fn from_library(
+        library: Arc<TokenizerPluginLibrary>,
+        config: impl Into<String>,
+    ) -> Result<Self> {
+        let config = config.into();
+        let factory = OwnedPluginFactory::new(Arc::clone(&library), &config)?;
+        Ok(Self {
             library,
-            config: config.into(),
-            cached_factory: None,
-        }
+            config,
+            cached_factory: Some(factory),
+        })
     }
 
     pub fn plugin_name(&self) -> &str {
@@ -180,13 +193,27 @@ impl TokenStream for PluginTokenStreamAdapter {
                 let text = if c_token.text.data.is_null() {
                     String::new()
                 } else {
-                    unsafe {
-                        let slice = std::slice::from_raw_parts(
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(
                             c_token.text.data as *const u8,
                             c_token.text.length as usize,
-                        );
-                        String::from_utf8_lossy(slice).into_owned()
-                    }
+                        )
+                    };
+                    // The plugin ABI requires UTF-8 token text. Lossy
+                    // conversion would silently substitute U+FFFD for invalid
+                    // bytes, which corrupts FTS terms and is hard to diagnose
+                    // after the index has been written. Fail loud instead, in
+                    // line with how every other plugin contract violation is
+                    // handled.
+                    std::str::from_utf8(slice)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Plugin returned token with invalid UTF-8 text: {} \
+                                 (the plugin ABI requires UTF-8)",
+                                e
+                            )
+                        })
+                        .to_string()
                 };
                 self.current_token = Token {
                     offset_from: c_token.offset_from as usize,

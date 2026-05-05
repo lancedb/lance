@@ -149,7 +149,14 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
-            tokenizer_plugin_library: params.tokenizer_plugin_library.clone(),
+            // Defense in depth: even if `InvertedIndexParams` was constructed
+            // outside the `plugin()` builder (e.g. serde deserialization, raw
+            // field access in tests), persist an absolute path so the index
+            // remains usable when reopened from a different CWD.
+            tokenizer_plugin_library: params
+                .tokenizer_plugin_library
+                .as_ref()
+                .map(|p| absolutize_plugin_path(p.clone())),
             tokenizer_plugin_config: params.tokenizer_plugin_config.clone(),
         })
     }
@@ -365,9 +372,15 @@ impl InvertedIndexParams {
     /// `config` is the configuration string for the plugin (format defined by plugin).
     /// This is required because the "empty" representation varies by format
     /// (e.g., "{}" for JSON, "" for plain text).
+    ///
+    /// Relative paths are resolved against the current working directory at
+    /// the time this method is called and stored as absolute. Otherwise the
+    /// persisted path would be re-interpreted against the CWD of whichever
+    /// process later reopens the index, which can fail to find the plugin or,
+    /// worse, silently load a different file with the same relative name.
     pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
-        self.tokenizer_plugin_library = Some(library_path);
+        self.tokenizer_plugin_library = Some(absolutize_plugin_path(library_path));
         self.tokenizer_plugin_config = Some(config);
         self
     }
@@ -492,6 +505,26 @@ impl InvertedIndexParams {
         Err(Error::invalid_input(
             "tokenizer-plugin feature is not enabled, cannot use plugin tokenizers",
         ))
+    }
+}
+
+/// Convert a (possibly relative) plugin library path to absolute. This must
+/// happen *before* the path is persisted into the index manifest, because the
+/// process that reopens the index may have a different CWD than the one that
+/// created it; resolving a relative path lazily would either fail to find the
+/// plugin or load a wrong file with the same relative name.
+fn absolutize_plugin_path(library_path: String) -> String {
+    let path = std::path::Path::new(&library_path);
+    if path.is_absolute() {
+        return library_path;
+    }
+    // Best effort: prepend CWD. If `current_dir()` fails (extremely rare —
+    // e.g. the directory was deleted out from under the process), fall back
+    // to the original string so the caller still sees a useful error from
+    // the eager validation in `PluginTokenizer::new`.
+    match env::current_dir() {
+        Ok(cwd) => cwd.join(path).to_string_lossy().into_owned(),
+        Err(_) => library_path,
     }
 }
 

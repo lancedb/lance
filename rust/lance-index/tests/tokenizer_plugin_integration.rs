@@ -327,6 +327,94 @@ fn test_plugin_load_nonexistent() {
 
 #[test]
 #[serial(plugin_tests)]
+fn test_plugin_constructor_rejects_invalid_config() {
+    // A malformed config must surface as a regular `Err` from
+    // `PluginTokenizer::new`, not as a panic on first tokenization. The test
+    // plugin returns a NULL factory + error message when the config contains
+    // "reject_config": true.
+    let plugin_path = get_plugin_path();
+    let result = PluginTokenizer::new(&plugin_path, r#"{"reject_config": true}"#);
+    let err = result.expect_err("constructor must reject invalid config");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("simulated config rejection"),
+        "error must propagate the plugin's message, got: {}",
+        msg
+    );
+}
+
+#[test]
+#[serial(plugin_tests)]
+fn test_inverted_index_params_build_rejects_invalid_plugin_config() {
+    // Same contract going through the public `InvertedIndexParams::build()`
+    // path: the user must see the error here, not later during tokenization.
+    let plugin_path = get_plugin_path();
+    let params = InvertedIndexParams::default().plugin(
+        plugin_path.to_string_lossy().to_string(),
+        r#"{"reject_config": true}"#.to_string(),
+    );
+    let err = params
+        .build()
+        .expect_err("build must reject invalid config");
+    assert!(
+        err.to_string().contains("simulated config rejection"),
+        "error must propagate the plugin's message, got: {}",
+        err
+    );
+}
+
+#[test]
+#[serial(plugin_tests)]
+#[should_panic(expected = "invalid UTF-8")]
+fn test_plugin_invalid_utf8_token_is_rejected() {
+    // The plugin ABI requires UTF-8 token text. A buggy plugin that returns
+    // non-UTF-8 bytes must be rejected loudly, otherwise corrupted FTS terms
+    // would be silently persisted with replacement characters substituted.
+    let plugin_path = get_plugin_path();
+    let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"emit_invalid_utf8": true}"#)
+        .expect("Failed to create tokenizer");
+    let mut stream = tokenizer.token_stream_for_doc("hello");
+    while stream.advance() {}
+}
+
+#[test]
+#[serial(plugin_tests)]
+fn test_plugin_relative_path_is_absolutized_before_persist() {
+    // A relative `tokenizer_plugin_library` would be re-interpreted against
+    // the CWD of whichever process later reopens the index, which can fail
+    // to find the plugin or load a wrong file. The persisted (proto) form
+    // must be absolute regardless of what the caller passed in.
+    use lance_index::pbold::InvertedIndexDetails;
+
+    let params = InvertedIndexParams::default()
+        .plugin("relative/path/to/plugin.so".to_string(), "{}".to_string());
+    let proto: InvertedIndexDetails = (&params).try_into().expect("proto conversion failed");
+    let proto_path = proto
+        .tokenizer_plugin_library
+        .as_ref()
+        .expect("proto plugin path must be set");
+    assert!(
+        std::path::Path::new(proto_path).is_absolute(),
+        "proto-persisted plugin path must be absolute; got {:?}",
+        proto_path
+    );
+    // Round-trip back into params and confirm the path stays absolute (so a
+    // second save doesn't reintroduce relativity).
+    let restored: InvertedIndexParams = (&proto).try_into().expect("proto -> params failed");
+    let proto2: InvertedIndexDetails = (&restored).try_into().expect("re-serialize failed");
+    let proto2_path = proto2
+        .tokenizer_plugin_library
+        .as_ref()
+        .expect("re-serialized plugin path must be set");
+    assert!(
+        std::path::Path::new(proto2_path).is_absolute(),
+        "round-tripped plugin path must remain absolute; got {:?}",
+        proto2_path
+    );
+}
+
+#[test]
+#[serial(plugin_tests)]
 fn test_plugin_unicode_text() {
     let plugin_path = get_plugin_path();
 
@@ -616,15 +704,25 @@ fn test_plugin_multithread_with_lance_tokenizer_trait() {
 #[test]
 #[serial(plugin_tests)]
 fn test_factory_caching_behavior() {
-    // Reset counter at the start of this test
+    // Reset counter, then construct the tokenizer. Factory creation now
+    // happens eagerly in `PluginTokenizer::new` so a malformed config can
+    // surface as a regular `Err` instead of a panic during tokenization.
     reset_factory_create_count();
 
     let plugin_path = get_plugin_path();
 
+    let count_before_new = get_factory_create_count();
     let mut tokenizer =
         PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
+    let count_after_new = get_factory_create_count();
+    assert_eq!(
+        count_after_new - count_before_new,
+        1,
+        "Factory should be created eagerly during PluginTokenizer::new"
+    );
 
-    // First tokenization - factory should be created (count increases by 1)
+    // Subsequent tokenizations must reuse the cached factory (no new
+    // create_factory calls).
     let count_before = get_factory_create_count();
     {
         let mut stream = tokenizer.token_stream_for_doc("hello world");
@@ -634,15 +732,6 @@ fn test_factory_caching_behavior() {
         }
         assert_eq!(tokens.len(), 2);
     }
-    let count_after = get_factory_create_count();
-    assert_eq!(
-        count_after - count_before,
-        1,
-        "Factory should be created once on first tokenization"
-    );
-
-    // Second tokenization - factory should be cached (count stays same)
-    let count_before = get_factory_create_count();
     {
         let mut stream = tokenizer.token_stream_for_doc("foo bar baz");
         let mut tokens = Vec::new();
@@ -655,22 +744,29 @@ fn test_factory_caching_behavior() {
     assert_eq!(
         count_after - count_before,
         0,
-        "Factory should be cached (no new factory created)"
+        "Factory should be cached across tokenizations (no new factory created)"
     );
 }
 
 #[test]
 #[serial(plugin_tests)]
 fn test_clone_creates_separate_factory() {
-    // Reset counter at the start of this test
     reset_factory_create_count();
 
     let plugin_path = get_plugin_path();
 
+    // `PluginTokenizer::new` creates the factory eagerly (1 call so far).
+    let count_before_new = get_factory_create_count();
     let mut tokenizer =
         PluginTokenizer::new(&plugin_path, "{}").expect("Failed to create tokenizer");
+    let count_after_new = get_factory_create_count();
+    assert_eq!(
+        count_after_new - count_before_new,
+        1,
+        "Original tokenizer should create one factory eagerly during construction"
+    );
 
-    // Use tokenizer to cache factory (creates 1 factory)
+    // Tokenizing through the original must reuse the cached factory.
     let count_before = get_factory_create_count();
     {
         let mut stream = tokenizer.token_stream_for_doc("hello");
@@ -679,11 +775,12 @@ fn test_clone_creates_separate_factory() {
     let count_after = get_factory_create_count();
     assert_eq!(
         count_after - count_before,
-        1,
-        "Original tokenizer should create one factory"
+        0,
+        "Original tokenizer should reuse its cached factory across tokenizations"
     );
 
-    // Clone and use it - should create a new factory
+    // Clone resets the cached factory; the clone lazily re-creates one on
+    // first use so each thread/worker gets its own instance.
     let mut cloned = tokenizer.clone();
     let count_before = get_factory_create_count();
     {
@@ -694,7 +791,7 @@ fn test_clone_creates_separate_factory() {
     assert_eq!(
         count_after - count_before,
         1,
-        "Cloned tokenizer should create its own factory"
+        "Cloned tokenizer should create its own factory on first tokenization"
     );
 
     // Original tokenizer should still use its cached factory

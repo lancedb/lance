@@ -82,6 +82,9 @@ struct Config {
     /// If set, returns an error after producing this many tokens.
     /// Used for testing error propagation.
     error_after_n_tokens: Option<usize>,
+    /// If true, emit a token whose text bytes are not valid UTF-8. Used to
+    /// regression-test the host's UTF-8 validation on the plugin output.
+    emit_invalid_utf8: bool,
 }
 
 struct Factory {
@@ -102,6 +105,11 @@ struct TokenStream {
     tokens_produced: usize,
     /// Error message for simulated errors.
     error_message: String,
+    /// If true, the token text returned will contain invalid UTF-8 bytes.
+    emit_invalid_utf8: bool,
+    /// Backing storage for the invalid byte sequence (kept alive while the
+    /// stream borrows it through `LanceStringRef`).
+    invalid_utf8_bytes: Vec<u8>,
 }
 
 impl Factory {
@@ -129,10 +137,14 @@ impl Factory {
             None
         };
 
+        let emit_invalid_utf8 = config.contains("\"emit_invalid_utf8\":true")
+            || config.contains("\"emit_invalid_utf8\": true");
+
         Self {
             config: Config {
                 lowercase,
                 error_after_n_tokens,
+                emit_invalid_utf8,
             },
         }
     }
@@ -209,10 +221,22 @@ impl TokenStream {
         token.offset_to = end as u32;
         token.position = self.index as u32;
         token.position_length = 1;
-        token.text = LanceStringRef {
-            data: self.current_token_text.as_ptr() as *const c_char,
-            length: self.current_token_text.len() as u32,
-        };
+
+        if self.emit_invalid_utf8 {
+            // Return a byte sequence that is not valid UTF-8. The host must
+            // reject this rather than silently substituting replacement
+            // characters into the index.
+            self.invalid_utf8_bytes = vec![0x68, 0x69, 0xFF, 0xFE]; // "hi" + invalid bytes
+            token.text = LanceStringRef {
+                data: self.invalid_utf8_bytes.as_ptr() as *const c_char,
+                length: self.invalid_utf8_bytes.len() as u32,
+            };
+        } else {
+            token.text = LanceStringRef {
+                data: self.current_token_text.as_ptr() as *const c_char,
+                length: self.current_token_text.len() as u32,
+            };
+        }
 
         self.index += 1;
         self.tokens_produced += 1;
@@ -224,9 +248,26 @@ unsafe extern "C" fn api_version() -> u32 {
     PLUGIN_API_VERSION
 }
 
-unsafe extern "C" fn create_factory(config: LanceStringRef, _error: *mut Error) -> *mut c_void {
-    FACTORY_CREATE_COUNT.fetch_add(1, Ordering::SeqCst);
+/// Static error message returned when a malformed config is detected.
+/// The lifetime must outlive the plugin call, so it lives in static storage.
+static REJECT_CONFIG_MSG: &str = "test plugin: simulated config rejection";
+
+unsafe extern "C" fn create_factory(config: LanceStringRef, error: *mut Error) -> *mut c_void {
     let config_str = config.as_str();
+
+    // Simulate a plugin that detects a malformed config and refuses to build
+    // a factory. Used for regression-testing the host's eager factory check
+    // during PluginTokenizer construction.
+    if config_str.contains("\"reject_config\":true")
+        || config_str.contains("\"reject_config\": true")
+    {
+        if !error.is_null() {
+            (*error).message = LanceStringRef::from_str(REJECT_CONFIG_MSG);
+        }
+        return ptr::null_mut();
+    }
+
+    FACTORY_CREATE_COUNT.fetch_add(1, Ordering::SeqCst);
     Box::into_raw(Box::new(Factory::new(config_str))) as *mut c_void
 }
 
@@ -271,6 +312,8 @@ unsafe extern "C" fn create_stream(
         error_after_n_tokens: tokenizer.config.error_after_n_tokens,
         tokens_produced: 0,
         error_message: String::new(),
+        emit_invalid_utf8: tokenizer.config.emit_invalid_utf8,
+        invalid_utf8_bytes: Vec::new(),
     };
     Box::into_raw(Box::new(stream)) as *mut c_void
 }
