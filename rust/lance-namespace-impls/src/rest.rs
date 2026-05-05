@@ -18,7 +18,8 @@ use crate::context::{DynamicContextProvider, OperationInfo};
 use lance_namespace::apis::urlencode;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
-    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
@@ -38,10 +39,11 @@ use lance_namespace::models::{
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
+    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -1435,6 +1437,32 @@ impl LanceNamespace for RestNamespace {
         let path = format!("/v1/table/{}/drop_columns", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "alter_table_drop_columns", &id)
+            .await
+    }
+
+    async fn alter_table_backfill_columns(
+        &self,
+        request: AlterTableBackfillColumnsRequest,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        self.record_op("alter_table_backfill_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/backfill_column", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+            .await
+    }
+
+    async fn refresh_materialized_view(
+        &self,
+        request: RefreshMaterializedViewRequest,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        self.record_op("refresh_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/refresh", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
             .await
     }
 
