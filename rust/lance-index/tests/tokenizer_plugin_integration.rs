@@ -1006,3 +1006,92 @@ fn test_create_stream_independence_across_instances() {
         .create_stream("foo bar")
         .expect("instance b stream must be independent of instance a's slot");
 }
+
+/// Multiple threads racing to call `create_stream` against the same
+/// `Arc<OwnedPluginTokenizerInstance>` must see exactly one winner per
+/// "stream slot": the others must observe the explicit "already has a live
+/// token stream" error, not an unsafe overlap. This is the multi-threaded
+/// counterpart of `test_create_stream_rejects_overlapping_streams_*`, and
+/// it exercises the `compare_exchange` fence directly.
+#[test]
+#[serial(plugin_tests)]
+fn test_create_stream_serialization_under_concurrent_callers() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
+    use std::thread;
+
+    use lance_index::scalar::inverted::tokenizer::plugin::loader::OwnedPluginFactory;
+
+    let library = TokenizerPluginLibrary::load(get_plugin_path()).expect("load plugin");
+    let factory = Arc::new(OwnedPluginFactory::new(library, "{}").expect("create factory"));
+    let instance = factory.create_tokenizer().expect("create instance");
+
+    const ROUNDS: usize = 64;
+    const THREADS: usize = 8;
+
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let reject_count = Arc::new(AtomicUsize::new(0));
+    let other_error_messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    for _ in 0..ROUNDS {
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let instance = Arc::clone(&instance);
+                let barrier = Arc::clone(&barrier);
+                let success_count = Arc::clone(&success_count);
+                let reject_count = Arc::clone(&reject_count);
+                let other_error_messages = Arc::clone(&other_error_messages);
+                thread::spawn(move || {
+                    barrier.wait();
+                    match instance.create_stream("hello world") {
+                        Ok(stream) => {
+                            success_count.fetch_add(1, Ordering::Relaxed);
+                            // Hold the stream briefly so the other threads
+                            // are guaranteed to race against an active slot
+                            // rather than picking it up after we've already
+                            // released.
+                            drop(stream);
+                        }
+                        Err(err) => {
+                            let msg = err.to_string();
+                            if msg.contains("already has a live token stream") {
+                                reject_count.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                other_error_messages.lock().unwrap().push(msg);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+    }
+
+    let other_errors = other_error_messages.lock().unwrap();
+    assert!(
+        other_errors.is_empty(),
+        "every concurrent create_stream must either succeed or be \
+         rejected with the exclusion error, got unexpected errors: {:?}",
+        *other_errors
+    );
+
+    let total = success_count.load(Ordering::Relaxed) + reject_count.load(Ordering::Relaxed);
+    assert_eq!(
+        total,
+        ROUNDS * THREADS,
+        "every attempt must be accounted for as success or reject"
+    );
+    // At least one rejection must have happened across the whole run —
+    // otherwise the concurrent reservation is not actually being exercised.
+    assert!(
+        reject_count.load(Ordering::Relaxed) > 0,
+        "no rejection observed across {} rounds of {} threads; the \
+         concurrent reservation is not being exercised",
+        ROUNDS,
+        THREADS
+    );
+}

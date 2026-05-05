@@ -157,19 +157,41 @@ impl PluginTokenStreamAdapter {
         // Lazily create and cache the factory. A failure here is treated as a
         // hard error: the plugin is misconfigured (bad config string, etc.)
         // and silently returning an empty stream would mask the misconfig.
+        //
+        // Note: this adapter is invoked from inside an FTS worker, so any
+        // panic here surfaces as a worker task failure and aborts the entire
+        // FTS build job. That trade-off is intentional — the alternative
+        // (silently truncating or skipping a document) would produce an
+        // index whose contents disagree with what the user configured.
         if cached_factory.is_none() {
-            let factory = OwnedPluginFactory::new(Arc::clone(library), config)
-                .unwrap_or_else(|e| panic!("failed to create plugin factory: {}", e));
+            let factory =
+                OwnedPluginFactory::new(Arc::clone(library), config).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to create plugin factory: {} \
+                         (this aborts the entire FTS build job)",
+                        e
+                    )
+                });
             *cached_factory = Some(Arc::new(factory));
         }
         let factory = cached_factory.as_ref().unwrap();
 
-        let instance = factory
-            .create_tokenizer()
-            .unwrap_or_else(|e| panic!("failed to create plugin tokenizer instance: {}", e));
+        let instance = factory.create_tokenizer().unwrap_or_else(|e| {
+            panic!(
+                "failed to create plugin tokenizer instance: {} \
+                 (this aborts the entire FTS build job)",
+                e
+            )
+        });
         let stream = instance
             .create_stream(text.to_string())
-            .unwrap_or_else(|e| panic!("failed to create plugin token stream: {}", e));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to create plugin token stream: {} \
+                 (this aborts the entire FTS build job)",
+                    e
+                )
+            });
 
         Self {
             current_token: Token::default(),
@@ -206,7 +228,8 @@ impl TokenStream for PluginTokenStreamAdapter {
                         .unwrap_or_else(|e| {
                             panic!(
                                 "Plugin returned token with invalid UTF-8 text: {} \
-                                 (the plugin ABI requires UTF-8)",
+                                 (the plugin ABI requires UTF-8; \
+                                 this aborts the entire FTS build job)",
                                 e
                             )
                         })
@@ -227,9 +250,13 @@ impl TokenStream for PluginTokenStreamAdapter {
             }
             NextTokenResult::Error(code, msg) => {
                 // Fail loud: a partial token stream would corrupt FTS results
-                // (some tokens indexed, others silently dropped).
+                // (some tokens indexed, others silently dropped). This aborts
+                // the entire FTS build job, which is preferable to silently
+                // writing an index that disagrees with the configured
+                // tokenizer.
                 panic!(
-                    "Plugin tokenizer error during tokenization (code: {}): {}",
+                    "Plugin tokenizer error during tokenization (code: {}): {} \
+                     (this aborts the entire FTS build job)",
                     code, msg
                 );
             }

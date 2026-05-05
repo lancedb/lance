@@ -133,6 +133,21 @@ pub struct InvertedIndexParams {
     /// producer). Serialization itself is a pure pass-through, so repeated
     /// `serde_json::to_string` calls on the same params are idempotent and do
     /// not depend on the current working directory.
+    ///
+    /// # Security
+    ///
+    /// Opening an index whose manifest carries this field will dlopen the
+    /// referenced shared library and run its code inside the host process.
+    /// Anyone with write access to the manifest can therefore achieve
+    /// arbitrary native code execution. Only open indexes from sources you
+    /// trust to the same level you trust the host process itself.
+    ///
+    /// # Portability
+    ///
+    /// The persisted path is the writer's absolute path. An index built on
+    /// one machine will not resolve the plugin on another unless the same
+    /// absolute path exists there too. Plugin tokenizers are currently
+    /// intended for indexes that stay on a single host.
     #[serde(default, deserialize_with = "deserialize_plugin_path")]
     pub(crate) tokenizer_plugin_library: Option<String>,
 
@@ -399,6 +414,26 @@ impl InvertedIndexParams {
     /// `params.lower_case(false).stem(false).ascii_folding(false)`); otherwise
     /// the filter chain will apply on top of what the plugin produced and may
     /// surprise users who expect the plugin to be the sole source of truth.
+    ///
+    /// # Security
+    ///
+    /// The shared library at `library_path` is loaded with `dlopen` (or the
+    /// platform equivalent) and its code runs inside the host process.
+    /// Reopening an index whose manifest carries a plugin path will
+    /// transparently do the same load. Anyone with write access to the
+    /// manifest — a misconfigured object store, a shared filesystem, an
+    /// untrusted index publisher — can therefore achieve arbitrary native
+    /// code execution. Only enable plugin tokenizers, and only open indexes
+    /// that use them, when you trust the source as much as the host process.
+    ///
+    /// # Portability
+    ///
+    /// `library_path` is absolutized against the current working directory
+    /// and stored verbatim in the index manifest. An index built on one
+    /// machine will not resolve the plugin on another unless the same
+    /// absolute path exists there. Plugin tokenizers are currently intended
+    /// for indexes that stay on a single host; portable basename + search
+    /// directory resolution is a future extension.
     pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(absolutize_plugin_path(library_path));
@@ -436,13 +471,12 @@ impl InvertedIndexParams {
         }
         let tokenizer = builder.build();
 
-        match self.lance_tokenizer {
-            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
-            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            _ => Err(Error::invalid_input(format!(
+        match self.lance_tokenizer.as_deref() {
+            Some("text") | None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+            Some("json") => Ok(Box::new(JsonTokenizer::new(tokenizer))),
+            Some(other) => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
-                self.lance_tokenizer.as_ref().unwrap()
+                other
             ))),
         }
     }

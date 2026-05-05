@@ -385,22 +385,37 @@ pub enum NextTokenResult {
     Error(i32, String),
 }
 
+impl NextTokenResult {
+    /// Translate the raw `next_token` ABI return code (positive = token,
+    /// 0 = end of stream, negative = error) and accompanying `CError`
+    /// payload into a `NextTokenResult`.
+    ///
+    /// SAFETY: `error` must point to a valid `CError` whose `message`
+    /// payload (if `has_message()` is true) lives until this call returns.
+    /// In practice this is the same `CError` the caller passed to the
+    /// plugin, so the lifetime is guaranteed by the borrow checker on the
+    /// caller side.
+    unsafe fn from_raw(result: i32, error: &CError) -> Self {
+        if result > 0 {
+            Self::Token
+        } else if result == 0 {
+            Self::EndOfStream
+        } else {
+            let error_msg = if error.has_message() {
+                error.message_str().to_string()
+            } else {
+                format!("tokenizer error code: {}", result)
+            };
+            Self::Error(result, error_msg)
+        }
+    }
+}
+
 impl PluginTokenStream<'_> {
     pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
         let mut error = CError::default();
         let result = unsafe { self.library.next_token(self.stream, token, &mut error) };
-        if result > 0 {
-            NextTokenResult::Token
-        } else if result == 0 {
-            NextTokenResult::EndOfStream
-        } else {
-            let error_msg = if error.has_message() {
-                unsafe { error.message_str().to_string() }
-            } else {
-                format!("tokenizer error code: {}", result)
-            };
-            NextTokenResult::Error(result, error_msg)
-        }
+        unsafe { NextTokenResult::from_raw(result, &error) }
     }
 }
 
@@ -414,6 +429,16 @@ impl Drop for PluginTokenStream<'_> {
 
 /// An owned plugin factory that holds an Arc to the library.
 /// This allows the factory to be cached and reused across multiple tokenizations.
+///
+/// # Reentrancy
+///
+/// Calls into the plugin's vtable happen with the `factory` mutex held.
+/// Plugin callbacks must therefore not call back into Lance from a thread
+/// they spawn while a Lance-driven call is still on the stack: any such
+/// reentrant call against the same handle would deadlock on the same
+/// mutex. The same constraint applies to `OwnedPluginTokenizerInstance`'s
+/// `tokenizer` mutex. See `include/lance_tokenizer_plugin.h` for the full
+/// ABI contract.
 pub struct OwnedPluginFactory {
     library: Arc<TokenizerPluginLibrary>,
     /// Raw factory handle from the C plugin, guarded by a Mutex.
@@ -670,18 +695,7 @@ impl OwnedPluginTokenStream {
         let mut error = CError::default();
         let result =
             unsafe { ((*self.library.plugin).next_token.unwrap())(self.stream, token, &mut error) };
-        if result > 0 {
-            NextTokenResult::Token
-        } else if result == 0 {
-            NextTokenResult::EndOfStream
-        } else {
-            let error_msg = if error.has_message() {
-                unsafe { error.message_str().to_string() }
-            } else {
-                format!("tokenizer error code: {}", result)
-            };
-            NextTokenResult::Error(result, error_msg)
-        }
+        unsafe { NextTokenResult::from_raw(result, &error) }
     }
 }
 
