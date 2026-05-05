@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lance_core::Result;
-use lance_tokenizer::{BoxTokenStream, Token, TokenStream};
+use lance_tokenizer::{BoxTokenStream, Token, TokenStream, Tokenizer};
 
 use super::ffi::CToken;
 use super::loader::{NextTokenResult, OwnedPluginFactory, TokenizerPluginLibrary};
@@ -97,6 +97,14 @@ impl LanceTokenizer for PluginTokenizer {
     fn doc_type(&self) -> DocType {
         // Plugin tokenizers are currently text-based only
         DocType::Text
+    }
+}
+
+impl Tokenizer for PluginTokenizer {
+    type TokenStream<'a> = BoxTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
+        self.create_stream(text)
     }
 }
 

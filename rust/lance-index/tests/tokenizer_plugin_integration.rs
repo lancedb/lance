@@ -255,6 +255,71 @@ fn test_inverted_index_params_with_plugin() {
 
 #[test]
 #[serial(plugin_tests)]
+fn test_plugin_output_flows_through_filter_chain() {
+    // Regression test for the issue where plugin tokenizers bypassed the
+    // InvertedIndexParams filter chain (lower_case / stem / remove_stop_words /
+    // ascii_folding / max_token_length) and the doc-type wrapping. Plugin
+    // tokenizers must produce the same final output as Lindera/Jieba when the
+    // same params are configured. The plugin is invoked with `{}` so it returns
+    // raw whitespace tokens with no normalization applied; all normalization
+    // here must come from InvertedIndexParams filters.
+    let plugin_path = get_plugin_path();
+
+    let params = InvertedIndexParams::default()
+        .plugin(plugin_path.to_string_lossy().to_string(), "{}".to_string())
+        .lower_case(true)
+        .stem(true)
+        .remove_stop_words(true)
+        .ascii_folding(true);
+
+    let mut tokenizer = params
+        .build()
+        .expect("Failed to build tokenizer from params");
+
+    let mut stream = tokenizer.token_stream_for_doc("The Quick Brown Foxes");
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+
+    // Expected pipeline:
+    //   plugin (raw whitespace) -> ["The", "Quick", "Brown", "Foxes"]
+    //   LowerCaser              -> ["the", "quick", "brown", "foxes"]
+    //   Stemmer(English)        -> ["the", "quick", "brown", "fox"]
+    //   StopWordFilter(English) -> ["quick", "brown", "fox"]    ("the" removed)
+    assert_eq!(tokens, vec!["quick", "brown", "fox"]);
+}
+
+#[test]
+#[serial(plugin_tests)]
+fn test_plugin_max_token_length_applied() {
+    // Regression test: max_token_length must be applied to plugin output.
+    let plugin_path = get_plugin_path();
+
+    let params = InvertedIndexParams::default()
+        .plugin(plugin_path.to_string_lossy().to_string(), "{}".to_string())
+        .lower_case(false)
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false)
+        .max_token_length(Some(5));
+
+    let mut tokenizer = params
+        .build()
+        .expect("Failed to build tokenizer from params");
+
+    let mut stream = tokenizer.token_stream_for_doc("a abcdef ab abcdefghi");
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+
+    // RemoveLongFilter removes tokens longer than 5 chars.
+    assert_eq!(tokens, vec!["a", "ab"]);
+}
+
+#[test]
+#[serial(plugin_tests)]
 fn test_plugin_load_nonexistent() {
     let result = TokenizerPluginLibrary::load("/nonexistent/path/to/plugin.so");
     assert!(result.is_err());

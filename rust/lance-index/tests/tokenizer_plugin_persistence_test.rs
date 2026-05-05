@@ -146,11 +146,17 @@ fn test_tokens_match_after_reopen_with_plugin() {
 
     let plugin_path = get_plugin_path();
 
-    // Create params with plugin that does NOT lowercase
-    let original_params = InvertedIndexParams::default().plugin(
-        plugin_path.to_string_lossy().to_string(),
-        r#"{"lowercase": false}"#.to_string(),
-    );
+    // Create params with plugin that does NOT lowercase, and disable the
+    // InvertedIndexParams filter chain so that case is preserved end-to-end.
+    let original_params = InvertedIndexParams::default()
+        .plugin(
+            plugin_path.to_string_lossy().to_string(),
+            r#"{"lowercase": false}"#.to_string(),
+        )
+        .lower_case(false)
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false);
 
     // Index document with plugin tokenizer (preserves case)
     let mut index_tokenizer = original_params
@@ -160,7 +166,7 @@ fn test_tokens_match_after_reopen_with_plugin() {
     assert_eq!(
         indexed_tokens,
         vec!["Hello", "World"],
-        "Plugin should preserve case when lowercase=false"
+        "Plugin should preserve case when lowercase=false and filters are disabled"
     );
 
     // Simulate index save/reopen via protobuf
@@ -283,10 +289,11 @@ fn test_plugin_requires_config() {
         .try_into()
         .expect("Failed to convert from protobuf");
 
-    // Should work with explicit empty JSON config
+    // Should work with explicit empty JSON config. Default params apply
+    // LowerCaser, so the expected tokens are lowercased.
     let mut tokenizer = restored_params.build().expect("Failed to build tokenizer");
     let tokens = tokenize(&mut tokenizer, "Hello World");
-    assert_eq!(tokens, vec!["Hello", "World"]);
+    assert_eq!(tokens, vec!["hello", "world"]);
 
     // Test that missing config causes an error (construct via proto)
     let proto_without_config = InvertedIndexDetails {

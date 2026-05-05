@@ -32,14 +32,6 @@ use lance_tokenizer::{
     WhitespaceTokenizer,
 };
 
-/// Result of building a base tokenizer.
-/// Either a tantivy TextAnalyzerBuilder (for built-in tokenizers)
-/// or a LanceTokenizer directly (for plugin tokenizers).
-enum BaseTokenizerResult {
-    Builder(TextAnalyzerBuilder),
-    LanceTokenizer(Box<dyn LanceTokenizer>),
-}
-
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
@@ -381,13 +373,7 @@ impl InvertedIndexParams {
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
-        let base_result = self.build_base_tokenizer()?;
-
-        // Plugin tokenizers return LanceTokenizer directly, no further processing needed
-        let mut builder = match base_result {
-            BaseTokenizerResult::LanceTokenizer(tokenizer) => return Ok(tokenizer),
-            BaseTokenizerResult::Builder(builder) => builder,
-        };
+        let mut builder = self.build_base_tokenizer()?;
 
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
@@ -426,17 +412,11 @@ impl InvertedIndexParams {
         }
     }
 
-    fn build_base_tokenizer(&self) -> Result<BaseTokenizerResult> {
+    fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
-            "simple" => Ok(BaseTokenizerResult::Builder(
-                TextAnalyzer::builder(SimpleTokenizer::default()).dynamic(),
-            )),
-            "whitespace" => Ok(BaseTokenizerResult::Builder(
-                TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic(),
-            )),
-            "raw" => Ok(BaseTokenizerResult::Builder(
-                TextAnalyzer::builder(RawTokenizer::default()).dynamic(),
-            )),
+            "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
+            "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
+            "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -444,9 +424,7 @@ impl InvertedIndexParams {
                     self.prefix_only,
                 )
                 .map_err(|e| Error::invalid_input(e.to_string()))?;
-                Ok(BaseTokenizerResult::Builder(
-                    TextAnalyzer::builder(tokenizer).dynamic(),
-                ))
+                Ok(TextAnalyzer::builder(tokenizer).dynamic())
             }
             #[cfg(feature = "tokenizer-lindera")]
             s if s.starts_with("lindera/") => {
@@ -456,9 +434,7 @@ impl InvertedIndexParams {
                         self.base_tokenizer
                     )));
                 };
-                Ok(BaseTokenizerResult::Builder(
-                    lindera::LinderaBuilder::load(&home.join(s))?.build()?,
-                ))
+                lindera::LinderaBuilder::load(&home.join(s))?.build()
             }
             #[cfg(feature = "tokenizer-jieba")]
             s if s.starts_with("jieba/") || s == "jieba" => {
@@ -469,13 +445,9 @@ impl InvertedIndexParams {
                         self.base_tokenizer
                     )));
                 };
-                Ok(BaseTokenizerResult::Builder(
-                    jieba::JiebaBuilder::load(&home.join(s))?.build()?,
-                ))
+                jieba::JiebaBuilder::load(&home.join(s))?.build()
             }
-            "plugin" => self
-                .build_plugin_tokenizer()
-                .map(BaseTokenizerResult::LanceTokenizer),
+            "plugin" => self.build_plugin_tokenizer(),
             _ => Err(Error::invalid_input(format!(
                 "unknown base tokenizer {}",
                 self.base_tokenizer
@@ -483,7 +455,7 @@ impl InvertedIndexParams {
         }
     }
 
-    fn build_plugin_tokenizer(&self) -> Result<Box<dyn LanceTokenizer>> {
+    fn build_plugin_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         #[cfg(feature = "tokenizer-plugin")]
         {
             use std::path::Path;
@@ -513,7 +485,7 @@ impl InvertedIndexParams {
             }
 
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;
-            Ok(Box::new(tokenizer))
+            Ok(TextAnalyzer::builder(tokenizer).dynamic())
         }
 
         #[cfg(not(feature = "tokenizer-plugin"))]
