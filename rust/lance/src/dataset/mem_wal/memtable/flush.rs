@@ -570,12 +570,16 @@ impl MemTableFlusher {
         mem_index: &super::super::index::HnswMemIndex,
         total_rows: usize,
     ) -> Result<IndexMetadata> {
+        use arrow_array::{FixedSizeListArray, Float32Array};
         use arrow_schema::Schema as ArrowSchema;
+        use lance_arrow::FixedSizeListArrayExt;
         use lance_file::writer::FileWriter;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
+        use lance_index::vector::flat::index::FlatMetadata;
         use lance_index::vector::hnsw::HNSW;
         use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+        use lance_index::vector::storage::STORAGE_METADATA_KEY;
         use lance_index::vector::v3::subindex::IvfSubIndex;
         use lance_index::{
             INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
@@ -591,11 +595,30 @@ impl MemTableFlusher {
             .join(index_uuid.to_string());
 
         let distance_type = mem_index.distance_type();
+        let dim = mem_index.dim();
+        if dim == 0 {
+            return Err(Error::invalid_input(
+                "HnswMemIndex has no inserted vectors; nothing to flush",
+            ));
+        }
         let Some((hnsw, storage_batch)) = mem_index.to_lance_hnsw(Some(total_rows as u64))? else {
             return Err(Error::invalid_input(
                 "HnswMemIndex is empty; nothing to flush",
             ));
         };
+
+        // Single-partition IVF for both the storage and graph files. We need
+        // *some* centroid because the on-disk read path routes every query
+        // through `IvfModel::find_partitions` before HNSW search; that call
+        // unwraps `centroids`. With one partition the centroid value is
+        // irrelevant for routing — every query goes to partition 0 — so use
+        // a zero vector.
+        let zero_centroid_values = Float32Array::from(vec![0.0f32; dim]);
+        let zero_centroid_fsl =
+            FixedSizeListArray::try_new_from_values(zero_centroid_values, dim as i32)?;
+        let mut storage_ivf =
+            lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
+        storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
         let storage_schema: ArrowSchema = storage_batch.schema().as_ref().clone();
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
@@ -606,21 +629,25 @@ impl MemTableFlusher {
         )?;
         storage_writer.write_batch(&storage_batch).await?;
 
-        // Single-partition placeholder IVF model so the on-disk Lance HNSW
-        // reader (which always expects an IVF partition layout) is happy.
-        // FLAT storage doesn't need centroids; we emit an empty IVF.
-        let mut storage_ivf = lance_index::vector::ivf::storage::IvfModel::empty();
-        storage_ivf.add_partition(storage_batch.num_rows() as u32);
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
         let ivf_buffer_pos = storage_writer
             .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
-        storage_writer.add_schema_metadata("storage_metadata", "[\"\"]".to_string());
+
+        // Storage metadata is a JSON array of per-partition `FlatMetadata`
+        // strings. With one partition we emit one entry. The reader at
+        // `lance-index/src/vector/storage.rs` parses the outer JSON array and
+        // then decodes each entry as `FlatMetadata`.
+        let flat_metadata = serde_json::to_string(&FlatMetadata { dim })?;
+        let storage_metadata_json = serde_json::to_string(&[flat_metadata])?;
+        storage_writer.add_schema_metadata(STORAGE_METADATA_KEY, storage_metadata_json);
         storage_writer.finish().await?;
 
-        // Write the HNSW graph batch to index.idx.
+        // Write the HNSW graph batch to index.idx. The graph file uses the
+        // same single-partition IVF model with zero centroid for the same
+        // reason as the storage file.
         let hnsw_batch = hnsw.to_batch()?;
         let hnsw_metadata_json = hnsw_batch
             .schema_ref()
@@ -637,13 +664,16 @@ impl MemTableFlusher {
         )?;
         index_writer.write_batch(&hnsw_batch).await?;
 
-        let mut index_ivf = lance_index::vector::ivf::storage::IvfModel::empty();
-        // Empty centroids placeholder; HNSW search reads the graph directly
-        // and does not consult centroids.
+        let mut index_ivf =
+            lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl, None);
         index_ivf.add_partition(hnsw_batch.num_rows() as u32);
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
+        // The on-disk type string matches Lance's index loader vocabulary —
+        // an HNSW sub-index over FLAT (uncompressed) vector storage,
+        // registered under the same name as the standard IVF_HNSW_FLAT
+        // path even though our IVF layer is a single-partition placeholder.
         let index_metadata = IndexMetaSchema {
-            index_type: "HNSW".to_string(),
+            index_type: "IVF_HNSW_FLAT".to_string(),
             distance_type: distance_type.to_string(),
         };
         index_writer.add_schema_metadata(
@@ -654,7 +684,7 @@ impl MemTableFlusher {
             .add_global_buffer(index_ivf_pb.encode_to_vec().into())
             .await?;
         index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
-        // Per-partition HNSW metadata: a JSON array with one entry (single partition).
+        // Per-partition HNSW metadata: a JSON array with one entry.
         index_writer.add_schema_metadata(
             HNSW::metadata_key(),
             serde_json::to_string(&[hnsw_metadata_json])?,
@@ -665,7 +695,6 @@ impl MemTableFlusher {
             type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
             value: vec![],
         }));
-        let _ = config; // name is set by the caller from `config.name`
         let index_meta = IndexMetadata {
             uuid: index_uuid,
             name: config.name.clone(),
@@ -1071,6 +1100,49 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "vector_hnsw");
+
+        // End-to-end query: pick a row from the flushed dataset, query for
+        // it, and verify the index path returns it as the nearest neighbor.
+        // This exercises the on-disk HNSW + FLAT format including the IVF
+        // partition routing and the storage_metadata FlatMetadata
+        // deserialization — both of which had subtle bugs masked by tests
+        // that only checked metadata.
+        let scanned: Vec<RecordBatch> = {
+            use futures::TryStreamExt;
+            dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        };
+        let total_scanned: usize = scanned.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_scanned, num_vectors);
+
+        // Query with the first vector in the dataset; it must come back as
+        // the nearest neighbor with distance ~0.
+        let first_vec_values: Vec<f32> = (0..vector_dim)
+            .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
+            .collect();
+        let query = Float32Array::from(first_vec_values);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 5).unwrap();
+        scan.fast_search();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert!(batch.num_rows() > 0, "query returned no rows");
+        let dist_col = batch
+            .column_by_name("_distance")
+            .expect("_distance column missing")
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert!(
+            dist_col.value(0) < 1e-3,
+            "expected near-zero distance for self-match, got {}",
+            dist_col.value(0)
+        );
     }
 
     #[tokio::test]

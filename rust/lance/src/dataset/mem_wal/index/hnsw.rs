@@ -519,6 +519,12 @@ impl HnswMemIndex {
         self.capacity
     }
 
+    /// Vector dimension. Returns 0 before the first insert (dim is derived
+    /// from the first incoming batch).
+    pub fn dim(&self) -> usize {
+        self.dim.load(Ordering::Acquire)
+    }
+
     pub fn len(&self) -> usize {
         self.state.get().map(|s| s.builder.len()).unwrap_or(0)
     }
