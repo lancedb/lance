@@ -243,7 +243,8 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.build_projection_for_knn(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+                let query_arr = single_query_array(query_vector);
+                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 // fast_search: only search indexed data (memtables cover unindexed).
@@ -263,7 +264,8 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.build_projection_for_knn(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+                let query_arr = single_query_array(query_vector);
+                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 // fast_search: only search indexed data
@@ -339,6 +341,22 @@ impl LsmVectorSearchPlanner {
 
         let schema = Arc::new(Schema::new(fields));
         Ok(Arc::new(EmptyExec::new(schema)))
+    }
+}
+
+/// Convert a (typically single-row) FixedSizeList query into the array shape
+/// `Scanner::nearest` expects:
+///
+/// - 1 row → the inner Float32Array (single-vector query). Passing the FSL
+///   directly would make the scanner treat it as a multivector query and
+///   reject it on a non-multivector column.
+/// - >1 row → the FSL itself (multivector query path).
+fn single_query_array(query_vector: &FixedSizeListArray) -> arrow_array::ArrayRef {
+    use arrow_array::Array;
+    if query_vector.len() == 1 {
+        query_vector.value(0)
+    } else {
+        std::sync::Arc::new(query_vector.clone()) as arrow_array::ArrayRef
     }
 }
 
