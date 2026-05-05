@@ -46,7 +46,9 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
-use super::wal::{TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, empty_flush_result};
+use super::wal::{
+    TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer, empty_flush_result,
+};
 
 use super::manifest::ShardManifestStore;
 
@@ -715,6 +717,89 @@ fn now_millis() -> u64 {
     start_time().elapsed().as_millis() as u64
 }
 
+/// Replay WAL entries written after the last successfully-flushed generation
+/// into the freshly-built MemTable. Updates any in-memory indexes attached to
+/// the MemTable so replayed rows are immediately searchable.
+///
+/// Returns the highest WAL position replayed, or `None` if there were no
+/// entries to replay (fresh shard with no prior writes, or the manifest is
+/// already caught up with the WAL tip).
+///
+/// Aborts with an error if any replayed entry's `writer_epoch` is strictly
+/// greater than `our_epoch` — that indicates a successor writer claimed the
+/// shard between our `claim_epoch` and this replay, fencing us.
+async fn replay_memtable_from_wal(
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+    shard_id: Uuid,
+    our_epoch: u64,
+    manifest: &ShardManifest,
+    memtable: &mut MemTable,
+) -> Result<Option<u64>> {
+    // Fresh shards (no flushes yet) start replay at position 0; otherwise
+    // start one past the last covered position. Distinguishing "no flushes"
+    // from "flushed up to position 0" requires `flushed_generations` since
+    // `replay_after_wal_entry_position` defaults to 0 in both cases.
+    let start_position = if manifest.flushed_generations.is_empty() {
+        0
+    } else {
+        manifest.replay_after_wal_entry_position.saturating_add(1)
+    };
+
+    let tailer = WalTailer::new(object_store, base_path, shard_id);
+    let batches_before = memtable.batch_count();
+    let mut highest_replayed: Option<u64> = None;
+    let mut position = start_position;
+
+    loop {
+        match tailer.read_entry(position).await? {
+            None => break,
+            Some(entry) => {
+                if entry.writer_epoch > our_epoch {
+                    return Err(Error::io(format!(
+                        "WAL replay aborted: entry at position {} has writer_epoch {} > our claimed epoch {} for shard {} (writer was fenced during open)",
+                        position, entry.writer_epoch, our_epoch, shard_id
+                    )));
+                }
+                if !entry.batches.is_empty() {
+                    memtable.insert_batches_only(entry.batches).await?;
+                }
+                highest_replayed = Some(position);
+                position = position.checked_add(1).ok_or_else(|| {
+                    Error::io(format!(
+                        "WAL position overflow during replay for shard {}",
+                        shard_id
+                    ))
+                })?;
+            }
+        }
+    }
+
+    // Update in-memory indexes with the replayed batches so readers see them
+    // through the index path (matching what would have happened on the
+    // pre-crash writer's WAL flush). Indexes from the previous writer don't
+    // persist; this rebuilds them from the WAL.
+    if let Some(indexes) = memtable.indexes_arc() {
+        let batches_after = memtable.batch_count();
+        if batches_after > batches_before {
+            let store = memtable.batch_store();
+            let mut stored: Vec<StoredBatch> = Vec::with_capacity(batches_after - batches_before);
+            for pos in batches_before..batches_after {
+                if let Some(s) = store.get(pos) {
+                    stored.push(s.clone());
+                }
+            }
+            tokio::task::spawn_blocking(move || indexes.insert_batches_parallel(&stored))
+                .await
+                .map_err(|e| {
+                    Error::internal(format!("WAL replay index update task panicked: {}", e))
+                })??;
+        }
+    }
+
+    Ok(highest_replayed)
+}
+
 /// Shared state for writer operations.
 struct SharedWriterState {
     state: Arc<RwLock<WriterState>>,
@@ -1098,7 +1183,8 @@ impl ShardWriter {
                 manifest_store.clone(),
                 stats.clone(),
                 &task_executor,
-            )?
+            )
+            .await?
         } else {
             Self::open_wal_only_mode(
                 &config,
@@ -1122,7 +1208,7 @@ impl ShardWriter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn open_memtable_mode(
+    async fn open_memtable_mode(
         config: &ShardWriterConfig,
         schema: &Arc<ArrowSchema>,
         manifest: &ShardManifest,
@@ -1162,6 +1248,29 @@ impl ShardWriter {
                 config.ivf_index_partition_capacity_safety_factor,
             )?);
             memtable.set_indexes_arc(indexes);
+        }
+
+        // Replay any WAL entries written after the last successfully-flushed
+        // generation. Each entry's writer_epoch is checked against ours; an
+        // entry with a strictly greater epoch indicates a successor writer
+        // claimed the shard between our `claim_epoch` and replay, so we
+        // abort the open with a fence error. After replay, seed the
+        // appender's next-position counter so the first put doesn't pay the
+        // lazy-discovery probe cost.
+        let last_replayed = replay_memtable_from_wal(
+            object_store.clone(),
+            base_path.clone(),
+            shard_id,
+            epoch,
+            manifest,
+            &mut memtable,
+        )
+        .await?;
+        if let Some(last) = last_replayed {
+            wal_flusher
+                .wal_appender()
+                .seed_next_position(last.saturating_add(1))
+                .await;
         }
 
         let state = Arc::new(RwLock::new(WriterState {
@@ -2741,6 +2850,202 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    // ----- MemTable replay on open -----
+
+    fn memtable_config_with_pk(shard_id: Uuid) -> ShardWriterConfig {
+        ShardWriterConfig {
+            shard_id,
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        }
+    }
+
+    fn schema_with_pk() -> Arc<ArrowSchema> {
+        use arrow_schema::Field;
+        // Mark `id` as the unenforced primary key.
+        let pk_meta: std::collections::HashMap<String, String> = [(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "1".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(pk_meta);
+        Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    /// Replay-on-open recovers durable WAL entries that were never flushed
+    /// to a Lance generation. Setup: writer A durably writes batches, drops
+    /// without close (so MemTable freeze never runs); writer B reopens and
+    /// must see A's rows in its MemTable scan.
+    #[tokio::test]
+    async fn test_memtable_replay_recovers_unflushed_writes() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Writer A: write two durable batches, then drop without close.
+        // The WAL files persist; the in-memory MemTable does not.
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                memtable_config_with_pk(shard_id),
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 0, 5)])
+                .await
+                .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 100, 3)])
+                .await
+                .unwrap();
+            // intentionally drop without close()
+        }
+
+        // Writer B reopens. Replay must rehydrate A's two batches into the
+        // active MemTable.
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let stats = writer_b.memtable_stats().await.unwrap();
+        assert_eq!(
+            stats.row_count, 8,
+            "expected replay to insert 5 + 3 = 8 rows, got {}",
+            stats.row_count
+        );
+        assert_eq!(
+            stats.batch_count, 2,
+            "expected replay to insert 2 batches, got {}",
+            stats.batch_count
+        );
+
+        writer_b.close().await.unwrap();
+    }
+
+    /// Replay is a no-op on a fresh shard: the MemTable starts empty.
+    #[tokio::test]
+    async fn test_memtable_replay_no_op_on_fresh_shard() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.row_count, 0);
+        assert_eq!(stats.batch_count, 0);
+        writer.close().await.unwrap();
+    }
+
+    /// Replay aborts the open with a clear fence error if it encounters a
+    /// WAL entry written with an epoch strictly greater than ours. Simulate
+    /// the race where another writer wrote an entry with a higher epoch
+    /// between our `claim_epoch` and our replay by injecting a high-epoch
+    /// entry directly via `WalAppender::with_claimed_epoch` (which
+    /// bypasses `claim_epoch` and so does not bump the manifest).
+    #[tokio::test]
+    async fn test_memtable_replay_fenced_aborts_open() {
+        use crate::dataset::mem_wal::ShardManifestStore;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Writer A: write one durable batch (claims epoch 1, writes entry at position 0).
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                memtable_config_with_pk(shard_id),
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 0, 1)])
+                .await
+                .unwrap();
+            // drop without close
+        }
+
+        // Inject a WAL entry written with epoch 100 — far above whatever
+        // claim_epoch will hand the next opener. The manifest is not
+        // updated since we use `with_claimed_epoch` directly.
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let high_epoch_appender = WalAppender::with_claimed_epoch(
+            store.clone(),
+            base_path.clone(),
+            shard_id,
+            manifest_store,
+            100,
+            // hint seed irrelevant; the real position counter is discovered
+            // lazily on the first append.
+            0,
+        );
+        high_epoch_appender
+            .append(vec![create_test_batch(&schema, 999, 1)])
+            .await
+            .unwrap();
+
+        // Writer B opens. claim_epoch returns 2 (manifest's writer_epoch
+        // was 1 before this open). Replay reads the injected entry, sees
+        // epoch 100 > 2, and aborts with a fence error.
+        let result = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![],
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("expected open to fail with fence error during replay");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("WAL replay aborted") && msg.contains("fenced"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Regression: `wal_stats().next_wal_entry_position` must reflect the

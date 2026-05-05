@@ -790,6 +790,17 @@ impl WalAppender {
         self.next_entry_position_hint.load(Ordering::SeqCst)
     }
 
+    /// Seed the appender's next-position counter from a known value
+    /// (e.g. one past the highest WAL entry observed during MemTable
+    /// replay on `ShardWriter::open`). Skips the first-append lazy
+    /// discovery probe.
+    pub(crate) async fn seed_next_position(&self, position: u64) {
+        let mut guard = self.next_entry_position.lock().await;
+        *guard = Some(position);
+        self.next_entry_position_hint
+            .store(position, Ordering::SeqCst);
+    }
+
     /// Append batches as one durable WAL entry.
     pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
         validate_appender_batches(&batches)?;
