@@ -989,7 +989,15 @@ impl Dataset {
                 })? {
                     Ok(r) => r,
                     Err(error) => {
-                        log::warn!("Cannot derive index type for {:?}: {}", idx, error);
+                        log::warn!(
+                            "Cannot derive index type for index {} (uuid={}, type_url={:?}, version={}) on dataset {}: {}",
+                            idx.name,
+                            idx.uuid,
+                            idx.index_details.as_ref().map(|d| d.type_url.as_str()),
+                            idx.index_version,
+                            self_.ds.uri(),
+                            error,
+                        );
                         // mark the type as unknown for any new index type
                         "Unknown".to_owned()
                     }
