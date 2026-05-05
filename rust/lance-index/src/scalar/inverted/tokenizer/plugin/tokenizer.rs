@@ -9,8 +9,7 @@ use lance_tokenizer::{BoxTokenStream, Token, TokenStream, Tokenizer};
 
 use super::ffi::CToken;
 use super::loader::{
-    NextTokenResult, OwnedPluginFactory, OwnedPluginTokenStream, OwnedPluginTokenizerInstance,
-    TokenizerPluginLibrary,
+    NextTokenResult, OwnedPluginFactory, OwnedPluginTokenStream, TokenizerPluginLibrary,
 };
 use crate::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 
@@ -23,8 +22,13 @@ pub struct PluginTokenizer {
     /// Configuration string for creating factories (format defined by plugin)
     config: String,
 
-    /// Cached factory for repeated tokenization (lazily initialized)
-    cached_factory: Option<OwnedPluginFactory>,
+    /// Cached factory for repeated tokenization (lazily initialized).
+    ///
+    /// Wrapped in `Arc` because every `OwnedPluginTokenizerInstance` we hand
+    /// out keeps an `Arc<OwnedPluginFactory>` back-reference to prevent the
+    /// C-side factory from being destroyed while a tokenizer/stream derived
+    /// from it is still alive.
+    cached_factory: Option<Arc<OwnedPluginFactory>>,
 }
 
 impl PluginTokenizer {
@@ -41,7 +45,7 @@ impl PluginTokenizer {
         Ok(Self {
             library,
             config,
-            cached_factory: Some(factory),
+            cached_factory: Some(Arc::new(factory)),
         })
     }
 
@@ -54,7 +58,7 @@ impl PluginTokenizer {
         Ok(Self {
             library,
             config,
-            cached_factory: Some(factory),
+            cached_factory: Some(Arc::new(factory)),
         })
     }
 
@@ -139,19 +143,18 @@ impl Tokenizer for PluginTokenizer {
 /// FTS worker as a task failure that the build pipeline must surface, so a
 /// misbehaving plugin cannot persist incorrect index contents.
 ///
-/// Field declaration order matters for `Drop`: `stream` is dropped before
-/// `_instance`, because the C-side stream pointer aliases memory owned by the
-/// tokenizer instance.
+/// `OwnedPluginTokenStream` itself owns its parent tokenizer instance (via
+/// `Arc`) and the input text (as `String`), so we don't need to keep them
+/// alive separately here.
 struct PluginTokenStreamAdapter {
     current_token: Token,
     eof: bool,
     stream: OwnedPluginTokenStream,
-    _instance: OwnedPluginTokenizerInstance,
 }
 
 impl PluginTokenStreamAdapter {
     fn new(
-        cached_factory: &mut Option<OwnedPluginFactory>,
+        cached_factory: &mut Option<Arc<OwnedPluginFactory>>,
         library: &Arc<TokenizerPluginLibrary>,
         config: &str,
         text: &str,
@@ -162,7 +165,7 @@ impl PluginTokenStreamAdapter {
         if cached_factory.is_none() {
             let factory = OwnedPluginFactory::new(Arc::clone(library), config)
                 .unwrap_or_else(|e| panic!("failed to create plugin factory: {}", e));
-            *cached_factory = Some(factory);
+            *cached_factory = Some(Arc::new(factory));
         }
         let factory = cached_factory.as_ref().unwrap();
 
@@ -170,14 +173,13 @@ impl PluginTokenStreamAdapter {
             .create_tokenizer()
             .unwrap_or_else(|e| panic!("failed to create plugin tokenizer instance: {}", e));
         let stream = instance
-            .create_stream(text)
+            .create_stream(text.to_string())
             .unwrap_or_else(|e| panic!("failed to create plugin token stream: {}", e));
 
         Self {
             current_token: Token::default(),
             eof: false,
             stream,
-            _instance: instance,
         }
     }
 }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ffi::CStr;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -230,20 +231,65 @@ impl TokenizerPluginLibrary {
 // Note: PluginFactory, PluginTokenizerInstance, and PluginTokenStream
 //       are not Send/Sync because they hold raw pointers to plugin state.
 //       Each thread should create its own instances.
+//
+// Lifetime chain: a stream borrows from its tokenizer instance and from the
+// input text; a tokenizer instance borrows from the factory. The plugin C ABI
+// allows children to alias parent state (e.g. a tokenizer holds pointers into
+// the factory's dictionary, or a stream zero-copies the input text), so we
+// encode that as a borrow chain in the type system. Without this, safe Rust
+// would let a caller `drop(factory)` while a tokenizer/stream is still alive,
+// or pass `&format!(...)` as the input text and outlive the temporary string,
+// either of which is a use-after-free in the plugin.
 
 /// PluginFactory holds shared resources (like dictionaries) and can create
 /// multiple tokenizer instances.
+///
+/// The borrow chain `factory -> instance -> stream` is enforced at compile
+/// time so a caller cannot drop a parent while a child is still alive.
+///
+/// Dropping the factory while a tokenizer derived from it is still alive
+/// must be rejected by the borrow checker:
+///
+/// ```compile_fail
+/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::PluginFactory;
+/// fn use_after_factory_drop<'a>(factory: PluginFactory<'a>) {
+///     let inst = factory.create_tokenizer().unwrap();
+///     drop(factory);
+///     let _ = inst.create_stream("hi");
+/// }
+/// ```
+///
+/// Likewise, returning a stream that borrows a temporary input string
+/// (e.g. `&format!(...)`) must be rejected:
+///
+/// ```compile_fail
+/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::{
+/// #     PluginFactory, PluginTokenStream,
+/// # };
+/// fn temp_input_outlives_stream<'a>(
+///     factory: &'a PluginFactory<'a>,
+/// ) -> PluginTokenStream<'a> {
+///     let inst = factory.create_tokenizer().unwrap();
+///     inst.create_stream(&format!("temp {}", 1)).unwrap()
+/// }
+/// ```
 pub struct PluginFactory<'a> {
     library: &'a TokenizerPluginLibrary,
     factory: *mut LanceTokenizerFactory,
 }
 
 impl<'a> PluginFactory<'a> {
-    pub fn create_tokenizer(&self) -> Result<PluginTokenizerInstance<'a>> {
+    /// The returned instance borrows from `self`, so the borrow checker
+    /// rejects dropping the factory while any instance is still alive.
+    pub fn create_tokenizer<'b>(&'b self) -> Result<PluginTokenizerInstance<'b>>
+    where
+        'a: 'b,
+    {
         let tokenizer = unsafe { self.library.create_tokenizer(self.factory)? };
         Ok(PluginTokenizerInstance {
             library: self.library,
             tokenizer,
+            _factory: PhantomData,
         })
     }
 }
@@ -256,18 +302,30 @@ impl Drop for PluginFactory<'_> {
     }
 }
 
-/// A tokenizer instance created from a plugin factory.
+/// A tokenizer instance created from a plugin factory. Borrows from the
+/// factory so the factory cannot be dropped while the instance is alive.
 pub struct PluginTokenizerInstance<'a> {
     library: &'a TokenizerPluginLibrary,
     tokenizer: *mut LanceTokenizer,
+    /// Tie the instance's lifetime to the factory it was created from.
+    _factory: PhantomData<&'a PluginFactory<'a>>,
 }
 
 impl<'a> PluginTokenizerInstance<'a> {
-    pub fn create_stream(&self, text: &str) -> Result<PluginTokenStream<'a>> {
+    /// The returned stream borrows from both `self` (the tokenizer instance)
+    /// and `text`, so the borrow checker rejects dropping either while the
+    /// stream is still alive — including the common foot-gun of passing
+    /// `&format!(...)` as the input.
+    pub fn create_stream<'b>(&'b self, text: &'b str) -> Result<PluginTokenStream<'b>>
+    where
+        'a: 'b,
+    {
         let stream = unsafe { self.library.create_stream(self.tokenizer, text)? };
         Ok(PluginTokenStream {
             library: self.library,
             stream,
+            _instance: PhantomData,
+            _text: PhantomData,
         })
     }
 }
@@ -280,10 +338,14 @@ impl Drop for PluginTokenizerInstance<'_> {
     }
 }
 
-/// A token stream from a plugin tokenizer.
+/// A token stream from a plugin tokenizer. Borrows from the parent
+/// tokenizer instance and the input text — the plugin may zero-copy either,
+/// so dropping either while the stream is alive would be a use-after-free.
 pub struct PluginTokenStream<'a> {
     library: &'a TokenizerPluginLibrary,
     stream: *mut LanceTokenStream,
+    _instance: PhantomData<&'a PluginTokenizerInstance<'a>>,
+    _text: PhantomData<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,7 +438,13 @@ impl OwnedPluginFactory {
     }
 
     /// Create a tokenizer instance from this factory.
-    pub fn create_tokenizer(&self) -> Result<OwnedPluginTokenizerInstance> {
+    ///
+    /// The returned instance keeps an `Arc` to the factory so the C-side
+    /// factory state cannot be destroyed while the tokenizer (or any stream
+    /// it produced) is still alive. Without this back-reference a caller
+    /// could write `let inst = factory.create_tokenizer()?; drop(factory);`
+    /// and then dereference the freed factory state through `inst`.
+    pub fn create_tokenizer(self: &Arc<Self>) -> Result<Arc<OwnedPluginTokenizerInstance>> {
         let factory_ptr = self.factory.lock().expect("plugin factory mutex poisoned");
         let mut error = CError::default();
         let tokenizer =
@@ -392,10 +460,11 @@ impl OwnedPluginFactory {
                 error_msg
             )));
         }
-        Ok(OwnedPluginTokenizerInstance {
+        Ok(Arc::new(OwnedPluginTokenizerInstance {
             library: Arc::clone(&self.library),
-            tokenizer,
-        })
+            tokenizer: Mutex::new(tokenizer),
+            _factory: Arc::clone(self),
+        }))
     }
 }
 
@@ -414,19 +483,53 @@ impl Drop for OwnedPluginFactory {
 }
 
 /// An owned tokenizer instance created from an owned factory.
+///
+/// Keeps an `Arc<OwnedPluginFactory>` back-reference so the factory cannot
+/// be dropped (which would invoke the plugin's `destroy_factory`) while any
+/// instance derived from it is still alive.
 pub struct OwnedPluginTokenizerInstance {
     library: Arc<TokenizerPluginLibrary>,
-    tokenizer: *mut LanceTokenizer,
+    /// Raw tokenizer handle, guarded by a Mutex for the same reason
+    /// `OwnedPluginFactory.factory` is — a stateful plugin's
+    /// `create_stream` is not required by the C ABI to be safe under
+    /// concurrent calls against the same tokenizer handle, and instances
+    /// are shared via `Arc` so multiple threads may legitimately call
+    /// `create_stream` on the same instance.
+    tokenizer: Mutex<*mut LanceTokenizer>,
+    _factory: Arc<OwnedPluginFactory>,
 }
+
+// SAFETY: same rationale as OwnedPluginFactory — the only access to the raw
+// tokenizer pointer goes through the Mutex above. `Mutex<*mut T>` is not
+// auto-`Send`/`Sync` because of the raw pointer, so we declare both
+// manually.
+unsafe impl Send for OwnedPluginTokenizerInstance {}
+unsafe impl Sync for OwnedPluginTokenizerInstance {}
 
 impl OwnedPluginTokenizerInstance {
     /// Create a token stream for the given text.
-    pub fn create_stream(&self, text: &str) -> Result<OwnedPluginTokenStream> {
+    ///
+    /// The returned stream owns the input `text` (as `String`) and keeps an
+    /// `Arc` to the parent instance. This is necessary because the plugin
+    /// ABI lets streams alias either the tokenizer state or the input bytes
+    /// (for zero-copy / lazy implementations). Without this composition the
+    /// safe API would allow `let stream = inst.create_stream(&format!(...))`
+    /// — the temporary `String` would drop while the C-side stream still
+    /// holds a pointer into it.
+    pub fn create_stream(
+        self: &Arc<Self>,
+        text: impl Into<String>,
+    ) -> Result<OwnedPluginTokenStream> {
+        let text = text.into();
+        let tokenizer_ptr = self
+            .tokenizer
+            .lock()
+            .expect("plugin tokenizer mutex poisoned");
         let mut error = CError::default();
         let stream = unsafe {
             ((*self.library.plugin).create_stream.unwrap())(
-                self.tokenizer,
-                CStringRef::from_str(text),
+                *tokenizer_ptr,
+                CStringRef::from_str(&text),
                 &mut error,
             )
         };
@@ -442,25 +545,48 @@ impl OwnedPluginTokenizerInstance {
             )));
         }
         Ok(OwnedPluginTokenStream {
-            library: Arc::clone(&self.library),
+            // Field declaration order matters for Drop: `stream` is dropped
+            // first (custom Drop calls destroy_stream while text/instance
+            // are still alive), then text/instance/library are released.
             stream,
+            library: Arc::clone(&self.library),
+            _instance: Arc::clone(self),
+            _text: text,
         })
     }
 }
 
 impl Drop for OwnedPluginTokenizerInstance {
     fn drop(&mut self) {
+        let tokenizer_ptr = *self
+            .tokenizer
+            .get_mut()
+            .expect("plugin tokenizer mutex poisoned");
         unsafe {
-            self.library.destroy_tokenizer(self.tokenizer);
+            self.library.destroy_tokenizer(tokenizer_ptr);
         }
     }
 }
 
 /// An owned token stream from an owned tokenizer instance.
+///
+/// Owns the input `String` and keeps an `Arc` to the parent instance so
+/// neither can be freed while the C-side stream is still alive. The plugin
+/// is allowed to zero-copy from either, so dropping them earlier would be
+/// a use-after-free.
 pub struct OwnedPluginTokenStream {
-    library: Arc<TokenizerPluginLibrary>,
     stream: *mut LanceTokenStream,
+    library: Arc<TokenizerPluginLibrary>,
+    _instance: Arc<OwnedPluginTokenizerInstance>,
+    _text: String,
 }
+
+// SAFETY: `next_token` takes `&mut self`, so the borrow checker already
+// guarantees exclusive access — no per-stream Mutex is needed. The struct
+// merely holds a raw pointer alongside Arc-counted owners, so the auto
+// Send/Sync impls would fall through if not for the raw pointer.
+unsafe impl Send for OwnedPluginTokenStream {}
+unsafe impl Sync for OwnedPluginTokenStream {}
 
 impl OwnedPluginTokenStream {
     pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {

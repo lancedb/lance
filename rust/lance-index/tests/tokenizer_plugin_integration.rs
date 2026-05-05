@@ -867,3 +867,55 @@ fn test_concurrent_create_tokenizer_through_arc_factory() {
         h.join().expect("worker thread panicked");
     }
 }
+
+/// The owned plugin objects must form a parent-keeps-alive chain so that a
+/// caller can drop a parent (factory or instance) without invalidating the
+/// children. This prevents a use-after-free where the plugin's
+/// `destroy_factory` would run before tokenization finishes.
+#[test]
+#[serial(plugin_tests)]
+fn test_owned_objects_outlive_dropped_parents() {
+    use std::sync::Arc;
+
+    use lance_index::scalar::inverted::tokenizer::plugin::ffi::CToken;
+    use lance_index::scalar::inverted::tokenizer::plugin::loader::{
+        NextTokenResult, OwnedPluginFactory,
+    };
+
+    let library = TokenizerPluginLibrary::load(get_plugin_path()).expect("load plugin");
+    let factory = Arc::new(OwnedPluginFactory::new(library, "{}").expect("create factory"));
+    let instance = factory.create_tokenizer().expect("create_tokenizer");
+
+    // Drop the only outer reference to the factory. The instance keeps an
+    // Arc<OwnedPluginFactory> internally, so the C-side factory must remain
+    // alive — otherwise `create_stream` below dereferences freed state.
+    drop(factory);
+
+    // The stream must also be usable after dropping the only outer reference
+    // to the instance, because OwnedPluginTokenStream owns the parent
+    // instance via Arc and the input text via String. The temporary
+    // `format!(...)` would be a use-after-free under a borrowing API.
+    let mut stream = instance
+        .create_stream(format!("hello {}", "world"))
+        .expect("create_stream after dropping factory");
+    drop(instance);
+
+    let mut tok = CToken::default();
+    let mut tokens = Vec::new();
+    loop {
+        match stream.next_token(&mut tok) {
+            NextTokenResult::Token => unsafe {
+                let slice = std::slice::from_raw_parts(
+                    tok.text.data as *const u8,
+                    tok.text.length as usize,
+                );
+                tokens.push(std::str::from_utf8(slice).unwrap().to_string());
+            },
+            NextTokenResult::EndOfStream => break,
+            NextTokenResult::Error(code, msg) => {
+                panic!("unexpected plugin error (code={}): {}", code, msg);
+            }
+        }
+    }
+    assert_eq!(tokens, vec!["hello", "world"]);
+}
