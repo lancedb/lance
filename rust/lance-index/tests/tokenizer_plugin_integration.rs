@@ -933,3 +933,76 @@ fn test_owned_objects_outlive_dropped_parents() {
     }
     assert_eq!(tokens, vec!["hello", "world"]);
 }
+
+/// The plugin C ABI requires "the previous stream must be destroyed before
+/// creating another from the same tokenizer." A plugin is allowed to share
+/// scratch state between a tokenizer and its single live stream (lazy
+/// buffers, zero-copy slices into tokenizer state, etc.), so two
+/// concurrently-live streams from one tokenizer would data-race or
+/// use-after-free on the plugin side. The safe wrapper must reject the
+/// second `create_stream` call rather than silently producing an unsafe
+/// configuration.
+#[test]
+#[serial(plugin_tests)]
+fn test_create_stream_rejects_overlapping_streams_from_same_instance() {
+    use std::sync::Arc;
+
+    use lance_index::scalar::inverted::tokenizer::plugin::loader::OwnedPluginFactory;
+
+    let library = TokenizerPluginLibrary::load(get_plugin_path()).expect("load plugin");
+    let factory = Arc::new(OwnedPluginFactory::new(library, "{}").expect("create factory"));
+    let instance = factory.create_tokenizer().expect("create instance");
+
+    let _first = instance
+        .create_stream("hello world")
+        .expect("first create_stream must succeed");
+
+    // Second call against the same instance, while `_first` is still alive,
+    // must fail with a clear error rather than handing the plugin two
+    // overlapping streams. `OwnedPluginTokenStream` does not implement
+    // `Debug`, so we cannot use `expect_err` directly.
+    match instance.create_stream("foo bar") {
+        Ok(_) => panic!("second create_stream while first is alive must fail"),
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("already has a live token stream"),
+                "error must explain the ABI contract, got: {}",
+                msg
+            );
+        }
+    }
+
+    // After dropping the first stream, the slot is released and a new
+    // stream from the same instance must succeed.
+    drop(_first);
+    let _second = instance
+        .create_stream("foo bar")
+        .expect("create_stream must succeed once the previous stream is dropped");
+}
+
+/// Distinct tokenizer instances from the same factory have independent
+/// "active stream" slots — one instance's live stream must not block
+/// another instance from creating its own. This is what FTS workers rely
+/// on: each worker holds its own `OwnedPluginTokenizerInstance`.
+#[test]
+#[serial(plugin_tests)]
+fn test_create_stream_independence_across_instances() {
+    use std::sync::Arc;
+
+    use lance_index::scalar::inverted::tokenizer::plugin::loader::OwnedPluginFactory;
+
+    let library = TokenizerPluginLibrary::load(get_plugin_path()).expect("load plugin");
+    let factory = Arc::new(OwnedPluginFactory::new(library, "{}").expect("create factory"));
+    let inst_a = factory.create_tokenizer().expect("instance a");
+    let inst_b = factory.create_tokenizer().expect("instance b");
+
+    let _stream_a = inst_a
+        .create_stream("hello world")
+        .expect("instance a stream");
+    // `inst_b` is a separate instance, so it must accept a new stream even
+    // while `inst_a` still has one live.
+    let _stream_b = inst_b
+        .create_stream("foo bar")
+        .expect("instance b stream must be independent of instance a's slot");
+}

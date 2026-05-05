@@ -4,6 +4,7 @@
 use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lance_core::{Error, Result};
@@ -492,6 +493,7 @@ impl OwnedPluginFactory {
         Ok(Arc::new(OwnedPluginTokenizerInstance {
             library: Arc::clone(&self.library),
             tokenizer: Mutex::new(tokenizer),
+            active_stream: AtomicBool::new(false),
             _factory: Arc::clone(self),
         }))
     }
@@ -525,6 +527,23 @@ pub struct OwnedPluginTokenizerInstance {
     /// are shared via `Arc` so multiple threads may legitimately call
     /// `create_stream` on the same instance.
     tokenizer: Mutex<*mut LanceTokenizer>,
+    /// Tracks whether this instance currently has a live `OwnedPluginTokenStream`.
+    ///
+    /// Per the plugin C ABI (`create_stream` in `lance_tokenizer_plugin.h`):
+    /// "The stream must be destroyed before creating another stream from the
+    /// same tokenizer." Plugins are allowed to share scratch state between a
+    /// tokenizer and its stream (lazy buffers, zero-copy slices into tokenizer
+    /// dictionaries, etc.), so two concurrently-live streams from one
+    /// tokenizer would be a data race or use-after-free in the plugin even
+    /// though the safe wrapper itself is sound.
+    ///
+    /// We enforce the contract with an atomic flag rather than the existing
+    /// `tokenizer` mutex because the lock would have to span the lifetime of
+    /// the returned stream, and a `MutexGuard` cannot be stored in the
+    /// stream alongside the `Arc<OwnedPluginTokenizerInstance>` it borrows
+    /// from. Stream `Drop` clears the flag, restoring the instance to a
+    /// usable state.
+    active_stream: AtomicBool,
     _factory: Arc<OwnedPluginFactory>,
 }
 
@@ -549,11 +568,39 @@ impl OwnedPluginTokenizerInstance {
         self: &Arc<Self>,
         text: impl Into<String>,
     ) -> Result<OwnedPluginTokenStream> {
+        // Reserve the "one active stream per instance" slot before calling
+        // into the plugin. If another stream from this instance is still
+        // alive, refuse here — the C ABI explicitly forbids overlapping
+        // streams on the same tokenizer, and a plugin that shares scratch
+        // state between tokenizer and stream would otherwise data-race or
+        // use-after-free.
+        self.active_stream
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| {
+                Error::invalid_input(
+                    "tokenizer instance already has a live token stream; \
+                     the plugin C ABI requires the previous stream to be \
+                     dropped before creating another from the same tokenizer",
+                )
+            })?;
+
+        // Helper to release the slot if anything below this point fails,
+        // so a failure path does not leave the instance permanently blocked.
+        let release_on_failure = |this: &Arc<Self>| {
+            this.active_stream.store(false, Ordering::Release);
+        };
+
         let text = text.into();
-        let tokenizer_ptr = self
-            .tokenizer
-            .lock()
-            .expect("plugin tokenizer mutex poisoned");
+        let tokenizer_ptr = match self.tokenizer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                release_on_failure(self);
+                return Err(Error::invalid_input(format!(
+                    "plugin tokenizer mutex poisoned: {}",
+                    poisoned
+                )));
+            }
+        };
         let mut error = CError::default();
         let stream = unsafe {
             ((*self.library.plugin).create_stream.unwrap())(
@@ -568,6 +615,7 @@ impl OwnedPluginTokenizerInstance {
             } else {
                 "unknown error".to_string()
             };
+            release_on_failure(self);
             return Err(Error::invalid_input(format!(
                 "failed to create token stream: {}",
                 error_msg
@@ -642,6 +690,10 @@ impl Drop for OwnedPluginTokenStream {
         unsafe {
             self.library.destroy_stream(self.stream);
         }
+        // Release the parent instance's "one active stream" slot so a new
+        // stream can be created from it. `Release` ordering pairs with the
+        // `Acquire` CAS in `OwnedPluginTokenizerInstance::create_stream`.
+        self._instance.active_stream.store(false, Ordering::Release);
     }
 }
 

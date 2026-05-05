@@ -407,6 +407,7 @@ impl InvertedIndexParams {
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
+        self.validate_plugin_consistency()?;
         let mut builder = self.build_base_tokenizer()?;
 
         if let Some(max_token_length) = self.max_token_length {
@@ -444,6 +445,33 @@ impl InvertedIndexParams {
                 self.lance_tokenizer.as_ref().unwrap()
             ))),
         }
+    }
+
+    /// Reject parameter sets that mix the plugin fields with a non-`"plugin"`
+    /// base tokenizer.
+    ///
+    /// Without this check, `tokenizer_plugin_library` / `tokenizer_plugin_config`
+    /// arriving via JSON or proto deserialization would be silently ignored
+    /// whenever `base_tokenizer` was left at its default `"simple"`. The user
+    /// would believe they configured a plugin tokenizer (the metadata even
+    /// keeps the path), while the index was actually built with the built-in
+    /// `simple` tokenizer — and search results would silently use a different
+    /// tokenizer than indexing did. This guards both the build-side and the
+    /// post-deserialization paths in one place.
+    fn validate_plugin_consistency(&self) -> Result<()> {
+        let has_plugin_fields =
+            self.tokenizer_plugin_library.is_some() || self.tokenizer_plugin_config.is_some();
+        if has_plugin_fields && self.base_tokenizer != "plugin" {
+            return Err(Error::invalid_input(format!(
+                "tokenizer_plugin_library / tokenizer_plugin_config are set \
+                 but base_tokenizer is {:?}; expected \"plugin\". Use \
+                 InvertedIndexParams::plugin(library, config) to configure a \
+                 plugin tokenizer, or unset the plugin fields if you intended \
+                 to use the {:?} tokenizer.",
+                self.base_tokenizer, self.base_tokenizer,
+            )));
+        }
+        Ok(())
     }
 
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
@@ -714,5 +742,53 @@ mod tests {
             "deserialized plugin path must be absolute, got {:?}",
             stored
         );
+    }
+
+    /// `tokenizer_plugin_library` / `tokenizer_plugin_config` arriving via
+    /// JSON or proto deserialization must not be silently ignored when
+    /// `base_tokenizer` is left at its default. Without validation the
+    /// resulting index would be built with the built-in `simple` tokenizer
+    /// while still persisting the plugin path in metadata, leading to a
+    /// silent mismatch between indexing and search tokenizers.
+    #[test]
+    fn test_build_rejects_plugin_fields_without_plugin_base_tokenizer() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "tokenizer_plugin_library".to_string(),
+            serde_json::Value::from("/tmp/lib.so"),
+        );
+        obj.insert(
+            "tokenizer_plugin_config".to_string(),
+            serde_json::Value::from("{}"),
+        );
+        // Note: `base_tokenizer` is left at the default ("simple").
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.base_tokenizer, "simple");
+
+        // `Box<dyn LanceTokenizer>` doesn't implement `Debug`, so we cannot
+        // use `expect_err` directly.
+        match params.build() {
+            Ok(_) => panic!("build must reject plugin fields with non-plugin base tokenizer"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("base_tokenizer") && msg.contains("plugin"),
+                    "error must name the conflicting fields, got: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    /// Sanity check the inverse: a default params object without plugin
+    /// fields must still build cleanly through `simple` and not be
+    /// blocked by the new validation.
+    #[test]
+    fn test_build_default_params_still_succeeds() {
+        let params = InvertedIndexParams::default();
+        params
+            .build()
+            .expect("default params must still build a simple tokenizer");
     }
 }
