@@ -230,33 +230,27 @@ impl MemTableFlusher {
             );
         }
 
-        // Create IVF-PQ indexes and commit them to the dataset
+        // Create HNSW vector indexes and commit them to the dataset
         if let Some(registry) = memtable.indexes() {
             let uri = self.path_to_uri(&gen_path);
             let mut dataset = Dataset::open(&uri).await?;
 
             for config in index_configs {
-                if let MemIndexConfig::IvfPq(ivf_pq_config) = config
-                    && let Some(mem_index) = registry.get_ivf_pq(&ivf_pq_config.name)
+                if let MemIndexConfig::Hnsw(hnsw_config) = config
+                    && let Some(mem_index) = registry.get_hnsw(&hnsw_config.name)
                 {
                     let mut index_meta = self
-                        .create_ivf_pq_index(&gen_path, ivf_pq_config, mem_index, total_rows)
+                        .create_hnsw_index(&gen_path, hnsw_config, mem_index, total_rows)
                         .await?;
 
-                    // Fix up the index metadata with correct field index
                     let schema = dataset.schema();
-                    let field_idx = schema
-                        .field(&ivf_pq_config.column)
-                        .map(|f| f.id)
-                        .unwrap_or(0);
+                    let field_idx = schema.field(&hnsw_config.column).map(|f| f.id).unwrap_or(0);
                     index_meta.fields = vec![field_idx];
                     index_meta.dataset_version = dataset.version().version;
-                    // Calculate fragment_bitmap from dataset fragments
                     let fragment_ids: roaring::RoaringBitmap =
                         dataset.fragment_bitmap.as_ref().clone();
                     index_meta.fragment_bitmap = Some(fragment_ids);
 
-                    // Commit the index to the dataset
                     use crate::dataset::transaction::{Operation, Transaction};
                     let transaction = Transaction::new(
                         index_meta.dataset_version,
@@ -271,8 +265,8 @@ impl MemTableFlusher {
                         .await?;
 
                     info!(
-                        "Created IVF-PQ index '{}' on flushed generation {}",
-                        ivf_pq_config.name, generation
+                        "Created HNSW index '{}' on flushed generation {}",
+                        hnsw_config.name, generation
                     );
                 }
             }
@@ -330,7 +324,7 @@ impl MemTableFlusher {
             .iter()
             .filter_map(|c| match c {
                 MemIndexConfig::BTree(cfg) => Some(cfg),
-                MemIndexConfig::IvfPq(_) => None,
+                MemIndexConfig::Hnsw(_) => None,
                 MemIndexConfig::Fts(_) => None,
             })
             .collect();
@@ -555,30 +549,34 @@ impl MemTableFlusher {
     /// Writes the index files directly using the pre-computed partition assignments
     /// and PQ codes from the in-memory index.
     ///
+    /// Create an HNSW + FLAT index from the in-memory HNSW.
+    ///
+    /// Writes:
+    /// - `auxiliary.idx`: FLAT vector storage (`_rowid`, `flat`).
+    /// - `index.idx`: HNSW graph (`__vector_id`, `__neighbors`, `_distance`).
+    ///
+    /// Both files use a single placeholder IVF partition so they conform to
+    /// the existing Lance HNSW/FLAT layout used by the on-disk readers.
+    ///
     /// # Arguments
     /// * `gen_path` - Path to the flushed generation folder
-    /// * `config` - IVF-PQ index configuration
-    /// * `mem_index` - In-memory IVF-PQ index
+    /// * `config` - HNSW index configuration
+    /// * `mem_index` - In-memory HNSW index (snapshotted, not consumed)
     /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
-    async fn create_ivf_pq_index(
+    async fn create_hnsw_index(
         &self,
         gen_path: &Path,
-        config: &super::super::index::IvfPqIndexConfig,
-        mem_index: &super::super::index::IvfPqMemIndex,
+        config: &super::super::index::HnswIndexConfig,
+        mem_index: &super::super::index::HnswMemIndex,
         total_rows: usize,
     ) -> Result<IndexMetadata> {
-        use arrow_schema::{Field, Schema as ArrowSchema};
-        use lance_core::ROW_ID;
+        use arrow_schema::Schema as ArrowSchema;
         use lance_file::writer::FileWriter;
         use lance_index::pb;
-        use lance_index::vector::flat::index::FlatIndex;
+        use lance_index::vector::DISTANCE_TYPE_KEY;
+        use lance_index::vector::hnsw::HNSW;
         use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
-        use lance_index::vector::quantizer::{
-            Quantization, QuantizationMetadata, QuantizerMetadata,
-        };
-        use lance_index::vector::storage::STORAGE_METADATA_KEY;
         use lance_index::vector::v3::subindex::IvfSubIndex;
-        use lance_index::vector::{DISTANCE_TYPE_KEY, PQ_CODE_COLUMN};
         use lance_index::{
             INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
             IndexMetadata as IndexMetaSchema,
@@ -592,110 +590,60 @@ impl MemTableFlusher {
             .join("_indices")
             .join(index_uuid.to_string());
 
-        // Get partition data from in-memory index with reversed row positions
-        // since the flushed data is in reverse order.
-        let partition_batches = mem_index.to_partition_batches_reversed(total_rows)?;
-        let ivf_model = mem_index.ivf_model();
-        let pq = mem_index.pq();
         let distance_type = mem_index.distance_type();
+        let Some((hnsw, storage_batch)) = mem_index.to_lance_hnsw(Some(total_rows as u64))? else {
+            return Err(Error::invalid_input(
+                "HnswMemIndex is empty; nothing to flush",
+            ));
+        };
 
-        // Create storage file schema: _rowid, __pq_code
-        let pq_code_len = pq.num_sub_vectors * pq.num_bits as usize / 8;
-        let storage_schema: ArrowSchema = ArrowSchema::new(vec![
-            Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
-            Field::new(
-                PQ_CODE_COLUMN,
-                arrow_schema::DataType::FixedSizeList(
-                    Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false)),
-                    pq_code_len as i32,
-                ),
-                false,
-            ),
-        ]);
-
-        // Create index file schema (FlatIndex schema)
-        let index_schema: ArrowSchema = FlatIndex::schema().as_ref().clone();
-
-        // Create file writers
+        let storage_schema: ArrowSchema = storage_batch.schema().as_ref().clone();
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
             Default::default(),
         )?;
-        let mut index_writer = FileWriter::try_new(
-            self.object_store.create(&index_path).await?,
-            (&index_schema).try_into()?,
-            Default::default(),
-        )?;
+        storage_writer.write_batch(&storage_batch).await?;
 
-        // Track IVF partitions for both files
+        // Single-partition placeholder IVF model so the on-disk Lance HNSW
+        // reader (which always expects an IVF partition layout) is happy.
+        // FLAT storage doesn't need centroids; we emit an empty IVF.
         let mut storage_ivf = lance_index::vector::ivf::storage::IvfModel::empty();
-
-        // Get centroids (required for IVF index)
-        let centroids = ivf_model
-            .centroids
-            .clone()
-            .ok_or_else(|| Error::io("IVF model has no centroids"))?;
-        let mut index_ivf = lance_index::vector::ivf::storage::IvfModel::new(centroids, None);
-        let mut partition_index_metadata = Vec::with_capacity(ivf_model.num_partitions());
-
-        // Create a map of partition_id -> batch for quick lookup
-        let partition_map: std::collections::HashMap<usize, _> =
-            partition_batches.into_iter().collect();
-
-        // Write each partition
-        for part_id in 0..ivf_model.num_partitions() {
-            if let Some(batch) = partition_map.get(&part_id) {
-                // Transpose PQ codes for storage (column-major layout)
-                let transposed_batch = transpose_pq_batch(batch, pq_code_len)?;
-
-                // Write storage data
-                storage_writer.write_batch(&transposed_batch).await?;
-                storage_ivf.add_partition(transposed_batch.num_rows() as u32);
-
-                // FlatIndex is empty (no additional sub-index data needed for IVF-PQ)
-                index_ivf.add_partition(0);
-                partition_index_metadata.push(String::new());
-            } else {
-                // Empty partition
-                storage_ivf.add_partition(0);
-                index_ivf.add_partition(0);
-                partition_index_metadata.push(String::new());
-            }
-        }
-
-        // Write storage file metadata
+        storage_ivf.add_partition(storage_batch.num_rows() as u32);
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
         let ivf_buffer_pos = storage_writer
             .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        storage_writer.add_schema_metadata("storage_metadata", "[\"\"]".to_string());
+        storage_writer.finish().await?;
 
-        // Write PQ metadata
-        let pq_metadata = pq.metadata(Some(QuantizationMetadata {
-            codebook_position: Some(0),
-            codebook: None,
-            transposed: true,
-        }));
-        if let Some(extra_metadata) = pq_metadata.extra_metadata()? {
-            let idx = storage_writer.add_global_buffer(extra_metadata).await?;
-            let mut pq_meta = pq_metadata;
-            pq_meta.set_buffer_index(idx);
-            let storage_partition_metadata = vec![serde_json::to_string(&pq_meta)?];
-            storage_writer.add_schema_metadata(
-                STORAGE_METADATA_KEY,
-                serde_json::to_string(&storage_partition_metadata)?,
-            );
-        }
+        // Write the HNSW graph batch to index.idx.
+        let hnsw_batch = hnsw.to_batch()?;
+        let hnsw_metadata_json = hnsw_batch
+            .schema_ref()
+            .metadata()
+            .get(lance_index::vector::hnsw::builder::HNSW_METADATA_KEY)
+            .cloned()
+            .unwrap_or_default();
+        let index_schema: ArrowSchema = HNSW::schema().as_ref().clone();
+        let index_path = index_dir.clone().join(INDEX_FILE_NAME);
+        let mut index_writer = FileWriter::try_new(
+            self.object_store.create(&index_path).await?,
+            (&index_schema).try_into()?,
+            Default::default(),
+        )?;
+        index_writer.write_batch(&hnsw_batch).await?;
 
-        // Write index file metadata
+        let mut index_ivf = lance_index::vector::ivf::storage::IvfModel::empty();
+        // Empty centroids placeholder; HNSW search reads the graph directly
+        // and does not consult centroids.
+        index_ivf.add_partition(hnsw_batch.num_rows() as u32);
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
         let index_metadata = IndexMetaSchema {
-            index_type: "IVF_PQ".to_string(),
+            index_type: "HNSW".to_string(),
             distance_type: distance_type.to_string(),
         };
         index_writer.add_schema_metadata(
@@ -706,25 +654,22 @@ impl MemTableFlusher {
             .add_global_buffer(index_ivf_pb.encode_to_vec().into())
             .await?;
         index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        // Per-partition HNSW metadata: a JSON array with one entry (single partition).
         index_writer.add_schema_metadata(
-            FlatIndex::metadata_key(),
-            serde_json::to_string(&partition_index_metadata)?,
+            HNSW::metadata_key(),
+            serde_json::to_string(&[hnsw_metadata_json])?,
         );
-
-        // Finish writing
-        storage_writer.finish().await?;
         index_writer.finish().await?;
 
-        // Create index metadata for commit
-        // Vector indices need index_details set for retain_supported_indices() to keep them
-        let index_details = Some(std::sync::Arc::new(prost_types::Any {
+        let index_details = Some(Arc::new(prost_types::Any {
             type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
             value: vec![],
         }));
+        let _ = config; // name is set by the caller from `config.name`
         let index_meta = IndexMetadata {
             uuid: index_uuid,
             name: config.name.clone(),
-            fields: vec![0], // Will be updated when committing
+            fields: vec![0], // updated by caller
             dataset_version: 0,
             fragment_bitmap: None,
             index_details,
@@ -768,47 +713,6 @@ impl MemTableFlusher {
             })
             .await
     }
-}
-
-/// Transpose PQ codes in a batch from row-major to column-major layout.
-///
-/// The storage format expects PQ codes to be transposed for efficient distance computation.
-fn transpose_pq_batch(
-    batch: &arrow_array::RecordBatch,
-    pq_code_len: usize,
-) -> Result<arrow_array::RecordBatch> {
-    use arrow_array::FixedSizeListArray;
-    use arrow_array::cast::AsArray;
-    use arrow_schema::Field;
-    use lance_core::ROW_ID;
-    use lance_index::vector::PQ_CODE_COLUMN;
-    use lance_index::vector::pq::storage::transpose;
-    use std::sync::Arc;
-
-    let row_ids = batch
-        .column_by_name(ROW_ID)
-        .ok_or_else(|| Error::io("Missing _rowid column in partition batch"))?;
-
-    let pq_codes = batch
-        .column_by_name(PQ_CODE_COLUMN)
-        .ok_or_else(|| Error::io("Missing __pq_code column in partition batch"))?;
-
-    let pq_codes_fsl = pq_codes.as_fixed_size_list();
-    let codes_flat = pq_codes_fsl
-        .values()
-        .as_primitive::<arrow_array::types::UInt8Type>();
-
-    // Transpose from row-major to column-major
-    let transposed = transpose(codes_flat, pq_code_len, batch.num_rows());
-    // Use non-nullable inner field to match the schema
-    let inner_field = Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false));
-    let transposed_fsl = Arc::new(
-        FixedSizeListArray::try_new(inner_field, pq_code_len as i32, Arc::new(transposed), None)
-            .map_err(|e| Error::io(format!("Failed to create transposed PQ array: {}", e)))?,
-    );
-
-    arrow_array::RecordBatch::try_new(batch.schema(), vec![row_ids.clone(), transposed_fsl])
-        .map_err(|e| Error::io(format!("Failed to create transposed batch: {}", e)))
 }
 
 /// Message to trigger flush of a frozen memtable to Lance storage.
@@ -998,7 +902,7 @@ mod tests {
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry so preprocessed data path is used
-        let registry = IndexStore::from_configs(&index_configs, 100_000, 8).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, 100_000).unwrap();
         memtable.set_indexes(registry);
 
         let frag_id = memtable
@@ -1069,14 +973,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flusher_with_ivf_pq_index() {
-        use super::super::super::index::{IndexStore, IvfPqIndexConfig};
+    async fn test_flusher_with_hnsw_index() {
+        use super::super::super::index::IndexStore;
         use crate::index::DatasetIndexExt;
         use arrow_array::{FixedSizeListArray, Float32Array};
-        use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::vector::ivf::storage::IvfModel;
-        use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
-        use lance_index::vector::pq::PQBuildParams;
         use lance_linalg::distance::DistanceType;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -1091,12 +991,8 @@ mod tests {
         // Claim shard
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
-        // Create schema with vector column
-        // Use 300 vectors to satisfy PQ training requirement (min 256)
         let vector_dim = 8;
         let num_vectors = 300;
-        let num_partitions = 4;
-        let num_sub_vectors = 2;
 
         let vector_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1110,67 +1006,22 @@ mod tests {
             ),
         ]));
 
-        // Generate random vectors for training and testing
+        // Generate random-ish vectors.
         let vectors: Vec<f32> = (0..num_vectors * vector_dim)
             .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
             .collect();
         let vectors_array = Float32Array::from(vectors);
 
-        // Train IVF centroids using KMeans
-        let kmeans_params = KMeansParams::new(None, 10, 1, DistanceType::L2);
-        let kmeans = train_kmeans::<arrow_array::types::Float32Type>(
-            &vectors_array,
-            kmeans_params,
-            vector_dim,
-            num_partitions,
-            num_vectors, // sample_size
-        )
-        .unwrap();
-
-        // Create centroids as FixedSizeListArray
-        let centroids_flat = kmeans
-            .centroids
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("Centroids should be Float32Array")
-            .clone();
-        let centroids_fsl =
-            FixedSizeListArray::try_new_from_values(centroids_flat, vector_dim as i32).unwrap();
-
-        let ivf_model = IvfModel::new(centroids_fsl, None);
-
-        // Train PQ codebook
-        let vectors_fsl =
-            FixedSizeListArray::try_new_from_values(vectors_array.clone(), vector_dim as i32)
-                .unwrap();
-        let pq_params = PQBuildParams::new(num_sub_vectors, 8);
-        let pq = pq_params.build(&vectors_fsl, DistanceType::L2).unwrap();
-
-        // Create index config (field_id = 1 for vector column)
-        let index_configs = vec![MemIndexConfig::IvfPq(Box::new(IvfPqIndexConfig {
-            name: "vector_ivf_pq".to_string(),
-            field_id: 1,
-            column: "vector".to_string(),
-            ivf_model: ivf_model.clone(),
-            pq: pq.clone(),
-            distance_type: DistanceType::L2,
-        }))];
-
-        // Create MemTable with vector schema
-        let mut memtable = MemTable::new(vector_schema.clone(), 1, vec![]).unwrap();
-
-        // Set up in-memory index registry
-        let mut registry = IndexStore::from_configs(&index_configs, 100_000, 8).unwrap();
-
-        // Also need to add the IVF-PQ index to the registry for preprocessing
-        registry.add_ivf_pq(
-            "vector_ivf_pq".to_string(),
-            1, // field_id for vector column
+        // Create HNSW index config (field_id = 1 for vector column)
+        let index_configs = vec![MemIndexConfig::hnsw(
+            "vector_hnsw".to_string(),
+            1,
             "vector".to_string(),
-            ivf_model,
-            pq,
             DistanceType::L2,
-        );
+        )];
+
+        let mut memtable = MemTable::new(vector_schema.clone(), 1, vec![]).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, num_vectors).unwrap();
         memtable.set_indexes(registry);
 
         // Create test batch with vectors
@@ -1219,77 +1070,7 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
 
         assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].name, "vector_ivf_pq");
-
-        // Create a query vector (use first vector from the dataset)
-        let query_vector: Vec<f32> = (0..vector_dim)
-            .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
-            .collect();
-        let query_array = Float32Array::from(query_vector);
-
-        // Verify ANN query returns correct results
-        let batch = dataset
-            .scan()
-            .nearest("vector", &query_array, 10)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        // Should return 10 nearest neighbors
-        assert_eq!(batch.num_rows(), 10);
-
-        // Verify distances are non-negative and sorted in ascending order (nearest first)
-        let distance_col = batch
-            .column_by_name("_distance")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap();
-        assert!(
-            distance_col.value(0) >= 0.0,
-            "First distance should be non-negative"
-        );
-        for i in 1..10 {
-            assert!(
-                distance_col.value(i - 1) <= distance_col.value(i),
-                "Distances should be sorted: {} > {}",
-                distance_col.value(i - 1),
-                distance_col.value(i)
-            );
-        }
-
-        // Verify returned IDs are valid (within range 0..num_vectors)
-        let id_col = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        for i in 0..10 {
-            let id = id_col.value(i);
-            assert!(
-                id >= 0 && id < num_vectors as i32,
-                "ID {} should be in range [0, {})",
-                id,
-                num_vectors
-            );
-        }
-
-        // Verify the query plan uses the IVF-PQ index
-        let mut scan = dataset.scan();
-        scan.nearest("vector", &query_array, 10).unwrap();
-        let plan = scan.create_plan().await.unwrap();
-        crate::utils::test::assert_plan_node_equals(
-            plan,
-            "ProjectionExec: expr=[id@2 as id, vector@3 as vector, _distance@0 as _distance]
-  Take: ...
-    CoalesceBatchesExec: ...
-      SortExec: TopK...
-        ANNSubIndex: name=vector_ivf_pq, k=10, deltas=1, metric=L2
-          ANNIvfPartition: ...deltas=1",
-        )
-        .await
-        .unwrap();
+        assert_eq!(indices[0].name, "vector_hnsw");
     }
 
     #[tokio::test]
@@ -1328,7 +1109,7 @@ mod tests {
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry
-        let registry = IndexStore::from_configs(&index_configs, 100_000, 8).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, 100_000).unwrap();
         memtable.set_indexes(registry);
 
         // Create test batch with text data

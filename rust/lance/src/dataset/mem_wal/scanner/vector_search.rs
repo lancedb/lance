@@ -80,6 +80,14 @@ pub struct LsmVectorSearchPlanner {
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
     distance_type: lance_linalg::distance::DistanceType,
+    /// Refine factor applied to the base-table KNN scan.
+    ///
+    /// `None` (default): no refine — base distances may be approximate
+    /// (e.g. when the base table is indexed with IVF-PQ). `Some(n)`: fetch
+    /// `k * n` candidates and re-rank with exact distances using the
+    /// original vectors. Set this to make cross-source distance comparison
+    /// across the LSM merge fully exact.
+    base_table_refine_factor: Option<u32>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -106,7 +114,21 @@ impl LsmVectorSearchPlanner {
             bloom_filters: Vec::new(),
             vector_column,
             distance_type,
+            base_table_refine_factor: None,
         }
+    }
+
+    /// Enable base-table refine.
+    ///
+    /// When set, the base-table arm of the KNN plan asks the scanner for
+    /// `k * factor` candidates and re-ranks them with exact distances. This
+    /// is useful when the base table uses an approximate index (IVF-PQ) and
+    /// you need exact distances for cross-source merging in the LSM scan.
+    ///
+    /// Default: disabled (base table returns approximate distances).
+    pub fn with_base_table_refine_factor(mut self, factor: u32) -> Self {
+        self.base_table_refine_factor = Some(factor);
+        self
     }
 
     /// Add a bloom filter for staleness detection.
@@ -224,8 +246,14 @@ impl LsmVectorSearchPlanner {
                 scanner.nearest(&self.vector_column, query_vector, k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
-                // fast_search: only search indexed data (memtables cover unindexed)
+                // fast_search: only search indexed data (memtables cover unindexed).
                 scanner.fast_search();
+                // Optional: re-rank base-table candidates with exact distances so
+                // they are directly comparable to MemTable / flushed-MemTable
+                // distances in the cross-source merge.
+                if let Some(factor) = self.base_table_refine_factor {
+                    scanner.refine(factor);
+                }
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {

@@ -17,9 +17,13 @@ use super::storage::VectorStore;
 
 pub mod builder;
 pub mod index;
+pub mod online;
 
 pub use builder::HNSW;
 pub use index::HNSWIndex;
+pub use online::{
+    OnlineGraphBuilderNode, OnlineHnswBottomView, OnlineHnswBuilder, OnlineHnswLevelView,
+};
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -59,7 +63,7 @@ impl Default for HnswMetadata {
 ///
 /// # NOTE
 /// The results are not ordered.
-fn select_neighbors_heuristic(
+pub(crate) fn select_neighbors_heuristic(
     storage: &impl VectorStore,
     candidates: &[OrderedNode],
     k: usize,

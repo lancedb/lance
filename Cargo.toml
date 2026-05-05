@@ -53,6 +53,7 @@ categories = [
 rust-version = "1.91.0"
 
 [workspace.dependencies]
+arc-swap = "1.7"
 libc = "0.2.176"
 lance = { version = "=7.0.0-beta.3", path = "./rust/lance", default-features = false }
 lance-arrow = { version = "=7.0.0-beta.3", path = "./rust/lance-arrow" }

@@ -638,8 +638,6 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                         .unwrap_or(default_config.max_memtable_size),
                                     max_memtable_rows: default_config.max_memtable_rows,
                                     max_memtable_batches: default_config.max_memtable_batches,
-                                    ivf_index_partition_capacity_safety_factor: default_config
-                                        .ivf_index_partition_capacity_safety_factor,
                                     async_index_buffer_rows: default_config.async_index_buffer_rows,
                                     async_index_interval: default_config.async_index_interval,
                                     manifest_scan_batch_size: default_config
