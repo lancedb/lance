@@ -724,7 +724,10 @@ impl WalAppender {
             2,
         ));
         let (writer_epoch, manifest) = manifest_store.claim_epoch(shard_spec_id).await?;
-        let position_hint = manifest.wal_entry_position_last_seen.saturating_add(1);
+        let position_hint = manifest
+            .wal_entry_position_last_seen
+            .max(manifest.replay_after_wal_entry_position)
+            .saturating_add(1);
         Ok(Self::with_claimed_epoch(
             object_store,
             base_path,

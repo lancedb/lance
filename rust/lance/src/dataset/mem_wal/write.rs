@@ -721,9 +721,12 @@ fn now_millis() -> u64 {
 /// into the freshly-built MemTable. Updates any in-memory indexes attached to
 /// the MemTable so replayed rows are immediately searchable.
 ///
-/// Returns the highest WAL position replayed, or `None` if there were no
-/// entries to replay (fresh shard with no prior writes, or the manifest is
-/// already caught up with the WAL tip).
+/// Returns the WAL position the next `WalAppender::append` should use — i.e.
+/// one past the highest replayed position, or the original start position if
+/// the loop found nothing (we proved that position is empty by getting
+/// `None` back from the tailer). The caller can pass this directly to
+/// `WalAppender::seed_next_position` unconditionally so the first post-open
+/// append skips its own discovery probe.
 ///
 /// Aborts with an error if any replayed entry's `writer_epoch` is strictly
 /// greater than `our_epoch` — that indicates a successor writer claimed the
@@ -735,7 +738,7 @@ async fn replay_memtable_from_wal(
     our_epoch: u64,
     manifest: &ShardManifest,
     memtable: &mut MemTable,
-) -> Result<Option<u64>> {
+) -> Result<u64> {
     // Fresh shards (no flushes yet) start replay at position 0; otherwise
     // start one past the last covered position. Distinguishing "no flushes"
     // from "flushed up to position 0" requires `flushed_generations` since
@@ -746,13 +749,18 @@ async fn replay_memtable_from_wal(
         manifest.replay_after_wal_entry_position.saturating_add(1)
     };
 
+    // The MemTable is always freshly built before this function runs, so
+    // any existing BatchStore entries can only have come from this replay
+    // pass. We index everything in `[0, batch_count)` at the end.
+    debug_assert_eq!(memtable.batch_count(), 0);
+
     let tailer = WalTailer::new(object_store, base_path, shard_id);
-    let batches_before = memtable.batch_count();
-    let mut highest_replayed: Option<u64> = None;
     let mut position = start_position;
 
     loop {
         match tailer.read_entry(position).await? {
+            // The first NotFound proves the WAL tip is at `position`, which
+            // is the next write position to hand back.
             None => break,
             Some(entry) => {
                 if entry.writer_epoch > our_epoch {
@@ -764,7 +772,6 @@ async fn replay_memtable_from_wal(
                 if !entry.batches.is_empty() {
                     memtable.insert_batches_only(entry.batches).await?;
                 }
-                highest_replayed = Some(position);
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
                         "WAL position overflow during replay for shard {}",
@@ -781,10 +788,10 @@ async fn replay_memtable_from_wal(
     // persist; this rebuilds them from the WAL.
     if let Some(indexes) = memtable.indexes_arc() {
         let batches_after = memtable.batch_count();
-        if batches_after > batches_before {
+        if batches_after > 0 {
             let store = memtable.batch_store();
-            let mut stored: Vec<StoredBatch> = Vec::with_capacity(batches_after - batches_before);
-            for pos in batches_before..batches_after {
+            let mut stored: Vec<StoredBatch> = Vec::with_capacity(batches_after);
+            for pos in 0..batches_after {
                 if let Some(s) = store.get(pos) {
                     stored.push(s.clone());
                 }
@@ -797,7 +804,7 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    Ok(highest_replayed)
+    Ok(position)
 }
 
 /// Shared state for writer operations.
@@ -1143,17 +1150,24 @@ impl ShardWriter {
         );
 
         // Create WAL appender (owns object store, epoch, and position
-        // state). Seed the appender's stats hint from the manifest so
-        // `wal_stats().next_wal_entry_position` reflects the post-recovery
-        // cursor immediately on reopen instead of reading 0 until the
-        // first append has discovered the true tip.
+        // state). Seed the appender's stats hint from the higher of the
+        // manifest's two cursors: `replay_after_wal_entry_position` is
+        // updated authoritatively at every MemTable flush, while
+        // `wal_entry_position_last_seen` is a best-effort hint that may
+        // lag behind. Either can lead the other depending on which was
+        // updated last, so take the max (then +1) to get the most
+        // accurate post-recovery cursor for `wal_stats()`.
+        let position_hint_seed = manifest
+            .wal_entry_position_last_seen
+            .max(manifest.replay_after_wal_entry_position)
+            .saturating_add(1);
         let wal_appender = Arc::new(WalAppender::with_claimed_epoch(
             object_store.clone(),
             base_path.clone(),
             shard_id,
             manifest_store.clone(),
             epoch,
-            manifest.wal_entry_position_last_seen.saturating_add(1),
+            position_hint_seed,
         ));
 
         // Create WAL flusher backed by the shared appender.
@@ -1254,10 +1268,11 @@ impl ShardWriter {
         // generation. Each entry's writer_epoch is checked against ours; an
         // entry with a strictly greater epoch indicates a successor writer
         // claimed the shard between our `claim_epoch` and replay, so we
-        // abort the open with a fence error. After replay, seed the
-        // appender's next-position counter so the first put doesn't pay the
-        // lazy-discovery probe cost.
-        let last_replayed = replay_memtable_from_wal(
+        // abort the open with a fence error. The replay walked the tailer
+        // up to the WAL tip, so we hand the discovered next-write position
+        // straight to the appender — its first append skips the
+        // discover_next_position probe entirely.
+        let next_wal_position = replay_memtable_from_wal(
             object_store.clone(),
             base_path.clone(),
             shard_id,
@@ -1266,12 +1281,10 @@ impl ShardWriter {
             &mut memtable,
         )
         .await?;
-        if let Some(last) = last_replayed {
-            wal_flusher
-                .wal_appender()
-                .seed_next_position(last.saturating_add(1))
-                .await;
-        }
+        wal_flusher
+            .wal_appender()
+            .seed_next_position(next_wal_position)
+            .await;
 
         let state = Arc::new(RwLock::new(WriterState {
             memtable,
