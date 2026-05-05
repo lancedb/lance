@@ -19,16 +19,22 @@ pub struct PluginTokenizer {
     /// The loaded plugin library (shared across clones)
     library: Arc<TokenizerPluginLibrary>,
 
-    /// Configuration string for creating factories (format defined by plugin)
+    /// Configuration string for creating factories (format defined by plugin).
+    /// Retained alongside `factory` for diagnostics (`Debug`) and so that a
+    /// future API for re-binding the factory has the original input on hand.
     config: String,
 
-    /// Cached factory for repeated tokenization (lazily initialized).
+    /// Eagerly-built factory shared across `Clone`s.
     ///
-    /// Wrapped in `Arc` because every `OwnedPluginTokenizerInstance` we hand
-    /// out keeps an `Arc<OwnedPluginFactory>` back-reference to prevent the
-    /// C-side factory from being destroyed while a tokenizer/stream derived
-    /// from it is still alive.
-    cached_factory: Option<Arc<OwnedPluginFactory>>,
+    /// `PluginTokenizer::new` constructs the factory up front so a malformed
+    /// config surfaces as `Err` from `params.build()` rather than a panic
+    /// from the first `token_stream_*` call. Wrapped in `Arc` because every
+    /// `OwnedPluginTokenizerInstance` we hand out keeps an
+    /// `Arc<OwnedPluginFactory>` back-reference to prevent the C-side
+    /// factory from being destroyed while a tokenizer/stream derived from
+    /// it is still alive, and `Clone` shares this same `Arc` so cloned
+    /// tokenizers (one per FTS worker) reuse the same C-side factory.
+    factory: Arc<OwnedPluginFactory>,
 }
 
 impl PluginTokenizer {
@@ -45,7 +51,7 @@ impl PluginTokenizer {
         Ok(Self {
             library,
             config,
-            cached_factory: Some(Arc::new(factory)),
+            factory: Arc::new(factory),
         })
     }
 
@@ -58,12 +64,7 @@ impl PluginTokenizer {
     }
 
     fn create_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
-        let stream = PluginTokenStreamAdapter::new(
-            &mut self.cached_factory,
-            &self.library,
-            &self.config,
-            text,
-        );
+        let stream = PluginTokenStreamAdapter::new(&self.factory, text);
         BoxTokenStream::new(stream)
     }
 }
@@ -81,7 +82,7 @@ impl Clone for PluginTokenizer {
         Self {
             library: Arc::clone(&self.library),
             config: self.config.clone(),
-            cached_factory: self.cached_factory.as_ref().map(Arc::clone),
+            factory: Arc::clone(&self.factory),
         }
     }
 }
@@ -130,13 +131,30 @@ impl Tokenizer for PluginTokenizer {
 /// memory — the FTS worker `worker_memory_limit` budget assumes streamed
 /// tokenization, and built-in tokenizers behave the same way.
 ///
+/// # Panic policy
+///
 /// Plugin failures (factory/instance/stream creation, or `next_token`
 /// returning a negative error code) panic out of the adapter rather than
-/// silently truncating the stream. A truncated stream would index/search the
+/// silently truncating the stream. A truncated stream would index/search a
 /// document as if it had only the tokens emitted before the error, which
-/// silently corrupts FTS results. Panicking is fail-loud: it propagates up the
-/// FTS worker as a task failure that the build pipeline must surface, so a
-/// misbehaving plugin cannot persist incorrect index contents.
+/// silently corrupts FTS results.
+///
+/// The same adapter backs both indexing (`token_stream_for_doc`) and search
+/// (`token_stream_for_search`), so the panic policy applies to **both**
+/// paths:
+///
+/// - During an index build, the panic surfaces as an FTS worker task
+///   failure and aborts the build job. This is preferable to writing an
+///   index whose contents disagree with what the user configured.
+/// - During a search, the panic surfaces inside the query worker handling
+///   the request. The query fails (rather than returning silently
+///   truncated results) and the worker recovers per the host's task-panic
+///   policy.
+///
+/// In both cases the trade-off is "fail loud" over "silently produce
+/// inconsistent results". The host `LanceTokenizer` trait does not expose a
+/// `Result`-returning token-stream API today, so adapters cannot propagate
+/// these errors as `Err` — see `document_tokenizer::LanceTokenizer`.
 ///
 /// `OwnedPluginTokenStream` itself owns its parent tokenizer instance (via
 /// `Arc`) and the input text (as `String`), so we don't need to keep them
@@ -148,38 +166,17 @@ struct PluginTokenStreamAdapter {
 }
 
 impl PluginTokenStreamAdapter {
-    fn new(
-        cached_factory: &mut Option<Arc<OwnedPluginFactory>>,
-        library: &Arc<TokenizerPluginLibrary>,
-        config: &str,
-        text: &str,
-    ) -> Self {
-        // Lazily create and cache the factory. A failure here is treated as a
-        // hard error: the plugin is misconfigured (bad config string, etc.)
-        // and silently returning an empty stream would mask the misconfig.
-        //
-        // Note: this adapter is invoked from inside an FTS worker, so any
-        // panic here surfaces as a worker task failure and aborts the entire
-        // FTS build job. That trade-off is intentional — the alternative
-        // (silently truncating or skipping a document) would produce an
-        // index whose contents disagree with what the user configured.
-        if cached_factory.is_none() {
-            let factory =
-                OwnedPluginFactory::new(Arc::clone(library), config).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to create plugin factory: {} \
-                         (this aborts the entire FTS build job)",
-                        e
-                    )
-                });
-            *cached_factory = Some(Arc::new(factory));
-        }
-        let factory = cached_factory.as_ref().unwrap();
-
+    fn new(factory: &Arc<OwnedPluginFactory>, text: &str) -> Self {
+        // The factory is built eagerly in `PluginTokenizer::new`, so the only
+        // failure modes left here come from `create_tokenizer` /
+        // `create_stream`. The adapter is reached from both
+        // `token_stream_for_doc` (indexing) and `token_stream_for_search`
+        // (queries), so any panic below aborts the in-flight task in either
+        // path. See the type-level docs above for the rationale.
         let instance = factory.create_tokenizer().unwrap_or_else(|e| {
             panic!(
                 "failed to create plugin tokenizer instance: {} \
-                 (this aborts the entire FTS build job)",
+                 (the in-flight indexing or search task is aborted)",
                 e
             )
         });
@@ -188,7 +185,7 @@ impl PluginTokenStreamAdapter {
             .unwrap_or_else(|e| {
                 panic!(
                     "failed to create plugin token stream: {} \
-                 (this aborts the entire FTS build job)",
+                 (the in-flight indexing or search task is aborted)",
                     e
                 )
             });
@@ -229,7 +226,7 @@ impl TokenStream for PluginTokenStreamAdapter {
                             panic!(
                                 "Plugin returned token with invalid UTF-8 text: {} \
                                  (the plugin ABI requires UTF-8; \
-                                 this aborts the entire FTS build job)",
+                                 the in-flight indexing or search task is aborted)",
                                 e
                             )
                         })
@@ -250,13 +247,13 @@ impl TokenStream for PluginTokenStreamAdapter {
             }
             NextTokenResult::Error(code, msg) => {
                 // Fail loud: a partial token stream would corrupt FTS results
-                // (some tokens indexed, others silently dropped). This aborts
-                // the entire FTS build job, which is preferable to silently
-                // writing an index that disagrees with the configured
-                // tokenizer.
+                // (some tokens indexed, others silently dropped). The
+                // in-flight indexing or search task aborts, which is
+                // preferable to silently emitting tokens that disagree with
+                // the configured tokenizer.
                 panic!(
                     "Plugin tokenizer error during tokenization (code: {}): {} \
-                     (this aborts the entire FTS build job)",
+                     (the in-flight indexing or search task is aborted)",
                     code, msg
                 );
             }

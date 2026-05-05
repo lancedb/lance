@@ -76,11 +76,33 @@ fn verify_plugin_compat(plugin: *const CTokenizerPlugin, path: &Path) -> Result<
     validate_vtable(p, path)
 }
 
+/// Number of required callbacks in `CTokenizerPlugin`. Bumping this without
+/// also extending the `required` table in `validate_vtable` (or vice versa)
+/// is caught at compile time by the size assertion below.
+const REQUIRED_VTABLE_CALLBACKS: usize = 10;
+
+// `CTokenizerPlugin` is `#[repr(C)]` and its fields are
+// `Option<unsafe extern "C" fn(...)>`, each of which is one
+// pointer-sized word thanks to the function-pointer niche optimization.
+// If a new field is added to the struct without updating
+// `REQUIRED_VTABLE_CALLBACKS` and the `required` table in
+// `validate_vtable`, this assertion fires at compile time and the loader
+// won't build, so a NULL function pointer in the new slot can't slip
+// past validation at runtime.
+const _: () = {
+    assert!(
+        std::mem::size_of::<CTokenizerPlugin>()
+            == REQUIRED_VTABLE_CALLBACKS * std::mem::size_of::<usize>(),
+        "CTokenizerPlugin layout changed; update REQUIRED_VTABLE_CALLBACKS and \
+         the `required` table in validate_vtable to cover every callback"
+    );
+};
+
 /// Reject plugin vtables that are missing any required callback. Returning
 /// `Err` here keeps the failure on the user-input boundary instead of letting
 /// a NULL function pointer crash the host the first time it is dereferenced.
 fn validate_vtable(p: &CTokenizerPlugin, path: &Path) -> Result<()> {
-    let required: [(&str, bool); 10] = [
+    let required: [(&str, bool); REQUIRED_VTABLE_CALLBACKS] = [
         ("api_version", p.api_version.is_some()),
         ("create_factory", p.create_factory.is_some()),
         ("destroy_factory", p.destroy_factory.is_some()),
@@ -558,12 +580,18 @@ impl OwnedPluginFactory {
 
 impl Drop for OwnedPluginFactory {
     fn drop(&mut self) {
-        // Exclusive access in Drop, so `get_mut` is sufficient and avoids the
-        // poisoning check entirely.
+        // `get_mut` is sufficient for exclusive access (we own the only
+        // reference here), but it still surfaces a `PoisonError` if a prior
+        // panic dropped the lock guard. Recovering the inner pointer through
+        // `into_inner()` lets us still invoke `destroy_factory` instead of
+        // double-panicking inside `Drop` — which during unwind would escalate
+        // to `abort`. Plugin-fault recovery is otherwise unsupported (see
+        // `mod.rs`); this only avoids turning a single plugin panic into a
+        // process abort.
         let factory_ptr = *self
             .factory
             .get_mut()
-            .expect("plugin factory mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             self.library.destroy_factory(factory_ptr);
         }
@@ -692,10 +720,14 @@ impl OwnedPluginTokenizerInstance {
 
 impl Drop for OwnedPluginTokenizerInstance {
     fn drop(&mut self) {
+        // Same rationale as `OwnedPluginFactory::drop`: recover the
+        // pointer through `into_inner()` if the lock is poisoned so we
+        // can still call `destroy_tokenizer` instead of double-panicking
+        // during unwind.
         let tokenizer_ptr = *self
             .tokenizer
             .get_mut()
-            .expect("plugin tokenizer mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             self.library.destroy_tokenizer(tokenizer_ptr);
         }
@@ -718,9 +750,16 @@ pub struct OwnedPluginTokenStream {
 // SAFETY: `next_token` takes `&mut self`, so the borrow checker already
 // guarantees exclusive access — no per-stream Mutex is needed. The struct
 // merely holds a raw pointer alongside Arc-counted owners, so the auto
-// Send/Sync impls would fall through if not for the raw pointer.
+// Send impl would fall through if not for the raw pointer; we re-add it
+// manually. FTS workers move a stream into a worker task, which is the
+// only sharing pattern this type currently supports.
+//
+// `Sync` is *not* asserted: the wrapper exposes only `&mut self` access
+// today, so concurrent shared use is not a real shape. If a `&self`
+// method is added later (e.g. a "peek next token" probe), Sync would
+// need fresh review to confirm the underlying plugin call is reentrant
+// from multiple threads against the same stream handle.
 unsafe impl Send for OwnedPluginTokenStream {}
-unsafe impl Sync for OwnedPluginTokenStream {}
 
 impl OwnedPluginTokenStream {
     pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
