@@ -30,6 +30,51 @@ pub struct TokenizerPluginLibrary {
 unsafe impl Send for TokenizerPluginLibrary {}
 unsafe impl Sync for TokenizerPluginLibrary {}
 
+/// Verify that a freshly returned plugin pointer is compatible with the
+/// `CTokenizerPlugin` layout this crate was built against.
+///
+/// The check order matters: `api_version` MUST be read and compared before
+/// touching any other field. The plugin may have been compiled against a
+/// shorter / older vtable layout, so reading the full struct up front
+/// could be an out-of-bounds read against the plugin's actual memory.
+/// `api_version` is, by contract, the first field of every vtable
+/// revision, so reading just that one field is always safe.
+fn verify_plugin_compat(plugin: *const CTokenizerPlugin, path: &Path) -> Result<()> {
+    if plugin.is_null() {
+        return Err(Error::invalid_input(format!(
+            "tokenizer plugin {:?} returned null plugin interface",
+            path
+        )));
+    }
+
+    // Read only the first field. `Option<unsafe extern "C" fn() -> u32>`
+    // has the same single-pointer layout as the bare function pointer,
+    // so this dereferences exactly the bytes of `api_version` and no
+    // more.
+    let api_version_fn = unsafe {
+        let api_version_ptr = plugin as *const Option<unsafe extern "C" fn() -> u32>;
+        *api_version_ptr
+    };
+    let api_version_fn = api_version_fn.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "tokenizer plugin {:?} has NULL api_version callback",
+            path
+        ))
+    })?;
+    let api_version = unsafe { api_version_fn() };
+    if api_version != PLUGIN_API_VERSION {
+        return Err(Error::invalid_input(format!(
+            "tokenizer plugin {:?} has incompatible API version {} (expected {})",
+            path, api_version, PLUGIN_API_VERSION
+        )));
+    }
+
+    // API version matches the layout we were compiled against — it is
+    // now safe to read the rest of the vtable.
+    let p = unsafe { &*plugin };
+    validate_vtable(p, path)
+}
+
 /// Reject plugin vtables that are missing any required callback. Returning
 /// `Err` here keeps the failure on the user-input boundary instead of letting
 /// a NULL function pointer crash the host the first time it is dereferenced.
@@ -80,28 +125,7 @@ impl TokenizerPluginLibrary {
             })?;
 
         let plugin = unsafe { get_plugin() };
-        if plugin.is_null() {
-            return Err(Error::invalid_input(format!(
-                "tokenizer plugin {:?} returned null plugin interface",
-                path
-            )));
-        }
-
-        // Validate that the plugin's vtable has every required callback.
-        // A broken or older-ABI plugin can leave fields as NULL; calling
-        // a NULL function pointer would crash the host process. Reject
-        // such plugins here as user input errors instead.
-        let p = unsafe { &*plugin };
-        validate_vtable(p, path)?;
-
-        // Safe: validated above.
-        let api_version = unsafe { (p.api_version.unwrap())() };
-        if api_version != PLUGIN_API_VERSION {
-            return Err(Error::invalid_input(format!(
-                "tokenizer plugin {:?} has incompatible API version {} (expected {})",
-                path, api_version, PLUGIN_API_VERSION
-            )));
-        }
+        verify_plugin_compat(plugin, path)?;
 
         Ok(Arc::new(Self {
             _library: library,
@@ -713,5 +737,70 @@ mod tests {
                 err
             );
         }
+    }
+
+    /// API version mismatch must be detected before any other vtable
+    /// field is read. Reading the rest of the vtable first risks an
+    /// out-of-bounds access against a plugin built with a smaller /
+    /// older `CTokenizerPlugin` layout. The test sets a vtable whose
+    /// `api_version` returns the wrong number AND has a missing
+    /// callback; the version error must surface first.
+    #[test]
+    fn test_verify_plugin_compat_checks_api_version_before_vtable() {
+        unsafe extern "C" fn wrong_api_version() -> u32 {
+            PLUGIN_API_VERSION + 999
+        }
+        let mut vtable = full_vtable();
+        vtable.api_version = Some(wrong_api_version);
+        // Also clear an unrelated callback. If `validate_vtable` ran
+        // before the version check, the "missing callback" message
+        // would surface instead of the version mismatch.
+        vtable.next_token = None;
+
+        let path = Path::new("/test/plugin.so");
+        let err = verify_plugin_compat(&vtable as *const _, path)
+            .expect_err("incompatible API version must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("incompatible API version"),
+            "version mismatch must be reported before vtable validation, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("next_token"),
+            "vtable validation must not run before the version check, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_verify_plugin_compat_rejects_null_api_version() {
+        let mut vtable = full_vtable();
+        vtable.api_version = None;
+        let err = verify_plugin_compat(&vtable as *const _, Path::new("/test/plugin.so"))
+            .expect_err("NULL api_version must be rejected");
+        assert!(
+            err.to_string().contains("NULL api_version callback"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_verify_plugin_compat_rejects_null_plugin_pointer() {
+        let err = verify_plugin_compat(std::ptr::null(), Path::new("/test/plugin.so"))
+            .expect_err("null plugin pointer must be rejected");
+        assert!(
+            err.to_string().contains("null plugin interface"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_verify_plugin_compat_accepts_valid_vtable() {
+        let vtable = full_vtable();
+        verify_plugin_compat(&vtable as *const _, Path::new("/test/plugin.so"))
+            .expect("matching API version with full vtable should pass");
     }
 }
