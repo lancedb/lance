@@ -10,8 +10,8 @@ use libloading::Library;
 use snafu::location;
 
 use super::ffi::{
-    CError, CStringRef, CToken, CTokenizerPlugin, GetPluginFn, LanceTokenStream, LanceTokenizer,
-    LanceTokenizerFactory, ENTRY_POINT_SYMBOL, PLUGIN_API_VERSION,
+    CError, CStringRef, CToken, CTokenizerPlugin, ENTRY_POINT_SYMBOL, GetPluginFn,
+    LanceTokenStream, LanceTokenizer, LanceTokenizerFactory, PLUGIN_API_VERSION,
 };
 
 pub struct TokenizerPluginLibrary {

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use serial_test::serial;
 use tantivy::tokenizer::TokenStream;
 
