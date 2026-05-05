@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lance_core::Result;
-use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
+use lance_tokenizer::{BoxTokenStream, Token, TokenStream};
 
 use super::ffi::CToken;
 use super::loader::{NextTokenResult, OwnedPluginFactory, TokenizerPluginLibrary};
@@ -68,6 +68,16 @@ impl Clone for PluginTokenizer {
             config: self.config.clone(),
             cached_factory: None,
         }
+    }
+}
+
+impl std::fmt::Debug for PluginTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginTokenizer")
+            .field("plugin", &self.library.name())
+            .field("version", &self.library.version())
+            .field("config", &self.config)
+            .finish()
     }
 }
 

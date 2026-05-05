@@ -499,21 +499,17 @@ impl InvertedIndexParams {
             let config = self.tokenizer_plugin_config.as_ref().ok_or_else(|| {
                 Error::invalid_input(
                     "base_tokenizer is 'plugin' but tokenizer_plugin_config is not set.",
-                    location!(),
                 )
             })?;
 
             // Check if the plugin file exists before attempting to load
             let path = Path::new(plugin_path);
             if !path.exists() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "tokenizer plugin library not found: {:?}. \
+                return Err(Error::invalid_input(format!(
+                    "tokenizer plugin library not found: {:?}. \
                          Please ensure the file exists and the path is correct.",
-                        plugin_path
-                    ),
-                    location!(),
-                ));
+                    plugin_path
+                )));
             }
 
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;

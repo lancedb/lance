@@ -9,11 +9,11 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::tokenizer::plugin::{PluginTokenizer, TokenizerPluginLibrary};
+use lance_tokenizer::TokenStream;
 use libloading::Library;
 use serial_test::serial;
-use tantivy::tokenizer::TokenStream;
 
 static PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PLUGIN_LIBRARY: OnceLock<Library> = OnceLock::new();
