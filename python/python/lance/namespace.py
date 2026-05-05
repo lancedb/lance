@@ -20,6 +20,8 @@ from lance_namespace import (
     AlterTableAddColumnsResponse,
     AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse,
+    AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse,
     AlterTableDropColumnsRequest,
     AlterTableDropColumnsResponse,
     AlterTransactionRequest,
@@ -77,6 +79,8 @@ from lance_namespace import (
     MergeInsertIntoTableRequest,
     MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
+    RefreshMaterializedViewRequest,
+    RefreshMaterializedViewResponse,
     RegisterTableRequest,
     RegisterTableResponse,
     RenameTableRequest,
@@ -788,6 +792,20 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.alter_table_drop_columns(request.model_dump())
         return AlterTableDropColumnsResponse.from_dict(response_dict)
 
+    def alter_table_backfill_columns(
+        self, request: AlterTableBackfillColumnsRequest
+    ) -> AlterTableBackfillColumnsResponse:
+        """Trigger an async backfill job for a computed column."""
+        response_dict = self._inner.alter_table_backfill_columns(request.model_dump())
+        return AlterTableBackfillColumnsResponse.from_dict(response_dict)
+
+    def refresh_materialized_view(
+        self, request: RefreshMaterializedViewRequest
+    ) -> RefreshMaterializedViewResponse:
+        """Trigger an async materialized view refresh."""
+        response_dict = self._inner.refresh_materialized_view(request.model_dump())
+        return RefreshMaterializedViewResponse.from_dict(response_dict)
+
     # Table tag operations
 
     def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
@@ -1336,6 +1354,20 @@ class RestNamespace(LanceNamespace):
         """Drop columns from a table."""
         response_dict = self._inner.alter_table_drop_columns(request.model_dump())
         return AlterTableDropColumnsResponse.from_dict(response_dict)
+
+    def alter_table_backfill_columns(
+        self, request: AlterTableBackfillColumnsRequest
+    ) -> AlterTableBackfillColumnsResponse:
+        """Trigger an async backfill job for a computed column."""
+        response_dict = self._inner.alter_table_backfill_columns(request.model_dump())
+        return AlterTableBackfillColumnsResponse.from_dict(response_dict)
+
+    def refresh_materialized_view(
+        self, request: RefreshMaterializedViewRequest
+    ) -> RefreshMaterializedViewResponse:
+        """Trigger an async materialized view refresh."""
+        response_dict = self._inner.refresh_materialized_view(request.model_dump())
+        return RefreshMaterializedViewResponse.from_dict(response_dict)
 
     # Table tag operations
 
