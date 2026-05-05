@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Reference tokenizer plugin used by the lance-index integration tests, and the
+//! canonical sample for users authoring their own plugins.
+//!
+//! This crate implements the Lance tokenizer plugin C ABI defined in
+//! `include/lance_tokenizer_plugin.h`: a whitespace tokenizer with optional
+//! lowercase conversion plus a few hooks (`error_after_n_tokens`,
+//! `emit_invalid_utf8`) used to exercise the host's error-propagation paths.
+//!
+//! To build your own plugin, copy this file's structure into a new crate with
+//! `crate-type = ["cdylib"]` and replace the `Tokenizer` / `TokenStream`
+//! implementations. See `tokenizer_plugin_integration.rs` in the parent crate
+//! for end-to-end usage examples.
+
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +62,7 @@ impl Default for LanceStringRef {
 /// Error information returned by plugin functions.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct Error {
+pub struct LanceError {
     pub message: LanceStringRef,
 }
 
@@ -65,13 +78,14 @@ pub struct LanceToken {
 #[repr(C)]
 pub struct LanceTokenizerPlugin {
     pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory: unsafe extern "C" fn(LanceStringRef, *mut Error) -> *mut c_void,
+    pub create_factory: unsafe extern "C" fn(LanceStringRef, *mut LanceError) -> *mut c_void,
     pub destroy_factory: unsafe extern "C" fn(*mut c_void),
-    pub create_tokenizer: unsafe extern "C" fn(*mut c_void, *mut Error) -> *mut c_void,
+    pub create_tokenizer: unsafe extern "C" fn(*mut c_void, *mut LanceError) -> *mut c_void,
     pub destroy_tokenizer: unsafe extern "C" fn(*mut c_void),
-    pub create_stream: unsafe extern "C" fn(*mut c_void, LanceStringRef, *mut Error) -> *mut c_void,
+    pub create_stream:
+        unsafe extern "C" fn(*mut c_void, LanceStringRef, *mut LanceError) -> *mut c_void,
     pub destroy_stream: unsafe extern "C" fn(*mut c_void),
-    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken, *mut Error) -> i32,
+    pub next_token: unsafe extern "C" fn(*mut c_void, *mut LanceToken, *mut LanceError) -> i32,
     pub name: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
 }
@@ -195,7 +209,7 @@ impl Tokenizer {
 const SIMULATED_ERROR_CODE: i32 = -100;
 
 impl TokenStream {
-    fn next(&mut self, token: &mut LanceToken, error: *mut Error) -> i32 {
+    fn next(&mut self, token: &mut LanceToken, error: *mut LanceError) -> i32 {
         // Check if we should simulate an error
         if let Some(limit) = self.error_after_n_tokens {
             if self.tokens_produced >= limit {
@@ -252,7 +266,7 @@ unsafe extern "C" fn api_version() -> u32 {
 /// The lifetime must outlive the plugin call, so it lives in static storage.
 static REJECT_CONFIG_MSG: &str = "test plugin: simulated config rejection";
 
-unsafe extern "C" fn create_factory(config: LanceStringRef, error: *mut Error) -> *mut c_void {
+unsafe extern "C" fn create_factory(config: LanceStringRef, error: *mut LanceError) -> *mut c_void {
     let config_str = config.as_str();
 
     // Simulate a plugin that detects a malformed config and refuses to build
@@ -277,7 +291,10 @@ unsafe extern "C" fn destroy_factory(factory: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_tokenizer(factory: *mut c_void, _error: *mut Error) -> *mut c_void {
+unsafe extern "C" fn create_tokenizer(
+    factory: *mut c_void,
+    _error: *mut LanceError,
+) -> *mut c_void {
     if factory.is_null() {
         return ptr::null_mut();
     }
@@ -297,7 +314,7 @@ unsafe extern "C" fn destroy_tokenizer(tokenizer: *mut c_void) {
 unsafe extern "C" fn create_stream(
     tokenizer: *mut c_void,
     text: LanceStringRef,
-    _error: *mut Error,
+    _error: *mut LanceError,
 ) -> *mut c_void {
     if tokenizer.is_null() {
         return ptr::null_mut();
@@ -327,7 +344,7 @@ unsafe extern "C" fn destroy_stream(stream: *mut c_void) {
 unsafe extern "C" fn next_token(
     stream: *mut c_void,
     token: *mut LanceToken,
-    error: *mut Error,
+    error: *mut LanceError,
 ) -> i32 {
     if stream.is_null() || token.is_null() {
         return -1;

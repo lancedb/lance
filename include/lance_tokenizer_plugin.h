@@ -20,9 +20,9 @@ typedef struct LanceStringRef {
 
 /// Error information returned by plugin functions.
 /// The message is valid until the next call on the same object or until destruction.
-typedef struct Error {
+typedef struct LanceError {
     LanceStringRef message;
-} Error;
+} LanceError;
 
 typedef struct LanceToken {
     /// Start and end byte offsets in the original text (UTF-8)
@@ -61,7 +61,7 @@ typedef struct LanceTokenizerPlugin {
     ///               Plugins may use any format (JSON, YAML, custom DSL, etc.).
     /// @param error Output parameter for error details (may be NULL if not needed)
     /// @return Factory handle, or NULL on error
-    LanceTokenizerFactory* (*create_factory)(LanceStringRef config, Error* error);
+    LanceTokenizerFactory* (*create_factory)(LanceStringRef config, LanceError* error);
 
     /// Destroy a factory and free its resources.
     ///
@@ -74,7 +74,7 @@ typedef struct LanceTokenizerPlugin {
     /// @param factory Factory handle
     /// @param error Output parameter for error details (may be NULL if not needed)
     /// @return Tokenizer handle, or NULL on error
-    LanceTokenizer* (*create_tokenizer)(LanceTokenizerFactory* factory, Error* error);
+    LanceTokenizer* (*create_tokenizer)(LanceTokenizerFactory* factory, LanceError* error);
 
     /// Destroy a tokenizer and free its resources.
     ///
@@ -88,7 +88,7 @@ typedef struct LanceTokenizerPlugin {
     /// @param text Text to tokenize (UTF-8)
     /// @param error Output parameter for error details (may be NULL if not needed)
     /// @return Stream handle, or NULL on error
-    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, LanceStringRef text, Error* error);
+    LanceTokenStream* (*create_stream)(LanceTokenizer* tokenizer, LanceStringRef text, LanceError* error);
 
     /// Destroy a token stream and free its resources.
     ///
@@ -101,7 +101,7 @@ typedef struct LanceTokenizerPlugin {
     /// @param token Output parameter - filled with token data if a token is available
     /// @param error Output parameter for error details (may be NULL if not needed)
     /// @return 1 if a token was produced, 0 if no more tokens, negative on error
-    int32_t (*next_token)(LanceTokenStream* stream, LanceToken* token, Error* error);
+    int32_t (*next_token)(LanceTokenStream* stream, LanceToken* token, LanceError* error);
 
     /// Get the plugin name.
     ///

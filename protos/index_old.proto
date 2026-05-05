@@ -49,7 +49,10 @@ message InvertedIndexDetails {
 
   // Configuration string passed to the tokenizer plugin when creating a factory.
   // The format is defined by the plugin implementation (e.g., JSON, YAML).
-  // This field is REQUIRED when tokenizer_plugin_library is set, because the
-  // representation of "empty" config varies by serialization format (e.g., "{}" for JSON, "" for plain text).
+  // The build path enforces that this field is set whenever tokenizer_plugin_library
+  // is set, and rejects a missing value with a descriptive error. The field is
+  // declared optional in proto3 because the representation of "empty" config varies
+  // by serialization format (e.g., "{}" for JSON, "" for plain text), so the caller
+  // must supply the format-appropriate value rather than relying on a proto default.
   optional string tokenizer_plugin_config = 13;
 }

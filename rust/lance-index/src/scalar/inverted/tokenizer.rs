@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::{Error, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -126,17 +126,14 @@ pub struct InvertedIndexParams {
     /// When set, the plugin will be loaded and used instead of built-in tokenizers.
     /// Requires the `tokenizer-plugin` feature.
     ///
-    /// The path is absolutized on serialize/deserialize so a relative path
-    /// is not interpreted against an arbitrary CWD when the index is later
-    /// reopened by a different process. `write_metadata` writes params
-    /// through `serde_json::to_string`, so the absolutization must happen
-    /// at the serde layer (the proto-conversion absolutization alone is
-    /// insufficient).
-    #[serde(
-        default,
-        serialize_with = "serialize_plugin_path",
-        deserialize_with = "deserialize_plugin_path"
-    )]
+    /// The value is always absolute by the time it lands in this field: the
+    /// `plugin()` builder absolutizes user input at construction time, and the
+    /// serde deserializer absolutizes any relative path it reads back (e.g.,
+    /// from JSON written by an older version of this code, or by an external
+    /// producer). Serialization itself is a pure pass-through, so repeated
+    /// `serde_json::to_string` calls on the same params are idempotent and do
+    /// not depend on the current working directory.
+    #[serde(default, deserialize_with = "deserialize_plugin_path")]
     pub(crate) tokenizer_plugin_library: Option<String>,
 
     /// Configuration string for the tokenizer plugin (format defined by plugin).
@@ -160,14 +157,10 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
-            // Defense in depth: even if `InvertedIndexParams` was constructed
-            // outside the `plugin()` builder (e.g. serde deserialization, raw
-            // field access in tests), persist an absolute path so the index
-            // remains usable when reopened from a different CWD.
-            tokenizer_plugin_library: params
-                .tokenizer_plugin_library
-                .as_ref()
-                .map(|p| absolutize_plugin_path(p.clone())),
+            // The value is already absolute at this point — the `plugin()`
+            // builder and the serde deserializer both absolutize on the way
+            // in, so we just clone through.
+            tokenizer_plugin_library: params.tokenizer_plugin_library.clone(),
             tokenizer_plugin_config: params.tokenizer_plugin_config.clone(),
         })
     }
@@ -389,6 +382,23 @@ impl InvertedIndexParams {
     /// persisted path would be re-interpreted against the CWD of whichever
     /// process later reopens the index, which can fail to find the plugin or,
     /// worse, silently load a different file with the same relative name.
+    ///
+    /// # Filter chain
+    ///
+    /// Tokens emitted by the plugin flow through the same post-processing
+    /// chain as the built-in tokenizers. Defaults applied to plugin output:
+    ///
+    /// - `max_token_length = Some(40)` — drops tokens longer than 40 bytes
+    /// - `lower_case = true` — ASCII-lowercases every token
+    /// - `stem = true` — applies the configured language stemmer
+    /// - `remove_stop_words = true` — drops language-specific stop words
+    /// - `ascii_folding = true` — folds Latin diacritics to ASCII
+    ///
+    /// If the plugin already case-normalizes, stems, or strips diacritics on
+    /// its side, set the corresponding option to `false` (e.g.
+    /// `params.lower_case(false).stem(false).ascii_folding(false)`); otherwise
+    /// the filter chain will apply on top of what the plugin produced and may
+    /// surprise users who expect the plugin to be the sole source of truth.
     pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(absolutize_plugin_path(library_path));
@@ -482,8 +492,6 @@ impl InvertedIndexParams {
     fn build_plugin_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         #[cfg(feature = "tokenizer-plugin")]
         {
-            use std::path::Path;
-
             use plugin::PluginTokenizer;
 
             let plugin_path = self.tokenizer_plugin_library.as_ref().ok_or_else(|| {
@@ -498,16 +506,13 @@ impl InvertedIndexParams {
                 )
             })?;
 
-            // Check if the plugin file exists before attempting to load
-            let path = Path::new(plugin_path);
-            if !path.exists() {
-                return Err(Error::invalid_input(format!(
-                    "tokenizer plugin library not found: {:?}. \
-                         Please ensure the file exists and the path is correct.",
-                    plugin_path
-                )));
-            }
-
+            // No `Path::exists()` precheck: `libloading::Library::new` (wrapped
+            // by `TokenizerPluginLibrary::load`) already produces a precise
+            // error for the underlying cause — file not found, missing
+            // dependent shared library, permission denied, missing symbols,
+            // ABI version mismatch — and an extra existence check would only
+            // flatten those into a generic "file not found" while introducing
+            // a TOCTOU window with `Library::new`.
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;
             Ok(TextAnalyzer::builder(tokenizer).dynamic())
         }
@@ -519,24 +524,22 @@ impl InvertedIndexParams {
     }
 }
 
-/// Custom serializer that absolutizes the plugin library path. `write_metadata`
-/// serializes the whole `InvertedIndexParams` as JSON, so relying on the
-/// proto-only `TryFrom` absolutization would let relative paths slip through
-/// the JSON metadata path and break index reopen from a different CWD.
-fn serialize_plugin_path<S: Serializer>(
-    path: &Option<String>,
-    ser: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    path.as_ref()
-        .map(|p| absolutize_plugin_path(p.clone()))
-        .serialize(ser)
-}
-
-/// Custom deserializer that absolutizes the plugin library path on read.
+/// Deserializer hook that absolutizes a plugin library path on read.
+///
 /// Callers may construct `InvertedIndexParams` from JSON produced by another
-/// process (or another version of this code) where the path is still
-/// relative; resolving here keeps the in-memory representation consistent
-/// with what the `plugin()` builder would produce.
+/// process (or by an older version of this code) where the path is still
+/// relative; resolving here keeps the in-memory value consistent with what the
+/// `plugin()` builder would produce, regardless of the producer's CWD.
+///
+/// Serialization is intentionally a pass-through: absolutization happens once,
+/// at the input boundary, so repeated `serde_json::to_string` calls on the
+/// same params are idempotent and do not drift if the process `chdir`s
+/// between calls.
+///
+/// Non-UTF-8 path components survive `Path::to_string_lossy` as U+FFFD
+/// replacement characters; in that case `Library::new` will fail with "file
+/// not found" when the plugin is loaded, which surfaces a clear error at the
+/// boundary where it can be reported to the user.
 fn deserialize_plugin_path<'de, D: Deserializer<'de>>(
     deser: D,
 ) -> std::result::Result<Option<String>, D::Error> {
@@ -577,6 +580,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::InvertedIndexParams;
+    use serial_test::serial;
 
     #[test]
     fn test_build_only_fields_are_not_serialized() {
@@ -627,12 +631,13 @@ mod tests {
     }
 
     /// `write_metadata` persists `InvertedIndexParams` through `serde_json`,
-    /// so the JSON serialize path — not just the proto-conversion path —
-    /// must absolutize the plugin library path. Otherwise an index built
-    /// with a relative path becomes unusable when reopened from a different
-    /// CWD.
+    /// so the JSON it produces must already carry an absolute plugin library
+    /// path; otherwise an index built with a relative path becomes unusable
+    /// when reopened from a different CWD. Absolutization happens at the
+    /// `plugin()` builder boundary, so serialization itself only needs to
+    /// faithfully echo what the struct holds.
     #[test]
-    fn test_plugin_path_absolutized_on_json_serialize() {
+    fn test_plugin_path_is_absolute_in_serialized_json() {
         let params = InvertedIndexParams::default()
             .plugin("relative/dir/lib.so".to_string(), "{}".to_string());
         let json = serde_json::to_value(&params).unwrap();
@@ -644,6 +649,44 @@ mod tests {
             std::path::Path::new(serialized_path).is_absolute(),
             "JSON-serialized plugin path must be absolute, got {:?}",
             serialized_path
+        );
+    }
+
+    /// Serialization must be a pure pass-through of the in-memory value:
+    /// repeating it on the same params (without rebuilding) must produce
+    /// byte-identical JSON, even if the process CWD has changed between
+    /// calls. This guards against regressing to the previous design where
+    /// `serialize` re-evaluated `current_dir()` and could write a different
+    /// absolute path on each call.
+    ///
+    /// `chdir` is process-wide, so this test must run serially with any other
+    /// test that depends on CWD (notably the builder-side absolutization
+    /// tests).
+    #[test]
+    #[serial(plugin_cwd)]
+    fn test_plugin_path_serialize_is_idempotent_across_chdir() {
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let _guard = CwdGuard(std::env::current_dir().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let params = InvertedIndexParams::default()
+            .plugin("relative/dir/lib.so".to_string(), "{}".to_string());
+        let first = serde_json::to_string(&params).unwrap();
+
+        // chdir somewhere else, then serialize again. The output must not
+        // change — the absolute path was baked in at builder time.
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let second = serde_json::to_string(&params).unwrap();
+
+        assert_eq!(
+            first, second,
+            "serialize must not re-evaluate current_dir; output drifted across chdir"
         );
     }
 

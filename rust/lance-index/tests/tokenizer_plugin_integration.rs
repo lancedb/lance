@@ -748,9 +748,26 @@ fn test_factory_caching_behavior() {
     );
 }
 
+/// Cloning a `PluginTokenizer` must share the eagerly-built factory rather
+/// than recreating it on the clone's first tokenization.
+///
+/// Why this matters:
+///
+/// 1. `PluginTokenizer::new` validates the user's config eagerly so a bad
+///    config surfaces as an `Err` from `params.build()` rather than a panic
+///    deep inside an FTS worker. If `clone()` reset the cache to `None`,
+///    every clone would re-run `create_factory` on first use — and any
+///    failure there can only be reported as a panic from the tokenization
+///    adapter, defeating the eager-validation guarantee.
+/// 2. `OwnedPluginFactory` is `Sync` and serializes `create_tokenizer`
+///    through an internal `Mutex`, so multiple clones can safely share one
+///    factory instance.
+/// 3. FTS build creates one tokenizer per worker via `Clone`. Recreating the
+///    plugin's (often heavyweight) factory N times per build burns CPU for
+///    no benefit.
 #[test]
 #[serial(plugin_tests)]
-fn test_clone_creates_separate_factory() {
+fn test_clone_shares_cached_factory() {
     reset_factory_create_count();
 
     let plugin_path = get_plugin_path();
@@ -772,39 +789,36 @@ fn test_clone_creates_separate_factory() {
         let mut stream = tokenizer.token_stream_for_doc("hello");
         while stream.advance() {}
     }
-    let count_after = get_factory_create_count();
     assert_eq!(
-        count_after - count_before,
+        get_factory_create_count() - count_before,
         0,
         "Original tokenizer should reuse its cached factory across tokenizations"
     );
 
-    // Clone resets the cached factory; the clone lazily re-creates one on
-    // first use so each thread/worker gets its own instance.
+    // Cloning must Arc-share the cached factory, not reset it.
     let mut cloned = tokenizer.clone();
     let count_before = get_factory_create_count();
     {
         let mut stream = cloned.token_stream_for_doc("world");
         while stream.advance() {}
     }
-    let count_after = get_factory_create_count();
     assert_eq!(
-        count_after - count_before,
-        1,
-        "Cloned tokenizer should create its own factory on first tokenization"
+        get_factory_create_count() - count_before,
+        0,
+        "Cloned tokenizer must share the original's factory; create_factory \
+         should not be called again on first use"
     );
 
-    // Original tokenizer should still use its cached factory
+    // The original is unaffected by the clone using the shared factory.
     let count_before = get_factory_create_count();
     {
         let mut stream = tokenizer.token_stream_for_doc("test");
         while stream.advance() {}
     }
-    let count_after = get_factory_create_count();
     assert_eq!(
-        count_after - count_before,
+        get_factory_create_count() - count_before,
         0,
-        "Original tokenizer should still use cached factory"
+        "Original tokenizer should still use the shared cached factory"
     );
 }
 

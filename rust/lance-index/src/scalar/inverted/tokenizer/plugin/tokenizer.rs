@@ -49,19 +49,6 @@ impl PluginTokenizer {
         })
     }
 
-    pub fn from_library(
-        library: Arc<TokenizerPluginLibrary>,
-        config: impl Into<String>,
-    ) -> Result<Self> {
-        let config = config.into();
-        let factory = OwnedPluginFactory::new(Arc::clone(&library), &config)?;
-        Ok(Self {
-            library,
-            config,
-            cached_factory: Some(Arc::new(factory)),
-        })
-    }
-
     pub fn plugin_name(&self) -> &str {
         self.library.name()
     }
@@ -83,10 +70,18 @@ impl PluginTokenizer {
 
 impl Clone for PluginTokenizer {
     fn clone(&self) -> Self {
+        // Share the cached factory across clones rather than recreating it
+        // lazily on first use. `OwnedPluginFactory` is `Sync` and serializes
+        // `create_tokenizer` calls through an internal `Mutex`, so multiple
+        // clones may safely tokenize concurrently against the same factory.
+        // Cloning the `Arc` also preserves the early-failure guarantee from
+        // `PluginTokenizer::new`: a clone derived from a successfully built
+        // tokenizer cannot panic later from a deferred factory rebuild that
+        // fails.
         Self {
             library: Arc::clone(&self.library),
             config: self.config.clone(),
-            cached_factory: None,
+            cached_factory: self.cached_factory.as_ref().map(Arc::clone),
         }
     }
 }

@@ -108,8 +108,13 @@ impl TokenizerPluginLibrary {
         let path = path.as_ref();
 
         let library = unsafe { Library::new(path) }.map_err(|e| {
+            // The underlying libloading error already names the precise cause
+            // (file not found, missing dependent .so, permission denied, etc.).
+            // Pass it through verbatim and add a hint pointing the user at the
+            // path they configured.
             Error::invalid_input(format!(
-                "failed to load tokenizer plugin from {:?}: {}",
+                "failed to load tokenizer plugin from {:?}: {}. \
+                 Verify the path is correct and the file is readable.",
                 path, e
             ))
         })?;
