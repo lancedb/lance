@@ -283,7 +283,7 @@ impl TokenizerPluginLibrary {
 /// ```compile_fail
 /// # use lance_index::scalar::inverted::tokenizer::plugin::loader::PluginFactory;
 /// fn use_after_factory_drop<'a>(factory: PluginFactory<'a>) {
-///     let inst = factory.create_tokenizer().unwrap();
+///     let mut inst = factory.create_tokenizer().unwrap();
 ///     drop(factory);
 ///     let _ = inst.create_stream("hi");
 /// }
@@ -299,8 +299,25 @@ impl TokenizerPluginLibrary {
 /// fn temp_input_outlives_stream<'a>(
 ///     factory: &'a PluginFactory<'a>,
 /// ) -> PluginTokenStream<'a> {
-///     let inst = factory.create_tokenizer().unwrap();
+///     let mut inst = factory.create_tokenizer().unwrap();
 ///     inst.create_stream(&format!("temp {}", 1)).unwrap()
+/// }
+/// ```
+///
+/// Holding two streams from the same instance simultaneously must also be
+/// rejected. The plugin C ABI requires the previous stream to be destroyed
+/// before another is created from the same tokenizer; on the borrowed wrapper
+/// this is enforced by the borrow checker because `create_stream` takes
+/// `&mut self`, so the second call cannot run while `s1` still borrows
+/// `inst`:
+///
+/// ```compile_fail
+/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::PluginFactory;
+/// fn two_overlapping_streams<'a>(factory: &'a PluginFactory<'a>) {
+///     let mut inst = factory.create_tokenizer().unwrap();
+///     let s1 = inst.create_stream("first").unwrap();
+///     let s2 = inst.create_stream("second").unwrap();
+///     drop((s1, s2));
 /// }
 /// ```
 pub struct PluginFactory<'a> {
@@ -346,7 +363,17 @@ impl<'a> PluginTokenizerInstance<'a> {
     /// and `text`, so the borrow checker rejects dropping either while the
     /// stream is still alive — including the common foot-gun of passing
     /// `&format!(...)` as the input.
-    pub fn create_stream<'b>(&'b self, text: &'b str) -> Result<PluginTokenStream<'b>>
+    ///
+    /// `&mut self` (rather than `&self`) is required so that the plugin ABI
+    /// rule "the previous stream must be destroyed before creating another
+    /// from the same tokenizer" is enforced by the borrow checker: while the
+    /// returned stream is alive it holds the unique borrow of `self`, so a
+    /// second `create_stream` call against the same instance simply fails to
+    /// compile. Plugins are allowed to share scratch state between a tokenizer
+    /// and its single live stream, so two overlapping streams would be a data
+    /// race or use-after-free in the plugin even though the safe wrapper is
+    /// itself sound.
+    pub fn create_stream<'b>(&'b mut self, text: &'b str) -> Result<PluginTokenStream<'b>>
     where
         'a: 'b,
     {
@@ -371,10 +398,15 @@ impl Drop for PluginTokenizerInstance<'_> {
 /// A token stream from a plugin tokenizer. Borrows from the parent
 /// tokenizer instance and the input text — the plugin may zero-copy either,
 /// so dropping either while the stream is alive would be a use-after-free.
+///
+/// The instance is borrowed mutably (via `PhantomData<&'a mut ...>`) so that
+/// the borrow checker also rejects creating a second stream from the same
+/// instance while this one is still alive; see
+/// `PluginTokenizerInstance::create_stream` for the ABI rationale.
 pub struct PluginTokenStream<'a> {
     library: &'a TokenizerPluginLibrary,
     stream: *mut LanceTokenStream,
-    _instance: PhantomData<&'a PluginTokenizerInstance<'a>>,
+    _instance: PhantomData<&'a mut PluginTokenizerInstance<'a>>,
     _text: PhantomData<&'a str>,
 }
 
