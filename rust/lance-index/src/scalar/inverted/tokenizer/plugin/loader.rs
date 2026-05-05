@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use libloading::Library;
-use snafu::location;
 
 use super::ffi::{
     CError, CStringRef, CToken, CTokenizerPlugin, ENTRY_POINT_SYMBOL, GetPluginFn,
@@ -34,43 +33,38 @@ impl TokenizerPluginLibrary {
     pub fn load(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let path = path.as_ref();
 
-        let library = unsafe { Library::new(path) }.map_err(|e| Error::InvalidInput {
-            source: format!("failed to load tokenizer plugin from {:?}: {}", path, e).into(),
-            location: location!(),
+        let library = unsafe { Library::new(path) }.map_err(|e| {
+            Error::invalid_input(format!(
+                "failed to load tokenizer plugin from {:?}: {}",
+                path, e
+            ))
         })?;
 
         let get_plugin: libloading::Symbol<GetPluginFn> =
-            unsafe { library.get(ENTRY_POINT_SYMBOL) }.map_err(|e| Error::InvalidInput {
-                source: format!(
+            unsafe { library.get(ENTRY_POINT_SYMBOL) }.map_err(|e| {
+                Error::invalid_input(format!(
                     "tokenizer plugin {:?} missing entry point '{}': {}",
                     path,
                     String::from_utf8_lossy(ENTRY_POINT_SYMBOL),
                     e
-                )
-                .into(),
-                location: location!(),
+                ))
             })?;
 
         let plugin = unsafe { get_plugin() };
         if plugin.is_null() {
-            return Err(Error::InvalidInput {
-                source: format!("tokenizer plugin {:?} returned null plugin interface", path)
-                    .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "tokenizer plugin {:?} returned null plugin interface",
+                path
+            )));
         }
 
         // Check API version
         let api_version = unsafe { ((*plugin).api_version)() };
         if api_version != PLUGIN_API_VERSION {
-            return Err(Error::InvalidInput {
-                source: format!(
-                    "tokenizer plugin {:?} has incompatible API version {} (expected {})",
-                    path, api_version, PLUGIN_API_VERSION
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "tokenizer plugin {:?} has incompatible API version {} (expected {})",
+                path, api_version, PLUGIN_API_VERSION
+            )));
         }
 
         Ok(Arc::new(Self {
@@ -112,10 +106,10 @@ impl TokenizerPluginLibrary {
             } else {
                 "unknown error".to_string()
             };
-            return Err(Error::InvalidInput {
-                source: format!("failed to create tokenizer factory: {}", error_msg).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "failed to create tokenizer factory: {}",
+                error_msg
+            )));
         }
 
         Ok(PluginFactory {
@@ -142,10 +136,10 @@ impl TokenizerPluginLibrary {
             } else {
                 "unknown error".to_string()
             };
-            return Err(Error::InvalidInput {
-                source: format!("failed to create tokenizer: {}", error_msg).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "failed to create tokenizer: {}",
+                error_msg
+            )));
         }
         Ok(tokenizer)
     }
@@ -170,10 +164,10 @@ impl TokenizerPluginLibrary {
             } else {
                 "unknown error".to_string()
             };
-            return Err(Error::InvalidInput {
-                source: format!("failed to create token stream: {}", error_msg).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "failed to create token stream: {}",
+                error_msg
+            )));
         }
         Ok(stream)
     }
@@ -315,10 +309,10 @@ impl OwnedPluginFactory {
             } else {
                 "unknown error".to_string()
             };
-            return Err(Error::InvalidInput {
-                source: format!("failed to create tokenizer factory: {}", error_msg).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "failed to create tokenizer factory: {}",
+                error_msg
+            )));
         }
 
         Ok(Self { library, factory })
@@ -335,10 +329,10 @@ impl OwnedPluginFactory {
             } else {
                 "unknown error".to_string()
             };
-            return Err(Error::InvalidInput {
-                source: format!("failed to create tokenizer: {}", error_msg).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "failed to create tokenizer: {}",
+                error_msg
+            )));
         }
         Ok(OwnedPluginTokenizerInstance {
             library: Arc::clone(&self.library),
@@ -378,10 +372,10 @@ impl OwnedPluginTokenizerInstance {
             } else {
                 "unknown error".to_string()
             };
-            return Err(Error::InvalidInput {
-                source: format!("failed to create token stream: {}", error_msg).into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input(format!(
+                "failed to create token stream: {}",
+                error_msg
+            )));
         }
         Ok(OwnedPluginTokenStream {
             library: Arc::clone(&self.library),
