@@ -192,10 +192,9 @@ impl TokenizerPluginLibrary {
     }
 
     pub fn create_factory(&self, config: &str) -> Result<PluginFactory<'_>> {
+        let config_ref = CStringRef::from_str(config)?;
         let mut error = CError::default();
-        let factory = unsafe {
-            ((*self.plugin).create_factory.unwrap())(CStringRef::from_str(config), &mut error)
-        };
+        let factory = unsafe { ((*self.plugin).create_factory.unwrap())(config_ref, &mut error) };
 
         if factory.is_null() {
             let error_msg = if error.has_message() {
@@ -252,12 +251,9 @@ impl TokenizerPluginLibrary {
         tokenizer: *mut LanceTokenizer,
         text: &str,
     ) -> Result<*mut LanceTokenStream> {
+        let text_ref = CStringRef::from_str(text)?;
         let mut error = CError::default();
-        let stream = ((*self.plugin).create_stream.unwrap())(
-            tokenizer,
-            CStringRef::from_str(text),
-            &mut error,
-        );
+        let stream = ((*self.plugin).create_stream.unwrap())(tokenizer, text_ref, &mut error);
         if stream.is_null() {
             let error_msg = if error.has_message() {
                 error.message_str().to_string()
@@ -532,10 +528,10 @@ unsafe impl Sync for OwnedPluginFactory {}
 impl OwnedPluginFactory {
     /// Create a new owned factory from a library and config.
     pub fn new(library: Arc<TokenizerPluginLibrary>, config: &str) -> Result<Self> {
+        let config_ref = CStringRef::from_str(config)?;
         let mut error = CError::default();
-        let factory = unsafe {
-            ((*library.plugin).create_factory.unwrap())(CStringRef::from_str(config), &mut error)
-        };
+        let factory =
+            unsafe { ((*library.plugin).create_factory.unwrap())(config_ref, &mut error) };
 
         if factory.is_null() {
             let error_msg = if error.has_message() {
@@ -671,6 +667,17 @@ impl OwnedPluginTokenizerInstance {
         self: &Arc<Self>,
         text: impl Into<String>,
     ) -> Result<OwnedPluginTokenStream> {
+        // Validate the text length up front, before we reserve the
+        // "one active stream per instance" slot. The plugin ABI uses a
+        // u32 length, so a `String` longer than `u32::MAX` bytes cannot
+        // be passed faithfully — silently truncating it would emit a
+        // partial token stream and corrupt FTS results. Doing this
+        // check before reservation also keeps the slot-release logic
+        // below dealing only with failures that genuinely happened
+        // after we took ownership of the slot.
+        let text = text.into();
+        let text_ref = CStringRef::from_str(&text)?;
+
         // Reserve the "one active stream per instance" slot before calling
         // into the plugin. If another stream from this instance is still
         // alive, refuse here — the C ABI explicitly forbids overlapping
@@ -693,7 +700,6 @@ impl OwnedPluginTokenizerInstance {
             this.active_stream.store(false, Ordering::Release);
         };
 
-        let text = text.into();
         let tokenizer_ptr = match self.tokenizer.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -706,11 +712,7 @@ impl OwnedPluginTokenizerInstance {
         };
         let mut error = CError::default();
         let stream = unsafe {
-            ((*self.library.plugin).create_stream.unwrap())(
-                *tokenizer_ptr,
-                CStringRef::from_str(&text),
-                &mut error,
-            )
+            ((*self.library.plugin).create_stream.unwrap())(*tokenizer_ptr, text_ref, &mut error)
         };
         if stream.is_null() {
             let error_msg = if error.has_message() {

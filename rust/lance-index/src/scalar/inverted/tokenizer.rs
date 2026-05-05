@@ -637,6 +637,15 @@ fn deserialize_plugin_path<'de, D: Deserializer<'de>>(
 /// created it; resolving a relative path lazily would either fail to find the
 /// plugin or load a wrong file with the same relative name.
 fn absolutize_plugin_path(library_path: String) -> String {
+    // Pass an empty string through unchanged. `Path::new("")` is otherwise
+    // treated as a relative path, so prepending the CWD would turn `""` into
+    // a directory path and quietly defeat the empty-string check in
+    // `build_plugin_tokenizer`. The downstream check then surfaces a
+    // descriptive "tokenizer_plugin_library is set to an empty string"
+    // error instead of a confusing "is a directory" / dlopen failure.
+    if library_path.is_empty() {
+        return library_path;
+    }
     let path = std::path::Path::new(&library_path);
     if path.is_absolute() {
         return library_path;
@@ -875,5 +884,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `Path::new("")` is treated as a relative path, so a naive
+    /// "prepend CWD if not absolute" implementation would turn an empty
+    /// path into the current directory and silently defeat the
+    /// downstream empty-string check. `absolutize_plugin_path` and the
+    /// `plugin()` builder must keep an empty string empty so the
+    /// `build_plugin_tokenizer` boundary check fires with a clear error.
+    #[test]
+    fn test_plugin_builder_keeps_empty_path_empty() {
+        let params = InvertedIndexParams::default().plugin(String::new(), "{}".to_string());
+        assert_eq!(
+            params.tokenizer_plugin_library.as_deref(),
+            Some(""),
+            "plugin builder must not absolutize an empty library path \
+             into the CWD"
+        );
+    }
+
+    /// Same boundary, reached via JSON deserialization. An external
+    /// producer that hands us `"tokenizer_plugin_library": ""` must not
+    /// have that value rewritten to the reader's CWD by the
+    /// `deserialize_plugin_path` hook.
+    #[test]
+    fn test_plugin_path_deserialize_keeps_empty_string_empty() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "tokenizer_plugin_library".to_string(),
+            serde_json::Value::from(""),
+        );
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            params.tokenizer_plugin_library.as_deref(),
+            Some(""),
+            "deserializer must not absolutize an empty library path \
+             into the reader's CWD"
+        );
     }
 }

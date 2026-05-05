@@ -8,6 +8,8 @@
 use std::borrow::Cow;
 use std::ffi::{c_char, c_void};
 
+use lance_core::{Error, Result};
+
 pub const PLUGIN_API_VERSION: u32 = 1;
 
 /// A reference to a UTF-8 string that provides a zero-copy way to pass strings between Rust and C.
@@ -19,13 +21,39 @@ pub struct CStringRef {
 }
 
 impl CStringRef {
-    /// Create a CStringRef from a Rust string slice.
+    /// Create a `CStringRef` from a Rust string slice, rejecting any input
+    /// that does not fit in the ABI's `u32` length field.
+    ///
+    /// The plugin C ABI encodes string lengths as `u32`, so a Rust `&str`
+    /// longer than `u32::MAX` bytes cannot be passed faithfully. Casting
+    /// `usize` to `u32` would silently wrap and hand the plugin a shorter
+    /// length, which would emit a partial token stream and quietly corrupt
+    /// FTS results — the same failure mode plugin tokenization is otherwise
+    /// designed to fail loud about. `LargeUtf8` columns and unusually large
+    /// plugin configs are the realistic ways to reach this size, so we
+    /// surface the limit as a regular `Err`.
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        Self {
+    pub fn from_str(s: &str) -> Result<Self> {
+        Self::from_str_with_limit(s, u32::MAX)
+    }
+
+    /// Like `from_str`, but with an explicit upper bound on the encoded
+    /// length. Exposed inside the crate so unit tests can exercise the
+    /// rejection path without allocating a real 4 GiB buffer.
+    pub(crate) fn from_str_with_limit(s: &str, limit: u32) -> Result<Self> {
+        if s.len() > limit as usize {
+            return Err(Error::invalid_input(format!(
+                "input is {} bytes; the plugin C ABI uses a u32 length, so \
+                 values larger than {} bytes cannot be passed without \
+                 silently truncating the token stream",
+                s.len(),
+                limit,
+            )));
+        }
+        Ok(Self {
             data: s.as_ptr() as *const c_char,
             length: s.len() as u32,
-        }
+        })
     }
 
     /// Convert to a Rust string, safely handling invalid UTF-8.
@@ -169,13 +197,46 @@ mod tests {
     #[test]
     fn test_cstring_ref_from_str() {
         let s = "hello";
-        let sr = CStringRef::from_str(s);
+        let sr = CStringRef::from_str(s).expect("ascii input must fit");
         assert_eq!(sr.length, 5);
         assert!(!sr.data.is_null());
 
         unsafe {
             assert_eq!(sr.to_string_lossy(), "hello");
         }
+    }
+
+    /// `from_str_with_limit` must reject inputs that would silently wrap
+    /// when cast to the ABI's `u32` length, because the alternative is a
+    /// truncated token stream that quietly corrupts FTS results. The
+    /// limit is parameterized so the test can drive the rejection path
+    /// with a 6-byte string instead of having to allocate 4 GiB.
+    #[test]
+    fn test_cstring_ref_rejects_input_over_u32_len_limit() {
+        let s = "abcdef"; // 6 bytes
+        let err = CStringRef::from_str_with_limit(s, 5)
+            .expect_err("string longer than the limit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("u32 length"),
+            "error must mention the ABI length limit, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("silently truncating"),
+            "error must explain the consequence of accepting it, got: {}",
+            msg
+        );
+    }
+
+    /// At the limit boundary the input must still be accepted — this
+    /// pins the inclusive comparison so a future "off-by-one to make
+    /// the wrap impossible" rewrite can't quietly tighten the contract.
+    #[test]
+    fn test_cstring_ref_accepts_input_at_limit() {
+        let s = "abcde"; // 5 bytes, exactly equals the limit
+        let sr = CStringRef::from_str_with_limit(s, 5).expect("input at the limit must succeed");
+        assert_eq!(sr.length, 5);
     }
 
     #[test]
