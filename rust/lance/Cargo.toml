@@ -210,5 +210,9 @@ harness = false
 name = "mem_wal_read"
 harness = false
 
+[[bench]]
+name = "mem_wal_replay"
+harness = false
+
 [lints]
 workspace = true
