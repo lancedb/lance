@@ -8,7 +8,10 @@ use lance_core::Result;
 use lance_tokenizer::{BoxTokenStream, Token, TokenStream, Tokenizer};
 
 use super::ffi::CToken;
-use super::loader::{NextTokenResult, OwnedPluginFactory, TokenizerPluginLibrary};
+use super::loader::{
+    NextTokenResult, OwnedPluginFactory, OwnedPluginTokenStream, OwnedPluginTokenizerInstance,
+    TokenizerPluginLibrary,
+};
 use crate::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 
 /// PluginTokenizer loads a shared library at runtime and uses its tokenization
@@ -108,12 +111,29 @@ impl Tokenizer for PluginTokenizer {
     }
 }
 
-/// Adapter that implements tantivy's TokenStream trait for plugin streams.
+/// Adapter that implements tantivy's `TokenStream` trait by pulling one token
+/// at a time from a plugin's `next_token` C callback.
+///
+/// The stream is consumed lazily so we never buffer an entire document in
+/// memory — the FTS worker `worker_memory_limit` budget assumes streamed
+/// tokenization, and built-in tokenizers behave the same way.
+///
+/// Plugin failures (factory/instance/stream creation, or `next_token`
+/// returning a negative error code) panic out of the adapter rather than
+/// silently truncating the stream. A truncated stream would index/search the
+/// document as if it had only the tokens emitted before the error, which
+/// silently corrupts FTS results. Panicking is fail-loud: it propagates up the
+/// FTS worker as a task failure that the build pipeline must surface, so a
+/// misbehaving plugin cannot persist incorrect index contents.
+///
+/// Field declaration order matters for `Drop`: `stream` is dropped before
+/// `_instance`, because the C-side stream pointer aliases memory owned by the
+/// tokenizer instance.
 struct PluginTokenStreamAdapter {
     current_token: Token,
-    tokens: Vec<Token>,
-    index: usize,
-    has_error: bool,
+    eof: bool,
+    stream: OwnedPluginTokenStream,
+    _instance: OwnedPluginTokenizerInstance,
 }
 
 impl PluginTokenStreamAdapter {
@@ -123,101 +143,72 @@ impl PluginTokenStreamAdapter {
         config: &str,
         text: &str,
     ) -> Self {
-        let mut tokens = Vec::new();
-        let mut has_error = false;
-
-        // Lazily create and cache the factory
-        let factory = match cached_factory {
-            Some(f) => f,
-            None => match OwnedPluginFactory::new(Arc::clone(library), config) {
-                Ok(f) => {
-                    *cached_factory = Some(f);
-                    cached_factory.as_ref().unwrap()
-                }
-                Err(e) => {
-                    log::error!("Failed to create plugin factory: {}", e);
-                    return Self {
-                        current_token: Token::default(),
-                        tokens,
-                        index: 0,
-                        has_error: true,
-                    };
-                }
-            },
-        };
-
-        // Create tokenizer and stream, then collect all tokens
-        match factory.create_tokenizer() {
-            Ok(tokenizer_instance) => match tokenizer_instance.create_stream(text) {
-                Ok(mut stream) => {
-                    let mut c_token = CToken::default();
-                    loop {
-                        match stream.next_token(&mut c_token) {
-                            NextTokenResult::Token => {
-                                let text = if c_token.text.data.is_null() {
-                                    String::new()
-                                } else {
-                                    unsafe {
-                                        let slice = std::slice::from_raw_parts(
-                                            c_token.text.data as *const u8,
-                                            c_token.text.length as usize,
-                                        );
-                                        String::from_utf8_lossy(slice).into_owned()
-                                    }
-                                };
-
-                                tokens.push(Token {
-                                    offset_from: c_token.offset_from as usize,
-                                    offset_to: c_token.offset_to as usize,
-                                    position: c_token.position as usize,
-                                    text,
-                                    position_length: c_token.position_length as usize,
-                                });
-                            }
-                            NextTokenResult::EndOfStream => {
-                                break;
-                            }
-                            NextTokenResult::Error(code, msg) => {
-                                log::error!(
-                                    "Plugin tokenizer error during tokenization (code: {}): {}",
-                                    code,
-                                    msg
-                                );
-                                has_error = true;
-                                tokens.clear();
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to create plugin token stream: {}", e);
-                    has_error = true;
-                }
-            },
-            Err(e) => {
-                log::error!("Failed to create plugin tokenizer instance: {}", e);
-                has_error = true;
-            }
+        // Lazily create and cache the factory. A failure here is treated as a
+        // hard error: the plugin is misconfigured (bad config string, etc.)
+        // and silently returning an empty stream would mask the misconfig.
+        if cached_factory.is_none() {
+            let factory = OwnedPluginFactory::new(Arc::clone(library), config)
+                .unwrap_or_else(|e| panic!("failed to create plugin factory: {}", e));
+            *cached_factory = Some(factory);
         }
+        let factory = cached_factory.as_ref().unwrap();
+
+        let instance = factory
+            .create_tokenizer()
+            .unwrap_or_else(|e| panic!("failed to create plugin tokenizer instance: {}", e));
+        let stream = instance
+            .create_stream(text)
+            .unwrap_or_else(|e| panic!("failed to create plugin token stream: {}", e));
 
         Self {
             current_token: Token::default(),
-            tokens,
-            index: 0,
-            has_error,
+            eof: false,
+            stream,
+            _instance: instance,
         }
     }
 }
 
 impl TokenStream for PluginTokenStreamAdapter {
     fn advance(&mut self) -> bool {
-        if self.has_error || self.index >= self.tokens.len() {
-            false
-        } else {
-            self.current_token = self.tokens[self.index].clone();
-            self.index += 1;
-            true
+        if self.eof {
+            return false;
+        }
+        let mut c_token = CToken::default();
+        match self.stream.next_token(&mut c_token) {
+            NextTokenResult::Token => {
+                let text = if c_token.text.data.is_null() {
+                    String::new()
+                } else {
+                    unsafe {
+                        let slice = std::slice::from_raw_parts(
+                            c_token.text.data as *const u8,
+                            c_token.text.length as usize,
+                        );
+                        String::from_utf8_lossy(slice).into_owned()
+                    }
+                };
+                self.current_token = Token {
+                    offset_from: c_token.offset_from as usize,
+                    offset_to: c_token.offset_to as usize,
+                    position: c_token.position as usize,
+                    text,
+                    position_length: c_token.position_length as usize,
+                };
+                true
+            }
+            NextTokenResult::EndOfStream => {
+                self.eof = true;
+                false
+            }
+            NextTokenResult::Error(code, msg) => {
+                // Fail loud: a partial token stream would corrupt FTS results
+                // (some tokens indexed, others silently dropped).
+                panic!(
+                    "Plugin tokenizer error during tokenization (code: {}): {}",
+                    code, msg
+                );
+            }
         }
     }
 
@@ -227,90 +218,5 @@ impl TokenStream for PluginTokenStreamAdapter {
 
     fn token_mut(&mut self) -> &mut Token {
         &mut self.current_token
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty_stream() {
-        let mut adapter = PluginTokenStreamAdapter {
-            current_token: Token::default(),
-            tokens: vec![],
-            index: 0,
-            has_error: false,
-        };
-        assert!(!adapter.advance());
-    }
-
-    #[test]
-    fn test_error_flag_prevents_advance() {
-        let mut adapter = PluginTokenStreamAdapter {
-            current_token: Token::default(),
-            tokens: vec![Token {
-                offset_from: 0,
-                offset_to: 5,
-                position: 0,
-                text: "hello".to_string(),
-                position_length: 1,
-            }],
-            index: 0,
-            has_error: true,
-        };
-        assert!(!adapter.advance());
-    }
-
-    #[test]
-    fn test_stream_exhausted() {
-        let mut adapter = PluginTokenStreamAdapter {
-            current_token: Token::default(),
-            tokens: vec![Token {
-                offset_from: 0,
-                offset_to: 5,
-                position: 0,
-                text: "hello".to_string(),
-                position_length: 1,
-            }],
-            index: 1,
-            has_error: false,
-        };
-        assert!(!adapter.advance());
-    }
-
-    #[test]
-    fn test_token_iteration() {
-        let mut adapter = PluginTokenStreamAdapter {
-            current_token: Token::default(),
-            tokens: vec![
-                Token {
-                    offset_from: 0,
-                    offset_to: 5,
-                    position: 0,
-                    text: "hello".to_string(),
-                    position_length: 1,
-                },
-                Token {
-                    offset_from: 6,
-                    offset_to: 11,
-                    position: 1,
-                    text: "world".to_string(),
-                    position_length: 1,
-                },
-            ],
-            index: 0,
-            has_error: false,
-        };
-
-        assert!(adapter.advance());
-        assert_eq!(adapter.token().text, "hello");
-        assert_eq!(adapter.token().position, 0);
-
-        assert!(adapter.advance());
-        assert_eq!(adapter.token().text, "world");
-        assert_eq!(adapter.token().position, 1);
-
-        assert!(!adapter.advance());
     }
 }

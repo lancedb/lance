@@ -29,6 +29,34 @@ pub struct TokenizerPluginLibrary {
 unsafe impl Send for TokenizerPluginLibrary {}
 unsafe impl Sync for TokenizerPluginLibrary {}
 
+/// Reject plugin vtables that are missing any required callback. Returning
+/// `Err` here keeps the failure on the user-input boundary instead of letting
+/// a NULL function pointer crash the host the first time it is dereferenced.
+fn validate_vtable(p: &CTokenizerPlugin, path: &Path) -> Result<()> {
+    let required: [(&str, bool); 10] = [
+        ("api_version", p.api_version.is_some()),
+        ("create_factory", p.create_factory.is_some()),
+        ("destroy_factory", p.destroy_factory.is_some()),
+        ("create_tokenizer", p.create_tokenizer.is_some()),
+        ("destroy_tokenizer", p.destroy_tokenizer.is_some()),
+        ("create_stream", p.create_stream.is_some()),
+        ("destroy_stream", p.destroy_stream.is_some()),
+        ("next_token", p.next_token.is_some()),
+        ("name", p.name.is_some()),
+        ("version", p.version.is_some()),
+    ];
+    for (callback_name, present) in required {
+        if !present {
+            return Err(Error::invalid_input(format!(
+                "tokenizer plugin {:?} missing required callback `{}` \
+                 (NULL function pointer in vtable)",
+                path, callback_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl TokenizerPluginLibrary {
     pub fn load(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let path = path.as_ref();
@@ -58,8 +86,15 @@ impl TokenizerPluginLibrary {
             )));
         }
 
-        // Check API version
-        let api_version = unsafe { ((*plugin).api_version)() };
+        // Validate that the plugin's vtable has every required callback.
+        // A broken or older-ABI plugin can leave fields as NULL; calling
+        // a NULL function pointer would crash the host process. Reject
+        // such plugins here as user input errors instead.
+        let p = unsafe { &*plugin };
+        validate_vtable(p, path)?;
+
+        // Safe: validated above.
+        let api_version = unsafe { (p.api_version.unwrap())() };
         if api_version != PLUGIN_API_VERSION {
             return Err(Error::invalid_input(format!(
                 "tokenizer plugin {:?} has incompatible API version {} (expected {})",
@@ -75,7 +110,7 @@ impl TokenizerPluginLibrary {
 
     pub fn name(&self) -> &str {
         unsafe {
-            let name_ptr = ((*self.plugin).name)();
+            let name_ptr = ((*self.plugin).name.unwrap())();
             if name_ptr.is_null() {
                 "unknown"
             } else {
@@ -86,7 +121,7 @@ impl TokenizerPluginLibrary {
 
     pub fn version(&self) -> &str {
         unsafe {
-            let version_ptr = ((*self.plugin).version)();
+            let version_ptr = ((*self.plugin).version.unwrap())();
             if version_ptr.is_null() {
                 "unknown"
             } else {
@@ -97,8 +132,9 @@ impl TokenizerPluginLibrary {
 
     pub fn create_factory(&self, config: &str) -> Result<PluginFactory<'_>> {
         let mut error = CError::default();
-        let factory =
-            unsafe { ((*self.plugin).create_factory)(CStringRef::from_str(config), &mut error) };
+        let factory = unsafe {
+            ((*self.plugin).create_factory.unwrap())(CStringRef::from_str(config), &mut error)
+        };
 
         if factory.is_null() {
             let error_msg = if error.has_message() {
@@ -120,7 +156,7 @@ impl TokenizerPluginLibrary {
 
     unsafe fn destroy_factory(&self, factory: *mut LanceTokenizerFactory) {
         if !factory.is_null() {
-            ((*self.plugin).destroy_factory)(factory);
+            ((*self.plugin).destroy_factory.unwrap())(factory);
         }
     }
 
@@ -129,7 +165,7 @@ impl TokenizerPluginLibrary {
         factory: *mut LanceTokenizerFactory,
     ) -> Result<*mut LanceTokenizer> {
         let mut error = CError::default();
-        let tokenizer = ((*self.plugin).create_tokenizer)(factory, &mut error);
+        let tokenizer = ((*self.plugin).create_tokenizer.unwrap())(factory, &mut error);
         if tokenizer.is_null() {
             let error_msg = if error.has_message() {
                 error.message_str().to_string()
@@ -146,7 +182,7 @@ impl TokenizerPluginLibrary {
 
     unsafe fn destroy_tokenizer(&self, tokenizer: *mut LanceTokenizer) {
         if !tokenizer.is_null() {
-            ((*self.plugin).destroy_tokenizer)(tokenizer);
+            ((*self.plugin).destroy_tokenizer.unwrap())(tokenizer);
         }
     }
 
@@ -156,8 +192,11 @@ impl TokenizerPluginLibrary {
         text: &str,
     ) -> Result<*mut LanceTokenStream> {
         let mut error = CError::default();
-        let stream =
-            ((*self.plugin).create_stream)(tokenizer, CStringRef::from_str(text), &mut error);
+        let stream = ((*self.plugin).create_stream.unwrap())(
+            tokenizer,
+            CStringRef::from_str(text),
+            &mut error,
+        );
         if stream.is_null() {
             let error_msg = if error.has_message() {
                 error.message_str().to_string()
@@ -174,7 +213,7 @@ impl TokenizerPluginLibrary {
 
     unsafe fn destroy_stream(&self, stream: *mut LanceTokenStream) {
         if !stream.is_null() {
-            ((*self.plugin).destroy_stream)(stream);
+            ((*self.plugin).destroy_stream.unwrap())(stream);
         }
     }
 
@@ -184,7 +223,7 @@ impl TokenizerPluginLibrary {
         token: &mut CToken,
         error: &mut CError,
     ) -> i32 {
-        ((*self.plugin).next_token)(stream, token, error)
+        ((*self.plugin).next_token.unwrap())(stream, token, error)
     }
 }
 
@@ -300,8 +339,9 @@ impl OwnedPluginFactory {
     /// Create a new owned factory from a library and config.
     pub fn new(library: Arc<TokenizerPluginLibrary>, config: &str) -> Result<Self> {
         let mut error = CError::default();
-        let factory =
-            unsafe { ((*library.plugin).create_factory)(CStringRef::from_str(config), &mut error) };
+        let factory = unsafe {
+            ((*library.plugin).create_factory.unwrap())(CStringRef::from_str(config), &mut error)
+        };
 
         if factory.is_null() {
             let error_msg = if error.has_message() {
@@ -322,7 +362,7 @@ impl OwnedPluginFactory {
     pub fn create_tokenizer(&self) -> Result<OwnedPluginTokenizerInstance> {
         let mut error = CError::default();
         let tokenizer =
-            unsafe { ((*self.library.plugin).create_tokenizer)(self.factory, &mut error) };
+            unsafe { ((*self.library.plugin).create_tokenizer.unwrap())(self.factory, &mut error) };
         if tokenizer.is_null() {
             let error_msg = if error.has_message() {
                 unsafe { error.message_str().to_string() }
@@ -360,7 +400,7 @@ impl OwnedPluginTokenizerInstance {
     pub fn create_stream(&self, text: &str) -> Result<OwnedPluginTokenStream> {
         let mut error = CError::default();
         let stream = unsafe {
-            ((*self.library.plugin).create_stream)(
+            ((*self.library.plugin).create_stream.unwrap())(
                 self.tokenizer,
                 CStringRef::from_str(text),
                 &mut error,
@@ -401,7 +441,8 @@ pub struct OwnedPluginTokenStream {
 impl OwnedPluginTokenStream {
     pub fn next_token(&mut self, token: &mut CToken) -> NextTokenResult {
         let mut error = CError::default();
-        let result = unsafe { ((*self.library.plugin).next_token)(self.stream, token, &mut error) };
+        let result =
+            unsafe { ((*self.library.plugin).next_token.unwrap())(self.stream, token, &mut error) };
         if result > 0 {
             NextTokenResult::Token
         } else if result == 0 {
@@ -421,6 +462,106 @@ impl Drop for OwnedPluginTokenStream {
     fn drop(&mut self) {
         unsafe {
             self.library.destroy_stream(self.stream);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_char;
+
+    // Stub callbacks used to populate a "valid" vtable for tests.
+    unsafe extern "C" fn stub_api_version() -> u32 {
+        PLUGIN_API_VERSION
+    }
+    unsafe extern "C" fn stub_create_factory(
+        _config: CStringRef,
+        _error: *mut CError,
+    ) -> *mut LanceTokenizerFactory {
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn stub_destroy_factory(_factory: *mut LanceTokenizerFactory) {}
+    unsafe extern "C" fn stub_create_tokenizer(
+        _factory: *mut LanceTokenizerFactory,
+        _error: *mut CError,
+    ) -> *mut LanceTokenizer {
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn stub_destroy_tokenizer(_tokenizer: *mut LanceTokenizer) {}
+    unsafe extern "C" fn stub_create_stream(
+        _tokenizer: *mut LanceTokenizer,
+        _text: CStringRef,
+        _error: *mut CError,
+    ) -> *mut LanceTokenStream {
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn stub_destroy_stream(_stream: *mut LanceTokenStream) {}
+    unsafe extern "C" fn stub_next_token(
+        _stream: *mut LanceTokenStream,
+        _token: *mut CToken,
+        _error: *mut CError,
+    ) -> i32 {
+        0
+    }
+    unsafe extern "C" fn stub_name() -> *const c_char {
+        std::ptr::null()
+    }
+    unsafe extern "C" fn stub_version() -> *const c_char {
+        std::ptr::null()
+    }
+
+    fn full_vtable() -> CTokenizerPlugin {
+        CTokenizerPlugin {
+            api_version: Some(stub_api_version),
+            create_factory: Some(stub_create_factory),
+            destroy_factory: Some(stub_destroy_factory),
+            create_tokenizer: Some(stub_create_tokenizer),
+            destroy_tokenizer: Some(stub_destroy_tokenizer),
+            create_stream: Some(stub_create_stream),
+            destroy_stream: Some(stub_destroy_stream),
+            next_token: Some(stub_next_token),
+            name: Some(stub_name),
+            version: Some(stub_version),
+        }
+    }
+
+    #[test]
+    fn test_validate_vtable_accepts_full_table() {
+        let vtable = full_vtable();
+        validate_vtable(&vtable, Path::new("/test/plugin.so")).expect("full vtable should pass");
+    }
+
+    /// Every required callback must be flagged when missing. A broken or
+    /// older-ABI plugin can leave individual fields as NULL; calling them
+    /// would crash the host process.
+    #[test]
+    fn test_validate_vtable_rejects_each_missing_callback() {
+        type Clear = fn(&mut CTokenizerPlugin);
+        let path = Path::new("/test/plugin.so");
+        let cases: &[(&str, Clear)] = &[
+            ("api_version", |p| p.api_version = None),
+            ("create_factory", |p| p.create_factory = None),
+            ("destroy_factory", |p| p.destroy_factory = None),
+            ("create_tokenizer", |p| p.create_tokenizer = None),
+            ("destroy_tokenizer", |p| p.destroy_tokenizer = None),
+            ("create_stream", |p| p.create_stream = None),
+            ("destroy_stream", |p| p.destroy_stream = None),
+            ("next_token", |p| p.next_token = None),
+            ("name", |p| p.name = None),
+            ("version", |p| p.version = None),
+        ];
+        for (name, clear) in cases {
+            let mut vtable = full_vtable();
+            clear(&mut vtable);
+            let err = validate_vtable(&vtable, path)
+                .expect_err(&format!("missing `{}` should be rejected", name));
+            assert!(
+                err.to_string().contains(name),
+                "error message should mention the missing callback `{}`, got: {}",
+                name,
+                err
+            );
         }
     }
 }

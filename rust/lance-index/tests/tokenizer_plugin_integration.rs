@@ -369,25 +369,43 @@ fn test_plugin_long_text() {
     assert_eq!(count, 100);
 }
 
+/// Drive the token stream until either it ends or the plugin panics. Returns
+/// the tokens collected before the panic, plus whether a panic occurred. This
+/// proves both:
+///   1. tokenization is streamed (we observe partial results before the panic
+///      reaches us, so the adapter is not buffering the whole document); and
+///   2. plugin errors propagate as panics, so a misbehaving plugin cannot
+///      silently truncate index/search input.
+fn collect_until_panic(tokenizer: &mut PluginTokenizer, text: &str) -> (Vec<String>, bool) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Mutex;
+
+    let collected: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        while stream.advance() {
+            collected.lock().unwrap().push(stream.token().text.clone());
+        }
+    }));
+    (collected.into_inner().unwrap(), result.is_err())
+}
+
 #[test]
 #[serial(plugin_tests)]
 fn test_plugin_error_after_zero_tokens() {
     let plugin_path = get_plugin_path();
-
-    // Configure to error immediately (after 0 tokens)
     let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 0}"#)
         .expect("Failed to create tokenizer");
 
-    // Should produce no tokens due to error
-    let mut stream = tokenizer.token_stream_for_doc("Hello World");
-    let mut count = 0;
-    while stream.advance() {
-        count += 1;
-    }
+    let (tokens, panicked) = collect_until_panic(&mut tokenizer, "Hello World");
 
-    assert_eq!(
-        count, 0,
-        "Should produce no tokens when error occurs at start"
+    assert!(
+        panicked,
+        "Plugin error must surface as a panic so the FTS pipeline can detect it",
+    );
+    assert!(
+        tokens.is_empty(),
+        "no tokens should be observed before the immediate error"
     );
 }
 
@@ -395,46 +413,29 @@ fn test_plugin_error_after_zero_tokens() {
 #[serial(plugin_tests)]
 fn test_plugin_error_after_one_token() {
     let plugin_path = get_plugin_path();
-
-    // Configure to error after 1 token
     let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 1}"#)
         .expect("Failed to create tokenizer");
 
-    // Error discards all tokens
-    let mut stream = tokenizer.token_stream_for_doc("Hello World Test");
-    let mut tokens = Vec::new();
-    while stream.advance() {
-        tokens.push(stream.token().text.clone());
-    }
+    let (tokens, panicked) = collect_until_panic(&mut tokenizer, "Hello World Test");
 
-    assert_eq!(
-        tokens.len(),
-        0,
-        "Should produce no tokens when error occurs"
-    );
+    assert!(panicked, "Plugin error must surface as a panic");
+    // The first token must be observable to the caller before the panic — this
+    // is the streaming contract. Buffered (collect-then-return) implementations
+    // would have lost this token because the error follows it in the stream.
+    assert_eq!(tokens, vec!["Hello"]);
 }
 
 #[test]
 #[serial(plugin_tests)]
 fn test_plugin_error_after_two_tokens() {
     let plugin_path = get_plugin_path();
-
-    // Configure to error after 2 tokens
     let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"error_after_n_tokens": 2}"#)
         .expect("Failed to create tokenizer");
 
-    // Error discards all tokens
-    let mut stream = tokenizer.token_stream_for_doc("one two three four five");
-    let mut tokens = Vec::new();
-    while stream.advance() {
-        tokens.push(stream.token().text.clone());
-    }
+    let (tokens, panicked) = collect_until_panic(&mut tokenizer, "one two three four five");
 
-    assert_eq!(
-        tokens.len(),
-        0,
-        "Should produce no tokens when error occurs"
-    );
+    assert!(panicked, "Plugin error must surface as a panic");
+    assert_eq!(tokens, vec!["one", "two"]);
 }
 
 #[test]
@@ -464,30 +465,20 @@ fn test_plugin_error_not_triggered_when_fewer_tokens() {
 
 #[test]
 #[serial(plugin_tests)]
+#[should_panic(expected = "Plugin tokenizer error during tokenization")]
 fn test_plugin_error_with_inverted_index_params() {
+    // The same fail-loud contract must hold when the plugin is wrapped by the
+    // full InvertedIndexParams pipeline (filter chain + TextTokenizer).
     let plugin_path = get_plugin_path();
-
-    // Test error propagation through InvertedIndexParams interface
     let params = InvertedIndexParams::default().plugin(
         plugin_path.to_string_lossy().to_string(),
         r#"{"error_after_n_tokens": 1}"#.to_string(),
     );
-
     let mut tokenizer = params
         .build()
         .expect("Failed to build tokenizer from params");
-
     let mut stream = tokenizer.token_stream_for_doc("one two three");
-    let mut tokens = Vec::new();
-    while stream.advance() {
-        tokens.push(stream.token().text.clone());
-    }
-
-    assert_eq!(
-        tokens.len(),
-        0,
-        "Error should be propagated through InvertedIndexParams"
-    );
+    while stream.advance() {}
 }
 
 #[test]

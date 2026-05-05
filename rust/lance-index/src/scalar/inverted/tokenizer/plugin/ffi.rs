@@ -116,34 +116,46 @@ pub type LanceTokenizerFactory = c_void;
 pub type LanceTokenizer = c_void;
 pub type LanceTokenStream = c_void;
 
+/// Plugin vtable. All function pointers are nullable (`Option<extern fn>`),
+/// matching the ABI of a C struct that may contain `NULL` for un-implemented
+/// callbacks. The Rust niche optimization guarantees `Option<extern "C" fn>`
+/// has the same layout as `extern "C" fn`. The loader must validate that
+/// every required callback is `Some` before any other code dereferences them.
 #[repr(C)]
 pub struct CTokenizerPlugin {
-    pub api_version: unsafe extern "C" fn() -> u32,
-    pub create_factory:
+    pub api_version: Option<unsafe extern "C" fn() -> u32>,
+    pub create_factory: Option<
         unsafe extern "C" fn(config: CStringRef, error: *mut CError) -> *mut LanceTokenizerFactory,
-    pub destroy_factory: unsafe extern "C" fn(factory: *mut LanceTokenizerFactory),
-    pub create_tokenizer: unsafe extern "C" fn(
-        factory: *mut LanceTokenizerFactory,
-        error: *mut CError,
-    ) -> *mut LanceTokenizer,
-    pub destroy_tokenizer: unsafe extern "C" fn(tokenizer: *mut LanceTokenizer),
-    pub create_stream: unsafe extern "C" fn(
-        tokenizer: *mut LanceTokenizer,
-        text: CStringRef,
-        error: *mut CError,
-    ) -> *mut LanceTokenStream,
-    pub destroy_stream: unsafe extern "C" fn(stream: *mut LanceTokenStream),
+    >,
+    pub destroy_factory: Option<unsafe extern "C" fn(factory: *mut LanceTokenizerFactory)>,
+    pub create_tokenizer: Option<
+        unsafe extern "C" fn(
+            factory: *mut LanceTokenizerFactory,
+            error: *mut CError,
+        ) -> *mut LanceTokenizer,
+    >,
+    pub destroy_tokenizer: Option<unsafe extern "C" fn(tokenizer: *mut LanceTokenizer)>,
+    pub create_stream: Option<
+        unsafe extern "C" fn(
+            tokenizer: *mut LanceTokenizer,
+            text: CStringRef,
+            error: *mut CError,
+        ) -> *mut LanceTokenStream,
+    >,
+    pub destroy_stream: Option<unsafe extern "C" fn(stream: *mut LanceTokenStream)>,
 
     /// Get the next token from the stream.
     /// Returns 1 if a token was produced, 0 if no more tokens, negative on error.
-    pub next_token: unsafe extern "C" fn(
-        stream: *mut LanceTokenStream,
-        token: *mut CToken,
-        error: *mut CError,
-    ) -> i32,
+    pub next_token: Option<
+        unsafe extern "C" fn(
+            stream: *mut LanceTokenStream,
+            token: *mut CToken,
+            error: *mut CError,
+        ) -> i32,
+    >,
 
-    pub name: unsafe extern "C" fn() -> *const c_char,
-    pub version: unsafe extern "C" fn() -> *const c_char,
+    pub name: Option<unsafe extern "C" fn() -> *const c_char>,
+    pub version: Option<unsafe extern "C" fn() -> *const c_char>,
 }
 
 pub type GetPluginFn = unsafe extern "C" fn() -> *const CTokenizerPlugin;
