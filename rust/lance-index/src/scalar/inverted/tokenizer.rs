@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -125,7 +125,18 @@ pub struct InvertedIndexParams {
     /// Path to a tokenizer plugin shared library.
     /// When set, the plugin will be loaded and used instead of built-in tokenizers.
     /// Requires the `tokenizer-plugin` feature.
-    #[serde(default)]
+    ///
+    /// The path is absolutized on serialize/deserialize so a relative path
+    /// is not interpreted against an arbitrary CWD when the index is later
+    /// reopened by a different process. `write_metadata` writes params
+    /// through `serde_json::to_string`, so the absolutization must happen
+    /// at the serde layer (the proto-conversion absolutization alone is
+    /// insufficient).
+    #[serde(
+        default,
+        serialize_with = "serialize_plugin_path",
+        deserialize_with = "deserialize_plugin_path"
+    )]
     pub(crate) tokenizer_plugin_library: Option<String>,
 
     /// Configuration string for the tokenizer plugin (format defined by plugin).
@@ -508,6 +519,30 @@ impl InvertedIndexParams {
     }
 }
 
+/// Custom serializer that absolutizes the plugin library path. `write_metadata`
+/// serializes the whole `InvertedIndexParams` as JSON, so relying on the
+/// proto-only `TryFrom` absolutization would let relative paths slip through
+/// the JSON metadata path and break index reopen from a different CWD.
+fn serialize_plugin_path<S: Serializer>(
+    path: &Option<String>,
+    ser: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    path.as_ref()
+        .map(|p| absolutize_plugin_path(p.clone()))
+        .serialize(ser)
+}
+
+/// Custom deserializer that absolutizes the plugin library path on read.
+/// Callers may construct `InvertedIndexParams` from JSON produced by another
+/// process (or another version of this code) where the path is still
+/// relative; resolving here keeps the in-memory representation consistent
+/// with what the `plugin()` builder would produce.
+fn deserialize_plugin_path<'de, D: Deserializer<'de>>(
+    deser: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deser)?.map(absolutize_plugin_path))
+}
+
 /// Convert a (possibly relative) plugin library path to absolute. This must
 /// happen *before* the path is persisted into the index manifest, because the
 /// process that reopens the index may have a different CWD than the one that
@@ -589,5 +624,52 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
+    }
+
+    /// `write_metadata` persists `InvertedIndexParams` through `serde_json`,
+    /// so the JSON serialize path — not just the proto-conversion path —
+    /// must absolutize the plugin library path. Otherwise an index built
+    /// with a relative path becomes unusable when reopened from a different
+    /// CWD.
+    #[test]
+    fn test_plugin_path_absolutized_on_json_serialize() {
+        let params = InvertedIndexParams::default()
+            .plugin("relative/dir/lib.so".to_string(), "{}".to_string());
+        let json = serde_json::to_value(&params).unwrap();
+        let serialized_path = json
+            .get("tokenizer_plugin_library")
+            .and_then(|v| v.as_str())
+            .expect("serialized JSON should contain plugin path");
+        assert!(
+            std::path::Path::new(serialized_path).is_absolute(),
+            "JSON-serialized plugin path must be absolute, got {:?}",
+            serialized_path
+        );
+    }
+
+    /// Defense in depth: if an external producer hands us JSON with a
+    /// relative plugin path (or an older version of this code wrote one),
+    /// the deserializer must normalize it on read so downstream code never
+    /// sees a CWD-dependent value.
+    #[test]
+    fn test_plugin_path_absolutized_on_json_deserialize() {
+        // Start from a serialized default and inject a relative plugin
+        // path, simulating JSON from an external producer.
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "tokenizer_plugin_library".to_string(),
+            serde_json::Value::from("some/relative/lib.so"),
+        );
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        let stored = params
+            .tokenizer_plugin_library
+            .as_ref()
+            .expect("plugin library path should be set");
+        assert!(
+            std::path::Path::new(stored).is_absolute(),
+            "deserialized plugin path must be absolute, got {:?}",
+            stored
+        );
     }
 }

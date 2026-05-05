@@ -807,3 +807,63 @@ fn test_clone_creates_separate_factory() {
         "Original tokenizer should still use cached factory"
     );
 }
+
+/// `OwnedPluginFactory` is `pub` and `Sync`, so callers may legitimately
+/// share an `Arc<OwnedPluginFactory>` across threads. The plugin C ABI
+/// does not require `create_tokenizer` to be safe under concurrent calls
+/// against the same factory handle, so the type must serialize access
+/// internally. This test hammers a single shared factory from multiple
+/// threads and verifies that every produced tokenizer is usable.
+#[test]
+#[serial(plugin_tests)]
+fn test_concurrent_create_tokenizer_through_arc_factory() {
+    use std::sync::Arc;
+    use std::thread;
+
+    use lance_index::scalar::inverted::tokenizer::plugin::ffi::CToken;
+    use lance_index::scalar::inverted::tokenizer::plugin::loader::{
+        NextTokenResult, OwnedPluginFactory,
+    };
+
+    let library = TokenizerPluginLibrary::load(get_plugin_path()).expect("load plugin");
+    let factory = Arc::new(OwnedPluginFactory::new(library, "{}").expect("create factory"));
+
+    const THREADS: usize = 8;
+    const ITERATIONS_PER_THREAD: usize = 200;
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let factory = Arc::clone(&factory);
+            thread::spawn(move || {
+                for _ in 0..ITERATIONS_PER_THREAD {
+                    let instance = factory
+                        .create_tokenizer()
+                        .expect("create_tokenizer must succeed under concurrent access");
+                    let mut stream = instance
+                        .create_stream("hello world")
+                        .expect("create_stream must succeed");
+                    let mut tok = CToken::default();
+                    let mut count = 0usize;
+                    loop {
+                        match stream.next_token(&mut tok) {
+                            NextTokenResult::Token => count += 1,
+                            NextTokenResult::EndOfStream => break,
+                            NextTokenResult::Error(code, msg) => {
+                                panic!(
+                                    "unexpected plugin error during concurrent stress \
+                                     (code={}): {}",
+                                    code, msg
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(count, 2, "each iteration should yield 2 tokens");
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+}

@@ -3,7 +3,7 @@
 
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use lance_core::{Error, Result};
 use libloading::Library;
@@ -324,14 +324,28 @@ impl Drop for PluginTokenStream<'_> {
 /// This allows the factory to be cached and reused across multiple tokenizations.
 pub struct OwnedPluginFactory {
     library: Arc<TokenizerPluginLibrary>,
-    factory: *mut LanceTokenizerFactory,
+    /// Raw factory handle from the C plugin, guarded by a Mutex.
+    ///
+    /// The plugin C ABI does not require `create_tokenizer` to be safe under
+    /// concurrent calls against the same factory handle — a stateful plugin
+    /// (e.g. one that lazy-initializes a dictionary on first use) could
+    /// data-race or crash. Since `OwnedPluginFactory` is `pub` and `Sync`,
+    /// callers may legitimately share an `Arc<OwnedPluginFactory>` across
+    /// threads, so we serialize access here rather than rely on every caller
+    /// to wrap it externally.
+    factory: Mutex<*mut LanceTokenizerFactory>,
 }
 
 // SAFETY: OwnedPluginFactory can be sent/shared across threads because:
-// 1. `library` (Arc<TokenizerPluginLibrary>) is Send + Sync
-// 2. `factory` is a raw pointer to plugin state that is only accessed through
-//    the library's thread-safe function pointers
-// 3. The factory is used with &mut self, ensuring single-threaded access
+// 1. `library` (Arc<TokenizerPluginLibrary>) is Send + Sync.
+// 2. `factory` is a raw pointer to plugin state, but every call into the
+//    plugin that uses it goes through the `Mutex` above, so there is at
+//    most one thread inside the plugin's `create_tokenizer` for a given
+//    factory at any time. The plugin's other vtable callbacks
+//    (create_factory / destroy_factory) are only invoked from `new` /
+//    `Drop` where `&self` exclusivity is guaranteed by the borrow checker.
+// 3. `Mutex<*mut T>` is not auto-`Send`/`Sync` because of the raw pointer,
+//    so we declare both impls manually.
 unsafe impl Send for OwnedPluginFactory {}
 unsafe impl Sync for OwnedPluginFactory {}
 
@@ -355,14 +369,18 @@ impl OwnedPluginFactory {
             )));
         }
 
-        Ok(Self { library, factory })
+        Ok(Self {
+            library,
+            factory: Mutex::new(factory),
+        })
     }
 
     /// Create a tokenizer instance from this factory.
     pub fn create_tokenizer(&self) -> Result<OwnedPluginTokenizerInstance> {
+        let factory_ptr = self.factory.lock().expect("plugin factory mutex poisoned");
         let mut error = CError::default();
         let tokenizer =
-            unsafe { ((*self.library.plugin).create_tokenizer.unwrap())(self.factory, &mut error) };
+            unsafe { ((*self.library.plugin).create_tokenizer.unwrap())(*factory_ptr, &mut error) };
         if tokenizer.is_null() {
             let error_msg = if error.has_message() {
                 unsafe { error.message_str().to_string() }
@@ -383,8 +401,14 @@ impl OwnedPluginFactory {
 
 impl Drop for OwnedPluginFactory {
     fn drop(&mut self) {
+        // Exclusive access in Drop, so `get_mut` is sufficient and avoids the
+        // poisoning check entirely.
+        let factory_ptr = *self
+            .factory
+            .get_mut()
+            .expect("plugin factory mutex poisoned");
         unsafe {
-            self.library.destroy_factory(self.factory);
+            self.library.destroy_factory(factory_ptr);
         }
     }
 }
