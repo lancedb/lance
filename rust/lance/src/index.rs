@@ -46,7 +46,7 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex};
 use lance_index::{
-    IndexCriteria, is_system_index,
+    IndexCriteria, infer_system_index_type, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -651,8 +651,14 @@ impl IndexDescriptionImpl {
         let details = IndexDetails(index_details.clone());
         let mut rows_indexed = 0;
 
-        // Vector indices need to be opened to get the correct type
-        let index_type = if details.is_vector() {
+        // System indices (e.g. __lance_frag_reuse, __lance_mem_wal) are
+        // identified by name and have no entry in the scalar plugin registry,
+        // so resolve them up front. This mirrors `load_indices` in
+        // python/src/dataset.rs, keeping the two listing methods in agreement.
+        let index_type = if let Some(system_type) = infer_system_index_type(example_metadata) {
+            system_type.to_string()
+        } else if details.is_vector() {
+            // Vector indices need to be opened to get the correct type
             let column = field_ids
                 .first()
                 .and_then(|id| dataset.schema().field_by_id(*id))
