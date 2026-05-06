@@ -106,10 +106,7 @@ fn make_batch(start_id: i64, n: usize, dim: usize) -> RecordBatch {
     }
     RecordBatch::try_new(
         s,
-        vec![
-            Arc::new(Int64Array::from(ids)),
-            Arc::new(builder.finish()),
-        ],
+        vec![Arc::new(Int64Array::from(ids)), Arc::new(builder.finish())],
     )
     .unwrap()
 }
@@ -159,8 +156,7 @@ async fn main() -> lance_core::Result<()> {
     );
 
     // ---- Write + query through ShardWriter (production path) ----
-    let temp = tempfile::tempdir()
-        .map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
+    let temp = tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
     let uri = format!("file://{}/lsm", temp.path().display());
     println!("base dataset: {}", uri);
 
@@ -334,27 +330,31 @@ async fn measure_flush(
 ) -> lance_core::Result<Duration> {
     let s = schema(dim);
     let mut memtable = MemTable::new(s.clone(), 1, vec![]).unwrap();
-    let registry = IndexStore::from_configs(index_configs, cp).unwrap();
+    let registry =
+        IndexStore::from_configs(index_configs, cp, cp.div_ceil(batch_size).max(64)).unwrap();
     memtable.set_indexes(registry);
 
     let total_batches = cp.div_ceil(batch_size);
-    let mut wal_pos: u64 = 0;
-    for i in 0..total_batches {
+    for (wal_pos, i) in (0_u64..).zip(0..total_batches) {
         let start = (i * batch_size) as i64;
         let rows = batch_size.min(cp - i * batch_size);
         let batch = make_batch(start, rows, dim);
         let frag_id = memtable.insert(batch).await?;
         memtable.mark_wal_flushed(&[frag_id], wal_pos + 1, &[i]);
-        wal_pos += 1;
     }
 
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
     let temp_path: PathBuf = temp_dir.path().to_path_buf();
     let uri = format!("file://{}", temp_path.display());
     let (store, base_path) = ObjectStore::from_uri(&uri).await?;
     let shard_id = Uuid::new_v4();
-    let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base_path, shard_id, 2));
+    let manifest_store = Arc::new(ShardManifestStore::new(
+        store.clone(),
+        &base_path,
+        shard_id,
+        2,
+    ));
     let (epoch, _) = manifest_store.claim_epoch(0).await?;
     let flusher = MemTableFlusher::new(store, base_path, uri, shard_id, manifest_store);
 

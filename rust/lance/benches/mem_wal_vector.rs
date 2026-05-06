@@ -73,7 +73,10 @@ const DEFAULT_PQ_SUBVECTORS: usize = 16;
 const VECTOR_INDEX_NAME: &str = "vector_idx";
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn dataset_prefix() -> String {
@@ -271,9 +274,8 @@ async fn setup_benchmark(
         .await
         .unwrap();
 
-    let is_cloud = prefix.starts_with("s3://")
-        || prefix.starts_with("gs://")
-        || prefix.starts_with("az://");
+    let is_cloud =
+        prefix.starts_with("s3://") || prefix.starts_with("gs://") || prefix.starts_with("az://");
     let flush_wait = if is_cloud {
         Duration::from_secs(8)
     } else {
@@ -285,7 +287,10 @@ async fn setup_benchmark(
     for i in 0..memtable_rows.div_ceil(batch_size) {
         let start = g1_start + (i * batch_size) as i64;
         let rows = batch_size.min(memtable_rows - i * batch_size);
-        writer.put(vec![create_batch(&schema, start, rows, dim)]).await.unwrap();
+        writer
+            .put(vec![create_batch(&schema, start, rows, dim)])
+            .await
+            .unwrap();
     }
     tokio::time::sleep(flush_wait).await;
 
@@ -294,7 +299,10 @@ async fn setup_benchmark(
     for i in 0..memtable_rows.div_ceil(batch_size) {
         let start = g2_start + (i * batch_size) as i64;
         let rows = batch_size.min(memtable_rows - i * batch_size);
-        writer.put(vec![create_batch(&schema, start, rows, dim)]).await.unwrap();
+        writer
+            .put(vec![create_batch(&schema, start, rows, dim)])
+            .await
+            .unwrap();
     }
     tokio::time::sleep(flush_wait).await;
 
@@ -304,7 +312,10 @@ async fn setup_benchmark(
     for i in 0..active_rows.div_ceil(batch_size) {
         let start = g3_start + (i * batch_size) as i64;
         let rows = batch_size.min(active_rows - i * batch_size);
-        writer.put(vec![create_batch(&schema, start, rows, dim)]).await.unwrap();
+        writer
+            .put(vec![create_batch(&schema, start, rows, dim)])
+            .await
+            .unwrap();
     }
 
     let manifest = writer.manifest().await.unwrap();

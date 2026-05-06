@@ -42,26 +42,70 @@ pub use super::RowPosition;
 
 const MEM_HNSW_DIM_PLACEHOLDER: usize = 0;
 
+/// Reference into the writer's BatchStore for a single appended batch.
+///
+/// `MemHnswStorage` keeps these instead of copying vectors. The Arc keeps
+/// the underlying Arrow buffer alive for the storage's lifetime; `values_ptr`
+/// is cached to avoid repeated downcast on the hot dist-calc path.
+struct MemHnswBatch {
+    /// Owned reference to the batch's vector column. Held to keep the
+    /// underlying Arrow buffer alive for the lifetime of this storage entry;
+    /// `values_ptr` borrows into this Arc.
+    #[allow(dead_code)]
+    arrow_array: Arc<FixedSizeListArray>,
+    /// Cached pointer to the first f32 in the values buffer.
+    values_ptr: *const f32,
+}
+
+/// Maps a vector id to its location in the per-batch storage. `id` is dense
+/// `[0, committed_len)`; `(batch_idx, offset)` indexes into the `batches`
+/// table.
+#[derive(Copy, Clone)]
+struct RowLookup {
+    batch_idx: u32,
+    offset: u32,
+}
+
 /// Lock-free flat-float vector storage for in-memory HNSW.
+///
+/// # Storage layout
+///
+/// Vectors are *not copied*. The storage holds `Arc<FixedSizeListArray>`
+/// references into the writer's BatchStore — the same allocations the
+/// writer's query path materializes from. A small `row_to_batch` table maps
+/// each id to `(batch_idx, offset_within_batch)` so distance calc is O(1).
+///
+/// Memory cost relative to the previous owns-its-own-buffer design:
+/// - Saved: `capacity * dim * 4` bytes (the duplicate Float32 buffer).
+/// - Added: `capacity * 8` bytes (`row_to_batch`) + `max_batches *
+///   sizeof(MemHnswBatch)` for the per-batch metadata.
+///
+/// At dim=1024 / 1M rows this is ~4 GB saved vs ~8 MB added.
 ///
 /// # Concurrency
 ///
-/// - Single writer (the MemTable's WAL flush handler thread).
-/// - Multiple concurrent readers (queries and the HNSW search algorithms).
+/// - Single writer appends batches via `append_batch`.
+/// - Multiple concurrent readers call `vector_slice` / `row_position`.
 ///
-/// All buffer access goes through raw pointers — never `&Box<…>` or
-/// `&mut Box<…>` — to avoid creating aliasing references between the writer
-/// and concurrent readers. Slots are never overwritten after publication, so
-/// readers reading slot `i < committed_len` are safe for the lifetime of the
-/// storage.
+/// Publication: writer initializes all metadata for a batch (slot in
+/// `batches`, entries in `row_to_batch`, entries in `row_positions`)
+/// *before* incrementing `committed_len` with `Release`. Readers acquire-load
+/// `committed_len` and only access indices `< committed_len`, so all writes
+/// above are visible. `committed_batches` follows the same release/acquire
+/// pattern.
 pub struct MemHnswStorage {
-    /// Pointer to the start of the vector buffer. Owns
-    /// `capacity * dim * sizeof(f32)` bytes; freed in `Drop`.
-    vectors_ptr: *mut MaybeUninit<f32>,
-    /// Pointer to the start of the row-positions buffer. Owns
-    /// `capacity * sizeof(u64)` bytes; freed in `Drop`.
+    /// Per-batch metadata. Slot `i` is initialized iff `i < committed_batches`.
+    batches: *mut MaybeUninit<MemHnswBatch>,
+    /// Number of committed batches. Reads use Acquire; writes use Release.
+    committed_batches: AtomicUsize,
+    /// id → (batch_idx, offset_in_batch). Slot at index `id` is initialized
+    /// iff `id < committed_len`. 8 bytes per row.
+    row_to_batch: *mut MaybeUninit<RowLookup>,
+    /// Pointer to the start of the row-positions buffer. Slot at index `id`
+    /// is initialized iff `id < committed_len`. 8 bytes per row.
     row_positions_ptr: *mut MaybeUninit<u64>,
     capacity: usize,
+    max_batches: usize,
     dim: usize,
     distance_type: DistanceType,
     /// Number of committed vectors. Reads must use Acquire; writes use Release.
@@ -72,23 +116,30 @@ pub struct MemHnswStorage {
 
 // SAFETY: `MemHnswStorage` follows a single-writer multi-reader model. The
 // writer is the only mutator of the underlying buffers; readers only access
-// indices `< committed_len`, and `committed_len` is published with `Release`
-// ordering so readers see initialized data. All buffer access uses raw
-// pointers to avoid Rust-level aliasing of references.
+// indices `< committed_len` (or `< committed_batches` for the batches table),
+// and those counters are published with `Release` ordering so readers see
+// initialized data. All buffer access uses raw pointers to avoid Rust-level
+// aliasing of references.
 unsafe impl Sync for MemHnswStorage {}
 unsafe impl Send for MemHnswStorage {}
 
 impl Drop for MemHnswStorage {
     fn drop(&mut self) {
-        // Reconstruct the original boxed slices so their backing allocations
-        // are freed correctly. This is the only place a Rust reference to
-        // the buffers exists, and at this point we have `&mut self` so there
-        // are no concurrent readers.
+        // Drop committed batch entries to release their Arcs, then free the
+        // backing allocations. Only the writer-owned writes matter here:
+        // we have `&mut self` so there are no concurrent readers.
         unsafe {
-            let _: Box<[MaybeUninit<f32>]> = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                self.vectors_ptr,
-                self.capacity * self.dim,
-            ));
+            let committed_batches = self.committed_batches.load(Ordering::Acquire);
+            for i in 0..committed_batches {
+                let slot = self.batches.add(i);
+                std::ptr::drop_in_place(slot.cast::<MemHnswBatch>());
+            }
+            let _: Box<[MaybeUninit<MemHnswBatch>]> = Box::from_raw(
+                std::ptr::slice_from_raw_parts_mut(self.batches, self.max_batches),
+            );
+            let _: Box<[MaybeUninit<RowLookup>]> = Box::from_raw(
+                std::ptr::slice_from_raw_parts_mut(self.row_to_batch, self.capacity),
+            );
             let _: Box<[MaybeUninit<u64>]> = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 self.row_positions_ptr,
                 self.capacity,
@@ -98,18 +149,32 @@ impl Drop for MemHnswStorage {
 }
 
 impl MemHnswStorage {
-    /// Create a storage pre-allocated for `capacity` vectors of `dim` floats.
-    pub fn with_capacity(capacity: usize, dim: usize, distance_type: DistanceType) -> Self {
+    /// Create a storage pre-allocated for `capacity` vectors of `dim` floats
+    /// across at most `max_batches` batches. Vectors are stored by reference
+    /// to the appended Arrow `FixedSizeListArray`s, not copied.
+    pub fn with_capacity(
+        capacity: usize,
+        max_batches: usize,
+        dim: usize,
+        distance_type: DistanceType,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
         assert!(dim > 0, "dim must be > 0");
+        assert!(max_batches > 0, "max_batches must be > 0");
         assert!(
             capacity <= u32::MAX as usize,
             "MemHnswStorage capacity must fit in u32"
         );
+        assert!(
+            max_batches <= u32::MAX as usize,
+            "MemHnswStorage max_batches must fit in u32"
+        );
 
-        // Allocate uninitialized buffers and leak them; they are freed in
-        // `Drop` by reconstructing the boxed slices.
-        let vectors: Box<[MaybeUninit<f32>]> = (0..capacity * dim)
+        let batches: Box<[MaybeUninit<MemHnswBatch>]> = (0..max_batches)
+            .map(|_| MaybeUninit::uninit())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let row_to_batch: Box<[MaybeUninit<RowLookup>]> = (0..capacity)
             .map(|_| MaybeUninit::uninit())
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -117,9 +182,10 @@ impl MemHnswStorage {
             .map(|_| MaybeUninit::uninit())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let vectors_ptr: *mut MaybeUninit<f32> = Box::into_raw(vectors) as *mut MaybeUninit<f32>;
-        let row_positions_ptr: *mut MaybeUninit<u64> =
-            Box::into_raw(row_positions) as *mut MaybeUninit<u64>;
+
+        let batches_ptr = Box::into_raw(batches) as *mut MaybeUninit<MemHnswBatch>;
+        let row_to_batch_ptr = Box::into_raw(row_to_batch) as *mut MaybeUninit<RowLookup>;
+        let row_positions_ptr = Box::into_raw(row_positions) as *mut MaybeUninit<u64>;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
@@ -134,9 +200,12 @@ impl MemHnswStorage {
         ]));
 
         Self {
-            vectors_ptr,
+            batches: batches_ptr,
+            committed_batches: AtomicUsize::new(0),
+            row_to_batch: row_to_batch_ptr,
             row_positions_ptr,
             capacity,
+            max_batches,
             dim,
             distance_type,
             committed_len: Arc::new(AtomicUsize::new(0)),
@@ -149,64 +218,123 @@ impl MemHnswStorage {
         self.committed_len.load(Ordering::Acquire)
     }
 
-    /// Append a single vector + row position. Single-writer only.
+    /// Append a whole batch by reference. Single-writer only.
     ///
-    /// Returns the assigned id (=position in the storage). Returns `Err` if
-    /// the storage is full.
-    pub fn append(&self, vector: &[f32], row_position: u64) -> Result<u32> {
-        if vector.len() != self.dim {
+    /// `vectors` is borrowed (Arc-cloned internally); the underlying Arrow
+    /// buffer is kept alive via the stored Arc. `row_positions` are computed
+    /// from `row_offset` (the row position assigned to row 0 of this batch).
+    pub fn append_batch(
+        &self,
+        vectors: Arc<FixedSizeListArray>,
+        row_offset: u64,
+    ) -> Result<std::ops::Range<u32>> {
+        let n = vectors.len();
+        if n == 0 {
+            let id = self.committed_len.load(Ordering::Relaxed) as u32;
+            return Ok(id..id);
+        }
+        if vectors.value_length() as usize != self.dim {
             return Err(Error::invalid_input(format!(
-                "vector dim mismatch: expected {}, got {}",
+                "batch vector dim mismatch: expected {}, got {}",
                 self.dim,
-                vector.len()
+                vectors.value_length()
             )));
         }
-        let id = self.committed_len.load(Ordering::Relaxed);
-        if id >= self.capacity {
+
+        let id_start = self.committed_len.load(Ordering::Relaxed);
+        if id_start + n > self.capacity {
             return Err(Error::invalid_input(format!(
-                "MemHnswStorage capacity {} exhausted",
-                self.capacity
+                "MemHnswStorage capacity {} exhausted (have {}, need {})",
+                self.capacity,
+                id_start,
+                id_start + n
+            )));
+        }
+        let batch_idx = self.committed_batches.load(Ordering::Relaxed);
+        if batch_idx >= self.max_batches {
+            return Err(Error::invalid_input(format!(
+                "MemHnswStorage max_batches {} exhausted",
+                self.max_batches
             )));
         }
 
-        // SAFETY: single writer, id < capacity. Slot at `id` was reserved by
-        // construction and is not concurrently read (readers only access
-        // indices < committed_len, which still equals `id` here).
+        // Cache the values buffer pointer for fast access. The Arc keeps
+        // this buffer alive for the life of the storage entry.
+        let values_arr = vectors.values();
+        let values_f32 = values_arr.as_primitive::<Float32Type>();
+        let values_ptr = values_f32.values().as_ptr();
+
+        // SAFETY: single writer, slots at id_start..id_start+n and
+        // batch_idx are reserved and not yet visible to readers (committed_*
+        // counters haven't been incremented).
         unsafe {
-            let vec_base = self.vectors_ptr.add(id * self.dim);
-            for (i, &v) in vector.iter().enumerate() {
-                vec_base.add(i).write(MaybeUninit::new(v));
+            let batch_slot = self.batches.add(batch_idx);
+            batch_slot.write(MaybeUninit::new(MemHnswBatch {
+                arrow_array: vectors,
+                values_ptr,
+            }));
+
+            for i in 0..n {
+                self.row_to_batch
+                    .add(id_start + i)
+                    .write(MaybeUninit::new(RowLookup {
+                        batch_idx: batch_idx as u32,
+                        offset: i as u32,
+                    }));
+                self.row_positions_ptr
+                    .add(id_start + i)
+                    .write(MaybeUninit::new(row_offset + i as u64));
             }
-            self.row_positions_ptr
-                .add(id)
-                .write(MaybeUninit::new(row_position));
         }
 
-        // Release publishes the writes above to readers.
-        self.committed_len.store(id + 1, Ordering::Release);
-        Ok(id as u32)
+        // Publish committed_batches first so readers that observe a future
+        // committed_len's increased value will also see the new batch slot.
+        self.committed_batches
+            .store(batch_idx + 1, Ordering::Release);
+        self.committed_len.store(id_start + n, Ordering::Release);
+
+        Ok(id_start as u32..(id_start + n) as u32)
+    }
+
+    /// Convenience for tests: append a single Float32 vector by value as a
+    /// freshly-allocated 1-row Arrow batch. Production code goes through
+    /// `append_batch` which is zero-copy.
+    #[cfg(test)]
+    pub fn append(&self, vector: &[f32], row_position: u64) -> Result<u32> {
+        let inner = Arc::new(Float32Array::from(vector.to_vec())) as ArrayRef;
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl = Arc::new(FixedSizeListArray::try_new(
+            field,
+            vector.len() as i32,
+            inner,
+            None,
+        )?);
+        let range = self.append_batch(fsl, row_position)?;
+        Ok(range.start)
     }
 
     /// Get the row position for a committed id.
     pub fn row_position(&self, id: u32) -> u64 {
         debug_assert!((id as usize) < self.committed_len.load(Ordering::Acquire));
         // SAFETY: id < committed_len => initialized; the slot is never
-        // overwritten after publication. We read the raw pointer without
-        // materializing any Rust reference to the surrounding buffer.
+        // overwritten after publication.
         unsafe { self.row_positions_ptr.add(id as usize).read().assume_init() }
     }
 
-    /// Get a slice view of the vector at id `id`. Lifetime is tied to the
-    /// storage; the underlying memory is stable for the life of the storage.
+    /// Get a slice view of the vector at id `id`. The slice borrows the
+    /// underlying Arrow buffer; lifetime is tied to the storage (which holds
+    /// an Arc to the buffer).
     pub fn vector_slice(&self, id: u32) -> &[f32] {
         debug_assert!((id as usize) < self.committed_len.load(Ordering::Acquire));
-        // SAFETY: id < committed_len => initialized; storage is single-writer
-        // and never overwrites committed slots, so the returned slice's
-        // bytes are stable for the storage's lifetime. We use raw pointer
-        // arithmetic to avoid creating any aliasing reference to the
-        // backing buffer.
+        // SAFETY: id < committed_len => row_to_batch[id] initialized AND
+        // the referenced batches[batch_idx] is initialized (writer publishes
+        // committed_batches before committed_len). The Arrow buffer behind
+        // values_ptr stays valid because storage holds an Arc to it.
         unsafe {
-            let base = self.vectors_ptr.add((id as usize) * self.dim) as *const f32;
+            let lookup = self.row_to_batch.add(id as usize).read().assume_init();
+            let batch_slot = self.batches.add(lookup.batch_idx as usize);
+            let batch = batch_slot.cast::<MemHnswBatch>().as_ref().unwrap();
+            let base = batch.values_ptr.add((lookup.offset as usize) * self.dim);
             std::slice::from_raw_parts(base, self.dim)
         }
     }
@@ -505,6 +633,8 @@ pub struct HnswMemIndex {
     dim: AtomicUsize,
     /// Capacity (max vectors) — set at construction.
     capacity: usize,
+    /// Maximum number of batches the storage can hold by reference.
+    max_batches: usize,
     /// Build parameters (passed to the online builder once dim is known).
     build_params: HnswBuildParams,
     /// Lazily-initialized storage and builder. We initialize on first insert
@@ -537,6 +667,7 @@ impl HnswMemIndex {
         distance_type: DistanceType,
         build_params: HnswBuildParams,
         capacity: usize,
+        max_batches: usize,
     ) -> Self {
         Self {
             field_id,
@@ -544,6 +675,7 @@ impl HnswMemIndex {
             distance_type,
             dim: AtomicUsize::new(MEM_HNSW_DIM_PLACEHOLDER),
             capacity,
+            max_batches,
             build_params,
             state: std::sync::OnceLock::new(),
         }
@@ -589,6 +721,7 @@ impl HnswMemIndex {
             self.dim.store(dim, Ordering::Release);
             let storage = Arc::new(MemHnswStorage::with_capacity(
                 self.capacity,
+                self.max_batches,
                 dim,
                 self.distance_type,
             ));
@@ -599,36 +732,43 @@ impl HnswMemIndex {
     }
 
     /// Insert vectors from a single batch.
+    ///
+    /// The batch's vector column is appended **by reference** — the Arrow
+    /// buffer is not copied; the storage holds an Arc to the
+    /// `FixedSizeListArray` for the lifetime of the MemTable.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         let Some((col_idx, _)) = batch.schema().column_with_name(&self.column) else {
             return Ok(());
         };
         let column = batch.column(col_idx);
-        let fsl = column.as_fixed_size_list_opt().ok_or_else(|| {
+        let fsl_ref = column.as_fixed_size_list_opt().ok_or_else(|| {
             Error::invalid_input(format!(
                 "Column '{}' is not a FixedSizeList, got {:?}",
                 self.column,
                 column.data_type()
             ))
         })?;
-        if fsl.is_empty() {
+        if fsl_ref.is_empty() {
             return Ok(());
         }
-
+        // Validate Float32 element type — the fast path assumes raw f32.
+        if fsl_ref.values().as_primitive_opt::<Float32Type>().is_none() {
+            return Err(Error::invalid_input(format!(
+                "Column '{}' must be FixedSizeList<Float32>, got values type {:?}",
+                self.column,
+                fsl_ref.values().data_type()
+            )));
+        }
+        let fsl: Arc<FixedSizeListArray> = Arc::new(fsl_ref.clone());
         let dim = fsl.value_length() as usize;
         let state = self.ensure_state(dim);
-        // Snapshot of storage that the inserts will share. Storage's snapshot
-        // sees the latest committed_len at the time of construction; we
-        // rebuild snapshots after each append so the HNSW insert sees the
-        // newly added vector.
-        let values = fsl.values().as_primitive::<Float32Type>().values();
-        for i in 0..fsl.len() {
-            let row_position = row_offset + i as u64;
-            let base = i * dim;
-            let id = state
-                .storage
-                .append(&values[base..base + dim], row_position)?;
-            // After append, snapshot includes id.
+
+        // Append the batch by reference (zero-copy) and get the id range
+        // assigned to its rows.
+        let id_range = state.storage.append_batch(fsl, row_offset)?;
+        // Per-row HNSW insert; each insert sees a fresh snapshot so it
+        // observes its own predecessor in the same batch.
+        for id in id_range {
             let view = state.storage.snapshot();
             state.builder.insert(id, &view);
         }
@@ -752,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_storage_append_and_read() {
-        let storage = MemHnswStorage::with_capacity(8, 4, DistanceType::L2);
+        let storage = MemHnswStorage::with_capacity(8, 4, 4, DistanceType::L2);
         let v0 = vec![1.0, 2.0, 3.0, 4.0];
         let v1 = vec![5.0, 6.0, 7.0, 8.0];
         let id0 = storage.append(&v0, 100).unwrap();
@@ -768,7 +908,7 @@ mod tests {
 
     #[test]
     fn test_storage_capacity_exhausted() {
-        let storage = MemHnswStorage::with_capacity(2, 2, DistanceType::L2);
+        let storage = MemHnswStorage::with_capacity(2, 4, 2, DistanceType::L2);
         storage.append(&[1.0, 1.0], 0).unwrap();
         storage.append(&[2.0, 2.0], 1).unwrap();
         assert!(storage.append(&[3.0, 3.0], 2).is_err());
@@ -784,6 +924,7 @@ mod tests {
             DistanceType::L2,
             HnswBuildParams::default().num_edges(16).ef_construction(64),
             n,
+            64,
         );
 
         let batch = make_batch(0, n, dim);
@@ -818,6 +959,7 @@ mod tests {
             DistanceType::L2,
             HnswBuildParams::default().num_edges(16).ef_construction(64),
             n,
+            64,
         );
         let batch = make_batch(0, n, dim);
         index.insert(&batch, 0).unwrap();
@@ -845,6 +987,7 @@ mod tests {
             "vector".to_string(),
             DistanceType::L2,
             HnswBuildParams::default(),
+            16,
             16,
         );
         // Build a query of dim 4 — but the index has no state yet. Should
@@ -874,6 +1017,7 @@ mod tests {
             DistanceType::L2,
             HnswBuildParams::default().num_edges(8).ef_construction(32),
             n,
+            256,
         ));
 
         // Pre-insert one vector so the index has dim and an entry point.

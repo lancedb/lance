@@ -194,6 +194,7 @@ async fn setup_memtable(
         "vector".to_string(),
         DistanceType::L2,
         total_rows.max(1),
+        num_batches.max(1),
     );
 
     let batch_capacity = ((num_batches as f64) * 1.1) as usize;

@@ -549,14 +549,15 @@ impl MemTableFlusher {
     /// Writes the index files directly using the pre-computed partition assignments
     /// and PQ codes from the in-memory index.
     ///
-    /// Create an HNSW + FLAT index from the in-memory HNSW.
+    /// Create an HNSW + SQ8 index from the in-memory HNSW.
     ///
     /// Writes:
-    /// - `auxiliary.idx`: FLAT vector storage (`_rowid`, `flat`).
+    /// - `auxiliary.idx`: SQ8-quantized vector storage (`_rowid`, `__sq_code`).
+    ///   Bounds learned from the full memtable in one pass.
     /// - `index.idx`: HNSW graph (`__vector_id`, `__neighbors`, `_distance`).
     ///
     /// Both files use a single placeholder IVF partition so they conform to
-    /// the existing Lance HNSW/FLAT layout used by the on-disk readers.
+    /// the existing Lance `IVF_HNSW_SQ` reader path.
     ///
     /// # Arguments
     /// * `gen_path` - Path to the flushed generation folder
@@ -570,15 +571,19 @@ impl MemTableFlusher {
         mem_index: &super::super::index::HnswMemIndex,
         total_rows: usize,
     ) -> Result<IndexMetadata> {
-        use arrow_array::{FixedSizeListArray, Float32Array};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Float32Type;
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch as ArrowRecordBatch};
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
+        use lance_core::ROW_ID;
         use lance_file::writer::FileWriter;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
-        use lance_index::vector::flat::index::FlatMetadata;
+        use lance_index::vector::SQ_CODE_COLUMN;
         use lance_index::vector::hnsw::HNSW;
         use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+        use lance_index::vector::sq::ScalarQuantizer;
         use lance_index::vector::storage::STORAGE_METADATA_KEY;
         use lance_index::vector::v3::subindex::IvfSubIndex;
         use lance_index::{
@@ -586,6 +591,7 @@ impl MemTableFlusher {
             IndexMetadata as IndexMetaSchema,
         };
         use prost::Message;
+        use std::ops::Range;
         use std::sync::Arc;
 
         let index_uuid = uuid::Uuid::new_v4();
@@ -601,11 +607,47 @@ impl MemTableFlusher {
                 "HnswMemIndex has no inserted vectors; nothing to flush",
             ));
         }
-        let Some((hnsw, storage_batch)) = mem_index.to_lance_hnsw(Some(total_rows as u64))? else {
+        let Some((hnsw, flat_storage_batch)) = mem_index.to_lance_hnsw(Some(total_rows as u64))?
+        else {
             return Err(Error::invalid_input(
                 "HnswMemIndex is empty; nothing to flush",
             ));
         };
+
+        // Train SQ8 on the full memtable in one pass: learn global min/max
+        // from every flushed vector, then quantize all rows in one shot.
+        let row_id_col = flat_storage_batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| Error::invalid_input("_rowid missing from HNSW storage batch"))?
+            .clone();
+        let flat_col = flat_storage_batch
+            .column_by_name(lance_index::vector::flat::storage::FLAT_COLUMN)
+            .ok_or_else(|| Error::invalid_input("flat column missing from HNSW storage batch"))?
+            .clone();
+        let flat_fsl = flat_col.as_fixed_size_list();
+        let mut sq = ScalarQuantizer::new(8, dim);
+        let bounds: Range<f64> = sq.update_bounds::<Float32Type>(flat_fsl)?;
+        let sq_codes = sq.transform::<Float32Type>(flat_fsl as &dyn arrow_array::Array)?;
+
+        let storage_schema = ArrowSchema::new(vec![
+            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(
+                SQ_CODE_COLUMN,
+                arrow_schema::DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new(
+                        "item",
+                        arrow_schema::DataType::UInt8,
+                        true,
+                    )),
+                    dim as i32,
+                ),
+                true,
+            ),
+        ]);
+        let storage_batch = ArrowRecordBatch::try_new(
+            Arc::new(storage_schema.clone()),
+            vec![row_id_col, sq_codes],
+        )?;
 
         // Single-partition IVF for both the storage and graph files. We need
         // *some* centroid because the on-disk read path routes every query
@@ -620,7 +662,6 @@ impl MemTableFlusher {
             lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
-        let storage_schema: ArrowSchema = storage_batch.schema().as_ref().clone();
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
@@ -636,13 +677,31 @@ impl MemTableFlusher {
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
 
-        // Storage metadata is a JSON array of per-partition `FlatMetadata`
-        // strings. With one partition we emit one entry. The reader at
-        // `lance-index/src/vector/storage.rs` parses the outer JSON array and
-        // then decodes each entry as `FlatMetadata`.
-        let flat_metadata = serde_json::to_string(&FlatMetadata { dim })?;
-        let storage_metadata_json = serde_json::to_string(&[flat_metadata])?;
+        // Storage metadata is a JSON array of per-partition quantization
+        // metadata. With one partition we emit one `ScalarQuantizationMetadata`
+        // entry. The on-disk reader parses the outer JSON array and decodes
+        // each entry as `ScalarQuantizationMetadata`.
+        let sq_metadata = serde_json::to_string(
+            &lance_index::vector::sq::storage::ScalarQuantizationMetadata {
+                dim,
+                num_bits: 8,
+                bounds: bounds.clone(),
+            },
+        )?;
+        let storage_metadata_json = serde_json::to_string(&[sq_metadata])?;
         storage_writer.add_schema_metadata(STORAGE_METADATA_KEY, storage_metadata_json);
+        // Per-file SQ metadata key — duplicate of the per-partition entry but
+        // required by the reader's whole-file metadata path.
+        storage_writer.add_schema_metadata(
+            lance_index::vector::sq::storage::SQ_METADATA_KEY,
+            serde_json::to_string(
+                &lance_index::vector::sq::storage::ScalarQuantizationMetadata {
+                    dim,
+                    num_bits: 8,
+                    bounds: bounds.clone(),
+                },
+            )?,
+        );
         storage_writer.finish().await?;
 
         // Write the HNSW graph batch to index.idx. The graph file uses the
@@ -669,11 +728,11 @@ impl MemTableFlusher {
         index_ivf.add_partition(hnsw_batch.num_rows() as u32);
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
         // The on-disk type string matches Lance's index loader vocabulary —
-        // an HNSW sub-index over FLAT (uncompressed) vector storage,
-        // registered under the same name as the standard IVF_HNSW_FLAT
-        // path even though our IVF layer is a single-partition placeholder.
+        // an HNSW sub-index over SQ8-quantized vector storage, registered
+        // under the same name as the standard IVF_HNSW_SQ path even though
+        // our IVF layer is a single-partition placeholder.
         let index_metadata = IndexMetaSchema {
-            index_type: "IVF_HNSW_FLAT".to_string(),
+            index_type: "IVF_HNSW_SQ".to_string(),
             distance_type: distance_type.to_string(),
         };
         index_writer.add_schema_metadata(
@@ -931,7 +990,7 @@ mod tests {
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry so preprocessed data path is used
-        let registry = IndexStore::from_configs(&index_configs, 100_000).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, 100_000, 1_000).unwrap();
         memtable.set_indexes(registry);
 
         let frag_id = memtable
@@ -1050,7 +1109,7 @@ mod tests {
         )];
 
         let mut memtable = MemTable::new(vector_schema.clone(), 1, vec![]).unwrap();
-        let registry = IndexStore::from_configs(&index_configs, num_vectors).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, num_vectors, 100).unwrap();
         memtable.set_indexes(registry);
 
         // Create test batch with vectors
@@ -1103,10 +1162,9 @@ mod tests {
 
         // End-to-end query: pick a row from the flushed dataset, query for
         // it, and verify the index path returns it as the nearest neighbor.
-        // This exercises the on-disk HNSW + FLAT format including the IVF
-        // partition routing and the storage_metadata FlatMetadata
-        // deserialization — both of which had subtle bugs masked by tests
-        // that only checked metadata.
+        // This exercises the on-disk HNSW + SQ8 format including the IVF
+        // partition routing and the storage_metadata ScalarQuantizationMetadata
+        // deserialization.
         let scanned: Vec<RecordBatch> = {
             use futures::TryStreamExt;
             dataset
@@ -1181,7 +1239,7 @@ mod tests {
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry
-        let registry = IndexStore::from_configs(&index_configs, 100_000).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, 100_000, 1_000).unwrap();
         memtable.set_indexes(registry);
 
         // Create test batch with text data

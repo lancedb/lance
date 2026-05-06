@@ -248,7 +248,14 @@ impl IndexStore {
     /// * `configs` - Index configurations
     /// * `max_rows` - Maximum vectors / rows in memtable. Used to size the
     ///   pre-allocated HNSW graph and storage capacity.
-    pub fn from_configs(configs: &[MemIndexConfig], max_rows: usize) -> Result<Self> {
+    /// * `max_batches` - Maximum number of write batches the HNSW storage
+    ///   can hold by reference (matches the writer's
+    ///   `ShardWriterConfig::max_memtable_batches`).
+    pub fn from_configs(
+        configs: &[MemIndexConfig],
+        max_rows: usize,
+        max_batches: usize,
+    ) -> Result<Self> {
         let mut registry = Self::new();
 
         for config in configs {
@@ -264,6 +271,7 @@ impl IndexStore {
                         c.distance_type,
                         c.build_params.clone(),
                         max_rows,
+                        max_batches,
                     );
                     registry.hnsw_indexes.insert(c.name.clone(), index);
                 }
@@ -292,6 +300,7 @@ impl IndexStore {
         column: String,
         distance_type: DistanceType,
         capacity: usize,
+        max_batches: usize,
     ) {
         self.hnsw_indexes.insert(
             name,
@@ -301,11 +310,13 @@ impl IndexStore {
                 distance_type,
                 HnswBuildParams::default(),
                 capacity,
+                max_batches,
             ),
         );
     }
 
     /// Add an HNSW vector index with explicit build parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_with_params(
         &mut self,
         name: String,
@@ -314,10 +325,18 @@ impl IndexStore {
         distance_type: DistanceType,
         build_params: HnswBuildParams,
         capacity: usize,
+        max_batches: usize,
     ) {
         self.hnsw_indexes.insert(
             name,
-            HnswMemIndex::with_capacity(field_id, column, distance_type, build_params, capacity),
+            HnswMemIndex::with_capacity(
+                field_id,
+                column,
+                distance_type,
+                build_params,
+                capacity,
+                max_batches,
+            ),
         );
     }
 
@@ -720,7 +739,7 @@ mod tests {
             )),
         ];
 
-        let registry = IndexStore::from_configs(&configs, 100_000).unwrap();
+        let registry = IndexStore::from_configs(&configs, 100_000, 1_000).unwrap();
         assert_eq!(registry.len(), 2);
         assert!(registry.get_btree("pk_idx").is_some());
         assert!(registry.get_fts("search_idx").is_some());

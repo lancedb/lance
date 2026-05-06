@@ -862,6 +862,7 @@ impl SharedWriterState {
             let indexes = Arc::new(IndexStore::from_configs(
                 &self.index_configs,
                 self.max_memtable_rows,
+                self.max_memtable_batches,
             )?);
             new_memtable.set_indexes_arc(indexes);
         }
@@ -1245,6 +1246,7 @@ impl ShardWriter {
             let indexes = Arc::new(IndexStore::from_configs(
                 index_configs,
                 config.max_memtable_rows,
+                config.max_memtable_batches,
             )?);
             memtable.set_indexes_arc(indexes);
         }
