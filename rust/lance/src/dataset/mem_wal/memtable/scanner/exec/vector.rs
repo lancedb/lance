@@ -29,7 +29,8 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 /// Distance column name in output.
 pub const DISTANCE_COLUMN: &str = "_distance";
 
-/// ExecutionPlan node that queries IVF-PQ vector index with MVCC visibility.
+/// ExecutionPlan node that queries the in-memory HNSW vector index with
+/// MVCC visibility.
 pub struct VectorIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
@@ -378,9 +379,9 @@ impl ExecutionPlan for VectorIndexExec {
 mod tests {
     use super::*;
 
-    // Note: Full tests for VectorIndexExec require setting up IVF-PQ index
-    // with trained centroids and codebook, which is complex.
-    // Basic structure tests are included here.
+    // Note: end-to-end tests for VectorIndexExec live next to the in-memory
+    // HNSW index in `dataset/mem_wal/index/hnsw.rs`. The structural tests
+    // here only exercise the MVCC visibility plumbing.
 
     #[test]
     fn test_distance_column_name() {

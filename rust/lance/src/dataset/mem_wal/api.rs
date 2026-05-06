@@ -221,7 +221,6 @@ impl DatasetMemWalExt for Dataset {
                     )?);
                 }
                 "vector" => {
-                    // Vector index - load IVF-PQ config from base table
                     let vector_config =
                         load_vector_index_config(self, index_name, &index_meta).await?;
                     index_configs.push(vector_config);
