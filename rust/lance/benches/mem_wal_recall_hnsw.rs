@@ -286,10 +286,16 @@ fn brute_force_top_k(corpus: &[f32], n: usize, query: &[f32], k: usize) -> Vec<(
 }
 
 async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::Result<()> {
-    // Tiny base table — content is irrelevant; MemWAL just needs the maintained
-    // index to exist on the underlying dataset.
+    // Tiny base table — content is irrelevant for the recall test (we only
+    // query the MemTable), but it can't be all-zero: IVF/PQ training rejects
+    // zero-norm vectors under cosine. Use a deterministic non-zero pattern.
     let base_n = 1024usize;
-    let base_vec = vec![0.0f32; base_n * DIM];
+    let mut base_vec = Vec::with_capacity(base_n * DIM);
+    for i in 0..base_n {
+        for d in 0..DIM {
+            base_vec.push((((i * 31 + d) as f32) * 0.000_173_f32).sin());
+        }
+    }
     let base_batch = make_batch(0, &base_vec, schema.clone());
     let reader = RecordBatchIterator::new(std::iter::once(Ok(base_batch)), schema.clone());
     let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
