@@ -218,5 +218,9 @@ harness = false
 name = "mem_wal_vector"
 harness = false
 
+[[bench]]
+name = "mem_wal_index_micro"
+harness = false
+
 [lints]
 workspace = true
