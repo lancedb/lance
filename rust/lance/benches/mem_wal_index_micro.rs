@@ -3,28 +3,24 @@
 
 //! Microbench for the in-memory MemTable vector index.
 //!
-//! Two measurements:
+//! Two phases:
 //!
-//! 1. **Pure MemTable write + query**: insert N rows into a single MemTable
-//!    (no flush). Record cumulative insert time and median query latency at
-//!    several fill checkpoints. The MemTable is configured with one vector
-//!    index — HNSW on `jack/mem-wal-hnsw`, IVF-PQ on `main` — and that index
-//!    is the one being measured.
+//! 1. **Write + query through `ShardWriter`** — the production write path.
+//!    Builds a base table with a vector index, initializes MemWAL with that
+//!    index maintained, opens `mem_wal_writer` with a `ShardWriterConfig`
+//!    sized to hold the largest checkpoint without flushing, and times
+//!    `writer.put(batch)` calls. Index updates therefore go through the
+//!    parallel `IndexStore::insert_batches_parallel` path. At each
+//!    checkpoint, queries are issued against `active_memtable_ref()` via
+//!    `MemTableScanner::nearest`.
 //!
-//! 2. **Flush time**: explicitly flush a fully-populated MemTable to local
-//!    disk via `MemTableFlusher::flush_with_indexes`. Measure wall time at
-//!    each fill checkpoint.
+//! 2. **Flush** — populate a fresh `MemTable` directly through
+//!    `MemTable::insert` (same in-memory index, same final state) and time
+//!    `MemTableFlusher::flush_with_indexes`. This isolates the
+//!    memory-to-disk conversion cost (HNSW graph + FLAT vectors vs IVF-PQ
+//!    partition batches) from any writer/WAL coordination.
 //!
-//! ## Configuration (env vars)
-//!
-//! - `BENCH_DIM` — vector dimension (default 1024)
-//! - `BENCH_BATCH` — rows per insert batch (default 1000)
-//! - `BENCH_NUM_QUERIES` — queries to run per checkpoint (default 50)
-//! - `BENCH_CHECKPOINTS` — comma-separated row counts (default
-//!   `100000,500000,1000000`)
-//!
-//! Output is plain stdout, one section per checkpoint. Captured by the
-//! runner script for comparison.
+//! Output is plain stdout, one line per checkpoint, captured by the runner.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -33,21 +29,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Int64Array, RecordBatch,
+    ArrayRef, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator,
     builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::ShardManifestStore;
 use lance::dataset::mem_wal::write::{
-    HnswIndexConfig, IndexStore, MemTable, MemTableFlusher, MemTableScanner, MemIndexConfig,
+    HnswIndexConfig, IndexStore, MemIndexConfig, MemTable, MemTableFlusher, MemTableScanner,
+    ShardWriterConfig,
 };
+use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardManifestStore};
+use lance::dataset::{Dataset, WriteParams};
+use lance::index::DatasetIndexExt;
+use lance::index::vector::VectorIndexParams;
+use lance_index::IndexType;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::pq::builder::PQBuildParams;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use uuid::Uuid;
 
 const VECTOR_COL: &str = "vector";
+const VECTOR_INDEX_NAME: &str = "vector_idx";
+const BASE_ROWS: usize = 1024;
+const BASE_IVF_PARTITIONS: usize = 16;
+const BASE_PQ_SUBVECTORS: usize = 16;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -91,7 +98,6 @@ fn make_batch(start_id: i64, n: usize, dim: usize) -> RecordBatch {
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim as i32);
     for &id in &ids {
         for d in 0..dim {
-            // Deterministic but spread out so distances vary.
             let v = ((id as f32) * 0.000_173 + (d as f32) * 0.000_011).fract();
             builder.values().append_value(v);
         }
@@ -117,6 +123,26 @@ fn make_query_fsl(dim: usize, seed: u64) -> FixedSizeListArray {
     b.finish()
 }
 
+async fn build_base_dataset(uri: &str, dim: usize) -> lance_core::Result<Dataset> {
+    let s = schema(dim);
+    let batch = make_batch(0, BASE_ROWS, dim);
+    let reader = RecordBatchIterator::new(std::iter::once(Ok(batch)), s.clone());
+    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    let ivf_params = IvfBuildParams::new(BASE_IVF_PARTITIONS);
+    let pq_params = PQBuildParams::new(BASE_PQ_SUBVECTORS, 8);
+    let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+    dataset
+        .create_index(
+            &[VECTOR_COL],
+            IndexType::Vector,
+            Some(VECTOR_INDEX_NAME.to_string()),
+            &params,
+            true,
+        )
+        .await?;
+    Ok(dataset)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> lance_core::Result<()> {
     let dim = env_usize("BENCH_DIM", 1024);
@@ -127,72 +153,81 @@ async fn main() -> lance_core::Result<()> {
 
     println!("=== mem_wal_index_micro [HNSW] ===");
     println!(
-        "dim={} batch={} num_queries={} checkpoints={:?} (HNSW backend)",
+        "dim={} batch={} num_queries={} checkpoints={:?}",
         dim, batch_size, num_queries, checkpoints
     );
 
-    // ---- Setup ----
-    let s = schema(dim);
-    let index_configs = vec![MemIndexConfig::Hnsw(Box::new(
-        HnswIndexConfig::new(
-            "vector_idx".to_string(),
-            1,
-            VECTOR_COL.to_string(),
-            DistanceType::L2,
-        )
-        .with_build_params(HnswBuildParams::default()),
-    ))];
+    // ---- Write + query through ShardWriter (production path) ----
+    let temp = tempfile::tempdir()
+        .map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
+    let uri = format!("file://{}/lsm", temp.path().display());
+    println!("base dataset: {}", uri);
 
-    let mut memtable = MemTable::new(s.clone(), 1, vec![]).unwrap();
-    let registry = IndexStore::from_configs(&index_configs, max_rows).unwrap();
-    memtable.set_indexes(registry);
+    let mut dataset = build_base_dataset(&uri, dim).await?;
+    dataset
+        .initialize_mem_wal(MemWalConfig {
+            shard_spec: None,
+            maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
+        })
+        .await?;
+    let dataset = Arc::new(dataset);
 
-    // ---- Insert + query loop ----
+    let shard_id = Uuid::new_v4();
+    // Sized to hold the largest checkpoint with comfortable slack so the
+    // writer never flushes during the write phase.
+    let row_size_estimate = dim * 4 + 8;
+    let total_batches_max = max_rows.div_ceil(batch_size);
+    let writer_config = ShardWriterConfig {
+        shard_id,
+        shard_spec_id: 0,
+        durable_write: false,
+        sync_indexed_write: true,
+        max_memtable_size: max_rows.saturating_mul(row_size_estimate).saturating_mul(4),
+        max_memtable_rows: max_rows.saturating_mul(2),
+        max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
+        max_wal_flush_interval: Some(Duration::from_secs(3600)),
+        max_unflushed_memtable_bytes: usize::MAX / 2,
+        ..ShardWriterConfig::default()
+    };
+    let writer = dataset
+        .as_ref()
+        .mem_wal_writer(shard_id, writer_config)
+        .await?;
+
     let mut total_inserted: usize = 0;
-    let mut total_insert_wall = Duration::ZERO;
+    let mut total_put_wall = Duration::ZERO;
     let mut next_cp_idx = 0;
-    let mut wal_position: u64 = 0;
-
     let total_batches = max_rows.div_ceil(batch_size);
-    println!("write phase: {} batches of {} rows", total_batches, batch_size);
+    println!("write phase: {} batches of {} rows via ShardWriter", total_batches, batch_size);
 
     for i in 0..total_batches {
         let start = (i * batch_size) as i64;
         let rows = batch_size.min(max_rows - i * batch_size);
         let batch = make_batch(start, rows, dim);
         let t = Instant::now();
-        let frag_id = memtable.insert(batch).await?;
-        // Pretend WAL flushed each batch immediately so flush() will succeed.
-        memtable.mark_wal_flushed(&[frag_id], wal_position + 1, &[i]);
-        wal_position += 1;
-        total_insert_wall += t.elapsed();
+        writer.put(vec![batch]).await?;
+        total_put_wall += t.elapsed();
         total_inserted += rows;
 
-        // Hit checkpoint?
         while next_cp_idx < checkpoints.len() && total_inserted >= checkpoints[next_cp_idx] {
             let cp = checkpoints[next_cp_idx];
-            let throughput = cp as f64 / total_insert_wall.as_secs_f64();
+            let throughput = cp as f64 / total_put_wall.as_secs_f64();
             println!(
-                "[checkpoint] rows={} cumulative_insert_time_ms={:.1} throughput_rows_per_sec={:.1}",
+                "[checkpoint] rows={} cumulative_put_time_ms={:.1} put_throughput_rows_per_sec={:.1}",
                 cp,
-                total_insert_wall.as_millis(),
+                total_put_wall.as_millis(),
                 throughput
             );
 
-            // Query phase: median latency over `num_queries` queries.
-            let scanner_indexes = memtable
-                .indexes_arc()
-                .expect("indexes registered above");
-            let bs = memtable.batch_store();
-            let scanner_schema = memtable.schema().clone();
-
+            // Query: run num_queries lookups against the active memtable.
+            let active = writer.active_memtable_ref().await?;
             let mut latencies = Vec::with_capacity(num_queries);
             for q in 0..num_queries {
                 let q_fsl = make_query_fsl(dim, q as u64);
                 let mut scanner = MemTableScanner::new(
-                    bs.clone(),
-                    scanner_indexes.clone(),
-                    scanner_schema.clone(),
+                    active.batch_store.clone(),
+                    active.index_store.clone(),
+                    active.schema.clone(),
                 );
                 let q_arr: ArrayRef = Arc::new(q_fsl);
                 scanner.nearest(VECTOR_COL, q_arr, 10);
@@ -217,16 +252,27 @@ async fn main() -> lance_core::Result<()> {
     }
 
     println!(
-        "write phase done: total_rows={} wall={:.2}s overall_throughput={:.0} rows/sec",
+        "write phase done: total_rows={} wall={:.2}s overall_put_throughput={:.0} rows/sec",
         total_inserted,
-        total_insert_wall.as_secs_f64(),
-        total_inserted as f64 / total_insert_wall.as_secs_f64()
+        total_put_wall.as_secs_f64(),
+        total_inserted as f64 / total_put_wall.as_secs_f64()
     );
 
-    // ---- Flush phase: time MemTableFlusher::flush_with_indexes ----
-    // We can only flush the whole memtable once, so re-create it at each
-    // checkpoint to measure flush time at that fill level.
+    // Drop the writer cleanly (don't measure shutdown time as part of put).
+    writer.close().await?;
+    drop(dataset);
+
+    // ---- Flush phase (direct flusher; isolates memory→disk cost) ----
     println!("flush phase:");
+    let index_configs = vec![MemIndexConfig::Hnsw(Box::new(
+        HnswIndexConfig::new(
+            VECTOR_INDEX_NAME.to_string(),
+            1,
+            VECTOR_COL.to_string(),
+            DistanceType::L2,
+        )
+        .with_build_params(HnswBuildParams::default()),
+    ))];
     for &cp in &checkpoints {
         let elapsed = measure_flush(cp, dim, batch_size, &index_configs).await?;
         println!(
