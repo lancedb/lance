@@ -207,6 +207,23 @@ impl TokenStream for PluginTokenStreamAdapter {
         match self.stream.next_token(&mut c_token) {
             NextTokenResult::Token => {
                 let text = if c_token.text.data.is_null() {
+                    // A NULL data pointer is only valid when length is zero.
+                    // Plugins that return `data == NULL` with `length > 0`
+                    // are violating the C ABI; treating the result as an
+                    // empty string would silently swap the real token for
+                    // "" and corrupt FTS terms — the same failure mode the
+                    // invalid-UTF-8 branch fails loud about. Mirror that
+                    // policy here.
+                    if c_token.text.length != 0 {
+                        panic!(
+                            "Plugin returned token with NULL text pointer but \
+                             non-zero length {} (the plugin ABI requires the \
+                             pointer to be non-null whenever length is greater \
+                             than zero; the in-flight indexing or search task \
+                             is aborted)",
+                            c_token.text.length
+                        );
+                    }
                     String::new()
                 } else {
                     let slice = unsafe {

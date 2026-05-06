@@ -379,6 +379,22 @@ fn test_plugin_invalid_utf8_token_is_rejected() {
 
 #[test]
 #[serial(plugin_tests)]
+#[should_panic(expected = "NULL text pointer but non-zero length")]
+fn test_plugin_null_text_with_nonzero_length_is_rejected() {
+    // The plugin ABI permits `data == NULL` only when `length == 0`.
+    // A plugin that returns a NULL pointer with a non-zero length is
+    // claiming there are bytes that the host cannot read; treating
+    // that as an empty token would silently swap the real content for
+    // "" in the index. Mirror the invalid-UTF-8 policy and fail loud.
+    let plugin_path = get_plugin_path();
+    let mut tokenizer = PluginTokenizer::new(&plugin_path, r#"{"emit_null_with_length": true}"#)
+        .expect("Failed to create tokenizer");
+    let mut stream = tokenizer.token_stream_for_doc("hello");
+    while stream.advance() {}
+}
+
+#[test]
+#[serial(plugin_tests)]
 fn test_plugin_relative_path_is_absolutized_before_persist() {
     // A relative `tokenizer_plugin_library` would be re-interpreted against
     // the CWD of whichever process later reopens the index, which can fail

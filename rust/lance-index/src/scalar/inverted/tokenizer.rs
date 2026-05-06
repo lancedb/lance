@@ -206,7 +206,19 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             prefix_only: details.prefix_only,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
-            tokenizer_plugin_library: details.tokenizer_plugin_library.clone(),
+            // The proto field allows relative paths and is absolutized
+            // best-effort by the writer, but it can still arrive relative
+            // here when read by a process with a different CWD (or by an
+            // older writer that did not absolutize). Normalize on read so
+            // the in-memory representation matches what the `plugin()`
+            // builder and the JSON deserializer would produce — without
+            // this, downstream `build()` and re-serialization paths would
+            // resolve the path against the reader's CWD and silently load
+            // the wrong library or fail to load at all.
+            tokenizer_plugin_library: details
+                .tokenizer_plugin_library
+                .as_ref()
+                .map(|p| absolutize_plugin_path(p.clone())),
             tokenizer_plugin_config: details.tokenizer_plugin_config.clone(),
         })
     }
@@ -673,7 +685,10 @@ pub fn language_model_home() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::InvertedIndexParams;
+    use super::{
+        InvertedIndexParams, Language, default_max_ngram_length, default_min_ngram_length,
+    };
+    use crate::pbold;
     use serial_test::serial;
 
     #[test]
@@ -920,6 +935,74 @@ mod tests {
             params.tokenizer_plugin_library.as_deref(),
             Some(""),
             "deserializer must not absolutize an empty library path \
+             into the reader's CWD"
+        );
+    }
+
+    /// `TryFrom<&pbold::InvertedIndexDetails>` is the third entry point
+    /// alongside the `plugin()` builder and the JSON deserializer.
+    /// Older writers, or writers running with a CWD that has since
+    /// vanished, can leave a relative path in the persisted proto. The
+    /// reader must absolutize on the way in so the in-memory value is
+    /// stable regardless of who serialized it — otherwise downstream
+    /// `build()` and re-serialization would resolve against the reader's
+    /// CWD and silently load the wrong library on a different machine.
+    #[test]
+    fn test_proto_deserialize_absolutizes_relative_plugin_path() {
+        let details = pbold::InvertedIndexDetails {
+            base_tokenizer: Some("plugin".to_string()),
+            language: serde_json::to_string(&Language::English).unwrap(),
+            with_position: false,
+            max_token_length: None,
+            lower_case: true,
+            stem: true,
+            remove_stop_words: true,
+            ascii_folding: true,
+            min_ngram_length: default_min_ngram_length(),
+            max_ngram_length: default_max_ngram_length(),
+            prefix_only: false,
+            tokenizer_plugin_library: Some("relative/dir/lib.so".to_string()),
+            tokenizer_plugin_config: Some("{}".to_string()),
+        };
+
+        let params = InvertedIndexParams::try_from(&details).expect("proto roundtrip");
+        let stored = params
+            .tokenizer_plugin_library
+            .as_ref()
+            .expect("plugin path should be set");
+        assert!(
+            std::path::Path::new(stored).is_absolute(),
+            "proto-deserialized plugin path must be absolute, got {:?}",
+            stored
+        );
+    }
+
+    /// Counterpart to the relative case: an empty string in the proto
+    /// must remain an empty string after `TryFrom`, so the downstream
+    /// `build_plugin_tokenizer` empty-path reject still fires.
+    #[test]
+    fn test_proto_deserialize_keeps_empty_plugin_path_empty() {
+        let details = pbold::InvertedIndexDetails {
+            base_tokenizer: Some("plugin".to_string()),
+            language: serde_json::to_string(&Language::English).unwrap(),
+            with_position: false,
+            max_token_length: None,
+            lower_case: true,
+            stem: true,
+            remove_stop_words: true,
+            ascii_folding: true,
+            min_ngram_length: default_min_ngram_length(),
+            max_ngram_length: default_max_ngram_length(),
+            prefix_only: false,
+            tokenizer_plugin_library: Some(String::new()),
+            tokenizer_plugin_config: Some("{}".to_string()),
+        };
+
+        let params = InvertedIndexParams::try_from(&details).expect("proto roundtrip");
+        assert_eq!(
+            params.tokenizer_plugin_library.as_deref(),
+            Some(""),
+            "proto deserializer must not absolutize an empty library path \
              into the reader's CWD"
         );
     }

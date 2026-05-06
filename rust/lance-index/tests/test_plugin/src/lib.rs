@@ -99,6 +99,10 @@ struct Config {
     /// If true, emit a token whose text bytes are not valid UTF-8. Used to
     /// regression-test the host's UTF-8 validation on the plugin output.
     emit_invalid_utf8: bool,
+    /// If true, emit a token with `data == NULL` but `length > 0`, which is
+    /// an ABI violation (the host must treat NULL as empty only when the
+    /// length is zero). Regression-tests the host's NULL+length check.
+    emit_null_with_length: bool,
 }
 
 struct Factory {
@@ -124,6 +128,10 @@ struct TokenStream {
     /// Backing storage for the invalid byte sequence (kept alive while the
     /// stream borrows it through `LanceStringRef`).
     invalid_utf8_bytes: Vec<u8>,
+    /// If true, the token text returned will have `data == NULL` and a
+    /// non-zero length, simulating a misbehaving plugin that violates
+    /// the ABI's "NULL only when length is zero" contract.
+    emit_null_with_length: bool,
 }
 
 impl Factory {
@@ -154,11 +162,15 @@ impl Factory {
         let emit_invalid_utf8 = config.contains("\"emit_invalid_utf8\":true")
             || config.contains("\"emit_invalid_utf8\": true");
 
+        let emit_null_with_length = config.contains("\"emit_null_with_length\":true")
+            || config.contains("\"emit_null_with_length\": true");
+
         Self {
             config: Config {
                 lowercase,
                 error_after_n_tokens,
                 emit_invalid_utf8,
+                emit_null_with_length,
             },
         }
     }
@@ -244,6 +256,15 @@ impl TokenStream {
             token.text = LanceStringRef {
                 data: self.invalid_utf8_bytes.as_ptr() as *const c_char,
                 length: self.invalid_utf8_bytes.len() as u32,
+            };
+        } else if self.emit_null_with_length {
+            // Violate the ABI: NULL data pointer with a non-zero length.
+            // The host must reject this rather than treating the result
+            // as an empty token, which would silently swap real content
+            // for "" in the index.
+            token.text = LanceStringRef {
+                data: ptr::null(),
+                length: 5,
             };
         } else {
             token.text = LanceStringRef {
@@ -331,6 +352,7 @@ unsafe extern "C" fn create_stream(
         error_message: String::new(),
         emit_invalid_utf8: tokenizer.config.emit_invalid_utf8,
         invalid_utf8_bytes: Vec::new(),
+        emit_null_with_length: tokenizer.config.emit_null_with_length,
     };
     Box::into_raw(Box::new(stream)) as *mut c_void
 }
