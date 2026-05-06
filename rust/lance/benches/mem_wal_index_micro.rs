@@ -64,6 +64,22 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|s| {
+            let s = s.to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes")
+        })
+        .unwrap_or(default)
+}
+
+fn env_dataset_prefix() -> Option<String> {
+    std::env::var("DATASET_PREFIX")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 fn env_checkpoints() -> Vec<usize> {
     let raw =
         std::env::var("BENCH_CHECKPOINTS").unwrap_or_else(|_| "100000,500000,1000000".to_string());
@@ -148,16 +164,25 @@ async fn main() -> lance_core::Result<()> {
     let num_queries = env_usize("BENCH_NUM_QUERIES", 50);
     let checkpoints = env_checkpoints();
     let max_rows = *checkpoints.iter().max().unwrap_or(&1_000_000);
+    let durable_write = env_bool("BENCH_DURABLE_WRITE", false);
+    let prefix = env_dataset_prefix();
 
     println!("=== mem_wal_index_micro [HNSW] ===");
     println!(
-        "dim={} batch={} num_queries={} checkpoints={:?}",
-        dim, batch_size, num_queries, checkpoints
+        "dim={} batch={} num_queries={} checkpoints={:?} durable_write={} prefix={:?}",
+        dim, batch_size, num_queries, checkpoints, durable_write, prefix
     );
 
     // ---- Write + query through ShardWriter (production path) ----
     let temp = tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
-    let uri = format!("file://{}/lsm", temp.path().display());
+    let uri = match prefix.as_deref() {
+        Some(p) => format!(
+            "{}/run-{}/lsm",
+            p.trim_end_matches('/'),
+            Uuid::new_v4().simple()
+        ),
+        None => format!("file://{}/lsm", temp.path().display()),
+    };
     println!("base dataset: {}", uri);
 
     let mut dataset = build_base_dataset(&uri, dim).await?;
@@ -177,7 +202,7 @@ async fn main() -> lance_core::Result<()> {
     let writer_config = ShardWriterConfig {
         shard_id,
         shard_spec_id: 0,
-        durable_write: false,
+        durable_write,
         sync_indexed_write: true,
         max_memtable_size: max_rows.saturating_mul(row_size_estimate).saturating_mul(4),
         max_memtable_rows: max_rows.saturating_mul(2),
@@ -311,7 +336,8 @@ async fn main() -> lance_core::Result<()> {
         .with_build_params(HnswBuildParams::default()),
     ))];
     for &cp in &checkpoints {
-        let (elapsed, disk_bytes) = measure_flush(cp, dim, batch_size, &index_configs).await?;
+        let (elapsed, disk_bytes) =
+            measure_flush(cp, dim, batch_size, &index_configs, prefix.as_deref()).await?;
         println!(
             "[flush] rows={} flush_wall_ms={} throughput_rows_per_sec={:.0} on_disk_bytes={} on_disk_mb={:.1}",
             cp,
@@ -331,6 +357,7 @@ async fn measure_flush(
     dim: usize,
     batch_size: usize,
     index_configs: &[MemIndexConfig],
+    prefix: Option<&str>,
 ) -> lance_core::Result<(Duration, u64)> {
     let s = schema(dim);
     let mut memtable = MemTable::new(s.clone(), 1, vec![]).unwrap();
@@ -350,7 +377,14 @@ async fn measure_flush(
     let temp_dir =
         tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
     let temp_path: PathBuf = temp_dir.path().to_path_buf();
-    let uri = format!("file://{}", temp_path.display());
+    let uri = match prefix {
+        Some(p) => format!(
+            "{}/flush-{}",
+            p.trim_end_matches('/'),
+            Uuid::new_v4().simple()
+        ),
+        None => format!("file://{}", temp_path.display()),
+    };
     let (store, base_path) = ObjectStore::from_uri(&uri).await?;
     let shard_id = Uuid::new_v4();
     let manifest_store = Arc::new(ShardManifestStore::new(
@@ -368,7 +402,14 @@ async fn measure_flush(
         .await?;
     let elapsed = t.elapsed();
 
-    let disk_bytes = dir_size_bytes(&temp_path);
+    // Disk size only meaningful when local; on remote storage the temp dir
+    // is empty so we report 0 (and bench output makes the storage location
+    // explicit via the printed URI/prefix).
+    let disk_bytes = if prefix.is_some() {
+        0
+    } else {
+        dir_size_bytes(&temp_path)
+    };
     Ok((elapsed, disk_bytes))
 }
 
