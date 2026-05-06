@@ -395,37 +395,24 @@ fn test_plugin_null_text_with_nonzero_length_is_rejected() {
 
 #[test]
 #[serial(plugin_tests)]
-fn test_plugin_relative_path_is_absolutized_before_persist() {
+fn test_plugin_relative_path_is_rejected_at_persistence_boundary() {
     // A relative `tokenizer_plugin_library` would be re-interpreted against
-    // the CWD of whichever process later reopens the index, which can fail
-    // to find the plugin or load a wrong file. The persisted (proto) form
-    // must be absolute regardless of what the caller passed in.
+    // the CWD of whichever process later reopens the index, silently
+    // loading a different file or failing entirely. Reject the value at
+    // the proto-conversion boundary so a relative path can never reach
+    // the persisted manifest, even if the caller hand-built params
+    // without going through the `plugin()` builder + `build()`.
     use lance_index::pbold::InvertedIndexDetails;
 
     let params = InvertedIndexParams::default()
         .plugin("relative/path/to/plugin.so".to_string(), "{}".to_string());
-    let proto: InvertedIndexDetails = (&params).try_into().expect("proto conversion failed");
-    let proto_path = proto
-        .tokenizer_plugin_library
-        .as_ref()
-        .expect("proto plugin path must be set");
+    let err = InvertedIndexDetails::try_from(&params)
+        .expect_err("proto conversion must reject a relative plugin path");
+    let msg = err.to_string();
     assert!(
-        std::path::Path::new(proto_path).is_absolute(),
-        "proto-persisted plugin path must be absolute; got {:?}",
-        proto_path
-    );
-    // Round-trip back into params and confirm the path stays absolute (so a
-    // second save doesn't reintroduce relativity).
-    let restored: InvertedIndexParams = (&proto).try_into().expect("proto -> params failed");
-    let proto2: InvertedIndexDetails = (&restored).try_into().expect("re-serialize failed");
-    let proto2_path = proto2
-        .tokenizer_plugin_library
-        .as_ref()
-        .expect("re-serialized plugin path must be set");
-    assert!(
-        std::path::Path::new(proto2_path).is_absolute(),
-        "round-tripped plugin path must remain absolute; got {:?}",
-        proto2_path
+        msg.contains("absolute"),
+        "error must call out the absolute-path requirement, got: {}",
+        msg
     );
 }
 

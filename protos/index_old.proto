@@ -39,8 +39,13 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
-  // Path to a tokenizer plugin shared library (.so on Linux, .dylib on macOS, .dll on Windows).
-  // The path can be absolute or relative to the current working directory.
+  // Absolute path to a tokenizer plugin shared library (.so on Linux,
+  // .dylib on macOS, .dll on Windows). Relative paths are rejected before
+  // the manifest is written, because the persisted value is interpreted by
+  // whichever process later reopens the index — resolving a relative path
+  // against the reader's CWD would silently load a different file or fail
+  // entirely. As a consequence, the same absolute path must exist on every
+  // host that opens the index.
   //
   // Failure modes differ by phase:
   // - Library load (file not found, missing symbols, API version mismatch,
@@ -62,13 +67,6 @@ message InvertedIndexDetails {
   // an untrusted index publisher, a shared filesystem, etc.) can therefore
   // achieve arbitrary native code execution. Only open indexes from sources
   // you trust to the same level you trust the host process itself.
-  //
-  // PORTABILITY: the path is absolutized against the writer's working
-  // directory and stored verbatim. An index built on machine A will not
-  // resolve the plugin on machine B unless both machines share the same
-  // absolute path. Plugin tokenizers are intended for indexes that stay on
-  // a single host; a future revision may add basename + search-dir
-  // resolution for portable deployments.
   optional string tokenizer_plugin_library = 12;
 
   // Configuration string passed to the tokenizer plugin when creating a factory.
