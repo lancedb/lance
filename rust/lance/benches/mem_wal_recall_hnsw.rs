@@ -90,28 +90,51 @@ async fn download_shard(rel_path: &str, dest: &std::path::Path) -> lance_core::R
         return Ok(());
     }
     let url = format!("{}{}", HF_FILE_BASE, rel_path);
-    println!("downloading {} ...", rel_path);
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|e| lance_core::Error::io(format!("download HTTP: {}", e)))?;
-    if !resp.status().is_success() {
-        return Err(lance_core::Error::io(format!(
-            "download {} → status {}",
-            url,
-            resp.status()
-        )));
+    let max_attempts = 5;
+    for attempt in 1..=max_attempts {
+        println!(
+            "downloading {} (attempt {}/{}) ...",
+            rel_path, attempt, max_attempts
+        );
+        let result: lance_core::Result<bytes::Bytes> = async {
+            let resp = reqwest::get(&url)
+                .await
+                .map_err(|e| lance_core::Error::io(format!("download HTTP: {}", e)))?;
+            if !resp.status().is_success() {
+                return Err(lance_core::Error::io(format!(
+                    "download {} → status {}",
+                    url,
+                    resp.status()
+                )));
+            }
+            resp.bytes()
+                .await
+                .map_err(|e| lance_core::Error::io(format!("read body: {}", e)))
+        }
+        .await;
+        match result {
+            Ok(bytes) => {
+                std::fs::write(dest, &bytes)
+                    .map_err(|e| lance_core::Error::io(format!("write: {}", e)))?;
+                println!(
+                    "  wrote {:.1} MB to {}",
+                    bytes.len() as f64 / 1024.0 / 1024.0,
+                    dest.display()
+                );
+                return Ok(());
+            }
+            Err(e) if attempt < max_attempts => {
+                let backoff = Duration::from_secs(2u64.pow(attempt as u32));
+                eprintln!(
+                    "  attempt {} failed: {}; retrying in {:?}",
+                    attempt, e, backoff
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| lance_core::Error::io(format!("read body: {}", e)))?;
-    std::fs::write(dest, &bytes).map_err(|e| lance_core::Error::io(format!("write: {}", e)))?;
-    println!(
-        "  wrote {:.1} MB to {}",
-        bytes.len() as f64 / 1024.0 / 1024.0,
-        dest.display()
-    );
-    Ok(())
+    unreachable!()
 }
 
 /// Read up to `max_rows` rows from a single parquet file, appending to `buf`.
