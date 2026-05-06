@@ -877,6 +877,13 @@ impl DatasetIndexExt for Dataset {
             )));
         };
 
+        // Honor the documented `Operation::CreateIndex` semantics: any existing indices with
+        // the same name are replaced as part of this same commit (see transaction.rs).
+        // This folds drop-and-create into one manifest version bump so callers replacing a
+        // same-name index never observe an intermediate state where the old index is gone but
+        // the new one is not yet installed.
+        let removed_indices = self.load_indices_by_name(index_name).await?;
+
         let new_indices =
             build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
 
@@ -884,7 +891,7 @@ impl DatasetIndexExt for Dataset {
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
-                removed_indices: vec![],
+                removed_indices,
             },
             None,
         );
@@ -5468,6 +5475,92 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("overlapping fragment coverage"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_replaces_same_name_in_single_commit() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let seg_old = IndexSegment::new(
+            Uuid::new_v4(),
+            [0_u32, 1_u32],
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
+        let seg_new = IndexSegment::new(
+            Uuid::new_v4(),
+            [0_u32, 1_u32],
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
+        for uuid in [seg_old.uuid(), seg_new.uuid()] {
+            let path = dataset
+                .indices_dir()
+                .child(uuid.to_string())
+                .child(INDEX_FILE_NAME);
+            dataset.object_store().put(&path, b"seg").await.unwrap();
+        }
+
+        // Install the original index.
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![seg_old.clone()])
+            .await
+            .unwrap();
+
+        let version_before_replace = dataset.manifest.version;
+        let installed_old = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(installed_old.len(), 1);
+        assert_eq!(installed_old[0].uuid, seg_old.uuid());
+
+        // Commit a fresh segment under the same name. Per the documented
+        // `Operation::CreateIndex` semantics, the same-name old index is removed in the same
+        // manifest commit as the new segment is installed.
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![seg_new.clone()])
+            .await
+            .unwrap();
+
+        // Single manifest version bump — no intermediate state where the index is missing.
+        assert_eq!(
+            dataset.manifest.version,
+            version_before_replace + 1,
+            "same-name replace should produce exactly one commit"
+        );
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "the old segment should be replaced, not appended"
+        );
+        assert_eq!(
+            after[0].uuid,
+            seg_new.uuid(),
+            "the new segment should be the only one bound to vector_idx"
+        );
     }
 
     #[tokio::test]
