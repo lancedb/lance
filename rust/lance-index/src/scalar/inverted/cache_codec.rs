@@ -198,7 +198,8 @@ fn read_position_storage(
                 read_ipc_stream_single_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
             let block_offsets = batch
                 .column(0)
-                .as_primitive::<UInt32Type>()
+                .as_primitive_opt::<UInt32Type>()
+                .ok_or_else(|| Error::io("block_offsets column is not UInt32".to_string()))?
                 .values()
                 .to_vec();
 
@@ -294,12 +295,14 @@ fn deserialize_plain(data: &Bytes, offset: &mut usize) -> Result<PlainPostingLis
     let batch = read_ipc_stream_single_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
     let row_ids = batch
         .column(0)
-        .as_primitive::<UInt64Type>()
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| Error::io("row_ids column is not UInt64".to_string()))?
         .values()
         .clone();
     let frequencies = batch
         .column(1)
-        .as_primitive::<Float32Type>()
+        .as_primitive_opt::<Float32Type>()
+        .ok_or_else(|| Error::io("frequencies column is not Float32".to_string()))?
         .values()
         .clone();
 
