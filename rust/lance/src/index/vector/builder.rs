@@ -2307,6 +2307,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optimize_split_after_append_pushes_partition_over_threshold() {
+        use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+        use crate::index::vector::VectorIndexParams;
+        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use arrow_array::RecordBatchIterator;
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(item_field, 4),
+            false,
+        )]));
+
+        // Tiny per-row perturbation gives kmeans something to fit while keeping
+        // within-cluster variance negligible relative to the 1000-unit cluster
+        // separation, so kmeans (k=2) reliably places one centroid per cluster.
+        let make_batch = |num_rows: usize, center: f32| -> RecordBatch {
+            let mut values = Vec::with_capacity(num_rows * 4);
+            for i in 0..num_rows {
+                let p = center + (i as f32) * 0.0001;
+                values.extend_from_slice(&[p, p, p, p]);
+            }
+            let fsl =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), 4).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap()
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+
+        // 15k near origin (just under split threshold of 4 * 4096 = 16384) plus
+        // 1.5k far away in cluster B.
+        let initial = vec![Ok(make_batch(15_000, 0.0)), Ok(make_batch(1_500, 1000.0))];
+        let reader = RecordBatchIterator::new(initial, schema.clone());
+        let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("idx").await.unwrap();
+        let initial_index = dataset
+            .open_vector_index("vec", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let initial_ivf = initial_index.ivf_model();
+        assert_eq!(initial_ivf.num_partitions(), 2);
+        let max_initial = (0..2).map(|p| initial_ivf.partition_size(p)).max().unwrap();
+        assert!(
+            max_initial <= 16_384,
+            "initial max partition size {max_initial} should be at or under split threshold",
+        );
+
+        // Append 3k more cluster-A rows so partition 0 grows past the threshold.
+        let append = make_batch(3_000, 0.0);
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![append])
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("idx").await.unwrap();
+        assert_eq!(indices.len(), 1, "expected merge-all on split");
+        let optimized = dataset
+            .open_vector_index("vec", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf = optimized.ivf_model();
+
+        assert_eq!(
+            ivf.num_partitions(),
+            3,
+            "expected one split: 2 original + 1 new = 3 partitions",
+        );
+        let total_rows: usize = (0..ivf.num_partitions())
+            .map(|p| optimized.partition_size(p))
+            .sum();
+        assert_eq!(total_rows, 19_500, "all vectors preserved across split");
+    }
+
+    #[tokio::test]
     async fn take_partition_batches_preserves_partition_order_for_large_fixed_size_list() {
         let value_length = 1_073_741_824i32;
         let num_rows = 5usize;
