@@ -3,14 +3,17 @@
 
 //! HNSW recall benchmark for the in-memory MemTable index.
 //!
-//! - Downloads a single shard of `KShivendu/dbpedia-entities-openai-1M`
-//!   (1536-dim, OpenAI ada embeddings) from the HF CDN.
-//! - Splits into a corpus + a held-out query set.
-//! - Loads the corpus into a MemTable via the production `ShardWriter` path,
-//!   like `mem_wal_index_micro` does.
-//! - For each query: brute-force top-k against the corpus (exact) vs HNSW
-//!   top-k via `MemTableScanner::nearest`.
-//! - Reports recall@k = |brute ∩ hnsw| / k aggregated across queries.
+//! - Downloads `KShivendu/dbpedia-entities-openai-1M` parquet shards (1536-dim
+//!   OpenAI ada embeddings) from HF as needed to cover the requested
+//!   checkpoints.
+//! - For each checkpoint size N (default 100k / 500k / 1M):
+//!     * Build a fresh MemTable with rows `[0..N)` via the production
+//!       ShardWriter path.
+//!     * Use 200 held-out queries from rows `[max_checkpoint..max_checkpoint+200)`
+//!       (constant across checkpoints so recall comparisons are apples-to-apples).
+//!     * For each query: brute-force top-k against the corpus (exact ground
+//!       truth) vs HNSW top-k via `MemTableScanner::nearest`.
+//!     * Recall@k = |brute ∩ hnsw| / k aggregated over queries.
 
 #![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -38,7 +41,10 @@ use uuid::Uuid;
 
 const VECTOR_COL: &str = "vector";
 const VECTOR_INDEX_NAME: &str = "vector_idx";
-const DATASET_URL: &str = "https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M/resolve/main/data/train-00000-of-00026-3c7b99d1c7eda36e.parquet";
+const HF_API_LISTING: &str =
+    "https://huggingface.co/api/datasets/KShivendu/dbpedia-entities-openai-1M/tree/main/data";
+const HF_FILE_BASE: &str =
+    "https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M/resolve/main/";
 const DIM: usize = 1536;
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -48,18 +54,50 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-async fn download_parquet(local_path: &std::path::Path) -> lance_core::Result<()> {
-    if local_path.exists() {
-        println!("parquet already cached at {}", local_path.display());
+fn env_checkpoints() -> Vec<usize> {
+    let raw =
+        std::env::var("BENCH_CHECKPOINTS").unwrap_or_else(|_| "100000,500000,1000000".to_string());
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct HfTreeEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+}
+
+async fn list_shard_paths() -> lance_core::Result<Vec<String>> {
+    let entries: Vec<HfTreeEntry> = reqwest::get(HF_API_LISTING)
+        .await
+        .map_err(|e| lance_core::Error::io(format!("listing HTTP: {}", e)))?
+        .json()
+        .await
+        .map_err(|e| lance_core::Error::io(format!("listing JSON: {}", e)))?;
+    let mut shards: Vec<String> = entries
+        .into_iter()
+        .filter(|e| e.kind == "file" && e.path.ends_with(".parquet"))
+        .map(|e| e.path)
+        .collect();
+    shards.sort();
+    Ok(shards)
+}
+
+async fn download_shard(rel_path: &str, dest: &std::path::Path) -> lance_core::Result<()> {
+    if dest.exists() {
         return Ok(());
     }
-    println!("downloading {}", DATASET_URL);
-    let resp = reqwest::get(DATASET_URL)
+    let url = format!("{}{}", HF_FILE_BASE, rel_path);
+    println!("downloading {} ...", rel_path);
+    let resp = reqwest::get(&url)
         .await
-        .map_err(|e| lance_core::Error::io(format!("download failed: {}", e)))?;
+        .map_err(|e| lance_core::Error::io(format!("download HTTP: {}", e)))?;
     if !resp.status().is_success() {
         return Err(lance_core::Error::io(format!(
-            "download status {}",
+            "download {} → status {}",
+            url,
             resp.status()
         )));
     }
@@ -67,23 +105,22 @@ async fn download_parquet(local_path: &std::path::Path) -> lance_core::Result<()
         .bytes()
         .await
         .map_err(|e| lance_core::Error::io(format!("read body: {}", e)))?;
-    std::fs::write(local_path, &bytes)
-        .map_err(|e| lance_core::Error::io(format!("write: {}", e)))?;
+    std::fs::write(dest, &bytes).map_err(|e| lance_core::Error::io(format!("write: {}", e)))?;
     println!(
-        "downloaded {} bytes to {}",
-        bytes.len(),
-        local_path.display()
+        "  wrote {:.1} MB to {}",
+        bytes.len() as f64 / 1024.0 / 1024.0,
+        dest.display()
     );
     Ok(())
 }
 
-/// Read up to `max_rows` rows from the parquet, extracting the embedding
-/// column as a contiguous Float32 buffer of length `rows * DIM` plus matching
-/// row ids `[0..rows)`.
-async fn read_embeddings(
+/// Read up to `max_rows` rows from a single parquet file, appending to `buf`.
+/// Returns the number of rows actually read from this file.
+async fn read_shard_into_buf(
     path: &std::path::Path,
+    buf: &mut Vec<f32>,
     max_rows: usize,
-) -> lance_core::Result<(Vec<f32>, usize)> {
+) -> lance_core::Result<usize> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| lance_core::Error::io(format!("open parquet: {}", e)))?;
@@ -94,10 +131,12 @@ async fn read_embeddings(
         .build()
         .map_err(|e| lance_core::Error::io(format!("parquet stream: {}", e)))?;
 
-    let mut buf: Vec<f32> = Vec::with_capacity(max_rows * DIM);
-    let mut rows: usize = 0;
-
-    while rows < max_rows {
+    let cast_target = arrow_schema::DataType::FixedSizeList(
+        Arc::new(Field::new("item", arrow_schema::DataType::Float32, true)),
+        DIM as i32,
+    );
+    let mut rows_from_shard = 0usize;
+    while rows_from_shard < max_rows {
         let Some(rb) = stream
             .try_next()
             .await
@@ -108,27 +147,13 @@ async fn read_embeddings(
         let col = rb
             .column_by_name("openai")
             .ok_or_else(|| lance_core::Error::io("openai column missing".to_string()))?;
-        if rows == 0 {
-            println!("openai column type: {:?}", col.data_type());
-        }
-        // Cast the column to FixedSizeList<Float32, DIM>, going through
-        // FixedSizeList<Float64> if needed (parquet drivers sometimes store
-        // 32-bit floats as f64 for compatibility).
-        let cast_target = arrow_schema::DataType::FixedSizeList(
-            Arc::new(Field::new("item", arrow_schema::DataType::Float32, true)),
-            DIM as i32,
-        );
         let casted = if col.data_type() == &cast_target {
             col.clone()
         } else {
-            // Fall back to a generic cast — handles List<Float64>,
-            // FixedSizeList<Float64>, LargeList<Float32>, etc.
             arrow_cast::cast::cast(col.as_ref(), &cast_target).map_err(|e| {
                 lance_core::Error::io(format!(
-                    "failed to cast openai column ({:?}) to FixedSizeList<Float32, {}>: {}",
-                    col.data_type(),
-                    DIM,
-                    e
+                    "cast openai column to FixedSizeList<Float32, {}>: {}",
+                    DIM, e
                 ))
             })?
         };
@@ -138,23 +163,56 @@ async fn read_embeddings(
             .as_primitive_opt::<Float32Type>()
             .ok_or_else(|| {
                 lance_core::Error::io(format!(
-                    "fsl values still not Float32 after cast: {:?}",
+                    "fsl values not Float32: {:?}",
                     fsl.values().data_type()
                 ))
             })?
             .values();
-
         for i in 0..rb.num_rows() {
-            if rows >= max_rows {
+            if rows_from_shard >= max_rows {
                 break;
             }
             let off = i * DIM;
             buf.extend_from_slice(&values[off..off + DIM]);
-            rows += 1;
+            rows_from_shard += 1;
         }
     }
-    println!("read {} rows × {} dims from parquet", rows, DIM);
-    Ok((buf, rows))
+    Ok(rows_from_shard)
+}
+
+async fn load_corpus(needed_rows: usize) -> lance_core::Result<Vec<f32>> {
+    let shards = list_shard_paths().await?;
+    println!("dataset has {} parquet shards", shards.len());
+
+    let cache_dir = std::env::temp_dir().join("mem_wal_recall_hnsw_cache");
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| lance_core::Error::io(format!("mkdir cache: {}", e)))?;
+
+    let mut buf: Vec<f32> = Vec::with_capacity(needed_rows * DIM);
+    let mut total_rows: usize = 0;
+
+    for rel_path in &shards {
+        if total_rows >= needed_rows {
+            break;
+        }
+        let local_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        let local = cache_dir.join(local_name);
+        download_shard(rel_path, &local).await?;
+        let want = needed_rows - total_rows;
+        let got = read_shard_into_buf(&local, &mut buf, want).await?;
+        total_rows += got;
+        println!(
+            "  shard {} → {} rows (cumulative {})",
+            local_name, got, total_rows
+        );
+    }
+    if total_rows < needed_rows {
+        return Err(lance_core::Error::io(format!(
+            "dataset only has {} rows, need {}",
+            total_rows, needed_rows
+        )));
+    }
+    Ok(buf)
 }
 
 fn make_schema() -> Arc<ArrowSchema> {
@@ -189,96 +247,85 @@ fn make_batch(start_id: i64, vectors: &[f32], schema: Arc<ArrowSchema>) -> Recor
 }
 
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    // Cohere/OpenAI ada embeddings are unit-normalized; cosine ≡ 1 - dot.
-    // Lance uses cosine_distance = 1 - cos_similarity. Use the dispatched fn
-    // so the brute force matches what the index reports.
     DistanceType::Cosine.func()(a, b)
 }
 
 fn brute_force_top_k(corpus: &[f32], n: usize, query: &[f32], k: usize) -> Vec<(f32, i64)> {
-    let mut heap: Vec<(f32, i64)> = (0..n)
+    let mut all: Vec<(f32, i64)> = (0..n)
         .map(|i| {
             let off = i * DIM;
             (cosine_distance(query, &corpus[off..off + DIM]), i as i64)
         })
         .collect();
-    heap.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    heap.truncate(k);
-    heap
+    all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    all.truncate(k);
+    all
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> lance_core::Result<()> {
-    let total_rows = env_usize("BENCH_ROWS", 30_000);
-    let num_queries = env_usize("BENCH_NUM_QUERIES", 200);
-    let k = env_usize("BENCH_K", 10);
-    let ef = env_usize("BENCH_EF", 64);
+async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::Result<()> {
+    // Tiny base table — content is irrelevant; MemWAL just needs the maintained
+    // index to exist on the underlying dataset.
+    let base_n = 1024usize;
+    let base_vec = vec![0.0f32; base_n * DIM];
+    let base_batch = make_batch(0, &base_vec, schema.clone());
+    let reader = RecordBatchIterator::new(std::iter::once(Ok(base_batch)), schema.clone());
+    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    let ivf = IvfBuildParams::new(16);
+    let pq = PQBuildParams::new(16, 8);
+    let params = VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf, pq);
+    dataset
+        .create_index(
+            &[VECTOR_COL],
+            IndexType::Vector,
+            Some(VECTOR_INDEX_NAME.to_string()),
+            &params,
+            true,
+        )
+        .await?;
+    dataset
+        .initialize_mem_wal(MemWalConfig {
+            shard_spec: None,
+            maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
+        })
+        .await?;
+    Ok(())
+}
 
-    let total_to_read = total_rows + num_queries;
-    println!(
-        "=== mem_wal_recall_hnsw === corpus={} queries={} k={} ef={} dim={}",
-        total_rows, num_queries, k, ef, DIM
-    );
+struct CheckpointResult {
+    rows: usize,
+    write_wall: Duration,
+    mean_recall: f64,
+    min_recall: f64,
+    median_query_us: u128,
+    p99_query_us: u128,
+    bf_total: Duration,
+    hnsw_total: Duration,
+}
 
-    let cache = std::env::temp_dir().join("mem_wal_recall_hnsw_dbpedia.parquet");
-    download_parquet(&cache).await?;
-    let (all_vectors, rows) = read_embeddings(&cache, total_to_read).await?;
-    if rows < total_to_read {
-        return Err(lance_core::Error::io(format!(
-            "parquet shard only has {} rows, need {}",
-            rows, total_to_read
-        )));
-    }
-
-    let corpus = &all_vectors[..total_rows * DIM];
-    let queries = &all_vectors[total_rows * DIM..(total_rows + num_queries) * DIM];
-
-    // Build a base table + initialize MemWAL, mirroring mem_wal_index_micro.
+async fn run_checkpoint(
+    cp: usize,
+    corpus: &[f32],
+    queries: &[f32],
+    num_queries: usize,
+    k: usize,
+    schema: Arc<ArrowSchema>,
+) -> lance_core::Result<CheckpointResult> {
+    println!("\n=== checkpoint rows={} ===", cp);
     let temp = tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
     let uri = format!("file://{}/lsm", temp.path().display());
-    let schema = make_schema();
-    {
-        // Tiny base table with enough rows to train an IVF/PQ on the base
-        // (the base index doesn't matter for this bench but MemWAL expects
-        // the maintained index to exist on the dataset).
-        let base_n = 1024usize;
-        let base_vec = vec![0.0f32; base_n * DIM];
-        let base_batch = make_batch(0, &base_vec, schema.clone());
-        let reader = RecordBatchIterator::new(std::iter::once(Ok(base_batch)), schema.clone());
-        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default())).await?;
-        let ivf = IvfBuildParams::new(16);
-        let pq = PQBuildParams::new(16, 8);
-        let params = VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf, pq);
-        dataset
-            .create_index(
-                &[VECTOR_COL],
-                IndexType::Vector,
-                Some(VECTOR_INDEX_NAME.to_string()),
-                &params,
-                true,
-            )
-            .await?;
-        dataset
-            .initialize_mem_wal(MemWalConfig {
-                shard_spec: None,
-                maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
-            })
-            .await?;
-    }
+    build_base_dataset(&uri, schema.clone()).await?;
     let dataset = Arc::new(Dataset::open(&uri).await?);
 
     let shard_id = Uuid::new_v4();
     let row_size_estimate = DIM * 4 + 8;
-    let total_batches_max = total_rows.div_ceil(1000);
+    let total_batches_max = cp.div_ceil(1000);
     let writer_config = ShardWriterConfig {
         shard_id,
         shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: true,
-        max_memtable_size: total_rows
-            .saturating_mul(row_size_estimate)
-            .saturating_mul(4),
-        max_memtable_rows: total_rows.saturating_mul(2),
+        max_memtable_size: cp.saturating_mul(row_size_estimate).saturating_mul(4),
+        max_memtable_rows: cp.saturating_mul(2),
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
         max_wal_flush_interval: Some(Duration::from_millis(200)),
         max_unflushed_memtable_bytes: usize::MAX / 2,
@@ -289,22 +336,19 @@ async fn main() -> lance_core::Result<()> {
         .mem_wal_writer(shard_id, writer_config)
         .await?;
 
-    // Skip the base-table rows when assigning corpus IDs so the test can
-    // distinguish them.
-    let id_offset: i64 = 1024 + 1; // after base rows
+    // Skip the base-table rows (1024) when assigning corpus IDs.
+    let id_offset: i64 = 1024 + 1;
     let batch_size = 1000;
-    let total_batches = total_rows.div_ceil(batch_size);
+    let total_batches = cp.div_ceil(batch_size);
     let write_start = Instant::now();
     for i in 0..total_batches {
         let start_row = i * batch_size;
-        let n = batch_size.min(total_rows - start_row);
+        let n = batch_size.min(cp - start_row);
         let batch_vec = &corpus[start_row * DIM..(start_row + n) * DIM];
         let batch = make_batch(id_offset + start_row as i64, batch_vec, schema.clone());
         writer.put(vec![batch]).await?;
     }
 
-    // Wait until the index is caught up. Heartbeat a tiny put every ~400ms
-    // to drive the in-put time-trigger when the corpus stream is exhausted.
     let target_batch_pos = total_batches.saturating_sub(1);
     let mut spins = 0u64;
     loop {
@@ -321,13 +365,13 @@ async fn main() -> lance_core::Result<()> {
             writer.put(vec![dummy]).await?;
         }
     }
+    let write_wall = write_start.elapsed();
     println!(
-        "wrote {} rows in {:.2}s (incl. index catchup)",
-        total_rows,
-        write_start.elapsed().as_secs_f64()
+        "  wrote {} rows in {:.2}s (incl. index catchup)",
+        cp,
+        write_wall.as_secs_f64()
     );
 
-    // Run recall comparison.
     let active = writer.active_memtable_ref().await?;
     let mut recall_sum: f64 = 0.0;
     let mut min_recall: f64 = 1.0;
@@ -339,12 +383,10 @@ async fn main() -> lance_core::Result<()> {
         let q_off = q * DIM;
         let q_vec = &queries[q_off..q_off + DIM];
 
-        // Brute force.
         let bf_t = Instant::now();
-        let bf = brute_force_top_k(corpus, total_rows, q_vec, k);
+        let bf = brute_force_top_k(corpus, cp, q_vec, k);
         bf_total += bf_t.elapsed();
 
-        // HNSW via scanner.
         let inner = Arc::new(Float32Array::from(q_vec.to_vec()));
         let inner_field = Arc::new(Field::new("item", DataType::Float32, true));
         let q_fsl = FixedSizeListArray::try_new(inner_field, DIM as i32, inner, None).unwrap();
@@ -363,8 +405,6 @@ async fn main() -> lance_core::Result<()> {
         hnsw_total += elapsed;
         latencies_us.push(elapsed.as_micros());
 
-        // Extract returned ids from the scanner output. The id column maps
-        // back to corpus row index via `id - id_offset`.
         let mut hnsw_ids: Vec<i64> = Vec::with_capacity(k);
         for b in &batches {
             let id_col = b
@@ -386,29 +426,78 @@ async fn main() -> lance_core::Result<()> {
     }
 
     latencies_us.sort();
-    let median_lat = latencies_us[latencies_us.len() / 2];
-    let p99_lat = latencies_us[latencies_us.len() * 99 / 100];
-    let mean_recall = recall_sum / (num_queries as f64);
-
-    println!();
-    println!("=== RESULTS ===");
-    println!(
-        "recall@{}: mean={:.4} min={:.4} (over {} queries)",
-        k, mean_recall, min_recall, num_queries
-    );
-    println!(
-        "hnsw query latency: median={} us p99={} us total={:.2}s",
-        median_lat,
-        p99_lat,
-        hnsw_total.as_secs_f64()
-    );
-    println!(
-        "brute-force total: {:.2}s (sanity: per-query mean {} us)",
-        bf_total.as_secs_f64(),
-        bf_total.as_micros() / num_queries as u128
-    );
-
+    let median_q = latencies_us[latencies_us.len() / 2];
+    let p99_q = latencies_us[latencies_us.len() * 99 / 100];
     drop(active);
     writer.close().await?;
+    Ok(CheckpointResult {
+        rows: cp,
+        write_wall,
+        mean_recall: recall_sum / num_queries as f64,
+        min_recall,
+        median_query_us: median_q,
+        p99_query_us: p99_q,
+        bf_total,
+        hnsw_total,
+    })
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> lance_core::Result<()> {
+    let checkpoints = env_checkpoints();
+    let num_queries = env_usize("BENCH_NUM_QUERIES", 200);
+    let k = env_usize("BENCH_K", 10);
+    let ef = env_usize("BENCH_EF", 64);
+    let max_cp = *checkpoints.iter().max().unwrap_or(&1_000_000);
+    let total_to_read = max_cp + num_queries;
+
+    println!(
+        "=== mem_wal_recall_hnsw === checkpoints={:?} num_queries={} k={} ef={} dim={}",
+        checkpoints, num_queries, k, ef, DIM
+    );
+
+    let all_vectors = load_corpus(total_to_read).await?;
+    println!(
+        "loaded {} rows × {} dim ({:.2} GB)",
+        total_to_read,
+        DIM,
+        (total_to_read * DIM * 4) as f64 / 1024.0 / 1024.0 / 1024.0
+    );
+    let corpus = &all_vectors[..max_cp * DIM];
+    let queries = &all_vectors[max_cp * DIM..(max_cp + num_queries) * DIM];
+
+    let schema = make_schema();
+    let mut results: Vec<CheckpointResult> = Vec::with_capacity(checkpoints.len());
+    for &cp in &checkpoints {
+        let r = run_checkpoint(cp, corpus, queries, num_queries, k, schema.clone()).await?;
+        results.push(r);
+    }
+
+    println!("\n=== RESULTS ===");
+    println!(
+        "{:<10} {:>14} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",
+        "rows",
+        "write_wall_s",
+        "mean_recall",
+        "min_recall",
+        "q_median_us",
+        "q_p99_us",
+        "bf_s",
+        "hnsw_s"
+    );
+    for r in &results {
+        println!(
+            "{:<10} {:>14.2} {:>12.4} {:>12.4} {:>12} {:>12} {:>10.2} {:>10.2}",
+            r.rows,
+            r.write_wall.as_secs_f64(),
+            r.mean_recall,
+            r.min_recall,
+            r.median_query_us,
+            r.p99_query_us,
+            r.bf_total.as_secs_f64(),
+            r.hnsw_total.as_secs_f64(),
+        );
+    }
+    println!("=== DONE ===");
     Ok(())
 }
