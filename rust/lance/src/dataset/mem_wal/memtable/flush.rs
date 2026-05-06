@@ -544,11 +544,6 @@ impl MemTableFlusher {
         Ok(())
     }
 
-    /// Create an IVF-PQ index from in-memory data.
-    ///
-    /// Writes the index files directly using the pre-computed partition assignments
-    /// and PQ codes from the in-memory index.
-    ///
     /// Create an HNSW + SQ8 index from the in-memory HNSW.
     ///
     /// Writes:
@@ -677,30 +672,24 @@ impl MemTableFlusher {
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
 
-        // Storage metadata is a JSON array of per-partition quantization
-        // metadata. With one partition we emit one `ScalarQuantizationMetadata`
-        // entry. The on-disk reader parses the outer JSON array and decodes
-        // each entry as `ScalarQuantizationMetadata`.
-        let sq_metadata = serde_json::to_string(
-            &lance_index::vector::sq::storage::ScalarQuantizationMetadata {
-                dim,
-                num_bits: 8,
-                bounds: bounds.clone(),
-            },
-        )?;
-        let storage_metadata_json = serde_json::to_string(&[sq_metadata])?;
-        storage_writer.add_schema_metadata(STORAGE_METADATA_KEY, storage_metadata_json);
-        // Per-file SQ metadata key — duplicate of the per-partition entry but
-        // required by the reader's whole-file metadata path.
+        // The reader needs the SQ metadata in two forms: a single
+        // ScalarQuantizationMetadata under SQ_METADATA_KEY (whole-file path),
+        // and a JSON array of per-partition ScalarQuantizationMetadata strings
+        // under STORAGE_METADATA_KEY (per-partition path). With one partition
+        // we serialize the same value twice.
+        let sq_meta = lance_index::vector::sq::storage::ScalarQuantizationMetadata {
+            dim,
+            num_bits: 8,
+            bounds,
+        };
+        let sq_meta_json = serde_json::to_string(&sq_meta)?;
+        storage_writer.add_schema_metadata(
+            STORAGE_METADATA_KEY,
+            serde_json::to_string(&[&sq_meta_json])?,
+        );
         storage_writer.add_schema_metadata(
             lance_index::vector::sq::storage::SQ_METADATA_KEY,
-            serde_json::to_string(
-                &lance_index::vector::sq::storage::ScalarQuantizationMetadata {
-                    dim,
-                    num_bits: 8,
-                    bounds: bounds.clone(),
-                },
-            )?,
+            sq_meta_json,
         );
         storage_writer.finish().await?;
 
