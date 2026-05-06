@@ -520,7 +520,7 @@ mod tests {
 
         let cases = [
             ("s3://bucket/path/to/file", "path/to/file"),
-            // for non ASCII string tests
+            // for non ASCII string tests: the URL encodes them, extract_path must decode back
             ("s3://bucket/测试path/to/file", "测试path/to/file"),
             ("s3://bucket/path/&to/file", "path/&to/file"),
             ("s3://bucket/path/=to/file", "path/=to/file"),
@@ -533,9 +533,43 @@ mod tests {
         for (uri, expected_path) in cases {
             let url = Url::parse(uri).unwrap();
             let path = provider.extract_path(&url).unwrap();
+            // Path::from(decoded_str) stores the decoded representation, same as
+            // Path::from_url_path(encoded_str), so this comparison is correct.
             let expected_path = Path::from(expected_path);
             assert_eq!(path, expected_path)
         }
+    }
+
+    // Regression test for https://github.com/lance-format/lance/issues/6643
+    // extract_path must NOT double-encode paths that contain non-ASCII characters.
+    // url.path() returns a percent-encoded string; we must decode it back to raw
+    // UTF-8 before storing it in a Path, so the object store HTTP client can apply
+    // a single, correct percent-encoding when building the request URL.
+    #[test]
+    fn test_s3_non_ascii_path_no_double_encoding() {
+        let provider = AwsStoreProvider;
+
+        // "s3://bucket/中文路径" → url.path() == "/%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84".
+        // With the buggy Path::parse, the internal representation is "%E4%B8%AD..."
+        // which would be double-encoded to "%25E4%25B8%25AD..." by the S3 HTTP client.
+        // With Path::from_url_path, the internal representation is the decoded UTF-8
+        // string, which equals Path::from("中文路径").
+        let url = Url::parse("s3://bucket/中文路径").unwrap();
+        let path = provider.extract_path(&url).unwrap();
+
+        // Must equal the canonical non-ASCII path (same internal decoded representation).
+        // If double-encoding were still present, this would fail because the internal
+        // path would contain literal '%' characters that Path::from does not.
+        let expected = Path::from("中文路径");
+        assert_eq!(path, expected);
+
+        // Verify the path is NOT the percent-encoded form by ensuring it differs from
+        // a path constructed with the raw percent-encoded string.
+        let double_encoded = Path::from("%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84");
+        assert_ne!(
+            path, double_encoded,
+            "extract_path should decode the URL path, not store the percent-encoded form"
+        );
     }
 
     #[test]

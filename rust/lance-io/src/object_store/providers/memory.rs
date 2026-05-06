@@ -42,7 +42,9 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             output.push_str(domain);
         }
         output.push_str(url.path());
-        Ok(Path::from(output))
+        Path::from_url_path(output).map_err(|e| {
+            lance_core::Error::invalid_input(format!("Failed to parse path '{}': {}", output, e))
+        })
     }
 
     fn calculate_object_store_prefix(
