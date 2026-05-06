@@ -283,12 +283,6 @@ impl ShardWriterConfig {
         self
     }
 
-    #[deprecated(note = "no longer used; HNSW index capacity is sized from max_memtable_rows")]
-    #[allow(unused)]
-    pub fn with_ivf_index_partition_capacity_safety_factor(self, _factor: usize) -> Self {
-        self
-    }
-
     /// Set manifest scan batch size.
     pub fn with_manifest_scan_batch_size(mut self, size: usize) -> Self {
         self.manifest_scan_batch_size = size;
