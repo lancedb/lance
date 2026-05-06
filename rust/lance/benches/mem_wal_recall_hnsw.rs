@@ -230,10 +230,10 @@ async fn load_corpus(needed_rows: usize) -> lance_core::Result<Vec<f32>> {
         );
     }
     if total_rows < needed_rows {
-        return Err(lance_core::Error::io(format!(
-            "dataset only has {} rows, need {}",
+        println!(
+            "  note: dataset exhausted at {} rows (asked {}); caller will adjust",
             total_rows, needed_rows
-        )));
+        );
     }
     Ok(buf)
 }
@@ -467,27 +467,48 @@ async fn run_checkpoint(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> lance_core::Result<()> {
-    let checkpoints = env_checkpoints();
+    let mut checkpoints = env_checkpoints();
     let num_queries = env_usize("BENCH_NUM_QUERIES", 200);
     let k = env_usize("BENCH_K", 10);
     let ef = env_usize("BENCH_EF", 64);
-    let max_cp = *checkpoints.iter().max().unwrap_or(&1_000_000);
-    let total_to_read = max_cp + num_queries;
 
+    // Probe how many rows the dataset actually contains by listing shards
+    // and estimating from the file count, then read all of them. The DBpedia
+    // dataset is exactly 1,000,000 rows across 26 shards; we want to leave
+    // room for `num_queries` queries at the tail.
     println!(
         "=== mem_wal_recall_hnsw === checkpoints={:?} num_queries={} k={} ef={} dim={}",
         checkpoints, num_queries, k, ef, DIM
     );
 
-    let all_vectors = load_corpus(total_to_read).await?;
+    // Pull the entire dataset; queries come from the last `num_queries` rows
+    // and corpus from `[0, total - num_queries)`. Any checkpoint larger than
+    // the available corpus size is clamped down.
+    let max_cp_requested = *checkpoints.iter().max().unwrap_or(&1_000_000);
+    // load_corpus returns exactly the rows it could read, capped at max
+    // available; ask for max_cp_requested + num_queries up front so the
+    // common case (max_cp + queries <= dataset) avoids extra shards.
+    let all_vectors = load_corpus(max_cp_requested + num_queries).await?;
+    let total_rows_loaded = all_vectors.len() / DIM;
+    let max_corpus = total_rows_loaded.saturating_sub(num_queries);
     println!(
-        "loaded {} rows × {} dim ({:.2} GB)",
-        total_to_read,
+        "loaded {} rows × {} dim ({:.2} GB); corpus available = {}, queries = last {} rows",
+        total_rows_loaded,
         DIM,
-        (total_to_read * DIM * 4) as f64 / 1024.0 / 1024.0 / 1024.0
+        (total_rows_loaded * DIM * 4) as f64 / 1024.0 / 1024.0 / 1024.0,
+        max_corpus,
+        num_queries
     );
-    let corpus = &all_vectors[..max_cp * DIM];
-    let queries = &all_vectors[max_cp * DIM..(max_cp + num_queries) * DIM];
+    // Clamp any checkpoint that exceeds available corpus rows.
+    for cp in checkpoints.iter_mut() {
+        if *cp > max_corpus {
+            println!("  clamping checkpoint {} → {}", cp, max_corpus);
+            *cp = max_corpus;
+        }
+    }
+    let corpus = &all_vectors[..max_corpus * DIM];
+    let queries = &all_vectors
+        [max_corpus * DIM..(max_corpus + num_queries.min(total_rows_loaded - max_corpus)) * DIM];
 
     let schema = make_schema();
     let mut results: Vec<CheckpointResult> = Vec::with_capacity(checkpoints.len());
