@@ -247,11 +247,13 @@ async fn main() -> lance_core::Result<()> {
 
             let elapsed = phase_start.elapsed();
             let throughput = cp as f64 / elapsed.as_secs_f64();
+            let rss_kb = read_rss_kb();
             println!(
-                "[checkpoint] rows={} cumulative_wall_ms={} indexed_throughput_rows_per_sec={:.1}",
+                "[checkpoint] rows={} cumulative_wall_ms={} indexed_throughput_rows_per_sec={:.1} rss_mb={}",
                 cp,
                 elapsed.as_millis(),
-                throughput
+                throughput,
+                rss_kb / 1024,
             );
 
             let active = writer.active_memtable_ref().await?;
@@ -309,12 +311,14 @@ async fn main() -> lance_core::Result<()> {
         .with_build_params(HnswBuildParams::default()),
     ))];
     for &cp in &checkpoints {
-        let elapsed = measure_flush(cp, dim, batch_size, &index_configs).await?;
+        let (elapsed, disk_bytes) = measure_flush(cp, dim, batch_size, &index_configs).await?;
         println!(
-            "[flush] rows={} flush_wall_ms={} throughput_rows_per_sec={:.0}",
+            "[flush] rows={} flush_wall_ms={} throughput_rows_per_sec={:.0} on_disk_bytes={} on_disk_mb={:.1}",
             cp,
             elapsed.as_millis(),
-            cp as f64 / elapsed.as_secs_f64()
+            cp as f64 / elapsed.as_secs_f64(),
+            disk_bytes,
+            disk_bytes as f64 / 1024.0 / 1024.0,
         );
     }
 
@@ -327,7 +331,7 @@ async fn measure_flush(
     dim: usize,
     batch_size: usize,
     index_configs: &[MemIndexConfig],
-) -> lance_core::Result<Duration> {
+) -> lance_core::Result<(Duration, u64)> {
     let s = schema(dim);
     let mut memtable = MemTable::new(s.clone(), 1, vec![]).unwrap();
     let registry =
@@ -362,5 +366,42 @@ async fn measure_flush(
     let _result = flusher
         .flush_with_indexes(&memtable, epoch, index_configs)
         .await?;
-    Ok(t.elapsed())
+    let elapsed = t.elapsed();
+
+    let disk_bytes = dir_size_bytes(&temp_path);
+    Ok((elapsed, disk_bytes))
+}
+
+fn read_rss_kb() -> u64 {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                if let Some(num) = rest.split_whitespace().next() {
+                    if let Ok(v) = num.parse::<u64>() {
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(md) = entry.metadata() {
+                total += md.len();
+            }
+        }
+    }
+    total
 }
