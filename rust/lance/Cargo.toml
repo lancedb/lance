@@ -124,6 +124,8 @@ geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
+parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
@@ -220,6 +222,10 @@ harness = false
 
 [[bench]]
 name = "mem_wal_index_micro"
+harness = false
+
+[[bench]]
+name = "mem_wal_recall_hnsw"
 harness = false
 
 [lints]
