@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, pin::Pin};
 
@@ -682,14 +681,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .unwrap_or_default()
         } else {
             HashMap::new()
-        };
-        let progress = self.progress.clone();
-        let total = if let (lower, Some(upper)) = data.size_hint()
-            && lower == upper
-        {
-            Some(lower as u64)
-        } else {
-            None
         };
 
         let partition_map = Arc::new(precomputed_partitions);
