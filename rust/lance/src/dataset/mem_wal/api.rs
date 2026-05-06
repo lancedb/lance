@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardSpec};
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -333,13 +332,21 @@ async fn load_vector_index_config(
     })?;
     let column = field.name.clone();
 
-    let distance_type = match dataset
+    // Inherit the base table's distance type so the in-memory index and the
+    // base index produce comparable distances. Surface the open error
+    // instead of silently defaulting to L2 — flushed `IVF_HNSW_SQ` files
+    // bake this metric into their on-disk metadata, so a wrong default would
+    // be durable corruption.
+    let distance_type = dataset
         .open_vector_index(&column, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
         .await
-    {
-        Ok(index) => index.metric_type(),
-        Err(_) => DistanceType::L2,
-    };
+        .map_err(|e| {
+            Error::invalid_input(format!(
+                "Failed to open base vector index '{}' to inherit distance type: {}",
+                index_name, e
+            ))
+        })?
+        .metric_type();
 
     Ok(MemIndexConfig::hnsw(
         index_name.to_string(),

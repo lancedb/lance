@@ -389,6 +389,13 @@ impl OnlineHnswBuilder {
     ///
     /// Visible nodes are those whose insert has fully returned. Returns
     /// (node_id, distance) pairs sorted by ascending distance.
+    /// Return the top candidates from beam search.
+    ///
+    /// Returns up to `ef.max(k)` candidates ordered by distance. The caller
+    /// is responsible for any post-filtering (visibility, etc.) and the final
+    /// truncate to `k`. Returning the full beam — not just `k` — lets a
+    /// post-filter that drops some candidates still produce up to `k`
+    /// results before recall regresses.
     pub fn search(
         &self,
         query: arrow_array::ArrayRef,
@@ -437,7 +444,10 @@ impl OnlineHnswBuilder {
 
         let _ = self.visited_generator_queue.push(visited_generator);
 
-        result.into_iter().take(k).collect()
+        // Return up to `ef.max(k)` so post-filtering at the caller has more
+        // headroom than just `k`.
+        let limit = ef.max(k);
+        result.into_iter().take(limit).collect()
     }
 
     /// Snapshot the current graph as an immutable on-disk Lance HNSW.

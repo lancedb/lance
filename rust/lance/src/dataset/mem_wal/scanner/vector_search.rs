@@ -454,9 +454,9 @@ mod tests {
         let query = create_query_vector();
         let plan = planner.plan_search(&query, 10, 8, None).await;
 
-        // Plan creation should succeed (even if execution would fail on empty data)
-        // The important thing is the plan structure is correct
-        assert!(plan.is_ok() || plan.is_err()); // Either is fine for structure test
+        // Plan construction must succeed. Execution against empty data is a
+        // separate concern handled by integration tests.
+        plan.expect("planner should produce a plan even when memtables are empty");
     }
 
     #[tokio::test]

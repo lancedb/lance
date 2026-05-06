@@ -244,7 +244,15 @@ impl MemTableFlusher {
                         .await?;
 
                     let schema = dataset.schema();
-                    let field_idx = schema.field(&hnsw_config.column).map(|f| f.id).unwrap_or(0);
+                    let field_idx = schema
+                        .field(&hnsw_config.column)
+                        .map(|f| f.id)
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "HNSW index '{}' references column '{}' which is not in the dataset schema",
+                                hnsw_config.name, hnsw_config.column
+                            ))
+                        })?;
                     index_meta.fields = vec![field_idx];
                     index_meta.dataset_version = dataset.version().version;
                     let fragment_ids: roaring::RoaringBitmap =
@@ -464,7 +472,12 @@ impl MemTableFlusher {
                 .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
 
             let schema = dataset.schema();
-            let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
+            let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "FTS index '{}' references column '{}' which is not in the dataset schema",
+                    fts_cfg.name, fts_cfg.column
+                ))
+            })?;
 
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
 
@@ -1138,7 +1151,7 @@ mod tests {
         assert_eq!(result.generation.generation, 1);
         assert_eq!(result.rows_flushed, num_vectors);
 
-        // Verify the flushed dataset has the IVF-PQ index
+        // Verify the flushed dataset has the HNSW index
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
             base_uri, shard_id, result.generation.path

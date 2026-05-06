@@ -49,7 +49,6 @@ impl Debug for VectorIndexExec {
         let mut debug = f.debug_struct("VectorIndexExec");
         debug
             .field("column", &self.query.column)
-            .field("k", &self.query.k)
             .field("k", &self.query.k);
         if let Some(ef) = self.query.ef {
             debug.field("ef", &ef);
@@ -157,13 +156,13 @@ impl VectorIndexExec {
     ///
     /// Distances are exact because the in-memory HNSW is backed by FLAT
     /// (uncompressed) vectors; no refine step is needed.
-    fn query_index(&self) -> Vec<(f32, u64)> {
+    fn query_index(&self) -> Result<Vec<(f32, u64)>> {
         let Some(index) = self.indexes.get_hnsw_by_column(&self.query.column) else {
-            return vec![];
+            return Ok(vec![]);
         };
 
         let Some(max_visible_row) = self.compute_max_visible_row() else {
-            return vec![];
+            return Ok(vec![]);
         };
 
         // Normalize the query vector to a single-row FixedSizeListArray.
@@ -174,15 +173,15 @@ impl VectorIndexExec {
             let values = self.query.query_vector.clone();
             let dim = values.len() as i32;
             let field = Arc::new(Field::new("item", values.data_type().clone(), true));
-            match FixedSizeListArray::try_new(field, dim, values, None) {
-                Ok(arr) => arr,
-                Err(_) => return vec![],
-            }
+            FixedSizeListArray::try_new(field, dim, values, None).map_err(|e| {
+                Error::invalid_input(format!(
+                    "Failed to wrap vector query into FixedSizeListArray (dim={}): {}",
+                    dim, e
+                ))
+            })?
         };
 
-        let mut results = index
-            .search(&fsl, self.query.k, self.query.ef, max_visible_row)
-            .unwrap_or_default();
+        let mut results = index.search(&fsl, self.query.k, self.query.ef, max_visible_row)?;
 
         if self.query.distance_lower_bound.is_some() || self.query.distance_upper_bound.is_some() {
             results.retain(|&(dist, _)| {
@@ -193,7 +192,7 @@ impl VectorIndexExec {
         }
 
         results.truncate(self.query.k);
-        results
+        Ok(results)
     }
 
     /// Materialize rows from batch store with distance column.
@@ -341,7 +340,9 @@ impl ExecutionPlan for VectorIndexExec {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Query the index (visibility filtering happens inside search)
-        let results = self.query_index();
+        let results = self
+            .query_index()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         // Materialize the rows
         let batches = self.materialize_rows(&results)?;

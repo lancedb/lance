@@ -21,9 +21,7 @@ pub mod online;
 
 pub use builder::HNSW;
 pub use index::HNSWIndex;
-pub use online::{
-    OnlineGraphBuilderNode, OnlineHnswBottomView, OnlineHnswBuilder, OnlineHnswLevelView,
-};
+pub use online::OnlineHnswBuilder;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";

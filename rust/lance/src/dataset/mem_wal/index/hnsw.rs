@@ -508,9 +508,21 @@ impl VectorStore for MemHnswStorageView {
 }
 
 /// Distance calculator that operates over `MemHnswStorageView`'s f32 buffers.
+///
+/// Two construction modes:
+/// - From an external query (`new_for_query`): the query is owned because the
+///   caller's `ArrayRef` lifetime isn't tied to the view.
+/// - From an existing id (`new_for_id`): the query borrows the view's own
+///   buffer to avoid a `dim*4`-byte copy on the hot insert path. This matters
+///   because `select_neighbors_heuristic` builds an `ef_construction`-sized
+///   pool of these, so the per-call copy was order of `ef * dim * 4` bytes
+///   per insert.
 pub struct MemHnswDistCalc<'a> {
     view: &'a MemHnswStorageView,
-    query: Vec<f32>,
+    /// `None` is a tombstone used when `new_for_id` is called with an id past
+    /// the view's snapshot — `distance()` returns +inf so the search path
+    /// drops that candidate.
+    query: Option<std::borrow::Cow<'a, [f32]>>,
 }
 
 impl<'a> MemHnswDistCalc<'a> {
@@ -524,22 +536,22 @@ impl<'a> MemHnswDistCalc<'a> {
         };
         Self {
             view,
-            query: query_vec,
+            query: Some(std::borrow::Cow::Owned(query_vec)),
         }
     }
 
     fn new_for_id(view: &'a MemHnswStorageView, id: u32) -> Self {
         // The graph's `level_neighbors` lists are published via `ArcSwap`
-        // and may include ids beyond this view's snapshot — the writer
-        // could have appended a new vector and published reverse edges
-        // referencing it after this view was constructed. If the seed
-        // candidate is out of snapshot, we use an empty query as a
-        // tombstone; `distance()` returns +inf for any id so the search
-        // path drops the candidate.
+        // and may include ids beyond this view's snapshot — the writer could
+        // have appended a new vector and published reverse edges referencing
+        // it after this view was constructed. If the seed candidate is out
+        // of snapshot, we tombstone the calculator.
         let query = if (id as usize) < view.visible_len {
-            view.vector_slice(id).to_vec()
+            // Borrow the view's own buffer instead of copying — the buffer
+            // outlives `'a` because the view holds an Arc to the storage.
+            Some(std::borrow::Cow::Borrowed(view.vector_slice(id)))
         } else {
-            Vec::new()
+            None
         };
         Self { view, query }
     }
@@ -547,25 +559,24 @@ impl<'a> MemHnswDistCalc<'a> {
 
 impl DistCalculator for MemHnswDistCalc<'_> {
     fn distance(&self, id: u32) -> f32 {
-        if self.query.is_empty() || (id as usize) >= self.view.visible_len {
+        let Some(query) = self.query.as_deref() else {
+            return f32::INFINITY;
+        };
+        if (id as usize) >= self.view.visible_len {
             return f32::INFINITY;
         }
         let v = self.view.vector_slice(id);
-        compute_distance(&self.query, v, self.view.storage.distance_type)
+        compute_distance(query, v, self.view.storage.distance_type)
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
-        if self.query.is_empty() {
+        let Some(query) = self.query.as_deref() else {
             return vec![f32::INFINITY; self.view.visible_len];
-        }
+        };
         let mut out = Vec::with_capacity(self.view.visible_len);
         for id in 0..self.view.visible_len as u32 {
             let v = self.view.vector_slice(id);
-            out.push(compute_distance(
-                &self.query,
-                v,
-                self.view.storage.distance_type,
-            ));
+            out.push(compute_distance(query, v, self.view.storage.distance_type));
         }
         out
     }
@@ -578,17 +589,9 @@ impl DistCalculator for MemHnswDistCalc<'_> {
 fn compute_distance(query: &[f32], vector: &[f32], distance_type: DistanceType) -> f32 {
     match distance_type {
         DistanceType::L2 => f32::l2(query, vector),
-        DistanceType::Cosine => {
-            // Cosine on the primitive slice — match FlatFloatStorage's behavior.
-            // FlatFloatStorage uses `distance_type.func()` which dispatches.
-            let f = distance_type.func();
-            f(query, vector)
-        }
         DistanceType::Dot => f32::dot(query, vector),
-        _ => {
-            let f = distance_type.func();
-            f(query, vector)
-        }
+        // Cosine and other variants go through the dispatched fn.
+        _ => distance_type.func()(query, vector),
     }
 }
 
@@ -737,9 +740,18 @@ impl HnswMemIndex {
     /// buffer is not copied; the storage holds an Arc to the
     /// `FixedSizeListArray` for the lifetime of the MemTable.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
-        let Some((col_idx, _)) = batch.schema().column_with_name(&self.column) else {
-            return Ok(());
-        };
+        // Bail loudly if the column is missing rather than silently skipping —
+        // a partial-schema batch reaching this code path means the index will
+        // silently desync from the data.
+        let (col_idx, _) = batch
+            .schema()
+            .column_with_name(&self.column)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "HNSW index column '{}' is not in the inserted batch schema",
+                    self.column
+                ))
+            })?;
         let column = batch.column(col_idx);
         let fsl_ref = column.as_fixed_size_list_opt().ok_or_else(|| {
             Error::invalid_input(format!(
@@ -757,6 +769,16 @@ impl HnswMemIndex {
                 "Column '{}' must be FixedSizeList<Float32>, got values type {:?}",
                 self.column,
                 fsl_ref.values().data_type()
+            )));
+        }
+        // Vector indexes don't have a sensible "null vector" semantics —
+        // distances on uninitialized buffer bytes are garbage. Reject FSLs
+        // that contain null rows up front.
+        if fsl_ref.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "HNSW index column '{}' has {} null row(s); null vectors are not supported",
+                self.column,
+                fsl_ref.null_count()
             )));
         }
         let fsl: Arc<FixedSizeListArray> = Arc::new(fsl_ref.clone());
@@ -827,11 +849,12 @@ impl HnswMemIndex {
                 }
             })
             .collect();
-        // search_inner may return at most `ef_actual` items; slice to k.
-        if out.len() > k {
-            out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            out.truncate(k);
-        }
+        // `OnlineHnswBuilder::search` returns up to `ef` candidates ordered by
+        // distance. After visibility filtering some may be dropped, so re-sort
+        // and truncate to `k` here (the post-filter ordering may still hold but
+        // the sort is cheap and keeps the contract robust).
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(k);
         Ok(out)
     }
 

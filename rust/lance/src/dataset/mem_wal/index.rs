@@ -510,17 +510,19 @@ impl IndexStore {
                 handles.push((name.as_str(), "fts", handle));
             }
 
-            // Collect results, log timing, and check for errors
+            // Collect results, log timing, and check for errors. Keep the raw
+            // `Duration` so sub-millisecond timings (the steady-state case for
+            // BTree updates) are preserved instead of getting truncated to 0.
             let mut first_error: Option<Error> = None;
-            let mut timings: Vec<(&str, &str, u128)> = Vec::new();
+            let mut timings: Vec<(&str, &str, std::time::Duration)> = Vec::new();
 
             for (name, idx_type, handle) in handles {
                 match handle.join() {
                     Ok((duration, Ok(()))) => {
-                        timings.push((name, idx_type, duration.as_millis()));
+                        timings.push((name, idx_type, duration));
                     }
                     Ok((duration, Err(e))) => {
-                        timings.push((name, idx_type, duration.as_millis()));
+                        timings.push((name, idx_type, duration));
                         if first_error.is_none() {
                             first_error = Some(e);
                         }
@@ -538,15 +540,9 @@ impl IndexStore {
                 return Err(e);
             }
 
-            // Convert timings to HashMap<String, Duration>
             let duration_map: std::collections::HashMap<String, std::time::Duration> = timings
                 .into_iter()
-                .map(|(name, _idx_type, ms)| {
-                    (
-                        name.to_string(),
-                        std::time::Duration::from_millis(ms as u64),
-                    )
-                })
+                .map(|(name, _idx_type, duration)| (name.to_string(), duration))
                 .collect();
 
             // Update global watermark to the max batch position
