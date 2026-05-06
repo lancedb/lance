@@ -10,6 +10,7 @@ use lance_core::{
 };
 use lance_index::{
     INDEX_FILE_NAME,
+    IndexType,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
@@ -27,6 +28,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
+
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -72,6 +74,43 @@ async fn build_stable_row_id_filter(
 
     // Merge all fragment-local row-id sets into one exact membership structure.
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
+}
+
+fn scalar_index_type_from_details(details: &prost_types::Any) -> IndexType {
+    let type_url = details.type_url.as_str();
+    if type_url.ends_with("BTreeIndexDetails") {
+        IndexType::BTree
+    } else if type_url.ends_with("BitmapIndexDetails") {
+        IndexType::Bitmap
+    } else if type_url.ends_with("LabelListIndexDetails") {
+        IndexType::LabelList
+    } else if type_url.ends_with("NGramIndexDetails") {
+        IndexType::NGram
+    } else if type_url.ends_with("ZoneMapIndexDetails") {
+        IndexType::ZoneMap
+    } else if type_url.ends_with("BloomFilterIndexDetails") {
+        IndexType::BloomFilter
+    } else if type_url.ends_with("RTreeIndexDetails") {
+        IndexType::RTree
+    } else if type_url.ends_with("InvertedIndexDetails") {
+        IndexType::Inverted
+    } else if type_url.ends_with("JsonIndexDetails") {
+        // Json index is a wrapper around another scalar index.
+        // `JsonIndex::index_type` currently reports `Scalar`.
+        IndexType::Scalar
+    } else {
+        // Fall back to legacy scalar (btree) type.
+        IndexType::Scalar
+    }
+}
+
+async fn scalar_index_type_from_metadata(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+) -> Result<IndexType> {
+    let details = super::scalar::fetch_index_details(dataset, column, index).await?;
+    Ok(scalar_index_type_from_details(details.as_ref()))
 }
 
 async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
@@ -310,36 +349,35 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         }
     } else {
         let mut frag_bitmap = base_unindexed_bitmap;
-        let mut indices = Vec::with_capacity(old_indices.len());
+        // Avoid opening scalar indices just to validate delta consistency.
+        // Some scalar indices (e.g. FTS) can be extremely memory-intensive to load.
+        let mut index_type: Option<IndexType> = None;
         for idx in old_indices {
-            match dataset
-                .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
-                .await
-            {
-                Ok(index) => indices.push(index),
+            let current = match scalar_index_type_from_metadata(dataset.as_ref(), &field_path, idx).await {
+                Ok(t) => t,
                 Err(e) => {
                     log::warn!(
-                        "Cannot open index on column '{}': {}. \
+                        "Cannot determine index type on column '{}': {}. \
                          Skipping index merge for this column.",
                         field_path,
                         e
                     );
                     return Ok(None);
                 }
+            };
+            if let Some(expected) = index_type {
+                if expected != current {
+                    return Err(Error::index(format!(
+                        "Append index: invalid index deltas: {:?}",
+                        old_indices
+                    )));
+                }
+            } else {
+                index_type = Some(current);
             }
         }
 
-        if indices
-            .windows(2)
-            .any(|w| w[0].index_type() != w[1].index_type())
-        {
-            return Err(Error::index(format!(
-                "Append index: invalid index deltas: {:?}",
-                old_indices
-            )));
-        }
-
-        let index_type = indices[0].index_type();
+        let index_type = index_type.ok_or_else(|| Error::index("no index deltas".to_owned()))?;
         match index_type {
             it if it.is_scalar() => {
                 // Use effective bitmap (intersected with existing dataset fragments)
@@ -436,7 +474,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             }
             _ => Err(Error::index(format!(
                 "Append index: invalid index type: {:?}",
-                indices[0].index_type()
+                index_type
             ))),
         }
     }?;
@@ -475,6 +513,7 @@ mod tests {
         scalar::ScalarIndexParams,
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
+    use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
@@ -938,6 +977,75 @@ mod tests {
         assert!(
             merge_result.is_some(),
             "subset merges should respect the caller-provided indices"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_inverted_index_after_append() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..10)),
+                Arc::new(StringArray::from_iter_values((0..10).map(|i| format!("hello {i}")))),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Append more rows to create unindexed fragments
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from_iter_values(10..20)),
+                Arc::new(StringArray::from_iter_values((10..20).map(|i| format!("world {i}")))),
+            ],
+        )
+        .unwrap();
+        let reader2 = RecordBatchIterator::new(vec![Ok(batch2)], schema);
+        dataset.append(reader2, None).await.unwrap();
+
+        assert!(
+            !dataset
+                .unindexed_fragments("text_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "expected unindexed fragments after append"
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        assert!(
+            dataset
+                .unindexed_fragments("text_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "expected optimize to cover all fragments"
         );
     }
 

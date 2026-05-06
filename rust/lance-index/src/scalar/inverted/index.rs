@@ -122,6 +122,57 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionLoadStrategy {
+    /// Load and keep all partitions in memory when opening the index.
+    Eager,
+    /// Keep only partition IDs and load partitions on-demand during searches.
+    IdOnly,
+}
+
+impl PartitionLoadStrategy {
+    fn is_id_only(self) -> bool {
+        matches!(self, Self::IdOnly)
+    }
+}
+
+fn parse_partition_load_strategy(value: &str) -> Option<PartitionLoadStrategy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "eager" | "load" | "loaded" => Some(PartitionLoadStrategy::Eager),
+        "id_only" | "id-only" | "idonly" | "by_id" | "by-id" => Some(PartitionLoadStrategy::IdOnly),
+        _ => None,
+    }
+}
+
+const DEFAULT_FTS_PARTITION_LOAD_STRATEGY: PartitionLoadStrategy = PartitionLoadStrategy::Eager;
+
+static LANCE_FTS_PARTITION_LOAD_STRATEGY: LazyLock<PartitionLoadStrategy> = LazyLock::new(|| {
+    if let Ok(v) = std::env::var("LANCE_FTS_PARTITION_LOAD_STRATEGY") {
+        if let Some(strategy) = parse_partition_load_strategy(&v) {
+            return strategy;
+        }
+        log::warn!(
+            "Invalid LANCE_FTS_PARTITION_LOAD_STRATEGY='{}'. Expected eager|id_only.",
+            v
+        );
+    }
+
+    DEFAULT_FTS_PARTITION_LOAD_STRATEGY
+});
+
+fn parse_id_only_search_concurrency(value: Option<&str>) -> usize {
+    let requested = value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1);
+    let max_allowed = get_num_compute_intensive_cpus().max(1);
+    requested.clamp(1, max_allowed)
+}
+
+/// Controls max concurrent partition tasks when `LANCE_FTS_PARTITION_LOAD_STRATEGY=id_only`.
+static LANCE_FTS_ID_ONLY_SEARCH_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    parse_id_only_search_concurrency(std::env::var("LANCE_FTS_ID_ONLY_SEARCH_CONCURRENCY").ok().as_deref())
+});
+
 fn resolve_fts_format_version(
     value: Option<&str>,
 ) -> std::result::Result<InvertedListFormatVersion, Error> {
@@ -204,6 +255,41 @@ impl PartitionCandidates {
         Self {
             tokens_by_position: Vec::new(),
             candidates: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IdOnlyPartitionCandidates {
+    tokens_by_position: Vec<String>,
+    candidates: Vec<DocCandidate>,
+    token_docs: HashMap<String, usize>,
+    num_docs: usize,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub(crate) enum PartitionHandle {
+    Loaded(Arc<InvertedPartition>),
+    Id(u64),
+}
+
+impl PartitionHandle {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Loaded(part) => part.id(),
+            Self::Id(id) => *id,
+        }
+    }
+
+    fn belongs_to_fragment(&self, fragment_mask: u64) -> bool {
+        (self.id() & fragment_mask) == fragment_mask
+    }
+
+    pub(crate) fn as_loaded(&self) -> Option<&Arc<InvertedPartition>> {
+        match self {
+            Self::Loaded(part) => Some(part),
+            Self::Id(_) => None,
         }
     }
 }
@@ -341,9 +427,12 @@ pub(super) fn parse_format_version_from_metadata(
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
     tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
-    pub(crate) partitions: Vec<Arc<InvertedPartition>>,
+    format_version: InvertedListFormatVersion,
+    partition_load_strategy: PartitionLoadStrategy,
+    pub(crate) partitions: Vec<PartitionHandle>,
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
     deleted_fragments: RoaringBitmap,
@@ -368,14 +457,7 @@ impl DeepSizeOf for InvertedIndex {
 
 impl InvertedIndex {
     fn format_version(&self) -> InvertedListFormatVersion {
-        self.partitions
-            .first()
-            .map(|partition| {
-                InvertedListFormatVersion::from_posting_tail_codec(
-                    partition.inverted_list.posting_tail_codec(),
-                )
-            })
-            .unwrap_or_else(current_fts_format_version)
+        self.format_version
     }
 
     fn index_version(&self) -> u32 {
@@ -386,10 +468,15 @@ impl InvertedIndex {
     }
 
     fn posting_tail_codec(&self) -> PostingTailCodec {
-        self.partitions
-            .first()
-            .map(|partition| partition.inverted_list.posting_tail_codec())
-            .unwrap_or_default()
+        if self.token_set_format == TokenSetFormat::Arrow {
+            self.partitions
+                .iter()
+                .find_map(|part| part.as_loaded())
+                .map(|partition| partition.inverted_list.posting_tail_codec())
+                .unwrap_or_default()
+        } else {
+            self.format_version().posting_tail_codec()
+        }
     }
 
     fn to_builder(&self) -> InvertedIndexBuilder {
@@ -456,32 +543,23 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
-    // search the documents that contain the query
-    // return the row ids of the documents sorted by bm25 score
-    // ref: https://en.wikipedia.org/wiki/Okapi_BM25
-    // we first calculate in-partition BM25 scores,
-    // then re-calculate the scores for the top k documents across all partitions
-    #[instrument(level = "debug", skip_all)]
-    pub async fn bm25_search(
+    async fn bm25_search_loaded_partitions(
         &self,
         tokens: Arc<Tokens>,
         params: Arc<FtsSearchParams>,
         operator: Operator,
-        prefilter: Arc<dyn PreFilter>,
+        mask: Arc<RowAddrMask>,
         metrics: Arc<dyn MetricsCollector>,
+        limit: usize,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        let limit = params.limit.unwrap_or(usize::MAX);
-        if limit == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let mask = prefilter.mask();
-
         let mut candidates = BinaryHeap::new();
+
         let parts = self
             .partitions
             .iter()
+            .filter_map(|part| part.as_loaded())
+            .cloned()
             .map(|part| {
-                let part = part.clone();
                 let tokens = tokens.clone();
                 let params = params.clone();
                 let mask = mask.clone();
@@ -503,9 +581,6 @@ impl InvertedIndex {
                         let idx = posting.term_index() as usize;
                         tokens_by_position[idx] = posting.token().to_owned();
                     }
-                    let params = params.clone();
-                    let mask = mask.clone();
-                    let metrics = metrics.clone();
                     spawn_cpu(move || {
                         let candidates = part.bm25_search(
                             params.as_ref(),
@@ -523,8 +598,14 @@ impl InvertedIndex {
                 }
             })
             .collect::<Vec<_>>();
+
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let scorer = IndexBM25Scorer::new(
+            self.partitions
+                .iter()
+                .filter_map(|part| part.as_loaded())
+                .map(|part| part.as_ref()),
+        );
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
             if res.candidates.is_empty() {
@@ -551,8 +632,8 @@ impl InvertedIndex {
                 let mut score = 0.0;
                 for (term_index, freq) in freqs.into_iter() {
                     debug_assert!((term_index as usize) < idf_by_position.len());
-                    score +=
-                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
+                    score += idf_by_position[term_index as usize]
+                        * scorer.doc_weight(freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -568,6 +649,194 @@ impl InvertedIndex {
             .into_iter()
             .map(|Reverse(doc)| (doc.row_id, doc.score.0))
             .unzip())
+    }
+
+    async fn bm25_search_id_only_partitions(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        mask: Arc<RowAddrMask>,
+        metrics: Arc<dyn MetricsCollector>,
+        limit: usize,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let mut candidates = BinaryHeap::new();
+
+        let mut parts = Vec::with_capacity(self.partitions.len());
+        for handle in &self.partitions {
+            let id = handle.id();
+            let store = self.store.clone();
+            let frag_reuse_index = self.frag_reuse_index.clone();
+            let token_set_format = self.token_set_format;
+            let tokens = tokens.clone();
+            let params = params.clone();
+            let mask = mask.clone();
+            let metrics = metrics.clone();
+            parts.push(async move {
+                let index_cache = LanceCache::no_cache();
+                let part = InvertedPartition::load(
+                    store,
+                    id,
+                    frag_reuse_index,
+                    &index_cache,
+                    token_set_format,
+                )
+                .await?;
+
+                let num_docs = part.docs.len();
+                let total_tokens = part.docs.total_tokens_num();
+
+                let postings = part
+                    .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                    .await?;
+                if postings.is_empty() {
+                    return Result::Ok(IdOnlyPartitionCandidates {
+                        tokens_by_position: Vec::new(),
+                        candidates: Vec::new(),
+                        token_docs: HashMap::new(),
+                        num_docs,
+                        total_tokens,
+                    });
+                }
+
+                let mut token_docs: HashMap<String, usize> = HashMap::new();
+                for posting in &postings {
+                    token_docs
+                        .entry(posting.token().to_owned())
+                        .or_insert(posting.posting_len());
+                }
+
+                let max_position = postings
+                    .iter()
+                    .map(|posting| posting.term_index() as usize)
+                    .max()
+                    .unwrap_or_default();
+                let mut tokens_by_position = vec![String::new(); max_position + 1];
+                for posting in &postings {
+                    let idx = posting.term_index() as usize;
+                    tokens_by_position[idx] = posting.token().to_owned();
+                }
+
+                let candidates = spawn_cpu(move || {
+                    part.bm25_search(
+                        params.as_ref(),
+                        operator,
+                        mask,
+                        postings,
+                        metrics.as_ref(),
+                    )
+                })
+                .await?;
+
+                Ok(IdOnlyPartitionCandidates {
+                    tokens_by_position,
+                    candidates,
+                    token_docs,
+                    num_docs,
+                    total_tokens,
+                })
+            });
+        }
+
+        // Keep concurrency low by default: avoid holding many TokenSets / postings at once.
+        let mut parts =
+            stream::iter(parts).buffer_unordered(*LANCE_FTS_ID_ONLY_SEARCH_CONCURRENCY);
+
+        let mut partition_results = Vec::new();
+        let mut global_token_docs: HashMap<String, usize> = HashMap::new();
+        let mut total_docs: usize = 0;
+        let mut total_tokens: u64 = 0;
+        while let Some(res) = parts.try_next().await? {
+            total_docs = total_docs.checked_add(res.num_docs).ok_or_else(|| {
+                Error::internal(format!(
+                    "FTS total docs overflow: total_docs={} + part_docs={}",
+                    total_docs, res.num_docs
+                ))
+            })?;
+            total_tokens = total_tokens.checked_add(res.total_tokens).ok_or_else(|| {
+                Error::internal(format!(
+                    "FTS total tokens overflow: total_tokens={} + part_tokens={}",
+                    total_tokens, res.total_tokens
+                ))
+            })?;
+            for (token, docs) in &res.token_docs {
+                *global_token_docs.entry(token.clone()).or_insert(0) += *docs;
+            }
+            if !res.candidates.is_empty() {
+                partition_results.push(res);
+            }
+        }
+
+        let scorer = MemBM25Scorer::new(total_tokens, total_docs, global_token_docs);
+        let mut idf_cache: HashMap<String, f32> = HashMap::new();
+        for res in partition_results {
+            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
+            for token in &res.tokens_by_position {
+                let idf_weight = match idf_cache.get(token) {
+                    Some(weight) => *weight,
+                    None => {
+                        let weight = scorer.query_weight(token);
+                        idf_cache.insert(token.clone(), weight);
+                        weight
+                    }
+                };
+                idf_by_position.push(idf_weight);
+            }
+            for DocCandidate {
+                row_id,
+                freqs,
+                doc_length,
+            } in res.candidates
+            {
+                let mut score = 0.0;
+                for (term_index, freq) in freqs.into_iter() {
+                    debug_assert!((term_index as usize) < idf_by_position.len());
+                    score += idf_by_position[term_index as usize]
+                        * scorer.doc_weight(freq, doc_length);
+                }
+                if candidates.len() < limit {
+                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                } else if candidates.peek().unwrap().0.score.0 < score {
+                    candidates.pop();
+                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                }
+            }
+        }
+
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+            .unzip())
+    }
+
+    // search the documents that contain the query
+    // return the row ids of the documents sorted by bm25 score
+    // ref: https://en.wikipedia.org/wiki/Okapi_BM25
+    // we first calculate in-partition BM25 scores,
+    // then re-calculate the scores for the top k documents across all partitions
+    #[instrument(level = "debug", skip_all)]
+    pub async fn bm25_search(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mask = prefilter.mask();
+
+        if self.partition_load_strategy.is_id_only() {
+            self.bm25_search_id_only_partitions(tokens, params, operator, mask, metrics, limit)
+                .await
+        } else {
+            self.bm25_search_loaded_partitions(tokens, params, operator, mask, metrics, limit)
+                .await
+        }
     }
 
     async fn load_legacy_index(
@@ -603,6 +872,7 @@ impl InvertedIndex {
         });
         let docs_fut = tokio::spawn({
             let store = store.clone();
+            let frag_reuse_index = frag_reuse_index.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
                 let docs = DocSet::load(docs_reader, true, frag_reuse_index).await?;
@@ -619,22 +889,30 @@ impl InvertedIndex {
         Ok(Arc::new(Self {
             params: tokenizer_config,
             store: store.clone(),
+            frag_reuse_index,
             tokenizer,
             token_set_format: TokenSetFormat::Arrow,
-            partitions: vec![Arc::new(InvertedPartition {
+            format_version: current_fts_format_version(),
+            partition_load_strategy: PartitionLoadStrategy::Eager,
+            partitions: vec![PartitionHandle::Loaded(Arc::new(InvertedPartition {
                 id: 0,
                 store,
                 tokens,
                 inverted_list,
                 docs,
                 token_set_format: TokenSetFormat::Arrow,
-            })],
+            }))],
             deleted_fragments: RoaringBitmap::new(),
         }))
     }
 
     pub fn is_legacy(&self) -> bool {
-        self.partitions.len() == 1 && self.partitions[0].is_legacy()
+        self.partitions.len() == 1
+            && self
+                .partitions
+                .first()
+                .and_then(|part| part.as_loaded())
+                .is_some_and(|part| part.is_legacy())
     }
 
     pub async fn load(
@@ -671,6 +949,9 @@ impl InvertedIndex {
                     .transpose()?
                     .unwrap_or(TokenSetFormat::Arrow);
 
+                let format_version = parse_format_version_from_metadata(&reader.schema().metadata)?;
+                let partition_load_strategy = *LANCE_FTS_PARTITION_LOAD_STRATEGY;
+
                 // Load deleted_fragments if present (optional for backward compatibility)
                 let deleted_fragments = if reader.num_rows() > 0 {
                     let metadata_batch = reader.read_range(0..1, None).await?;
@@ -684,37 +965,44 @@ impl InvertedIndex {
                     RoaringBitmap::new()
                 };
 
-                let format = token_set_format;
-                let partitions = partitions.into_iter().map(|id| {
-                    let store = store.clone();
-                    let frag_reuse_index_clone = frag_reuse_index.clone();
-                    let index_cache_for_part =
-                        index_cache.with_key_prefix(format!("part-{}", id).as_str());
-                    let token_set_format = format;
-                    async move {
-                        Result::Ok(Arc::new(
-                            InvertedPartition::load(
-                                store,
-                                id,
-                                frag_reuse_index_clone,
-                                &index_cache_for_part,
-                                token_set_format,
-                            )
-                            .await?,
-                        ))
-                    }
-                });
-                let partitions = stream::iter(partitions)
-                    .buffer_unordered(store.io_parallelism())
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                let partitions = if partition_load_strategy.is_id_only() {
+                    partitions.into_iter().map(PartitionHandle::Id).collect()
+                } else {
+                    let format = token_set_format;
+                    let partitions = partitions.into_iter().map(|id| {
+                        let store = store.clone();
+                        let frag_reuse_index_clone = frag_reuse_index.clone();
+                        let index_cache_for_part =
+                            index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                        let token_set_format = format;
+                        async move {
+                            Result::Ok(PartitionHandle::Loaded(Arc::new(
+                                InvertedPartition::load(
+                                    store,
+                                    id,
+                                    frag_reuse_index_clone,
+                                    &index_cache_for_part,
+                                    token_set_format,
+                                )
+                                .await?,
+                            )))
+                        }
+                    });
+                    stream::iter(partitions)
+                        .buffer_unordered(store.io_parallelism())
+                        .try_collect::<Vec<_>>()
+                        .await?
+                };
 
                 let tokenizer = params.build()?;
                 Ok(Arc::new(Self {
                     params,
                     store,
+                    frag_reuse_index,
                     tokenizer,
                     token_set_format,
+                    format_version,
+                    partition_load_strategy,
                     partitions,
                     deleted_fragments,
                 }))
@@ -744,14 +1032,23 @@ impl Index for InvertedIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
+        if self.partition_load_strategy.is_id_only() {
+            return Ok(serde_json::json!({
+                "params": self.params,
+                "num_tokens": serde_json::Value::Null,
+                "num_docs": serde_json::Value::Null,
+            }));
+        }
         let num_tokens = self
             .partitions
             .iter()
+            .filter_map(|part| part.as_loaded())
             .map(|part| part.tokens.len())
             .sum::<usize>();
         let num_docs = self
             .partitions
             .iter()
+            .filter_map(|part| part.as_loaded())
             .map(|part| part.docs.len())
             .sum::<usize>();
         Ok(serde_json::json!({
@@ -779,16 +1076,41 @@ impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let with_position = options.with_position;
         let io_parallelism = self.store.io_parallelism();
-        let prewarm_futures = self
-            .partitions
-            .iter()
-            .map(Arc::clone)
-            .map(|part| async move {
-                part.inverted_list
-                    .prewarm_posting_lists(with_position)
-                    .await?;
-                Result::Ok(())
-            });
+        let mut prewarm_futures = Vec::with_capacity(self.partitions.len());
+        for part in &self.partitions {
+            match part {
+                PartitionHandle::Loaded(part) => {
+                    let part = Arc::clone(part);
+                    prewarm_futures.push(
+                        async move {
+                            part.inverted_list
+                                .prewarm_posting_lists(with_position)
+                                .await?;
+                            Result::Ok(())
+                        }
+                        .boxed(),
+                    );
+                }
+                PartitionHandle::Id(id) => {
+                    let store = self.store.clone();
+                    let id = *id;
+                    prewarm_futures.push(
+                        async move {
+                            let index_cache = LanceCache::no_cache();
+                            let invert_list_file =
+                                store.open_index_file(&posting_file_path(id)).await?;
+                            let inverted_list =
+                                PostingListReader::try_new(invert_list_file, &index_cache).await?;
+                            inverted_list
+                                .prewarm_posting_lists(with_position)
+                                .await?;
+                            Result::Ok(())
+                        }
+                        .boxed(),
+                    );
+                }
+            }
+        }
         stream::iter(prewarm_futures)
             .buffer_unordered(io_parallelism)
             .try_collect::<Vec<_>>()
@@ -809,7 +1131,6 @@ impl InvertedIndex {
                 Arc::new(NoFilter),
                 Arc::new(NoOpMetricsCollector),
             )
-            .boxed()
             .await?;
 
         Ok(RecordBatch::try_new(
@@ -1286,10 +1607,27 @@ impl TokenSet {
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
-        match format {
-            TokenSetFormat::Arrow => Self::load_arrow(reader).await,
-            TokenSetFormat::Fst => Self::load_fst(reader).await,
-        }
+        let loaded = match format {
+            TokenSetFormat::Arrow => Self::load_arrow(reader).await?,
+            TokenSetFormat::Fst => Self::load_fst(reader).await?,
+        };
+
+        let fst_bytes = match &loaded.tokens {
+            TokenMap::Fst(map) => map.as_fst().size(),
+            TokenMap::HashMap(_) => 0,
+        };
+
+        log::info!(
+            "Loaded TokenSet: format={:?}, tokens={}, next_id={}, total_length_bytes={}, fst_bytes={}, approx_bytes={}",
+            format,
+            loaded.tokens.len(),
+            loaded.next_id,
+            loaded.total_length,
+            fst_bytes,
+            loaded.deep_size_of(),
+        );
+
+        Ok(loaded)
     }
 
     async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
@@ -4003,23 +4341,63 @@ async fn tokenize_and_count(
 ///
 /// In order to calculate BM25 scores we need to know token counts for the entire corpus.  We extract these from the
 /// counted input of the flat search combined with any counts recorded for the indexed portion.
-fn initialize_scorer(
+async fn initialize_scorer(
     index: &Option<InvertedIndex>,
     query_tokens: &Tokens,
     counted_input: &RecordBatch,
-) -> MemBM25Scorer {
+) -> DataFusionResult<MemBM25Scorer> {
     let mut total_tokens = 0;
     let mut num_docs = 0;
     let mut all_token_counts = vec![0; query_tokens.len()];
 
     if let Some(index) = index {
-        let index_bm25_scorer = IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
-        for (token_index, token) in query_tokens.into_iter().enumerate() {
-            let token_nq = index_bm25_scorer.num_docs_containing_token(token);
-            all_token_counts[token_index] = token_nq as u64;
+        if index.partition_load_strategy.is_id_only() {
+            for part in &index.partitions {
+                let part = match part {
+                    PartitionHandle::Loaded(part) => part.clone(),
+                    PartitionHandle::Id(id) => {
+                        let index_cache = LanceCache::no_cache();
+                        Arc::new(
+                            InvertedPartition::load(
+                                index.store.clone(),
+                                *id,
+                                index.frag_reuse_index.clone(),
+                                &index_cache,
+                                index.token_set_format,
+                            )
+                            .await
+                            .map_err(|e| {
+                                datafusion::error::DataFusionError::External(Box::new(e))
+                            })?,
+                        )
+                    }
+                };
+
+                num_docs += part.docs.len();
+                total_tokens += part.docs.total_tokens_num();
+
+                for (token_index, token) in query_tokens.into_iter().enumerate() {
+                    if let Some(token_id) = part.tokens.get(token) {
+                        all_token_counts[token_index] +=
+                            part.inverted_list.posting_len(token_id) as u64;
+                    }
+                }
+            }
+        } else {
+            let index_bm25_scorer = IndexBM25Scorer::new(
+                index
+                    .partitions
+                    .iter()
+                    .filter_map(|p| p.as_loaded())
+                    .map(|p| p.as_ref()),
+            );
+            for (token_index, token) in query_tokens.into_iter().enumerate() {
+                let token_nq = index_bm25_scorer.num_docs_containing_token(token);
+                all_token_counts[token_index] = token_nq as u64;
+            }
+            total_tokens += index_bm25_scorer.total_tokens();
+            num_docs += index_bm25_scorer.num_docs();
         }
-        total_tokens += index_bm25_scorer.total_tokens();
-        num_docs += index_bm25_scorer.num_docs();
     }
 
     num_docs += counted_input.num_rows();
@@ -4055,7 +4433,7 @@ fn initialize_scorer(
             )
         })
         .collect::<HashMap<String, usize>>();
-    MemBM25Scorer::new(total_tokens, num_docs, token_counts_map)
+    Ok(MemBM25Scorer::new(total_tokens, num_docs, token_counts_map))
 }
 
 fn flat_bm25_score(
@@ -4157,7 +4535,7 @@ pub async fn flat_bm25_search_stream(
         tokenize_and_count(chunked, tokenizer, query_tokens.clone(), doc_col_idx).await?;
 
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize)
-    let scorer = initialize_scorer(index, query_tokens.as_ref(), &counted_input);
+    let scorer = initialize_scorer(index, query_tokens.as_ref(), &counted_input).await?;
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
 
     // Finally we emit batches according to the target batch size
@@ -4205,6 +4583,23 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn test_parse_id_only_search_concurrency_defaults_and_clamps() {
+        let max_allowed = get_num_compute_intensive_cpus().max(1);
+
+        assert_eq!(parse_id_only_search_concurrency(None), 1);
+        assert_eq!(parse_id_only_search_concurrency(Some("0")), 1);
+        assert_eq!(parse_id_only_search_concurrency(Some("not-a-number")), 1);
+        assert_eq!(
+            parse_id_only_search_concurrency(Some("9999999")),
+            max_allowed
+        );
+
+        let actual = parse_id_only_search_concurrency(Some("2"));
+        let expected = 2usize.clamp(1, max_allowed);
+        assert_eq!(actual, expected);
+    }
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -4788,8 +5183,10 @@ mod tests {
 
         // Verify the index structure
         assert_eq!(index.partitions.len(), 2);
-        assert_eq!(index.partitions[0].tokens.len(), 1);
-        assert_eq!(index.partitions[1].tokens.len(), 1);
+        let p0 = index.partitions[0].as_loaded().unwrap();
+        let p1 = index.partitions[1].as_loaded().unwrap();
+        assert_eq!(p0.tokens.len(), 1);
+        assert_eq!(p1.tokens.len(), 1);
 
         // Verify the partitions were loaded correctly
 
@@ -4797,16 +5194,16 @@ mod tests {
         // Verify based on actual loading order
         if index.partitions[0].id() == 0 {
             // If partition[0] is ID=0, then it should have 1 document
-            assert_eq!(index.partitions[0].inverted_list.posting_len(0), 1);
-            assert_eq!(index.partitions[1].inverted_list.posting_len(0), 4);
-            assert_eq!(index.partitions[0].docs.len(), 1);
-            assert_eq!(index.partitions[1].docs.len(), 4);
+            assert_eq!(p0.inverted_list.posting_len(0), 1);
+            assert_eq!(p1.inverted_list.posting_len(0), 4);
+            assert_eq!(p0.docs.len(), 1);
+            assert_eq!(p1.docs.len(), 4);
         } else {
             // If partition[0] is ID=1, then it should have 4 documents
-            assert_eq!(index.partitions[0].inverted_list.posting_len(0), 4);
-            assert_eq!(index.partitions[1].inverted_list.posting_len(0), 1);
-            assert_eq!(index.partitions[0].docs.len(), 4);
-            assert_eq!(index.partitions[1].docs.len(), 1);
+            assert_eq!(p0.inverted_list.posting_len(0), 4);
+            assert_eq!(p1.inverted_list.posting_len(0), 1);
+            assert_eq!(p0.docs.len(), 4);
+            assert_eq!(p1.docs.len(), 1);
         }
 
         // Prewarm the inverted index (this loads posting lists into cache)
@@ -4892,7 +5289,7 @@ mod tests {
         let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
             .await
             .unwrap();
-        let inverted_list = &index.partitions[0].inverted_list;
+        let inverted_list = &index.partitions[0].as_loaded().unwrap().inverted_list;
         assert!(
             inverted_list.offsets.is_none(),
             "test should use modern posting layout"
@@ -4992,7 +5389,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inverted_list = &index.partitions[0].inverted_list;
+        let inverted_list = &index.partitions[0].as_loaded().unwrap().inverted_list;
         let posting = inverted_list
             .index_cache
             .get_with_key(&PostingListKey { token_id: 0 })
@@ -5091,6 +5488,8 @@ mod tests {
             .unwrap();
 
         let actual = index.partitions[0]
+            .as_loaded()
+            .unwrap()
             .inverted_list
             .posting_list(0, true, &NoOpMetricsCollector)
             .await
@@ -5361,6 +5760,7 @@ mod tests {
         assert_eq!(updated.index_version(), format_version.index_version());
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
+            let partition = partition.as_loaded().unwrap();
             assert_eq!(
                 partition.inverted_list.posting_tail_codec(),
                 posting_tail_codec

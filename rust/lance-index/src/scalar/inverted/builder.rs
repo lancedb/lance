@@ -2102,6 +2102,7 @@ mod tests {
             InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
+            let partition = partition.as_loaded().unwrap();
             assert_eq!(
                 partition.inverted_list.posting_tail_codec(),
                 posting_tail_codec
@@ -2168,7 +2169,7 @@ mod tests {
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.partitions.len(), 1);
-        let partition = &index.partitions[0];
+        let partition = index.partitions[0].as_loaded().unwrap();
         let token_id = partition.tokens.get("hello").unwrap();
         let posting = partition
             .inverted_list

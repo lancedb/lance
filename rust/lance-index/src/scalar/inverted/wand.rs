@@ -244,6 +244,11 @@ impl PostingIterator {
     }
 
     #[inline]
+    pub(crate) fn posting_len(&self) -> usize {
+        self.list.len()
+    }
+
+    #[inline]
     fn approximate_upper_bound(&self) -> f32 {
         self.approximate_upper_bound
     }
