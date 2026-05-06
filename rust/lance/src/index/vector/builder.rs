@@ -627,11 +627,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// Attach an unindexed input stream. The shuffle is deferred until
     /// `build()` so progress reporting wraps the actual shuffle work.
     /// Data must have schema | ROW_ID | vector_column |.
+    ///
+    /// Passing `None` records "no unindexed data" by installing an empty
+    /// shuffle reader directly, so `build()` won't fall back to re-scanning
+    /// the dataset.
     pub fn shuffle_data_input(
         &mut self,
         data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> &mut Self {
-        *self.shuffle_data_input.lock().unwrap() = data.map(|d| Box::new(d) as UnindexedStream);
+        match data {
+            Some(d) => {
+                *self.shuffle_data_input.lock().unwrap() = Some(Box::new(d) as UnindexedStream);
+            }
+            None => {
+                self.shuffle_reader = Some(Arc::new(EmptyReader));
+            }
+        }
         self
     }
 
