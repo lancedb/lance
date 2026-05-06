@@ -108,21 +108,48 @@ async fn read_embeddings(
         let col = rb
             .column_by_name("openai")
             .ok_or_else(|| lance_core::Error::io("openai column missing".to_string()))?;
-        let list = col.as_list::<i32>();
-        let values = list.values().as_primitive::<Float32Type>();
+        if rows == 0 {
+            println!("openai column type: {:?}", col.data_type());
+        }
+        // Cast the column to FixedSizeList<Float32, DIM>, going through
+        // FixedSizeList<Float64> if needed (parquet drivers sometimes store
+        // 32-bit floats as f64 for compatibility).
+        let cast_target = arrow_schema::DataType::FixedSizeList(
+            Arc::new(Field::new("item", arrow_schema::DataType::Float32, true)),
+            DIM as i32,
+        );
+        let casted = if col.data_type() == &cast_target {
+            col.clone()
+        } else {
+            // Fall back to a generic cast — handles List<Float64>,
+            // FixedSizeList<Float64>, LargeList<Float32>, etc.
+            arrow_cast::cast::cast(col.as_ref(), &cast_target).map_err(|e| {
+                lance_core::Error::io(format!(
+                    "failed to cast openai column ({:?}) to FixedSizeList<Float32, {}>: {}",
+                    col.data_type(),
+                    DIM,
+                    e
+                ))
+            })?
+        };
+        let fsl = casted.as_fixed_size_list();
+        let values = fsl
+            .values()
+            .as_primitive_opt::<Float32Type>()
+            .ok_or_else(|| {
+                lance_core::Error::io(format!(
+                    "fsl values still not Float32 after cast: {:?}",
+                    fsl.values().data_type()
+                ))
+            })?
+            .values();
+
         for i in 0..rb.num_rows() {
             if rows >= max_rows {
                 break;
             }
-            let off = list.value_offsets()[i] as usize;
-            let len = (list.value_offsets()[i + 1] as usize) - off;
-            if len != DIM {
-                return Err(lance_core::Error::io(format!(
-                    "expected {}-dim embedding, got {}",
-                    DIM, len
-                )));
-            }
-            buf.extend_from_slice(&values.values()[off..off + DIM]);
+            let off = i * DIM;
+            buf.extend_from_slice(&values[off..off + DIM]);
             rows += 1;
         }
     }
