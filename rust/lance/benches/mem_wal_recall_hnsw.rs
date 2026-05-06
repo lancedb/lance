@@ -400,6 +400,8 @@ async fn run_checkpoint(
         cp,
         write_wall.as_secs_f64()
     );
+    use std::io::Write;
+    std::io::stdout().flush().ok();
 
     let active = writer.active_memtable_ref().await?;
     let mut recall_sum: f64 = 0.0;
@@ -407,6 +409,7 @@ async fn run_checkpoint(
     let mut bf_total = Duration::ZERO;
     let mut hnsw_total = Duration::ZERO;
     let mut latencies_us: Vec<u128> = Vec::with_capacity(num_queries);
+    let recall_phase_start = Instant::now();
 
     for q in 0..num_queries {
         let q_off = q * DIM;
@@ -452,17 +455,42 @@ async fn run_checkpoint(
         if recall < min_recall {
             min_recall = recall;
         }
+        if (q + 1) % 25 == 0 || q + 1 == num_queries {
+            println!(
+                "    progress: {}/{} queries (running mean recall = {:.4})",
+                q + 1,
+                num_queries,
+                recall_sum / (q + 1) as f64
+            );
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        }
     }
 
+    let recall_phase_wall = recall_phase_start.elapsed();
     latencies_us.sort();
     let median_q = latencies_us[latencies_us.len() / 2];
     let p99_q = latencies_us[latencies_us.len() * 99 / 100];
+    let mean_recall = recall_sum / num_queries as f64;
+    println!(
+        "  recall phase: cp={} mean_recall={:.4} min_recall={:.4} q_median_us={} q_p99_us={} bf_s={:.2} hnsw_s={:.2} wall={:.2}s",
+        cp,
+        mean_recall,
+        min_recall,
+        median_q,
+        p99_q,
+        bf_total.as_secs_f64(),
+        hnsw_total.as_secs_f64(),
+        recall_phase_wall.as_secs_f64()
+    );
+    std::io::stdout().flush().ok();
+
     drop(active);
     writer.close().await?;
     Ok(CheckpointResult {
         rows: cp,
         write_wall,
-        mean_recall: recall_sum / num_queries as f64,
+        mean_recall,
         min_recall,
         median_query_us: median_q,
         p99_query_us: p99_q,
