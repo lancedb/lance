@@ -116,6 +116,24 @@ fn test_plugin_config_survives_proto_roundtrip(
     assert_eq!(tokenize(&mut restored_tokenizer, input), original_tokens);
 }
 
+/// Old indexes saved before the plugin fields existed (or any current index
+/// whose `base_tokenizer != "plugin"`) must still load and build cleanly.
+/// Regression guard for the manifest-compat path.
+#[test]
+#[serial(plugin_tests)]
+fn test_proto_without_plugin_fields_still_builds() {
+    let proto = InvertedIndexDetails {
+        base_tokenizer: Some("simple".to_string()),
+        language: r#""English""#.to_string(),
+        tokenizer_plugin_library: None,
+        tokenizer_plugin_config: None,
+        ..Default::default()
+    };
+    let params: InvertedIndexParams = (&proto).try_into().expect("from proto");
+    let mut tokenizer = params.build().expect("build");
+    assert!(!tokenize(&mut tokenizer, "Hello World").is_empty());
+}
+
 /// A proto with `base_tokenizer = "plugin"` and a missing `tokenizer_plugin_config`
 /// must surface as `Err` from `build()`, not a panic later.
 #[test]

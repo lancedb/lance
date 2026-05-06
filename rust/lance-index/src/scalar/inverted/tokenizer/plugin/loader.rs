@@ -259,6 +259,35 @@ unsafe fn read_c_str_or(ptr: *const std::ffi::c_char) -> &'static str {
 ///     let _ = inst.create_stream("hi");
 /// }
 /// ```
+///
+/// A stream that borrows a temporary input string (e.g. `&format!(...)`)
+/// must be rejected — the plugin may zero-copy the bytes.
+///
+/// ```compile_fail
+/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::{
+/// #     PluginFactory, PluginTokenStream,
+/// # };
+/// fn temp_input_outlives_stream<'a>(
+///     factory: &'a PluginFactory<'a>,
+/// ) -> PluginTokenStream<'a> {
+///     let mut inst = factory.create_tokenizer().unwrap();
+///     inst.create_stream(&format!("temp {}", 1)).unwrap()
+/// }
+/// ```
+///
+/// Two streams from the same instance must be rejected — `create_stream`
+/// takes `&mut self` so the second call cannot run while the first stream
+/// still borrows the instance.
+///
+/// ```compile_fail
+/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::PluginFactory;
+/// fn two_overlapping_streams<'a>(factory: &'a PluginFactory<'a>) {
+///     let mut inst = factory.create_tokenizer().unwrap();
+///     let s1 = inst.create_stream("first").unwrap();
+///     let s2 = inst.create_stream("second").unwrap();
+///     drop((s1, s2));
+/// }
+/// ```
 pub struct PluginFactory<'a> {
     library: &'a TokenizerPluginLibrary,
     factory: *mut LanceTokenizerFactory,
