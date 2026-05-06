@@ -103,6 +103,11 @@ struct Config {
     /// an ABI violation (the host must treat NULL as empty only when the
     /// length is zero). Regression-tests the host's NULL+length check.
     emit_null_with_length: bool,
+    /// If true, `create_factory` succeeds but `create_tokenizer` returns
+    /// NULL with an error. Simulates plugins that defer config validation
+    /// to instance construction; regression-tests the host's eager
+    /// `create_tokenizer` probe in `PluginTokenizer::new`.
+    reject_create_tokenizer: bool,
 }
 
 struct Factory {
@@ -165,12 +170,16 @@ impl Factory {
         let emit_null_with_length = config.contains("\"emit_null_with_length\":true")
             || config.contains("\"emit_null_with_length\": true");
 
+        let reject_create_tokenizer = config.contains("\"reject_create_tokenizer\":true")
+            || config.contains("\"reject_create_tokenizer\": true");
+
         Self {
             config: Config {
                 lowercase,
                 error_after_n_tokens,
                 emit_invalid_utf8,
                 emit_null_with_length,
+                reject_create_tokenizer,
             },
         }
     }
@@ -287,6 +296,8 @@ unsafe extern "C" fn api_version() -> u32 {
 /// The lifetime must outlive the plugin call, so it lives in static storage.
 static REJECT_CONFIG_MSG: &str = "test plugin: simulated config rejection";
 
+static REJECT_CREATE_TOKENIZER_MSG: &str = "test plugin: simulated create_tokenizer rejection";
+
 unsafe extern "C" fn create_factory(config: LanceStringRef, error: *mut LanceError) -> *mut c_void {
     let config_str = config.as_str();
 
@@ -312,14 +323,17 @@ unsafe extern "C" fn destroy_factory(factory: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_tokenizer(
-    factory: *mut c_void,
-    _error: *mut LanceError,
-) -> *mut c_void {
+unsafe extern "C" fn create_tokenizer(factory: *mut c_void, error: *mut LanceError) -> *mut c_void {
     if factory.is_null() {
         return ptr::null_mut();
     }
     let factory = &*(factory as *const Factory);
+    if factory.config.reject_create_tokenizer {
+        if !error.is_null() {
+            (*error).message = LanceStringRef::from_str(REJECT_CREATE_TOKENIZER_MSG);
+        }
+        return ptr::null_mut();
+    }
     let tokenizer = Tokenizer {
         config: factory.config.clone(),
     };

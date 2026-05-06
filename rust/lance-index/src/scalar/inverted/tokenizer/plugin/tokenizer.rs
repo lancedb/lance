@@ -29,11 +29,16 @@ impl PluginTokenizer {
     pub fn new(library_path: impl AsRef<Path>, config: impl Into<String>) -> Result<Self> {
         let library = TokenizerPluginLibrary::load(library_path)?;
         let config = config.into();
-        let factory = OwnedPluginFactory::new(Arc::clone(&library), &config)?;
+        let factory = Arc::new(OwnedPluginFactory::new(Arc::clone(&library), &config)?);
+        // Some plugins accept any config in `create_factory` and defer
+        // validation to `create_tokenizer`; build and drop one instance so
+        // that path's errors surface here as `Err` instead of a panic from
+        // the first `token_stream_*` call.
+        let _probe = factory.create_tokenizer()?;
         Ok(Self {
             library,
             config,
-            factory: Arc::new(factory),
+            factory,
         })
     }
 

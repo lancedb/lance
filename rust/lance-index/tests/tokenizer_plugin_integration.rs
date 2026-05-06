@@ -225,6 +225,25 @@ fn test_plugin_constructor_rejects_invalid_config() {
     );
 }
 
+/// Plugins are allowed to defer config validation to `create_tokenizer`
+/// (factory build succeeds, instance build fails). Without an eager probe
+/// in `PluginTokenizer::new`, that error would only surface as a panic from
+/// the first `token_stream_*` call — defeating the whole point of returning
+/// `Result` from construction.
+#[test]
+#[serial(plugin_tests)]
+fn test_plugin_constructor_rejects_create_tokenizer_failure() {
+    let plugin_path = get_plugin_path();
+    let err = PluginTokenizer::new(&plugin_path, r#"{"reject_create_tokenizer": true}"#)
+        .expect_err("constructor must probe create_tokenizer");
+    assert!(
+        err.to_string()
+            .contains("simulated create_tokenizer rejection"),
+        "got: {}",
+        err
+    );
+}
+
 /// Same contract via the public `build()` path.
 #[test]
 #[serial(plugin_tests)]
