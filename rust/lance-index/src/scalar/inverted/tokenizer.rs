@@ -122,26 +122,12 @@ pub struct InvertedIndexParams {
     #[serde(rename = "num_workers", skip_serializing, default)]
     pub(crate) num_workers: Option<usize>,
 
-    /// Absolute path to a tokenizer plugin shared library.
-    /// When set, the plugin will be loaded and used instead of built-in tokenizers.
-    /// Requires the `tokenizer-plugin` feature.
-    ///
-    /// Must be an absolute path. Relative paths are rejected by `build()` and
-    /// by the proto-conversion path so that the persisted manifest never
-    /// contains a CWD-dependent value — index reopen has to resolve the same
-    /// file from any process, regardless of its working directory.
-    ///
-    /// # Security
-    ///
-    /// Opening an index whose manifest carries this field will dlopen the
-    /// referenced shared library and run its code inside the host process.
-    /// Anyone with write access to the manifest can therefore achieve
-    /// arbitrary native code execution. Only open indexes from sources you
-    /// trust to the same level you trust the host process itself.
+    /// Absolute path to a tokenizer plugin shared library. See `plugin()`
+    /// for the full contract (security model, failure modes, filter chain).
     #[serde(default)]
     pub(crate) tokenizer_plugin_library: Option<String>,
 
-    /// Configuration string for the tokenizer plugin (format defined by plugin).
+    /// Plugin-defined configuration string passed verbatim to the plugin.
     #[serde(default)]
     pub(crate) tokenizer_plugin_config: Option<String>,
 }
@@ -150,12 +136,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
     type Error = Error;
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {
-        // Run the same validation we apply at `build()` so a relative or
-        // empty plugin path can never reach the persisted manifest. The
-        // build path and the persistence path are both reachable from
-        // user-visible APIs, and rejecting in both keeps the contract
-        // symmetrical: anything we accept here can be reopened by any
-        // process, regardless of its CWD.
+        // Same validation as `build()` so a relative/empty plugin path can
+        // never reach the persisted manifest.
         params.validate_plugin_consistency()?;
         Ok(Self {
             base_tokenizer: Some(params.base_tokenizer.clone()),
@@ -200,12 +182,6 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             prefix_only: details.prefix_only,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
-            // The plugin path is required to be absolute by the time it
-            // reaches persistence (see `validate_plugin_consistency` in the
-            // `TryFrom<&InvertedIndexParams>` direction), so we just clone
-            // through. Older manifests carrying a relative value will be
-            // rejected by `build()` rather than silently resolved against
-            // the reader's CWD.
             tokenizer_plugin_library: details.tokenizer_plugin_library.clone(),
             tokenizer_plugin_config: details.tokenizer_plugin_config.clone(),
         })
@@ -386,57 +362,21 @@ impl InvertedIndexParams {
         Ok(value)
     }
 
-    /// Set a tokenizer plugin to use.
+    /// Configure a tokenizer plugin. `library_path` must be an absolute path
+    /// to the plugin shared library (`.so`/`.dylib`/`.dll`); relative paths
+    /// are rejected because the persisted manifest is interpreted by any
+    /// process that later reopens the index. `config` is opaque to Lance and
+    /// passed verbatim to the plugin.
     ///
-    /// `library_path` must be an **absolute** path to the plugin shared
-    /// library (`.so`, `.dylib`, or `.dll`). Relative paths are rejected by
-    /// `build()` and by the proto-conversion path, because the persisted
-    /// path is interpreted by whichever process later reopens the index;
-    /// resolving against the reader's CWD would silently load a different
-    /// file or fail to find anything at all. An index that stays on one
-    /// host therefore needs the same absolute path to exist on every
-    /// process that opens it.
+    /// Plugin tokens still flow through the standard filter chain
+    /// (`max_token_length`, `lower_case`, `stem`, `remove_stop_words`,
+    /// `ascii_folding`); disable any filter the plugin already applies.
     ///
-    /// `config` is the plugin-defined configuration string (e.g. JSON,
-    /// YAML, or plain text). The format is up to the plugin; the value is
-    /// passed through verbatim. It is required at this layer because the
-    /// "empty" representation varies by format (`"{}"` vs. `""`).
-    ///
-    /// # Filter chain
-    ///
-    /// Tokens emitted by the plugin flow through the same post-processing
-    /// chain as the built-in tokenizers. Defaults applied to plugin output:
-    ///
-    /// - `max_token_length = Some(40)` — drops tokens longer than 40 bytes
-    /// - `lower_case = true` — ASCII-lowercases every token
-    /// - `stem = true` — applies the configured language stemmer
-    /// - `remove_stop_words = true` — drops language-specific stop words
-    /// - `ascii_folding = true` — folds Latin diacritics to ASCII
-    ///
-    /// If the plugin already case-normalizes, stems, or strips diacritics on
-    /// its side, set the corresponding option to `false` (e.g.
-    /// `params.lower_case(false).stem(false).ascii_folding(false)`); otherwise
-    /// the filter chain will apply on top of what the plugin produced and may
-    /// surprise users who expect the plugin to be the sole source of truth.
-    ///
-    /// # Security
-    ///
-    /// The shared library at `library_path` is loaded with `dlopen` (or the
-    /// platform equivalent) and its code runs inside the host process.
-    /// Reopening an index whose manifest carries a plugin path will
-    /// transparently do the same load. Anyone with write access to the
-    /// manifest — a misconfigured object store, a shared filesystem, an
-    /// untrusted index publisher — can therefore achieve arbitrary native
-    /// code execution. Only enable plugin tokenizers, and only open indexes
-    /// that use them, when you trust the source as much as the host process.
-    ///
-    /// # Bindings
-    ///
-    /// The plugin tokenizer is exposed only through the Rust API today.
-    /// The Python (`pyo3`) and Java (JNI) bindings have not been extended
-    /// with `tokenizer_plugin_library` / `tokenizer_plugin_config`, so
-    /// plugin tokenizers cannot be configured from those languages. The
-    /// conservative scope is intentional given the security model.
+    /// SECURITY: opening an index whose manifest carries a plugin path will
+    /// `dlopen` the referenced library and execute its code in the host
+    /// process. Only enable this for indexes from sources you trust as much
+    /// as the host. Python/Java bindings intentionally do not expose this
+    /// API today.
     pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(library_path);
@@ -484,28 +424,18 @@ impl InvertedIndexParams {
         }
     }
 
-    /// Single point of validation for the plugin tokenizer fields.
+    /// Single validation point for plugin fields, called from both `build()`
+    /// and the proto-conversion path so callers see a stable failure mode
+    /// regardless of how the params were constructed:
     ///
-    /// Three independent contracts are checked here so callers see a stable
-    /// failure mode regardless of how the params were constructed (the
-    /// `plugin()` builder, JSON deserialization, or proto deserialization):
-    ///
-    /// 1. `tokenizer_plugin_library` / `tokenizer_plugin_config` may only be
-    ///    set when `base_tokenizer == "plugin"`. Otherwise the build path
+    /// 1. plugin fields require `base_tokenizer == "plugin"` (otherwise build
     ///    would silently fall through to the default tokenizer while the
-    ///    metadata still carried a plugin path — search and indexing would
-    ///    then use different tokenizers without any error surface.
-    /// 2. The plugin library path must not be empty. `Path::new("")` is
-    ///    treated as a relative path, so the absolute-path check below
-    ///    would otherwise have to special-case it; rejecting up front
-    ///    keeps the error message specific.
-    /// 3. The plugin library path must be absolute. The persisted path is
-    ///    interpreted by whichever process later reopens the index, and
-    ///    a relative value would resolve against that process's CWD —
-    ///    silently loading a different file or failing to load at all.
-    ///    Rejecting at validation lets us drop the previous CWD-prepending
-    ///    machinery and keeps the contract one-way: a path that reaches
-    ///    persistence is already absolute.
+    ///    metadata still carries a plugin path — indexing and search would
+    ///    end up with different tokenizers).
+    /// 2. plugin library path must not be empty (`Path::new("")` is relative,
+    ///    so it would otherwise have to special-case the check below).
+    /// 3. plugin library path must be absolute (relative would resolve
+    ///    against the reader's CWD — silently loading a different file).
     fn validate_plugin_consistency(&self) -> Result<()> {
         let has_plugin_fields =
             self.tokenizer_plugin_library.is_some() || self.tokenizer_plugin_config.is_some();
@@ -593,25 +523,17 @@ impl InvertedIndexParams {
                 )
             })?;
 
-            // Empty-path / relative-path rejection lives in
-            // `validate_plugin_consistency`, which `build()` already called
-            // before reaching this point. By the time we get here the path
-            // is guaranteed non-empty and absolute, so we can hand it
-            // straight to the loader.
-
+            // Empty/relative paths are already rejected in
+            // `validate_plugin_consistency` (called by `build()`).
             let config = self.tokenizer_plugin_config.as_ref().ok_or_else(|| {
                 Error::invalid_input(
                     "base_tokenizer is 'plugin' but tokenizer_plugin_config is not set.",
                 )
             })?;
 
-            // No `Path::exists()` precheck: `libloading::Library::new` (wrapped
-            // by `TokenizerPluginLibrary::load`) already produces a precise
-            // error for the underlying cause — file not found, missing
-            // dependent shared library, permission denied, missing symbols,
-            // ABI version mismatch — and an extra existence check would only
-            // flatten those into a generic "file not found" while introducing
-            // a TOCTOU window with `Library::new`.
+            // No `Path::exists()` precheck: `libloading::Library::new` already
+            // produces a precise error and a precheck would introduce a TOCTOU
+            // window.
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;
             Ok(TextAnalyzer::builder(tokenizer).dynamic())
         }
@@ -689,12 +611,8 @@ mod tests {
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
     }
 
-    /// `tokenizer_plugin_library` / `tokenizer_plugin_config` arriving via
-    /// JSON or proto deserialization must not be silently ignored when
-    /// `base_tokenizer` is left at its default. Without validation the
-    /// resulting index would be built with the built-in `simple` tokenizer
-    /// while still persisting the plugin path in metadata, leading to a
-    /// silent mismatch between indexing and search tokenizers.
+    /// Plugin fields without `base_tokenizer == "plugin"` must fail loud:
+    /// otherwise indexing would use `simple` while metadata claimed a plugin.
     #[test]
     fn test_build_rejects_plugin_fields_without_plugin_base_tokenizer() {
         let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
@@ -726,9 +644,6 @@ mod tests {
         }
     }
 
-    /// Sanity check the inverse: a default params object without plugin
-    /// fields must still build cleanly through `simple` and not be
-    /// blocked by the new validation.
     #[test]
     fn test_build_default_params_still_succeeds() {
         let params = InvertedIndexParams::default();
@@ -737,11 +652,8 @@ mod tests {
             .expect("default params must still build a simple tokenizer");
     }
 
-    /// An empty `tokenizer_plugin_library` would otherwise descend into
-    /// `libloading::Library::new("")`, which surfaces a relatively
-    /// opaque platform-specific error (the executable's own image, or
-    /// `ERROR_MOD_NOT_FOUND` on Windows). The boundary check should turn
-    /// that into a self-explanatory error before we attempt to load.
+    /// Reject empty paths with a self-explanatory error rather than letting
+    /// `libloading::Library::new("")` surface an opaque platform error.
     #[cfg(feature = "tokenizer-plugin")]
     #[test]
     fn test_build_rejects_empty_plugin_library_path() {
@@ -765,12 +677,8 @@ mod tests {
         }
     }
 
-    /// `tokenizer_plugin_library` must be an absolute path. A relative
-    /// value reaching `build()` would otherwise be loaded against the
-    /// process's CWD and silently differ between the writer and any
-    /// future reader. Reject the misconfiguration with a descriptive
-    /// error rather than letting `libloading` fail with a confusing
-    /// message that hides the real cause.
+    /// Relative paths would resolve against the reader's CWD — silently
+    /// loading a different file. Reject at validation with a clear error.
     #[cfg(feature = "tokenizer-plugin")]
     #[test]
     fn test_build_rejects_relative_plugin_library_path() {
@@ -794,27 +702,15 @@ mod tests {
         }
     }
 
-    /// `Path::new("")` is treated as a relative path, so a naive
-    /// "prepend CWD if not absolute" implementation would turn an empty
-    /// path into the current directory and silently defeat the
-    /// downstream empty-string check. `absolutize_plugin_path` and the
-    /// `plugin()` builder must keep an empty string empty so the
-    /// `build_plugin_tokenizer` boundary check fires with a clear error.
+    /// Pin that empty paths stay empty through `plugin()` and serde — guards
+    /// against a future "prepend CWD if not absolute" rewrite that would
+    /// silently defeat the empty-path validation.
     #[test]
     fn test_plugin_builder_keeps_empty_path_empty() {
         let params = InvertedIndexParams::default().plugin(String::new(), "{}".to_string());
-        assert_eq!(
-            params.tokenizer_plugin_library.as_deref(),
-            Some(""),
-            "plugin builder must not absolutize an empty library path \
-             into the CWD"
-        );
+        assert_eq!(params.tokenizer_plugin_library.as_deref(), Some(""));
     }
 
-    /// Same boundary, reached via JSON deserialization. An external
-    /// producer that hands us `"tokenizer_plugin_library": ""` must not
-    /// have that value rewritten to the reader's CWD by the
-    /// `deserialize_plugin_path` hook.
     #[test]
     fn test_plugin_path_deserialize_keeps_empty_string_empty() {
         let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
@@ -824,20 +720,12 @@ mod tests {
             serde_json::Value::from(""),
         );
         let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            params.tokenizer_plugin_library.as_deref(),
-            Some(""),
-            "deserializer must not absolutize an empty library path \
-             into the reader's CWD"
-        );
+        assert_eq!(params.tokenizer_plugin_library.as_deref(), Some(""));
     }
 
-    /// Relative plugin paths must not survive into the persisted proto.
-    /// `TryFrom<&InvertedIndexParams>` runs `validate_plugin_consistency`,
-    /// which now requires absolute paths, so a stray relative value is
-    /// caught at the persistence boundary even if it slipped past the
-    /// build path (e.g. a caller serialized a hand-built params struct
-    /// without going through `plugin()` and `build()`).
+    /// Catch a stray relative path at persistence even if it slipped past
+    /// the build path (hand-built params serialized without going through
+    /// `plugin()` + `build()`).
     #[test]
     fn test_proto_serialize_rejects_relative_plugin_path() {
         let params = InvertedIndexParams {
@@ -856,9 +744,8 @@ mod tests {
         );
     }
 
-    /// Counterpart to the relative case: an empty string in the proto
-    /// must remain an empty string after `TryFrom`, so the downstream
-    /// `build_plugin_tokenizer` empty-path reject still fires.
+    /// Counterpart: empty proto path stays empty after `TryFrom` so the
+    /// downstream empty-path reject still fires.
     #[test]
     fn test_proto_deserialize_keeps_empty_plugin_path_empty() {
         let details = pbold::InvertedIndexDetails {
@@ -878,11 +765,6 @@ mod tests {
         };
 
         let params = InvertedIndexParams::try_from(&details).expect("proto roundtrip");
-        assert_eq!(
-            params.tokenizer_plugin_library.as_deref(),
-            Some(""),
-            "proto deserializer must not absolutize an empty library path \
-             into the reader's CWD"
-        );
+        assert_eq!(params.tokenizer_plugin_library.as_deref(), Some(""));
     }
 }

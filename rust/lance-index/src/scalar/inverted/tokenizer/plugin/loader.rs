@@ -5,7 +5,7 @@ use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lance_core::{Error, Result};
 use libloading::Library;
@@ -17,29 +17,38 @@ use super::ffi::{
 
 pub struct TokenizerPluginLibrary {
     _library: Library,
-
     plugin: *const CTokenizerPlugin,
 }
 
-// SAFETY: TokenizerPluginLibrary can be shared across threads because:
-// 1. `_library` (libloading::Library) is Send + Sync
-// 2. `plugin` points to an immutable vtable of function pointers that
-//    remains valid as long as `_library` is alive
-// 3. The plugin functions themselves are stateless; mutable state is
-//    confined to Factory/Tokenizer/Stream instances which are NOT
-//    Send/Sync and must be used on a single thread
+// SAFETY: `_library` is Send+Sync; `plugin` points to an immutable vtable
+// that lives as long as `_library`. Per-call mutable state lives in
+// Factory/Tokenizer/Stream instances, not here.
 unsafe impl Send for TokenizerPluginLibrary {}
 unsafe impl Sync for TokenizerPluginLibrary {}
 
-/// Verify that a freshly returned plugin pointer is compatible with the
-/// `CTokenizerPlugin` layout this crate was built against.
-///
-/// The check order matters: `api_version` MUST be read and compared before
-/// touching any other field. The plugin may have been compiled against a
-/// shorter / older vtable layout, so reading the full struct up front
-/// could be an out-of-bounds read against the plugin's actual memory.
-/// `api_version` is, by contract, the first field of every vtable
-/// revision, so reading just that one field is always safe.
+/// Build an `Error` from an out-parameter `CError` returned by a plugin
+/// callback that signalled failure (typically by returning a NULL handle).
+unsafe fn plugin_error(error: &CError, context: &str) -> Error {
+    let msg = if error.has_message() {
+        error.message_str().to_string()
+    } else {
+        "unknown error".to_string()
+    };
+    Error::invalid_input(format!("{}: {}", context, msg))
+}
+
+/// Recover the inner pointer from a `Mutex` in `Drop`, even if the lock is
+/// poisoned. Lets `destroy_*` callbacks still run instead of double-panicking
+/// during unwind (which would escalate to `abort`).
+fn lock_or_recover<T: Copy>(mutex: &mut Mutex<T>) -> T {
+    *mutex.get_mut().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `api_version` MUST be read before any other vtable field. The plugin may
+/// have been compiled against a shorter / older `CTokenizerPlugin` layout, so
+/// reading the full struct up front could be an out-of-bounds read against
+/// the plugin's actual memory. `api_version` is contractually the first field
+/// of every revision, so reading just that one field is always safe.
 fn verify_plugin_compat(plugin: *const CTokenizerPlugin, path: &Path) -> Result<()> {
     if plugin.is_null() {
         return Err(Error::invalid_input(format!(
@@ -48,10 +57,9 @@ fn verify_plugin_compat(plugin: *const CTokenizerPlugin, path: &Path) -> Result<
         )));
     }
 
-    // Read only the first field. `Option<unsafe extern "C" fn() -> u32>`
-    // has the same single-pointer layout as the bare function pointer,
-    // so this dereferences exactly the bytes of `api_version` and no
-    // more.
+    // `Option<unsafe extern "C" fn() -> u32>` has the same single-pointer
+    // layout as the bare function pointer, so this dereferences only the
+    // `api_version` slot.
     let api_version_fn = unsafe {
         let api_version_ptr = plugin as *const Option<unsafe extern "C" fn() -> u32>;
         *api_version_ptr
@@ -70,25 +78,16 @@ fn verify_plugin_compat(plugin: *const CTokenizerPlugin, path: &Path) -> Result<
         )));
     }
 
-    // API version matches the layout we were compiled against — it is
-    // now safe to read the rest of the vtable.
     let p = unsafe { &*plugin };
     validate_vtable(p, path)
 }
 
-/// Number of required callbacks in `CTokenizerPlugin`. Bumping this without
-/// also extending the `required` table in `validate_vtable` (or vice versa)
-/// is caught at compile time by the size assertion below.
 const REQUIRED_VTABLE_CALLBACKS: usize = 10;
 
-// `CTokenizerPlugin` is `#[repr(C)]` and its fields are
-// `Option<unsafe extern "C" fn(...)>`, each of which is one
-// pointer-sized word thanks to the function-pointer niche optimization.
-// If a new field is added to the struct without updating
-// `REQUIRED_VTABLE_CALLBACKS` and the `required` table in
-// `validate_vtable`, this assertion fires at compile time and the loader
-// won't build, so a NULL function pointer in the new slot can't slip
-// past validation at runtime.
+// `CTokenizerPlugin` is `#[repr(C)]` and every field is one pointer-sized
+// `Option<extern "C" fn>`. Adding a field without updating
+// `REQUIRED_VTABLE_CALLBACKS` and the `required` table fires this assertion
+// at compile time, so a NULL slot can't slip past validation.
 const _: () = {
     assert!(
         std::mem::size_of::<CTokenizerPlugin>()
@@ -98,9 +97,6 @@ const _: () = {
     );
 };
 
-/// Reject plugin vtables that are missing any required callback. Returning
-/// `Err` here keeps the failure on the user-input boundary instead of letting
-/// a NULL function pointer crash the host the first time it is dereferenced.
 fn validate_vtable(p: &CTokenizerPlugin, path: &Path) -> Result<()> {
     let required: [(&str, bool); REQUIRED_VTABLE_CALLBACKS] = [
         ("api_version", p.api_version.is_some()),
@@ -131,10 +127,6 @@ impl TokenizerPluginLibrary {
         let path = path.as_ref();
 
         let library = unsafe { Library::new(path) }.map_err(|e| {
-            // The underlying libloading error already names the precise cause
-            // (file not found, missing dependent .so, permission denied, etc.).
-            // Pass it through verbatim and add a hint pointing the user at the
-            // path they configured.
             Error::invalid_input(format!(
                 "failed to load tokenizer plugin from {:?}: {}. \
                  Verify the path is correct and the file is readable.",
@@ -162,33 +154,16 @@ impl TokenizerPluginLibrary {
     }
 
     // The `(*self.plugin).<callback>.unwrap()` pattern below (and at every
-    // other vtable dispatch site in this file) is sound because
-    // `TokenizerPluginLibrary::load` runs every plugin pointer through
-    // `verify_plugin_compat` → `validate_vtable`, which rejects the load
-    // unless all 10 required callbacks are `Some`. A `TokenizerPluginLibrary`
-    // therefore cannot exist with a NULL slot, so each `.unwrap()` is an
-    // invariant assertion rather than a fallible operation.
+    // other vtable dispatch site in this file) is sound because `load` runs
+    // every plugin pointer through `verify_plugin_compat` → `validate_vtable`,
+    // which rejects the load unless all 10 required callbacks are `Some`.
 
     pub fn name(&self) -> &str {
-        unsafe {
-            let name_ptr = ((*self.plugin).name.unwrap())();
-            if name_ptr.is_null() {
-                "unknown"
-            } else {
-                CStr::from_ptr(name_ptr).to_str().unwrap_or("unknown")
-            }
-        }
+        unsafe { read_c_str_or((*self.plugin).name.unwrap()()) }
     }
 
     pub fn version(&self) -> &str {
-        unsafe {
-            let version_ptr = ((*self.plugin).version.unwrap())();
-            if version_ptr.is_null() {
-                "unknown"
-            } else {
-                CStr::from_ptr(version_ptr).to_str().unwrap_or("unknown")
-            }
-        }
+        unsafe { read_c_str_or((*self.plugin).version.unwrap()()) }
     }
 
     pub fn create_factory(&self, config: &str) -> Result<PluginFactory<'_>> {
@@ -197,15 +172,7 @@ impl TokenizerPluginLibrary {
         let factory = unsafe { ((*self.plugin).create_factory.unwrap())(config_ref, &mut error) };
 
         if factory.is_null() {
-            let error_msg = if error.has_message() {
-                unsafe { error.message_str().to_string() }
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(Error::invalid_input(format!(
-                "failed to create tokenizer factory: {}",
-                error_msg
-            )));
+            return Err(unsafe { plugin_error(&error, "failed to create tokenizer factory") });
         }
 
         Ok(PluginFactory {
@@ -227,15 +194,7 @@ impl TokenizerPluginLibrary {
         let mut error = CError::default();
         let tokenizer = ((*self.plugin).create_tokenizer.unwrap())(factory, &mut error);
         if tokenizer.is_null() {
-            let error_msg = if error.has_message() {
-                error.message_str().to_string()
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(Error::invalid_input(format!(
-                "failed to create tokenizer: {}",
-                error_msg
-            )));
+            return Err(plugin_error(&error, "failed to create tokenizer"));
         }
         Ok(tokenizer)
     }
@@ -255,15 +214,7 @@ impl TokenizerPluginLibrary {
         let mut error = CError::default();
         let stream = ((*self.plugin).create_stream.unwrap())(tokenizer, text_ref, &mut error);
         if stream.is_null() {
-            let error_msg = if error.has_message() {
-                error.message_str().to_string()
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(Error::invalid_input(format!(
-                "failed to create token stream: {}",
-                error_msg
-            )));
+            return Err(plugin_error(&error, "failed to create token stream"));
         }
         Ok(stream)
     }
@@ -284,27 +235,21 @@ impl TokenizerPluginLibrary {
     }
 }
 
-// Note: PluginFactory, PluginTokenizerInstance, and PluginTokenStream
-//       are not Send/Sync because they hold raw pointers to plugin state.
-//       Each thread should create its own instances.
-//
-// Lifetime chain: a stream borrows from its tokenizer instance and from the
-// input text; a tokenizer instance borrows from the factory. The plugin C ABI
-// allows children to alias parent state (e.g. a tokenizer holds pointers into
-// the factory's dictionary, or a stream zero-copies the input text), so we
-// encode that as a borrow chain in the type system. Without this, safe Rust
-// would let a caller `drop(factory)` while a tokenizer/stream is still alive,
-// or pass `&format!(...)` as the input text and outlive the temporary string,
-// either of which is a use-after-free in the plugin.
+unsafe fn read_c_str_or(ptr: *const std::ffi::c_char) -> &'static str {
+    if ptr.is_null() {
+        "unknown"
+    } else {
+        CStr::from_ptr(ptr).to_str().unwrap_or("unknown")
+    }
+}
 
-/// PluginFactory holds shared resources (like dictionaries) and can create
-/// multiple tokenizer instances.
-///
-/// The borrow chain `factory -> instance -> stream` is enforced at compile
-/// time so a caller cannot drop a parent while a child is still alive.
-///
-/// Dropping the factory while a tokenizer derived from it is still alive
-/// must be rejected by the borrow checker:
+/// PluginFactory holds shared resources (e.g. dictionaries) and creates
+/// tokenizer instances. The borrow chain `factory -> instance -> stream` is
+/// encoded in the type system so a caller cannot drop a parent while a child
+/// is still alive — without it the safe API would let `&format!(...)` outlive
+/// a stream that zero-copies it, or let `drop(factory)` run while a tokenizer
+/// borrowing the C-side state is still around. Both would be use-after-frees
+/// in the plugin.
 ///
 /// ```compile_fail
 /// # use lance_index::scalar::inverted::tokenizer::plugin::loader::PluginFactory;
@@ -314,46 +259,12 @@ impl TokenizerPluginLibrary {
 ///     let _ = inst.create_stream("hi");
 /// }
 /// ```
-///
-/// Likewise, returning a stream that borrows a temporary input string
-/// (e.g. `&format!(...)`) must be rejected:
-///
-/// ```compile_fail
-/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::{
-/// #     PluginFactory, PluginTokenStream,
-/// # };
-/// fn temp_input_outlives_stream<'a>(
-///     factory: &'a PluginFactory<'a>,
-/// ) -> PluginTokenStream<'a> {
-///     let mut inst = factory.create_tokenizer().unwrap();
-///     inst.create_stream(&format!("temp {}", 1)).unwrap()
-/// }
-/// ```
-///
-/// Holding two streams from the same instance simultaneously must also be
-/// rejected. The plugin C ABI requires the previous stream to be destroyed
-/// before another is created from the same tokenizer; on the borrowed wrapper
-/// this is enforced by the borrow checker because `create_stream` takes
-/// `&mut self`, so the second call cannot run while `s1` still borrows
-/// `inst`:
-///
-/// ```compile_fail
-/// # use lance_index::scalar::inverted::tokenizer::plugin::loader::PluginFactory;
-/// fn two_overlapping_streams<'a>(factory: &'a PluginFactory<'a>) {
-///     let mut inst = factory.create_tokenizer().unwrap();
-///     let s1 = inst.create_stream("first").unwrap();
-///     let s2 = inst.create_stream("second").unwrap();
-///     drop((s1, s2));
-/// }
-/// ```
 pub struct PluginFactory<'a> {
     library: &'a TokenizerPluginLibrary,
     factory: *mut LanceTokenizerFactory,
 }
 
 impl<'a> PluginFactory<'a> {
-    /// The returned instance borrows from `self`, so the borrow checker
-    /// rejects dropping the factory while any instance is still alive.
     pub fn create_tokenizer<'b>(&'b self) -> Result<PluginTokenizerInstance<'b>>
     where
         'a: 'b,
@@ -375,30 +286,19 @@ impl Drop for PluginFactory<'_> {
     }
 }
 
-/// A tokenizer instance created from a plugin factory. Borrows from the
-/// factory so the factory cannot be dropped while the instance is alive.
 pub struct PluginTokenizerInstance<'a> {
     library: &'a TokenizerPluginLibrary,
     tokenizer: *mut LanceTokenizer,
-    /// Tie the instance's lifetime to the factory it was created from.
     _factory: PhantomData<&'a PluginFactory<'a>>,
 }
 
 impl<'a> PluginTokenizerInstance<'a> {
-    /// The returned stream borrows from both `self` (the tokenizer instance)
-    /// and `text`, so the borrow checker rejects dropping either while the
-    /// stream is still alive — including the common foot-gun of passing
-    /// `&format!(...)` as the input.
-    ///
-    /// `&mut self` (rather than `&self`) is required so that the plugin ABI
-    /// rule "the previous stream must be destroyed before creating another
-    /// from the same tokenizer" is enforced by the borrow checker: while the
-    /// returned stream is alive it holds the unique borrow of `self`, so a
-    /// second `create_stream` call against the same instance simply fails to
-    /// compile. Plugins are allowed to share scratch state between a tokenizer
+    /// `&mut self` (rather than `&self`) enforces the C ABI rule that the
+    /// previous stream must be destroyed before another is created from the
+    /// same tokenizer: while the returned stream lives it holds the unique
+    /// borrow. Plugins are allowed to share scratch state between a tokenizer
     /// and its single live stream, so two overlapping streams would be a data
-    /// race or use-after-free in the plugin even though the safe wrapper is
-    /// itself sound.
+    /// race or use-after-free in the plugin.
     pub fn create_stream<'b>(&'b mut self, text: &'b str) -> Result<PluginTokenStream<'b>>
     where
         'a: 'b,
@@ -421,14 +321,6 @@ impl Drop for PluginTokenizerInstance<'_> {
     }
 }
 
-/// A token stream from a plugin tokenizer. Borrows from the parent
-/// tokenizer instance and the input text — the plugin may zero-copy either,
-/// so dropping either while the stream is alive would be a use-after-free.
-///
-/// The instance is borrowed mutably (via `PhantomData<&'a mut ...>`) so that
-/// the borrow checker also rejects creating a second stream from the same
-/// instance while this one is still alive; see
-/// `PluginTokenizerInstance::create_stream` for the ABI rationale.
 pub struct PluginTokenStream<'a> {
     library: &'a TokenizerPluginLibrary,
     stream: *mut LanceTokenStream,
@@ -444,15 +336,8 @@ pub enum NextTokenResult {
 }
 
 impl NextTokenResult {
-    /// Translate the raw `next_token` ABI return code (positive = token,
-    /// 0 = end of stream, negative = error) and accompanying `CError`
-    /// payload into a `NextTokenResult`.
-    ///
     /// SAFETY: `error` must point to a valid `CError` whose `message`
     /// payload (if `has_message()` is true) lives until this call returns.
-    /// In practice this is the same `CError` the caller passed to the
-    /// plugin, so the lifetime is guaranteed by the borrow checker on the
-    /// caller side.
     unsafe fn from_raw(result: i32, error: &CError) -> Self {
         if result > 0 {
             Self::Token
@@ -485,48 +370,26 @@ impl Drop for PluginTokenStream<'_> {
     }
 }
 
-/// An owned plugin factory that holds an Arc to the library.
-/// This allows the factory to be cached and reused across multiple tokenizations.
-///
-/// # Reentrancy
-///
-/// Calls into the plugin's vtable happen with the `factory` mutex held.
-/// A plugin callback that synchronously waits on another thread which is
-/// itself dispatching against the same factory handle will deadlock on
-/// that mutex; the same constraint applies to `OwnedPluginTokenizerInstance`'s
-/// `tokenizer` mutex. Lance does not expose any callback API that a plugin
-/// could "call back into", so the rule is purely about reentrant dispatch
-/// on the same handle from another thread the plugin spawned. See
-/// `include/lance_tokenizer_plugin.h` for the full ABI contract.
+/// An owned plugin factory that holds an `Arc` to the library, suitable for
+/// sharing across threads via `Arc<OwnedPluginFactory>`. The C ABI does not
+/// require `create_*` callbacks to be safe under concurrent calls against the
+/// same handle (e.g. a stateful plugin lazy-initializing a dictionary), so
+/// access goes through an internal `Mutex`. A plugin callback that
+/// synchronously waits on another thread which is itself dispatching against
+/// the same handle will deadlock — see `include/lance_tokenizer_plugin.h` for
+/// the full reentrancy contract.
 pub struct OwnedPluginFactory {
     library: Arc<TokenizerPluginLibrary>,
-    /// Raw factory handle from the C plugin, guarded by a Mutex.
-    ///
-    /// The plugin C ABI does not require `create_tokenizer` to be safe under
-    /// concurrent calls against the same factory handle — a stateful plugin
-    /// (e.g. one that lazy-initializes a dictionary on first use) could
-    /// data-race or crash. Since `OwnedPluginFactory` is `pub` and `Sync`,
-    /// callers may legitimately share an `Arc<OwnedPluginFactory>` across
-    /// threads, so we serialize access here rather than rely on every caller
-    /// to wrap it externally.
     factory: Mutex<*mut LanceTokenizerFactory>,
 }
 
-// SAFETY: OwnedPluginFactory can be sent/shared across threads because:
-// 1. `library` (Arc<TokenizerPluginLibrary>) is Send + Sync.
-// 2. `factory` is a raw pointer to plugin state, but every call into the
-//    plugin that uses it goes through the `Mutex` above, so there is at
-//    most one thread inside the plugin's `create_tokenizer` for a given
-//    factory at any time. The plugin's other vtable callbacks
-//    (create_factory / destroy_factory) are only invoked from `new` /
-//    `Drop` where `&self` exclusivity is guaranteed by the borrow checker.
-// 3. `Mutex<*mut T>` is not auto-`Send`/`Sync` because of the raw pointer,
-//    so we declare both impls manually.
+// SAFETY: All access to the raw `factory` pointer is serialized by the
+// `Mutex`. `Mutex<*mut T>` is not auto-Send/Sync because of the raw pointer,
+// so we declare both manually.
 unsafe impl Send for OwnedPluginFactory {}
 unsafe impl Sync for OwnedPluginFactory {}
 
 impl OwnedPluginFactory {
-    /// Create a new owned factory from a library and config.
     pub fn new(library: Arc<TokenizerPluginLibrary>, config: &str) -> Result<Self> {
         let config_ref = CStringRef::from_str(config)?;
         let mut error = CError::default();
@@ -534,15 +397,7 @@ impl OwnedPluginFactory {
             unsafe { ((*library.plugin).create_factory.unwrap())(config_ref, &mut error) };
 
         if factory.is_null() {
-            let error_msg = if error.has_message() {
-                unsafe { error.message_str().to_string() }
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(Error::invalid_input(format!(
-                "failed to create tokenizer factory: {}",
-                error_msg
-            )));
+            return Err(unsafe { plugin_error(&error, "failed to create tokenizer factory") });
         }
 
         Ok(Self {
@@ -551,20 +406,12 @@ impl OwnedPluginFactory {
         })
     }
 
-    /// Create a tokenizer instance from this factory.
-    ///
-    /// The returned instance keeps an `Arc` to the factory so the C-side
+    /// The returned instance keeps an `Arc` to this factory so the C-side
     /// factory state cannot be destroyed while the tokenizer (or any stream
-    /// it produced) is still alive. Without this back-reference a caller
-    /// could write `let inst = factory.create_tokenizer()?; drop(factory);`
-    /// and then dereference the freed factory state through `inst`.
+    /// it produced) is still alive.
     pub fn create_tokenizer(self: &Arc<Self>) -> Result<Arc<OwnedPluginTokenizerInstance>> {
-        // Surface a poisoned factory mutex as a regular `Err` rather than
-        // propagating the panic that poisoned it. This keeps the public
-        // contract consistent with `OwnedPluginTokenizerInstance::create_stream`
-        // (which must report poisoning to release its `active_stream` slot)
-        // and lets callers see a single failure mode for "the underlying
-        // plugin handle is no longer trustworthy".
+        // Surface poisoning as `Err` (not panic) so the `create_stream` caller
+        // contract is consistent across both fallible operations on the chain.
         let factory_ptr = self
             .factory
             .lock()
@@ -573,15 +420,7 @@ impl OwnedPluginFactory {
         let tokenizer =
             unsafe { ((*self.library.plugin).create_tokenizer.unwrap())(*factory_ptr, &mut error) };
         if tokenizer.is_null() {
-            let error_msg = if error.has_message() {
-                unsafe { error.message_str().to_string() }
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(Error::invalid_input(format!(
-                "failed to create tokenizer: {}",
-                error_msg
-            )));
+            return Err(unsafe { plugin_error(&error, "failed to create tokenizer") });
         }
         Ok(Arc::new(OwnedPluginTokenizerInstance {
             library: Arc::clone(&self.library),
@@ -594,96 +433,48 @@ impl OwnedPluginFactory {
 
 impl Drop for OwnedPluginFactory {
     fn drop(&mut self) {
-        // `get_mut` is sufficient for exclusive access (we own the only
-        // reference here), but it still surfaces a `PoisonError` if a prior
-        // panic dropped the lock guard. Recovering the inner pointer through
-        // `into_inner()` lets us still invoke `destroy_factory` instead of
-        // double-panicking inside `Drop` — which during unwind would escalate
-        // to `abort`. Plugin-fault recovery is otherwise unsupported (see
-        // `mod.rs`); this only avoids turning a single plugin panic into a
-        // process abort.
-        let factory_ptr = *self
-            .factory
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let factory_ptr = lock_or_recover(&mut self.factory);
         unsafe {
             self.library.destroy_factory(factory_ptr);
         }
     }
 }
 
-/// An owned tokenizer instance created from an owned factory.
-///
-/// Keeps an `Arc<OwnedPluginFactory>` back-reference so the factory cannot
-/// be dropped (which would invoke the plugin's `destroy_factory`) while any
-/// instance derived from it is still alive.
 pub struct OwnedPluginTokenizerInstance {
     library: Arc<TokenizerPluginLibrary>,
-    /// Raw tokenizer handle, guarded by a Mutex for the same reason
-    /// `OwnedPluginFactory.factory` is — a stateful plugin's
-    /// `create_stream` is not required by the C ABI to be safe under
-    /// concurrent calls against the same tokenizer handle, and instances
-    /// are shared via `Arc` so multiple threads may legitimately call
-    /// `create_stream` on the same instance.
     tokenizer: Mutex<*mut LanceTokenizer>,
-    /// Tracks whether this instance currently has a live `OwnedPluginTokenStream`.
-    ///
-    /// Per the plugin C ABI (`create_stream` in `lance_tokenizer_plugin.h`):
-    /// "The stream must be destroyed before creating another stream from the
-    /// same tokenizer." Plugins are allowed to share scratch state between a
-    /// tokenizer and its stream (lazy buffers, zero-copy slices into tokenizer
-    /// dictionaries, etc.), so two concurrently-live streams from one
-    /// tokenizer would be a data race or use-after-free in the plugin even
-    /// though the safe wrapper itself is sound.
-    ///
-    /// We enforce the contract with an atomic flag rather than the existing
-    /// `tokenizer` mutex because the lock would have to span the lifetime of
-    /// the returned stream, and a `MutexGuard` cannot be stored in the
-    /// stream alongside the `Arc<OwnedPluginTokenizerInstance>` it borrows
-    /// from. Stream `Drop` clears the flag, restoring the instance to a
-    /// usable state.
+    /// Guards the C ABI rule "the stream must be destroyed before creating
+    /// another from the same tokenizer". We can't span the lifetime of the
+    /// returned stream with a `MutexGuard` (a guard cannot be stored in the
+    /// stream alongside the `Arc<Self>` it borrows from), so we use an
+    /// atomic flag that stream `Drop` clears.
     active_stream: AtomicBool,
     _factory: Arc<OwnedPluginFactory>,
 }
 
-// SAFETY: same rationale as OwnedPluginFactory — the only access to the raw
-// tokenizer pointer goes through the Mutex above. `Mutex<*mut T>` is not
-// auto-`Send`/`Sync` because of the raw pointer, so we declare both
-// manually.
+// SAFETY: same rationale as OwnedPluginFactory — Mutex serializes raw
+// pointer access; the auto impls would fall through but for the raw pointer.
 unsafe impl Send for OwnedPluginTokenizerInstance {}
 unsafe impl Sync for OwnedPluginTokenizerInstance {}
 
 impl OwnedPluginTokenizerInstance {
-    /// Create a token stream for the given text.
-    ///
-    /// The returned stream owns the input `text` (as `String`) and keeps an
-    /// `Arc` to the parent instance. This is necessary because the plugin
-    /// ABI lets streams alias either the tokenizer state or the input bytes
-    /// (for zero-copy / lazy implementations). Without this composition the
-    /// safe API would allow `let stream = inst.create_stream(&format!(...))`
-    /// — the temporary `String` would drop while the C-side stream still
-    /// holds a pointer into it.
+    /// The returned stream owns the input `text` (as `String`) and holds an
+    /// `Arc` to this instance — necessary because the plugin ABI lets streams
+    /// alias either tokenizer state or the input bytes (zero-copy / lazy
+    /// implementations). Without this, passing `&format!(...)` would drop the
+    /// temporary while the C-side stream still holds a pointer into it.
     pub fn create_stream(
         self: &Arc<Self>,
         text: impl Into<String>,
     ) -> Result<OwnedPluginTokenStream> {
-        // Validate the text length up front, before we reserve the
-        // "one active stream per instance" slot. The plugin ABI uses a
-        // u32 length, so a `String` longer than `u32::MAX` bytes cannot
-        // be passed faithfully — silently truncating it would emit a
-        // partial token stream and corrupt FTS results. Doing this
-        // check before reservation also keeps the slot-release logic
-        // below dealing only with failures that genuinely happened
-        // after we took ownership of the slot.
+        // Validate the text length before reserving the active_stream slot:
+        // a length-overflow failure leaves the slot in the same state a
+        // successful build would have left it (free).
         let text = text.into();
         let text_ref = CStringRef::from_str(&text)?;
 
-        // Reserve the "one active stream per instance" slot before calling
-        // into the plugin. If another stream from this instance is still
-        // alive, refuse here — the C ABI explicitly forbids overlapping
-        // streams on the same tokenizer, and a plugin that shares scratch
-        // state between tokenizer and stream would otherwise data-race or
-        // use-after-free.
+        // C ABI forbids overlapping streams on the same tokenizer; reserve
+        // the per-instance slot before calling into the plugin.
         self.active_stream
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| {
@@ -694,42 +485,32 @@ impl OwnedPluginTokenizerInstance {
                 )
             })?;
 
-        // Helper to release the slot if anything below this point fails,
-        // so a failure path does not leave the instance permanently blocked.
-        let release_on_failure = |this: &Arc<Self>| {
-            this.active_stream.store(false, Ordering::Release);
-        };
+        let result = self.create_stream_locked(text, text_ref);
+        if result.is_err() {
+            self.active_stream.store(false, Ordering::Release);
+        }
+        result
+    }
 
-        let tokenizer_ptr = match self.tokenizer.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                release_on_failure(self);
-                return Err(Error::invalid_input(format!(
-                    "plugin tokenizer mutex poisoned: {}",
-                    poisoned
-                )));
-            }
-        };
+    fn create_stream_locked(
+        self: &Arc<Self>,
+        text: String,
+        text_ref: CStringRef,
+    ) -> Result<OwnedPluginTokenStream> {
+        let tokenizer_ptr: MutexGuard<*mut LanceTokenizer> = self
+            .tokenizer
+            .lock()
+            .map_err(|e| Error::invalid_input(format!("plugin tokenizer mutex poisoned: {}", e)))?;
         let mut error = CError::default();
         let stream = unsafe {
             ((*self.library.plugin).create_stream.unwrap())(*tokenizer_ptr, text_ref, &mut error)
         };
         if stream.is_null() {
-            let error_msg = if error.has_message() {
-                unsafe { error.message_str().to_string() }
-            } else {
-                "unknown error".to_string()
-            };
-            release_on_failure(self);
-            return Err(Error::invalid_input(format!(
-                "failed to create token stream: {}",
-                error_msg
-            )));
+            return Err(unsafe { plugin_error(&error, "failed to create token stream") });
         }
         Ok(OwnedPluginTokenStream {
-            // Field declaration order matters for Drop: `stream` is dropped
-            // first (custom Drop calls destroy_stream while text/instance
-            // are still alive), then text/instance/library are released.
+            // Drop order: `stream` first (calls destroy_stream while text /
+            // instance / library are still alive), then text/instance/library.
             stream,
             library: Arc::clone(&self.library),
             _instance: Arc::clone(self),
@@ -740,26 +521,13 @@ impl OwnedPluginTokenizerInstance {
 
 impl Drop for OwnedPluginTokenizerInstance {
     fn drop(&mut self) {
-        // Same rationale as `OwnedPluginFactory::drop`: recover the
-        // pointer through `into_inner()` if the lock is poisoned so we
-        // can still call `destroy_tokenizer` instead of double-panicking
-        // during unwind.
-        let tokenizer_ptr = *self
-            .tokenizer
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tokenizer_ptr = lock_or_recover(&mut self.tokenizer);
         unsafe {
             self.library.destroy_tokenizer(tokenizer_ptr);
         }
     }
 }
 
-/// An owned token stream from an owned tokenizer instance.
-///
-/// Owns the input `String` and keeps an `Arc` to the parent instance so
-/// neither can be freed while the C-side stream is still alive. The plugin
-/// is allowed to zero-copy from either, so dropping them earlier would be
-/// a use-after-free.
 pub struct OwnedPluginTokenStream {
     stream: *mut LanceTokenStream,
     library: Arc<TokenizerPluginLibrary>,
@@ -767,18 +535,11 @@ pub struct OwnedPluginTokenStream {
     _text: String,
 }
 
-// SAFETY: `next_token` takes `&mut self`, so the borrow checker already
-// guarantees exclusive access — no per-stream Mutex is needed. The struct
-// merely holds a raw pointer alongside Arc-counted owners, so the auto
-// Send impl would fall through if not for the raw pointer; we re-add it
-// manually. FTS workers move a stream into a worker task, which is the
-// only sharing pattern this type currently supports.
-//
-// `Sync` is *not* asserted: the wrapper exposes only `&mut self` access
-// today, so concurrent shared use is not a real shape. If a `&self`
-// method is added later (e.g. a "peek next token" probe), Sync would
-// need fresh review to confirm the underlying plugin call is reentrant
-// from multiple threads against the same stream handle.
+// SAFETY: `next_token` takes `&mut self`, so the borrow checker guarantees
+// exclusive access; no per-stream Mutex is needed. `Sync` is intentionally
+// *not* asserted: only `&mut self` access is exposed today, so concurrent
+// shared use is not a real shape. Adding a `&self` method later requires
+// fresh review.
 unsafe impl Send for OwnedPluginTokenStream {}
 
 impl OwnedPluginTokenStream {
@@ -795,9 +556,7 @@ impl Drop for OwnedPluginTokenStream {
         unsafe {
             self.library.destroy_stream(self.stream);
         }
-        // Release the parent instance's "one active stream" slot so a new
-        // stream can be created from it. `Release` ordering pairs with the
-        // `Acquire` CAS in `OwnedPluginTokenizerInstance::create_stream`.
+        // `Release` pairs with `Acquire` in `create_stream`'s CAS.
         self._instance.active_stream.store(false, Ordering::Release);
     }
 }
@@ -807,7 +566,6 @@ mod tests {
     use super::*;
     use std::ffi::c_char;
 
-    // Stub callbacks used to populate a "valid" vtable for tests.
     unsafe extern "C" fn stub_api_version() -> u32 {
         PLUGIN_API_VERSION
     }
@@ -868,9 +626,8 @@ mod tests {
         validate_vtable(&vtable, Path::new("/test/plugin.so")).expect("full vtable should pass");
     }
 
-    /// Every required callback must be flagged when missing. A broken or
-    /// older-ABI plugin can leave individual fields as NULL; calling them
-    /// would crash the host process.
+    /// Every required callback must be flagged when missing — calling a NULL
+    /// slot would crash the host.
     #[test]
     fn test_validate_vtable_rejects_each_missing_callback() {
         type Clear = fn(&mut CTokenizerPlugin);
@@ -894,19 +651,16 @@ mod tests {
                 .expect_err(&format!("missing `{}` should be rejected", name));
             assert!(
                 err.to_string().contains(name),
-                "error message should mention the missing callback `{}`, got: {}",
+                "error must mention the missing callback `{}`, got: {}",
                 name,
                 err
             );
         }
     }
 
-    /// API version mismatch must be detected before any other vtable
-    /// field is read. Reading the rest of the vtable first risks an
-    /// out-of-bounds access against a plugin built with a smaller /
-    /// older `CTokenizerPlugin` layout. The test sets a vtable whose
-    /// `api_version` returns the wrong number AND has a missing
-    /// callback; the version error must surface first.
+    /// API version mismatch must surface before any other vtable field is
+    /// read — reading the rest first risks an OOB access against an
+    /// older-layout plugin.
     #[test]
     fn test_verify_plugin_compat_checks_api_version_before_vtable() {
         unsafe extern "C" fn wrong_api_version() -> u32 {
@@ -914,25 +668,15 @@ mod tests {
         }
         let mut vtable = full_vtable();
         vtable.api_version = Some(wrong_api_version);
-        // Also clear an unrelated callback. If `validate_vtable` ran
-        // before the version check, the "missing callback" message
-        // would surface instead of the version mismatch.
+        // Also clear an unrelated callback; the version error must still surface first.
         vtable.next_token = None;
 
         let path = Path::new("/test/plugin.so");
         let err = verify_plugin_compat(&vtable as *const _, path)
             .expect_err("incompatible API version must be rejected");
         let msg = err.to_string();
-        assert!(
-            msg.contains("incompatible API version"),
-            "version mismatch must be reported before vtable validation, got: {}",
-            msg
-        );
-        assert!(
-            !msg.contains("next_token"),
-            "vtable validation must not run before the version check, got: {}",
-            msg
-        );
+        assert!(msg.contains("incompatible API version"), "got: {}", msg);
+        assert!(!msg.contains("next_token"), "got: {}", msg);
     }
 
     #[test]

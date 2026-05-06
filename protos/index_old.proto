@@ -39,42 +39,13 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
-  // Absolute path to a tokenizer plugin shared library (.so on Linux,
-  // .dylib on macOS, .dll on Windows). Relative paths are rejected before
-  // the manifest is written, because the persisted value is interpreted by
-  // whichever process later reopens the index — resolving a relative path
-  // against the reader's CWD would silently load a different file or fail
-  // entirely. As a consequence, the same absolute path must exist on every
-  // host that opens the index.
-  //
-  // Failure modes differ by phase:
-  // - Library load (file not found, missing symbols, API version mismatch,
-  //  missing required vtable callback, malformed config) surfaces as a
-  //  regular Err on `params.build()`, before the index is built or a query
-  //  begins. These are recoverable from the caller's perspective.
-  // - Failures during streaming tokenization (`next_token` returning a
-  //  negative status, plugin emitting non-UTF-8 token text) panic out of
-  //  the token-stream adapter to avoid silently writing or returning a
-  //  truncated stream. The panic aborts the in-flight indexing or search
-  //  task; recovery is the host's task-panic policy.
-  //
-  // The plugin must implement the Lance tokenizer plugin C ABI interface defined in include/lance_tokenizer_plugin.h.
-  // When this field is set, base_tokenizer should be set to "plugin".
-  //
-  // SECURITY: opening an index whose manifest sets this field will dlopen the
-  // referenced shared library and execute its code inside the host process.
-  // Anyone with write access to the manifest (a misconfigured object store,
-  // an untrusted index publisher, a shared filesystem, etc.) can therefore
-  // achieve arbitrary native code execution. Only open indexes from sources
-  // you trust to the same level you trust the host process itself.
+  // Absolute path to a tokenizer plugin shared library implementing the
+  // C ABI in include/lance_tokenizer_plugin.h. When set, base_tokenizer
+  // must be "plugin". See InvertedIndexParams::plugin in the Rust crate
+  // for the security model, failure modes, and filter-chain interaction.
   optional string tokenizer_plugin_library = 12;
 
-  // Configuration string passed to the tokenizer plugin when creating a factory.
-  // The format is defined by the plugin implementation (e.g., JSON, YAML).
-  // The build path enforces that this field is set whenever tokenizer_plugin_library
-  // is set, and rejects a missing value with a descriptive error. The field is
-  // declared optional in proto3 because the representation of "empty" config varies
-  // by serialization format (e.g., "{}" for JSON, "" for plain text), so the caller
-  // must supply the format-appropriate value rather than relying on a proto default.
+  // Plugin-defined configuration string (e.g. JSON, YAML). Optional in
+  // proto3 because the "empty" representation varies by format ("{}" vs "").
   optional string tokenizer_plugin_config = 13;
 }
