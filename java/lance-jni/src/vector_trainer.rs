@@ -34,6 +34,11 @@ fn flatten_fixed_size_list_to_f32(arr: &FixedSizeListArray) -> Result<Vec<f32>> 
     Ok(values.values().to_vec())
 }
 
+fn parse_distance_type(env: &mut JNIEnv, distance_type_jstr: &JString) -> Result<MetricType> {
+    let distance_type_str: String = env.get_string(distance_type_jstr)?.into();
+    MetricType::try_from(distance_type_str.as_str()).map_err(|e| Error::input_error(e.to_string()))
+}
+
 fn build_ivf_params_from_java(
     env: &mut JNIEnv,
     ivf_params_obj: &JObject,
@@ -80,14 +85,21 @@ fn build_pq_params_from_java(
 pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainIvfCentroids<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    dataset_obj: JObject<'local>,    // org.lance.Dataset
-    column_jstr: JString<'local>,    // java.lang.String
-    ivf_params_obj: JObject<'local>, // org.lance.index.vector.IvfBuildParams
+    dataset_obj: JObject<'local>,        // org.lance.Dataset
+    column_jstr: JString<'local>,        // java.lang.String
+    ivf_params_obj: JObject<'local>,     // org.lance.index.vector.IvfBuildParams
+    distance_type_jstr: JString<'local>, // org.lance.index.DistanceType#toString()
 ) -> jfloatArray {
     ok_or_throw_with_return!(
         env,
-        inner_train_ivf_centroids(&mut env, dataset_obj, column_jstr, ivf_params_obj)
-            .map(|arr| arr.into_raw()),
+        inner_train_ivf_centroids(
+            &mut env,
+            dataset_obj,
+            column_jstr,
+            ivf_params_obj,
+            distance_type_jstr,
+        )
+        .map(|arr| arr.into_raw()),
         JFloatArray::default().into_raw()
     )
 }
@@ -97,9 +109,11 @@ fn inner_train_ivf_centroids<'local>(
     dataset_obj: JObject<'local>,
     column_jstr: JString<'local>,
     ivf_params_obj: JObject<'local>,
+    distance_type_jstr: JString<'local>,
 ) -> Result<JFloatArray<'local>> {
     let column: String = env.get_string(&column_jstr)?.into();
     let ivf_params = build_ivf_params_from_java(env, &ivf_params_obj)?;
+    let metric_type = parse_distance_type(env, &distance_type_jstr)?;
 
     let flattened: Vec<f32> = {
         let dataset_guard =
@@ -107,9 +121,6 @@ fn inner_train_ivf_centroids<'local>(
         let dataset = &dataset_guard.inner;
 
         let dim = get_vector_dim(dataset.schema(), &column)?;
-
-        // For now we default to L2 metric; tests and Java bindings currently use L2.
-        let metric_type = MetricType::L2;
 
         let ivf_model = RT.block_on(lance::index::vector::ivf::build_ivf_model(
             dataset,
@@ -137,14 +148,21 @@ fn inner_train_ivf_centroids<'local>(
 pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainPqCodebook<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    dataset_obj: JObject<'local>,   // org.lance.Dataset
-    column_jstr: JString<'local>,   // java.lang.String
-    pq_params_obj: JObject<'local>, // org.lance.index.vector.PQBuildParams
+    dataset_obj: JObject<'local>,        // org.lance.Dataset
+    column_jstr: JString<'local>,        // java.lang.String
+    pq_params_obj: JObject<'local>,      // org.lance.index.vector.PQBuildParams
+    distance_type_jstr: JString<'local>, // org.lance.index.DistanceType#toString()
 ) -> jfloatArray {
     ok_or_throw_with_return!(
         env,
-        inner_train_pq_codebook(&mut env, dataset_obj, column_jstr, pq_params_obj)
-            .map(|arr| arr.into_raw()),
+        inner_train_pq_codebook(
+            &mut env,
+            dataset_obj,
+            column_jstr,
+            pq_params_obj,
+            distance_type_jstr,
+        )
+        .map(|arr| arr.into_raw()),
         JFloatArray::default().into_raw()
     )
 }
@@ -154,9 +172,11 @@ fn inner_train_pq_codebook<'local>(
     dataset_obj: JObject<'local>,
     column_jstr: JString<'local>,
     pq_params_obj: JObject<'local>,
+    distance_type_jstr: JString<'local>,
 ) -> Result<JFloatArray<'local>> {
     let column: String = env.get_string(&column_jstr)?.into();
     let pq_params = build_pq_params_from_java(env, &pq_params_obj)?;
+    let metric_type = parse_distance_type(env, &distance_type_jstr)?;
 
     let flattened: Vec<f32> = {
         let dataset_guard =
@@ -164,7 +184,6 @@ fn inner_train_pq_codebook<'local>(
         let dataset = &dataset_guard.inner;
 
         let dim = get_vector_dim(dataset.schema(), &column)?;
-        let metric_type = MetricType::L2;
 
         let pq = RT.block_on(lance::index::vector::pq::build_pq_model(
             dataset,
