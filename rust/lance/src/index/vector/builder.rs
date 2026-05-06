@@ -960,6 +960,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 }
 
                                 if assign_batch.num_rows() > 0 {
+                                    // Drop PART_ID column from assign_batch to match schema of existing batches
                                     let assign_batch = assign_batch.drop_column(PART_ID_COLUMN)?;
                                     batches.push(assign_batch);
                                 }
