@@ -27,7 +27,7 @@
 //! 3. Readers call `search(...)` at any time; visible nodes are those whose
 //!    `insert` returned.
 //! 4. `finalize()` consumes the builder and returns an immutable
-//!    [`HNSW`](super::HNSW) that can be serialized via `HNSW::to_batch()`.
+//!    [`super::HNSW`] that can be serialized via `HNSW::to_batch()`.
 
 use std::cmp::min;
 use std::sync::Arc;

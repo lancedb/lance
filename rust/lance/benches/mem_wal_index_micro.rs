@@ -414,15 +414,15 @@ async fn measure_flush(
 }
 
 fn read_rss_kb() -> u64 {
-    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                if let Some(num) = rest.split_whitespace().next() {
-                    if let Ok(v) = num.parse::<u64>() {
-                        return v;
-                    }
-                }
-            }
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:")
+            && let Some(num) = rest.split_whitespace().next()
+            && let Ok(v) = num.parse::<u64>()
+        {
+            return v;
         }
     }
     0
