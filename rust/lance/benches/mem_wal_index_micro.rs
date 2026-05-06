@@ -186,7 +186,10 @@ async fn main() -> lance_core::Result<()> {
         max_memtable_size: max_rows.saturating_mul(row_size_estimate).saturating_mul(4),
         max_memtable_rows: max_rows.saturating_mul(2),
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
-        max_wal_flush_interval: Some(Duration::from_secs(3600)),
+        // Keep the time-based WAL flush trigger short so the last batch
+        // before each checkpoint isn't stranded in the buffer below the
+        // size threshold (which would block the index-catchup poll).
+        max_wal_flush_interval: Some(Duration::from_millis(200)),
         max_unflushed_memtable_bytes: usize::MAX / 2,
         ..ShardWriterConfig::default()
     };
