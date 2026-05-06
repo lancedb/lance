@@ -195,32 +195,54 @@ async fn main() -> lance_core::Result<()> {
         .mem_wal_writer(shard_id, writer_config)
         .await?;
 
+    // `writer.put()` enqueues the batch into the WAL pipeline and returns;
+    // the actual index update happens in the background WAL flush handler.
+    // Measuring the put() return latency would only capture queueing, so we
+    // walk the wall clock from the first put to the moment the index store
+    // has caught up to the expected batch position. That's the end-to-end
+    // "rows successfully indexed" throughput a writer experiences when it
+    // both writes data AND waits for the data to become queryable.
     let mut total_inserted: usize = 0;
-    let mut total_put_wall = Duration::ZERO;
     let mut next_cp_idx = 0;
     let total_batches = max_rows.div_ceil(batch_size);
-    println!("write phase: {} batches of {} rows via ShardWriter", total_batches, batch_size);
+    println!(
+        "write phase: {} batches of {} rows via ShardWriter (wall time includes index catchup)",
+        total_batches, batch_size
+    );
+    let phase_start = Instant::now();
 
     for i in 0..total_batches {
         let start = (i * batch_size) as i64;
         let rows = batch_size.min(max_rows - i * batch_size);
         let batch = make_batch(start, rows, dim);
-        let t = Instant::now();
         writer.put(vec![batch]).await?;
-        total_put_wall += t.elapsed();
         total_inserted += rows;
 
         while next_cp_idx < checkpoints.len() && total_inserted >= checkpoints[next_cp_idx] {
             let cp = checkpoints[next_cp_idx];
-            let throughput = cp as f64 / total_put_wall.as_secs_f64();
+            let target_batch_pos = (cp / batch_size).saturating_sub(1);
+            // Wait for the WAL flush handler to drive the index store up to
+            // the checkpoint's batch position. Polls the watermark; bounded
+            // by the WAL flush cadence (max_wal_buffer_size + flush
+            // interval).
+            loop {
+                let active = writer.active_memtable_ref().await?;
+                if active.index_store.max_indexed_batch_position() >= target_batch_pos {
+                    break;
+                }
+                drop(active);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let elapsed = phase_start.elapsed();
+            let throughput = cp as f64 / elapsed.as_secs_f64();
             println!(
-                "[checkpoint] rows={} cumulative_put_time_ms={:.1} put_throughput_rows_per_sec={:.1}",
+                "[checkpoint] rows={} cumulative_wall_ms={} indexed_throughput_rows_per_sec={:.1}",
                 cp,
-                total_put_wall.as_millis(),
+                elapsed.as_millis(),
                 throughput
             );
 
-            // Query: run num_queries lookups against the active memtable.
             let active = writer.active_memtable_ref().await?;
             let mut latencies = Vec::with_capacity(num_queries);
             for q in 0..num_queries {
@@ -252,11 +274,12 @@ async fn main() -> lance_core::Result<()> {
         }
     }
 
+    let phase_wall = phase_start.elapsed();
     println!(
-        "write phase done: total_rows={} wall={:.2}s overall_put_throughput={:.0} rows/sec",
+        "write phase done: total_rows={} wall={:.2}s overall_indexed_throughput={:.0} rows/sec",
         total_inserted,
-        total_put_wall.as_secs_f64(),
-        total_inserted as f64 / total_put_wall.as_secs_f64()
+        phase_wall.as_secs_f64(),
+        total_inserted as f64 / phase_wall.as_secs_f64()
     );
 
     // Drop the writer cleanly (don't measure shutdown time as part of put).
