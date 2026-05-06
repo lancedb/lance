@@ -224,17 +224,29 @@ async fn main() -> lance_core::Result<()> {
         while next_cp_idx < checkpoints.len() && total_inserted >= checkpoints[next_cp_idx] {
             let cp = checkpoints[next_cp_idx];
             let target_batch_pos = (cp / batch_size).saturating_sub(1);
-            // Wait for the WAL flush handler to drive the index store up to
-            // the checkpoint's batch position. Polls the watermark; bounded
-            // by the WAL flush cadence (max_wal_buffer_size + flush
-            // interval).
+            // The WAL flush handler only updates the index watermark when a
+            // flush is triggered, and the time-based trigger inside the
+            // writer runs only when `put()` is called. After the final put
+            // for the final checkpoint, no more put() comes — so we issue
+            // tiny dummy puts as a heartbeat to force the time trigger to
+            // fire and drain the last batch through the index pipeline.
+            // The dummy rows are negligible (1 row each) but are excluded
+            // from `total_inserted` so the throughput math stays accurate.
+            let mut spins = 0u64;
             loop {
                 let active = writer.active_memtable_ref().await?;
                 if active.index_store.max_indexed_batch_position() >= target_batch_pos {
                     break;
                 }
                 drop(active);
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                spins += 1;
+                if spins.is_multiple_of(8) {
+                    // Heartbeat: poke the writer so its in-put time-trigger
+                    // check fires and flushes any stragglers.
+                    let dummy = make_batch(-1 - spins as i64, 1, dim);
+                    writer.put(vec![dummy]).await?;
+                }
             }
 
             let elapsed = phase_start.elapsed();
