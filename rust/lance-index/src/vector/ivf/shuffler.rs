@@ -593,6 +593,7 @@ impl IvfShuffler {
                         16,
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 while let Some(batch) = stream.next().await {
@@ -667,7 +668,8 @@ impl IvfShuffler {
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
-                    )?
+                    )
+                    .await?
                     .boxed()
             };
 
@@ -845,7 +847,8 @@ impl IvfShuffler {
                     /*batch_size=*/ 1,
                     /*batch_readahead=*/ 32,
                     FilterExpression::no_filter(),
-                )?
+                )
+                .await?
                 .and_then(|batch| {
                     let list_array = batch
                         .column(0)

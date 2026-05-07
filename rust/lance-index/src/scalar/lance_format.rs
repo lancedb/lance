@@ -215,7 +215,8 @@ impl IndexReader for current_reader::FileReader {
                 u32::MAX,
                 projection,
                 FilterExpression::no_filter(),
-            )?
+            )
+            .await?
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(batches.len(), 1);
@@ -249,6 +250,7 @@ impl IndexReader for current_reader::FileReader {
             projection,
             FilterExpression::no_filter(),
         )
+        .await
     }
 
     // V2 format has removed the row group concept,
