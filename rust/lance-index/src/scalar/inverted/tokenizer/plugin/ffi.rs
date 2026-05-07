@@ -205,10 +205,12 @@ mod tests {
 
     #[test]
     fn test_ctoken_layout() {
+        // Verify CToken has expected size and alignment for C interop
+        // CToken: 4*u32 + CStringRef (pointer + u32)
         let expected_size = if mem::size_of::<*const c_char>() == 8 {
-            32
+            32 // 64-bit: 4*4 + 8 + 4 + padding = 32
         } else {
-            24
+            24 // 32-bit: 4*4 + 4 + 4 = 24
         };
         assert_eq!(mem::size_of::<CToken>(), expected_size);
         assert_eq!(mem::align_of::<CToken>(), mem::align_of::<*const c_char>());
@@ -216,13 +218,14 @@ mod tests {
 
     #[test]
     fn test_cstringref_to_string_lossy_with_invalid_utf8() {
-        let invalid_utf8: [u8; 6] = [0x68, 0x65, 0x6c, 0x6c, 0x6F, 0xFF];
+        let invalid_utf8: [u8; 6] = [0x68, 0x65, 0x6c, 0x6c, 0x6F, 0xFF]; // "hello" + invalid byte
         let sr = CStringRef {
             data: invalid_utf8.as_ptr() as *const c_char,
             length: 6,
         };
 
         unsafe {
+            // Invalid byte should be replaced with U+FFFD
             assert_eq!(sr.to_string_lossy(), "hello\u{FFFD}");
         }
     }

@@ -39,13 +39,6 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
-  // Absolute path to a tokenizer plugin shared library implementing the
-  // C ABI in include/lance_tokenizer_plugin.h. When set, base_tokenizer
-  // must be "plugin". See InvertedIndexParams::plugin in the Rust crate
-  // for the security model, failure modes, and filter-chain interaction.
   optional string tokenizer_plugin_library = 12;
-
-  // Plugin-defined configuration string (e.g. JSON, YAML). Optional in
-  // proto3 because the "empty" representation varies by format ("{}" vs "").
   optional string tokenizer_plugin_config = 13;
 }

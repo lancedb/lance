@@ -122,12 +122,14 @@ pub struct InvertedIndexParams {
     #[serde(rename = "num_workers", skip_serializing, default)]
     pub(crate) num_workers: Option<usize>,
 
-    /// Absolute path to a tokenizer plugin shared library. See `plugin()`
-    /// for the full contract (security model, failure modes, filter chain).
+    /// Absolute path to a tokenizer plugin shared library implementing the
+    /// C ABI in `include/lance_tokenizer_plugin.h`.
+    ///
+    /// When set, `base_tokenizer` must be `"plugin"`.
     #[serde(default)]
     pub(crate) tokenizer_plugin_library: Option<String>,
 
-    /// Plugin-defined configuration string passed verbatim to the plugin.
+    /// Plugin-defined configuration string (e.g. JSON, YAML) passed verbatim to the plugin.
     #[serde(default)]
     pub(crate) tokenizer_plugin_config: Option<String>,
 }
@@ -136,8 +138,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
     type Error = Error;
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {
-        // Same validation as `build()` so a relative/empty plugin path can
-        // never reach the persisted manifest.
         params.validate_plugin_consistency()?;
         Ok(Self {
             base_tokenizer: Some(params.base_tokenizer.clone()),
@@ -362,25 +362,25 @@ impl InvertedIndexParams {
         Ok(value)
     }
 
-    /// Configure a tokenizer plugin. `library_path` must be an absolute path
-    /// to the plugin shared library (`.so`/`.dylib`/`.dll`); relative paths
-    /// are rejected because the persisted manifest is interpreted by any
-    /// process that later reopens the index. `config` is opaque to Lance and
-    /// passed verbatim to the plugin.
+    /// Configure a tokenizer plugin.
+    /// `library_path` must be an absolute path to the plugin shared library (`.so`/`.dylib`/`.dll`).
     ///
-    /// Plugin tokens still flow through the standard filter chain
-    /// (`max_token_length`, `lower_case`, `stem`, `remove_stop_words`,
-    /// `ascii_folding`); disable any filter the plugin already applies.
+    /// Standard filters (`max_token_length`, `lower_case`, `stem`, `remove_stop_words`, `ascii_folding`)
+    /// are disabled by default for plugin tokenizers.
+    /// Re-enable any Lance-side filter that should run after the plugin returns tokens.
     ///
     /// SECURITY: opening an index whose manifest carries a plugin path will
     /// `dlopen` the referenced library and execute its code in the host
-    /// process. Only enable this for indexes from sources you trust as much
-    /// as the host. Python/Java bindings intentionally do not expose this
-    /// API today.
+    /// process. Only enable this for indexes from sources you trust as much as the host.
     pub fn plugin(mut self, library_path: String, config: String) -> Self {
         self.base_tokenizer = "plugin".to_string();
         self.tokenizer_plugin_library = Some(library_path);
         self.tokenizer_plugin_config = Some(config);
+        self.max_token_length = None;
+        self.lower_case = false;
+        self.stem = false;
+        self.remove_stop_words = false;
+        self.ascii_folding = false;
         self
     }
 
@@ -427,15 +427,6 @@ impl InvertedIndexParams {
     /// Single validation point for plugin fields, called from both `build()`
     /// and the proto-conversion path so callers see a stable failure mode
     /// regardless of how the params were constructed:
-    ///
-    /// 1. plugin fields require `base_tokenizer == "plugin"` (otherwise build
-    ///    would silently fall through to the default tokenizer while the
-    ///    metadata still carries a plugin path — indexing and search would
-    ///    end up with different tokenizers).
-    /// 2. plugin library path must not be empty (`Path::new("")` is relative,
-    ///    so it would otherwise have to special-case the check below).
-    /// 3. plugin library path must be absolute (relative would resolve
-    ///    against the reader's CWD — silently loading a different file).
     fn validate_plugin_consistency(&self) -> Result<()> {
         let has_plugin_fields =
             self.tokenizer_plugin_library.is_some() || self.tokenizer_plugin_config.is_some();
@@ -523,17 +514,12 @@ impl InvertedIndexParams {
                 )
             })?;
 
-            // Empty/relative paths are already rejected in
-            // `validate_plugin_consistency` (called by `build()`).
             let config = self.tokenizer_plugin_config.as_ref().ok_or_else(|| {
                 Error::invalid_input(
                     "base_tokenizer is 'plugin' but tokenizer_plugin_config is not set.",
                 )
             })?;
 
-            // No `Path::exists()` precheck: `libloading::Library::new` already
-            // produces a precise error and a precheck would introduce a TOCTOU
-            // window.
             let tokenizer = PluginTokenizer::new(plugin_path, config)?;
             Ok(TextAnalyzer::builder(tokenizer).dynamic())
         }
@@ -709,6 +695,35 @@ mod tests {
     fn test_plugin_builder_keeps_empty_path_empty() {
         let params = InvertedIndexParams::default().plugin(String::new(), "{}".to_string());
         assert_eq!(params.tokenizer_plugin_library.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_plugin_builder_disables_standard_filters_by_default() {
+        let params =
+            InvertedIndexParams::default().plugin("/tmp/lib.so".to_string(), "{}".to_string());
+
+        assert_eq!(params.max_token_length, None);
+        assert!(!params.lower_case);
+        assert!(!params.stem);
+        assert!(!params.remove_stop_words);
+        assert!(!params.ascii_folding);
+    }
+
+    #[test]
+    fn test_plugin_builder_allows_reenabling_standard_filters() {
+        let params = InvertedIndexParams::default()
+            .plugin("/tmp/lib.so".to_string(), "{}".to_string())
+            .max_token_length(Some(40))
+            .lower_case(true)
+            .stem(true)
+            .remove_stop_words(true)
+            .ascii_folding(true);
+
+        assert_eq!(params.max_token_length, Some(40));
+        assert!(params.lower_case);
+        assert!(params.stem);
+        assert!(params.remove_stop_words);
+        assert!(params.ascii_folding);
     }
 
     #[test]

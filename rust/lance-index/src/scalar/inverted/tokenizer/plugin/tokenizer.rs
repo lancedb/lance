@@ -18,10 +18,8 @@ use crate::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceToken
 pub struct PluginTokenizer {
     library: Arc<TokenizerPluginLibrary>,
     config: String,
-    /// Eagerly built so a malformed config surfaces as `Err` from `build()`
-    /// rather than as a panic from the first `token_stream_*` call. Shared
-    /// across `Clone`s so cloned tokenizers (one per FTS worker) reuse the
-    /// same C-side factory.
+    /// Shared across `Clone`s so cloned tokenizers (one per FTS worker) reuse
+    /// the same C-side factory.
     factory: Arc<OwnedPluginFactory>,
 }
 
@@ -89,6 +87,7 @@ impl LanceTokenizer for PluginTokenizer {
     }
 
     fn doc_type(&self) -> DocType {
+        // Plugin tokenizers are currently text-based only
         DocType::Text
     }
 }
