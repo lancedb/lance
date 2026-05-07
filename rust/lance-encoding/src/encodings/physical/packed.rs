@@ -21,10 +21,7 @@ use crate::{
         DefaultCompressionStrategy, FixedPerValueDecompressor, MiniBlockDecompressor,
         VariablePerValueDecompressor,
     },
-    data::{
-        BlockInfo, DataBlock, DataBlockBuilder, FixedWidthDataBlock, StructDataBlock,
-        VariableWidthBlock,
-    },
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, StructDataBlock, VariableWidthBlock},
     encodings::logical::primitive::{
         fullzip::{PerValueCompressor, PerValueDataBlock},
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
@@ -151,19 +148,16 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
             prefix_sum[i + 1] = prefix_sum[i] + bytes_per_values[i];
         }
 
-        let mut children_data_block = vec![];
+        let encoded_bytes = encoded_data_block.data.as_ref();
+        let mut children_data_block = Vec::with_capacity(self.bits_per_values.len());
         for i in 0..self.bits_per_values.len() {
-            let child_buf_size = bytes_per_values[i] * num_values as usize;
-            let mut child_buf: Vec<u8> = Vec::with_capacity(child_buf_size);
+            let field_width = bytes_per_values[i];
+            let mut child_buf: Vec<u8> = Vec::with_capacity(field_width * num_values as usize);
 
-            for j in 0..num_values as usize {
-                // the start of the data at this row is `j * encoded_bytes_per_row`, and the offset for this field is `prefix_sum[i]`, this field has length `bytes_per_values[i]`.
-                let this_value = encoded_data_block.data.slice_with_length(
-                    prefix_sum[i] + (j * encoded_bytes_per_row),
-                    bytes_per_values[i],
-                );
-
-                child_buf.extend_from_slice(&this_value);
+            let mut src = prefix_sum[i];
+            for _ in 0..num_values as usize {
+                child_buf.extend_from_slice(&encoded_bytes[src..src + field_width]);
+                src += encoded_bytes_per_row;
             }
 
             let child = DataBlock::FixedWidth(FixedWidthDataBlock {
@@ -427,19 +421,26 @@ impl PackedStructVariablePerValueDecompressor {
     }
 }
 
+// Per-field byte accumulators used by `PackedStructVariablePerValueDecompressor::decompress`.
+//
+// We bypass `DataBlockBuilder` here because the per-row decode path is hot
+// (one append per row per field) and constructing a `DataBlock` per row
+// just to call `append` shows up as ~1/3 of decode time in flamegraphs of
+// `decode_primitive/struct`.
 enum FieldAccumulator {
     Fixed {
-        builder: DataBlockBuilder,
         bits_per_value: u64,
-        empty_value: DataBlock,
+        bytes_per_value: usize,
+        data: Vec<u8>,
     },
     Variable32 {
-        builder: DataBlockBuilder,
-        empty_value: DataBlock,
+        data: Vec<u8>,
+        // offsets is `num_values + 1` long; starts with [0].
+        offsets: Vec<u32>,
     },
     Variable64 {
-        builder: DataBlockBuilder,
-        empty_value: DataBlock,
+        data: Vec<u8>,
+        offsets: Vec<u64>,
     },
 }
 
@@ -450,18 +451,18 @@ impl FieldAccumulator {
     fn append_empty(&mut self) {
         match self {
             Self::Fixed {
-                builder,
-                empty_value,
+                bytes_per_value,
+                data,
                 ..
-            } => builder.append(empty_value, 0..1),
-            Self::Variable32 {
-                builder,
-                empty_value,
-            } => builder.append(empty_value, 0..1),
-            Self::Variable64 {
-                builder,
-                empty_value,
-            } => builder.append(empty_value, 0..1),
+            } => {
+                data.resize(data.len() + *bytes_per_value, 0);
+            }
+            Self::Variable32 { data, offsets } => {
+                offsets.push(data.len() as u32);
+            }
+            Self::Variable64 { data, offsets } => {
+                offsets.push(data.len() as u64);
+            }
         }
     }
 }
@@ -509,47 +510,43 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     let estimate = bytes_per_value.checked_mul(num_values).ok_or_else(|| {
                         Error::invalid_input("Packed struct fixed child allocation overflow")
                     })?;
-                    let empty_value = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::from(vec![0_u8; bytes_per_value as usize]),
-                        bits_per_value: *bits_per_value,
-                        num_values: 1,
-                        block_info: BlockInfo::new(),
-                    });
                     accumulators.push(FieldAccumulator::Fixed {
-                        builder: DataBlockBuilder::with_capacity_estimate(estimate),
                         bits_per_value: *bits_per_value,
-                        empty_value,
+                        bytes_per_value: bytes_per_value as usize,
+                        data: Vec::with_capacity(estimate as usize),
                     });
                 }
                 VariablePackedStructFieldKind::Variable {
                     bits_per_length, ..
-                } => match bits_per_length {
-                    32 => accumulators.push(FieldAccumulator::Variable32 {
-                        builder: DataBlockBuilder::with_capacity_estimate(data.data.len() as u64),
-                        empty_value: DataBlock::VariableWidth(VariableWidthBlock {
-                            data: LanceBuffer::empty(),
-                            bits_per_offset: 32,
-                            offsets: LanceBuffer::reinterpret_vec(vec![0_u32, 0_u32]),
-                            num_values: 1,
-                            block_info: BlockInfo::new(),
+                } => {
+                    let mut offsets_capacity = num_values as usize + 1;
+                    // Cap pre-allocation; rep/def-driven empty rows can inflate
+                    // num_values relative to actual stored data.
+                    offsets_capacity = offsets_capacity.min(1 << 20);
+                    match bits_per_length {
+                        32 => accumulators.push(FieldAccumulator::Variable32 {
+                            data: Vec::with_capacity(data.data.len()),
+                            offsets: {
+                                let mut v = Vec::with_capacity(offsets_capacity);
+                                v.push(0_u32);
+                                v
+                            },
                         }),
-                    }),
-                    64 => accumulators.push(FieldAccumulator::Variable64 {
-                        builder: DataBlockBuilder::with_capacity_estimate(data.data.len() as u64),
-                        empty_value: DataBlock::VariableWidth(VariableWidthBlock {
-                            data: LanceBuffer::empty(),
-                            bits_per_offset: 64,
-                            offsets: LanceBuffer::reinterpret_vec(vec![0_u64, 0_u64]),
-                            num_values: 1,
-                            block_info: BlockInfo::new(),
+                        64 => accumulators.push(FieldAccumulator::Variable64 {
+                            data: Vec::with_capacity(data.data.len()),
+                            offsets: {
+                                let mut v = Vec::with_capacity(offsets_capacity);
+                                v.push(0_u64);
+                                v
+                            },
                         }),
-                    }),
-                    _ => {
-                        return Err(Error::invalid_input(
-                            "Packed struct variable child must use 32 or 64-bit length prefixes",
-                        ));
+                        _ => {
+                            return Err(Error::invalid_input(
+                                "Packed struct variable child must use 32 or 64-bit length prefixes",
+                            ));
+                        }
                     }
-                },
+                }
             }
         }
 
@@ -573,33 +570,30 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     (
                         VariablePackedStructFieldKind::Fixed { bits_per_value, .. },
                         FieldAccumulator::Fixed {
-                            builder,
+                            data: acc_data,
                             bits_per_value: acc_bits,
+                            bytes_per_value,
                             ..
                         },
                     ) => {
                         debug_assert_eq!(bits_per_value, acc_bits);
-                        let bytes_per_value = (bits_per_value / 8) as usize;
-                        let end = cursor + bytes_per_value;
+                        let end = cursor + *bytes_per_value;
                         if end > row_end {
                             return Err(Error::invalid_input(
                                 "Packed struct fixed child exceeds row bounds",
                             ));
                         }
-                        let value_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                            data: LanceBuffer::from(data.data[cursor..end].to_vec()),
-                            bits_per_value: *bits_per_value,
-                            num_values: 1,
-                            block_info: BlockInfo::new(),
-                        });
-                        builder.append(&value_block, 0..1);
+                        acc_data.extend_from_slice(&data.data[cursor..end]);
                         cursor = end;
                     }
                     (
                         VariablePackedStructFieldKind::Variable {
                             bits_per_length, ..
                         },
-                        FieldAccumulator::Variable32 { builder, .. },
+                        FieldAccumulator::Variable32 {
+                            data: acc_data,
+                            offsets,
+                        },
                     ) => {
                         if *bits_per_length != 32 {
                             return Err(Error::invalid_input(
@@ -624,21 +618,18 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                                 "Packed struct variable child exceeds row bounds",
                             ));
                         }
-                        let value_block = DataBlock::VariableWidth(VariableWidthBlock {
-                            data: LanceBuffer::from(data.data[cursor..value_end].to_vec()),
-                            bits_per_offset: 32,
-                            offsets: LanceBuffer::reinterpret_vec(vec![0_u32, len as u32]),
-                            num_values: 1,
-                            block_info: BlockInfo::new(),
-                        });
-                        builder.append(&value_block, 0..1);
+                        acc_data.extend_from_slice(&data.data[cursor..value_end]);
+                        offsets.push(acc_data.len() as u32);
                         cursor = value_end;
                     }
                     (
                         VariablePackedStructFieldKind::Variable {
                             bits_per_length, ..
                         },
-                        FieldAccumulator::Variable64 { builder, .. },
+                        FieldAccumulator::Variable64 {
+                            data: acc_data,
+                            offsets,
+                        },
                     ) => {
                         if *bits_per_length != 64 {
                             return Err(Error::invalid_input(
@@ -663,14 +654,8 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                                 "Packed struct variable child exceeds row bounds",
                             ));
                         }
-                        let value_block = DataBlock::VariableWidth(VariableWidthBlock {
-                            data: LanceBuffer::from(data.data[cursor..value_end].to_vec()),
-                            bits_per_offset: 64,
-                            offsets: LanceBuffer::reinterpret_vec(vec![0_u64, len as u64]),
-                            num_values: 1,
-                            block_info: BlockInfo::new(),
-                        });
-                        builder.append(&value_block, 0..1);
+                        acc_data.extend_from_slice(&data.data[cursor..value_end]);
+                        offsets.push(acc_data.len() as u64);
                         cursor = value_end;
                     }
                     _ => {
@@ -694,10 +679,17 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     VariablePackedStructFieldDecoder {
                         kind: VariablePackedStructFieldKind::Fixed { decompressor, .. },
                     },
-                    FieldAccumulator::Fixed { builder, .. },
+                    FieldAccumulator::Fixed {
+                        bits_per_value,
+                        data: acc_data,
+                        ..
+                    },
                 ) => {
-                    let DataBlock::FixedWidth(block) = builder.finish() else {
-                        panic!("Expected fixed-width datablock from builder");
+                    let block = FixedWidthDataBlock {
+                        data: LanceBuffer::from(acc_data),
+                        bits_per_value,
+                        num_values,
+                        block_info: BlockInfo::new(),
                     };
                     let decoded = decompressor.decompress(block, num_values)?;
                     children.push(decoded);
@@ -710,13 +702,19 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                                 decompressor,
                             },
                     },
-                    FieldAccumulator::Variable32 { builder, .. },
+                    FieldAccumulator::Variable32 {
+                        data: acc_data,
+                        offsets,
+                    },
                 ) => {
-                    let DataBlock::VariableWidth(mut block) = builder.finish() else {
-                        panic!("Expected variable-width datablock from builder");
+                    debug_assert_eq!(offsets.len() as u64, num_values + 1);
+                    let block = VariableWidthBlock {
+                        data: LanceBuffer::from(acc_data),
+                        bits_per_offset: (*bits_per_length) as u8,
+                        offsets: LanceBuffer::reinterpret_vec(offsets),
+                        num_values,
+                        block_info: BlockInfo::new(),
                     };
-                    debug_assert_eq!(block.bits_per_offset, 32);
-                    block.bits_per_offset = (*bits_per_length) as u8;
                     let decoded = decompressor.decompress(block)?;
                     children.push(decoded);
                 }
@@ -728,13 +726,19 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                                 decompressor,
                             },
                     },
-                    FieldAccumulator::Variable64 { builder, .. },
+                    FieldAccumulator::Variable64 {
+                        data: acc_data,
+                        offsets,
+                    },
                 ) => {
-                    let DataBlock::VariableWidth(mut block) = builder.finish() else {
-                        panic!("Expected variable-width datablock from builder");
+                    debug_assert_eq!(offsets.len() as u64, num_values + 1);
+                    let block = VariableWidthBlock {
+                        data: LanceBuffer::from(acc_data),
+                        bits_per_offset: (*bits_per_length) as u8,
+                        offsets: LanceBuffer::reinterpret_vec(offsets),
+                        num_values,
+                        block_info: BlockInfo::new(),
                     };
-                    debug_assert_eq!(block.bits_per_offset, 64);
-                    block.bits_per_offset = (*bits_per_length) as u8;
                     let decoded = decompressor.decompress(block)?;
                     children.push(decoded);
                 }
