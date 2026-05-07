@@ -479,8 +479,12 @@ def test_optimize_indices_second_call_is_noop(tmp_path: Path):
     dataset.create_scalar_index("name", index_type="NGRAM")
     dataset.create_scalar_index("value", index_type="ZONEMAP")
     dataset.create_scalar_index("bloom_val", index_type="BLOOMFILTER")
+    # num_partitions=1 keeps this dataset balanced: the auto-rebalance check
+    # in merge_indices only finds join candidates when num_partitions > 1, and
+    # 1024 + 128 rows is well below the split threshold. Without this, the
+    # rebalance heuristic would keep finding work on the small partitions.
     dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=2, num_sub_vectors=2
+        "vector", index_type="IVF_PQ", num_partitions=1, num_sub_vectors=2
     )
 
     extra_rows = 128

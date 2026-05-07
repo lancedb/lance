@@ -188,6 +188,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         )?;
         let ivf_view = logical_index.as_ivf()?;
 
+        // Specialized vector no-op: when there is no new data and the caller
+        // hasn't asked for retrain/merge, the only useful work is rebalancing.
+        // Bail when no segment needs rebalancing so repeated optimize calls
+        // don't keep rewriting the same index.
+        if unindexed.is_empty()
+            && !options.retrain
+            && options.num_indices_to_merge.is_none()
+            && select_segment_for_single_rebalance(&ivf_view)?.is_none()
+        {
+            return Ok(None);
+        }
+
         let use_single_segment_rebalance = logical_index.num_segments() > 1
             && options.num_indices_to_merge.is_none()
             && !options.retrain

@@ -1253,12 +1253,14 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
-            // Skip indices that already cover every fragment unless the caller
-            // explicitly asked for retrain or for merging existing deltas.
-            // Without this, repeated optimize_indices() calls on a steady-state
-            // dataset re-write identical files on every call.
+            // Scalar indices have no rebalance concept, so skip them entirely
+            // when every fragment is already covered and the caller hasn't
+            // asked for retrain or an explicit delta merge. Vector indices
+            // fall through and use a rebalance-aware no-op check inside
+            // merge_indices_with_unindexed_frags.
             if !options.retrain
                 && options.num_indices_to_merge.is_none_or(|n| n == 0)
+                && index_group_is_scalar(self, deltas)
                 && index_group_has_no_unindexed(self, deltas)
             {
                 continue;
@@ -1343,6 +1345,16 @@ impl DatasetIndexExt for Dataset {
             .as_ivf()?
             .read_partition(partition_id, with_vector)
             .await
+    }
+}
+
+fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let Some(field_id) = deltas.first().and_then(|d| d.fields.first()) else {
+        return false;
+    };
+    match dataset.schema().field_by_id(*field_id) {
+        Some(field) => !is_vector_field(field.data_type()),
+        None => false,
     }
 }
 
@@ -2828,11 +2840,6 @@ mod tests {
         );
     }
 
-    // optimize_indices is now a no-op when every fragment is already indexed
-    // (callers must add data, retrain, or merge deltas explicitly to do work).
-    // The single-segment auto-rebalance from #6402 is no longer reachable
-    // through the default options, so this regression test is shelved.
-    #[ignore = "auto-rebalance no longer fires when there are no unindexed fragments"]
     #[tokio::test]
     async fn test_segmented_optimize_rebalances_only_one_segment() {
         const DIMENSION: i32 = 8;
