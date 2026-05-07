@@ -508,16 +508,12 @@ def test_optimize_indices_second_call_is_noop(tmp_path: Path):
     # First optimize: should pull the new fragment into each index.
     dataset.optimize.optimize_indices()
 
-    files_before = {
-        p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()
-    }
+    files_before = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
 
     # Second optimize: nothing has changed, so this must be a no-op on disk.
     dataset.optimize.optimize_indices()
 
-    files_after = {
-        p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()
-    }
+    files_after = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
 
     new_files = files_after - files_before
     assert not new_files, f"second optimize_indices created new files: {new_files}"
