@@ -427,9 +427,7 @@ impl DistCalculator for SQDistCalculator<'_> {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
         let dist = match self.storage.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => {
-                l2_u8(sq_code, &self.query_sq_code) as f32
-            }
+            DistanceType::L2 | DistanceType::Cosine => l2_u8(sq_code, &self.query_sq_code) as f32,
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         };
