@@ -18,6 +18,7 @@ use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
+use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
@@ -2358,6 +2359,29 @@ impl Transaction {
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
+                        // The unenforced primary key position lives in two
+                        // places on `Field`: the `metadata` HashMap (which
+                        // round-trips on its own through this update path)
+                        // and the cached `unenforced_primary_key_position`
+                        // option, which is what gets written into the next
+                        // protobuf-encoded manifest. If we only update
+                        // metadata, the cached option goes stale and the
+                        // next commit drops the PK marker. Re-derive it
+                        // from the freshly-applied metadata to keep the
+                        // two views in sync.
+                        field.unenforced_primary_key_position = field
+                            .metadata
+                            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .or_else(|| {
+                                field
+                                    .metadata
+                                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                                    .filter(|s| {
+                                        matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
+                                    })
+                                    .map(|_| 0)
+                            });
                     } else {
                         return Err(Error::invalid_input_source(
                             format!("Field with id {} does not exist", field_id).into(),
