@@ -596,15 +596,69 @@ mod tests {
         assert_eq!(pk.len(), 1);
         assert_eq!(pk[0].name, "id");
 
-        // Legacy boolean-flag form must also sync the cached option.
+        // Legacy boolean-flag form must also sync the cached option. All
+        // three accepted boolean spellings ("true", "1", "yes") and case
+        // variants must work; non-matching strings must be ignored.
+        for truthy in ["true", "1", "yes", "TRUE", "Yes"] {
+            dataset
+                .update_field_metadata()
+                .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, truthy)])
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset
+                    .schema()
+                    .field("name")
+                    .unwrap()
+                    .unenforced_primary_key_position,
+                Some(0),
+                "value {:?} should be treated as a PK marker",
+                truthy
+            );
+        }
+        for falsy in ["no", "false", "0", "anything-else"] {
+            dataset
+                .update_field_metadata()
+                .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, falsy)])
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset
+                    .schema()
+                    .field("name")
+                    .unwrap()
+                    .unenforced_primary_key_position,
+                None,
+                "value {:?} should not be treated as a PK marker",
+                falsy
+            );
+        }
+
+        // Position key with a non-numeric value must fall back to the
+        // boolean-flag path, not panic on parse.
         dataset
             .update_field_metadata()
-            .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, "true")])
+            .replace(
+                "name",
+                [
+                    (LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "not-a-number"),
+                    (LANCE_UNENFORCED_PRIMARY_KEY, "true"),
+                ],
+            )
             .unwrap()
             .await
             .unwrap();
-        let name_field = dataset.schema().field("name").unwrap();
-        assert_eq!(name_field.unenforced_primary_key_position, Some(0));
+        assert_eq!(
+            dataset
+                .schema()
+                .field("name")
+                .unwrap()
+                .unenforced_primary_key_position,
+            Some(0),
+            "garbage position must fall through to the boolean fallback",
+        );
 
         // Removing the keys must clear the cached option, otherwise the
         // protobuf would still encode a stale PK marker on next commit.

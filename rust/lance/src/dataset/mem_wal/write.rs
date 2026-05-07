@@ -3155,11 +3155,13 @@ mod tests {
                 .put(vec![create_test_batch(&schema, i * 10, 10)])
                 .await
                 .unwrap();
-            // Yield so the background flush handler gets a chance to drain
-            // the trigger queue before the next push, otherwise multiple
-            // pending triggers could coalesce into a single drain.
+            // Yield, then sleep, so the background flush handler can
+            // drain the trigger queue before the next push — otherwise
+            // multiple pending triggers can coalesce into a single drain.
+            // 50ms historically failed on slow Windows CI runners; 250ms
+            // gives a comfortable margin without making the suite slow.
             tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
         writer.close().await.unwrap();
